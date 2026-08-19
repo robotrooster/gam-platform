@@ -23,11 +23,24 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// Auto-logout on 401
+// Auto-logout on 401 — but NEVER for /auth/ calls.
+//
+// S605 (Nic, live bug): a wrong password on the SIGN-IN page returns 401, and
+// this interceptor was hard-navigating to /login for it. That reload destroyed
+// the React state holding the error, so a landlord who mistyped saw the screen
+// blank and the empty form come back with NO message — indistinguishable from
+// the app being broken, and impossible to tell apart from "2FA never sent me a
+// code" (the password check runs BEFORE any code is issued).
+//
+// Auth routes own their own error display: login, the 2FA verify/resend step,
+// register, forgot-password and reset-password all render the server's message
+// inline. Only a 401 on a NORMAL authed request means a dead session worth
+// bouncing. The tenant portal already had this carve-out (S537).
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
+    const url = String(err.config?.url || '')
+    if (err.response?.status === 401 && !url.includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
     }

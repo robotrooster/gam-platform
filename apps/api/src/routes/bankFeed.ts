@@ -5,7 +5,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES } from '@gam/shared'
+import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
@@ -29,6 +29,17 @@ bankFeedRouter.post('/link-session', requireLandlord, async (req: any, res, next
 })
 
 // POST /api/bank-feed/finalize — after the FC modal, persist the linked accounts.
+// S605: books start date — keep pre-onboarding history out of the review queue.
+bankFeedRouter.put('/books-start-date', requireLandlord, async (req: any, res, next) => {
+  try {
+    const b = z.object({
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+    }).parse(req.body)
+    const { setBooksStartDate } = await import('../services/bankFeed')
+    res.json({ success: true, data: await setBooksStartDate(scope(req), b.date) })
+  } catch (e) { next(e) }
+})
+
 bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) => {
   try {
     const { sessionId } = z.object({ sessionId: z.string().min(1) }).parse(req.body)
@@ -78,7 +89,10 @@ bankFeedRouter.get('/transactions', requireLandlord, async (req: any, res, next)
 bankFeedRouter.post('/transactions/:id/categorize', requireLandlord, async (req: any, res, next) => {
   try {
     const body = z.object({
-      category: z.enum(EXPENSE_CATEGORIES as unknown as [string, ...string[]]),
+      // S605: accepts BOTH sides — the service picks by the transaction's sign
+      // (expense categories for money out, income for money in) and rejects a
+      // mismatch, so widening here can't file a deposit as 'repairs'.
+      category: z.enum([...EXPENSE_CATEGORIES, ...OTHER_INCOME_CATEGORIES] as unknown as [string, ...string[]]),
       scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
       unitId: z.string().uuid().nullable().optional(),
       propertyId: z.string().uuid().nullable().optional(),

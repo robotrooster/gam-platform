@@ -16,19 +16,19 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
-import React, { useContext, useState } from 'react'
+import React, { useContext, useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
-  Scale, SlidersHorizontal, BookOpen, Lightbulb,
+  Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail,
   Target, TrendingUp, Bot, Lock, LogOut, DollarSign, Sun, Moon,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -305,6 +305,8 @@ function Layout(){
           <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={15}/> Payments</NavLink>
           <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}><ArrowDownToLine size={15}/> Disbursements</NavLink>
           <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
+          {isSuperAdmin&&<NavLink to="/deposit-interest" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={15}/> Deposit Interest</NavLink>}
+          <NavLink to="/outreach" className={({isActive})=>`ni${isActive?' active':''}`}><Mail size={15}/> Signup Outreach</NavLink>
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Compliance</div>}
           {isSuperAdmin&&<NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}><Activity size={15}/> NACHA Monitor</NavLink>}
           {isSuperAdmin&&<NavLink to="/nexus" className={({isActive})=>`ni${isActive?' active':''}`}><MapIcon size={15}/> Sales-Tax Nexus</NavLink>}
@@ -592,8 +594,19 @@ function AdminOnboardingOverview(){
   )
 }
 
+// S605 (Nic): vendor + service health lives HERE, in the same layout as the
+// scaling trackers, rather than on a page of its own — "I'd like to not have to
+// go on those dashboards to know if there's a problem." Same audience, same
+// question ("how are we doing, is anything broken"), so same page.
+const HEALTH_HEX:Record<string,string>={ok:'#22c55e',warn:'#f59e0b',down:'#ef4444',unknown:'#6b7280'}
+const HEALTH_LBL:Record<string,string>={ok:'OK',warn:'Watch',down:'Down',unknown:'Unknown'}
+
 function ScalingReadiness(){
   const{data,isLoading}=useQuery('infra-readiness',()=>get<any>('/admin/infra-readiness'),{refetchInterval:20000,refetchOnWindowFocus:true})
+  // Slower cadence than the 20s scaling poll: each refresh fans out to four
+  // vendor APIs, and hammering them is a good way to get rate-limited by the
+  // very services we are trying to watch. The server also caches for 60s.
+  const{data:health}=useQuery<any>('platform-health',()=>get<any>('/admin/platform-health'),{refetchInterval:120000,refetchOnWindowFocus:true})
   const HEX:Record<string,string>={ok:'#22c55e',watch:'#f59e0b',move:'#ef4444'}
   const LBL:Record<string,string>={ok:'OK',watch:'Watch',move:'Move'}
   const VERD:Record<string,{t:string;s:string}>={
@@ -608,7 +621,7 @@ function ScalingReadiness(){
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">Scaling Readiness</h1><p className="ps">When it's time to move off the Mac · auto-refreshes every 20s{host?` · ${host.hostname} · ${host.cores} cores`:''}</p></div>
+        <div><h1 className="pt">Scaling Readiness</h1><p className="ps">Vendor health and when it's time to move off the Mac · auto-refreshes every 20s{host?` · ${host.hostname} · ${host.cores} cores`:''}</p></div>
       </div>
 
       <div className="card" style={{borderColor:c,marginBottom:16,display:'flex',gap:14,alignItems:'center'}}>
@@ -641,6 +654,53 @@ function ScalingReadiness(){
           )
         })}
       </div>
+
+      {health&&(
+        <>
+          <div style={{display:'flex',alignItems:'center',gap:10,margin:'22px 0 10px'}}>
+            <h2 style={{fontSize:'.95rem',fontWeight:700,color:'var(--t0)',margin:0}}>Vendors &amp; services</h2>
+            <span style={{fontSize:'.68rem',color:'var(--t3)'}}>
+              everything we depend on · checked {new Date(health.checkedAt).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}
+            </span>
+          </div>
+          <div className="card" style={{borderColor:HEALTH_HEX[health.overall],marginBottom:16,display:'flex',gap:14,alignItems:'center'}}>
+            <div style={{width:12,height:12,borderRadius:'50%',background:HEALTH_HEX[health.overall],boxShadow:`0 0 12px ${HEALTH_HEX[health.overall]}`,flexShrink:0}}/>
+            <div>
+              <div style={{fontWeight:700,color:HEALTH_HEX[health.overall],fontSize:'.95rem'}}>
+                {health.overall==='ok'?'All services healthy'
+                 :health.overall==='warn'?'Something needs a look'
+                 :health.overall==='down'?'A service is DOWN'
+                 :'Some checks could not run'}
+              </div>
+              <div style={{fontSize:'.78rem',color:'var(--t2)',marginTop:2}}>
+                {health.overall==='ok'
+                  ? 'Nothing to do. You will also get an admin notification the moment any of these breaks.'
+                  : 'Details below. Each row links to the console where it gets fixed.'}
+              </div>
+            </div>
+          </div>
+          <div className="grid3" style={{marginBottom:16}}>
+            {(health.components||[]).map((c:any)=>{
+              const hc=HEALTH_HEX[c.state]||HEALTH_HEX.unknown
+              return(
+                <div className="kpi" key={c.key}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
+                    <div className="kl" style={{margin:0}}>{c.label}</div>
+                    <span className="badge" style={{background:hc+'22',color:hc}}>{HEALTH_LBL[c.state]}</span>
+                  </div>
+                  <div style={{fontSize:'.78rem',color:'var(--t1)',lineHeight:1.5,marginTop:6,minHeight:34}}>{c.detail}</div>
+                  {c.console&&(
+                    <a href={c.console} target="_blank" rel="noopener noreferrer"
+                       style={{fontSize:'.68rem',color:'var(--gold)',textDecoration:'none',display:'inline-block',marginTop:8}}>
+                      Open console ↗
+                    </a>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
 
       <div className="card">
         <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>Migration game plan</div>
@@ -1145,6 +1205,55 @@ function Overview(){
         </div>
       )}
       </> }
+      <DepositTrust/>
+    </div>
+  )
+}
+
+// ── DEPOSITS HELD IN TRUST (S602) ──────────────────────────────
+// What SHOULD be sitting in the segregated deposit trust account right now:
+// every tenant deposit GAM holds in escrow (principal), + interest owed on top.
+function DepositTrust(){
+  const{user}=useAuth()
+  const{data,isLoading}=useQuery<any>('deposit-trust-summary',()=>get<any>('/admin/deposit-trust/summary'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  if(!user)return null
+  const d=data||{heldCount:0,totalPrincipal:0,totalInterestAccrued:0,totalLiability:0,byState:[]}
+  const R=40,SW=12,C=2*Math.PI*R
+  const palette=['#c9a227','#4f9d69','#5b8def','#c9635b','#8d6fd6','#3fb6b6','#d08a3f','#9d9d9d']
+  const states=(d.byState||[]).filter((s:any)=>s.principal>0)
+  const g=states.reduce((sum:number,s:any)=>sum+s.principal,0)
+  let acc=0
+  const segs=states.map((s:any,i:number)=>{const len=g>0?(s.principal/g)*C:0;const o=acc;acc+=len;return{state:s.state,principal:s.principal,len,off:o,color:palette[i%palette.length]}})
+  return(
+    <div className="card" style={{marginTop:20,padding:24}}>
+      <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',flexWrap:'wrap',gap:16,marginBottom:16}}>
+        <div>
+          <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Deposits held in trust</div>
+          <div style={{fontFamily:'var(--font-d)',fontSize:'2.4rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(d.totalPrincipal)}</div>
+          <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>{d.heldCount} deposit{d.heldCount===1?'':'s'} · should be in the trust account now</div>
+          {d.totalInterestAccrued>0&&<div style={{fontSize:'.74rem',color:'var(--t2)',marginTop:8}}>+ {formatCurrency(d.totalInterestAccrued)} interest owed → {formatCurrency(d.totalLiability)} total liability</div>}
+        </div>
+        {g>0&&(
+          <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
+            <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
+            {segs.map((s:any)=>(
+              <circle key={s.state} cx={52} cy={52} r={R} fill="none" stroke={s.color} strokeWidth={SW}
+                strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
+            ))}
+            <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:12,fontWeight:800,fontFamily:'var(--font-d)'}}>{states.length} state{states.length===1?'':'s'}</text>
+          </svg>
+        )}
+      </div>
+      {isLoading?<div style={{color:'var(--t3)',fontSize:'.8rem'}}>Loading…</div>:g>0?(
+        <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+          {segs.map((s:any)=>{const pct=g>0?(s.principal/g)*100:0;return(
+            <div key={s.state} style={{display:'flex',alignItems:'center',gap:6}}>
+              <div style={{width:9,height:9,borderRadius:'50%',background:s.color,flexShrink:0}}/>
+              <span style={{fontSize:'.72rem',color:'var(--t2)'}}>{s.state} · {formatCurrency(s.principal)} ({pct.toFixed(0)}%)</span>
+            </div>
+          )})}
+        </div>
+      ):<div style={{color:'var(--t3)',fontSize:'.82rem'}}>No deposits are being held in trust yet.</div>}
     </div>
   )
 }
@@ -3199,11 +3308,37 @@ function FeatureRequests(){
 }
 
 // ── APP ───────────────────────────────────────────────────────
+
+// S605 (Nic): "we should be doing that automatically... that way we're not
+// working on old visuals." A bfcache-restored tab on an outdated build reloads
+// itself; a newer deploy found on refocus or the 5-min poll only OFFERS a
+// reload, so nobody gets a page yanked mid-task. See packages/shared/versionWatch.
+function VersionWatch() {
+  const [ready, setReady] = useState(false)
+  useEffect(() => startVersionWatch({ onUpdateAvailable: () => setReady(true) }), [])
+  if (!ready) return null
+  return (
+    <div style={{
+      position:'fixed', bottom:18, left:'50%', transform:'translateX(-50%)', zIndex:99999,
+      display:'flex', alignItems:'center', gap:12, padding:'10px 16px',
+      background:'#111820', border:'1px solid #c9a227', borderRadius:10,
+      boxShadow:'0 6px 24px rgba(0,0,0,.45)', fontSize:'.82rem', color:'#eef1f8',
+    }}>
+      A newer version of GAM is available.
+      <button onClick={() => window.location.reload()} style={{
+        background:'#c9a227', color:'#060809', border:'none', borderRadius:6,
+        padding:'5px 12px', fontWeight:700, fontSize:'.78rem', cursor:'pointer',
+      }}>Reload</button>
+    </div>
+  )
+}
+
 function App(){
   const{user,loading}=useAuth()
   if(loading)return<div className="loading">Loading…</div>
   return(
     <BrowserRouter>
+      <VersionWatch/>
       <Routes>
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
         {/* S289: TOTP enrollment lives outside the Layout — it's the only
@@ -3238,6 +3373,8 @@ function App(){
           <Route path="disputes"      element={<SuperAdminGuard><Disputes/></SuperAdminGuard>}/>
           <Route path="subleases"     element={<SuperAdminGuard><Subleases/></SuperAdminGuard>}/>
           <Route path="deposit-portability" element={<SuperAdminGuard><DepositPortability/></SuperAdminGuard>}/>
+          <Route path="deposit-interest" element={<SuperAdminGuard><DepositInterest/></SuperAdminGuard>}/>
+          <Route path="outreach" element={<OutreachStatus/>}/>
           <Route path="system-features" element={<OwnerGuard><SystemFeatures/></OwnerGuard>}/>
           <Route path="audit-log"     element={<SuperAdminGuard><AuditLog/></SuperAdminGuard>}/>
           <Route path="csv-imports"   element={<SuperAdminGuard><CsvImports/></SuperAdminGuard>}/>
@@ -4352,6 +4489,311 @@ function FlexPayRequests() {
       )}
     </div>
   )
+}
+
+// ── S605: Signup outreach — did it land, and did they act? ────────────────
+//
+// Nic asked "can we tell if Charlie ever opened the email". Opens are
+// deliberately NOT here: they need a 1x1 pixel, Apple Mail Privacy Protection
+// pre-fetches remote images for every message (false positives for a large
+// share of recipients), and anyone blocking images reads it without registering
+// (false negatives). The outreach email is also deliberately image-free so it
+// reads as a person, not a campaign.
+//
+// What IS here is trustworthy: the recipient server accepted it (or bounced),
+// and whether they clicked the booking link — which is first-party, server-side
+// and proves intent rather than proving an image loaded.
+const STAGE_STYLE: Record<string, { label: string; color: string }> = {
+  booked:        { label: 'Booked a call', color: '#4f9d69' },
+  clicked:       { label: 'Clicked link',  color: '#c9a227' },
+  delivered:     { label: 'Delivered',     color: 'var(--t1)' },
+  sent:          { label: 'Sent',          color: 'var(--t3)' },
+  undeliverable: { label: 'Undeliverable', color: '#c9635b' },
+  failed:        { label: 'Send failed',   color: '#c9635b' },
+}
+
+function OutreachStatus() {
+  const { user } = useAuth()
+  const { data = [], isLoading } = useQuery<any[]>(
+    'outreach-status', () => get<any[]>('/admin/outreach-status'),
+    { enabled: !!user, staleTime: 60000, refetchOnWindowFocus: false })
+  if (!user) return null
+
+  const fmt = (d: any) => d ? new Date(d).toLocaleString('en-US',
+    { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—'
+
+  return (
+    <div>
+      <h1 className="pt">Signup Outreach</h1>
+      <p className="ps">
+        Whether the post-signup onboarding email reached self-signed-up landlords, and what they did next.
+      </p>
+
+      <div className="card" style={{ marginTop: 16, padding: 14, fontSize: '.78rem', color: 'var(--t2)', lineHeight: 1.6 }}>
+        <strong style={{ color: 'var(--t0)' }}>No open tracking, on purpose.</strong>{' '}
+        Opens need a tracking pixel, and Apple Mail pre-fetches images for every message — so "opened"
+        would read as true for people who never looked, and false for anyone blocking images.
+        <strong style={{ color: 'var(--t0)' }}> Clicked link</strong> is the honest signal: it means they
+        opened the email and came to book.
+      </div>
+
+      <div className="card" style={{ marginTop: 16, padding: 0 }}>
+        {isLoading ? (
+          <div style={{ padding: 20, color: 'var(--t3)', fontSize: '.82rem' }}>Loading…</div>
+        ) : data.length === 0 ? (
+          <div style={{ padding: 20, color: 'var(--t3)', fontSize: '.82rem' }}>
+            No outreach sent yet. It fires ~90 minutes after an organic landlord signs up.
+          </div>
+        ) : (
+          <table className="tbl">
+            <thead><tr>
+              <th>Landlord</th><th>Stage</th><th>Emailed</th><th>Delivery</th>
+              <th>Clicked</th><th>Call</th><th>Properties</th>
+            </tr></thead>
+            <tbody>
+              {data.map((r) => {
+                const st = STAGE_STYLE[r.stage] || STAGE_STYLE.sent
+                return (
+                  <tr key={r.landlordId}>
+                    <td>
+                      <div style={{ color: 'var(--t0)', fontWeight: 600 }}>{r.name}</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{r.email}</div>
+                    </td>
+                    <td><span style={{ color: st.color, fontWeight: 700, fontSize: '.78rem' }}>{st.label}</span></td>
+                    <td className="mono" style={{ fontSize: '.74rem' }}>{fmt(r.emailSentAt)}</td>
+                    <td style={{ fontSize: '.74rem' }}>
+                      {r.deliveryEvent
+                        ? <span style={{ color: r.deliveryEvent === 'delivered' ? '#4f9d69' : '#c9635b' }}>{r.deliveryEvent}</span>
+                        : <span style={{ color: 'var(--t3)' }} title="No delivery webhook received — is the Resend webhook configured?">unknown</span>}
+                    </td>
+                    <td className="mono" style={{ fontSize: '.74rem' }}>
+                      {r.clickedAt ? fmt(r.clickedAt) + (r.clickCount > 1 ? ` (${r.clickCount}×)` : '') : '—'}
+                    </td>
+                    <td className="mono" style={{ fontSize: '.74rem' }}>{fmt(r.bookedCallAt)}</td>
+                    <td className="mono" style={{ fontSize: '.74rem', color: r.propertyCount ? 'var(--t1)' : 'var(--t3)' }}>
+                      {r.propertyCount}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── S605: Deposit interest — pool spread + the 50-state catalog ───────────
+//
+// S604 built the whole engine and catalog and left them readable only in psql.
+// SUPER-ADMIN ONLY: `earned`, `spread` and the market rate are GAM's margin.
+// The same boundary was drawn twice already (calcNetPerUnit must not reach
+// landlords; getAccrualHistory strips these before the tenant portal sees it).
+//
+// Nic's core model, which the copy here has to reflect honestly: GAM earns on
+// EVERY held deposit and pays only where a state + unit type requires it. So a
+// state with no obligation is the BEST case — "no obligation, full spread to
+// GAM" — never "negative". Spread is signed: AZ mobile home (5% statutory vs
+// ~3.5% market) genuinely runs negative and GAM funds it.
+function DepositInterest() {
+  const { user } = useAuth()
+  const { data: spread, isLoading: loadingSpread } = useQuery<any>(
+    'deposit-interest-spread', () => get<any>('/admin/deposit-interest/spread'),
+    { enabled: !!user, staleTime: 60000, refetchOnWindowFocus: false })
+  const { data: catalog, isLoading: loadingCatalog } = useQuery<any>(
+    'deposit-interest-catalog', () => get<any>('/admin/deposit-interest/catalog'),
+    { enabled: !!user, staleTime: 300000, refetchOnWindowFocus: false })
+  const [tab, setTab] = useState<'spread' | 'catalog'>('spread')
+  const [onlyObligations, setOnlyObligations] = useState(false)
+
+  if (!user) return null
+  const months: any[] = spread?.months || []
+  const totals = spread?.totals || { principal: 0, owed: 0, earned: 0, spread: 0 }
+  const states: any[] = catalog?.states || []
+  const summary = catalog?.summary || {}
+  const shown = onlyObligations
+    ? states.filter((s) => s.rateBasis && s.rateBasis !== 'none')
+    : states
+
+  return (
+    <div>
+      <h1 className="pt">Deposit Interest</h1>
+      <p className="ps">
+        What GAM earns on held deposits versus what each state actually requires us to pay.
+      </p>
+
+      {/* The index gap is a live correctness issue, not a to-do: an
+          index_linked state with no published value computes $0 owed, which is
+          WRONG rather than merely unknown. Surface it loudly. */}
+      {summary.needsIndexValue?.length > 0 && (
+        <div className="card" style={{ marginTop: 16, padding: 16, borderLeft: '3px solid #e0a23a' }}>
+          <div style={{ fontWeight: 700, color: 'var(--t0)', fontSize: '.86rem' }}>
+            {summary.needsIndexValue.join(', ')} need a published index value
+          </div>
+          <div style={{ fontSize: '.78rem', color: 'var(--t2)', marginTop: 4 }}>
+            These states owe interest at a published index rate. Until the real value is loaded the
+            engine computes <strong>$0 owed</strong>, which would under-pay tenants there. Harmless
+            while no landlord operates in these states — load the rate before one does.
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 18, marginBottom: 14 }}>
+        <button className={`btn bsm${tab === 'spread' ? ' bgold' : ' bd'}`} onClick={() => setTab('spread')}>Pool spread</button>
+        <button className={`btn bsm${tab === 'catalog' ? ' bgold' : ' bd'}`} onClick={() => setTab('catalog')}>State catalog</button>
+      </div>
+
+      {tab === 'spread' && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 12 }}>
+            {[
+              { label: 'Principal held', v: totals.principal, c: 'var(--t0)' },
+              { label: 'Earned', v: totals.earned, c: '#4f9d69' },
+              { label: 'Owed to tenants', v: totals.owed, c: '#c9635b' },
+              { label: 'Spread to GAM', v: totals.spread, c: 'var(--gold)' },
+            ].map((k) => (
+              <div key={k.label} className="card" style={{ padding: 16 }}>
+                <div style={{ fontSize: '.62rem', color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.12em' }}>{k.label}</div>
+                <div style={{ fontFamily: 'var(--font-d)', fontSize: '1.5rem', fontWeight: 800, color: k.c, marginTop: 6 }}>
+                  {formatCurrency(k.v)}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="card" style={{ marginTop: 16, padding: 0 }}>
+            {loadingSpread ? (
+              <div style={{ padding: 20, color: 'var(--t3)', fontSize: '.82rem' }}>Loading…</div>
+            ) : months.length === 0 ? (
+              <div style={{ padding: 20, color: 'var(--t3)', fontSize: '.82rem' }}>
+                No accruals yet — the monthly job writes a row for every held deposit, including the
+                ones with no statutory obligation.
+              </div>
+            ) : (
+              <table className="tbl">
+                <thead><tr>
+                  <th>Month</th><th>Deposits</th><th>Principal</th><th>Earned</th><th>Owed</th><th>Spread</th><th>Market</th>
+                </tr></thead>
+                <tbody>
+                  {months.map((m) => (
+                    <tr key={m.accrualMonth}>
+                      <td className="mono">{String(m.accrualMonth).slice(0, 7)}</td>
+                      <td>{m.deposits}</td>
+                      <td className="mono">{formatCurrency(m.principal)}</td>
+                      <td className="mono" style={{ color: '#4f9d69' }}>{formatCurrency(m.earned)}</td>
+                      <td className="mono" style={{ color: '#c9635b' }}>{formatCurrency(m.owed)}</td>
+                      <td className="mono" style={{ color: m.spread < 0 ? '#c9635b' : 'var(--gold)', fontWeight: 700 }}>
+                        {formatCurrency(m.spread)}
+                      </td>
+                      <td className="mono" style={{ color: 'var(--t3)' }}>{m.marketRatePct == null ? '—' : m.marketRatePct + '%'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {tab === 'catalog' && (
+        <>
+          <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+            <span style={{ fontSize: '.76rem', color: 'var(--t2)' }}>
+              <strong style={{ color: 'var(--t0)' }}>{summary.obligations}</strong> obligations ·{' '}
+              <strong style={{ color: 'var(--t0)' }}>{summary.noObligation}</strong> no obligation (full spread) ·{' '}
+              <strong style={{ color: '#4f9d69' }}>{summary.custodySupported}</strong> custody-supported ·{' '}
+              <strong style={{ color: '#c9635b' }}>{summary.custodyBlocked}</strong> blocked
+            </span>
+            <button className={`btn bsm${onlyObligations ? ' bgold' : ' bd'}`} onClick={() => setOnlyObligations((v) => !v)}>
+              Only states that owe
+            </button>
+          </div>
+          <div className="card" style={{ padding: 0 }}>
+            {loadingCatalog ? (
+              <div style={{ padding: 20, color: 'var(--t3)', fontSize: '.82rem' }}>Loading…</div>
+            ) : (
+              <table className="tbl">
+                <thead><tr>
+                  <th>State</th><th>Basis</th><th>Rate</th><th>Unit types</th><th>Gates</th><th>Custody</th><th>Statute</th>
+                </tr></thead>
+                <tbody>
+                  {shown.map((s, i) => {
+                    const gates = [
+                      s.minTenureMonths ? `${s.minTenureMonths}mo tenure` : null,
+                      s.minPropertyUnits ? `${s.minPropertyUnits}+ units` : null,
+                      s.thresholdRule === 'excess_only' ? 'excess only' : null,
+                      s.thresholdRule === 'trigger' ? 'whole deposit above threshold' : null,
+                    ].filter(Boolean).join(' · ')
+                    const noObligation = !s.rateBasis || s.rateBasis === 'none'
+                    return (
+                      <tr key={s.stateCode + i}>
+                        <td className="mono" style={{ fontWeight: 700 }}>{s.stateCode}</td>
+                        <td style={{ fontSize: '.76rem', color: noObligation ? '#4f9d69' : 'var(--t1)' }}>
+                          {noObligation ? 'no obligation' : humanizeBasis(s.rateBasis)}
+                        </td>
+                        <td className="mono" style={{ fontSize: '.76rem' }}>
+                          {s.needsIndexValue
+                            ? <span style={{ color: '#e0a23a' }}>index needed</span>
+                            : rateCell(s)}
+                        </td>
+                        <td style={{ fontSize: '.72rem', color: 'var(--t3)' }}>
+                          {(s.unitTypes || []).length ? s.unitTypes.join(', ') : 'all'}
+                        </td>
+                        <td style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{gates || '—'}</td>
+                        <td style={{ fontSize: '.74rem' }}>
+                          <span style={{ color: s.custodyStatus === 'supported' ? '#4f9d69' : s.custodyStatus === 'blocked' ? '#c9635b' : '#e0a23a' }}>
+                            {s.custodyStatus}
+                          </span>
+                          {s.qualifiesWithSegregatedAccount && s.custodyStatus !== 'supported' &&
+                            <span style={{ color: 'var(--t3)', fontSize: '.68rem' }}> · pocket a/c would fix</span>}
+                        </td>
+                        <td style={{ fontSize: '.68rem', color: 'var(--t3)', maxWidth: 220 }}>{s.statuteCitation || s.custodyCitation || '—'}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// The meaningful number depends on the BASIS, and several states carry more
+// than one. Florida § 83.49 is the clearest case: it stores annual_rate_pct 5
+// AND actual_share_pct 75, because the landlord may pay either 5% simple
+// interest OR 75% of what was actually earned — showing only the 5% would
+// misstate the rule. NY/PA store their 1% admin retention separately, and
+// reading annual_rate_pct alone (0) would render "actual earned" and silently
+// drop the retention.
+function rateCell(s: any): string {
+  const pct = (n: any) => `${Number(n)}%`
+  switch (s.rateBasis) {
+    case 'fixed':            return pct(s.annualRatePct)
+    case 'lesser_of_actual': return `${pct(s.annualRatePct)} or actual, whichever is less`
+    case 'share_of_actual':  return s.annualRatePct > 0
+      ? `${pct(s.annualRatePct)} flat, or ${pct(s.actualSharePct)} of actual`
+      : `${pct(s.actualSharePct)} of actual`
+    case 'actual_minus_admin': return `actual − ${pct(s.adminRetentionPct)} admin`
+    case 'actual_earned':      return 'actual earned'
+    case 'index_linked':       return s.annualRatePct > 0 ? pct(s.annualRatePct) : 'index needed'
+    default:                   return '—'
+  }
+}
+
+function humanizeBasis(b: string): string {
+  const M: Record<string, string> = {
+    fixed: 'fixed rate',
+    lesser_of_actual: 'lesser of rate/actual',
+    share_of_actual: 'share of actual',
+    actual_earned: 'actual earned',
+    actual_minus_admin: 'actual minus admin',
+    index_linked: 'index-linked',
+    none: 'no obligation',
+  }
+  return M[b] || b
 }
 
 function DepositPortability() {

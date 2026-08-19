@@ -6,14 +6,37 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 
 interface Props { onClose: () => void }
 
-const STEPS = ['Tenant Info', 'Unit Assignment', 'Confirm']
+const STEPS = ['Residents', 'Unit Assignment', 'Confirm']
+
+const lbl: React.CSSProperties = {
+  fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)',
+  textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5,
+}
+const errStyle: React.CSSProperties = { color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }
 
 export function InviteTenantModal({ onClose }: Props) {
   const qc = useQueryClient()
   const [step, setStep] = useState(0)
-  const [form, setForm] = useState({ email: '', firstName: '', lastName: '', phone: '', unitId: '' })
+  // S605 (Nic): "have it say add resident and then have you able to put in
+  // multiple people on the same form, multiple names and phone numbers, and just
+  // select the one unit if they live together."
+  //
+  // A household — spouses, roommates — is ONE tenancy in one unit, and every
+  // adult on it gets a FULL account. Nic: "everybody needs to see the full
+  // details of what they are part of," the same rule as co-ownership. Inviting
+  // them one at a time gave no way to say they belong together and left the
+  // second person a stranger to the first person's lease.
+  //
+  // The FIRST resident is the primary; the rest are co-tenants. Liability is
+  // joint-and-several (the lease_tenants default), which is the other reason
+  // everyone needs their own login — a spouse who cannot sign in to pay rent
+  // becomes the landlord's support problem.
+  type Resident = { firstName: string; lastName: string; email: string; phone: string }
+  const blankResident = (): Resident => ({ firstName: '', lastName: '', email: '', phone: '' })
+  const [residents, setResidents] = useState<Resident[]>([blankResident()])
+  const [form, setForm] = useState({ unitId: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string; screened: boolean } | null>(null)
+  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string; screened: boolean; sent?: { email: string; acceptUrl: string }[]; draft?: { drafted: boolean; reason?: string } | null } | null>(null)
   const [copied, setCopied] = useState(false)
   // S579: a person invited to a vacant unit is a NEW applicant by default — they
   // create an account + complete a background check before a unit is assigned
@@ -25,13 +48,41 @@ export function InviteTenantModal({ onClose }: Props) {
   )
 
   const inviteMut = useMutation(
-    (data: any) => apiPost('/tenants/invite', data),
+    async (payloads: any[]) => {
+      const out: any[] = []
+      for (const [i, payload] of payloads.entries()) {
+        try {
+          const res: any = await apiPost('/tenants/invite', payload)
+          out.push({ email: payload.email, acceptUrl: res.data.acceptUrl })
+        } catch (e: any) {
+          const msg = e?.response?.data?.error || e?.message || 'Invite failed'
+          // Name WHICH resident failed — "invite failed" on a four-person
+          // household tells the landlord nothing about what to fix.
+          throw new Error(`${payload.email}: ${msg}${i > 0 ? ` (${i} invite${i > 1 ? 's' : ''} already sent)` : ''}`)
+        }
+      }
+      return out
+    },
     {
-      onSuccess: (res: any) => {
+      onSuccess: async (out: any[]) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
-        setInviteResult({ acceptUrl: res.data.acceptUrl, email: res.data.email, screened: requireScreening })
-      }
+        // S605: draft the lease for the whole household off the unit type's
+        // default template. Best-effort — the invites already went out, so a
+        // landlord who hasn't set a template yet is TOLD, not failed.
+        let draft: { drafted: boolean; reason?: string } | null = null
+        if (form.unitId) {
+          try {
+            const r: any = await apiPost('/esign/draft-household', {
+              unitId: form.unitId, emails: out.map(o => o.email),
+            })
+            draft = r?.data ?? r
+          } catch { draft = null }
+        }
+        setInviteResult({ acceptUrl: out[0].acceptUrl, email: out[0].email,
+          screened: requireScreening, sent: out, draft })
+      },
+      onError: (e: any) => setErrors(er => ({ ...er, submit: e?.message || 'Could not send the invites' })),
     }
   )
 
@@ -39,15 +90,29 @@ export function InviteTenantModal({ onClose }: Props) {
     setForm(f => ({ ...f, [key]: val }))
     setErrors(e => ({ ...e, [key]: '' }))
   }
+  const setResident = (i: number, key: keyof Resident, val: string) => {
+    setResidents(rs => rs.map((r, idx) => idx === i ? { ...r, [key]: val } : r))
+    setErrors(e => ({ ...e, [`r${i}_${key}`]: '' }))
+  }
+  const addResident = () => setResidents(rs => [...rs, blankResident()])
+  const removeResident = (i: number) => setResidents(rs => rs.filter((_, idx) => idx !== i))
 
   const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
 
   const validateStep = () => {
     const errs: Record<string, string> = {}
     if (step === 0) {
-      if (!form.email.trim()) errs.email = 'Email required'
-      else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) errs.email = 'Invalid email'
-      if (!form.firstName.trim()) errs.firstName = 'First name required'
+      const seen = new Set<string>()
+      residents.forEach((r, i) => {
+        if (!r.firstName.trim()) errs[`r${i}_firstName`] = 'First name required'
+        const email = r.email.trim().toLowerCase()
+        if (!email) errs[`r${i}_email`] = 'Email required'
+        else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errs[`r${i}_email`] = 'Invalid email'
+        // Two residents sharing an address would collide into one account and
+        // silently drop a signer off the lease.
+        else if (seen.has(email)) errs[`r${i}_email`] = 'Already used by another resident'
+        else seen.add(email)
+      })
     }
     if (step === 1 && !form.unitId) errs.unitId = 'Select a unit'
     setErrors(errs)
@@ -58,17 +123,24 @@ export function InviteTenantModal({ onClose }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
-    const base = {
-      email: form.email.trim(),
-      firstName: form.firstName.trim(),
-      lastName: form.lastName.trim(),
-      phone: form.phone.trim() || undefined,
-    }
-    // S579: screening → property-level invite (they screen, unit assigned later
-    // at lease). Otherwise the legacy unit-bound invite.
-    inviteMut.mutate(requireScreening && selectedUnit?.propertyId
-      ? { ...base, propertyId: selectedUnit.propertyId }
-      : { ...base, unitId: form.unitId })
+    // Sequential, not parallel: they hit the same unit and the same landlord
+    // scope, and a partially-applied household is worse than a slow one — the
+    // caller sees exactly which resident failed.
+    inviteMut.mutate(residents.map((r, i) => {
+      const base = {
+        email: r.email.trim(),
+        firstName: r.firstName.trim(),
+        lastName: r.lastName.trim(),
+        phone: r.phone.trim() || undefined,
+        // First listed holds the lease; the rest ride as co-tenants.
+        householdRole: i === 0 ? 'primary' : 'co_tenant',
+      }
+      // S579: screening → property-level invite (they screen, unit assigned
+      // later at lease). Otherwise the unit-bound invite.
+      return requireScreening && selectedUnit?.propertyId
+        ? { ...base, propertyId: selectedUnit.propertyId }
+        : { ...base, unitId: form.unitId }
+    }))
   }
 
   const copyLink = () => {
@@ -153,33 +225,63 @@ export function InviteTenantModal({ onClose }: Props) {
         {step === 0 && (
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 16 }}>
-              Enter the tenant's contact information. They'll receive an invite to set up their account.
+              Everyone living in the unit. The first person listed holds the lease; anyone
+              you add is a co-tenant on the same lease. <strong style={{ color: 'var(--text-0)' }}>Each
+              of them gets their own login</strong> and sees the full tenancy — lease, balance and payments.
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
-              <div>
-                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>First Name *</label>
-                <input className="input" placeholder="Jane" value={form.firstName} onChange={e => set('firstName', e.target.value)} autoFocus style={{ width: '100%' }} />
-                {errors.firstName && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.firstName}</div>}
-              </div>
-              <div>
-                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Last Name</label>
-                <input className="input" placeholder="Smith" value={form.lastName} onChange={e => set('lastName', e.target.value)} style={{ width: '100%' }} />
-              </div>
-            </div>
+            {residents.map((r, i) => (
+              <div key={i} style={{ border: '1px solid var(--border-0)', borderRadius: 10,
+                padding: 14, marginBottom: 12, background: i === 0 ? 'rgba(201,162,39,.04)' : 'var(--bg-2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
+                  <span style={{ fontSize: '.72rem', fontWeight: 700, textTransform: 'uppercase',
+                    letterSpacing: '.06em', color: i === 0 ? 'var(--gold)' : 'var(--text-3)' }}>
+                    {i === 0 ? 'Primary resident' : `Co-resident ${i + 1}`}
+                  </span>
+                  {i > 0 && (
+                    <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
+                      onClick={() => removeResident(i)}>Remove</button>
+                  )}
+                </div>
 
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Email Address *</label>
-              <div style={{ position: 'relative' }}>
-                <Mail size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
-                <input className="input" type="email" placeholder="jane@example.com" value={form.email} onChange={e => set('email', e.target.value)} style={{ width: '100%', paddingLeft: 32 }} />
-              </div>
-              {errors.email && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.email}</div>}
-            </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+                  <div>
+                    <label style={lbl}>First Name *</label>
+                    <input className="input" placeholder="Jane" value={r.firstName} autoFocus={i === 0}
+                      onChange={e => setResident(i, 'firstName', e.target.value)} style={{ width: '100%' }} />
+                    {errors[`r${i}_firstName`] && <div style={errStyle}>{errors[`r${i}_firstName`]}</div>}
+                  </div>
+                  <div>
+                    <label style={lbl}>Last Name</label>
+                    <input className="input" placeholder="Smith" value={r.lastName}
+                      onChange={e => setResident(i, 'lastName', e.target.value)} style={{ width: '100%' }} />
+                  </div>
+                </div>
 
-            <div style={{ marginBottom: 4 }}>
-              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Phone <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional)</span></label>
-              <input className="input" type="tel" placeholder="(555) 000-0000" value={form.phone} onChange={e => set('phone', e.target.value)} style={{ width: '100%' }} />
+                <div style={{ marginBottom: 10 }}>
+                  <label style={lbl}>Email Address *</label>
+                  <div style={{ position: 'relative' }}>
+                    <Mail size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
+                    <input className="input" type="email" placeholder="jane@example.com" value={r.email}
+                      onChange={e => setResident(i, 'email', e.target.value)} style={{ width: '100%', paddingLeft: 32 }} />
+                  </div>
+                  {errors[`r${i}_email`] && <div style={errStyle}>{errors[`r${i}_email`]}</div>}
+                </div>
+
+                <div>
+                  <label style={lbl}>Phone <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional)</span></label>
+                  <input className="input" type="tel" placeholder="(555) 000-0000" value={r.phone}
+                    onChange={e => setResident(i, 'phone', e.target.value)} style={{ width: '100%' }} />
+                </div>
+              </div>
+            ))}
+
+            <button type="button" className="btn btn-ghost btn-sm" onClick={addResident}>
+              + Add resident
+            </button>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+              Add a spouse, partner or roommate who lives in the same unit. They all sign the
+              same lease and are jointly responsible for the rent.
             </div>
           </div>
         )}
@@ -188,7 +290,10 @@ export function InviteTenantModal({ onClose }: Props) {
         {step === 1 && (
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 16 }}>
-              Assign <strong style={{ color: 'var(--text-0)' }}>{form.firstName}</strong> to a vacant unit.
+              Assign {residents.length > 1
+                ? <strong style={{ color: 'var(--text-0)' }}>{residents.length} residents</strong>
+                : <strong style={{ color: 'var(--text-0)' }}>{residents[0].firstName}</strong>} to a vacant unit.
+              {residents.length > 1 && ' They share one lease on it.'}
             </div>
 
             {(units as any[]).length === 0 ? (
@@ -262,11 +367,15 @@ export function InviteTenantModal({ onClose }: Props) {
               {/* Tenant */}
               <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)', display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{ width: 36, height: 36, borderRadius: '50%', background: 'linear-gradient(135deg, var(--gold-dark), var(--gold))', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', fontSize: '.8rem', fontWeight: 800, color: 'var(--bg-0)', flexShrink: 0 }}>
-                  {form.firstName[0]}{form.lastName?.[0] || ''}
+                  {residents[0].firstName[0]}{residents[0].lastName?.[0] || ''}
                 </div>
                 <div>
-                  <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>{form.firstName} {form.lastName}</div>
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{form.email}</div>
+                  <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
+                    {residents.map(r => [r.firstName, r.lastName].filter(Boolean).join(' ')).join(' · ')}
+                  </div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+                    {residents.map(r => r.email).join(', ')}
+                  </div>
                 </div>
                 <span className="badge badge-amber" style={{ marginLeft: 'auto' }}>Invite Pending</span>
               </div>
@@ -300,7 +409,10 @@ export function InviteTenantModal({ onClose }: Props) {
 
             {inviteMut.isError && (
               <div style={{ color: 'var(--red)', fontSize: '.75rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-                Failed to send invite. The tenant may already be assigned to a unit.
+                {/* S605: names the resident that failed and how many already
+                    went out — a household invite that dies halfway is otherwise
+                    impossible to reason about. */}
+                {errors.submit || 'Failed to send invite. The tenant may already be assigned to a unit.'}
               </div>
             )}
           </div>
@@ -319,7 +431,8 @@ export function InviteTenantModal({ onClose }: Props) {
             </button>
           ) : (
             <button className="btn btn-primary" onClick={submit} disabled={inviteMut.isLoading}>
-              {inviteMut.isLoading ? <span className="spinner" /> : <><Mail size={14} /> Send Invite</>}
+              {inviteMut.isLoading ? <span className="spinner" />
+                : <><Mail size={14} /> Send {residents.length > 1 ? `${residents.length} invites` : 'invite'}</>}
             </button>
           )}
         </div>

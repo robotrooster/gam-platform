@@ -4,6 +4,7 @@ import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
+import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
@@ -67,22 +68,6 @@ export function moveInRentAmount(rentAmount: number, startDate: string): number 
   return roundHalfEvenCents(rentAmount * daysRemaining / dim)
 }
 
-async function allocateInvoiceNumber(
-  client: PoolClient,
-  landlordId: string,
-  year: number
-): Promise<string> {
-  const r = await client.query(
-    `INSERT INTO invoice_sequences (landlord_id, year, next_number)
-     VALUES ($1, $2, 2)
-     ON CONFLICT (landlord_id, year)
-     DO UPDATE SET next_number = invoice_sequences.next_number + 1
-     RETURNING next_number`,
-    [landlordId, year]
-  )
-  const nextAfter = r.rows[0].next_number as number
-  return formatInvoiceNumber(year, nextAfter - 1)
-}
 
 export async function generateMoveInInvoice(
   inputs: MoveInInputs,

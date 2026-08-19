@@ -2,8 +2,8 @@
 
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
-Effective Date: [DATE OF PUBLIC LAUNCH]
-Last Updated: [DATE]
+Effective Date: August 10, 2026
+Last Updated: August 10, 2026
 
 ---
 
@@ -45,10 +45,10 @@ We collect personal information from three sources: (a) directly from you when y
 
 **FlexSuite enrollment information** (when you enroll in a FlexSuite product). The data GAM collects differs by product based on whether GAM, the Landlord, or a third-party lender is the creditor — see Consumer Terms of Service § 9 for the structure of each product.
 
-- **FlexDeposit** (Service-Level Agreement; not credit): your FlexDeposit Service-Level Agreement with GAM; the schedule of service-fee installments; ACH-pull authorization for the scheduled installments; payment history under the SLA, used by GAM internally for service-tier decisions only and **not furnished to any consumer reporting agency**. FlexDeposit eligibility is determined from your existing Platform account data (e.g., your tenancy record, payment history on the Platform, and active-lease status). FlexDeposit eligibility is not a credit decision and does not involve any consumer report obtained from a third-party consumer reporting agency.
-- **FlexPay** (payment-date scheduling subscription; no credit extension): the Scheduled Pull Date you select (a calendar day from the 1st through the 28th); the calculated monthly subscription fee under the date-based formula in Consumer ToS § 9.2; the payment-date schedule you choose for your rent and other recurring charges; ACH-pull authorization for the FlexPay monthly subscription fee; subscription billing history. GAM does not advance any funds on your behalf for FlexPay; no payment-performance data is furnished to any consumer reporting agency from FlexPay.
+- **FlexDeposit** (deposit custody; not credit): your FlexDeposit Custody Agreement with GAM; the schedule of custody installments by which you fund your own security deposit; ACH-pull authorization for those installments; and your installment payment history, used by GAM internally for service-tier decisions only and **not furnished to any consumer reporting agency**. FlexDeposit eligibility is determined from your existing Platform account data (e.g., your tenancy record, payment history on the Platform, and active-lease status) and your verified income; it is not a credit decision and does not involve any consumer report obtained from a third-party consumer reporting agency.
+- **FlexPay** (payment-date scheduling subscription; no credit extension): the Scheduled Pull Date you select (a calendar day from the 1st through the 28th); the flat monthly subscription fee described in Consumer ToS § 9.2; the payment-date schedule you choose for your rent and other recurring charges; ACH-pull authorization for the FlexPay monthly subscription fee; subscription billing history. GAM does not advance any funds on your behalf for FlexPay; no payment-performance data is furnished to any consumer reporting agency from FlexPay.
 - **FlexCharge** (Business Account Owner is the creditor; GAM provides accounting): the FlexCharge Business Account Agreement signed between you and the Business Account Owner (your Landlord, or a separate POS operator) at the specific Location where FlexCharge is enabled; transaction history (each charge posted by the Business Account Owner and each payment you make against the balance); the running balance; payment-receipt records. **GAM does not collect or process credit-underwriting data for FlexCharge** — the credit decision and the credit-limit setting are made by the Business Account Owner, and any underwriting-related data is held by the Business Account Owner, not by GAM.
-- **FlexCredit** (third-party FlexCredit Lender is the creditor; GAM is a referral partner): the application you submit, which GAM passes to the FlexCredit Lender; the FlexCredit Lender's decision; the resulting payment-flow integration into your tenant account (e.g., scheduled deductions to repay the FlexCredit Lender, if applicable). **GAM does not perform credit underwriting on FlexCredit applications** — the FlexCredit Lender makes the credit decision and holds the substantive underwriting data. The FlexCredit Lender's privacy policy governs the FlexCredit Lender's separate processing of your information; it is disclosed to you at the time of FlexCredit enrollment.
+- **FlexCredit** (rent-payment credit reporting; not a loan): your opt-in and opt-out choices, and the positive (on-time) rent-payment data GAM reports on your behalf to consumer reporting agencies through a third-party registered furnisher. **GAM does not lend you money, does not advance funds, and makes no credit decision about you** — FlexCredit reports rent you already pay so it can count toward your credit history. The furnisher's identity and its own privacy practices are disclosed to you at the time of FlexCredit enrollment.
 
 **Communications**: in-platform messages with your Landlord, your Property Manager, GAM support, and where applicable PM Company staff; support emails sent to `support@goldassetmanagement.com`; survey responses; notification preferences; comments on inspections, entry requests, and maintenance tickets.
 
@@ -74,17 +74,16 @@ We collect personal information from three sources: (a) directly from you when y
 
 **Payment processor data**: Stripe returns transaction status, ACH return notifications, and chargeback notifications.
 
-**FlexSuite credit-history data** (if applicable to a specific FlexSuite product at enrollment time): consumer credit information from the credit-reporting partner identified in the product-specific disclosures, where the underwriting of the product requires it.
-
 ## 3. How We Use Your Information
 
 We use personal information for the following purposes:
 
 - **To provide the Platform's tenant features**: enable account creation; authenticate sessions; deliver your lease document; collect rent and other charges; surface payment receipts; deliver maintenance and inspection workflows; render your tenant dashboard.
-- **To process payments**: route your rent payment through Stripe to your Landlord's Connect balance; calculate any pass-through processing fees; charge FlexSuite subscription fees where you have enrolled; reconcile any chargebacks or ACH returns.
+- **To process payments**: process your rent payment through Stripe and disburse your Landlord's share to your Landlord; calculate any pass-through processing fees; charge FlexSuite subscription or installment fees where you have enrolled; reconcile any chargebacks or ACH returns.
 - **To verify your identity for regulated features**: complete KYC verification via Stripe Identity where required; verify bank account ownership via Plaid or Stripe Financial Connections; comply with anti-money-laundering and sanctions-screening requirements.
 - **To run tenant screening you have authorized**: order a consumer report from the screening provider with your FCRA-compliant authorization; deliver an adverse-action notice on your Landlord's behalf if the application is declined based in whole or in part on the report.
-- **To facilitate your enrollment in FlexSuite products**: deliver the product-specific disclosures; verify eligibility; process repayments or subscription fees per the product-specific terms.
+- **To facilitate your enrollment in FlexSuite products**: deliver the product-specific disclosures; verify eligibility; process installments or subscription fees per the product-specific terms.
+- **To operate automated and AI-assisted features**: GAM uses automated systems and AI-assisted agents — hosted on GAM's own infrastructure and not shared with any third-party AI provider — to answer your questions, help you complete tasks, generate documents and notices for review, and perform routine platform actions. These systems process your account, lease, and payment information to do so, and they do not make legally significant decisions about you without a person's involvement.
 - **To communicate with you**: send transactional emails (registration confirmation, password reset, rent receipts, payment-failure notifications, maintenance updates, dispute responses, FlexSuite enrollment confirmations); respond to support inquiries.
 - **To detect and prevent fraud, abuse, and security incidents**: review login patterns; rate-limit authentication attempts; investigate disputes; respond to security alerts.
 - **To improve the Platform**: analyze aggregate usage patterns; debug errors via Sentry; refine product features.
@@ -118,7 +117,7 @@ We share personal information with third-party service providers who process it 
 - **Plaid Inc.** — bank account verification for ACH onboarding (in some regions and use cases).
 - **The screening provider** identified at the time you authorize tenant screening (Checkr, when active). The screening provider is engaged solely for the Landlord-initiated rental-application screening described in Section 2.1 above. The screening provider has no role in any other Platform feature.
 - **The collections partner** that your Landlord may engage for landlord-owed unpaid rent, as disclosed at the time the partner is engaged. The collections partner pursues unpaid rent under the Fair Debt Collection Practices Act and applicable state debt-collection law. The collections partner has no role in any other Platform feature.
-- **The FlexCredit Lender**, identified at the time you apply for FlexCredit. The FlexCredit Lender is the creditor on FlexCredit (not GAM, not your Landlord); GAM transmits your application data to the FlexCredit Lender and receives the FlexCredit Lender's decision back. The FlexCredit Lender's own privacy policy governs how the FlexCredit Lender processes your information separately from this Privacy Policy.
+- **The FlexCredit furnisher**, identified at the time you opt in to FlexCredit. The furnisher is a third-party registered furnisher that reports your positive (on-time) rent payments to consumer reporting agencies on your behalf; GAM transmits the reportable payment data to the furnisher. The furnisher's own privacy policy governs how it processes your information separately from this Privacy Policy.
 - **Functional Software, Inc. d/b/a Sentry** — application error tracking.
 - The hosting and database provider that hosts the Platform's infrastructure.
 

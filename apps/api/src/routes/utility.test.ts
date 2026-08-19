@@ -28,6 +28,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import { camelCaseKeys } from '../lib/caseConversion'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
@@ -645,5 +646,213 @@ describe('POST /bills/:id/pay (deprecated)', () => {
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(410)
     expect(res.body.error).toContain(p.rows[0].id)
+  })
+})
+
+// ─── S604: same-utility double-billing guard ───────────────────────────────
+describe('POST /meters/:id/units — same-utility overlap', () => {
+  const attach = (mid: string, f: Fixture, unitId: string) =>
+    request(buildApp()).post(`/api/utility/meters/${mid}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitId })
+
+  const mkMeter = async (propertyId: string, utilityType: string,
+                         billingMethod: 'submeter' | 'rubs', label: string) => {
+    const c = await db.connect()
+    try {
+      const { rows } = await c.query(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method,
+                                     rate_per_unit, rubs_allocation_method)
+         VALUES ($1,$2,$3,$4, 0.01, $5) RETURNING id`,
+        [propertyId, utilityType, label, billingMethod,
+         billingMethod === 'rubs' ? 'equal_split' : null])
+      return rows[0].id as string
+    } finally { c.release() }
+  }
+
+  it('blocks a unit being attached to TWO water masters (double billing)', async () => {
+    const f = await seed()
+    const m1 = await mkMeter(f.propertyAId, 'water', 'rubs', 'Master A')
+    const m2 = await mkMeter(f.propertyAId, 'water', 'rubs', 'Master B')
+    expect((await attach(m1, f, f.unitAId)).status).toBe(201)
+    const b = await attach(m2, f, f.unitAId)
+    expect(b.status).toBe(400)
+    expect(b.body.error).toMatch(/already on "Master A"/i)
+  })
+
+  it('ALLOWS submeter + RUBS master on the same utility (S558 metered exclusion)', async () => {
+    // Oak Park's shape: mobile homes submetered for water AND in the shared
+    // master's group so their usage is subtracted before the RUBS split.
+    const f = await seed()
+    const master = await mkMeter(f.propertyAId, 'water', 'rubs', 'Shared Master')
+    const sub    = await mkMeter(f.propertyAId, 'water', 'submeter', 'MH 01 submeter')
+    expect((await attach(master, f, f.unitAId)).status).toBe(201)
+    expect((await attach(sub, f, f.unitAId)).status).toBe(201)
+  })
+
+  it('does not block a DIFFERENT utility on the same unit', async () => {
+    const f = await seed()
+    const w = await mkMeter(f.propertyAId, 'water', 'rubs', 'W')
+    const e = await mkMeter(f.propertyAId, 'electric', 'rubs', 'E')
+    expect((await attach(w, f, f.unitAId)).status).toBe(201)
+    expect((await attach(e, f, f.unitAId)).status).toBe(201)
+  })
+})
+
+
+// ── S605: opening reads (baselines) ─────────────────────────────────────────
+// Nic: a submeter with only one reading bills NOTHING and says nothing, so a
+// landlord who enters just the end-of-month read loses that cycle with no
+// warning. These lock in that a baseline can be captured, is reported when
+// missing, and actually unblocks the first bill.
+describe('S605 meter baselines', () => {
+  it('POST /meters captures an opening read with the meter', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'Site 1', billingMethod: 'submeter',
+              ratePerUnit: 0.01, baselineReading: 1200, baselineDate: '2026-08-01' })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(
+      `SELECT reading_value, reason FROM utility_meter_readings WHERE meter_id = $1`, [res.body.data.id])
+    expect(rows).toHaveLength(1)
+    expect(Number(rows[0].reading_value)).toBe(1200)
+    // Must NOT be a cycle read — that slot belongs to the real monthly read.
+    expect(rows[0].reason).toBe('baseline')
+  })
+
+  it('an opening read without a date is refused', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'Site 2', billingMethod: 'submeter',
+              ratePerUnit: 0.01, baselineReading: 1200 })
+    expect(res.status).toBe(400)
+  })
+
+  it('GET /meters reports hasBaseline=false for a submeter with no reads', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'No baseline', billingMethod: 'submeter', ratePerUnit: 0.01 })
+    const res = await request(buildApp()).get(`/api/utility/meters?propertyId=${propertyId}`)
+      .set('Authorization', `Bearer ${token}`)
+    // buildApp() skips the camelize layer that index.ts applies in production,
+    // so camelize here to assert the shape the frontend actually reads.
+    const m = (camelCaseKeys(res.body.data) as any[]).find(x => x.label === 'No baseline')
+    expect(m.hasBaseline).toBe(false)
+  })
+
+  // RUBS/master allocate off the property invoice and never read an odometer,
+  // so flagging them would be noise the landlord learns to ignore.
+  it('a RUBS meter is never flagged as missing a baseline', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'RUBS master', billingMethod: 'rubs',
+              rubsAllocationMethod: 'equal_split', ratePerUnit: 0.01 })
+    const res = await request(buildApp()).get(`/api/utility/meters?propertyId=${propertyId}`)
+      .set('Authorization', `Bearer ${token}`)
+    const m = (camelCaseKeys(res.body.data) as any[]).find(x => x.label === 'RUBS master')
+    expect(m.hasBaseline).toBe(true)
+  })
+
+  it('a backdated baseline can be added to an existing meter, and clears the flag', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    const created = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'Late baseline', billingMethod: 'submeter', ratePerUnit: 0.01 })
+    const meterId = created.body.data.id
+    const add = await request(buildApp()).post(`/api/utility/meters/${meterId}/readings`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ readingValue: 900, readingDate: '2026-07-31', billingCycleMonth: '2026-07-01', reason: 'baseline' })
+    expect(add.status).toBe(201)
+    expect(add.body.data.reason).toBe('baseline')
+    const res = await request(buildApp()).get(`/api/utility/meters?propertyId=${propertyId}`)
+      .set('Authorization', `Bearer ${token}`)
+    const m = (camelCaseKeys(res.body.data) as any[]).find(x => x.label === 'Late baseline')
+    expect(m.hasBaseline).toBe(true)
+  })
+
+  // A client must not be able to claim any reason it likes on this route —
+  // 'monthly_cycle' is stamped by the system and is the read that gets billed.
+  it('refuses a caller-supplied reason other than baseline', async () => {
+    const f = await seed(); const propertyId = f.propertyAId, token = f.tokenA
+    const created = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, utilityType: 'water', label: 'Forge', billingMethod: 'submeter', ratePerUnit: 0.01 })
+    const res = await request(buildApp()).post(`/api/utility/meters/${created.body.data.id}/readings`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ readingValue: 5, readingDate: '2026-08-01', billingCycleMonth: '2026-08-01', reason: 'meter_replaced' })
+    expect(res.status).toBe(400)
+  })
+})
+
+
+// ── S605: atomic meter creation (Nic hit this on Oak Park) ──────────────────
+// Creating a meter and assigning it to a unit were two client calls. When the
+// assignment was refused the meter had ALREADY been created and stayed behind —
+// three failed attempts left three orphaned meters with no unit.
+describe('S605 meter + unit assignment is atomic', () => {
+  it('creates and assigns in one call', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(
+      `SELECT unit_id FROM utility_meter_units WHERE meter_id = $1`, [res.body.data.id])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(f.unitAId)
+  })
+
+  it('a refused assignment leaves NO meter behind', async () => {
+    const f = await seed()
+    // First electric submeter on the unit — fine.
+    await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+
+    const { rows: before } = await db.query<any>(
+      `SELECT id FROM utility_meters WHERE property_id = $1`, [f.propertyAId])
+
+    // Second electric submeter on the SAME unit — must be refused...
+    const dup = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+    expect(dup.status).toBe(400)
+
+    // ...and must not have created anything. This is the orphan regression.
+    const { rows: after } = await db.query<any>(
+      `SELECT id FROM utility_meters WHERE property_id = $1`, [f.propertyAId])
+    expect(after).toHaveLength(before.length)
+  })
+
+  it('a different utility on the same unit is allowed', async () => {
+    const f = await seed()
+    await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'electric', label: 'RV 03 electric',
+              billingMethod: 'submeter', ratePerUnit: 0.14, assignUnitId: f.unitAId })
+    // Exactly what Nic was trying to do: add water to a unit that has electric.
+    const water = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'RV 03 water',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitAId })
+    expect(water.status).toBe(201)
+  })
+
+  it('refuses a unit belonging to another landlord', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, utilityType: 'water', label: 'X',
+              billingMethod: 'submeter', ratePerUnit: 0.01, assignUnitId: f.unitBId })
+    expect(res.status).toBe(404)
+    const { rows } = await db.query<any>(
+      `SELECT id FROM utility_meters WHERE label = 'X'`)
+    expect(rows).toHaveLength(0)   // and nothing created
   })
 })

@@ -6,19 +6,47 @@ import { useAuth } from '../context/AuthContext'
 import {
   Check, Building2, CreditCard, FileText, User,
   ChevronRight, ChevronLeft, AlertTriangle,
-  Landmark, Plus, X
+  Landmark, Plus, X, LayoutGrid
 } from 'lucide-react'
 import {
   ACCOUNT_TYPE_VALUES, ACCOUNT_HOLDER_TYPE_VALUES,
-  AccountType, AccountHolderType,
+  AccountType, AccountHolderType, cardFeeLabel,
+  UNIT_TYPES, UNIT_TYPE_LABEL,
 } from '@gam/shared'
 
 const STEPS = [
   { id: 'profile',    label: 'Business Profile', icon: User,      desc: 'Tell us about yourself and your business' },
   { id: 'property',   label: 'First Property',   icon: Building2, desc: 'Add your first property to the platform' },
-  { id: 'banking',    label: 'Bank Account',      icon: CreditCard,desc: 'Connect your account to receive disbursements' },
+  // S605 (Nic, DIRECTIVE): units come BEFORE either bank step. "It's weird to
+  // ask for bank information when they haven't had a chance to initiate or
+  // immerse themselves into the platform." Asking for bank details from someone
+  // who has entered a name and an address — and seen nothing of their own
+  // portfolio yet — reads like a payment wall, not onboarding. Adding units is
+  // the first moment the platform reflects THEIR property back at them, so the
+  // money questions land after they have something to be paid for.
+  { id: 'units',      label: 'Add Your Units',    icon: LayoutGrid,desc: 'Add the units at this property — you can refine them later' },
+  { id: 'banking',    label: 'Get Paid',          icon: CreditCard,desc: 'Verify your business so rent can reach your bank' },
+  // S605 (Nic, DIRECTIVE): the bank feed is NOT optional. "No landlord is gonna
+  // be able to get their PNLs accurate if they can't reconcile the bank
+  // transactions." Its own step, after the payout account so the two bank
+  // moments read as distinct: money OUT to you, then your spending IN.
+  { id: 'bankfeed',   label: 'Connect Your Bank', icon: Landmark,  desc: 'Link your operating bank so your expenses land in your P&L' },
   { id: 'agreement',  label: 'Sign Agreement',    icon: FileText,  desc: 'Review and sign the platform agreement' },
 ]
+
+// S604 (Nic): EIN and phone accepted anything — "let's lock it so I can't just
+// type in fifty freaking numbers". Format as the landlord types and cap at the
+// real length. EIN is ALWAYS 9 digits (XX-XXXXXXX); US phone is 10.
+function formatEin(raw: string): string {
+  const d = raw.replace(/\D/g, '').slice(0, 9)
+  return d.length > 2 ? `${d.slice(0, 2)}-${d.slice(2)}` : d
+}
+function formatPhone(raw: string): string {
+  const d = raw.replace(/\D/g, '').slice(0, 10)
+  if (d.length <= 3) return d
+  if (d.length <= 6) return `(${d.slice(0, 3)}) ${d.slice(3)}`
+  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
+}
 
 export function OnboardingPage() {
   const navigate = useNavigate()
@@ -46,6 +74,38 @@ export function OnboardingPage() {
   const { data: bankAccounts = [] } = useQuery<any[]>(
     'bank-accounts', () => apiGet('/bank-accounts')
   )
+  // S605: the operating-bank feed. Polls while the landlord is on that step so
+  // the screen flips to "connected" the moment Stripe's window closes.
+  const { data: feedConnections = [], refetch: refetchFeed } = useQuery<any[]>(
+    'onboarding-bank-connections', () => apiGet('/bank-feed/connections'),
+    { refetchInterval: step === 4 ? 4000 : false },
+  )
+  const feedLinked = feedConnections.some((c: any) => c.status === 'active')
+  useEffect(() => { if (feedLinked) setCompleted(prev => new Set([...prev, 3])) }, [feedLinked])
+  const [feedErr, setFeedErr] = useState<string | null>(null)
+  const [feedBusy, setFeedBusy] = useState(false)
+
+  const linkOperatingBank = async () => {
+    setFeedErr(null); setFeedBusy(true)
+    try {
+      // Mirrors BankFeedPage.link() exactly — same endpoints, same shapes.
+      const { loadStripe } = await import('@stripe/stripe-js')
+      const pk = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY
+      if (!pk) throw new Error('Bank linking is not configured (missing Stripe key).')
+      const stripe = await loadStripe(pk)
+      if (!stripe) throw new Error('Stripe failed to load')
+      const { data: session } = await apiPost('/bank-feed/link-session', {})
+      const { clientSecret, sessionId } = session
+      const result = await (stripe as any).collectFinancialConnectionsAccounts({ clientSecret })
+      if (result.error) throw new Error(result.error.message)
+      const accounts = result.financialConnectionsSession?.accounts ?? []
+      if (!accounts.length) { setFeedBusy(false); return }   // user closed the window
+      await apiPost('/bank-feed/finalize', { sessionId })
+      await refetchFeed()
+    } catch (e: any) {
+      setFeedErr(e?.response?.data?.error || e?.message || 'Could not link the bank.')
+    } finally { setFeedBusy(false) }
+  }
   const activeBankAccounts = bankAccounts.filter((a: any) => a.status === 'active')
   const bankReady = activeBankAccounts.length > 0
   useEffect(() => {
@@ -54,13 +114,56 @@ export function OnboardingPage() {
 
   const addPropertyMut = useMutation(
     (data: any) => apiPost('/properties', data),
-    { onSuccess: () => { setCompleted(prev => new Set([...prev, 1])); setStep(2) } }
+    { onSuccess: (r: any) => {
+      // S604: the property IS created server-side, but react-query is still
+      // holding the empty 'properties' list it cached while the landlord was
+      // mid-onboarding. Without this invalidation the Properties page and the
+      // Units page both render "Add your first property" for a landlord who
+      // just added one — the data is on the server, the browser is showing a
+      // stale cache. Units/dashboard are invalidated too since both derive
+      // from the property list.
+      qc.invalidateQueries('properties')
+      qc.invalidateQueries('units')
+      qc.invalidateQueries('dashboard')
+      // S605: the units step needs the id of the property just created.
+      const pid = (r as any)?.data?.data?.id ?? (r as any)?.data?.id ?? null
+      if (pid) setNewPropertyId(pid)
+      setCompleted(prev => new Set([...prev, 1])); setStep(2)
+    } }
+  )
+
+  // ── S605: units step ──────────────────────────────────────────────────────
+  // Deliberately the SHORT form. The full unit editor (subtypes, amp service,
+  // inspection features, per-type late fees) lives on the Units page; forcing
+  // all of it here would trade one friction point for a worse one. This asks
+  // only what can't be inferred — what to call them, what they are, how many,
+  // and the rent — and says plainly that the rest can wait.
+  // Set when the property is created in THIS pass. A landlord who leaves and
+  // comes back has no such id, so fall back to the property they already have —
+  // otherwise resuming onboarding leaves the Add button permanently disabled.
+  const [newPropertyId, setNewPropertyId] = useState<string | null>(null)
+  const { data: existingProps = [] } = useQuery<any[]>('properties', () => apiGet('/properties'), { enabled: step >= 2 })
+  const targetPropertyId = newPropertyId ?? (existingProps as any[])[0]?.id ?? null
+  const [unitDraft, setUnitDraft] = useState({ unitNumber: '', unitType: 'apartment', quantity: 1, rentAmount: '' })
+
+  const { data: existingUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'), { enabled: step >= 2 })
+  const unitCount = (existingUnits as any[]).length
+
+  const addUnitsMut = useMutation(
+    (data: any) => apiPost('/units', data),
+    { onSuccess: () => {
+        qc.invalidateQueries('units'); qc.invalidateQueries('dashboard')
+        setUnitDraft({ unitNumber: '', unitType: 'apartment', quantity: 1, rentAmount: '' })
+      } }
   )
 
   const completeMut = useMutation(
     () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverTenantAch }),
     { onSuccess: async () => {
       await refresh?.()
+      // S604: same reason as addPropertyMut — everything downstream of the
+      // property list is stale by the time onboarding finishes.
+      qc.invalidateQueries()
       navigate('/dashboard')
     }}
   )
@@ -76,7 +179,7 @@ export function OnboardingPage() {
       if (!property.city.trim()) errs.city = 'City required'
       if (!property.zip.trim()) errs.zip = 'ZIP required'
     }
-    if (stepIdx === 3) {
+    if (stepIdx === 4) {
       if (!agreed) errs.agreed = 'You must agree to continue'
       if (!signature.trim()) errs.signature = 'Signature required'
       if (!scrolledAgreement) errs.scroll = 'Please read the full agreement'
@@ -93,11 +196,23 @@ export function OnboardingPage() {
     } else if (step === 1) {
       addPropertyMut.mutate(property)
     } else if (step === 2) {
-      if (bankReady) {
+      // S605 (Nic): units gate the money steps — see the STEPS comment.
+      if (unitCount > 0) {
         setCompleted(prev => new Set([...prev, 2]))
         setStep(3)
       }
     } else if (step === 3) {
+      if (bankReady) {
+        setCompleted(prev => new Set([...prev, 3]))
+        setStep(4)
+      }
+    } else if (step === 4) {
+      // Advances only once a bank is actually linked — see the disabled rule.
+      if (feedLinked) {
+        setCompleted(prev => new Set([...prev, 4]))
+        setStep(5)
+      }
+    } else if (step === 5) {
       completeMut.mutate()
     }
   }
@@ -203,12 +318,14 @@ export function OnboardingPage() {
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>
                     EIN / Tax ID <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional — required for 1099 at tax time)</span>
                   </label>
-                  <input className="input" placeholder="XX-XXXXXXX" value={profile.ein} onChange={e => setProfile(p => ({ ...p, ein: e.target.value }))} style={{ width: '100%' }} />
+                  <input className="input" placeholder="XX-XXXXXXX" inputMode="numeric" value={profile.ein}
+                    onChange={e => setProfile(p => ({ ...p, ein: formatEin(e.target.value) }))} style={{ width: '100%' }} />
                 </div>
 
                 <div style={{ marginBottom: 14 }}>
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Phone Number *</label>
-                  <input className="input" type="tel" placeholder="(555) 000-0000" value={profile.phone} onChange={e => setProfile(p => ({ ...p, phone: e.target.value }))} style={{ width: '100%' }} autoFocus />
+                  <input className="input" type="tel" placeholder="(555) 000-0000" inputMode="numeric" value={profile.phone}
+                    onChange={e => setProfile(p => ({ ...p, phone: formatPhone(e.target.value) }))} style={{ width: '100%' }} autoFocus />
                   {errors.phone && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.phone}</div>}
                 </div>
 
@@ -292,8 +409,78 @@ export function OnboardingPage() {
               </div>
             )}
 
-            {/* ── STEP 2: BANKING ── */}
+            {/* ── STEP 2: UNITS (S605) ── */}
             {step === 2 && (
+              <div>
+                <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 10, padding: '10px 14px', marginBottom: 20, fontSize: '.78rem', color: 'var(--gold)', lineHeight: 1.5 }}>
+                  💡 Add the units at this property. Numbering a block at a time is fine —
+                  add "RV" 1–3, then "Apt" 4–5, and so on. You can rename, re-type, and
+                  set details for any of them later.
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1.4fr .7fr 1fr', gap: 10, marginBottom: 14 }}>
+                  <div>
+                    <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Name / prefix *</label>
+                    <input className="input" placeholder="RV" value={unitDraft.unitNumber}
+                      onChange={e => setUnitDraft(u => ({ ...u, unitNumber: e.target.value }))} style={{ width: '100%' }} autoFocus />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Type *</label>
+                    <select className="input" value={unitDraft.unitType}
+                      onChange={e => setUnitDraft(u => ({ ...u, unitType: e.target.value }))} style={{ width: '100%' }}>
+                      {UNIT_TYPES.map(t => <option key={t} value={t}>{UNIT_TYPE_LABEL[t]}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>How many *</label>
+                    <input className="input" type="number" min={1} max={200} value={unitDraft.quantity}
+                      onChange={e => setUnitDraft(u => ({ ...u, quantity: Math.max(1, Number(e.target.value) || 1) }))} style={{ width: '100%' }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Rent each</label>
+                    <input className="input" type="number" min={0} placeholder="850" value={unitDraft.rentAmount}
+                      onChange={e => setUnitDraft(u => ({ ...u, rentAmount: e.target.value }))} style={{ width: '100%' }} />
+                  </div>
+                </div>
+
+                <button className="btn btn-primary btn-sm"
+                  disabled={!unitDraft.unitNumber.trim() || !targetPropertyId || addUnitsMut.isLoading}
+                  onClick={() => addUnitsMut.mutate({
+                    propertyId: targetPropertyId,
+                    unitNumber: unitDraft.unitNumber.trim(),
+                    unitType: unitDraft.unitType,
+                    quantity: unitDraft.quantity,
+                    ...(unitDraft.rentAmount ? { rentAmount: Number(unitDraft.rentAmount) } : {}),
+                  })}>
+                  <Plus size={14} /> {addUnitsMut.isLoading ? 'Adding…' : `Add ${unitDraft.quantity > 1 ? unitDraft.quantity + ' units' : 'unit'}`}
+                </button>
+
+                {addUnitsMut.isError && (
+                  <div style={{ color: 'var(--red)', fontSize: '.75rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginTop: 12 }}>
+                    {(addUnitsMut.error as any)?.response?.data?.error || 'Could not add those units. Please try again.'}
+                  </div>
+                )}
+
+                <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--border)' }}>
+                  <div style={{ fontSize: '.78rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 8 }}>
+                    {unitCount === 0 ? 'No units yet' : `${unitCount} unit${unitCount === 1 ? '' : 's'} added`}
+                  </div>
+                  {unitCount > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {(existingUnits as any[]).slice(0, 40).map((u: any) => (
+                        <span key={u.id} style={{ fontSize: '.72rem', padding: '3px 9px', borderRadius: 999, background: 'rgba(201,162,39,.1)', border: '1px solid rgba(201,162,39,.25)', color: 'var(--gold)' }}>
+                          {u.unitNumber}
+                        </span>
+                      ))}
+                      {unitCount > 40 && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>+{unitCount - 40} more</span>}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── STEP 3: BANKING ── */}
+            {step === 4 && (
               <div>
                 {bankReady ? (
                   <div>
@@ -355,7 +542,7 @@ export function OnboardingPage() {
                     </div>
                     <div style={{ textAlign: 'center' }}>
                       <button className="btn btn-ghost btn-sm" onClick={() => { setCompleted(prev => new Set([...prev, 2])); setStep(3) }}>
-                        Skip for now — set up banking later
+                        Skip for now — finish payout setup later
                       </button>
                     </div>
                   </div>
@@ -365,7 +552,7 @@ export function OnboardingPage() {
                 <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 18, marginTop: 8 }}>
                   <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Who pays the ACH processing fee?</div>
                   <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-                    ACH bank payments cost 1.0% (capped $6.00). By default your tenants pay this fee. You can
+                    ACH bank payments cost a flat $6.00. By default your tenants pay this fee. You can
                     choose to cover it for them — applied across your properties (change per-property later in Settings).
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
@@ -387,14 +574,51 @@ export function OnboardingPage() {
                   </div>
                   <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 12, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                     <CreditCard size={12} style={{ flexShrink: 0, marginTop: 2 }} />
-                    Card payments (3.25% + 26¢) are always paid by the tenant — landlords never cover card fees.
+                    Card payments ({cardFeeLabel()}) are always paid by the tenant — landlords never cover card fees.
                   </div>
                 </div>
               </div>
             )}
 
             {/* ── STEP 3: AGREEMENT ── */}
-            {step === 3 && (
+            {/* S605: required step — a landlord without this has no expense side
+                to their P&L. Read-only; it cannot move money. */}
+            {step === 4 && (
+              <div>
+                <h2 style={{ fontSize: '1.15rem', marginBottom: 6 }}>Connect your operating bank</h2>
+                <p style={{ color: 'var(--text-2)', fontSize: '.85rem', marginBottom: 18, lineHeight: 1.6 }}>
+                  This is the account you actually run the business from — the one repairs, supplies and
+                  utilities get paid out of. GAM reads it <strong>read-only</strong> so your spending
+                  becomes expenses automatically. Without it your P&amp;L only shows income.
+                </p>
+
+                {feedLinked ? (
+                  <div className="alert alert-success" style={{ marginBottom: 16 }}>
+                    <Check size={16} />
+                    <div>
+                      <strong>Bank connected.</strong> Your transactions will start syncing — deposits we
+                      already sent you are matched automatically, and the rest is yours to categorize.
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ padding: 14, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 16 }}>
+                      <ul style={{ margin: 0, paddingLeft: 18, fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.8 }}>
+                        <li><strong>Read-only.</strong> Nothing can move money from this connection.</li>
+                        <li>You sign in to your bank through Stripe — GAM never sees your bank login.</li>
+                        <li>Rent payouts we already sent you are hidden automatically, so nothing double-counts.</li>
+                      </ul>
+                    </div>
+                    {feedErr && <div className="alert alert-danger" style={{ marginBottom: 14 }}>{feedErr}</div>}
+                    <button className="btn btn-primary" onClick={linkOperatingBank} disabled={feedBusy}>
+                      {feedBusy ? <span className="spinner" /> : <><Landmark size={16} /> Connect a bank</>}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {step === 5 && (
               <div>
                 <div
                   ref={agreementRef}
@@ -412,7 +636,7 @@ export function OnboardingPage() {
                   {[
                     { title: '1. Payment Processing & Payouts', body: 'Platform processes Tenant rent payments (ACH and card) and routes settled funds to Landlord\'s connected bank account via Stripe Connect. Platform does NOT advance funds — Landlord receives rent as Tenant payments settle, not before. Platform acts as Landlord\'s authorized payment processor and collection agent. This is NOT an insurance policy, surety bond, financial guarantee, or rent advance.' },
                     { title: '2. Payment Routing Priority', body: 'When a Tenant makes a payment through the Platform, the payment is applied first to any outstanding balance the Tenant owes to Platform under any current or future Platform service, beginning with the oldest such balance (first-in, first-out); the remaining amount is then routed to Landlord. Landlord acknowledges that where a Tenant owes Platform, Landlord receives the residual amount after Platform\'s balance is satisfied, not the gross payment. This is an authorized routing of the Tenant\'s own funds — not a debt-collection action and not a reduction of any amount the Tenant owes Landlord. Landlord retains all rights and remedies against the Tenant for any rent or other amount that remains unpaid.' },
-                    { title: '3. Platform Fees', body: 'Occupied Units: $2.00 per occupied unit per month, subject to a $10.00 monthly minimum per connected payout account. A connected payout account corresponds to the legal entity or bank account that receives payouts; properties that share one connected account share a single minimum, while separate entities (for example, separate LLCs, each with its own connected account) each carry their own minimum. Vacant Units: $0.00 — vacant units are never charged. Card and ACH processing fees are paid by the Tenant and are never absorbed by Platform; at onboarding, Landlord may elect to cover its Tenants\' ACH fees, but card processing fees are always paid by the Tenant and are never covered by Landlord. Platform fees are billed monthly and deducted from Landlord payouts.' },
+                    { title: '3. Platform Fees', body: 'Occupied Units: $2.00 per occupied unit per month, subject to a $10.00 monthly minimum per connected payout account. A connected payout account corresponds to the legal entity or bank account that receives payouts; properties that share one connected account share a single minimum, while separate entities (for example, separate LLCs, each with its own connected account) each carry their own minimum. Vacant Units: $0.00 — vacant units are never charged. Short-Term Stays: for nightly or weekly bookings, space-only sites (RV spots, campsites, boat slips) are billed $2.00 per 30 booked nights, and furnished short stays (apartments, condos, motel/hotel rooms, and similar) are billed 5% of booking revenue; these amounts are additive to the occupied-unit fee and fall under the same $10.00 per-account monthly minimum. New-Landlord Grace: Platform does not charge the occupied-unit fee or the per-account minimum until Landlord goes live (the first rent payment settles through the Platform), up to a maximum of two billing cycles, so a Landlord switching from another platform does not pay both at once during onboarding. Card and ACH processing fees are paid by the Tenant and are never absorbed by Platform; at onboarding, Landlord may elect to cover its Tenants\' ACH fees, but card processing fees are always paid by the Tenant and are never covered by Landlord. Platform fees are billed monthly and deducted from Landlord payouts.' },
                     { title: '4. Payment Reversals & Pass-Through Charges', body: 'Platform does not absorb banking, processing, or payment-network charges of any kind. All such charges — including card-processing fees, ACH fees, returned-payment fees, and chargeback or dispute fees — pass through to the responsible party as described in the Platform Fees section, and Platform absorbs none of them. Because Platform does not advance funds, a Tenant payment that fails, is returned, or is reversed before settlement is simply not paid out. If a payment is reversed, returned, or charged back after it has been routed to Landlord, Landlord authorizes Platform to recover the reversed amount and any associated charge from Landlord\'s balance or future payouts. Platform bears no liability for reversed, returned, or charged-back payments.' },
                     { title: '5. Additional Services', body: 'Platform may make additional, optional services and products available to Landlord from time to time (for example, premium features, marketing or listing enhancements, tenant-screening packages, or other add-ons). Each such service is optional and is enrolled in separately. The scope and fees for any additional service are disclosed to Landlord at the point of enrollment, and upon enrollment that service is governed by this Agreement. Landlord authorizes Platform to bill the disclosed fees for any service Landlord enrolls in under the same terms as Platform Fees — billed monthly and deducted from Landlord payouts. Declining or not enrolling in an additional service does not affect Landlord\'s core platform access.' },
                     { title: '6. Security Deposit Custody', body: 'Where Landlord uses Platform to collect or hold security deposits, Platform holds those funds as custodian. Where applicable law requires a security deposit to be held in a separate, escrow, or trust account, to be held in a particular form, or to accrue interest, Platform holds the deposit accordingly and pays any required interest at the applicable statutory rate. Where applicable law does not require segregation, Landlord authorizes Platform to hold deposit funds in its general account and to use such funds in the ordinary course of its business. In all cases, Platform remains obligated to keep the deposit available for return and disbursement in accordance with the lease and applicable law, and the manner in which deposit funds are held does not reduce or impair the deposit owed to the Tenant; Landlord remains responsible to the Tenant for the security deposit under the lease and applicable law. Landlord may transfer security deposits it currently holds into Platform custody, in which case those deposits are held under this Section and Landlord\'s platform fee is reduced as disclosed by Platform.' },
@@ -499,7 +723,7 @@ export function OnboardingPage() {
               <button
                 className="btn btn-primary"
                 onClick={handleNext}
-                disabled={addPropertyMut.isLoading || completeMut.isLoading || (step === 2 && !bankReady && !completed.has(2))}
+                disabled={addPropertyMut.isLoading || completeMut.isLoading || addUnitsMut.isLoading || (step === 2 && unitCount === 0) || (step === 3 && !bankReady && !completed.has(3)) || (step === 4 && !feedLinked)}
                 style={{ padding: '10px 24px' }}
               >
                 {addPropertyMut.isLoading || completeMut.isLoading ? <span className="spinner" /> :

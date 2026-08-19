@@ -31,6 +31,7 @@ import { queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
+import { microdepositInstruction } from '@gam/shared'
 
 export const posCustomerOnboardingRouter = Router()
 
@@ -226,7 +227,10 @@ posCustomerOnboardingRouter.post('/:token/complete', async (req, res, next) => {
         data: {
           status: 'pending',
           verified: false,
-          message: 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish.',
+          // S605: Stripe chooses 'amounts' vs 'descriptor_code' per bank — say
+          // what it actually sent rather than promising two deposits.
+          message: microdepositInstruction(
+            (si.next_action as any)?.verify_with_microdeposits?.microdeposit_type ?? null),
         },
       })
     }

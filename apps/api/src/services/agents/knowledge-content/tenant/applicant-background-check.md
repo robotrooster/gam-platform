@@ -8,7 +8,7 @@ Along the way you'll provide proof of income (two documents — pay stubs, bank 
 
 ## The fee
 
-Where state law allows it, you pay the screening fee up front by card, and it's passed through at cost with no markup. The payment step always shows the correct amount for your situation automatically: some states cap what an applicant can be charged (you pay the capped amount and the landlord covers the remainder), and some states don't permit applicant-paid screening fees at all (you pay nothing and your landlord covers the screening).
+Where state law allows it, you pay the screening fee up front by card. The payment step always shows the correct amount for your situation automatically: some states cap what an applicant can be charged (you pay the capped amount and the landlord covers the remainder), and some states don't permit applicant-paid screening fees at all (you pay nothing and your landlord covers the screening).
 
 ## If your landlord screens through Checkr
 

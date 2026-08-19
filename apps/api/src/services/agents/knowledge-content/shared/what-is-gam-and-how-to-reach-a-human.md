@@ -18,11 +18,11 @@ When you need help, you have three doors:
 - **Human support** — the GAM support team handles platform and account questions the assistant can't resolve, or anytime you'd rather talk to a person.
 - **Your landlord** — anything specific to your home, lease terms, deposits, or repairs is your landlord's decision, so those questions route to them.
 
-Some topics are always handed off to a human GAM specialist:
+Some topics are always handed off to a human GAM Strategist:
 
 - Anything involving moving or refunding money
 - Account security, access, or sign-in problems
 - Legal questions (these depend on your lease and your local laws)
 - Complex issues the assistant can't fully resolve
 
-If your question falls into one of these areas, just ask to be connected and we'll bring in a human specialist. If you're ever unsure who to ask, start with the in-app assistant — it will either answer or point you to the right place.
+If your question falls into one of these areas, just ask to be connected and we'll bring in a human GAM Strategist. If you're ever unsure who to ask, start with the in-app assistant — it will either answer or point you to the right place.

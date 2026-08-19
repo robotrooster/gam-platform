@@ -11,7 +11,7 @@ import { landlordExpensesTotal } from './landlordExpenses'
 const round2 = (n: number) => Math.round(n * 100) / 100
 
 export interface LandlordPL {
-  gross: { rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number }
+  gross: { rent: number; fees: number; utilities: number; homeSale: number; otherIncome: number; other: number; total: number }
   depositsHeld: number
   expenses: { platformFee: number; maintenance: number; lotRent: number; enteredExpenses: number; total: number }
   net: number
@@ -45,7 +45,17 @@ export async function computeLandlordPL(
   const utilities = round2(+inc?.utilities || 0)
   const homeSale = round2(+inc?.home_sale || 0)
   const depositsHeld = round2(+inc?.deposits || 0)
-  const other = round2(fees + utilities + homeSale)
+  // S605: income the landlord banked that GAM never collected — laundry, vending,
+  // an insurance claim, cash rent deposited. Categorized off the bank feed. Until
+  // this existed the P&L counted every expense but only GAM-collected income, so
+  // it understated profit for any landlord with revenue outside the platform.
+  const otherIncRow = await queryOne<any>(`
+    SELECT COALESCE(SUM(amount), 0)::float AS c FROM landlord_other_income
+     WHERE landlord_id = $1 AND status = 'active' AND income_date >= $2::date AND income_date <= $3::date`,
+    [landlordId, String(start).slice(0, 10), String(end).slice(0, 10)])
+  const otherIncome = round2(+otherIncRow?.c || 0)
+
+  const other = round2(fees + utilities + homeSale + otherIncome)
   const grossTotal = round2(rent + other)
 
   // Expenses.
@@ -69,7 +79,7 @@ export async function computeLandlordPL(
   const expensesTotal = round2(platformFee + maintenance + lotRent + enteredExpenses)
 
   return {
-    gross: { rent, fees, utilities, homeSale, other, total: grossTotal },
+    gross: { rent, fees, utilities, homeSale, otherIncome, other, total: grossTotal },
     depositsHeld,
     expenses: { platformFee, maintenance, lotRent, enteredExpenses, total: expensesTotal },
     net: round2(grossTotal - expensesTotal),

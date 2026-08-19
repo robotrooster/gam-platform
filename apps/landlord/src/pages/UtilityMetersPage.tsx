@@ -25,7 +25,18 @@ const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00
 // business day of each month and prompts the manager; the guided walk
 // steps meter-to-meter, auto-calculates usage for leased spots, and the
 // charges ride each tenant's next monthly invoice automatically.
-export function UtilityMetersPage() {
+// S605 (Nic, DIRECTIVE): property-scoped screens belong INSIDE a property, not
+// as top-level nav. "A sub tab in the actual property... that way we see, like,
+// the amenities tab, inventory would be scoped to a specific property."
+//
+// `embeddedPropertyId` renders this as a tab of PropertyDetailPage: the property
+// is already chosen by the page around it, so the page title and the property
+// picker are suppressed. Standalone use is unchanged.
+//
+// The picker was also only rendered when a landlord had MORE THAN ONE property —
+// so a single-property landlord saw no scoping control at all and the page read
+// as global. Inside a property hub that ambiguity disappears entirely.
+export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?: string } = {}) {
   const qc = useQueryClient()
   const { can } = usePerms()
   // Front desk (utility.read_meters) can take reads; only the landlord
@@ -34,7 +45,8 @@ export function UtilityMetersPage() {
   const canRead = canReview || can('utility.read_meters')
   const [searchParams] = useSearchParams()
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
-  const [propertyId, setPropertyId] = useState(() => searchParams.get('propertyId') || '')
+  const [propertyId, setPropertyId] = useState(() => embeddedPropertyId || searchParams.get('propertyId') || '')
+  useEffect(() => { if (embeddedPropertyId) setPropertyId(embeddedPropertyId) }, [embeddedPropertyId])
   useEffect(() => {
     if (!propertyId && (properties as any[]).length === 1) setPropertyId((properties as any[])[0].id)
   }, [properties, propertyId])
@@ -106,10 +118,12 @@ export function UtilityMetersPage() {
       <div className="page-header">
         <div style={{ display:'flex', alignItems:'center', gap:14 }}>
           <div>
-            <h1 className="page-title">Utilities</h1>
-            <p className="page-subtitle">Monthly meter reading runs and per-unit utility billing</p>
+            {!embeddedPropertyId && <>
+              <h1 className="page-title">Utilities</h1>
+              <p className="page-subtitle">Monthly meter reading runs and per-unit utility billing</p>
+            </>}
           </div>
-          {(properties as any[]).length > 1 && (
+          {!embeddedPropertyId && (properties as any[]).length > 1 && (
             <select className="form-select" value={propertyId} onChange={e=>setPropertyId(e.target.value)} style={{ width:'auto', minWidth:200 }}>
               <option value="" disabled>Select a property…</option>
               {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name}</option>)}
@@ -211,6 +225,10 @@ export function UtilityMetersPage() {
               </div>
             </div>
           )}
+
+          {/* S605: rates sit ABOVE meter setup — the price is the first thing
+              you decide for a property, and every meter below bills at it. */}
+          <PropertyRatesCard propertyId={propertyId} />
 
           {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
           {/* Meter setup is LANDLORD-only (broken toggle, rates, links). */}
@@ -783,6 +801,77 @@ function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourM
 }
 
 // ── UTILITY TAX RATES (landlord-entered) ─────────────────────────────
+// S605 (Nic, DIRECTIVE): "Make utility rates set at the property level. Adding
+// each unit is redundant and possible discrimination."
+//
+// One rate per utility for the whole property. Every tenant pays the same price
+// for the same utility, and the landlord types it once instead of once per unit
+// with a chance to fat-finger each one. Overrides whatever a meter carries.
+function PropertyRatesCard({ propertyId }: { propertyId: string }) {
+  const qc = useQueryClient()
+  const { data: rates = [] } = useQuery<any[]>(
+    ['property-utility-rates', propertyId], () => apiGet(`/utility/property-rates?propertyId=${propertyId}`))
+  const [draft, setDraft] = useState<Record<string, { rate: string; sewer: string }>>({})
+  const TYPES = ['electric', 'water', 'gas', 'trash']
+  const row = (t: string) => (rates as any[]).find((r: any) => r.utilityType === t)
+
+  const mut = useMutation(
+    (p: any) => apiPost('/utility/property-rates', { propertyId, ...p }),
+    { onSuccess: () => { qc.invalidateQueries(['property-utility-rates', propertyId]); toast('Rate saved.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save the rate') },
+  )
+
+  return (
+    <>
+      <h2 style={{ fontSize: '.95rem', margin: '24px 0 12px' }}>Utility rates</h2>
+      <div className="card" style={{ padding: 14, marginBottom: 10 }}>
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+          What this property charges per unit of usage. <strong>The same rate applies to every
+          tenant here</strong> — meters bill at this price regardless of how they were set up.
+          Changing it affects future bills only; bills already issued keep the rate they were charged at.
+        </div>
+        {TYPES.map(t => {
+          const cur = row(t)
+          const d = draft[t] ?? {
+            rate: cur?.ratePerUnit != null ? String(cur.ratePerUnit) : '',
+            sewer: cur?.sewerRatePerUnit != null ? String(cur.sewerRatePerUnit) : '',
+          }
+          const set = (k: 'rate' | 'sewer', v: string) =>
+            setDraft(p => ({ ...p, [t]: { ...d, [k]: v } }))
+          return (
+            <div key={t} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '8px 0',
+              borderBottom: '1px solid var(--border-0)', flexWrap: 'wrap' }}>
+              <span style={{ minWidth: 92, fontSize: '.82rem', fontWeight: 600, textTransform: 'capitalize' }}>
+                {UTILITY_ICONS[t]} {t}
+              </span>
+              <input className="input input-sm" type="number" step="0.00001" value={d.rate}
+                onChange={e => set('rate', e.target.value)}
+                placeholder={`$ per ${UTILITY_UNITS[t] || 'unit'}`} style={{ width: 150 }} />
+              {t === 'water' && (
+                <input className="input input-sm" type="number" step="0.00001" value={d.sewer}
+                  onChange={e => set('sewer', e.target.value)}
+                  placeholder="sewer $/gal (optional)" style={{ width: 175 }} />
+              )}
+              <button className="btn btn-primary btn-sm" disabled={mut.isLoading}
+                onClick={() => mut.mutate({
+                  utilityType: t,
+                  ratePerUnit: d.rate === '' ? null : Number(d.rate),
+                  baseFee: 0,
+                  ...(t === 'water' ? { sewerRatePerUnit: d.sewer === '' ? null : Number(d.sewer) } : {}),
+                })}>Save</button>
+              {cur?.ratePerUnit != null && (
+                <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                  currently {fmt(cur.ratePerUnit)}/{UTILITY_UNITS[t] || 'unit'}
+                </span>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </>
+  )
+}
+
 function TaxRatesCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
   const { data: rates = [] } = useQuery<any[]>(
@@ -920,6 +1009,56 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
     )
   }
 
+  // S605 (Nic): the warning has to be ACTIONABLE where it appears. A landlord
+  // told "this won't bill" with no way to fix it on the spot will carry on and
+  // lose the cycle anyway. Backdating matters — the opening read must predate
+  // the reads it enables, so the date is editable and defaults to the 1st of
+  // the current month rather than today.
+  function BaselineFixer({ m }: { m: any }) {
+    const [open, setOpen] = useState(false)
+    const [value, setValue] = useState('')
+    const [date, setDate] = useState(() => new Date().toISOString().slice(0, 8) + '01')
+    const [err, setErr] = useState('')
+    const save = useMutation(
+      () => apiPost(`/utility/meters/${m.id}/readings`, {
+        readingValue: Number(value), readingDate: date,
+        billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
+      }),
+      { onSuccess: () => { setOpen(false); onChanged() },
+        onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save the opening read') },
+    )
+    return (
+      <div style={{ marginTop: 6 }}>
+        <div style={{ fontSize: '.72rem', color: 'var(--red)', lineHeight: 1.5 }}>
+          Will not bill — usage is the difference between two reads and this meter has none yet.
+        </div>
+        {!open ? (
+          <button className="btn btn-primary btn-sm" style={{ marginTop: 6 }} onClick={() => setOpen(true)}>
+            <Plus size={13} /> Add opening read
+          </button>
+        ) : (
+          <div style={{ marginTop: 6 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input className="input input-sm" type="number" value={value} autoFocus
+                onChange={e => setValue(e.target.value)} placeholder={`${m.digits}-digit read`} style={{ width: 150 }} />
+              <input className="input input-sm" type="date" value={date}
+                onChange={e => setDate(e.target.value)} style={{ width: 150 }} />
+              <button className="btn btn-primary btn-sm" disabled={value === '' || save.isLoading}
+                onClick={() => { setErr(''); save.mutate() }}>
+                {save.isLoading ? 'Saving…' : 'Save'}
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
+            </div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
+              Date it when the meter was actually read — it must come before the reads you want to bill.
+            </div>
+            {err && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 4 }}>{err}</div>}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   function PlainCard({ m }: { m: any }) {
     return (
       <div className="card" style={{ padding: 14, marginBottom: 10 }}>
@@ -929,11 +1068,18 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
             <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
               {m.label}
               {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+              {/* S605 (Nic): the failure this exists to stop is a SILENT one —
+                  a submeter with no opening read bills nothing and says nothing
+                  until the cycle has already closed. */}
+              {m.hasBaseline === false && (
+                <span className="badge badge-red" style={{ fontSize:'.62rem' }}>no opening read</span>
+              )}
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
               {methodLabel(m)}
               {m.outOfService && <> · billed from the lowest comparable spot until repaired</>}
             </div>
+            {m.hasBaseline === false && <BaselineFixer m={m} />}
           </div>
           {m.billingMethod === 'submeter' && (
             <button className="btn btn-ghost btn-sm" title={m.outOfService ? 'Mark repaired' : 'Mark broken — bills from comparable spots'}
@@ -971,9 +1117,16 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
   const [utilityType, setUtilityType] = useState('water')
   const [label, setLabel] = useState('')
   const [method, setMethod] = useState('rubs')
-  const [rate, setRate] = useState('')
+  const [rate] = useState('')   // S605: rates are property policy; kept only for the create payload
   const [baseFee, setBaseFee] = useState('')
   const [alloc, setAlloc] = useState('occupant_count')
+  // S605 (Nic): the OPENING READ. A submeter bills the difference between two
+  // reads, so without a starting value its first cycle produces no bill and
+  // says nothing about why. Asking here — the one moment it's obvious what the
+  // number is for — is what stops a landlord discovering it after the cycle
+  // closes. Defaults to today; backdate it to when the meter was actually read.
+  const [baselineReading, setBaselineReading] = useState('')
+  const [baselineDate, setBaselineDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [error, setError] = useState('')
 
   const create = useMutation(
@@ -983,10 +1136,14 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
       ratePerUnit: method === 'flat_rate' || method === 'master_bill_to_landlord' ? null : (rate === '' ? null : Number(rate)),
       baseFee: method === 'flat_rate' ? Number(baseFee || 0) : Number(baseFee || 0),
       rubsAllocationMethod: method === 'rubs' ? alloc : null,
+      ...(method === 'submeter' && baselineReading !== ''
+        ? { baselineReading: Number(baselineReading), baselineDate }
+        : {}),
     }),
     { onSuccess: () => { onCreated(); onClose() }, onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not create meter') }
   )
   const canSave = !!label && (method !== 'flat_rate' || Number(baseFee) > 0)
+  const noBaseline = method === 'submeter' && baselineReading === ''
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -1022,22 +1179,40 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
             </select>
           </div>
         )}
+        {/* S605 (Nic, DIRECTIVE): "make utility rates set at the property level.
+            Adding each unit is redundant and possible discrimination." The rate
+            is no longer a per-meter field — it is property policy, set once for
+            everyone, in the Rates panel above. Leaving the box here would invite
+            a number that billing ignores. */}
         {(method === 'rubs' || method === 'submeter') && (
-          <div style={{ marginBottom: 10 }}>
-            <label style={lbl}>Rate per {UTILITY_UNITS[utilityType] || 'unit'} ($)</label>
-            <input className="input" type="number" step="0.001" value={rate} onChange={e => setRate(e.target.value)} placeholder="e.g. 0.01" style={{ width: '100%' }} />
+          <div style={{ marginBottom: 10, fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+            The rate comes from this property's utility rates — every tenant pays the same
+            price for the same utility. Set it in <strong>Rates</strong> at the top of this page.
+          </div>
+        )}
+        {/* S605 (Nic): opening read — submeters only. RUBS and master-bill
+            allocate off the property invoice and never read an odometer. */}
+        {method === 'submeter' && (
+          <div style={{ marginBottom: 10, padding: 10, borderRadius: 8, background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)' }}>
+            <label style={lbl}>Opening read (current meter face)</label>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input className="input" type="number" value={baselineReading}
+                onChange={e => setBaselineReading(e.target.value)}
+                placeholder={`${'0'.repeat(Math.max(0, 5))}0 — what it reads now`} style={{ flex: 2 }} />
+              <input className="input" type="date" value={baselineDate}
+                onChange={e => setBaselineDate(e.target.value)} style={{ flex: 1 }} />
+            </div>
+            <div style={{ fontSize: '.7rem', color: noBaseline ? 'var(--red)' : 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+              {noBaseline
+                ? 'Without an opening read this meter will NOT bill its first cycle — there\'s nothing to measure usage against. You can add one later from the meter card, but it must be dated before the reads you want to bill.'
+                : 'Usage is the difference between two reads, so the first bill needs a starting point. Backdate this to when the meter was actually read.'}
+            </div>
           </div>
         )}
         {method === 'flat_rate' && (
           <div style={{ marginBottom: 10 }}>
             <label style={lbl}>Flat amount per unit ($/cycle) *</label>
             <input className="input" type="number" step="0.01" value={baseFee} onChange={e => setBaseFee(e.target.value)} placeholder="e.g. 20.00" style={{ width: '100%' }} />
-          </div>
-        )}
-        {(method === 'rubs' || method === 'submeter') && (
-          <div style={{ marginBottom: 10 }}>
-            <label style={lbl}>Base fee per bill ($, optional)</label>
-            <input className="input" type="number" step="0.01" value={baseFee} onChange={e => setBaseFee(e.target.value)} placeholder="0.00" style={{ width: '100%' }} />
           </div>
         )}
         {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginBottom: 8 }}>{error}</div>}

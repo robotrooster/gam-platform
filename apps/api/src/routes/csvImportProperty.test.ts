@@ -104,7 +104,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
     const { token } = await seedLandlordWithToken()
     const csv = [
       'property_name,street1,street2,city,state,zip,timezone,property_type,unit_number,bedrooms,bathrooms,sqft,unit_type,rent_amount,security_deposit',
-      'Sunset Apartments,100 Main St,,Phoenix,AZ,85001,America/Phoenix,residential,4B,2,1.5,850,apartment,1850,1850',
+      'Sunset Apartments,100 Main St,,Phoenix,AZ,85001,America/Phoenix,residential,Apt 4B,2,1.5,850,apartment,1850,1850',
     ].join('\n')
 
     const res = await request(buildApp())
@@ -378,7 +378,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     const fakeRow = {
       rowIndex: 0,
       propertyName: '', street1: '', city: '', state: '', zip: '',
-      unitNumber: '4B', rentAmount: '1850',
+      unitNumber: 'Apt 4B', rentAmount: '1850',
       bedrooms: '', bathrooms: '', sqft: '', unitType: '',
       securityDeposit: '', timezone: '', street2: '', propertyType: '',
       issues: [

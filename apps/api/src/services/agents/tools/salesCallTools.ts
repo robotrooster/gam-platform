@@ -1,5 +1,5 @@
 /**
- * Sales-call tools (S553) — Lucy books the Portfolio Specialist call
+ * Sales-call tools (S553) — Lucy books the Portfolio Strategist call
  * in-chat, using the SAME service as the public booking route.
  *
  * get_available_call_times (READ) — upcoming bookable slots, humanized.
@@ -14,7 +14,7 @@ import type { AgentTool, AgentActor } from './types'
 export const getAvailableCallTimes: AgentTool = {
   name: 'get_available_call_times',
   description:
-    'Upcoming times a GAM Portfolio Specialist is free for a call. Use when the prospect is interested in ' +
+    'Upcoming times a GAM Portfolio Strategist is free for a call. Use when the prospect is interested in ' +
     'talking to the team — offer 2-3 near-term options conversationally (never dump the whole list). ' +
     'Read-only; book with book_sales_call.',
   parameters: { type: 'object', properties: {} },
@@ -37,7 +37,7 @@ export const getAvailableCallTimes: AgentTool = {
 export const bookSalesCallTool: AgentTool = {
   name: 'book_sales_call',
   description:
-    'Book the prospect’s call with a Portfolio Specialist. CONFIRM FIRST: the exact time (startsAt from ' +
+    'Book the prospect’s call with a Portfolio Strategist. CONFIRM FIRST: the exact time (startsAt from ' +
     'get_available_call_times), video or phone, their name, and their email — read the details back and get an ' +
     'explicit yes before calling, because booking sends a real confirmation email. On success, tell them the ' +
     'confirmed time and that the confirmation is in their inbox.',
@@ -49,7 +49,7 @@ export const bookSalesCallTool: AgentTool = {
       name: { type: 'string', description: 'The prospect’s name.' },
       email: { type: 'string', description: 'Their email — the confirmation goes here.' },
       phone: { type: 'string', description: 'Their phone (required for phone calls).' },
-      notes: { type: 'string', description: 'Anything useful for the Specialist (portfolio, what they want to see).' },
+      notes: { type: 'string', description: 'Anything useful for the Strategist (portfolio, what they want to see).' },
     },
     required: ['startsAt', 'mode', 'name', 'email'],
   },

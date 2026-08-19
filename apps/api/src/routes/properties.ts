@@ -24,6 +24,8 @@ import {
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
+import { resolveLeaseSigner } from '../services/leaseSigner'
+import { initiateTransfer, approveTransfer, declineTransfer } from '../services/propertyTransfer'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -274,6 +276,25 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
        ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null])
 
     await client.query('COMMIT')
+
+    // S604 (Nic): if GAM cannot lawfully hold deposits in this state with the
+    // current custody vehicle (T-bills via Jiko), raise it the MOMENT the
+    // landlord onboards — this is an immediate build, not a backlog item.
+    // Post-commit and non-throwing: a custody gap must never block a signup.
+    {
+      const { flagUnsupportedCustodyState, flagDepositInterestObligation } =
+        await import('../services/depositCustody')
+      const ctx = {
+        stateCode:    body.state,
+        landlordId:   req.user!.profileId,
+        propertyId:   prop.id,
+        propertyName: prop.name,
+      }
+      // Two independent checks: WHERE the money may sit, and WHAT is owed on it.
+      // A state can be fine to custody in and still owe interest from day one.
+      void flagUnsupportedCustodyState(ctx)
+      void flagDepositInterestObligation(ctx)
+    }
 
     // S550: real-world address verification (parcel corroboration + geocode)
     // — fire-and-forget; never blocks or delays creation. Lands
@@ -1776,3 +1797,191 @@ publicPropertiesRouter.post('/apply', async (req, res, next) => {
 // wizard's bulk "Create Units" step is gone (Nic: one door for creating
 // units). Multi-unit creation is POST /api/units with `quantity` — same
 // type/subtype/pricing machinery as single-unit creation.
+
+// ── S605 (Nic): DESIGNATED LEASE SIGNER ─────────────────────────────────────
+// "The property owner can assign it to an on-site manager, but it shouldn't go
+// to both people... limit that permission to only one user per property. And if
+// that person gets fired or removed from permission, then it defaults back to
+// the landlord or the owner."
+//
+// ONE signer per property, held in a single column so a second is not
+// expressible. Only the OWNER may set it — delegating who signs the lease is not
+// something a delegate should be able to hand to themselves.
+propertiesRouter.put('/:id/lease-signer', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      // null clears the designation — the owner signs again.
+      userId: z.string().uuid().nullable(),
+    }).parse(req.body)
+
+    const prop = await queryOne<any>(
+      `SELECT p.id, p.landlord_id, l.user_id AS owner_user_id
+         FROM properties p JOIN landlords l ON l.id = p.landlord_id
+        WHERE p.id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // The delegation itself is the owner's call, not a manager's.
+    if (req.user!.userId !== prop.owner_user_id && req.user!.role !== 'admin' && req.user!.role !== 'super_admin') {
+      throw new AppError(403, 'Only the account owner can choose who signs leases')
+    }
+
+    if (body.userId) {
+      // Must be an on-site manager scoped to THIS property and entitled to sign.
+      // Refusing here — rather than silently falling back at signing time — is
+      // what makes the setting mean something when the landlord saves it.
+      const ok = await queryOne<{ id: string }>(
+        `SELECT s.id FROM onsite_manager_scopes s
+          WHERE s.user_id = $1 AND s.landlord_id = $2
+            AND (s.all_properties = TRUE OR $3 = ANY(s.property_ids))
+            AND COALESCE((s.permissions ->> 'leases.sign')::boolean, FALSE) = TRUE
+          LIMIT 1`, [body.userId, prop.landlord_id, req.params.id])
+      if (!ok) {
+        throw new AppError(400,
+          'That person needs the “sign leases” permission for this property before they can be the signer.')
+      }
+    }
+
+    const updated = await queryOne<any>(
+      `UPDATE properties SET lease_signer_user_id = $2, updated_at = NOW()
+        WHERE id = $1 RETURNING id, lease_signer_user_id`,
+      [req.params.id, body.userId])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// Who signs today — the designation if it still holds, otherwise the owner.
+propertiesRouter.get('/:id/lease-signer', async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>(
+      `SELECT id, landlord_id, lease_signer_user_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    const signer = await resolveLeaseSigner(prop.landlord_id, prop.id)
+    res.json({ success: true, data: {
+      designatedUserId: prop.lease_signer_user_id,
+      // Differs from designatedUserId when the designated manager has lost the
+      // permission — the UI can then say so instead of showing a stale name.
+      effectiveSigner: signer,
+    } })
+  } catch (e) { next(e) }
+})
+
+// ── S605 (Nic): SELL A PROPERTY ─────────────────────────────────────────────
+// "Transferring ownership of the property account and the record of deposits and
+// leases." No money moves — the closing contract settles proration via a credit
+// at closing. See services/propertyTransfer.ts for what moves and what stays.
+propertiesRouter.post('/:id/transfer', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      // Identify the buyer by the email they log in with — a landlord selling a
+      // park knows the buyer's email, not their internal id.
+      toEmail: z.string().trim().email(),
+      note: z.string().max(500).optional(),
+    }).parse(req.body)
+
+    const prop = await queryOne<any>(
+      `SELECT p.id, p.landlord_id, l.user_id AS owner_user_id
+         FROM properties p JOIN landlords l ON l.id = p.landlord_id
+        WHERE p.id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // Selling is the owner's act. A manager with properties.edit can configure a
+    // property; they cannot give it away.
+    if (req.user!.userId !== prop.owner_user_id && req.user!.role !== 'admin' && req.user!.role !== 'super_admin') {
+      throw new AppError(403, 'Only the account owner can transfer a property')
+    }
+
+    const buyer = await queryOne<any>(
+      `SELECT l.id FROM users u JOIN landlords l ON l.user_id = u.id
+        WHERE lower(u.email) = lower($1)`, [body.toEmail])
+    if (!buyer) {
+      throw new AppError(404,
+        'No landlord account with that email. The buyer needs to register on GAM before the property can be transferred to them.')
+    }
+
+    // S605 (Nic): this RAISES a request — it no longer transfers anything.
+    // "Anybody that has a GAM platform account as an owner needs to all have a
+    // signing or confirmation... so that one person can't just accidentally sell
+    // or transfer account ownership out from underneath other people."
+    const result = await initiateTransfer({
+      propertyId: req.params.id,
+      fromLandlordId: prop.landlord_id,
+      toLandlordId: buyer.id,
+      byUserId: req.user!.userId,
+      note: body.note ?? null,
+    })
+    res.status(202).json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+// The transfer history for a property — who owned it, and when it changed hands.
+propertiesRouter.get('/:id/transfers', async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT t.id, t.transferred_at, t.moved, t.note,
+              fl.business_name AS from_name, tl.business_name AS to_name
+         FROM property_transfers t
+         JOIN landlords fl ON fl.id = t.from_landlord_id
+         JOIN landlords tl ON tl.id = t.to_landlord_id
+        WHERE t.property_id = $1
+        ORDER BY t.transferred_at DESC`, [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// The pending sale for a property, and where each owner stands on it.
+propertiesRouter.get('/:id/transfer-request', async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const reqRow = await queryOne<any>(
+      `SELECT r.id, r.status, r.expires_at, r.note, r.initiated_by,
+              tl.business_name AS buyer_name
+         FROM property_transfer_requests r
+         JOIN landlords tl ON tl.id = r.to_landlord_id
+        WHERE r.property_id = $1 AND r.status = 'pending'
+        LIMIT 1`, [req.params.id])
+    if (!reqRow) return res.json({ success: true, data: null })
+
+    const approvals = await query<any>(
+      `SELECT a.user_id, a.approved_at, a.declined_at,
+              TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')) AS name, u.email
+         FROM property_transfer_approvals a JOIN users u ON u.id = a.user_id
+        WHERE a.request_id = $1
+        ORDER BY u.first_name`, [reqRow.id])
+
+    res.json({ success: true, data: {
+      ...reqRow,
+      approvals,
+      // Never send the codes — each owner has their own, by email.
+      youApproved: approvals.some((a: any) => a.user_id === req.user!.userId && a.approved_at),
+      youAreApprover: approvals.some((a: any) => a.user_id === req.user!.userId),
+    } })
+  } catch (e) { next(e) }
+})
+
+// Confirm with the code from your email. The LAST approval executes the sale.
+propertiesRouter.post('/transfer-request/:requestId/approve', async (req, res, next) => {
+  try {
+    const { code } = z.object({ code: z.string().min(4).max(12) }).parse(req.body)
+    const result = await approveTransfer({
+      requestId: req.params.requestId, userId: req.user!.userId, code: code.trim(),
+    })
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+// Any one owner can stop it — consent is unanimous, so a single refusal decides.
+propertiesRouter.post('/transfer-request/:requestId/decline', async (req, res, next) => {
+  try {
+    await declineTransfer(req.params.requestId, req.user!.userId)
+    res.json({ success: true, data: { cancelled: true } })
+  } catch (e) { next(e) }
+})

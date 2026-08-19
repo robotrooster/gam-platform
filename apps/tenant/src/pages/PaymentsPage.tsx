@@ -18,6 +18,7 @@ import {
   AddPaymentMethodModal,
   PayNowModal,
   SavedMethodsCard,
+  VerifyMicrodepositsCard,
   useTenantPaymentMethods,
   type PayTarget,
 } from './payShared'
@@ -159,6 +160,10 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
   return (
     <div>
+      {/* S603: a tenant whose bank is awaiting microdeposit confirmation
+          finishes it HERE rather than on a Stripe-hosted page. Renders itself
+          away when nothing is pending. */}
+      <VerifyMicrodepositsCard onVerified={() => qc.invalidateQueries('tenant-payment-methods')} />
       <div className="ph">
         <div>
           <h1 className="pt">Payments</h1>

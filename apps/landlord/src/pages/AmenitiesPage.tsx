@@ -34,11 +34,13 @@ const STATUS_BADGE: Record<string, string> = {
 const fmt = (s: string) => new Date(s).toLocaleString(undefined,
   { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 
-export function AmenitiesPage() {
+// S605 (Nic): renders as a tab of PropertyDetailPage when given a property —
+// see the note on UtilityMetersPage. Standalone use is unchanged.
+export function AmenitiesPage({ embeddedPropertyId }: { embeddedPropertyId?: string } = {}) {
   const qc = useQueryClient()
   const { data: properties = [] } = useQuery<Property[]>('properties-min', () => apiGet<Property[]>('/properties'))
   const [propertyId, setPropertyId] = useState('')
-  const pid = propertyId || properties[0]?.id || ''
+  const pid = embeddedPropertyId || propertyId || properties[0]?.id || ''
 
   const { data: areas = [] } = useQuery<Area[]>(
     ['common-areas', pid], () => apiGet<Area[]>(`/common-areas?propertyId=${pid}`), { enabled: !!pid })

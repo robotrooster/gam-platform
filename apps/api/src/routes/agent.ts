@@ -22,6 +22,7 @@ import { AppError } from '../middleware/errorHandler'
 import { runAgentSession } from '../services/agents/agentSession'
 import { isAssistantHidden } from '../services/agents/turnBudget'
 import { listAvailableSlots, formatSlotForHumans, bookSalesCall, groupSlotsByDay } from '../services/salesCalls'
+import { query, queryOne } from '../db'
 import { loadConversationHistory, loadGuestConversationHistory } from '../services/agents/conversationHistory'
 import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
 import { resolveProperty } from '../services/propertyBookingQuote'
@@ -258,6 +259,120 @@ salesAgentRouter.post('/demo', demoBookLimiter, async (req, res, next) => {
       painPoints: b.painPoints, lookingFor: b.lookingFor ?? null,
     })
     if (!result.ok) throw new AppError(409, result.error)
+    res.status(201).json({
+      success: true,
+      data: { startsAt: result.startsAt, when: result.when, meetingUrl: result.meetingUrl },
+    })
+  } catch (e) { next(e) }
+})
+
+// ── S605: ONBOARDING call booking (post-signup outreach email) ────────
+// Same slot engine as the demo above, different kind: a landlord who already
+// has an account books an "onboarding call", not a sales demo. One rep + one
+// calendar, so listAvailableSlots() already excludes demo-booked starts.
+//
+// The link in the outreach email carries an opaque token instead of the
+// landlord's details in query params (which would leak their email into every
+// mail-server log and Referer header en route). The token is traded here,
+// server-side, for the name/email we already have on file.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+interface OnboardingTokenRow {
+  user_id: string
+  landlord_id: string
+  first_name: string
+  last_name: string
+  email: string
+  phone: string | null
+}
+
+/** Resolve a live token, or null. Enumeration-safe: callers must 404 on null
+ *  without distinguishing malformed / unknown / expired. */
+async function resolveOnboardingToken(raw: string): Promise<OnboardingTokenRow | null> {
+  if (!UUID_RE.test(raw)) return null
+  return queryOne<OnboardingTokenRow>(
+    `SELECT t.user_id, t.landlord_id, u.first_name, u.last_name, u.email, u.phone
+       FROM landlord_onboarding_booking_tokens t
+       JOIN users u ON u.id = t.user_id
+      WHERE t.token = $1::uuid AND t.expires_at > now()`,
+    [raw])
+}
+
+// GET /api/sales/onboarding/prefill/:token — the booking form's identity read.
+// Returns ONLY what the form renders. No portfolio, no account state, no
+// anything else the token holder shouldn't be handed.
+salesAgentRouter.get('/onboarding/prefill/:token', async (req, res, next) => {
+  try {
+    const row = await resolveOnboardingToken(req.params.token)
+    if (!row) { res.status(404).json({ success: false, error: 'Not found' }); return }
+    // S605: THIS is the read receipt worth having. Reaching this endpoint means
+    // the landlord opened the outreach email AND clicked through to book —
+    // first-party, server-side, and it proves intent rather than proving an
+    // image loaded (which is all an open pixel shows, and Apple Mail pre-fetches
+    // those for everyone anyway). Best-effort: never let tracking break booking.
+    void query(
+      `UPDATE landlord_onboarding_booking_tokens
+          SET first_clicked_at = COALESCE(first_clicked_at, now()),
+              click_count = click_count + 1
+        WHERE token = $1::uuid`,
+      [req.params.token]
+    ).catch(() => {})
+    res.json({
+      success: true,
+      data: {
+        firstName: row.first_name,
+        name: [row.first_name, row.last_name].filter(Boolean).join(' ').trim(),
+        email: row.email,
+        phone: row.phone,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// GET /api/sales/onboarding/slots — open onboarding slots, grouped by day.
+salesAgentRouter.get('/onboarding/slots', async (_req, res, next) => {
+  try {
+    const slots = await listAvailableSlots('onboarding')
+    res.json({ success: true, data: { days: groupSlotsByDay(slots) } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/sales/onboarding — book it. The token is REQUIRED and is the only
+// accepted source of identity: name/email come off the token row, never off the
+// request body, so a stranger who guessed the endpoint can't book in someone
+// else's name. Availability + lead time are re-checked inside bookSalesCall.
+salesAgentRouter.post('/onboarding', demoBookLimiter, async (req, res, next) => {
+  try {
+    const b = z.object({
+      token:         z.string().trim(),
+      startsAt:      z.string().datetime(),
+      timezone:      z.string().trim().max(64).optional(),
+      propertyTypes: z.array(z.string().trim().min(1).max(60)).max(12).optional(),
+      unitRange:     z.string().trim().max(40).optional(),
+      painPoints:    z.array(z.string().trim().min(1).max(80)).max(20).optional(),
+      lookingFor:    z.string().trim().max(2000).optional(),
+    }).parse(req.body)
+
+    const who = await resolveOnboardingToken(b.token)
+    if (!who) throw new AppError(404, 'That booking link has expired — reply to the email and we’ll send a fresh one.')
+
+    const result = await bookSalesCall({
+      startsAt: b.startsAt, kind: 'onboarding', mode: 'video',
+      name: [who.first_name, who.last_name].filter(Boolean).join(' ').trim() || who.email,
+      email: who.email, phone: who.phone,
+      timezone: b.timezone ?? null,
+      propertyTypes: b.propertyTypes, unitRange: b.unitRange ?? null,
+      painPoints: b.painPoints, lookingFor: b.lookingFor ?? null,
+      notes: 'Booked from the post-signup onboarding outreach email.',
+    })
+    if (!result.ok) throw new AppError(409, result.error)
+
+    // Visibility only — never gates redemption, so rescheduling from the same
+    // email keeps working (see the migration header).
+    await query(
+      `UPDATE landlord_onboarding_booking_tokens SET used_at = now() WHERE token = $1::uuid`,
+      [b.token]).catch(() => {})
+
     res.status(201).json({
       success: true,
       data: { startsAt: result.startsAt, when: result.when, meetingUrl: result.meetingUrl },

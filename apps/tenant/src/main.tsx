@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -4198,11 +4198,37 @@ function SignupPage() {
 
 
 // ── APP ───────────────────────────────────────────────────────
+
+// S605 (Nic): "we should be doing that automatically... that way we're not
+// working on old visuals." A bfcache-restored tab on an outdated build reloads
+// itself; a newer deploy found on refocus or the 5-min poll only OFFERS a
+// reload, so nobody gets a page yanked mid-task. See packages/shared/versionWatch.
+function VersionWatch() {
+  const [ready, setReady] = useState(false)
+  useEffect(() => startVersionWatch({ onUpdateAvailable: () => setReady(true) }), [])
+  if (!ready) return null
+  return (
+    <div style={{
+      position:'fixed', bottom:18, left:'50%', transform:'translateX(-50%)', zIndex:99999,
+      display:'flex', alignItems:'center', gap:12, padding:'10px 16px',
+      background:'#111820', border:'1px solid #c9a227', borderRadius:10,
+      boxShadow:'0 6px 24px rgba(0,0,0,.45)', fontSize:'.82rem', color:'#eef1f8',
+    }}>
+      A newer version of GAM is available.
+      <button onClick={() => window.location.reload()} style={{
+        background:'#c9a227', color:'#060809', border:'none', borderRadius:6,
+        padding:'5px 12px', fontWeight:700, fontSize:'.78rem', cursor:'pointer',
+      }}>Reload</button>
+    </div>
+  )
+}
+
 function App() {
   const { token, loading } = useAuth()
   if (loading) return <div className="loading">Loading…</div>
   return (
     <BrowserRouter>
+      <VersionWatch/>
       <TelemetryPing />
       <Routes>
         <Route path="/login" element={<LoginPage />} />

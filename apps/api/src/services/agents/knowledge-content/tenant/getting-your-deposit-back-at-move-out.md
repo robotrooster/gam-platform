@@ -17,7 +17,7 @@ Because unpaid items roll in automatically, the cleanest way to protect your ref
 
 ## The three outcomes
 
-1. **Full or partial refund** — the refund shows up on your Payments tab as a deposit credit and is paid back to you once your landlord's payout processes.
+1. **Full or partial refund** — the refund shows up on your Payments tab as a deposit credit. Because GAM holds your deposit, it's returned to you directly once your landlord finalizes the return (no waiting on a separate landlord payout).
 2. **Nothing owed either way** — deductions exactly used up your deposit.
 3. **You owe a balance** — deductions came to more than your deposit. GAM records the difference and may automatically charge the payment method you have on file. If that charge doesn't go through, the balance stays open for your landlord to follow up on.
 

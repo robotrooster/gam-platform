@@ -2,8 +2,8 @@
 
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
-Effective Date: [DATE OF PUBLIC LAUNCH]
-Last Updated: [DATE]
+Effective Date: August 10, 2026
+Last Updated: August 10, 2026
 
 ---
 
@@ -27,7 +27,7 @@ These Business Terms of Service (the "**Terms**") form a binding legal agreement
 
 By creating an account, accessing, or otherwise using the GAM platform as a business user — including the websites, mobile-responsive portals, APIs, and related services we operate under the Gold Asset Management brand (collectively, the "**Platform**") — you agree to these Terms and to the [Business Privacy Policy](./BUSINESS_PRIVACY_POLICY.md), which is incorporated by reference. If you do not agree, you must not use the Platform.
 
-You also agree to the additional service-specific terms presented within the Platform (e.g., the lease electronic-signature consent, background-check authorization, Stripe Connect Express onboarding terms, On-Time Pay reporting enrollment terms). Those service-specific terms are incorporated by reference and prevail to the extent they conflict with these Terms for the specific feature they govern.
+You also agree to the additional service-specific terms presented within the Platform (e.g., the lease electronic-signature consent, background-check authorization, and Stripe Connect Express onboarding terms). Those service-specific terms are incorporated by reference and prevail to the extent they conflict with these Terms for the specific feature they govern.
 
 ## 2. Eligibility
 
@@ -54,7 +54,6 @@ GAM is a multi-portal real estate operations platform serving business users in 
 - Point-of-sale and inventory features for property-operated storefronts (e.g., RV park stores)
 - Property intelligence and listings surfaces
 - Communications between Landlords, Tenants, PM Companies, and managers
-- On-Time Pay tenant credit reporting (when enrolled and paid for by the Landlord on behalf of a Tenant)
 
 GAM is **not** a real estate broker, mortgage lender, escrow agent in the regulated sense, attorney, accountant, tax advisor, or fiduciary. We provide software that helps you operate your real estate business; you remain responsible for compliance with the laws governing your relationship with your tenants, employees, contractors, and counterparties.
 
@@ -91,25 +90,29 @@ GAM is not a party to any lease agreement between a Landlord and a Tenant, nor t
 
 GAM uses Stripe, Inc. ("**Stripe**") as its payment processor. All inbound payments (tenant rent, fees) and outbound payouts (Landlord disbursements, PM Company fees) move through Stripe Connect Express. By using the Platform's payment features, you also agree to the [Stripe Connect Services Agreement](https://stripe.com/connect-account/legal/full) and [Stripe Services Agreement](https://stripe.com/legal/ssa) as applicable to your role.
 
-Landlords and PM Companies are required to complete Stripe-hosted Connect onboarding (including identity verification, business verification, and bank account linking) before receiving any funds through the Platform. GAM does not custody funds intended for Landlords or PM Companies; those funds settle to the recipient's Stripe Connect balance and are paid out per the recipient's Stripe payout schedule, subject to any holds, reserves, or freezes that Stripe may impose at its discretion.
+Landlords and PM Companies are required to complete Stripe-hosted Connect onboarding (including identity verification, business verification, and bank account linking) before receiving any funds through the Platform. Tenant rent and other inbound payments are received into GAM's platform account and disbursed to the recipient — net of any GAM platform fee, any pass-through processing fee, and any amount routed under Section 6.6 — on a regular batch schedule (currently weekly). GAM holds funds only transiently, for the purpose of computing and making that disbursement; it does not hold them as a trustee, escrow agent, or fiduciary, and **GAM does not advance, front, or guarantee any amount it has not actually collected from the Tenant.** Disbursements settle to the recipient's Stripe Connect balance and pay out to the recipient's linked bank account, subject to any holds, reserves, or freezes that Stripe may impose at its discretion.
 
 ### 6.2 Fees and Pricing
 
 GAM charges fees for use of the Platform. The fees applicable to business users are:
 
 - **Per-occupied-unit platform fee** (long-term tenancies): $2.00 per occupied unit per month, with a minimum of $10.00 per property per month. Vacant units are not charged.
-- **Short-term-stay aggregate platform fee** (nightly and weekly bookings): $2.00 for every aggregate thirty (30) booked nights across the property, counted continuously across all bookings. **Cancellations do not reverse, refund, or otherwise reduce this accrual** — once a booking is recorded, its nights count toward the running total whether or not the guest ultimately stays. This fee applies in lieu of the per-occupied-unit fee for properties operated in short-term-stay (RV nightly or weekly) mode.
+- **Short-term-stay platform fee** (nightly and weekly bookings): billed monthly and **in addition to** the per-occupied-unit fee for any long-term units on the same property, using one of two methods depending on the unit type:
+  - **Space-only sites** — RV spots, campsites, and boat slips, where the operator coordinates nothing beyond the space: booked nights are aggregated at **$2.00 per thirty (30) booked nights** that fall within the month.
+  - **Furnished short stays** — apartments, condos, motel/hotel rooms, cabins, and any other furnished unit rented nightly or weekly: **5% of booking revenue**, pro-rated to the month.
+  Bookings that are cancelled or marked no-show are not counted. A property's total monthly platform fee is the greater of (the sum of its per-occupied-unit and short-term-stay amounts) or the $10.00 per-property minimum.
 - **Connect account fee**: $1.00 per active Connect account per month, waived once the associated Landlord or PM Company has ten or more billable units.
-- **Payment processing fees**: ACH at a flat $6.00 per transaction; card at 3.25% + $0.26 per transaction (no cap). Per-property settings determine whether processing fees are passed through to the tenant at checkout or deducted from the Landlord's settlement. **In no case will GAM absorb processing or banking fees on a Landlord's behalf.**
-- **On-Time Pay reporting** (when enrolled): a per-tenant monthly fee paid by the Landlord on behalf of each enrolled Tenant; pricing is disclosed in the OTP enrollment flow at the time of activation.
+- **Payment processing fees**: ACH at a flat $6.00 per transaction; card at 3.5% + $0.55 per transaction (no cap). Per-property settings determine whether processing fees are passed through to the tenant at checkout or deducted from the Landlord's settlement. **In no case will GAM absorb processing or banking fees on a Landlord's behalf.**
+
+**New-landlord onboarding grace.** A newly onboarded Landlord is not charged the per-occupied-unit or per-property platform fee until the Landlord goes live — that is, until the first rent payment settles through the Platform — subject to a maximum grace of two (2) billing cycles. This ensures a Landlord does not pay the platform fee before actually using the Platform to collect rent. A Landlord switching from another platform therefore does not pay both platforms at once during the transition.
 
 Pricing for additional services (background checks, screening, GAM Books features, point-of-sale, etc.) is disclosed in the Platform at the point of use.
 
 GAM reserves the right to change its fees prospectively with thirty (30) days' notice via email or in-platform notification. Continued use of the Platform after the effective date constitutes acceptance of the new pricing. Existing transactions in flight are honored at the pricing in effect when initiated.
 
-### 6.3 No Cash, No Check
+### 6.3 Electronic Payments and Recorded Manual Payments
 
-The Platform supports electronic payments only (ACH and card). Cash, checks, money orders, and other paper instruments are not supported. Any in-person collections must be handled outside the Platform; the Tenant's Platform account will continue to reflect the unpaid balance until the Tenant converts the payment to an electronic method.
+The Platform's built-in rent collection processes electronic payments (ACH and card) through the Payment Rail. A Landlord or authorized staff member may also **record a payment the Tenant made off-platform** — cash, check, or money order — so that the Tenant's balance reflects it. Recording a manual payment marks the corresponding rent as settled but moves no money through the Payment Rail; the Landlord is responsible for having actually received the off-platform funds and for their accuracy. Each recorded manual payment is subject to a **$10.00 manual-payment fee** payable to GAM. This fee is waived only for a Tenant's first recorded rent payment during a property's initial onboarding window — the first few weeks after the property is brought onto the Platform, while existing tenancies are being migrated over. Tenants added after that onboarding window are charged the fee even on a first recorded payment.
 
 ### 6.4 Chargebacks, ACH Returns, and Disputes
 
@@ -121,7 +124,7 @@ Each ledger entry written by the Platform's allocation engine records the destin
 
 ### 6.6 Payment Routing — GAM-First Application
 
-When a Tenant authorizes an ACH or card payment through the Platform for rent (or any other amount that would otherwise settle to your Connect balance), the Platform applies the payment **first to any outstanding balance the Tenant owes GAM** under a Service-Level Agreement (e.g., FlexDeposit installments), Platform subscription (e.g., FlexPay), or pass-through processing fee. Within outstanding GAM balances the Platform applies the payment first-in, first-out — oldest unpaid GAM amount first. Only the **remainder** (if any) settles to your Connect balance and is credited as rent received.
+When a Tenant authorizes an ACH or card payment through the Platform for rent (or any other amount that would otherwise settle to your Connect balance), the Platform applies the payment **first to any outstanding balance the Tenant owes GAM** under a FlexDeposit Custody Agreement (e.g., FlexDeposit custody installments), a Platform subscription (e.g., FlexPay), or a pass-through processing fee. Within outstanding GAM balances the Platform applies the payment first-in, first-out — oldest unpaid GAM amount first. Only the **remainder** (if any) settles to your Connect balance and is credited as rent received.
 
 Your Landlord-side ledger reflects only the amount actually received by you. **The Tenant's rent balance on the Landlord-side ledger will continue to show unpaid in the amount routed to GAM.** The Tenant remains responsible to you for any unpaid rent that results; this Section 6.6 does not impair any remedy you have under the lease (late fee, eviction notice, or other action) for unpaid rent. GAM is not liable for any rent shortfall on a particular Tenant payment caused by the GAM-first routing.
 
@@ -129,7 +132,7 @@ The Platform discloses the routing breakdown to both you and the Tenant after ea
 
 ### 6.7 Unpaid Rent and Collections Partner
 
-If a Tenant owes you unpaid rent, you may engage GAM's third-party collections partner (the "**Collections Partner**") through the Platform to recover the unpaid rent on your behalf. **The Collections Partner is engaged solely for landlord-owed unpaid rent.** It is not engaged for any FlexDeposit, FlexPay, or other GAM Service-Level Agreement amount.
+If a Tenant owes you unpaid rent, you may engage GAM's third-party collections partner (the "**Collections Partner**") through the Platform to recover the unpaid rent on your behalf. **The Collections Partner is engaged solely for landlord-owed unpaid rent.** It is not engaged for any FlexDeposit custody installment, FlexPay subscription fee, or other GAM-owed balance.
 
 When you engage the Collections Partner:
 
@@ -168,7 +171,7 @@ GAM does **not** determine the legality, reasonableness, or enforceability of an
 The following refund policy applies to all transactions on the Platform:
 
 - **Payment processing fees** (ACH, card, Connect, platform) are **non-refundable** under all circumstances, including when the underlying payment is reversed, refunded, or charged back.
-- **GAM platform fees** (the $2/occupied-unit fee, the $10/property minimum, the short-term-stay aggregate fee, and any other service fee charged by GAM to a Landlord or PM Company) are **non-refundable** under all circumstances.
+- **GAM platform fees** (the $2/occupied-unit fee, the $10/property minimum, the short-term-stay fee, the manual-payment fee, and any other service fee charged by GAM to a Landlord or PM Company) are **non-refundable** under all circumstances.
 - **Tenant payments to Landlords** (rent, utility charges, fee assessments) may be refunded by the Landlord at the Landlord's discretion through the Platform's refund interface. GAM does not initiate, mandate, or guarantee any such refund.
 - GAM does **not** refund any payment for services rendered, even if you claim dissatisfaction. Disputes about Platform functionality should be raised through `support@goldassetmanagement.com`; GAM will work in good faith to resolve operational issues but is not obligated to refund.
 
@@ -303,7 +306,7 @@ TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL GAM, ITS AFFILIATES, O
 
 GAM'S AGGREGATE LIABILITY ARISING OUT OF OR RELATED TO THESE TERMS OR THE PLATFORM IS LIMITED TO THE TOTAL **PLATFORM FEES** YOU PAID TO GAM IN THE NINETY (90) DAYS IMMEDIATELY PRECEDING THE EARLIER OF (i) THE EVENT GIVING RISE TO THE CLAIM, OR (ii) THE TERMINATION OF YOUR ACCOUNT. IF YOU PAID NO PLATFORM FEES IN THAT WINDOW, GAM'S AGGREGATE LIABILITY IS ZERO.
 
-FOR PURPOSES OF THIS SECTION, "**PLATFORM FEES**" MEANS FEES CHARGED BY GAM FOR USE OF THE PLATFORM, INCLUDING THE PER-OCCUPIED-UNIT PLATFORM FEE, THE PER-PROPERTY MINIMUM, THE SHORT-TERM-STAY AGGREGATE FEE, AND THE CONNECT ACCOUNT FEE. **PLATFORM FEES DO NOT INCLUDE, AND THE FOREGOING CAP EXCLUDES**:
+FOR PURPOSES OF THIS SECTION, "**PLATFORM FEES**" MEANS FEES CHARGED BY GAM FOR USE OF THE PLATFORM, INCLUDING THE PER-OCCUPIED-UNIT PLATFORM FEE, THE PER-PROPERTY MINIMUM, THE SHORT-TERM-STAY FEE, THE MANUAL-PAYMENT FEE, AND THE CONNECT ACCOUNT FEE. **PLATFORM FEES DO NOT INCLUDE, AND THE FOREGOING CAP EXCLUDES**:
 
 - (i) PAYMENT PROCESSING FEES OF ANY KIND, WHETHER ACH OR CARD, REGARDLESS OF WHETHER THEY WERE PAID BY THE TENANT (PASS-THROUGH) OR THE LANDLORD;
 - (ii) BANKING FEES, NETWORK INTERCHANGE, AND ANY THIRD-PARTY PAYMENT-NETWORK FEE OR SURCHARGE;
@@ -444,6 +447,14 @@ Headings in these Terms are for convenience only and do not affect interpretatio
 ### 24.8 Relationship of the Parties
 
 Nothing in these Terms creates any agency, partnership, joint venture, employment, or fiduciary relationship between you and GAM.
+
+## 25. Automated Systems and AI Agents
+
+The Platform operates in part through automated systems and AI-assisted agents that may communicate with you, generate documents and notices, schedule and process activity, and perform routine actions within the Platform. These agents identify themselves as AI when asked and do not claim to be GAM's human staff, your tenants, or any other person. **Where an automated or AI agent presents an action for your review — approving or declining an applicant, sending a tenant notice, recording an inspection condition, billing a fee, scheduling maintenance, or the like — you are responsible for confirming the action before it is taken, and you are responsible for any action you confirm or direct the agent to take.** These systems may occasionally make an error or take an incorrect action; GAM may review, correct, reverse, or adjust any erroneous action, entry, communication, or record produced by such systems, and you authorize GAM to make those corrections. Automated or AI-generated communications are operational tools — they are not legal, tax, or financial advice and do not replace your own judgment or your obligation to comply with the laws governing your properties, tenants, employees, and contractors. GAM's responsibility for the actions of its automated systems is governed by the Disclaimers and Limitation of Liability sections, and you agree to promptly notify GAM of any error you identify so it can be corrected.
+
+## 26. Communications and Consent to Contact
+
+You consent to receive communications from GAM — including account, billing, transaction, security, and service messages — by email, SMS/text message, push notification, and telephone, **including messages sent using automated or autodialed systems and prerecorded or AI-generated voices**, at the email address and phone numbers you provide. Message and data rates may apply and message frequency varies. **Consent to receive marketing communications is not a condition of using the Platform.** You may opt out of marketing communications at any time (for example, by replying STOP to a marketing text or using an unsubscribe link), but you may not opt out of operational and transactional messages necessary to provide the service while you maintain an account. You are responsible for keeping your contact information current and will promptly notify GAM if you stop using a phone number you provided.
 
 ---
 

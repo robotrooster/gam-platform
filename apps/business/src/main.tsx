@@ -22,6 +22,7 @@ import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout } from './components/layout/Layout'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { LoginPage } from './pages/LoginPage'
+import { BusinessForgotPasswordPage, BusinessResetPasswordPage } from './pages/PasswordRecoveryPages'
 import { SignupPage } from './pages/SignupPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { CustomersPage } from './pages/CustomersPage'
@@ -64,6 +65,12 @@ function App() {
       <AuthProvider>
         <Routes>
           <Route path="/login"  element={<LoginPage />} />
+          {/* S605: the business portal had NO password recovery — no link, no
+              page, no route — while the API endpoint existed since S289. A
+              forgotten password meant permanent lockout, the same gap Nic hit
+              on the real landlord account. */}
+          <Route path="/forgot-password" element={<BusinessForgotPasswordPage />} />
+          <Route path="/reset-password"  element={<BusinessResetPasswordPage />} />
           <Route path="/signup" element={<SignupPage />} />
           {/* Driver UI: full-screen, no Layout sidebar — phone-first. Lazy +
               Suspense so the MapLibre chunk loads only on this route. */}

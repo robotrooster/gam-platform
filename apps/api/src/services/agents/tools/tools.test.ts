@@ -11,8 +11,10 @@ vi.mock('../../../db/propertiesDb', () => ({ queryProperties: vi.fn() }))
 vi.mock('../../maintenanceRequests', () => ({ createMaintenanceRequest: vi.fn() }))
 vi.mock('../../notifications', () => ({ createNotification: vi.fn(), notifyMaintenanceUpdated: vi.fn() }))
 vi.mock('../../unitAvailability', () => ({ findStayConflict: vi.fn() }))
+vi.mock('../../../lib/stripe', () => ({ getStripe: vi.fn() }))
 
 import { query } from '../../../db'
+import { getStripe } from '../../../lib/stripe'
 import { createMaintenanceRequest } from '../../maintenanceRequests'
 import { getToolsForProfile, getTool } from './index'
 import { fileMaintenanceRequest } from './fileMaintenanceRequest'
@@ -451,13 +453,36 @@ describe('read tools scope to the actor', () => {
       expect((query as any).mock.calls[0][1][0]).toBe('t1')
     })
 
-    it('get_my_payment_methods binds to userId and never returns full account numbers', async () => {
-      ;(query as any).mockResolvedValue([{ nickname: 'Checking', account_type: 'checking', account_number_last4: '6789', status: 'verified' }])
+    it('get_my_payment_methods reads the tenant Stripe methods (bank + card), binds to the tenant id, never returns full account numbers', async () => {
+      ;(query as any).mockResolvedValue([{ stripe_customer_id: 'cus_1', ach_verified: true }])
+      ;(getStripe as any).mockReturnValue({
+        paymentMethods: {
+          list: vi.fn()
+            .mockResolvedValueOnce({ data: [{ id: 'pm_ach', us_bank_account: { bank_name: 'Chase', last4: '6789' } }] })
+            .mockResolvedValueOnce({ data: [{ id: 'pm_card', card: { brand: 'visa', last4: '4242' } }] }),
+        },
+      })
       const res: any = await getMyPaymentMethods.execute({}, TENANT_ACTOR)
-      expect((query as any).mock.calls[0][1]).toEqual(['u1'])
+      // Binds to the tenant profile id, reads `tenants` (NOT the payout catalog user_bank_accounts).
+      expect((query as any).mock.calls[0][1]).toEqual(['t1'])
       const sql = (query as any).mock.calls[0][0]
-      expect(sql).not.toMatch(/account_number_encrypted|routing_number/)
-      expect(res.methods[0]).toMatchObject({ last4: '6789' })
+      expect(sql).toMatch(/FROM tenants/)
+      expect(sql).not.toMatch(/user_bank_accounts|account_number_encrypted|routing_number/)
+      expect(res.hasPaymentMethod).toBe(true)
+      expect(res.methods).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'ach', last4: '6789', chargeable: true }),
+        expect.objectContaining({ type: 'card', brand: 'visa', last4: '4242' }),
+      ]))
+    })
+
+    it('get_my_payment_methods reports honestly (not "none") when Stripe lookup fails', async () => {
+      ;(query as any).mockResolvedValue([{ stripe_customer_id: 'cus_1', ach_verified: false }])
+      ;(getStripe as any).mockReturnValue({
+        paymentMethods: { list: vi.fn().mockRejectedValue(new Error('stripe down')) },
+      })
+      const res: any = await getMyPaymentMethods.execute({}, TENANT_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.error).toBe('could_not_check')
     })
 
     it('get_delinquent_tenants binds payments to the landlord id', async () => {

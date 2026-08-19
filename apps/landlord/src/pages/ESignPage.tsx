@@ -541,6 +541,11 @@ function SendDocumentModal({ onClose }) {
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
   const [prefillValues, setPrefillValues] = useState<Record<string,string>>({})
+  // S604 (Nic): migration onboarding — the landlord ALREADY holds this tenant's
+  // deposit. Without this, e-signing new leases for existing tenants bills every
+  // one of them a fresh deposit (19 x $350 at Oak Park). The lease still STATES
+  // the deposit; only the charge is suppressed.
+  const [depositAlreadyHeld, setDepositAlreadyHeld] = useState(false)
   // S235: witness signer fields. Only surfaced when the picked template
   // has fields assigned to signerRole='witness'; otherwise hidden so the
   // common no-witness leases stay one-click.
@@ -664,7 +669,7 @@ function SendDocumentModal({ onClose }) {
     const w = await witnessSigner(order)
     if (w) signers.push(w)
     const title = (selectedTemplate ? selectedTemplate.name : 'Document') + ' — Unit ' + group.unitNumber
-    const res = await apiPost('/esign/documents', { templateId, unitId: group.unitId, title, signers, prefillValues })
+    const res = await apiPost('/esign/documents', { templateId, unitId: group.unitId, title, signers, prefillValues, depositAlreadyHeld })
     await apiPost('/esign/documents/' + res.data.id + '/send', {})
   }
 
@@ -870,6 +875,25 @@ function SendDocumentModal({ onClose }) {
             </div>
           </div>
         )}
+        {/* S604 (Nic): migration onboarding. Existing tenants signing a NEW GAM
+            lease must not be re-billed a deposit the landlord already holds. */}
+        <div style={{ marginBottom: 12, padding: '10px 12px', background: 'var(--bg-2)',
+                      borderRadius: 8, border: `1px solid ${depositAlreadyHeld ? 'var(--gold)' : 'var(--border-0)'}` }}>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+            <input type="checkbox" checked={depositAlreadyHeld}
+              onChange={e => setDepositAlreadyHeld(e.target.checked)} style={{ marginTop: 2 }} />
+            <span>
+              <span style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)' }}>
+                Security deposit is already held
+              </span>
+              <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
+                For existing tenants moving onto GAM. The lease still states the deposit amount,
+                but the tenant is <strong>not billed</strong> for it — it&apos;s recorded as already
+                collected and held by you. Leave unchecked for a genuinely new tenant.
+              </span>
+            </span>
+          </label>
+        </div>
         {error && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>{error}</div>}
         {progress && <div style={{ color:'var(--gold)', fontSize:'.75rem', marginBottom:10 }}>{progress}</div>}
         <div className='modal-footer'>

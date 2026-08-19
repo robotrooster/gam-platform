@@ -52,45 +52,74 @@ function cycleUsageFromReadings(cycleVal: number, priorVal: number, isRollover: 
   return usage
 }
 
-/** S558: a linked submeter's usage for the cycle, for RUBS pool exclusion.
- *  Returns { blocked } when the submeter can't be resolved — the RUBS pool must
- *  NOT bill until every linked submeter is read + resolved, or the RUBS units
- *  would carry gallons that were actually the submetered units'. */
+/** S558/S605: a linked submeter's usage for the cycle, for RUBS pool exclusion.
+ *
+ *  S605 (Nic, DIRECTIVE): this NEVER blocks. It used to return { blocked } for
+ *  an unread, flagged, baseline-less or negative submeter, and the caller then
+ *  refused to bill the WHOLE master — so one meter nobody could read stopped
+ *  the entire property's water bill. Nic: "if one water meter is broken or not
+ *  spinning, or somebody was on vacation and it gets a read that shows no
+ *  usage... it still needs to bill the water out."
+ *
+ *  Unresolvable now falls back to the SAME estimate a broken meter already
+ *  used since S559 — the lowest usage among comparable units at the property
+ *  that cycle. The estimate is deliberately the LOWEST rather than an average:
+ *  it is the figure that can be defended to the excluded tenant without
+ *  argument, and it keeps the exclusion conservative.
+ *
+ *  `estimated` tells the caller the number was inferred, so the cycle can be
+ *  surfaced for a read-and-correct instead of passing silently. */
 async function submeterCycleUsageForExclusion(
   meterId: string, cycleIso: string,
-): Promise<{ usage: number } | { blocked: string }> {
+): Promise<{ usage: number; estimated?: string }> {
   const m = await queryOne<{ digits: number; label: string; out_of_service: boolean; utility_type: string; property_id: string }>(
     `SELECT digits, label, out_of_service, utility_type, property_id FROM utility_meters WHERE id = $1`, [meterId])
-  if (!m) return { blocked: 'linked submeter not found' }
+  if (!m) return { usage: 0, estimated: 'linked submeter not found' }
   // Broken submeter (S559): no real read, but it must NOT block the RUBS
   // pool. Its excluded amount is what it actually bills — the lowest
   // comparable usage (0 when there's no comparable to draw from).
   if (m.out_of_service) {
-    const u = await queryOne<{ unit_type: string | null; rv_amp_service: string | null }>(
-      `SELECT cu.unit_type, cu.rv_amp_service FROM utility_meter_units mu
-         JOIN units cu ON cu.id = mu.unit_id WHERE mu.meter_id = $1 LIMIT 1`, [meterId])
-    const comp = await lowestComparableUsage({
-      brokenMeterId: meterId, propertyId: m.property_id, utilityType: m.utility_type,
-      unitType: u?.unit_type ?? null, rvAmpService: u?.rv_amp_service ?? null, cycleIso,
-    })
-    return { usage: comp ?? 0 }
+    const est = await estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" is out of service`)
+    return { usage: est.usage }   // long-standing, expected state — not flagged as an anomaly
   }
   const cur = await queryOne<any>(
     `SELECT reading_value, is_rollover, needs_review, reading_date, created_at FROM utility_meter_readings
       WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' ORDER BY reading_date DESC LIMIT 1`,
     [meterId, cycleIso])
-  if (!cur) return { blocked: `submeter "${m.label}" has no reading this cycle` }
-  if (cur.needs_review) return { blocked: `submeter "${m.label}" awaiting double-check` }
+  if (!cur) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" had no reading this cycle`)
+  // A flagged read is a number nobody has confirmed yet. Estimating rather than
+  // using it keeps an obviously-wrong read (stuck meter, transposed digits) out
+  // of the pool math, and the double-check queue still gets it either way.
+  if (cur.needs_review) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" is awaiting a double-check`)
   // Point-in-time prior (S559) — see generateBillsForMeter.
   const prior = await queryOne<any>(
     `SELECT reading_value FROM utility_meter_readings
       WHERE meter_id = $1 AND (reading_date, created_at) < ($2, $3)
       ORDER BY reading_date DESC, created_at DESC LIMIT 1`, [meterId, cur.reading_date, cur.created_at])
-  if (!prior) return { blocked: `submeter "${m.label}" has no prior reading (needs a baseline cycle)` }
+  if (!prior) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" has no opening read`)
   const usage = cycleUsageFromReadings(
     Number(cur.reading_value), Number(prior.reading_value), !!cur.is_rollover, m.digits)
-  if (usage < 0) return { blocked: `submeter "${m.label}" has negative usage — awaiting double-check` }
+  if (usage < 0) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" read lower than the previous read`)
   return { usage }
+}
+
+/** S605: the shared fallback — what a submeter is assumed to have used when its
+ *  real usage can't be established this cycle. Mirrors the S559 broken-meter
+ *  rule exactly, so a meter that is unread and a meter that is out of service
+ *  are excluded on the same basis. 0 when the property has no comparable to
+ *  draw from: we never invent a number with no evidence behind it. */
+async function estimateForUnresolvedSubmeter(
+  m: { utility_type: string; property_id: string },
+  meterId: string, cycleIso: string, why: string,
+): Promise<{ usage: number; estimated: string }> {
+  const u = await queryOne<{ unit_type: string | null; rv_amp_service: string | null }>(
+    `SELECT cu.unit_type, cu.rv_amp_service FROM utility_meter_units mu
+       JOIN units cu ON cu.id = mu.unit_id WHERE mu.meter_id = $1 LIMIT 1`, [meterId])
+  const comp = await lowestComparableUsage({
+    brokenMeterId: meterId, propertyId: m.property_id, utilityType: m.utility_type,
+    unitType: u?.unit_type ?? null, rvAmpService: u?.rv_amp_service ?? null, cycleIso,
+  })
+  return { usage: comp ?? 0, estimated: why }
 }
 
 /** S559: lowest comparable submeter usage for a BROKEN meter's cycle.
@@ -142,6 +171,29 @@ async function lowestComparableUsage(args: {
   return Math.floor(Math.min(...usages))
 }
 
+
+/** S605: overlay the property's utility pricing onto a meter row, in place.
+ *
+ *  Mutates the row the billing math reads rather than threading a second rate
+ *  through every branch — submeter, RUBS, flat-rate and the exclusion path all
+ *  read `meter.rate_per_unit` / `base_fee` / `sewer_rate_per_unit`, and a policy
+ *  that only reached some of them would be worse than none.
+ *
+ *  A property row with a NULL rate is treated as "not set for this utility" and
+ *  leaves the meter's own value alone — configuring water must not silently zero
+ *  out electric. */
+async function applyPropertyRates(meter: any): Promise<void> {
+  const pr = await queryOne<any>(
+    `SELECT rate_per_unit, base_fee, sewer_rate_per_unit
+       FROM property_utility_rates
+      WHERE property_id = $1 AND utility_type = $2`,
+    [meter.property_id, meter.utility_type])
+  if (!pr) return
+  if (pr.rate_per_unit != null) meter.rate_per_unit = pr.rate_per_unit
+  if (pr.base_fee != null) meter.base_fee = pr.base_fee
+  if (pr.sewer_rate_per_unit != null) meter.sewer_rate_per_unit = pr.sewer_rate_per_unit
+}
+
 export async function generateBillsForMeter(
   meterId: string,
   cycleMonth: Date,  // 1st of month
@@ -151,6 +203,20 @@ export async function generateBillsForMeter(
   const meter = await queryOne<any>(
     `SELECT * FROM utility_meters WHERE id = $1`, [meterId])
   if (!meter) throw new AppError(404, 'Meter not found')
+
+  // S605 (Nic, DIRECTIVE): "make utility rates set at the property level. adding
+  // each unit is redundant and possible discrimination."
+  //
+  // Pricing is PROPERTY POLICY. Where the property sets a rate for this utility
+  // it overrides whatever the meter carries, so every tenant at the property is
+  // billed the same price for the same utility no matter who typed their unit
+  // in. Same choke point as the S535 property-level late fees, for the same
+  // reason.
+  //
+  // The meter columns remain the fallback for properties not yet configured, and
+  // each utility_bills row still snapshots the rate it was charged at — so an
+  // issued bill never changes because policy changed later.
+  await applyPropertyRates(meter)
 
   // Get the property's landlord — utility_meters carry property_id, not
   // landlord_id directly. Snapshot at generation time.
@@ -382,17 +448,27 @@ export async function generateBillsForMeter(
     [units.map((u: any) => u.unit_id), meter.utility_type])
   const excludedUnitIds = new Set(subOnUnit.map(r => r.unit_id))
   let excludedUsage = 0
+  // S605 (Nic, DIRECTIVE): "we need to block the behavior that stops the bill
+  // from going out for the master bill." One unread or flagged submeter used to
+  // abort the ENTIRE property's water bill — the landlord simply didn't get
+  // paid for water that month because somebody was on vacation. The exclusion
+  // now always resolves to a number (estimated where it must be), so the master
+  // always bills. Anything inferred is collected and reported so the landlord
+  // knows which meters to chase, rather than the whole bill silently vanishing.
+  const estimatedNotes: string[] = []
   for (const s of subOnUnit) {
     const r = await submeterCycleUsageForExclusion(s.submeter_id, cycleIso)
-    if ('blocked' in r) {
-      return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
-        reason: `RUBS pool can't be computed — ${r.blocked}. Read/resolve every submeter on this master's units, then re-run.` }
-    }
+    if (r.estimated) estimatedNotes.push(r.estimated)
     excludedUsage += r.usage
   }
+  // S605: exclusions exceeding the master reading means a bad read somewhere,
+  // but aborting is still the wrong response — it was the abort that lost the
+  // landlord the whole bill. Clamp the pool at zero (the RUBS units are charged
+  // nothing rather than a negative), bill the base fee, and report it loudly.
   if (excludedUsage > masterUsage) {
-    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
-      reason: `Submetered usage (${excludedUsage}) exceeds the master reading (${masterUsage}) — check the readings.` }
+    estimatedNotes.push(
+      `submetered usage (${excludedUsage}) exceeded the master reading (${masterUsage}) — check the readings`)
+    excludedUsage = masterUsage
   }
   // Only the units WITHOUT their own submeter split the remaining pool.
   const rubsUnits = units.filter((u: any) => !excludedUnitIds.has(u.unit_id))
@@ -473,7 +549,15 @@ export async function generateBillsForMeter(
   }
 
   if (billsCreated > 0) await invoiceEndedLeaseBills(meterId, cycleIso)
-  return { meterId, cycleMonth: cycleIso, billsCreated, unitsSkipped }
+  // S605: the bill went out either way — say plainly what had to be inferred so
+  // the landlord can read those meters and correct next cycle. Silence here was
+  // the old failure in a new costume.
+  return {
+    meterId, cycleMonth: cycleIso, billsCreated, unitsSkipped,
+    ...(estimatedNotes.length
+      ? { reason: `Billed with estimated submeter usage — ${estimatedNotes.join('; ')}. Read these meters and correct next cycle.` }
+      : {}),
+  }
 }
 
 /** S559: bill a MOVE-OUT final read on a submeter — the departing responsible
@@ -487,6 +571,10 @@ export async function generateBillsForMeter(
 export async function billMoveOutRead(meterId: string, readingId: string): Promise<{ billed: boolean; reason?: string }> {
   const meter = await queryOne<any>(`SELECT * FROM utility_meters WHERE id = $1`, [meterId])
   if (!meter || meter.billing_method !== 'submeter') return { billed: false, reason: 'not a submeter' }
+  // S605: a move-out bill is priced by the same property policy as every other
+  // bill — a departing tenant must not be charged a different rate than the one
+  // moving in behind them.
+  await applyPropertyRates(meter)
   const property = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id = $1`, [meter.property_id])
   if (!property) return { billed: false, reason: 'property not found' }
   // S560: format billing_cycle_month to 'YYYY-MM-DD' in SQL — pg returns a

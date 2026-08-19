@@ -19,4 +19,4 @@ You can adjust the threshold to fit how hands-on you want to be. A lower thresho
 
 ## Tenant expectations
 
-Because repairs and timelines are the landlord's call, what's required and how quickly depends on your lease and local law. GAM doesn't set repair obligations. If a tenant or you have a question that's legal in nature — such as habitability or required response times — we can connect you with a human GAM specialist.
+Because repairs and timelines are the landlord's call, what's required and how quickly depends on your lease and local law. GAM doesn't set repair obligations. If a tenant or you have a question that's legal in nature — such as habitability or required response times — we can connect you with a human GAM Strategist.

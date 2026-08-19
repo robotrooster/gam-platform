@@ -13,8 +13,8 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
-import { installDatePickerAutoClose } from '@gam/shared'
-import React, { useEffect } from 'react'
+import { installDatePickerAutoClose, startVersionWatch } from '@gam/shared'
+import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
@@ -30,12 +30,41 @@ function TelemetryPing() {
   }, [location.pathname])
   return null
 }
+// S605 — stale-shell self-heal. A landlord was locked out by a page that had
+// stopped talking to the server and could only be cured by a manual hard
+// refresh, which no real customer would ever think to do. A bfcache restore on
+// an outdated build reloads itself silently; a newer deploy found on refocus or
+// on the 5-minute poll only OFFERS a reload, because someone may be mid-way
+// through entering a batch of units and must never have the page yanked.
+function VersionWatch() {
+  const [updateReady, setUpdateReady] = useState(false)
+  useEffect(() => startVersionWatch({
+    intervalMs: 5 * 60_000,
+    onUpdateAvailable: () => setUpdateReady(true),
+  }), [])
+  if (!updateReady) return null
+  return (
+    <div style={{
+      position:'fixed', bottom:18, left:'50%', transform:'translateX(-50%)', zIndex:9999,
+      display:'flex', alignItems:'center', gap:12, padding:'10px 16px',
+      background:'var(--bg-2)', border:'1px solid var(--gold)', borderRadius:10,
+      boxShadow:'0 6px 24px rgba(0,0,0,.45)', fontSize:'.82rem', color:'var(--text-1)',
+    }}>
+      A newer version of GAM is available.
+      <button className="btn btn-primary btn-sm" onClick={() => window.location.reload()}>Reload</button>
+    </div>
+  )
+}
+
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor, HubTabLayout } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
+import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
+import { ResetPasswordPage }  from './pages/ResetPasswordPage'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
+import { AcceptOwnerInvitePage } from './pages/AcceptOwnerInvitePage'
 import { DashboardPage }   from './pages/DashboardPage'
 import { ReferLandlordPage } from './pages/ReferLandlordPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
@@ -53,8 +82,7 @@ import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { LotRentPage } from './pages/LotRentPage'
 import { ExpensesPage } from './pages/ExpensesPage'
-import { BankReconciliationPage } from './pages/BankReconciliationPage'
-import { BankFeedPage }      from './pages/BankFeedPage'
+import { BankPage } from './pages/BankPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
@@ -115,6 +143,13 @@ class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error:
 function RoleRedirect() {
   const { user } = useAuth()
   if (!user) return <Navigate to="/login" replace />
+  // S605: a co-owner invite that sent the visitor off to sign in or register
+  // must still be applied when they come back — otherwise they authenticate,
+  // land on a dashboard with none of the property they were invited to, and
+  // have no idea the invite was dropped. Survives both the login and the
+  // registration detour.
+  const pendingInvite = sessionStorage.getItem('gam_pending_owner_invite')
+  if (pendingInvite) return <Navigate to={`/accept-owner-invite/${pendingInvite}`} replace />
   // Staff land on the FIRST page their permission set actually grants — the
   // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
   // front-desk user with no POS access on an empty register). Zero grants →
@@ -158,10 +193,19 @@ export default function App() {
       <AuthProvider>
         <BrowserRouter>
           <TelemetryPing />
+          <VersionWatch />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
+            {/* S605: the landlord portal had no password recovery at all — no
+                link, no page, no route — while the API endpoint had existed
+                since S289. A forgotten password meant permanent lockout. */}
+            <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password"  element={<ResetPasswordPage />} />
             <Route path="/invite/:token" element={<AcceptInvitePage />} />
+            {/* S605: co-owner invite. PUBLIC — the invitee may have no account
+                yet, which is the entire point of the flow. */}
+            <Route path="/accept-owner-invite/:token" element={<AcceptOwnerInvitePage />} />
             <Route path="/shelf/:id" element={<ShelfLabelPage />} />
             <Route path="/" element={<PrivateRoute><ErrorBoundary><Layout /></ErrorBoundary></PrivateRoute>}>
               <Route index element={<RoleRedirect />} />
@@ -200,8 +244,11 @@ export default function App() {
                 <Route path="disbursements"  element={<DisbursementsPage />} />
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
-                <Route path="bank-feed"      element={<BankFeedPage />} />
-                <Route path="bank-reconciliation" element={<BankReconciliationPage />} />
+                {/* S605: one Bank tab. The old paths redirect so existing
+                    links and bookmarks don't 404. */}
+                <Route path="bank"           element={<BankPage />} />
+                <Route path="bank-feed"      element={<Navigate to="/bank" replace />} />
+                <Route path="bank-reconciliation" element={<Navigate to="/bank" replace />} />
                 <Route path="banking"        element={<BankingPage />} />
                 <Route path="lot-rent"       element={<LotRentPage />} />
               </Route>

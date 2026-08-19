@@ -141,7 +141,7 @@ function BalanceWithdrawSection() {
         <div className="kpi-card">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value gold">{fmt(balance)}</div>
-          <div className="kpi-sub">{connectReady ? 'Pays out on the next Friday batch' : 'Link your bank to get paid'}</div>
+          <div className="kpi-sub">{connectReady ? 'Paid out automatically each week — in your bank by Friday' : 'Link your bank to get paid'}</div>
         </div>
         {pending > 0 && (
           <div className="kpi-card">

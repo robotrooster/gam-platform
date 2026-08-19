@@ -18,4 +18,4 @@ Because GAM is electronic-only, the way to keep a payment from being late is to 
 
 ## If a late fee looks wrong
 
-First, check your lease to confirm the grace period and late-fee terms. If something still seems off, your landlord governs these terms — and for questions about whether a fee was applied correctly, or anything legal-adjacent, we can connect you with a human GAM specialist.
+First, check your lease to confirm the grace period and late-fee terms. If something still seems off, your landlord governs these terms — and for questions about whether a fee was applied correctly, or anything legal-adjacent, we can connect you with a human GAM Strategist.

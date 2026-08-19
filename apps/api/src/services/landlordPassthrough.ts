@@ -198,10 +198,18 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
           )`,
       [sentinel, landlordRow.landlord_id]
     )
+    // S602 deposit-trust: NEVER pass a deposit through to the landlord on the
+    // weekly batch. A tenant deposit is held by GAM in the segregated trust pool
+    // (held_by='gam_escrow') and only leaves at move-out, when depositReturn
+    // splits it (tenant refund out, landlord's retained share out). Deposits
+    // carry no owner-share, so they're already excluded from `owed` above; this
+    // guard also keeps the reconcile flip from silently clearing their held
+    // state — a deposit stays platform_held=TRUE in trust until it's disbursed.
     const flipped = await client.query(
       `UPDATE payments
           SET platform_held = false
-        WHERE landlord_id = $1 AND platform_held = true AND status = 'settled'`,
+        WHERE landlord_id = $1 AND platform_held = true AND status = 'settled'
+          AND type <> 'deposit'`,
       [landlordRow.landlord_id]
     )
 

@@ -20,7 +20,7 @@ export const setInspectionItemCondition: AgentTool = {
   description:
     'Record the condition of one item on one of the landlord’s OWN draft inspections, as you walk them ' +
     'through the unit. Get the inspectionId from create_inspection or get_inspection_progress, and the ' +
-    'area/item from the checklist. condition is one of: good, fair, damaged, missing, na. Add notes and ' +
+    'area/item from the checklist. condition is one of: excellent, good, fair, damaged_missing, na (na = the item doesn’t apply to this unit). Add notes and' +
     'an estimatedRepairCost (dollars) for anything damaged or missing. Re-recording the same area+item ' +
     'updates it. Only works while the inspection is still a draft (before anyone signs). You record ' +
     'conditions; signing and finalizing stay with the people involved.',
@@ -30,7 +30,7 @@ export const setInspectionItemCondition: AgentTool = {
       inspectionId: { type: 'string', description: 'The inspection to write to (from create_inspection or get_inspection_progress).' },
       area: { type: 'string', description: 'The area, e.g. "Kitchen" (from the checklist).' },
       itemLabel: { type: 'string', description: 'The item within the area, e.g. "Refrigerator".' },
-      condition: { type: 'string', enum: [...INSPECTION_ITEM_CONDITIONS], description: 'excellent, good, fair, or damaged_missing (damaged or missing).' },
+      condition: { type: 'string', enum: [...INSPECTION_ITEM_CONDITIONS], description: 'excellent, good, fair, damaged_missing (damaged or missing), or na (not applicable to this unit).' },
       notes: { type: 'string', description: 'Optional note about the item’s condition.' },
       estimatedRepairCost: { type: 'number', description: 'Optional estimated repair cost in dollars, for damaged/missing items.' },
     },

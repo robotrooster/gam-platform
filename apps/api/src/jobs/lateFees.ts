@@ -88,6 +88,11 @@ function qualifyingInvoicesSql(rowFilter: string): string {
       JOIN properties p ON p.id = u.property_id
       WHERE ${rowFilter}
         AND i.status IN ('pending', 'partial')
+        -- S605 (Nic): a balance carried in from the landlord's previous system
+        -- must not start compounding the day it is entered. "A tenant on a
+        -- catch-up plan shouldn't be fined for arrears from the old system."
+        -- Set per invoice, so a landlord CAN opt a specific debt back in.
+        AND i.late_fee_exempt = false
         AND l.late_fee_enabled = true
         AND l.late_fee_initial_amount IS NOT NULL
         AND (NOW() AT TIME ZONE p.timezone)::date

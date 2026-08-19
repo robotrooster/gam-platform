@@ -12,7 +12,7 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, CalendarClock, RefreshCw, MessageSquare,
+  Landmark, ClipboardCheck, MessageSquare,
   Sun, Moon, Globe
 } from 'lucide-react'
 
@@ -44,6 +44,11 @@ const NAV_ITEMS: Array<{
   { to: '/refer',         icon: HeartHandshake,   label: 'Refer & Earn',     section: null },
   { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          category: 'pos' },
   // Portfolio
+  // S605 (Nic, DIRECTIVE): Utilities and Amenities were removed from top-level
+  // nav — they are PROPERTY-scoped and now live as sub-tabs inside a property
+  // (PropertyDetailPage). "A sub tab in the actual property... that way we see,
+  // like, the amenities tab." Their routes remain registered so existing links
+  // and bookmarks still resolve.
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          category: 'units' },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
@@ -64,26 +69,32 @@ const NAV_ITEMS: Array<{
   { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports' },
   // S568: landlord expense entry (feeds the P&L). Owner-level.
   { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
-  // S570: bank feed — link operating bank, categorize spending into the P&L. Owner-level.
-  { to: '/bank-feed',     icon: RefreshCw,        label: 'Bank Feed',        section: null, hub: 'financials' },
-  // S568: bank reconciliation (categorize bank charges). Owner-level.
-  { to: '/bank-reconciliation', icon: Landmark,   label: 'Bank Reconciliation', section: null, hub: 'financials' },
+  // S605 (Nic): ONE Bank tab. Feed (S570) + reconciliation (S568) were two nav
+  // items answering one question — "is my bank money right?" — because
+  // reconciliation was built as the manual stand-in before the feed existed and
+  // nobody merged them afterwards. Both routes still resolve, via redirects.
+  { to: '/bank',          icon: Landmark,         label: 'Bank',             section: null, hub: 'financials' },
   // S168: managers see /banking only when their landlord has flipped their
   // per-scope direct_deposit_enabled toggle on — special-cased in the filter.
-  { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null, hub: 'financials', category: 'banking' },
+  // S605 (Nic): was "Banking", which sat confusingly beside the new "Bank" tab.
+  // He asked for "Disbursements" to match the dashboard's wording — but that
+  // name is already the payout LIST two tabs over, so this is the ACCOUNT those
+  // disbursements are sent to. Same vocabulary, no duplicate tab. (Merging it
+  // into /disbursements outright would leak payout setup to property managers,
+  // who only see this tab when direct deposit is switched on — see the filter
+  // special-case below.)
+  { to: '/banking',       icon: Landmark,         label: 'Disbursement Account', section: null, hub: 'financials', category: 'banking' },
   // S568/S575: investor-operator net + lot rent (homes-only parks). Owner-level;
   // the sub-tab is further gated on the landlord actually having a mobile-home unit.
   { to: '/lot-rent',      icon: Landmark,         label: 'Lot Rent & Net',   section: null, hub: 'financials' },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
-  { to: '/amenities',     icon: CalendarClock,    label: 'Amenities',        section: null,          category: 'amenities' },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
   { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          category: 'inventory' },
   // W-36 (S531): sub-meter management — meters CRUD is gated on
   // properties.edit / units.* server-side; 'units' is the closest catalog
   // category for staff visibility.
-  { to: '/utilities',     icon: Package,          label: 'Utilities',        section: null,          category: 'units' },
   { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null },
   { to: '/surveys',       icon: MessageSquare,    label: 'Surveys',          section: null },
   // Screening — S575: one "Screening" sidebar item, these render as sub-tabs.
@@ -132,7 +143,12 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // net for homes-only parks). Landlords see it only once they have a
     // mobile-home unit; admin/super_admin (platform oversight) always see it;
     // staff never (owner-only item, no category).
+    // S605 (Nic): Lot Rent & Net is folded into the shelved sublease workflow —
+    // same business case (own homes in someone else's park, pay ground rent,
+    // rent to tenants), and unusable while that park isn't on GAM because every
+    // figure would be hand-entered. Hidden for everyone, including admins.
     if (item.to === '/lot-rent') {
+      if (SUBLEASING_SHELVED) return false
       if (role === 'landlord') return hasMobileHomeUnits
       return isOwner
     }
@@ -207,6 +223,13 @@ export const LAUNCH_HIDDEN = new Set<string>([
   '/pm-invitations',
 ])
 export const LAUNCH_HIDE_FITNESS = true
+// S605 (Nic): subleasing is SHELVED — the workflow requires the sublessee to
+// already be a GAM tenant, so it can't work until both sides are on the
+// platform. "I know people that sublease in a variety of parks, they will never
+// be able to use this until all the landlords are on the same software."
+// Server-side the `subleasing_enabled` feature flag refuses creation; this hides
+// the data-capture UI so nobody sets a policy for a feature that won't run.
+export const SUBLEASING_SHELVED = true
 
 const LL_FONTS: Record<string, { imp: string; family: string; display: string }> = {
   default:     { imp: '', family: "'Inter',sans-serif", display: "'Space Grotesk',sans-serif" },

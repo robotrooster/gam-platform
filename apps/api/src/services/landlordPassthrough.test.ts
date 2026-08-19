@@ -141,6 +141,29 @@ describe('reconcilePlatformHeldPayments', () => {
     expect(p.platform_held).toBe(false)
   })
 
+  it('S602: a held deposit is NEVER batched — stays platform_held=TRUE while rent passes through', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)  // rent owner-share
+    // A settled, platform-held tenant deposit sitting in the trust pool (no owner-share).
+    const { rows: [{ id: depositPaymentId }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments
+         (unit_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, platform_held, settled_at)
+       VALUES ($1, $2, $3, 'deposit', 1500, 'settled', 'DEPOSIT', CURRENT_DATE,
+               TRUE, NOW()) RETURNING id`,
+      [ctx.unitId, ctx.tenantId, ctx.landlordId])
+    transferMock.mockResolvedValueOnce({ id: 'tr_rent_only' } as any)
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    // Only the rent owner-share is transferred; the deposit is not in the batch.
+    expect(res.amount).toBe(950)
+    expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({ amount: 950 }))
+    // Rent flips to passed-through; the deposit STAYS held in trust.
+    const { rows: [rent] } = await db.query<any>(`SELECT platform_held FROM payments WHERE id=$1`, [ctx.paymentId])
+    const { rows: [dep]  } = await db.query<any>(`SELECT platform_held FROM payments WHERE id=$1`, [depositPaymentId])
+    expect(rent.platform_held).toBe(false)
+    expect(dep.platform_held).toBe(true)
+  })
+
   it('S561: nets a scheduled reversal receivable against the payout + resolves it', async () => {
     const ctx = await seedCtx()
     await seedOwnerShareLedger(ctx, 950)

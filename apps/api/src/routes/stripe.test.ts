@@ -45,9 +45,18 @@ vi.mock('../lib/stripe', async () => {
   }))
   // S570: confirm-setup gates ach_verified on the SetupIntent status.
   // Default 'succeeded' (verified path); the microdeposit-pending test overrides.
+  // S605: confirm-setup proves PM ownership from the SetupIntent (customer +
+  // payment_method) rather than pm.customer, because a microdeposit ACH
+  // PaymentMethod stays unattached until the deposits are confirmed. The mock
+  // must carry both fields, as the real Stripe object does.
   const setupIntentsRetrieve = vi.fn(async () => ({
     id: 'seti_mock', status: 'succeeded',
+    customer: 'cus_mock_tenant', payment_method: 'pm_x',
   }))
+  // S605: the microdeposit verify path lists the tenant's SetupIntents and
+  // submits either amounts or a descriptor code.
+  const setupIntentsList = vi.fn(async () => ({ data: [] as any[] }))
+  const verifyMicrodeposits = vi.fn(async () => ({ id: 'seti_pending', status: 'processing' }))
   const paymentMethodsRetrieve = vi.fn(async () => ({
     id: 'pm_mock',
     customer: 'cus_mock_tenant',
@@ -73,7 +82,7 @@ vi.mock('../lib/stripe', async () => {
   const paymentMethodsDetach = vi.fn(async (id: string) => ({ id }))
   const fakeStripe = {
     customers: { create: customersCreate, retrieve: customersRetrieve, update: customersUpdate },
-    setupIntents: { create: setupIntentsCreate, retrieve: setupIntentsRetrieve },
+    setupIntents: { create: setupIntentsCreate, retrieve: setupIntentsRetrieve, list: setupIntentsList, verifyMicrodeposits },
     paymentMethods: { retrieve: paymentMethodsRetrieve, list: paymentMethodsList, detach: paymentMethodsDetach },
   }
   const createTenantAchSetup = vi.fn(async () => ({
@@ -81,6 +90,7 @@ vi.mock('../lib/stripe', async () => {
   }))
   ;(globalThis as any).__stripeMocks = {
     customersCreate, customersRetrieve, customersUpdate, setupIntentsCreate, setupIntentsRetrieve,
+    setupIntentsList, verifyMicrodeposits,
     paymentMethodsRetrieve, paymentMethodsList, paymentMethodsDetach, createTenantAchSetup,
   }
   return {
@@ -113,6 +123,8 @@ const stripeMocks = (globalThis as any).__stripeMocks as {
   customersCreate:        ReturnType<typeof vi.fn>
   setupIntentsCreate:     ReturnType<typeof vi.fn>
   setupIntentsRetrieve:   ReturnType<typeof vi.fn>
+  setupIntentsList:       ReturnType<typeof vi.fn>
+  verifyMicrodeposits:    ReturnType<typeof vi.fn>
   paymentMethodsRetrieve: ReturnType<typeof vi.fn>
   paymentMethodsList:     ReturnType<typeof vi.fn>
   paymentMethodsDetach:   ReturnType<typeof vi.fn>
@@ -139,7 +151,7 @@ beforeEach(async () => {
     us_bank_account: { last4: '6789', routing_number: '110000000', bank_name: 'Test Bank' },
   } as any)
   // S570: default SetupIntent status = succeeded (verified path).
-  stripeMocks.setupIntentsRetrieve.mockResolvedValue({ id: 'seti_mock', status: 'succeeded' } as any)
+  stripeMocks.setupIntentsRetrieve.mockResolvedValue({ id: 'seti_mock', status: 'succeeded', customer: 'cus_mock_tenant', payment_method: 'pm_x' } as any)
 })
 
 const sign = (claims: any) =>
@@ -374,12 +386,60 @@ describe('POST /api/stripe/tenant/setup', () => {
     } finally { c.release() }
   })
 
+  // S603: a tenant may only add a CARD when something is actually due — storing
+  // a card early burns a $0.26 Stripe authorization (+ $0.02 Radar) that collects
+  // nothing. Card entry belongs at the moment of payment. ACH is exempt.
+  async function seedOutstanding(c: any, tenantId: string): Promise<void> {
+    const { landlordId } = await seedLandlord(c)
+    await c.query(
+      `INSERT INTO payments
+         (tenant_id, landlord_id, type, amount, status, entry_description, due_date)
+       VALUES ($1, $2, 'rent', 1000, 'pending', 'RENT', CURRENT_DATE)`,
+      [tenantId, landlordId])
+  }
+
+  it('card setup is REFUSED when the tenant owes nothing (S603 auth-cost gate)', async () => {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const tenantId = await seedTenant(c)
+      const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
+        `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await c.query('COMMIT')
+      const token = sign({ userId: user_id, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/setup')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ method: 'card' })
+      expect(res.status).toBe(409)
+      // No Stripe object may be created — that's the whole point of the gate.
+      expect(stripeMocks.setupIntentsCreate).not.toHaveBeenCalled()
+      expect(stripeMocks.customersCreate).not.toHaveBeenCalled()
+    } finally { c.release() }
+  })
+
+  it('ACH setup is still allowed with nothing due (a bank mandate is not an authorization)', async () => {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const tenantId = await seedTenant(c)
+      const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
+        `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await c.query('COMMIT')
+      const token = sign({ userId: user_id, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/setup')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ method: 'ach' })
+      expect(res.status).toBe(200)
+    } finally { c.release() }
+  })
+
   it('card first-setup: creates customer + SetupIntent with card type', async () => {
     const c = await db.connect()
     let tenantId = ''; let userId = ''
     try {
       await c.query('BEGIN')
       tenantId = await seedTenant(c)
+      await seedOutstanding(c, tenantId)
       const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
         `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
       userId = user_id
@@ -477,7 +537,10 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
 
   it('S570 microdeposit pending: SetupIntent not succeeded → ach_verified stays FALSE, no first-sender log, stamps bank + returns verified:false', async () => {
     const { tenantId, userId } = await seedTenantWithStripe()
-    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce({ id: 'seti_x', status: 'requires_action' } as any)
+    // S605: the pending-microdeposit case is exactly where the PaymentMethod is
+    // NOT yet attached, so the SetupIntent carries the ownership proof.
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce(
+      { id: 'seti_x', status: 'requires_action', customer: 'cus_mock_tenant', payment_method: 'pm_x' } as any)
     const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
     const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
       .set('Authorization', `Bearer ${token}`)
@@ -506,6 +569,143 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
         .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
       expect(res.status).toBe(403)
     } finally { c.release() }
+  })
+
+  // S605 (Nic hit this live): the very first bank a tenant added always 403'd
+  // with "payment method does not belong to this tenant" — the check read
+  // pm.customer, which is NULL for microdeposit ACH until the deposits clear
+  // days later. Stripe had accepted the bank; GAM refused to record it.
+  it('S605: unattached microdeposit PM (pm.customer null) is still recorded', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce(
+      { id: 'seti_x', status: 'requires_action', customer: 'cus_mock_tenant', payment_method: 'pm_x' } as any)
+    stripeMocks.paymentMethodsRetrieve.mockResolvedValueOnce({
+      id: 'pm_x',
+      customer: null,                       // the whole point: NOT yet attached
+      us_bank_account: { last4: '5059', routing_number: '325070760', bank_name: 'WAFD BANK' },
+    } as any)
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(200)
+    expect(res.body.verified).toBe(false)   // pending microdeposits, not verified
+    expect(res.body.bankName).toBe('WAFD BANK')
+    const { rows: [t] } = await db.query<any>(
+      `SELECT bank_last4 FROM tenants WHERE id=$1`, [tenantId])
+    expect(t.bank_last4).toBe('5059')
+  })
+
+  // The S406 property must survive the S605 rewrite: ownership is now proven
+  // from the SetupIntent, so a foreign PM id fails because it isn't on the
+  // caller's SetupIntent — not because of pm.customer.
+  it('S605: a payment method NOT on the callers SetupIntent → 403', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce(
+      { id: 'seti_x', status: 'succeeded', customer: 'cus_mock_tenant', payment_method: 'pm_mine' } as any)
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_someone_elses' })
+    expect(res.status).toBe(403)
+  })
+
+  // A SetupIntent belonging to a DIFFERENT Stripe customer must be refused even
+  // when the payment method id lines up.
+  it('S605: a SetupIntent owned by another customer → 403', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce(
+      { id: 'seti_x', status: 'succeeded', customer: 'cus_some_other_tenant', payment_method: 'pm_x' } as any)
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(403)
+  })
+
+  // S605 (Nic): "we need our user interface to also allow the correct inputs
+  // based on what the bank chooses." The GET drives which fields render, so it
+  // must report the REAL type and must not invent one.
+  describe('GET /api/stripe/tenant/microdeposits — type drives the UI', () => {
+    const pendingSi = (mdType: string | null) => ({
+      id: 'seti_pending', status: 'requires_action',
+      next_action: {
+        type: 'verify_with_microdeposits',
+        verify_with_microdeposits: {
+          ...(mdType ? { microdeposit_type: mdType } : {}),
+          arrival_date: 1755500000,
+        },
+      },
+    })
+
+    it('descriptor_code is reported as descriptor_code', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pendingSi('descriptor_code')] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).get('/api/stripe/tenant/microdeposits')
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.status).toBe(200)
+      expect(res.body.data.pending).toBe(true)
+      expect(res.body.data.microdepositType).toBe('descriptor_code')
+    })
+
+    it('amounts is reported as amounts', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pendingSi('amounts')] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).get('/api/stripe/tenant/microdeposits')
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.body.data.microdepositType).toBe('amounts')
+    })
+
+    // The regression that matters: this used to default to 'amounts', which
+    // would show two amount boxes to a tenant holding a six-digit code.
+    it('an undetectable type reports NULL, never a guess', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pendingSi(null)] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).get('/api/stripe/tenant/microdeposits')
+        .set('Authorization', `Bearer ${token}`)
+      expect(res.body.data.pending).toBe(true)
+      expect(res.body.data.microdepositType).toBeNull()
+    })
+  })
+
+  // Whatever the UI renders, the verify endpoint must accept BOTH shapes — that
+  // is what makes the unknown-type screen (which offers both) usable.
+  describe('POST /api/stripe/tenant/microdeposits/verify — both input shapes', () => {
+    const pending = {
+      id: 'seti_pending', status: 'requires_action',
+      next_action: { type: 'verify_with_microdeposits', verify_with_microdeposits: {} },
+    }
+
+    it('accepts a descriptor code', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pending] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/microdeposits/verify')
+        .set('Authorization', `Bearer ${token}`).send({ descriptorCode: 'SM1234' })
+      expect(res.status).toBe(200)
+      expect(stripeMocks.verifyMicrodeposits).toHaveBeenCalledWith('seti_pending', { descriptor_code: 'SM1234' })
+    })
+
+    it('accepts two amounts', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pending] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/microdeposits/verify')
+        .set('Authorization', `Bearer ${token}`).send({ amounts: [32, 45] })
+      expect(res.status).toBe(200)
+      expect(stripeMocks.verifyMicrodeposits).toHaveBeenCalledWith('seti_pending', { amounts: [32, 45] })
+    })
+
+    it('rejects an empty submission', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/microdeposits/verify')
+        .set('Authorization', `Bearer ${token}`).send({})
+      expect(res.status).toBe(400)
+    })
   })
 
   it('S406 fix: paymentMethod from another tenant\'s customer → 403', async () => {

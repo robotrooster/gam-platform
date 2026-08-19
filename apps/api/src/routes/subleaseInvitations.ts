@@ -32,6 +32,7 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { db, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { isFeatureEnabled } from '../services/systemFeatures'
 import { logger } from '../lib/logger'
 
 export const subleaseInvitationsRouter = Router()
@@ -123,6 +124,11 @@ subleaseInvitationsRouter.get('/:token', async (req, res, next) => {
 // Body: { firstName, lastName, password, phone? }
 subleaseInvitationsRouter.post('/:token/accept', async (req, res, next) => {
   try {
+    // S605: shelved alongside sublease creation — accepting an invitation is
+    // what creates the sublease, so leaving it open would defeat the gate.
+    if (!(await isFeatureEnabled('subleasing_enabled'))) {
+      throw new AppError(403, 'Subleases are not available right now.')
+    }
     const { firstName, lastName, password, phone } = req.body || {}
     if (!firstName || !lastName || !password) {
       throw new AppError(400, 'firstName, lastName, password required')

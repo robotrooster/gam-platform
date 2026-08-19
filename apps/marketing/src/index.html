@@ -17,6 +17,18 @@
             ? 'http://localhost:3001' : 'https://landlord.goldassetmanagement.com');
     window.location.href = base + '/register';
   };
+  // S605: there was NO sign-in affordance anywhere on this site — five CTAs,
+  // all to /register. A landlord who already had an account had no way back to
+  // the portal from our own homepage: "Get started" lands them on a signup form
+  // that rejects them with "Email already registered", and
+  // goldassetmanagement.com/landlord silently serves THIS page (the static
+  // server falls back to index.html for unknown paths), so it looks broken.
+  window.gamSignIn = function () {
+    var base = window.GAM_LANDLORD_URL
+      || ((location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+            ? 'http://localhost:3001' : 'https://landlord.goldassetmanagement.com');
+    window.location.href = base + '/login';
+  };
 </script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -199,6 +211,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
         <a href="#why">Platform</a>
         <a href="#pricing">Pricing</a>
         <button class="btn-outline" style="padding:8px 18px;font-size:.82rem" onclick="window.gamOpenDemo&&window.gamOpenDemo()">Book a demo</button>
+        <a href="#" onclick="gamSignIn();return false;" style="font-weight:600">Sign in</a>
         <button class="btn-nav" onclick="gamRegister()">Get started →</button>
       </div>
     </div>
@@ -254,6 +267,16 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
           <p class="reason-p">Rent, screening, leases and e-sign, maintenance, and payouts to your bank — <strong>one login, one ledger, every property and every unit in one place.</strong></p>
         </div>
       </div>
+      <!-- STAGED (S602) — DO NOT PUBLISH until the segregated deposit trust account is live.
+           This makes a public "held in trust" claim; uncomment to show it as reason 04.
+      <div class="reason">
+        <div class="reason-num">04</div>
+        <div>
+          <div class="reason-h">Security deposits, off your plate</div>
+          <p class="reason-p">We collect each new tenant's deposit, hold it safely in trust, and handle any interest your state requires — then split it the way you decide at move-out. <strong>One less account to babysit, one less thing to get wrong.</strong></p>
+        </div>
+      </div>
+      -->
     </div>
   </div>
 </section>
@@ -406,17 +429,23 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     </div>
     <div class="gdm-body">
       <div class="gdm-step" data-step="survey">
-        <p class="gdm-lead">A few quick questions so we can tailor the walkthrough to your properties — about a minute.</p>
-        <label class="gdm-l" for="gdm-name">Your name</label>
-        <input class="gdm-in" id="gdm-name" type="text" maxlength="120" autocomplete="name" placeholder="Jane Doe">
-        <div class="gdm-two" style="margin-top:4px">
-          <div>
-            <label class="gdm-l" for="gdm-email">Email</label>
-            <input class="gdm-in" id="gdm-email" type="email" maxlength="254" autocomplete="email" placeholder="you@example.com">
-          </div>
-          <div>
-            <label class="gdm-l" for="gdm-phone">Phone <span class="opt">optional</span></label>
-            <input class="gdm-in" id="gdm-phone" type="tel" maxlength="40" autocomplete="tel" placeholder="(555) 555-5555">
+        <p class="gdm-lead" id="gdm-lead">A few quick questions so we can tailor the walkthrough to your properties — about a minute.</p>
+        <!-- S605: hidden in token-prefilled onboarding mode — we already know who
+             they are, and re-asking an existing account for its own name reads as
+             "we have no idea who you are". Replaced by #gdm-asyou. -->
+        <p class="gdm-lead" id="gdm-asyou" hidden></p>
+        <div id="gdm-identity">
+          <label class="gdm-l" for="gdm-name">Your name</label>
+          <input class="gdm-in" id="gdm-name" type="text" maxlength="120" autocomplete="name" placeholder="Jane Doe">
+          <div class="gdm-two" style="margin-top:4px">
+            <div>
+              <label class="gdm-l" for="gdm-email">Email</label>
+              <input class="gdm-in" id="gdm-email" type="email" maxlength="254" autocomplete="email" placeholder="you@example.com">
+            </div>
+            <div>
+              <label class="gdm-l" for="gdm-phone">Phone <span class="opt">optional</span></label>
+              <input class="gdm-in" id="gdm-phone" type="tel" maxlength="40" autocomplete="tel" placeholder="(555) 555-5555">
+            </div>
           </div>
         </div>
         <label class="gdm-l">What do you manage? <span class="opt">select all that apply</span></label>
@@ -465,6 +494,11 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   var step = 'survey';
   var selectedStart = null;
   var submitting = false;
+  // S605: 'demo' (default) or 'onboarding'. bookingToken/prefill are set only
+  // when arriving via #onboarding/<token> from the post-signup outreach email.
+  var mode = 'demo';
+  var bookingToken = null;
+  var prefill = null;
 
   function stepEl(name){ return overlay.querySelector('.gdm-step[data-step="'+name+'"]'); }
   function buildChips(containerId, values){
@@ -498,12 +532,99 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     if(name==='done'){ titleEl.textContent='Booked'; backBtn.hidden=true; nextBtn.hidden=false; nextBtn.disabled=false; nextBtn.textContent='Done'; }
     overlay.querySelector('.gdm-body').scrollTop = 0;
   }
-  function openModal(){ overlay.classList.add('open'); document.body.style.overflow='hidden'; show('survey'); setTimeout(function(){ var n=document.getElementById('gdm-name'); if(n) n.focus(); },80); }
+  // S605: focus with preventScroll + re-pin the body to the top afterwards.
+  // A plain .focus() scrolls the name field into view, and on the #demo
+  // deep-link path (modal opens during load, before layout settles) that
+  // landed the prospect ~335px down — staring at the unit-count chips with
+  // the name/email fields scrolled off the top.
+  function openModal(){
+    overlay.classList.add('open'); document.body.style.overflow='hidden'; show('survey');
+    setTimeout(function(){
+      var n=document.getElementById('gdm-name');
+      if(n){ try{ n.focus({preventScroll:true}); }catch(e){ n.focus(); } }
+      var body=overlay.querySelector('.gdm-body'); if(body) body.scrollTop=0;
+    },80);
+  }
   function closeModal(){ overlay.classList.remove('open'); document.body.style.overflow=''; }
   window.gamOpenDemo = openModal;
   document.getElementById('gdm-close').addEventListener('click', closeModal);
   overlay.addEventListener('click', function(e){ if(e.target===overlay) closeModal(); });
   document.addEventListener('keydown', function(e){ if(e.key==='Escape' && overlay.classList.contains('open')) closeModal(); });
+
+  // ── S605: deep links ────────────────────────────────────────────────────
+  //   #demo                  → the sales demo modal (as the buttons open it)
+  //   #onboarding            → same engine, relabelled as an onboarding call
+  //   #onboarding/<token>    → onboarding call, identity prefilled from the token
+  //
+  // Outreach to a landlord who signed up but stalled needs ONE clickable URL;
+  // "go to the site and click Book a demo" loses people. And a landlord who
+  // already has an account is booking an ONBOARDING call, not a sales demo —
+  // same slots, same calendar, correct words.
+  //
+  // Everything rides in the FRAGMENT, never a query string. Fragments are not
+  // sent to any server, so the token stays out of access logs and Referer
+  // headers even when the link is forwarded on.
+  var TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function applyMode(){
+    var onboard = (mode === 'onboarding');
+    titleEl.textContent = onboard ? 'Book your onboarding call' : 'Book a demo';
+    overlay.setAttribute('aria-label', titleEl.textContent);
+    document.getElementById('gdm-lead').textContent = onboard
+      ? 'A few quick questions so the call is about your properties instead of a generic tour — about a minute.'
+      : 'A few quick questions so we can tailor the walkthrough to your properties — about a minute.';
+    // Identity fields only make sense when we don't already know them.
+    document.getElementById('gdm-identity').hidden = !!prefill;
+    var asYou = document.getElementById('gdm-asyou');
+    if(prefill){
+      asYou.hidden = false;
+      asYou.textContent = 'Booking as ' + (prefill.name || prefill.email) +
+        (prefill.email ? ' (' + prefill.email + ')' : '') + '.';
+    } else {
+      asYou.hidden = true;
+    }
+  }
+
+  function openFromHash(){
+    var h = (location.hash || '').replace(/^#/, '');
+    var lower = h.toLowerCase();
+    // Bare #onboarding deliberately falls through to demo: booking an onboarding
+    // call REQUIRES a token (the server takes identity only from the token row),
+    // so onboarding labels without one would promise a booking we can't make.
+    // The tokenised email link is the only real onboarding entry point.
+    if(lower === 'demo' || lower === 'onboarding'){
+      mode='demo'; prefill=null; bookingToken=null; applyMode(); openModal(); return;
+    }
+
+    var m = h.match(/^onboarding\/(.+)$/i);
+    if(!m) return;
+    var tok = m[1];
+    mode = 'onboarding'; prefill = null; bookingToken = null;
+    applyMode(); openModal();
+    // Malformed token → straight to the demo flow. Never explain WHY the link
+    // didn't work; a bad token and an unknown one must look identical.
+    if(!TOKEN_RE.test(tok)){ mode='demo'; applyMode(); return; }
+    fetch(API + '/api/sales/onboarding/prefill/' + encodeURIComponent(tok))
+      .then(function(r){ if(!r.ok) throw new Error('http '+r.status); return r.json(); })
+      .then(function(j){
+        var d = j && j.data; if(!d) return;
+        bookingToken = tok; prefill = d;
+        // Populate the (now hidden) inputs too: the confirmation copy and the
+        // demo submit path both read them, so they stay the single source.
+        document.getElementById('gdm-name').value  = d.name || '';
+        document.getElementById('gdm-email').value = d.email || '';
+        if(d.phone) document.getElementById('gdm-phone').value = d.phone;
+        applyMode();
+      })
+      .catch(function(){
+        // Expired or unknown link → fall all the way back to the demo flow
+        // rather than a dead end. They can still book; they just type their
+        // details, and the labels match the endpoint that will actually run.
+        bookingToken = null; prefill = null; mode = 'demo'; applyMode();
+      });
+  }
+  window.addEventListener('hashchange', openFromHash);
+  openFromHash();
 
   var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   function validEmail(v){ return EMAIL_RE.test(v); }
@@ -533,10 +654,11 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   function loadSlots(){
     selectedStart = null; nextBtn.disabled = true;
     var note = document.getElementById('gdm-slots-note'), abbr = localTzAbbr();
-    if(note) note.textContent = "Pick a time — each demo is a 20-minute video call, and we'll email you a join link. Shown in your local time" + (abbr ? " (" + abbr + ")" : "") + ".";
+    if(note) note.textContent = "Pick a time — each " + (mode==='onboarding' ? 'onboarding call is a 30-minute' : 'demo is a 20-minute')
+      + " video call, and we'll email you a join link. Shown in your local time" + (abbr ? " (" + abbr + ")" : "") + ".";
     slotsEl.textContent=''; var p=document.createElement('p'); p.className='gdm-muted'; p.textContent='Loading available times…'; slotsEl.appendChild(p);
     document.getElementById('gdm-slots-err').textContent='';
-    fetch(API + '/api/sales/demo/slots')
+    fetch(API + (mode==='onboarding' ? '/api/sales/onboarding/slots' : '/api/sales/demo/slots'))
       .then(function(r){ if(!r.ok) throw new Error('http '+r.status); return r.json(); })
       .then(function(j){
         var days = groupLocal((j && j.data && j.data.days) || []);
@@ -567,19 +689,26 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     if(submitting || !selectedStart) return;
     submitting = true; nextBtn.disabled = true; nextBtn.textContent = 'Booking…';
     var tz = ''; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+    // Token path sends NO identity: the server reads name/email off the token
+    // row, so a tampered body can't book in someone else's name.
+    var tokenBooking = (mode==='onboarding' && bookingToken);
     var payload = {
       startsAt: selectedStart,
-      name: (document.getElementById('gdm-name').value||'').trim(),
-      email: (document.getElementById('gdm-email').value||'').trim(),
       propertyTypes: selectedChips('gdm-ptypes'),
       painPoints: selectedChips('gdm-pains')
     };
+    if(tokenBooking){
+      payload.token = bookingToken;
+    } else {
+      payload.name  = (document.getElementById('gdm-name').value||'').trim();
+      payload.email = (document.getElementById('gdm-email').value||'').trim();
+      var phone=(document.getElementById('gdm-phone').value||'').trim(); if(phone) payload.phone=phone;
+    }
     if(tz) payload.timezone = tz;
-    var phone=(document.getElementById('gdm-phone').value||'').trim(); if(phone) payload.phone=phone;
     var units=selectedChips('gdm-units'); if(units.length) payload.unitRange=units[0];
     var looking=(document.getElementById('gdm-looking').value||'').trim(); if(looking) payload.lookingFor=looking;
 
-    fetch(API + '/api/sales/demo', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+    fetch(API + (tokenBooking ? '/api/sales/onboarding' : '/api/sales/demo'), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) })
       .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, status:r.status, j:j }; }); })
       .then(function(res){
         if(!res.ok){

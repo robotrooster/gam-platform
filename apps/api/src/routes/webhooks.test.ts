@@ -272,7 +272,9 @@ describe('POST /webhooks/stripe — payment_intent.succeeded rent', () => {
         WHERE reference_id=$1 AND type='banking_spread'`,
       [paymentId!]
     )
-    expect(spread.rows[0].amount).toBe('5.00')
+    // S603: $1,000 rent + $10 tenant-paid fee = $1,010 processed; Stripe's
+    // 0.5% of that is $5.05, so the spread is $10.00 - $5.05 = $4.95.
+    expect(spread.rows[0].amount).toBe('4.95')
   })
 
   it('idempotent: re-firing the same event does not write duplicate ledger rows', async () => {
@@ -608,6 +610,69 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed', () => {
       return_code: 'R05',
       next_retry_at: null,
     })
+  })
+
+  // ── S603: declined-CARD-attempt fee ($1.00, 'DECLINEFEE') ──────────────
+  // Stripe bills per AUTHORIZATION, so every refused card attempt costs GAM
+  // $0.28 with no revenue. ACH is excluded (it carries its own $4 RETURNFEE).
+  function buildCardFailed(paymentIntentId: string): string {
+    return JSON.stringify({
+      id: 'evt_' + paymentIntentId,
+      type: 'payment_intent.payment_failed',
+      data: {
+        object: {
+          id: paymentIntentId,
+          metadata: {},
+          payment_method_types: ['card'],
+          last_payment_error: { payment_method: { type: 'card' } },
+        },
+      },
+    })
+  }
+
+  async function postEvent(body: string) {
+    return request(buildApp())
+      .post('/webhooks/stripe')
+      .set('Content-Type', 'application/json')
+      .set('stripe-signature', 't=1,v1=stub')
+      .send(body)
+  }
+
+  it('S603 card decline: bills a $1.00 DECLINEFEE row to the tenant', async () => {
+    await seedPendingPayment({ paymentIntentId: 'pi_card_decline_1' })
+    expect((await postEvent(buildCardFailed('pi_card_decline_1'))).status).toBe(200)
+
+    const fees = await db.query<{ amount: string; type: string; status: string }>(
+      `SELECT amount, type, status FROM payments WHERE entry_description='DECLINEFEE'`
+    )
+    expect(fees.rows).toHaveLength(1)
+    expect(fees.rows[0]).toMatchObject({ type: 'fee', status: 'pending' })
+    expect(parseFloat(fees.rows[0].amount)).toBe(1.00)
+  })
+
+  it('S603 ACH decline: bills NO decline fee (ACH keeps its own $4 return fee)', async () => {
+    await seedPendingPayment({ paymentIntentId: 'pi_ach_decline_1' })
+    expect((await postEvent(buildPaymentIntentFailed({
+      paymentIntentId: 'pi_ach_decline_1', returnCode: 'R01',
+    }))).status).toBe(200)
+
+    const fees = await db.query(
+      `SELECT 1 FROM payments WHERE entry_description='DECLINEFEE'`
+    )
+    expect(fees.rows).toHaveLength(0)
+  })
+
+  it('S603 card decline: a redelivered webhook does NOT double-bill the fee', async () => {
+    await seedPendingPayment({ paymentIntentId: 'pi_card_dupe_1' })
+    // Stripe redelivery: the raw-event insert is ON CONFLICT DO NOTHING but does
+    // not halt reprocessing, so idempotency has to hold at the fee insert.
+    expect((await postEvent(buildCardFailed('pi_card_dupe_1'))).status).toBe(200)
+    expect((await postEvent(buildCardFailed('pi_card_dupe_1'))).status).toBe(200)
+
+    const fees = await db.query(
+      `SELECT 1 FROM payments WHERE entry_description='DECLINEFEE'`
+    )
+    expect(fees.rows).toHaveLength(1)
   })
 
   it('retry cap reached (retry_count=2): falls through to permanent', async () => {

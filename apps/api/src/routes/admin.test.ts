@@ -29,7 +29,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant,
 } from '../test/dbHelpers'
 import { adminRouter } from './admin'
 import { OWNER_EMAIL } from '../middleware/auth'
@@ -111,6 +111,65 @@ describe('file-wide admin gating', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(403)
     expect(res.body.error).toMatch(/Insufficient permissions/)
+  })
+})
+
+describe('GET /api/admin/deposit-trust/summary', () => {
+  async function seedDeposit(
+    client: any, f: AFixture,
+    opts: { state: string; total: number; collected: number; status: string; heldBy: string; interest?: number; disbursed?: boolean },
+  ) {
+    const propertyId = await seedProperty(client, {
+      landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+    })
+    await client.query(`UPDATE properties SET state=$1 WHERE id=$2`, [opts.state, propertyId])
+    const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+    const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+    const tenantId = await seedTenant(client)
+    await client.query(
+      `INSERT INTO security_deposits
+         (unit_id, lease_id, tenant_id, total_amount, collected_amount, status, held_by, interest_accrued, disbursed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [unitId, leaseId, tenantId, opts.total, opts.collected, opts.status, opts.heldBy,
+       opts.interest ?? 0, opts.disbursed ? new Date().toISOString() : null])
+  }
+
+  it('super_admin: sums only currently-held gam_escrow deposits, with a by-state breakdown', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Held in trust → counted:
+      await seedDeposit(client, f, { state: 'AZ', total: 1000, collected: 1000, status: 'funded', heldBy: 'gam_escrow', interest: 5 })
+      await seedDeposit(client, f, { state: 'TX', total: 500,  collected: 500,  status: 'funded', heldBy: 'gam_escrow' })
+      // Excluded: landlord holds it / already disbursed / not yet collected:
+      await seedDeposit(client, f, { state: 'AZ', total: 800, collected: 800, status: 'funded',    heldBy: 'landlord' })
+      await seedDeposit(client, f, { state: 'AZ', total: 700, collected: 700, status: 'disbursed', heldBy: 'gam_escrow', disbursed: true })
+      await seedDeposit(client, f, { state: 'AZ', total: 900, collected: 0,   status: 'pending',   heldBy: 'gam_escrow' })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await request(buildApp())
+      .get('/api/admin/deposit-trust/summary')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    const d = res.body.data
+    expect(d.heldCount).toBe(2)
+    expect(d.totalPrincipal).toBe(1500)
+    expect(d.totalInterestAccrued).toBe(5)
+    expect(d.totalLiability).toBe(1505)
+    expect(d.byState).toEqual([
+      expect.objectContaining({ state: 'AZ', count: 1, principal: 1000, interest: 5 }),
+      expect.objectContaining({ state: 'TX', count: 1, principal: 500,  interest: 0 }),
+    ])
+  })
+
+  it('plain admin → 403 (financials are super_admin only)', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/deposit-trust/summary')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

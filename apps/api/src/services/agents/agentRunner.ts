@@ -43,7 +43,7 @@ function asHandoff(result: unknown): HandoffSignal | undefined {
 const HANDOFF_VERB =
   /\b(transfer(?:ring)?\s+you|connect(?:ing)?\s+you\s+with|put\s+you\s+through|hand(?:ing)?\s+(?:this|you|it)\s+(?:off|up|over)|pass(?:ing)?\s+(?:this|you|it)\s+(?:on|up|along)|bring(?:ing)?\s+in|loop(?:ing)?\s+(?:you\s+)?in|hold\s+(?:on\s+)?(?:tight\s+)?while\s+i)\b/i
 const SUPPORT_TARGET =
-  /\b(senior|supervisor|specialist|a\s+human|(?:real|live)\s+person|gam\s+support|support\s+(?:team|specialist|agent|representative)|(?:right|appropriate)\s+(?:team|department|person)|someone\s+(?:who|that)\s+can)\b/i
+  /\b(senior|supervisor|specialist|strategist|a\s+human|(?:real|live)\s+person|gam\s+support|support\s+(?:team|specialist|strategist|agent|representative)|(?:right|appropriate)\s+(?:team|department|person)|someone\s+(?:who|that)\s+can)\b/i
 
 /**
  * True when the agent's prose promises an escalation to a higher SUPPORT tier.
@@ -220,7 +220,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           role: 'system',
           content:
             `STOP — this customer is raising ${kind}. That is a hard stop: you must CALL your ` +
-            'escalation tool now so a human specialist takes over. Do not give advice, do not ' +
+            'escalation tool now so a human GAM Strategist takes over. Do not give advice, do not ' +
             'investigate further, and do not promise any outcome — escalate in this reply.',
         })
         continue

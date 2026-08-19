@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
-import { humanize } from '@gam/shared'
+import { humanize, EXPENSE_CATEGORY_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
@@ -47,6 +47,32 @@ function PrintStyles() {
         .card { break-inside: avoid; box-shadow: none !important; }
         .data-table { font-size: .72rem; }
         body { background: #fff !important; }
+        /* S603: the T-12 is a document that leaves the building — its branding
+           and watermark must survive printing, so force colour rendering and
+           keep the letterhead with the figures. */
+        .t12-brand { break-inside: avoid; }
+        .t12-watermark {
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+          color: rgba(160, 132, 60, 0.13) !important;
+        }
+      }
+      .t12-watermark {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        z-index: 0;
+        font-size: 2.6rem;
+        font-weight: 800;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        transform: rotate(-18deg);
+        color: rgba(160, 132, 60, 0.10);
+        user-select: none;
       }
     `}</style>
   )
@@ -203,12 +229,13 @@ function AreaChart({ series }: { series: { label: string; cumulative: number; m:
 // ══════════════════════════════════════════════════════════════
 // REPORTS PAGE — tabbed
 // ══════════════════════════════════════════════════════════════
-type Tab = 'overview' | 'property' | 'annual' | 'statement'
+type Tab = 'overview' | 'property' | 'annual' | 'statement' | 'custom'
 const TABS: { key: Tab; label: string; perm: string }[] = [
   { key: 'overview',  label: 'Overview',        perm: 'reports.tab.overview' },
   { key: 'property',  label: 'By Property',     perm: 'reports.tab.property' },
   { key: 'annual',    label: 'Annual & Tax',    perm: 'reports.tab.annual' },
   { key: 'statement', label: 'Owner Statement', perm: 'reports.tab.statement' },
+  { key: 'custom',    label: 'Custom & T-12',   perm: 'reports.tab.custom' },
 ]
 
 export function ReportsPage() {
@@ -239,6 +266,7 @@ export function ReportsPage() {
       {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab />}
       {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab />}
       {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab />}
+      {tab === 'custom'    && can('reports.tab.custom')    && <CustomReportTab />}
     </div>
   )
 }
@@ -903,6 +931,362 @@ function PnLStatement({ s, periodLabel }: { s: any; periodLabel: string }) {
             Deposits collected (held in custody, not income): {fmt(s.depositsCollected)}
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+// ══════════════════════════════════════════════════════════════
+// CUSTOM REPORT BUILDER + T-12 (S603, Nic)
+//
+// Every other tab on this page is a fixed report. This one drives the shared
+// engine (GET /reports/query) so any combination of range × level × time bucket
+// is one screen instead of one endpoint each. T-12 is the same engine with the
+// knobs preset — which is why it can never disagree with the numbers here.
+// ══════════════════════════════════════════════════════════════
+type RLevel  = 'portfolio' | 'property' | 'unit'
+type RBucket = 'total' | 'monthly' | 'daily'
+
+interface EngineRow {
+  period: string | null
+  propertyName: string | null
+  unitNumber: string | null
+  income:   { rent: number; fees: number; utilities: number; homeSale: number; other: number; total: number }
+  expenses: { maintenance: number; entered: number; platformFee: number; total: number; byCategory: Record<string, number> }
+  net: number
+  occupiedUnits: number
+  derived: { netPerUnit: number | null; costPerUnit: number | null; incomePerUnit: number | null; costPerDay: number; netPerDay: number }
+}
+interface EngineResult {
+  rows: EngineRow[]
+  totals: EngineRow
+  meta: { start: string; end: string; level: RLevel; bucket: RBucket; platformFeeIncluded: boolean; report?: string; note?: string }
+}
+
+const money = (n: number | null | undefined) =>
+  n == null ? '—' : n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+
+/** Default range: the last 12 complete months, matching the T-12 convention
+ *  (a half-finished current month makes income look worse than it is). */
+function defaultRange(): { start: string; end: string } {
+  const now = new Date()
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0))
+  const start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 11, 1))
+  const iso = (d: Date) => d.toISOString().slice(0, 10)
+  return { start: iso(start), end: iso(end) }
+}
+
+function CustomReportTab() {
+  const dflt = defaultRange()
+  const [start, setStart]   = useState(dflt.start)
+  const [end, setEnd]       = useState(dflt.end)
+  const [level, setLevel]   = useState<RLevel>('property')
+  const [bucket, setBucket] = useState<RBucket>('monthly')
+  const [running, setRunning] = useState(false)
+  const [error, setError]   = useState<string | null>(null)
+  const [result, setResult] = useState<EngineResult | null>(null)
+  const [title, setTitle]   = useState('Custom report')
+
+  const run = async (path: string, label: string) => {
+    setRunning(true); setError(null)
+    try {
+      const res = await apiGet<EngineResult>(path)
+      const data = (res as any)?.data ?? res
+      setResult(data)
+      setTitle(label)
+    } catch (e: any) {
+      setError(e?.response?.data?.error?.message || e?.response?.data?.error || e?.message || 'Could not run that report')
+      setResult(null)
+    } finally { setRunning(false) }
+  }
+
+  const runCustom = () => {
+    if (start > end) { setError('Start date must be on or before the end date.'); return }
+    run(`/reports/query?start=${start}&end=${end}&level=${level}&bucket=${bucket}`, 'Custom report')
+  }
+  const runT12 = () => run('/reports/t12', 'Trailing 12 months (T-12)')
+
+  const exportCsv = () => {
+    if (!result) return
+    const header = [
+      'Period', 'Property', 'Unit',
+      'Rent', 'Fees', 'Utilities', 'Home sale', 'Other income', 'Total income',
+      'Maintenance', 'Expenses', 'Platform fee', 'Total expenses',
+      'Net', 'Occupied units', 'Net / unit', 'Cost / unit',
+    ]
+    const body = result.rows.map(r => [
+      r.period ?? 'Total', r.propertyName ?? '', r.unitNumber ?? '',
+      r.income.rent, r.income.fees, r.income.utilities, r.income.homeSale, r.income.other, r.income.total,
+      r.expenses.maintenance, r.expenses.entered, r.expenses.platformFee, r.expenses.total,
+      r.net, r.occupiedUnits, r.derived.netPerUnit ?? '', r.derived.costPerUnit ?? '',
+    ])
+    const t = result.totals
+    body.push([
+      'TOTAL', '', '',
+      t.income.rent, t.income.fees, t.income.utilities, t.income.homeSale, t.income.other, t.income.total,
+      t.expenses.maintenance, t.expenses.entered, t.expenses.platformFee, t.expenses.total,
+      t.net, t.occupiedUnits, t.derived.netPerUnit ?? '', t.derived.costPerUnit ?? '',
+    ])
+    const name = (result.meta.report === 'T-12' ? 't12' : 'report')
+      + `_${result.meta.start}_to_${result.meta.end}.csv`
+    downloadCsv(name, header, body)
+  }
+
+  return (
+    <div>
+      <div className="card no-print" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-end' }}>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '.75rem', color: 'var(--text-2)' }}>
+            From
+            <input type="date" className="input" value={start} onChange={e => setStart(e.target.value)} />
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '.75rem', color: 'var(--text-2)' }}>
+            To
+            <input type="date" className="input" value={end} onChange={e => setEnd(e.target.value)} />
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '.75rem', color: 'var(--text-2)' }}>
+            Break down by
+            <select className="input" value={level} onChange={e => setLevel(e.target.value as RLevel)}>
+              <option value="portfolio">Whole portfolio</option>
+              <option value="property">Each property</option>
+              <option value="unit">Each unit</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '.75rem', color: 'var(--text-2)' }}>
+            Time
+            <select className="input" value={bucket} onChange={e => setBucket(e.target.value as RBucket)}>
+              <option value="total">One total</option>
+              <option value="monthly">Month by month</option>
+              <option value="daily">Day by day</option>
+            </select>
+          </label>
+          <button className="btn btn-primary" onClick={runCustom} disabled={running}>
+            {running ? 'Running…' : 'Run report'}
+          </button>
+          <button className="btn btn-primary" onClick={runT12} disabled={running}>
+            Trailing 12 months
+          </button>
+          {/* S603: the operating view — what a unit actually costs to run, month
+              by month. Same engine, knobs preset, because this is the number an
+              owner looks at regularly rather than only at sale time. */}
+          <button className="btn btn-primary" disabled={running} onClick={() => {
+            setLevel('unit'); setBucket('monthly')
+            run(`/reports/query?start=${start}&end=${end}&level=unit&bucket=monthly`,
+                'Operating cost per unit')
+          }}>
+            Cost per unit
+          </button>
+          {result && (
+            <button className="btn btn-primary" onClick={exportCsv}>Export CSV</button>
+          )}
+        </div>
+        <div style={{ marginTop: 10, fontSize: '.75rem', color: 'var(--text-2)' }}>
+          Security deposits are excluded — they are your tenants' money held, not income.
+          Repair costs count only once an actual cost is recorded, never estimates.
+        </div>
+      </div>
+
+      {error && <div className="alert a-warn" style={{ marginBottom: 14 }}>{error}</div>}
+
+      {result && result.meta.report === 'T-12' && (
+        <T12Statement result={result} propertyName={null} />
+      )}
+
+      {result && result.meta.report !== 'T-12' && (
+        <div className="card">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
+            <h3 style={{ margin: 0 }}>{title}</h3>
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)' }}>
+              {result.meta.start} → {result.meta.end}
+            </div>
+          </div>
+          {result.meta.note && (
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 6 }}>{result.meta.note}</div>
+          )}
+          {!result.meta.platformFeeIncluded && (
+            <div className="alert a-warn" style={{ marginTop: 10, fontSize: '.75rem' }}>
+              The GAM platform fee is billed monthly, so it can't be split across individual days.
+              It is not included in this day-by-day view — switch to month-by-month to see it.
+            </div>
+          )}
+
+          {result.rows.length === 0 ? (
+            <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)' }}>
+              No activity in this date range.
+            </div>
+          ) : (
+            <div style={{ overflowX: 'auto', marginTop: 12 }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {result.meta.bucket !== 'total' && <th>Period</th>}
+                    {result.meta.level !== 'portfolio' && <th>Property</th>}
+                    {result.meta.level === 'unit' && <th>Unit</th>}
+                    <th style={{ textAlign: 'right' }}>Income</th>
+                    <th style={{ textAlign: 'right' }}>Repairs</th>
+                    <th style={{ textAlign: 'right' }}>Expenses</th>
+                    <th style={{ textAlign: 'right' }}>Platform fee</th>
+                    <th style={{ textAlign: 'right' }}>Net</th>
+                    <th style={{ textAlign: 'right' }}>Net / unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.rows.map((r, i) => (
+                    <tr key={i}>
+                      {result.meta.bucket !== 'total' && <td>{r.period}</td>}
+                      {result.meta.level !== 'portfolio' && <td>{r.propertyName ?? '—'}</td>}
+                      {result.meta.level === 'unit' && <td>{r.unitNumber ?? '—'}</td>}
+                      <td style={{ textAlign: 'right' }}>{money(r.income.total)}</td>
+                      <td style={{ textAlign: 'right' }}>{money(r.expenses.maintenance)}</td>
+                      <td style={{ textAlign: 'right' }}>{money(r.expenses.entered)}</td>
+                      <td style={{ textAlign: 'right' }}>{money(r.expenses.platformFee)}</td>
+                      <td style={{ textAlign: 'right', color: r.net < 0 ? 'var(--danger)' : undefined }}>{money(r.net)}</td>
+                      <td style={{ textAlign: 'right' }}>{money(r.derived.netPerUnit)}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ fontWeight: 600, borderTop: '2px solid var(--border-0)' }}>
+                    <td colSpan={
+                      (result.meta.bucket !== 'total' ? 1 : 0)
+                      + (result.meta.level !== 'portfolio' ? 1 : 0)
+                      + (result.meta.level === 'unit' ? 1 : 0) || 1
+                    }>Total</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.income.total)}</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.maintenance)}</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.entered)}</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.expenses.platformFee)}</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.net)}</td>
+                    <td style={{ textAlign: 'right' }}>{money(result.totals.derived.netPerUnit)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── T-12 STATEMENT (S603) ─────────────────────────────────────
+// A real trailing-twelve is read line-items-DOWN, months-ACROSS — that is the
+// shape an agent, buyer, appraiser, or lender expects. The engine returns one
+// row per (month × property), so this transposes it and lets the existing print
+// styling (PrintStyles strips the app chrome) produce a clean PDF via print.
+function T12Statement({ result, propertyName }: { result: EngineResult; propertyName: string | null }) {
+  const months = [...new Set(result.rows.map(r => r.period).filter(Boolean))].sort() as string[]
+
+  // Sum a measure for one month across whatever properties are in scope.
+  const at = (m: string, pick: (r: EngineRow) => number) =>
+    result.rows.filter(r => r.period === m).reduce((s, r) => s + pick(r), 0)
+
+  // Expense categories actually present — never print an empty line item.
+  const categories = [...new Set(
+    result.rows.flatMap(r => Object.keys(r.expenses.byCategory)),
+  )].sort()
+
+  const lines: { label: string; get: (m: string) => number; strong?: boolean; indent?: boolean }[] = [
+    { label: 'Rent',                 get: m => at(m, r => r.income.rent), indent: true },
+    { label: 'Fees',                 get: m => at(m, r => r.income.fees), indent: true },
+    { label: 'Utilities reimbursed', get: m => at(m, r => r.income.utilities), indent: true },
+    { label: 'Other income',         get: m => at(m, r => r.income.homeSale + r.income.other), indent: true },
+    { label: 'Total income',         get: m => at(m, r => r.income.total), strong: true },
+    { label: 'Repairs & maintenance', get: m => at(m, r => r.expenses.maintenance), indent: true },
+    ...categories.map(c => ({
+      label: EXPENSE_CATEGORY_LABEL[c as keyof typeof EXPENSE_CATEGORY_LABEL] ?? c,
+      get: (m: string) => at(m, r => r.expenses.byCategory[c] ?? 0),
+      indent: true,
+    })),
+    { label: 'Platform fee',   get: m => at(m, r => r.expenses.platformFee), indent: true },
+    { label: 'Total expenses', get: m => at(m, r => r.expenses.total), strong: true },
+    { label: 'Net operating income', get: m => at(m, r => r.net), strong: true },
+  ]
+
+  const rowTotal = (get: (m: string) => number) => months.reduce((s, m) => s + get(m), 0)
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      {/* S603 (Nic): the T-12 leaves this property as a document handed to an
+          agent, buyer, or lender — so it carries GAM branding on the PRINTED
+          page, where the app's own sidebar logo is stripped away.
+          The logo SLOT resolves /brand/logo.png at runtime and silently falls
+          back to the wordmark, so dropping that file into apps/landlord/public
+          brands every statement with no code change. */}
+      <div className="t12-brand" style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+        flexWrap: 'wrap', gap: 10, paddingBottom: 12, marginBottom: 4,
+        borderBottom: '2px solid var(--gold)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div style={{
+            width: 132, height: 56, display: 'flex', alignItems: 'center',
+            justifyContent: 'flex-start', flexShrink: 0,
+          }}>
+            <img
+              src="/brand/logo.png"
+              alt="Gold Asset Management"
+              style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+              onError={e => {
+                // No logo file yet — show the wordmark instead of a broken image.
+                const el = e.currentTarget
+                el.style.display = 'none'
+                const fb = el.nextElementSibling as HTMLElement | null
+                if (fb) fb.style.display = 'block'
+              }}
+            />
+            <div style={{
+              display: 'none', fontWeight: 800, fontSize: '1.25rem',
+              letterSpacing: '.06em', color: 'var(--gold)',
+            }}>GAM</div>
+          </div>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: '.95rem' }}>Gold Asset Management</div>
+            <h3 style={{ margin: '2px 0 0' }}>Trailing 12 Months (T-12)</h3>
+            <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginTop: 2 }}>
+              {propertyName || 'All properties'} · {result.meta.start} to {result.meta.end}
+            </div>
+          </div>
+        </div>
+        <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print / Save PDF" />
+      </div>
+
+      <div style={{ overflowX: 'auto', marginTop: 14, position: 'relative' }}>
+        {/* Watermark — sits BEHIND the figures, never obscures them, and is
+            marked print-visible so it survives to paper (browsers drop
+            backgrounds by default; print-color-adjust forces it). */}
+        <div className="t12-watermark" aria-hidden="true">Gold Asset Management</div>
+        <table className="data-table" style={{ minWidth: 900, position: 'relative', zIndex: 1 }}>
+          <thead>
+            <tr>
+              <th style={{ position: 'sticky', left: 0, background: 'var(--bg-1)' }}>Line item</th>
+              {months.map(m => <th key={m} style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{monthLabel(m)}</th>)}
+              <th style={{ textAlign: 'right', fontWeight: 700 }}>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((ln, i) => (
+              <tr key={i} style={ln.strong ? { fontWeight: 700, borderTop: '1px solid var(--border-0)' } : undefined}>
+                <td style={{
+                  position: 'sticky', left: 0, background: 'var(--bg-1)',
+                  paddingLeft: ln.indent ? 18 : undefined,
+                }}>{ln.label}</td>
+                {months.map(m => (
+                  <td key={m} style={{ textAlign: 'right' }}>{money(ln.get(m))}</td>
+                ))}
+                <td style={{ textAlign: 'right', fontWeight: 700 }}>{money(rowTotal(ln.get))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Basis of preparation — a T-12 handed to a buyer or lender has to say
+          what is in it and what is not, or the reader assumes the worst. */}
+      <div style={{ marginTop: 14, fontSize: '.72rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+        <strong>Basis of preparation.</strong> Twelve complete months; the current partial month is
+        excluded. Income is counted on the date payment settled. Security deposits are excluded —
+        they are tenant funds held, not income. Repairs are included only where an actual cost was
+        recorded; estimates are excluded. Costs not tied to a specific unit are shown at the
+        property. Prepared from the operator's own records and unaudited.
       </div>
     </div>
   )

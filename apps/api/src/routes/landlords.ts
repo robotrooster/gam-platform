@@ -22,13 +22,15 @@ import {
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
 import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT } from '@gam/shared'
-import { emailPmPropertyInvitation } from '../services/email'
+import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
   sendPropertyInvitation, acceptPropertyInvitation,
   rejectPropertyInvitation, revokePropertyInvitation,
 } from '../services/pm'
 import { logger } from '../lib/logger'
+import { randomUUID } from 'crypto'
+import { unitNumberNeedsPrefix } from '@gam/shared'
 import { checkAgainstStatute } from '../services/stateLaw'
 import { assertLateFeeDecisionForUnit, assertLateFeeDecision } from '../services/lateFeePolicy'
 import { assertUnitCanAcceptNewLease } from '../services/leaseOnboarding'
@@ -41,6 +43,33 @@ import {
 } from '../services/csvImportAttempts'
 
 export const landlordsRouter = Router()
+// S605: the invite PREVIEW is deliberately public and sits above requireAuth.
+// The person being invited has no account yet — that is the entire point of
+// the flow — so they must be able to see who invited them and to what before
+// being asked to register. Express matches in order, so anything registered
+// after this line is authenticated.
+// GET /api/landlords/member-invite/:token — unauthenticated preview so the
+// accept page can say WHO invited them and to WHAT before asking them to sign up.
+landlordsRouter.get('/member-invite/:token', async (req, res, next) => {
+  try {
+    const inv = await queryOne<any>(
+      `SELECT i.id, i.email, i.expires_at, i.status, l.business_name,
+              u.first_name, u.last_name
+         FROM landlord_member_invitations i
+         JOIN landlords l ON l.id = i.landlord_id
+         JOIN users u ON u.id = i.invited_by_user_id
+        WHERE i.token = $1`, [req.params.token])
+    if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
+      throw new AppError(404, 'That invitation has expired or already been used. Ask your partner to send a new one.')
+    }
+    res.json({ success: true, data: {
+      email: inv.email,
+      entityName: inv.business_name,
+      invitedBy: [inv.first_name, inv.last_name].filter(Boolean).join(' ').trim(),
+    } })
+  } catch (e) { next(e) }
+})
+
 landlordsRouter.use(requireAuth)
 
 // S592: exported so the scoped /api/portfolio router shares this EXACT handler
@@ -396,7 +425,15 @@ landlordsRouter.post('/members', async (req, res, next) => {
 
     const target = await queryOne<any>(
       `SELECT id, role, first_name FROM users WHERE lower(email) = lower($1)`, [b.email])
-    if (!target) throw new AppError(404, 'No GAM account with that email. Have them register as a landlord first, then add them.')
+
+    // S605 (Nic): "it seems like kind of a backwards flow. I should be able to
+    // invite him through a link." Demanding the invitee register FIRST — with no
+    // prompt, no context, and nothing yet to look at — is where a partner
+    // invitation dies. An unknown email now gets an invite instead of a 404.
+    if (!target) {
+      const invite = await createCoOwnerInvitation(landlordId, b.email, u.userId)
+      return res.status(202).json({ success: true, data: { invited: true, invitationId: invite.id } })
+    }
     if (target.role !== 'landlord') throw new AppError(400, 'That account is not a landlord account. Co-owners need their own landlord login.')
 
     const row = await queryOne<any>(
@@ -508,6 +545,22 @@ landlordsRouter.get('/:id', async (req, res, next) => {
 landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
   try {
     const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    // S605 (Nic): a landlord who co-owns another entity was seeing a dashboard
+    // for ONE of them while their Properties list showed all of them — Oak Park
+    // appeared in the list but its income was missing from the rollup, so the
+    // two screens disagreed about the same portfolio.
+    //
+    // 'me' now aggregates every entity the caller is an owner-member of, exactly
+    // as the properties list does. Nic: "he sees everything combined for his,
+    // and I see everything combined for mine, without the two mixing." That
+    // separation is automatic — the aggregate is over the caller's OWN
+    // memberships, so a partner's unrelated property never enters this user's
+    // numbers unless they co-own it.
+    //
+    // An EXPLICIT id (admin inspecting one landlord) still scopes to that entity.
+    const scopeIds = req.params.id === 'me' && req.user!.role === 'landlord'
+      ? Array.from(new Set([req.user!.profileId, ...(req.user!.landlordIds ?? [])]))
+      : [id]
     // Dashboard surfaces revenue + disbursement totals — financial view.
     // Landlord/admin only; team roles don't get the financial rollup.
     if (!canViewLandlordFinances(req.user, id)) {
@@ -531,23 +584,32 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = $1`, [id])
+      WHERE u.landlord_id = ANY($1)`, [scopeIds])
+    // S605 (Nic): the dashboard never said that payouts were unverified, so a
+    // landlord could add units and tenants for days without learning that NO
+    // RENT CAN MOVE until Stripe Connect verification is done. It was only
+    // discoverable by wandering into Financials → Banking. "If I don't know how
+    // to do what I need to do, that's where the friction lives."
+    const [connect] = await query<{ payouts_enabled: boolean; details_submitted: boolean }>(
+      `SELECT connect_payouts_enabled AS payouts_enabled,
+              connect_details_submitted AS details_submitted
+         FROM landlords WHERE id = $1`, [id])
     const [upcoming] = await query<any>(`
       SELECT COUNT(*)::int AS count,
         COALESCE(SUM(d.amount),0) AS amount
       FROM disbursements d
-      WHERE d.landlord_id = $1 AND d.status='pending'`, [id])
+      WHERE d.landlord_id = ANY($1) AND d.status='pending'`, [scopeIds])
     // Real monthly revenue trend (last 6 months)
     const trend = await query<any>(`
       SELECT 
         TO_CHAR(DATE_TRUNC('month', p.created_at), 'Mon') as month,
         COALESCE(SUM(p.amount),0)::float as revenue
       FROM payments p
-      WHERE p.landlord_id = $1
+      WHERE p.landlord_id = ANY($1)
         AND p.status IN ('completed','settled')
         AND p.created_at >= NOW() - INTERVAL '6 months'
       GROUP BY DATE_TRUNC('month', p.created_at)
-      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [id])
+      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [scopeIds])
 
     // Real maintenance stats
     const [maintenance] = await query<any>(`
@@ -556,13 +618,13 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status='in_progress')::int as in_progress,
         COUNT(*) FILTER (WHERE status='completed' AND created_at > NOW()-INTERVAL '30 days')::int as completed_30d
       FROM maintenance_requests
-      WHERE landlord_id = $1`, [id])
+      WHERE landlord_id = ANY($1)`, [scopeIds])
 
     // Recent background checks pending review
     const [bgPending] = await query<any>(`
       SELECT COUNT(*)::int as count
       FROM background_checks
-      WHERE landlord_id = $1 AND status = 'submitted'`, [id])
+      WHERE landlord_id = ANY($1) AND status = 'submitted'`, [scopeIds])
 
     // S536 (Nic): needs-review leases belong on the main dashboard, not
     // just the Leases page banner. Current leases only (active+pending) —
@@ -570,7 +632,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const [leaseReview] = await query<any>(`
       SELECT COUNT(*)::int AS count
       FROM leases
-      WHERE landlord_id = $1 AND needs_review = TRUE AND status IN ('active','pending')`, [id])
+      WHERE landlord_id = ANY($1) AND needs_review = TRUE AND status IN ('active','pending')`, [scopeIds])
 
     const [otpStats] = await query<any>(`
       SELECT
@@ -580,9 +642,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
       JOIN leases l ON l.id = lt.lease_id AND l.status = 'active'
       JOIN units u ON u.id = l.unit_id
-      WHERE u.landlord_id = $1
+      WHERE u.landlord_id = ANY($1)
         AND t.on_time_pay_enrolled = TRUE
-        AND u.status = 'active'`, [id])
+        AND u.status = 'active'`, [scopeIds])
 
     // Authoritative platform fee for the current month — per property, $2/billable
     // unit floored at the $10 property minimum (full stop), summed. This is the
@@ -591,7 +653,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const feeMonth = periodMonths(new Date().getFullYear(), new Date().getMonth() + 1)
     const feeMap = await platformFeesByProperty(id, feeMonth)
     const feeProps = await query<any>(
-      `SELECT id, name FROM properties WHERE landlord_id = $1 ORDER BY name`, [id])
+      `SELECT id, name FROM properties WHERE landlord_id = ANY($1) ORDER BY name`, [scopeIds])
     const platformFeeByProperty = feeProps.map((p: any) => ({
       propertyId: p.id, name: p.name, fee: Math.round((feeMap.get(p.id) ?? 0) * 100) / 100,
     }))
@@ -606,8 +668,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const [collectedRow] = await query<any>(`
       SELECT COALESCE(SUM(amount), 0)::float AS collected_mtd
         FROM payments
-       WHERE landlord_id=$1 AND status='settled' AND type='rent'
-         AND settled_at >= date_trunc('month', NOW())`, [id])
+       WHERE landlord_id = ANY($1) AND status='settled' AND type='rent'
+         AND settled_at >= date_trunc('month', NOW())`, [scopeIds])
     const [outstandingRow] = await query<any>(`
       SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::float AS outstanding
         FROM invoices i
@@ -616,7 +678,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
             FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
            GROUP BY invoice_id
         ) p ON p.invoice_id = i.id
-       WHERE i.landlord_id = $1 AND i.status IN ('pending', 'partial')`, [id])
+       WHERE i.landlord_id = ANY($1) AND i.status IN ('pending', 'partial')`, [scopeIds])
 
     // Leases expiring soon — active leases whose end_date falls inside the next
     // 30 / 60 days. Drives the renewal-action KPI. Scoped by leases.landlord_id.
@@ -625,14 +687,18 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days')::int AS leases_expiring_30d,
         COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days')::int AS leases_expiring_60d
       FROM leases
-      WHERE landlord_id = $1 AND status = 'active' AND end_date IS NOT NULL`, [id])
+      WHERE landlord_id = ANY($1) AND status = 'active' AND end_date IS NOT NULL`, [scopeIds])
 
     // Occupancy rate — round(100 × active / total). SAME formula as the Reports
     // page (/reports/summary), so the Dashboard's Occupancy card agrees with it.
     const totalUnits = stats?.total_units || 0
     const occupancyRate = totalUnits > 0 ? Math.round(100 * (stats?.active_units || 0) / totalUnits) : 0
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate } })
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
+      // S605: surfaced so the dashboard can say "no rent can move yet" instead
+      // of leaving the landlord to discover it in Financials → Banking.
+      connect_payouts_enabled: connect?.payouts_enabled ?? false,
+      connect_details_submitted: connect?.details_submitted ?? false } })
   } catch (e) { next(e) }
 })
 
@@ -872,11 +938,22 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // landlord's user_id is the catalog owner under the 16a per-property
     // routing model. Owner-financial concern — always shown to the
     // calling owner regardless of property delegation.
+    // S605 (Nic): this asked "have you added a row to the legacy bank catalog?"
+    // — but rent pays out through STRIPE CONNECT (autoPayouts.ts fires
+    // stripe.payouts.create against the Connect account and never reads that
+    // table). So a landlord who completed Stripe onboarding, bank account and
+    // all, was still told to "Add a bank account", which read as though the
+    // whole Stripe process hadn't saved. Ready now means what it actually
+    // means: Stripe can pay you. The legacy catalog still counts, for the
+    // multi-owner allocation-split case that does use it.
     const bankReady = await queryOne<{ ready: boolean }>(`
-      SELECT EXISTS (
-        SELECT 1 FROM user_bank_accounts ba
-         WHERE ba.user_id = (SELECT user_id FROM landlords WHERE id=$1)
-           AND ba.status = 'active'
+      SELECT (
+        (SELECT connect_payouts_enabled FROM landlords WHERE id=$1)
+        OR EXISTS (
+          SELECT 1 FROM user_bank_accounts ba
+           WHERE ba.user_id = (SELECT user_id FROM landlords WHERE id=$1)
+             AND ba.status = 'active'
+        )
       ) AS ready
     `, [landlordId])
 
@@ -969,6 +1046,32 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
 
     // ── ACH ISSUES ────────────────────────────────────────
     const ach: any[] = []
+
+    // S605 (Nic, DIRECTIVE): the bank feed is NOT optional. "No landlord is
+    // gonna be able to get their PNLs accurate if they can't reconcile the bank
+    // transactions." It was treated as a nice-to-have buried in Financials; it
+    // is a required part of getting set up, so it surfaces as a standing task
+    // until a bank is linked.
+    //
+    // NOTE it is not yet a BLOCKING onboarding step, and deliberately so:
+    // reading transactions needs a one-time Stripe Financial Connections
+    // approval for the platform that is still pending, so a required step would
+    // strand every new landlord on a button that 503s. This keeps it visible and
+    // tracked meanwhile; make it blocking once the approval lands.
+    const [feed] = await query<{ linked: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM bank_connections
+          WHERE landlord_id = $1 AND status = 'active'
+       ) AS linked`, [landlordId])
+    if (!feed?.linked) {
+      ach.push({
+        id: 'landlord-bank-feed',
+        type: 'bank_feed',
+        title: 'Connect your operating bank',
+        subtitle: 'Needed for accurate P&L — GAM matches your rent payouts and turns the rest of your spending into expenses.',
+        href: '/bank',
+      })
+    }
 
     // 1. Landlord has no active bank account in their catalog yet
     if (!bankReady?.ready) {
@@ -2575,6 +2678,20 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
       // Required fields
       if (!row.propertyName) issues.push({ severity: 'block', field: 'property_name', message: 'Required' })
       if (!row.unitNumber)   issues.push({ severity: 'block', field: 'unit_number',   message: 'Required' })
+      // S605 (Nic, DIRECTIVE): units created in GAM must carry a prefix — a bare
+      // "37" is the accident that rule exists to stop, and it collides when two
+      // unit types share a number.
+      //
+      // WARN here rather than BLOCK, deliberately. This is the MIGRATION path:
+      // the rent roll being imported already exists in the real world, and a
+      // landlord whose apartments have genuinely been called "101" for twenty
+      // years should not be refused entry to the platform over naming. They are
+      // told, and can rename on the way in or afterwards.
+      else if (unitNumberNeedsPrefix(row.unitNumber)) {
+        issues.push({ severity: 'warn', field: 'unit_number',
+          message: `"${row.unitNumber}" has no prefix. New units in GAM require one (e.g. "Apt ${row.unitNumber}") — ` +
+                   `imported numbers are kept as-is, but a bare number can collide if another unit type reuses it.` })
+      }
 
       if (!row.rentAmount) {
         issues.push({ severity: 'block', field: 'rent_amount', message: 'Required' })
@@ -3187,6 +3304,20 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
 
       if (!row.propertyName) issues.push({ severity: 'block', field: 'property_name', message: 'Required' })
       if (!row.unitNumber)   issues.push({ severity: 'block', field: 'unit_number',   message: 'Required' })
+      // S605 (Nic, DIRECTIVE): units created in GAM must carry a prefix — a bare
+      // "37" is the accident that rule exists to stop, and it collides when two
+      // unit types share a number.
+      //
+      // WARN here rather than BLOCK, deliberately. This is the MIGRATION path:
+      // the rent roll being imported already exists in the real world, and a
+      // landlord whose apartments have genuinely been called "101" for twenty
+      // years should not be refused entry to the platform over naming. They are
+      // told, and can rename on the way in or afterwards.
+      else if (unitNumberNeedsPrefix(row.unitNumber)) {
+        issues.push({ severity: 'warn', field: 'unit_number',
+          message: `"${row.unitNumber}" has no prefix. New units in GAM require one (e.g. "Apt ${row.unitNumber}") — ` +
+                   `imported numbers are kept as-is, but a bare number can collide if another unit type reuses it.` })
+      }
 
       if (row.propertyName && row.unitNumber) {
         const match = units.find(u =>
@@ -4810,5 +4941,102 @@ landlordsRouter.delete('/me/pm-property-invitations/:invId', requirePerm('pm_inv
     } finally {
       client.release()
     }
+  } catch (e) { next(e) }
+})
+
+// ── S605 (Nic): CO-OWNER INVITATIONS ────────────────────────────────────────
+//
+// Invite a partner by email. They accept, register if they need to, and land as
+// an owner-member of this entity — WITHOUT their own business being folded into
+// it. That separation is the whole reason this is an invite rather than a
+// shared login: "I don't necessarily need to be part of his other operation."
+const CO_OWNER_INVITE_TTL_DAYS = 7
+
+async function createCoOwnerInvitation(landlordId: string, email: string, invitedByUserId: string) {
+  const entity = await queryOne<{ business_name: string | null; user_id: string }>(
+    `SELECT business_name, user_id FROM landlords WHERE id = $1`, [landlordId])
+  if (!entity) throw new AppError(404, 'Entity not found')
+  const inviter = await queryOne<{ first_name: string | null; last_name: string | null }>(
+    `SELECT first_name, last_name FROM users WHERE id = $1`, [invitedByUserId])
+
+  const token = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+  const expiresAt = new Date(Date.now() + CO_OWNER_INVITE_TTL_DAYS * 86400_000).toISOString()
+
+  // Re-inviting refreshes the live invite rather than leaving two valid tokens
+  // out for the same person (the partial unique index enforces one pending).
+  const row = await queryOne<{ id: string }>(
+    `INSERT INTO landlord_member_invitations
+       (landlord_id, email, invited_by_user_id, token, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (landlord_id, lower(email)) WHERE status = 'pending'
+     DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at,
+                   invited_by_user_id = EXCLUDED.invited_by_user_id, updated_at = now()
+     RETURNING id`,
+    [landlordId, email.trim(), invitedByUserId, token, expiresAt])
+
+  const inviterName = [inviter?.first_name, inviter?.last_name].filter(Boolean).join(' ').trim() || 'A GAM landlord'
+  const base = (process.env.LANDLORD_APP_URL || 'https://landlord.goldassetmanagement.com').replace(/\/$/, '')
+  await emailLandlordCoOwnerInvitation(
+    email.trim(), inviterName, entity.business_name || 'a property on GAM',
+    `${base}/accept-owner-invite/${token}`,
+    { landlordId, invitationId: row!.id },
+  ).catch(() => { /* the invite row stands; it can be resent */ })
+  return row!
+}
+
+
+// POST /api/landlords/member-invite/:token/accept — requires the invitee to be
+// signed in as a landlord (registering through the invite link gets them there).
+landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
+  try {
+    const u = req.user!
+    if (u.role !== 'landlord') throw new AppError(403, 'Co-owners need a landlord account')
+    const inv = await queryOne<any>(
+      `SELECT id, landlord_id, email, expires_at, status
+         FROM landlord_member_invitations WHERE token = $1`, [req.params.token])
+    if (!inv || inv.status !== 'pending' || new Date(inv.expires_at) < new Date()) {
+      throw new AppError(404, 'That invitation has expired or already been used.')
+    }
+    // The invite is addressed to a person, not a link-holder: accepting from a
+    // different account would silently attach the wrong business.
+    const me = await queryOne<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [u.userId])
+    if ((me?.email ?? '').toLowerCase() !== String(inv.email).toLowerCase()) {
+      throw new AppError(403, 'This invitation was sent to a different email address. Sign in with that address to accept it.')
+    }
+
+    await query(
+      `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
+       VALUES ($1, $2, 'owner', $3) ON CONFLICT (landlord_id, user_id) DO NOTHING`,
+      [inv.landlord_id, u.userId, inv.invited_by_user_id ?? null])
+    await query(
+      `UPDATE landlord_member_invitations
+          SET status='accepted', accepted_at=now(), accepted_user_id=$2, updated_at=now()
+        WHERE id=$1`, [inv.id, u.userId])
+
+    // S605 (Nic): "for him to just register, it would have tried to get him to
+    // onboard his property, which is already onboarded because I've completed
+    // Oak Park." The portal sends any landlord with onboarding_complete = false
+    // to the wizard — so an invited co-owner would land in a five-step flow
+    // asking for a first property, a payout account and a signed agreement for
+    // an entity that owns nothing, to reach a property somebody else already
+    // set up.
+    //
+    // Clearing the flag on their OWN entity lets them straight in. Guarded on
+    // having no properties of their own, so this can never skip a real
+    // onboarding: a landlord who already has property keeps whatever state they
+    // were in. If they add their first property later, the dashboard's standing
+    // tasks (Connect KYC, connect your operating bank) surface what's needed —
+    // those are the gates that matter before money can move.
+    await query(
+      `UPDATE landlords SET onboarding_complete = TRUE
+        WHERE id = $1
+          AND onboarding_complete = FALSE
+          AND NOT EXISTS (SELECT 1 FROM properties WHERE landlord_id = $1)`,
+      [u.profileId])
+
+    // landlordIds is stamped into the JWT at login, so the new entity appears
+    // once they re-authenticate. Say so rather than letting them wonder why the
+    // property isn't there yet.
+    res.json({ success: true, data: { landlordId: inv.landlord_id, reloginRequired: true } })
   } catch (e) { next(e) }
 })

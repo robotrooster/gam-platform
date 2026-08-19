@@ -525,3 +525,62 @@ describe('GET /work-orders', () => {
     expect(res.body.data.map((o: any) => o.title)).toEqual(['Emergency A', 'High A', 'Normal A'])
   })
 })
+
+
+// ── S605 (Nic, DIRECTIVE): equipment is property-scoped ────────────────────
+// "Inventory needs to be scoped to property. It's not a shared thing... Property
+// inventory is equipment. It's small tractors, weed whackers, tools."
+describe('S605 property-scoped equipment', () => {
+  it('files a new item against the property it was added from', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/maint-portal/parts')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Zero-turn mower', quantity: 1, propertyId: f.propertyAId })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT property_id FROM parts_inventory WHERE name='Zero-turn mower'`)
+    expect(rows[0].property_id).toBe(f.propertyAId)
+  })
+
+  it('?propertyId returns only that property’s equipment', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post('/api/maint-portal/parts').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Oak Park mower', quantity: 1, propertyId: f.propertyAId })
+    await request(app).post('/api/maint-portal/parts').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Unassigned trailer', quantity: 1 })
+
+    const scoped = await request(app).get(`/api/maint-portal/parts?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    const names = (scoped.body.data as any[]).map(i => i.name)
+    expect(names).toContain('Oak Park mower')
+    expect(names).not.toContain('Unassigned trailer')
+
+    // Portfolio-wide view still shows everything.
+    const all = await request(app).get('/api/maint-portal/parts')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect((all.body.data as any[]).map(i => i.name)).toContain('Unassigned trailer')
+  })
+
+  it('refuses another landlord’s property', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/maint-portal/parts')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Sneaky mower', quantity: 1, propertyId: f.propertyBId })
+    expect(res.status).toBe(404)
+  })
+
+  // A mower moves parks — re-homing is an ordinary edit, not a delete/recreate.
+  it('an item can be re-homed to another property', async () => {
+    const f = await seed()
+    const made = await request(buildApp()).post('/api/maint-portal/parts')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Roaming tractor', quantity: 1 })
+    const id = made.body.data.id
+    const res = await request(buildApp()).patch(`/api/maint-portal/parts/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ propertyId: f.propertyAId })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(`SELECT property_id FROM parts_inventory WHERE id=$1`, [id])
+    expect(rows[0].property_id).toBe(f.propertyAId)
+  })
+})

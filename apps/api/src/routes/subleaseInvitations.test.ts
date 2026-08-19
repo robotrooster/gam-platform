@@ -39,6 +39,14 @@ import {
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  // S605: subleasing is SHELVED behind `subleasing_enabled` (see the migration).
+  // cleanupAllSchema wipes system_features, so turn it on here — these suites
+  // exercise the feature itself, which still works when enabled. The gate's own
+  // behaviour is asserted separately below.
+  await db.query(
+    `INSERT INTO system_features (key, enabled, description)
+     VALUES ('subleasing_enabled', TRUE, 'test')
+     ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
   notifySubleaseRequestedMock.mockClear()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_s451'
 })

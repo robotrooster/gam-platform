@@ -7,9 +7,10 @@ import {
   UNIT_TYPES, UnitType, UNIT_TYPE_LABEL, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS,
   FLOOR_LEVELS, FLOOR_LEVEL_LABEL, type FloorLevel,
   PropertyUnitSubtype, unitSubtypeFactsLabel,
-  METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS,
+  METER_READING_DEFAULT_DIGITS,
 } from '@gam/shared'
 import { toast } from '../components/dialogs'
+import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void; preselectedPropertyId?: string }
@@ -32,6 +33,9 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     propertyId:       preselectedPropertyId || '',
     unitNumber:       '',
     quantity:         '1',
+    // S604 (Nic): real parks have signage the software must match. Oak Park runs
+    // RV 1-3, apartments 4-5, motel 6-12, apartments 13-19, then RV 20-36 — the
+    // second RV block can't be made by "continue after the highest".
     unitType:         'apartment' as UnitType,
     subtypeId:        '',
     bedrooms:         '1',
@@ -56,9 +60,30 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   // submeter per created unit (batches included).
   // Sewer is NOT a meter — it bills off the water reading at a second
   // rate (one line item on the invoice). Water row carries it.
-  const [meters, setMeters] = useState<Record<string, { on: boolean; rate: string; digits: string; sewerRate: string }>>({
-    electric: { on: false, rate: '', digits: String(METER_READING_DEFAULT_DIGITS), sewerRate: '' },
-    water:    { on: false, rate: '', digits: String(METER_READING_DEFAULT_DIGITS), sewerRate: '' },
+  // S605 (Nic): `mode` — this step used to assume SUBMETER for anything checked,
+  // which silently misconfigures any property that bills a utility as RUBS. Oak
+  // Park hit it immediately: RV sites submeter ELECTRIC but bill WATER as RUBS,
+  // and the only route through was to skip water here and rebuild it afterwards
+  // on the Utilities page. The engine has supported RUBS all along; the step
+  // just never asked.
+  //
+  // `baseline` — the opening read. This modal is where a property's submeters
+  // are actually born, so it's the first place the omission bites: a meter
+  // created here with no starting value bills nothing on its first cycle and
+  // says nothing about why.
+  // S605 (Nic, DIRECTIVE): unit onboarding is just ON or OFF per utility.
+  // "Let's fix it so it's a simple toggle. Electric or water on or off. That's
+  // it... we should have the link to the submeter and that kind of thing and
+  // initial read on NOT the onboarding of the unit page."
+  //
+  // Rates are property policy now, RUBS membership is a property-level decision,
+  // and opening reads are taken by walking the park — none of it belongs in the
+  // middle of typing a unit in. Toggling a utility on creates a BARE submeter;
+  // it is configured, linked or replaced on the Utilities page, where the whole
+  // property is visible at once.
+  const [meters, setMeters] = useState<Record<string, boolean>>({
+    electric: false,
+    water:    false,
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [prefilledFrom, setPrefilledFrom] = useState<string | null>(null)
@@ -78,21 +103,23 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
         // Create the configured submeters for every created unit
         // (batch adds included) — 1:1 assignment, label "<unit> <utility>".
         const createdUnits: any[] = res.data?.id ? [res.data] : (res.data?.units || [])
+
         for (const u of createdUnits) {
-          for (const [utility, m] of Object.entries(meters)) {
-            if (!m.on) continue
+          for (const [utility, on] of Object.entries(meters)) {
+            if (!on) continue
             try {
-              const meterRes: any = await apiPost('/utility/meters', {
+              // Bare meter: no rate (property policy sets it), no opening read
+              // (taken on the Utilities page), no sewer rate, no RUBS branch.
+              // Just "this unit has its own electric meter".
+              await apiPost('/utility/meters', {
                 propertyId: form.propertyId,
                 utilityType: utility,
                 label: `${u.unitNumber} ${utility}`,
                 billingMethod: 'submeter',
-                ratePerUnit: m.rate === '' ? null : Number(m.rate),
                 baseFee: 0,
-                digits: Number(m.digits) || METER_READING_DEFAULT_DIGITS,
-                ...(utility === 'water' && m.sewerRate !== '' ? { sewerRatePerUnit: Number(m.sewerRate) } : {}),
+                digits: METER_READING_DEFAULT_DIGITS,
+                assignUnitId: u.id,
               })
-              await apiPost(`/utility/meters/${meterRes.data.id}/units`, { unitId: u.id })
             } catch (e: any) {
               toast.error(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber}`)
             }
@@ -343,15 +370,52 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
 
             <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 14 }}>
               <div>
-                <label style={labelStyle}>{qty > 1 ? 'Number Prefix *' : 'Unit Number / Identifier *'}</label>
+                <label style={labelStyle}>{qty > 1 ? 'Starting number *' : 'Unit number *'} <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--gold)' }}>— prefixed “{UNIT_TYPE_PREFIX[form.unitType as UnitType]}” automatically</span></label>
                 <input
                   className="input"
-                  placeholder={qty > 1 ? (isRv ? 'e.g. RV → RV 01, RV 02…' : 'e.g. Apt → Apt 01, Apt 02…') : (isRv ? 'e.g. Site 42, Lot 7' : 'e.g. 101, A1')}
+                  placeholder={qty > 1 ? 'e.g. 1 → 01, 02, 03…' : 'e.g. 7, 14A, or A'}
                   value={form.unitNumber}
                   onChange={e => set('unitNumber', e.target.value)}
                   style={{ width: '100%' }}
                 />
                 {errors.unitNumber && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unitNumber}</div>}
+                {/* S604 (Nic): the prefix behaviour was only ever shown in the
+                    PLACEHOLDER, which disappears the moment you type — so a
+                    landlord bulk-adding 20 spots had no idea whether the field
+                    wanted a prefix or a comma-separated list. Show the actual
+                    names that will be created, live. */}
+                {qty > 1 && form.unitNumber.trim() && (() => {
+                  // S605 (Nic): ONE field decides the numbering — the unit
+                  // number IS the starting point. A separate "start numbering
+                  // at" box asked the same question twice, and a padding
+                  // selector let one property render "RV 8" while another
+                  // rendered "RV 08". Padding is fixed platform-wide.
+                  const pfx = UNIT_TYPE_PREFIX[form.unitType as keyof typeof UNIT_TYPE_PREFIX] ?? ''
+                  const s0 = parseInt(form.unitNumber.trim(), 10)
+                  const gold = { color: 'var(--gold)', fontFamily: 'var(--font-mono)' } as const
+                  if (!Number.isFinite(s0)) return null
+                  const nm = (n: number) => `${pfx} ${String(n).padStart(2, '0')}`
+                  return (
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 5, lineHeight: 1.5 }}>
+                      Creates <span style={gold}>{nm(s0)}</span>
+                      {qty > 2 ? <>, <span style={gold}>{nm(s0 + 1)}</span> … </> : ' and '}
+                      <span style={gold}>{nm(s0 + qty - 1)}</span>
+                    </div>
+                  )
+                })()}
+                {qty === 1 && form.unitNumber.trim() && (() => {
+                  // S605: show the CANONICAL name — the platform supplies the
+                  // unit type's prefix and zero-pads single digits, so "7" is
+                  // stored as "RV 07". A preview of the raw input would promise
+                  // something different from what gets created.
+                  const gold = { color: 'var(--gold)', fontFamily: 'var(--font-mono)' } as const
+                  const canon = canonicalUnitNumber(form.unitType as any, form.unitNumber)
+                  return (
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 5, lineHeight: 1.5 }}>
+                      Creates <span style={gold}>{canon}</span>
+                    </div>
+                  )
+                })()}
               </div>
               <div>
                 <label style={labelStyle}>How many?</label>
@@ -364,6 +428,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 {errors.quantity && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.quantity}</div>}
               </div>
             </div>
+
 
             {/* Manual fact fields — only without a subtype (the subtype IS the facts). */}
             {selectedSubtype ? (
@@ -516,8 +581,16 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               <label style={labelStyle}>Initial Status</label>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 {[
-                  { value: 'vacant', label: 'Vacant', desc: 'No tenant, $0 charge', color: 'var(--text-3)' },
-                  { value: 'active', label: 'Active', desc: 'Occupied, rent collected', color: 'var(--green)' },
+                  // S604 (Nic): 'vacant' rendered in muted grey read as DISABLED —
+                  // and it is the correct choice in almost every case, because
+                  // esign + the lease-start scheduler flip a unit to 'active'
+                  // automatically. Gold matches the selected state of every other
+                  // picker in this modal. Marking units active by hand does not
+                  // change the platform fee (that counts active LEASES) but it
+                  // DOES inflate occupancy and rep commission, and nothing walks
+                  // it back — so the copy says so.
+                  { value: 'vacant', label: 'Vacant', desc: 'No tenant yet — recommended; a lease flips this to Active', color: 'var(--gold)' },
+                  { value: 'active', label: 'Active', desc: 'Already occupied — only if a lease is being added', color: 'var(--green)' },
                 ].map(s => (
                   <div
                     key={s.value}
@@ -536,38 +609,22 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
             </div>
 
             <div style={{ marginTop: 4 }}>
-              <label style={labelStyle}>Sub-metered utilities</label>
+              <label style={labelStyle}>Metered utilities</label>
               <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 8 }}>
-                Check what this unit has its own meter for — readings bill the tenant through the monthly reading run. Sewer bills off the water reading (one line item); propane is a tank fill on the Utilities page.
+                Does this unit have its own meter? Rates, shared/RUBS meters and opening
+                reads are all set on the <strong>Utilities</strong> page, where you can see
+                the whole property at once.
               </div>
               <div style={{ display: 'grid', gap: 6 }}>
                 {(['electric', 'water'] as const).map(t => (
-                  <div key={t} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', flexWrap: 'wrap' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem', fontWeight: 600, cursor: 'pointer', minWidth: 110 }}>
-                      <input type="checkbox" checked={meters[t].on}
-                        onChange={e => setMeters(prev => ({ ...prev, [t]: { ...prev[t], on: e.target.checked } }))} />
+                  <label key={t} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px',
+                    borderRadius: 8, background: 'var(--bg-2)', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={meters[t]}
+                      onChange={e => setMeters(prev => ({ ...prev, [t]: e.target.checked }))} />
+                    <span style={{ fontSize: '.85rem', fontWeight: 600 }}>
                       {t === 'electric' ? '⚡ Electric' : '💧 Water'}
-                    </label>
-                    {meters[t].on && (
-                      <>
-                        <input className="input" type="text" inputMode="decimal" placeholder={t === 'electric' ? '$/kWh e.g. 0.14' : 'water $/gal'}
-                          value={meters[t].rate}
-                          onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setMeters(prev => ({ ...prev, [t]: { ...prev[t], rate: v } })) }}
-                          style={{ width: 130 }} />
-                        <select className="input" value={meters[t].digits}
-                          onChange={e => setMeters(prev => ({ ...prev, [t]: { ...prev[t], digits: e.target.value } }))}
-                          style={{ width: 120 }}>
-                          {METER_READING_DIGIT_OPTIONS.map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
-                        </select>
-                        {t === 'water' && (
-                          <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)"
-                            value={meters[t].sewerRate}
-                            onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setMeters(prev => ({ ...prev, [t]: { ...prev[t], sewerRate: v } })) }}
-                            style={{ width: 170 }} />
-                        )}
-                      </>
-                    )}
-                  </div>
+                    </span>
+                  </label>
                 ))}
               </div>
             </div>

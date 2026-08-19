@@ -19,4 +19,4 @@ Accurate units and occupancy give you a clear picture of your portfolio, route t
 
 GAM is the platform that records and tracks your units and tenants — GAM is not your landlord and does not own your properties. You decide lease terms, rent, who occupies each unit, and your own rules, within your lease and local law.
 
-If you need help correcting a unit's occupancy status, reconciling your unit count against your bill, or you believe a fee doesn't match your actual occupancy, we can connect you with a human GAM specialist to review it.
+If you need help correcting a unit's occupancy status, reconciling your unit count against your bill, or you believe a fee doesn't match your actual occupancy, we can connect you with a human GAM Strategist to review it.

@@ -151,7 +151,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
   it('happy path: 1 fully-valid row → summary ready=1, blockers=0, newProperties=1, newUnits=1', async () => {
     const f = await seedCFixture()
     const csv = CANONICAL_HEADERS + '\n' +
-      'Sunset Apts,123 Main St,,Phoenix,AZ,85001,residential,101,2,1.5,850,apartment,1450,1000'
+      'Sunset Apts,123 Main St,,Phoenix,AZ,85001,residential,Apt 101,2,1.5,850,apartment,1450,1000'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -161,7 +161,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
       total: 1, blockers: 0, ready: 1, newProperties: 1, newUnits: 1,
     })
     expect(res.body.data.rows[0].propertyName).toBe('Sunset Apts')
-    expect(res.body.data.rows[0].unitNumber).toBe('101')
+    expect(res.body.data.rows[0].unitNumber).toBe('Apt 101')
     expect(res.body.data.rows[0].issues).toEqual([])
     expect(recordValidateAttemptMock).toHaveBeenCalledTimes(1)
   })
@@ -169,7 +169,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
   it('missing property_name → blocker on row', async () => {
     const f = await seedCFixture()
     const csv = CANONICAL_HEADERS + '\n' +
-      ',123 Main St,,Phoenix,AZ,85001,residential,101,2,1,850,apartment,1450,'
+      ',123 Main St,,Phoenix,AZ,85001,residential,Apt 101,2,1,850,apartment,1450,'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -183,7 +183,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
   it('negative rent_amount → blocker', async () => {
     const f = await seedCFixture()
     const csv = CANONICAL_HEADERS + '\n' +
-      'X,1 Main,,Phoenix,AZ,85001,residential,101,1,1,500,apartment,-50,0'
+      'X,1 Main,,Phoenix,AZ,85001,residential,Apt 101,1,1,500,apartment,-50,0'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -196,8 +196,8 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
   it('in-batch duplicate unit_number on same property → blocker on the second row', async () => {
     const f = await seedCFixture()
     const csv = CANONICAL_HEADERS + '\n' +
-      'Sunset Apts,1 Main,,Phoenix,AZ,85001,residential,101,1,1,500,apartment,1000,\n' +
-      'Sunset Apts,1 Main,,Phoenix,AZ,85001,residential,101,1,1,500,apartment,1100,'
+      'Sunset Apts,1 Main,,Phoenix,AZ,85001,residential,Apt 101,1,1,500,apartment,1000,\n' +
+      'Sunset Apts,1 Main,,Phoenix,AZ,85001,residential,Apt 101,1,1,500,apartment,1100,'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -223,7 +223,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
     const existingId = propRes.rows[0].id
 
     const csv = CANONICAL_HEADERS + '\n' +
-      'Sunset Apts,1 Main St,,Phoenix,AZ,85001,residential,201,2,1,800,apartment,1500,0'
+      'Sunset Apts,1 Main St,,Phoenix,AZ,85001,residential,Apt 201,2,1,800,apartment,1500,0'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -237,7 +237,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
   it('unknown unit_type → blocker (different severity from property_type which is warn)', async () => {
     const f = await seedCFixture()
     const csv = CANONICAL_HEADERS + '\n' +
-      'X,1 Main,,Phoenix,AZ,85001,residential,101,1,1,500,treehouse,1000,'
+      'X,1 Main,,Phoenix,AZ,85001,residential,Apt 101,1,1,500,treehouse,1000,'
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -267,7 +267,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
       .send({
         rows: [{
           rowIndex: 0, propertyName: 'X', street1: '1 Main', city: 'Phoenix',
-          state: 'AZ', zip: '85001', unitNumber: '1',
+          state: 'AZ', zip: '85001', unitNumber: 'Apt 1',
           rentAmount: '1000', issues: [],
         }],
         source: 'generic',
@@ -285,7 +285,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
       .send({
         rows: [{
           rowIndex: 0, propertyName: 'X', street1: '1 Main', city: 'Phoenix',
-          state: 'AZ', zip: '85001', unitNumber: '1',
+          state: 'AZ', zip: '85001', unitNumber: 'Apt 1',
           rentAmount: '1000',
           issues: [{ severity: 'block', field: 'foo', message: 'still broken' }],
         }],
@@ -309,7 +309,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
           propertyName: 'Sunset Apts', street1: '1 Main St', street2: '',
           city: 'Phoenix', state: 'AZ', zip: '85001',
           propertyType: 'residential',
-          unitNumber: '101', bedrooms: '2', bathrooms: '1.5', sqft: '850',
+          unitNumber: 'Apt 101', bedrooms: '2', bathrooms: '1.5', sqft: '850',
           unitType: 'apartment',
           rentAmount: '1450', securityDeposit: '1000',
           issues: [],
@@ -344,7 +344,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
       `SELECT unit_number, unit_type, rent_amount::text FROM units WHERE property_id=$1`,
       [props.rows[0].id])
     expect(units.rows.length).toBe(1)
-    expect(units.rows[0].unit_number).toBe('101')
+    expect(units.rows[0].unit_number).toBe('Apt 101')
     expect(units.rows[0].unit_type).toBe('apartment')
     expect(Number(units.rows[0].rent_amount)).toBe(1450)
   })

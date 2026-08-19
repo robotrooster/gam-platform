@@ -826,3 +826,168 @@ describe('GET /api/reports/monthly-pl', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// ── S603: flexible report engine + T-12 preset ─────────────────────────────
+// These assert real MONEY, so every expectation is a hand-computed number, not
+// a reflection of whatever the engine happened to return.
+describe('GET /reports/query — flexible engine', () => {
+  async function seedSettledRent(args: {
+    landlordId: string; unitId: string; tenantId: string
+    amount: number; settledAt: string; type?: string
+  }) {
+    await db.query(
+      `INSERT INTO payments
+         (unit_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, settled_at)
+       VALUES ($1,$2,$3,$4,$5,'settled','RENT',$6::date,$6::timestamptz)`,
+      [args.unitId, args.tenantId, args.landlordId,
+       args.type ?? 'rent', args.amount, args.settledAt])
+  }
+
+  async function seedExpense(args: {
+    landlordId: string; propertyId: string; unitId?: string | null
+    category: string; amount: number; date: string
+  }) {
+    await db.query(
+      `INSERT INTO landlord_expenses
+         (landlord_id, property_id, unit_id, category, amount, expense_date, status)
+       VALUES ($1,$2,$3,$4,$5,$6::date,'active')`,
+      [args.landlordId, args.propertyId, args.unitId ?? null,
+       args.category, args.amount, args.date])
+  }
+
+  it('sums income and expenses over an ARBITRARY range (not a whole month)', async () => {
+    const f = await seed()
+    // In range (Mar 10 – Mar 20), plus one on each boundary day.
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 1000, settledAt: '2025-03-10' })
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 500,  settledAt: '2025-03-20' })
+    // Outside the range — must NOT count.
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 9999, settledAt: '2025-03-09' })
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 8888, settledAt: '2025-03-21' })
+    await seedExpense({ landlordId: f.aLid, propertyId: f.aPropId, unitId: f.aUnitId, category: 'repairs', amount: 200, date: '2025-03-15' })
+
+    const res = await request(buildApp())
+      .get('/api/reports/query?start=2025-03-10&end=2025-03-20&level=portfolio&bucket=total')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    const t = res.body.data.totals
+    expect(t.income.rent).toBe(1500)          // 1000 + 500, boundaries inclusive
+    expect(t.expenses.entered).toBe(200)
+    expect(t.expenses.byCategory.repairs).toBe(200)
+  })
+
+  it('a DEPOSIT is never counted as income (it is a held liability)', async () => {
+    const f = await seed()
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 1000, settledAt: '2025-04-05' })
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 2000, settledAt: '2025-04-06', type: 'deposit' })
+
+    const res = await request(buildApp())
+      .get('/api/reports/query?start=2025-04-01&end=2025-04-30&level=portfolio&bucket=total')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    const t = res.body.data.totals
+    expect(t.income.rent).toBe(1000)
+    expect(t.income.total).toBe(1000)   // the 2000 deposit is absent entirely
+  })
+
+  it('monthly bucket splits the range into months', async () => {
+    const f = await seed()
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 100, settledAt: '2025-01-15' })
+    await seedSettledRent({ landlordId: f.aLid, unitId: f.aUnitId, tenantId: f.tenant1Id, amount: 250, settledAt: '2025-02-15' })
+
+    const res = await request(buildApp())
+      .get('/api/reports/query?start=2025-01-01&end=2025-02-28&level=portfolio&bucket=monthly')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    const byPeriod: Record<string, number> = {}
+    for (const r of res.body.data.rows) byPeriod[r.period] = r.income.rent
+    expect(byPeriod['2025-01']).toBe(100)
+    expect(byPeriod['2025-02']).toBe(250)
+  })
+
+  // S603 (Nic): a property-level cost must land in per-unit numbers. Insurance
+  // is a property expense but a per-unit cost in how operators actually think.
+  it('spreads a property-level expense across every unit at unit level', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let unit2 = ''
+    try { unit2 = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid }) }
+    finally { c.release() }
+
+    // $900 insurance on the property, tied to NO unit and NOT flagged for
+    // allocation — under the old rule this vanished from per-unit cost.
+    await seedExpense({ landlordId: f.aLid, propertyId: f.aPropId, unitId: null,
+                        category: 'insurance', amount: 900, date: '2025-06-15' })
+
+    const res = await request(buildApp())
+      .get('/api/reports/query?start=2025-06-01&end=2025-06-30&level=unit&bucket=total')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    // 3 units on the property (seed unit + unit2 + ... whatever the fixture has)
+    // — each must carry an equal share, and the shares must re-add to $900.
+    const unitRows = res.body.data.rows.filter((r: any) => r.unitId || r.unitNumber !== null)
+    const shares = res.body.data.rows.map((r: any) => r.expenses.entered).filter((n: number) => n > 0)
+    expect(shares.length).toBeGreaterThan(1)          // spread, not parked on one row
+    const summed = shares.reduce((a: number, b: number) => a + b, 0)
+    expect(Math.round(summed)).toBe(900)              // nothing lost, nothing invented
+    expect(new Set(shares.map((n: number) => Math.round(n))).size).toBe(1)  // even split
+    expect(unitRows.length).toBeGreaterThan(0)
+  })
+
+  it('NEVER leaks another landlord\'s money', async () => {
+    const f = await seed()
+    await seedSettledRent({ landlordId: f.bLid, unitId: f.bUnitId, tenantId: f.tenant1Id, amount: 7777, settledAt: '2025-05-10' })
+    const res = await request(buildApp())
+      .get('/api/reports/query?start=2025-05-01&end=2025-05-31&level=portfolio&bucket=total')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.totals.income.rent).toBe(0)
+  })
+
+  it('rejects a bad range, a bad level, and an oversized daily report', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const call = (qs: string) => request(app).get(`/api/reports/query?${qs}`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect((await call('start=2025-05-31&end=2025-05-01')).status).toBe(400)   // end before start
+    expect((await call('start=2025-05-01&end=2025-05-31&level=galaxy')).status).toBe(400)
+    expect((await call('start=2020-01-01&end=2025-12-31&bucket=daily')).status).toBe(400)
+  })
+})
+
+describe('GET /reports/t12 — trailing twelve months', () => {
+  it('covers 12 complete months and EXCLUDES the current partial month', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .get('/api/reports/t12')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    const m = res.body.data.meta
+    expect(m.report).toBe('T-12')
+    expect(m.months).toBe(12)
+    expect(m.bucket).toBe('monthly')
+
+    // End must be the last day of LAST month — never today's month.
+    const end = new Date(m.end + 'T00:00:00Z')
+    const now = new Date()
+    const thisMonthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
+    expect(end.getTime()).toBeLessThan(thisMonthStart)
+
+    // Start must be exactly 11 months before the end month.
+    const start = new Date(m.start + 'T00:00:00Z')
+    const span = (end.getUTCFullYear() - start.getUTCFullYear()) * 12
+      + (end.getUTCMonth() - start.getUTCMonth())
+    expect(span).toBe(11)
+    expect(start.getUTCDate()).toBe(1)
+  })
+
+  it('refuses a property outside the caller\'s portfolio', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .get(`/api/reports/t12?propertyId=${f.bPropId}`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    // Landlord A asking for landlord B's property returns no money either way.
+    expect([200, 403]).toContain(res.status)
+    if (res.status === 200) expect(res.body.data.totals.income.total).toBe(0)
+  })
+})

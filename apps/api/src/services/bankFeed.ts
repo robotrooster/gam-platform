@@ -11,8 +11,11 @@
 //   * Landlord ALWAYS confirms and ALWAYS picks scope (a unit, or the property
 //     split/common across units). Auto-suggest only PRE-FILLS from remembered
 //     per-landlord merchant choices (`landlord_merchant_rules`).
-//   * Only OUTFLOWS (amount < 0) are categorizable as expenses. Inbound money is
-//     auto-matched to disbursements or left for the landlord to ignore.
+//   * OUTFLOWS (amount < 0) categorize into `landlord_expenses`; INFLOWS
+//     (amount > 0) that auto-matching did NOT tie to a GAM disbursement
+//     categorize into `landlord_other_income` (S605). Matched inflows stay
+//     hidden — that money already reaches the P&L via `payments`, and filing it
+//     again would double-count the landlord's revenue.
 //   * Provider-agnostic: Stripe FC today; a CSV import path can add rows to the
 //     same `bank_transactions` table later.
 //
@@ -24,6 +27,7 @@ import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
 import { createLandlordExpense } from './landlordExpenses'
 import type { MerchantRuleScope } from '@gam/shared'
+import { OTHER_INCOME_CATEGORIES, EXPENSE_CATEGORIES } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
@@ -74,11 +78,39 @@ export async function getOrCreateFcCustomer(landlordId: string): Promise<string>
 export async function createLinkSession(landlordId: string): Promise<{ clientSecret: string; sessionId: string }> {
   const customer = await getOrCreateFcCustomer(landlordId)
   const stripe = getStripe()
-  const session = await stripe.financialConnections.sessions.create({
-    account_holder: { type: 'customer', customer },
-    permissions: ['transactions'],
-    prefetch: ['transactions'],
-  })
+  // S605 (Nic hit this): the `transactions` permission requires the Financial
+  // Connections TRANSACTIONS product to be activated on the Stripe account —
+  // a separate registration, not something code can switch on. Without it
+  // Stripe 400s and the landlord saw a raw "request failed with status code
+  // 400". Translate it into something that says what to actually do.
+  let session
+  try {
+    session = await stripe.financialConnections.sessions.create({
+      account_holder: { type: 'customer', customer },
+      // S605: `balances` was left off the original FC application because
+      // nothing read it. Nic then asked "how do we see what the bank account
+      // balance is?" on a page already showing that bank's activity — a fair
+      // ask. Stripe had approved it alongside `transactions`, so this needed no
+      // new application. Links made BEFORE this change hold transactions-only
+      // consent and must be re-linked once to grant it; nothing breaks in the
+      // meantime, the balance just reads as unknown.
+      permissions: ['transactions', 'balances'],
+      prefetch: ['transactions', 'balances'],
+    })
+  } catch (err: any) {
+    if (/activating this product|financial-connections\/application/i.test(err?.message ?? '')) {
+      // Wording matters: a landlord reading this must not think their bank or
+      // their account is broken, and must not be sent chasing a fix they can't
+      // perform. Stripe gates READING transactions (and balances) behind a
+      // one-time approval; `payment_method` — collecting a bank for payments —
+      // works without it, which is why tenant ACH is unaffected.
+      throw new AppError(503,
+        'Bank feed isn’t available yet. Reading bank transactions needs a one-time approval from ' +
+        'Stripe that’s still pending — it isn’t anything to do with your bank or your account, and ' +
+        'it doesn’t affect rent payments or payouts. We’ll turn this on as soon as it clears.')
+    }
+    throw err
+  }
   if (!session.client_secret) throw new AppError(502, 'Stripe did not return a session client secret')
   return { clientSecret: session.client_secret, sessionId: session.id }
 }
@@ -100,6 +132,12 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
     try {
       await stripe.financialConnections.accounts.subscribe(acct.id, { features: ['transactions'] })
     } catch { /* subscription is best-effort; sync still works on demand */ }
+    // S605: subscribed separately from transactions on purpose — a link that
+    // predates balances consent rejects this one, and bundling them would take
+    // the transaction subscription down with it.
+    try {
+      await stripe.financialConnections.accounts.subscribe(acct.id, { features: ['balance'] as any })
+    } catch { /* older links have no balances consent; balance simply stays unknown */ }
 
     const inst = acct.institution_name ?? acct.display_name ?? 'Bank'
     const conn = await queryOne<any>(
@@ -130,25 +168,65 @@ export async function upsertTransactions(
   landlordId: string,
   rows: Array<{ externalId: string; postedDate: string; amount: number; currency?: string; description?: string | null }>,
 ): Promise<number> {
+  // S605: anything before the landlord's books start date is still stored, but
+  // lands as `ignored` so pre-GAM history never clutters the review queue.
+  const [ll] = await query<{ books_start_date: string | null }>(
+    `SELECT books_start_date FROM landlords WHERE id = $1`, [landlordId])
+  const cutoff = ll?.books_start_date ?? null
+
+  // S605: re-linking the SAME bank is now an expected action — granting balances
+  // consent requires it — and Stripe issues a fresh account id each time, so the
+  // (bank_connection_id, external_id) key sees the new rows as new. Left alone,
+  // Oak Park's history would import a second time and every figure in the P&L
+  // would double.
+  //
+  // So when a sibling connection exists for the same physical account (same
+  // landlord, same institution, same last4), treat a same-day / same-amount /
+  // same-description row as already-imported. Deliberately conservative: it only
+  // engages for the re-link case, and a genuine duplicate charge — same merchant,
+  // same amount, same day, same account — is rare enough that silently importing
+  // it twice is the worse error.
+  const siblings = await query<{ posted_date: string; amount: string; description: string | null }>(
+    `SELECT t.posted_date, t.amount, t.description
+       FROM bank_transactions t
+       JOIN bank_connections c ON c.id = t.bank_connection_id
+      WHERE t.landlord_id = $1
+        AND t.bank_connection_id <> $2
+        AND c.account_last4 IS NOT DISTINCT FROM (SELECT account_last4 FROM bank_connections WHERE id = $2)
+        AND c.institution_name IS NOT DISTINCT FROM (SELECT institution_name FROM bank_connections WHERE id = $2)`,
+    [landlordId, connectionId])
+  const seen = new Set(siblings.map((s) =>
+    `${String(s.posted_date).slice(0, 10)}|${Number(s.amount).toFixed(2)}|${s.description ?? ''}`))
+
   let inserted = 0
+  let skippedDuplicate = 0
   for (const r of rows) {
+    if (seen.size && seen.has(`${r.postedDate}|${round2(r.amount).toFixed(2)}|${r.description ?? ''}`)) {
+      skippedDuplicate++
+      continue
+    }
+    const beforeCutoff = cutoff != null && r.postedDate < cutoff
     const res = await queryOne<{ id: string }>(
       `INSERT INTO bank_transactions
          (bank_connection_id, landlord_id, external_id, posted_date, amount, currency,
-          description, normalized_merchant)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          description, normalized_merchant, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (bank_connection_id, external_id) DO NOTHING
        RETURNING id`,
       [connectionId, landlordId, r.externalId, r.postedDate, round2(r.amount).toFixed(2),
-       r.currency ?? 'usd', r.description ?? null, normalizeMerchant(r.description)])
+       r.currency ?? 'usd', r.description ?? null, normalizeMerchant(r.description),
+       beforeCutoff ? 'ignored' : 'needs_review'])
     if (res?.id) inserted++
   }
   await autoMatchLandlord(landlordId)
+  if (skippedDuplicate) {
+    console.log(`[bankFeed] connection ${connectionId}: skipped ${skippedDuplicate} row(s) already imported via a prior link to the same account`)
+  }
   return inserted
 }
 
 /** Pull transactions from Stripe FC for one connection and upsert them. */
-export async function syncConnection(connectionId: string): Promise<{ inserted: number }> {
+export async function syncConnection(connectionId: string): Promise<{ inserted: number; pending?: boolean }> {
   const conn = await queryOne<any>('SELECT * FROM bank_connections WHERE id = $1', [connectionId])
   if (!conn) throw new AppError(404, 'Connection not found')
   if (conn.provider !== 'stripe_fc' || !conn.stripe_fc_account_id) {
@@ -174,12 +252,73 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
     await query('UPDATE bank_connections SET last_synced_at=now(), last_sync_error=NULL, status=$2 WHERE id=$1',
       [connectionId, 'active'])
   } catch (e: any) {
+    const msg = String(e?.message ?? e)
+    // S605: right after linking, Stripe replies "A transaction refresh is still
+    // pending for this account" while it backfills history. That is the NORMAL
+    // first-sync path, not a failure — but it was being written as
+    // status='error' with the raw message, so a landlord who had just connected
+    // successfully saw their brand-new bank sitting in an error state.
+    if (/refresh is still pending|still pending for this account/i.test(msg)) {
+      await query(
+        `UPDATE bank_connections
+            SET status = 'active',
+                last_sync_error = 'Stripe is still fetching your history — this can take a few minutes on a new connection.'
+          WHERE id = $1`, [connectionId])
+      return { inserted: 0, pending: true }
+    }
     await query('UPDATE bank_connections SET last_sync_error=$2, status=$3 WHERE id=$1',
-      [connectionId, String(e?.message ?? e).slice(0, 500), 'error'])
+      [connectionId, msg.slice(0, 500), 'error'])
     throw new AppError(502, 'Could not sync transactions from the bank')
   }
   const inserted = await upsertTransactions(connectionId, conn.landlord_id, rows)
+  await refreshBalance(conn).catch(() => { /* see refreshBalance: never fails a sync */ })
   return { inserted }
+}
+
+/**
+ * S605: cache the account's current balance on the connection.
+ *
+ * Deliberately best-effort and swallowed by the caller. A balance is a
+ * convenience read on a page whose actual job is categorizing transactions —
+ * it must never be able to fail a sync or block the review queue. When it
+ * can't be read (a link consented before S605, an institution that doesn't
+ * report one, Stripe having a bad minute) the column stays NULL and the UI
+ * says the balance isn't available rather than showing a stale or wrong one.
+ *
+ * `available` is preferred over `current` because it's the spendable figure a
+ * landlord means when they ask what's in the account; `current` includes funds
+ * still on hold.
+ */
+export async function refreshBalance(conn: any): Promise<void> {
+  if (conn.provider !== 'stripe_fc' || !conn.stripe_fc_account_id) return
+  const stripe = getStripe()
+
+  let acct: any
+  try {
+    acct = await stripe.financialConnections.accounts.refresh(conn.stripe_fc_account_id, {
+      features: ['balance'],
+    })
+  } catch {
+    // Refresh is a nicety — an account Stripe already has a balance for still
+    // reports it on a plain retrieve, so fall back rather than giving up.
+    acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+  }
+
+  const bal = acct?.balance
+  if (!bal) return
+  // Both shapes are currency-keyed maps of minor units.
+  const pick = bal.cash?.available ?? bal.current ?? null
+  if (!pick) return
+  const currency = Object.keys(pick)[0]
+  if (!currency) return
+  const minorUnits = Number(pick[currency])
+  if (!Number.isFinite(minorUnits)) return
+
+  await query(
+    `UPDATE bank_connections
+        SET current_balance = $2, balance_currency = $3, balance_as_of = COALESCE(to_timestamp($4), now())
+      WHERE id = $1`,
+    [conn.id, round2(minorUnits / 100).toFixed(2), currency, bal.as_of ?? null])
 }
 
 /**
@@ -261,19 +400,30 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
   propertyId?: string | null
   vendor?: string | null
   description?: string | null
-}) {
+}): Promise<{ expenseId?: string; incomeId?: string }> {
   const txn = await queryOne<any>(
     `SELECT *, to_char(posted_date, 'YYYY-MM-DD') AS posted_date_str
        FROM bank_transactions WHERE id = $1 AND landlord_id = $2`, [txnId, landlordId])
   if (!txn) throw new AppError(404, 'Transaction not found')
   if (txn.status === 'categorized') throw new AppError(409, 'Transaction already categorized')
-  if (Number(txn.amount) >= 0) throw new AppError(400, 'Only money-out transactions can be categorized as expenses')
+
+  // S605: money IN is now categorizable as income rather than only ignorable.
+  // The branch is on the sign of the amount, not on a caller-supplied flag, so
+  // there's no way to file a deposit as an expense or a payment as income.
+  if (Number(txn.amount) > 0) {
+    return categorizeAsIncome(landlordId, txn, input)
+  }
+  if (Number(txn.amount) === 0) throw new AppError(400, 'This transaction has no amount to categorize')
+  // Symmetric to the income check below: the route accepts both category sets,
+  // so the expense branch must refuse an income category outright.
+  if (!EXPENSE_CATEGORIES.includes(input.category as any)) {
+    throw new AppError(400, 'Pick an expense category for money going out')
+  }
 
   // Scope → expense shape.
   let unitId: string | null = null
   let propertyId: string | null = null
   let isCommon = false
-  let allocatePerUnit = false
   if (input.scopeKind === 'unit') {
     if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
     unitId = input.unitId
@@ -281,7 +431,11 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
     if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
     propertyId = input.propertyId
     isCommon = true
-    allocatePerUnit = input.scopeKind === 'property_allocate'
+    // S603 (Nic): 'property_common' and 'property_allocate' now behave
+    // IDENTICALLY — every non-unit cost is split across the property's units at
+    // report time, so there is nothing left to choose between. The enum value is
+    // still accepted (existing merchant rules carry it) but no longer branches.
+    // Retiring the duplicate value needs its own migration + backfill.
   }
 
   const client = await getClient()
@@ -297,7 +451,6 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
       vendor: input.vendor ?? txn.normalized_merchant ?? null,
       expenseDate: txn.posted_date_str,
       isCommon,
-      allocatePerUnit,
     })
     await client.query(
       `UPDATE bank_transactions
@@ -309,6 +462,71 @@ export async function categorizeTransaction(landlordId: string, txnId: string, i
       category: input.category, scopeKind: input.scopeKind, propertyId, unitId,
     })
     return { expenseId: expense.id }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * S605: record a money-in bank row as landlord income.
+ *
+ * The guard that matters is the `matched` check. Auto-matching ties inbound rows
+ * to the GAM disbursement that produced them; those already reach the P&L via
+ * `payments`, so letting one be filed here too would count the same rent twice
+ * and overstate the landlord's income. Only unmatched deposits — money GAM never
+ * moved — are eligible.
+ */
+async function categorizeAsIncome(landlordId: string, txn: any, input: {
+  category: string
+  scopeKind: MerchantRuleScope
+  unitId?: string | null
+  propertyId?: string | null
+  vendor?: string | null
+  description?: string | null
+}) {
+  if (txn.status === 'matched' || txn.disbursement_id) {
+    throw new AppError(409,
+      'This deposit is money GAM already sent you, so it’s counted in your income ' +
+      'automatically. Recording it again would double it.')
+  }
+  if (!OTHER_INCOME_CATEGORIES.includes(input.category as any)) {
+    throw new AppError(400, 'Pick an income category for money coming in')
+  }
+
+  let unitId: string | null = null
+  let propertyId: string | null = null
+  let isCommon = false
+  if (input.scopeKind === 'unit') {
+    if (!input.unitId) throw new AppError(400, 'A unit is required for unit scope')
+    unitId = input.unitId
+  } else {
+    if (!input.propertyId) throw new AppError(400, 'A property is required for property scope')
+    propertyId = input.propertyId
+    isCommon = true
+  }
+
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const inc = await client.query(
+      `INSERT INTO landlord_other_income
+         (landlord_id, property_id, unit_id, category, amount, description, payer, income_date, is_common)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [landlordId, propertyId, unitId, input.category, Math.abs(Number(txn.amount)),
+       input.description ?? txn.description ?? null,
+       input.vendor ?? txn.normalized_merchant ?? null, txn.posted_date_str, isCommon])
+    await client.query(
+      `UPDATE bank_transactions
+          SET status='categorized', landlord_other_income_id=$2, categorized_at=now(), updated_at=now()
+        WHERE id=$1`, [txn.id, inc.rows[0].id])
+    await client.query('COMMIT')
+    await rememberMerchantChoice(landlordId, txn.normalized_merchant, {
+      category: input.category, scopeKind: input.scopeKind, propertyId, unitId,
+    })
+    return { incomeId: inc.rows[0].id }
   } catch (e) {
     await client.query('ROLLBACK')
     throw e
@@ -338,7 +556,8 @@ export async function disconnectConnection(landlordId: string, connectionId: str
 export async function listConnections(landlordId: string) {
   return query<any>(
     `SELECT id, provider, institution_name, account_last4, account_type, display_name,
-            status, last_synced_at, last_sync_error, created_at
+            status, last_synced_at, last_sync_error, created_at,
+            current_balance, balance_currency, balance_as_of
        FROM bank_connections
       WHERE landlord_id = $1 AND status <> 'disconnected'
       ORDER BY created_at DESC`, [landlordId])
@@ -368,4 +587,71 @@ export async function listTransactions(landlordId: string, opts: { status?: stri
       ORDER BY bt.posted_date DESC, bt.created_at DESC
       LIMIT ${limit}`, params)
   return rows
+}
+
+/**
+ * S605: sync every active connection. Stripe backfills a newly linked account
+ * asynchronously, so the sync fired at link time usually returns nothing and
+ * reports "refresh is still pending". Without a retry the landlord would have
+ * to keep pressing Sync by hand until Stripe caught up. Runs hourly.
+ *
+ * Per-connection failures are swallowed: one landlord's revoked bank must never
+ * stop everyone else's sync.
+ */
+export async function syncAllActiveConnections(): Promise<{ synced: number; inserted: number; failed: number }> {
+  const conns = await query<{ id: string }>(
+    `SELECT id FROM bank_connections WHERE status = 'active'`)
+  let inserted = 0, failed = 0, synced = 0
+  for (const c of conns) {
+    try {
+      const r = await syncConnection(c.id)
+      inserted += r.inserted
+      synced++
+    } catch {
+      failed++
+    }
+  }
+  return { synced, inserted, failed }
+}
+
+/**
+ * S605: set the landlord's books start date and apply it to what's already
+ * imported.
+ *
+ * Setting the date has to be retroactive or it's useless — Oak Park had already
+ * pulled 112 rows back to February before this existed. Moving the date is
+ * therefore two-way and non-destructive:
+ *   • rows before the cutoff that are still awaiting review  → ignored
+ *   • rows on/after the cutoff that were auto-ignored by a PREVIOUS, later
+ *     cutoff → returned to needs_review
+ *
+ * Rows the landlord already CATEGORIZED are never touched. Those are real
+ * expenses in their P&L; silently un-booking them because a date moved would
+ * change their financials behind their back.
+ */
+export async function setBooksStartDate(
+  landlordId: string,
+  date: string | null,
+): Promise<{ ignored: number; restored: number }> {
+  await query('UPDATE landlords SET books_start_date = $2 WHERE id = $1', [landlordId, date])
+
+  if (!date) {
+    // Cleared: bring auto-ignored rows back for review. Categorized stays.
+    const restored = await query<{ id: string }>(
+      `UPDATE bank_transactions SET status = 'needs_review'
+        WHERE landlord_id = $1 AND status = 'ignored' RETURNING id`, [landlordId])
+    return { ignored: 0, restored: restored.length }
+  }
+
+  const ignored = await query<{ id: string }>(
+    `UPDATE bank_transactions SET status = 'ignored'
+      WHERE landlord_id = $1 AND posted_date < $2::date AND status = 'needs_review'
+      RETURNING id`, [landlordId, date])
+
+  const restored = await query<{ id: string }>(
+    `UPDATE bank_transactions SET status = 'needs_review'
+      WHERE landlord_id = $1 AND posted_date >= $2::date AND status = 'ignored'
+      RETURNING id`, [landlordId, date])
+
+  return { ignored: ignored.length, restored: restored.length }
 }

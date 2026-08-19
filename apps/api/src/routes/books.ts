@@ -1697,7 +1697,11 @@ booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, 
       [lid]
     )
 
-    const totalExpected = rows.reduce((s: number, r: any) => s + (r.status !== 'vacant' ? +r.rent_amount : 0), 0)
+    // S604: an owner_use unit is occupied but collects no rent, so it belongs
+    // in the occupancy rate and NOT in expected rent — including it would show
+    // a permanent phantom variance the landlord can never collect.
+    const earnsRent = (r: any) => r.status !== 'vacant' && r.status !== 'owner_use'
+    const totalExpected = rows.reduce((s: number, r: any) => s + (earnsRent(r) ? +r.rent_amount : 0), 0)
     const totalCollected = rows.reduce((s: number, r: any) => s + (+r.collected_mtd || 0), 0)
 
     res.json({

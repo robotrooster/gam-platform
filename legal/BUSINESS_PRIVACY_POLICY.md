@@ -2,8 +2,8 @@
 
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
-Effective Date: [DATE OF PUBLIC LAUNCH]
-Last Updated: [DATE]
+Effective Date: August 10, 2026
+Last Updated: August 10, 2026
 
 ---
 
@@ -52,8 +52,6 @@ We collect personal information from three sources: (a) directly from you when y
 
 **Tax, payroll, and bookkeeping information** (GAM Books users): payroll information for property employees (wages, hours, deductions); 1099-NEC contractor payments; chart-of-accounts data; manual journal entries.
 
-**On-Time Pay reporting enrollment information** (when you enroll a Tenant): the Tenant's identifying information necessary to report on-time rent payments to the applicable consumer reporting agency, the enrollment cadence, and your authorization to fund the reporting fee on the Tenant's behalf.
-
 ### 2.2 Information We Collect Automatically
 
 **Device and usage information**: IP address, browser type and version, operating system, device identifiers, referring URL, pages visited, features used, and timestamps. This information is collected through server logs and session telemetry.
@@ -82,11 +80,11 @@ We use personal information for the following purposes:
 - **To process payments and money movement**: route inbound tenant rent through the Payment Rail; settle outbound payouts to your Connect balance; reconcile chargebacks and ACH returns; deduct GAM fees.
 - **To verify identity and authorize money movement**: complete KYC verification via Stripe Identity before activating your Connect account; verify bank account ownership via Plaid or Stripe Financial Connections; comply with anti-money-laundering and sanctions-screening requirements.
 - **To run tenant screening you initiate**: order consumer reports from the screening provider; deliver adverse-action notices when required by FCRA; surface report results to you as the requesting Landlord.
-- **To facilitate On-Time Pay reporting**: when you enroll a Tenant in OTP, transmit the on-time payment data to the applicable consumer reporting agency on the Tenant's behalf; charge the OTP fee to your account on the Tenant's behalf.
-- **To communicate with you**: send transactional emails (registration confirmation, password reset, payout notifications, dispute notifications, OTP enrollment confirmations); send service announcements; respond to support inquiries.
+- **To communicate with you**: send transactional emails (registration confirmation, password reset, payout notifications, dispute notifications); send service announcements; respond to support inquiries.
 - **To surface state-specific compliance information**: display state deposit interest rates, state tax form deadlines, and other state-specific data applicable to your properties' states.
 - **To detect and prevent fraud, abuse, and security incidents**: review login patterns; rate-limit authentication attempts; investigate chargebacks; respond to security alerts.
 - **To improve the Platform**: analyze aggregate usage patterns; debug errors via Sentry; refine product features.
+- **To operate automated and AI-assisted features**: GAM uses automated systems and AI-assisted agents — hosted on GAM's own infrastructure and not shared with any third-party AI provider — to answer your questions, help you operate your portfolio, generate documents and notices for your review, and perform routine platform actions. These systems process account, property, payment, and tenancy information to do so, and they present actions for your confirmation rather than making legally significant decisions on their own.
 - **To comply with legal obligations**: respond to subpoenas, court orders, and regulatory requests; facilitate tax reporting (e.g., 1099-K issuance via Stripe); maintain records required by law.
 
 We do **not** use personal information for behavioral advertising, profiling for marketing purposes, or training of artificial intelligence or machine learning models for external use. Internal model training, if any, is limited to anonymized, aggregated metrics — and as of this Privacy Policy's effective date, GAM does not train models on user data.
@@ -113,7 +111,6 @@ We share personal information with third-party service providers who process it 
 - **Resend, Inc.** — transactional email delivery.
 - **Plaid Inc.** — bank account verification for ACH onboarding (in some regions and use cases).
 - **Checkr, Inc.** (when activated) — tenant screening and background checks.
-- **The OTP reporting partner** — the consumer reporting agency that receives on-time-rent payment data for OTP-enrolled Tenants (identified at the time of OTP activation).
 - **Functional Software, Inc. d/b/a Sentry** — application error tracking.
 - The hosting and database provider that hosts the Platform's infrastructure.
 

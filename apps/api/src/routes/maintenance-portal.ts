@@ -87,9 +87,15 @@ maintenancePortalRouter.patch('/tasks/:id/complete', requirePerm('work_orders.co
 // ── PARTS INVENTORY ───────────────────────────────────────────
 maintenancePortalRouter.get('/parts', requirePerm('purchases.request', 'purchases.approve', 'work_orders.complete', 'unit_access.view'), async (req, res, next) => {
   try {
+    // S605 (Nic, DIRECTIVE): equipment lives AT a property. ?propertyId=…
+    // scopes the list to one park; without it the landlord sees everything,
+    // which is only useful from the portfolio-wide screen.
+    const propertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId : null
     const parts = await query<any>(
-      'SELECT * FROM parts_inventory WHERE landlord_id=$1 ORDER BY name ASC',
-      [req.user!.profileId]
+      propertyId
+        ? 'SELECT * FROM parts_inventory WHERE landlord_id=$1 AND property_id=$2 ORDER BY name ASC'
+        : 'SELECT * FROM parts_inventory WHERE landlord_id=$1 ORDER BY name ASC',
+      propertyId ? [req.user!.profileId, propertyId] : [req.user!.profileId]
     )
     res.json({ success: true, data: parts })
   } catch(e) { next(e) }
@@ -97,10 +103,17 @@ maintenancePortalRouter.get('/parts', requirePerm('purchases.request', 'purchase
 
 maintenancePortalRouter.post('/parts', requirePerm('purchases.request', 'purchases.approve'), async (req, res, next) => {
   try {
-    const { name, description, sku, quantity, minQuantity, unit, location, cost } = req.body
+    const { name, description, sku, quantity, minQuantity, unit, location, cost, propertyId } = req.body
+    // S605: a property supplied here must belong to the caller — otherwise a
+    // landlord could file equipment against someone else's park.
+    if (propertyId) {
+      const owned = await queryOne<{ id: string }>(
+        'SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      if (!owned) throw new AppError(404, 'Property not found')
+    }
     const part = await queryOne<any>(
-      'INSERT INTO parts_inventory (landlord_id,name,description,sku,quantity,min_quantity,unit,location,cost) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [req.user!.profileId, name, description||null, sku||null, quantity||0, minQuantity||0, unit||'each', location||null, cost||null]
+      'INSERT INTO parts_inventory (landlord_id,name,description,sku,quantity,min_quantity,unit,location,cost,property_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [req.user!.profileId, name, description||null, sku||null, quantity||0, minQuantity||0, unit||'each', location||null, cost||null, propertyId||null]
     )
     res.json({ success: true, data: part })
   } catch(e) { next(e) }
@@ -108,11 +121,19 @@ maintenancePortalRouter.post('/parts', requirePerm('purchases.request', 'purchas
 
 maintenancePortalRouter.patch('/parts/:id', requirePerm('purchases.request', 'purchases.approve'), async (req, res, next) => {
   try {
-    const { quantity, name, minQuantity, location, cost, sku, description, unit } = req.body
+    const { quantity, name, minQuantity, location, cost, sku, description, unit, propertyId } = req.body
+    // Re-homing equipment (a mower moves parks) is an ordinary edit. undefined
+    // leaves it alone; null unassigns it.
+    if (propertyId) {
+      const owned = await queryOne<{ id: string }>(
+        'SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      if (!owned) throw new AppError(404, 'Property not found')
+    }
     // S348: 404 instead of silent data:null when no matching row.
     const part = await queryOne<any>(
-      'UPDATE parts_inventory SET quantity=COALESCE($1,quantity), name=COALESCE($2,name), min_quantity=COALESCE($3,min_quantity), location=COALESCE($4,location), cost=COALESCE($5,cost), sku=COALESCE($6,sku), description=COALESCE($7,description), unit=COALESCE($8,unit), updated_at=NOW() WHERE id=$9 AND landlord_id=$10 RETURNING *',
-      [quantity, name, minQuantity, location, cost, sku, description, unit, req.params.id, req.user!.profileId]
+      'UPDATE parts_inventory SET quantity=COALESCE($1,quantity), name=COALESCE($2,name), min_quantity=COALESCE($3,min_quantity), location=COALESCE($4,location), cost=COALESCE($5,cost), sku=COALESCE($6,sku), description=COALESCE($7,description), unit=COALESCE($8,unit), property_id=CASE WHEN $11::boolean THEN $12::uuid ELSE property_id END, updated_at=NOW() WHERE id=$9 AND landlord_id=$10 RETURNING *',
+      [quantity, name, minQuantity, location, cost, sku, description, unit, req.params.id, req.user!.profileId,
+       propertyId !== undefined, propertyId ?? null]
     )
     if (!part) throw new AppError(404, 'Part not found')
     res.json({ success: true, data: part })

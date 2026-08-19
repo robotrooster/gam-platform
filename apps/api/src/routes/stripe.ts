@@ -11,6 +11,7 @@ import {
   type ConnectEntity,
 } from '../services/stripeConnect'
 import { assertLiveLandlordMember } from '../services/landlordMembership'
+import { microdepositInstruction, type MicrodepositType } from '@gam/shared'
 import { logger } from '../lib/logger'
 
 export const stripeRouter = Router()
@@ -179,6 +180,36 @@ stripeRouter.post('/tenant/setup', async (req: any, res, next) => {
     )
     if (!tenant) throw new AppError(404, 'Tenant not found')
 
+    // S603 (Nic): a tenant may NOT store a card when nothing is due.
+    //
+    // Stripe bills per AUTHORIZATION, not per successful payment. Saving a card
+    // is its own bank ask ($0.26 auth + $0.02 Radar) that collects nothing, so a
+    // tenant who stores a card today and pays rent next week costs GAM $0.28 for
+    // no reason — the exact waste this rule exists to kill. Card entry belongs at
+    // the moment of payment, where ONE authorization can both charge and store.
+    //
+    // Tenants are also the least mobile users on the platform; card-on-file is a
+    // GUEST feature (someone touring between RV parks), not a tenant one.
+    // See memory gam-card-on-file-guests-not-tenants + gam-card-auth-cost-model.
+    //
+    // ACH is unaffected — a bank mandate is not a card authorization, costs
+    // nothing to store, and is the rail GAM actively steers rent toward.
+    if (method === 'card') {
+      const outstanding = await queryOne<{ n: string }>(
+        `SELECT COUNT(*)::text AS n
+           FROM payments
+          WHERE tenant_id = $1
+            AND ((status = 'pending' AND stripe_payment_intent_id IS NULL)
+                 OR status = 'failed')`,
+        [req.user!.profileId]
+      )
+      if (!outstanding || parseInt(outstanding.n, 10) === 0) {
+        throw new AppError(409,
+          'You can add a card when a payment is due. Nothing is outstanding right now — ' +
+          'to set up automatic payments before then, add a bank account instead.')
+      }
+    }
+
     const stripe = getStripe()
 
     // Ensure a Stripe customer exists. ACH first-setup uses
@@ -217,9 +248,21 @@ stripeRouter.post('/tenant/setup', async (req: any, res, next) => {
         ? {
             customer:             customerId!,
             payment_method_types: ['us_bank_account'],
-            // S570 (Nic): microdeposits, NOT Financial Connections instant
-            // verification — instant bills $1.50/verification (see lib/stripe.ts
-            // createTenantAchSetup). Free microdeposit verification instead.
+            // S605 (Nic, DIRECTIVE): "We are not doing the dollar fifty instant
+            // verification at all... Remove all reference and options to even
+            // show a hint of the instant verification process."
+            //
+            // So this stays 'microdeposits' — the free path, permanently. That
+            // is INCOMPATIBLE with Stripe's PaymentElement, which is why the
+            // tenant portal collects routing + account numbers on its own form
+            // and calls confirmUsBankAccountSetup directly (apps/tenant
+            // payShared.tsx). Do NOT "fix" a PaymentElement error here by
+            // switching this to 'automatic' or 'instant' — that re-exposes
+            // Financial Connections instant verification at ~$1.50 a pop, which
+            // is exactly what this directive rules out. Fix the form instead.
+            //
+            // S570 (Nic), original: microdeposits, NOT Financial Connections
+            // instant — instant bills $1.50/verification.
             payment_method_options: {
               us_bank_account: {
                 verification_method: 'microdeposits',
@@ -284,7 +327,28 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     if (!tenant.stripe_customer_id) {
       throw new AppError(409, 'Stripe customer not initialized — call /tenant/setup first')
     }
-    if (pm.customer !== tenant.stripe_customer_id) {
+    // S605 (Nic hit this live — "payment method does not belong to this tenant"
+    // on a perfectly good bank account): this USED to be
+    // `pm.customer !== tenant.stripe_customer_id`. That holds for cards, which
+    // attach to the customer the moment setup confirms. It is WRONG for
+    // microdeposit ACH: the PaymentMethod stays UNATTACHED (`pm.customer` is
+    // null) until the tenant confirms the deposits days later, so the first
+    // bank any tenant ever added always 403'd. The bank was accepted by Stripe;
+    // GAM simply refused to record it.
+    //
+    // The SetupIntent is the correct ownership proof and is timing-independent:
+    // it is created server-side against THIS tenant's customer, so if it names
+    // their customer AND carries the submitted payment method, the PM is
+    // theirs. The S406 property is preserved — passing someone else's payment
+    // method id still fails, because that PM won't be on this SetupIntent.
+    //
+    // Scope note: this checks which GAM ACCOUNT the payment method belongs to,
+    // NOT whose NAME is on the bank account. A tenant whose rent is paid by a
+    // parent, partner, or friend enters that account here and it works — the
+    // account holder name is a separate field and is never compared to anything.
+    const siCustomerId = typeof si.customer === 'string' ? si.customer : si.customer?.id
+    const siPmId = typeof si.payment_method === 'string' ? si.payment_method : si.payment_method?.id
+    if (siCustomerId !== tenant.stripe_customer_id || siPmId !== paymentMethodId) {
       throw new AppError(403, 'Payment method does not belong to this tenant')
     }
     const bank = pm.us_bank_account
@@ -325,11 +389,27 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
       return res.json({ success: true, verified: true, message: 'Bank account verified. ACH collections active.' })
     }
 
+    const mdType = ((si.next_action as any)?.verify_with_microdeposits?.microdeposit_type
+      ?? null) as MicrodepositType | null
+
+    // S605 (Nic): return the bank NAME Stripe resolved from the routing number.
+    // The tenant never picks an institution — the routing number identifies it —
+    // so echoing "PNC Bank ••1234" back is how they confirm they typed the right
+    // account. Without it the only feedback is four digits, which proves nothing
+    // about the bank.
     res.json({
       success: true,
       verified: false,
       status: si.status,
-      message: 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish setup.',
+      bankName: bank?.bank_name ?? null,
+      bankLast4: bank?.last4 ?? null,
+      // S605 (Nic): Stripe picks 'amounts' vs 'descriptor_code' per bank, so the
+      // instructions must follow what it actually sent — a promise of two
+      // deposits followed by a screen asking for a six-digit code reads as a
+      // broken account, not a variation.
+      microdepositType: mdType,
+      arrivalDate: (si.next_action as any)?.verify_with_microdeposits?.arrival_date ?? null,
+      message: microdepositInstruction(mdType),
     })
   } catch (e) { next(e) }
 })
@@ -446,6 +526,16 @@ stripeRouter.patch('/tenant/default-payment-method', async (req: any, res, next)
 
     const stripe = getStripe()
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
+    // Unlike the confirm-setup check above, `pm.customer` is right here: a
+    // payment method can only be made the default once it is ATTACHED. But an
+    // unattached bank is the ordinary mid-microdeposit state, not a stranger's
+    // card, so say which one it is instead of implying the tenant is using
+    // someone else's account.
+    if (!pm.customer) {
+      throw new AppError(409,
+        'That bank account isn’t verified yet. Finish the verification Stripe sent you first, ' +
+        'then you can make it your default.')
+    }
     if (pm.customer !== tenant.stripe_customer_id) {
       throw new AppError(403, 'Payment method does not belong to this tenant')
     }
@@ -453,5 +543,116 @@ stripeRouter.patch('/tenant/default-payment-method', async (req: any, res, next)
       invoice_settings: { default_payment_method: paymentMethodId },
     })
     res.json({ success: true, data: { defaultPaymentMethodId: paymentMethodId } })
+  } catch (e) { next(e) }
+})
+
+// ══════════════════════════════════════════════════════════════
+// S603 (Nic) — IN-HOUSE MICRODEPOSIT VERIFICATION
+//
+// Before this, a tenant setting up ACH left GAM entirely: Stripe emailed them a
+// link and they confirmed the two deposit amounts on a Stripe-hosted page. Nic:
+// keep people in house. They still have to look in their own bank to READ the
+// amounts — nothing can change that — but confirming them now happens in GAM.
+//
+// Flow:
+//   1. POST /tenant/setup {method:'ach'} → SetupIntent, microdeposits sent
+//   2. GET  /tenant/microdeposits         → is one pending, and which KIND
+//   3. POST /tenant/microdeposits/verify  → submit amounts (or descriptor code)
+//   4. Stripe fires setup_intent.succeeded → webhook flips tenants.ach_verified
+//
+// Step 4 is why this could not have worked before today: that event was not
+// subscribed on the live endpoint, so verification could never complete no
+// matter where it was performed.
+//
+// Stripe uses one of TWO microdeposit styles depending on the bank:
+//   'amounts'         — two deposits under $1; tenant enters both, in cents
+//   'descriptor_code' — one $0.01 deposit whose STATEMENT DESCRIPTOR carries a
+//                       6-digit code; tenant enters the code
+// Both are supported; the GET tells the UI which one to ask for.
+// ══════════════════════════════════════════════════════════════
+
+/** The tenant's most recent bank SetupIntent still awaiting microdeposits. */
+async function pendingMicrodepositIntent(customerId: string) {
+  const stripe = getStripe()
+  const list = await stripe.setupIntents.list({ customer: customerId, limit: 10 })
+  return list.data.find(si =>
+    si.status === 'requires_action' &&
+    (si.next_action as any)?.type === 'verify_with_microdeposits') ?? null
+}
+
+// GET /api/stripe/tenant/microdeposits — is a verification waiting, and what
+// should we ask the tenant for?
+stripeRouter.get('/tenant/microdeposits', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
+      `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
+    if (!tenant?.stripe_customer_id) return res.json({ success: true, data: { pending: false } })
+
+    const si = await pendingMicrodepositIntent(tenant.stripe_customer_id)
+    if (!si) return res.json({ success: true, data: { pending: false } })
+
+    const na = (si.next_action as any)?.verify_with_microdeposits ?? {}
+    res.json({
+      success: true,
+      data: {
+        pending: true,
+        setupIntentId: si.id,
+        // 'amounts' | 'descriptor_code' — drives which field the UI shows.
+        //
+        // S605 (Nic): this used to fall back to 'amounts' when Stripe didn't say.
+        // A guess here is worse than an admission — a descriptor-code tenant
+        // would be shown two amount boxes for a deposit that has no amounts to
+        // read, with no way to enter what they actually received. NULL means
+        // "unknown", and the UI offers BOTH inputs rather than picking wrong.
+        microdepositType: na.microdeposit_type ?? null,
+        arrivalDate: na.arrival_date ?? null,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// POST /api/stripe/tenant/microdeposits/verify
+// Body: { amounts: [number, number] }  (cents)  OR  { descriptorCode: string }
+stripeRouter.post('/tenant/microdeposits/verify', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const body = z.object({
+      amounts:        z.array(z.number().int().min(1).max(99)).length(2).optional(),
+      descriptorCode: z.string().trim().min(4).max(12).optional(),
+    }).parse(req.body ?? {})
+    if (!body.amounts && !body.descriptorCode) {
+      throw new AppError(400, 'Enter the deposit amounts or the code from your statement')
+    }
+
+    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
+      `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
+    if (!tenant?.stripe_customer_id) throw new AppError(404, 'No payment profile on file')
+
+    // Ownership: resolve the SetupIntent from the TENANT'S OWN customer rather
+    // than trusting an id from the request body — otherwise a tenant could
+    // submit guesses against someone else's pending verification.
+    const si = await pendingMicrodepositIntent(tenant.stripe_customer_id)
+    if (!si) throw new AppError(409, 'No bank verification is waiting on your account')
+
+    const stripe = getStripe()
+    try {
+      await stripe.setupIntents.verifyMicrodeposits(
+        si.id,
+        body.amounts ? { amounts: body.amounts } : { descriptor_code: body.descriptorCode! },
+      )
+    } catch (err: any) {
+      // Stripe counts wrong guesses and locks the SetupIntent after too many.
+      // Pass its own wording through — it distinguishes "that's not right, try
+      // again" from "this is locked, start over" — rather than flattening both
+      // into one message that leaves the tenant stuck.
+      const msg: string = err?.raw?.message || err?.message || 'Those amounts did not match'
+      throw new AppError(400, msg)
+    }
+
+    // Do NOT flip ach_verified here. setup_intent.succeeded is the single place
+    // that happens (webhooks.ts), so the microdeposit path and every other path
+    // agree, and a Stripe-side confirmation still lands correctly.
+    res.json({ success: true, data: { verified: true } })
   } catch (e) { next(e) }
 })

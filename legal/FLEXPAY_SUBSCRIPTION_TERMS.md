@@ -132,7 +132,7 @@ Subscriber may cancel FlexPay at any time through any of the following methods:
 
 **Effect of cancellation.** Cancellation stops the FlexPay subscription at the end of the then-current billing cycle. Subscriber retains the chosen Scheduled Pull Date through the end of that billing cycle; the rent due date reverts to the Platform default (the date specified in Subscriber's lease) after cancellation takes effect. **Subscription fees already paid for the then-current billing cycle are non-refundable** under Section 10 of the Consumer ToS, except where state law requires a pro-rated refund (see Section 8 below).
 
-Cancellation of FlexPay does not affect any other Platform feature, including any other FlexSuite enrollment, rent payment authorizations, or any FlexDeposit Service-Level Agreement Subscriber has in place. Each is governed by its own terms.
+Cancellation of FlexPay does not affect any other Platform feature, including any other FlexSuite enrollment, rent payment authorizations, or any FlexDeposit Custody Agreement Subscriber has in place. Each is governed by its own terms.
 
 ## 8. Refunds
 

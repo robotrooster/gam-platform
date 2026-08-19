@@ -90,7 +90,14 @@ export function DialogHost() {
   useEffect(() => {
     pushToast = (t) => {
       setToasts((prev) => [...prev.slice(-3), t])
-      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== t.id)), 5000)
+      // S605 (Nic): "it popped up with a red error message, but it disappeared
+      // before I could get a good look at it." Every toast auto-dismissed at 5s,
+      // including errors — which are the ones that carry information the user
+      // has to ACT on, and are often long enough that 5s isn't reading time.
+      // Errors now stay until dismissed; confirmations still fade.
+      if (t.kind !== 'error') {
+        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== t.id)), 5000)
+      }
     }
     pushConfirm = (c) => setConfirmReq((prev) => {
       // one at a time — a second request while one is open resolves false
@@ -115,13 +122,22 @@ export function DialogHost() {
       {/* toast stack */}
       <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 300, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center', pointerEvents: 'none' }}>
         {toasts.map((t) => (
-          <div key={t.id} style={{
-            pointerEvents: 'auto', maxWidth: 480, padding: '10px 16px', borderRadius: 8,
-            background: 'var(--bg-1)', color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45,
-            border: `1px solid ${t.kind === 'error' ? 'var(--red, #dc2626)' : 'var(--gold)'}`,
-            boxShadow: '0 8px 30px rgba(0,0,0,.45)',
-          }}>
-            {t.text}
+          // Click anywhere to dismiss — required for errors, which no longer
+          // time out, and harmless for the rest.
+          <div key={t.id}
+            onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+            title="Click to dismiss"
+            style={{
+              pointerEvents: 'auto', maxWidth: 480, padding: '10px 16px', borderRadius: 8,
+              background: 'var(--bg-1)', color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45,
+              border: `1px solid ${t.kind === 'error' ? 'var(--red, #dc2626)' : 'var(--gold)'}`,
+              boxShadow: '0 8px 30px rgba(0,0,0,.45)', cursor: 'pointer',
+              display: 'flex', gap: 12, alignItems: 'flex-start',
+            }}>
+            <span style={{ flex: 1 }}>{t.text}</span>
+            {t.kind === 'error' && (
+              <span style={{ color: 'var(--text-3)', fontSize: '1rem', lineHeight: 1, marginTop: 1 }}>×</span>
+            )}
           </div>
         ))}
       </div>

@@ -276,29 +276,29 @@ describe('computeApplicationFee — ACH (S601: flat $6 at any rent)', () => {
   })
 })
 
-describe('computeApplicationFee — card (S552: 3.25% + $0.26/txn)', () => {
-  it('US card 3.25% + 26¢ ($100 → $3.51)', () => {
+describe('computeApplicationFee — card (S603: 3.5% + $0.55/txn)', () => {
+  it('US card 3.5% + 55¢ ($100 → $4.05)', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: 'US',
-    })).toBe(3.51)
+    })).toBe(4.05)
   })
 
-  it('card with null country defaults to base 3.25% + 26¢', () => {
+  it('card with null country defaults to base 3.5% + 55¢', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: null,
-    })).toBe(3.51)
+    })).toBe(4.05)
   })
 
-  it('non-US card adds 1.5% surcharge (CA $100 → $5.01)', () => {
+  it('non-US card adds 1.5% surcharge (CA $100 → $5.55)', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: 'CA',
-    })).toBe(5.01)
+    })).toBe(5.55)
   })
 
-  it('card amount rounded to cents (3.25% of $33.33 + 26¢ → $1.34)', () => {
+  it('card amount rounded to cents (3.5% of $33.33 + 55¢ → $1.72)', () => {
     expect(computeApplicationFee({
       amount: 33.33, paymentMethod: 'card', cardCountry: 'US',
-    })).toBe(1.34)
+    })).toBe(1.72)
   })
 })
 

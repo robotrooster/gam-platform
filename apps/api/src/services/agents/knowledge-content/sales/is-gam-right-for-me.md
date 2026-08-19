@@ -11,6 +11,6 @@ It tends to be a great fit if you:
 - **Want to stop chasing checks.** Tenants pay electronically (ACH or card), and your payouts land in your connected bank through Stripe on a regular schedule as those payments clear — no mailed checks, no manual deposits.
 - **Operate across more than one location or state.** GAM is a nationwide platform.
 
-It may be less of a fit if you only ever deal in cash and don't want any electronic payments — GAM is electronic-only by design.
+It's less of a fit if you refuse electronic payments entirely — GAM is built around electronic rent — though you can also record the occasional off-platform payment (cash, check, or money order) when one comes in.
 
 Every portfolio is a little different, so the best way to know is a short conversation. Tell me roughly how many units you have and what kind of properties, and I can point you in the right direction or connect you with our team for a closer look.

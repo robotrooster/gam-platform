@@ -352,7 +352,10 @@ function CostBreakdownModal({ requests, onClose }: { requests: any[]; onClose: (
   )
 }
 
-export function MaintenancePage() {
+// S605 (Nic): the same page serves two questions — "what needs attention across
+// everything" from the left nav, and "what's open at THIS property" as a tab
+// inside it. One component, two entry points; nothing moved or duplicated.
+export function MaintenancePage({ embeddedPropertyId }: { embeddedPropertyId?: string } = {}) {
   const qc = useQueryClient()
   const [showAdd, setShowAdd] = useState(false)
   const [selectedRequest, setSelectedRequest] = useState<any>(null)
@@ -366,7 +369,9 @@ export function MaintenancePage() {
   const [view, setView] = useState<'work' | 'entry' | 'outage'>('work')
   const { can } = usePerms()
 
-  const { data: requests = [], isLoading } = useQuery<any[]>('maintenance', () => apiGet('/maintenance'))
+  const { data: requests = [], isLoading } = useQuery<any[]>(
+    ['maintenance', embeddedPropertyId ?? 'all'],
+    () => apiGet(`/maintenance${embeddedPropertyId ? `?propertyId=${embeddedPropertyId}` : ''}`))
 
   // Deep-link: ?open=<requestId> opens the detail modal directly once requests load
   useEffect(() => {
@@ -431,7 +436,7 @@ export function MaintenancePage() {
       {tabs}
       <div className="page-header">
         <div>
-          <h1 className="page-title">Maintenance</h1>
+          {!embeddedPropertyId && <h1 className="page-title">Maintenance</h1>}
           <p className="page-subtitle">
             {(stats as any)?.openCount || 0} open · {(stats as any)?.inProgressCount || 0} in progress
             {emergencies.length > 0 && <span style={{ color: 'var(--red)', marginLeft: 8 }}>· {emergencies.length} emergency</span>}

@@ -7,7 +7,7 @@ Every electronic rent payment carries a small processing fee. GAM never absorbs 
 Here are the standard processing rates:
 
 - ACH (bank transfer): a flat $6 per payment
-- Card: 3.25% plus $0.26 per transaction
+- Card: 3.5% plus $0.55 per transaction
 - Non-US-issued cards: an extra 1.5% on top
 
 The ACH pass-through choice works like this:

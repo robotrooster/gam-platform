@@ -110,8 +110,14 @@ export function LoginPage() {
           {pending ? 'Signing in…' : 'Sign in'}
         </button>
 
+        {/* S605: no way to recover a forgotten password existed here, so a
+            mistyped password meant permanent lockout. */}
+        <div style={{ marginTop: 14, textAlign: 'center', fontSize: 13 }}>
+          <Link to="/forgot-password" style={{ color: 'var(--text-2)' }}>Forgot your password?</Link>
+        </div>
+
         <div style={{
-          marginTop: 16, textAlign: 'center', fontSize: 13,
+          marginTop: 12, textAlign: 'center', fontSize: 13,
           color: 'var(--text-2)',
         }}>
           New business owner? <Link to="/signup" style={{ color: 'var(--gold)' }}>Sign up</Link>

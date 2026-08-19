@@ -33,7 +33,7 @@ export function ExpensesPage() {
 
   const [form, setForm] = useState({
     propertyId: '', unitId: '', scope: 'unit' as 'unit' | 'common',
-    category: 'repairs', amount: '', description: '', vendor: '', expenseDate: today(), allocatePerUnit: false,
+    category: 'repairs', amount: '', description: '', vendor: '', expenseDate: today(),
   })
   const [err, setErr] = useState<string | null>(null)
   const [receipt, setReceipt] = useState<File | null>(null)
@@ -48,7 +48,7 @@ export function ExpensesPage() {
         description: form.description.trim() || null, vendor: form.vendor.trim() || null,
         ...(form.scope === 'unit'
           ? { unitId: form.unitId }
-          : { propertyId: form.propertyId, isCommon: true, allocatePerUnit: form.allocatePerUnit }),
+          : { propertyId: form.propertyId, isCommon: true }),
       })
       // Chain the receipt upload onto the freshly-created expense (S575). One
       // "Log expense" click; the file is optional.
@@ -109,10 +109,14 @@ export function ExpensesPage() {
               </select>
             </label>
           ) : (
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem', color: 'var(--text-2)', padding: '8px 0' }}>
-              <input type="checkbox" checked={form.allocatePerUnit} onChange={e => set({ allocatePerUnit: e.target.checked })} />
-              Divide this expense evenly per unit across the property (for per-unit P&L)
-            </label>
+            // S603 (Nic): the per-unit allocation CHOICE is gone. Any expense not
+            // tied to a specific unit is now always divided evenly across that
+            // property's units, so per-unit cost reflects reality. A control that
+            // no longer changes anything would only confuse.
+            <div style={{ fontSize: '.8rem', color: 'var(--text-2)', padding: '8px 0' }}>
+              This cost will be divided evenly across every unit at the property,
+              including vacant ones, so your per-unit numbers stay accurate.
+            </div>
           )}
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -163,7 +167,7 @@ export function ExpensesPage() {
                   <td style={{ fontSize: '.8rem' }}>{new Date(String(e.expenseDate).slice(0, 10) + 'T12:00:00').toLocaleDateString()}</td>
                   <td>{EXPENSE_CATEGORY_LABEL[e.category as keyof typeof EXPENSE_CATEGORY_LABEL] || humanize(e.category)}</td>
                   <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-                    {e.unitNumber ? `Unit ${e.unitNumber}` : e.isCommon ? `${e.propertyName} · common${e.allocatePerUnit ? ' (per unit)' : ''}` : (e.propertyName || '—')}
+                    {e.unitNumber ? `Unit ${e.unitNumber}` : e.isCommon ? `${e.propertyName} · common (split per unit)` : (e.propertyName || '—')}
                   </td>
                   <td>{fmt(e.amount)}</td>
                   <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{e.description || '—'}</td>

@@ -20,7 +20,8 @@
  * Frontend never computes the fee — it's shown in the authorization line
  * as customer-facing copy only.
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import { isValidRoutingNumber, microdepositInstruction, type MicrodepositType } from '@gam/shared'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
@@ -590,14 +591,24 @@ export function AddPaymentMethodModal({
   const [clientSecret, setClientSecret] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pendingMsg, setPendingMsg] = useState<string | null>(null)
+  // S605: shown on the pending screen so the tenant sees WHICH bank the routing
+  // number resolved to — the confirmation an institution picker would have given
+  // them, except derived rather than typed, so it can't disagree with the number.
+  const [pendingBank, setPendingBank] = useState<{ name: string | null; last4: string | null } | null>(null)
+  // S605 (Nic): which verification Stripe actually sent — 'amounts' or the
+  // six-digit 'descriptor_code'. Never assume; the screen must match the deposit.
+  const [pendingType, setPendingType] = useState<MicrodepositType | null>(null)
 
   const titleVerb  = method === 'ach' ? 'bank account' : 'card'
   const idleCopy   =
     method === 'ach'
-      ? 'Enter your bank\'s routing and account numbers. Stripe sends two small deposits to your account — confirm them in 1–3 business days (Stripe emails you a link) to finish. No fees. Prefer to pay right away? Use a card instead.'
+      ? 'Enter your bank\'s routing and account numbers. Stripe then sends a small verification deposit — depending on your bank you\'ll confirm either the deposit amounts or a six-digit code from your statement, usually within 1–3 business days. No fees. Need to pay right now? Use a card instead.'
       : 'We\'ll collect your card securely through Stripe. Card details never touch GAM\'s servers; we only see the last 4 digits, brand, and expiration once Stripe attaches the card to your account.'
   const loadingCopy = method === 'ach' ? 'Preparing secure bank form…' : 'Preparing secure card form…'
   const doneCopy    = method === 'ach' ? '✓ Bank account verified' : '✓ Card saved'
+
+  const elementsOptions = useMemo(
+    () => (clientSecret ? { clientSecret } : undefined), [clientSecret])
 
   const start = async () => {
     setPhase('loading')
@@ -649,12 +660,19 @@ export function AddPaymentMethodModal({
         <div style={{ padding: 20, textAlign: 'center', color: 'var(--t3)' }}>{loadingCopy}</div>
       )}
       {phase === 'collect' && clientSecret && stripePromise && (
-        <Elements stripe={stripePromise} options={{ clientSecret }}>
+        // Memoized: a fresh {clientSecret} object on every parent render makes
+        // react-stripe-js treat the options as changed, which can tear down and
+        // remount the element mid-flow — the other way to end up calling
+        // confirmSetup with nothing mounted.
+        <Elements stripe={stripePromise} options={elementsOptions!}>
           <PaymentMethodSetupForm
             method={method}
+            clientSecret={clientSecret}
             onDone={(result) => {
               if (result?.pending) {
                 setPendingMsg(result.message ?? null)
+                setPendingBank({ name: result.bankName ?? null, last4: result.bankLast4 ?? null })
+                setPendingType(result.microdepositType ?? null)
                 setPhase('pending')
               } else {
                 setPhase('done')
@@ -683,8 +701,19 @@ export function AddPaymentMethodModal({
       {phase === 'pending' && (
         <div>
           <div style={{ padding: '4px 0 14px', color: 'var(--t2)', fontSize: '.85rem', lineHeight: 1.55 }}>
-            <div style={{ fontWeight: 600, color: 'var(--t1)', marginBottom: 6 }}>Two small deposits are on the way</div>
-            {pendingMsg ?? 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish setting up your bank. You can pay by card in the meantime.'}
+            <div style={{ fontWeight: 600, color: 'var(--t1)', marginBottom: 6 }}>
+              {pendingType === 'descriptor_code' ? 'A $0.01 deposit is on the way' : 'Verification is on the way'}
+            </div>
+            {pendingBank?.name && (
+              <div style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg1)', border: '1px solid var(--b1)', fontSize: '.82rem', color: 'var(--t1)' }}>
+                <strong>{pendingBank.name}</strong>{pendingBank.last4 ? ` ••${pendingBank.last4}` : ''}
+                <div style={{ fontSize: '.72rem', color: 'var(--t3)', marginTop: 2 }}>
+                  Not your bank? Add the account again with the correct routing number.
+                </div>
+              </div>
+            )}
+            {pendingMsg ?? microdepositInstruction(pendingType)}
+            {' '}It usually arrives in 1–3 business days. You can pay by card in the meantime.
           </div>
           <button className="btn btn-p" style={{ width: '100%' }} onClick={onAdded}>Got it</button>
         </div>
@@ -703,13 +732,22 @@ export function AddPaymentMethodModal({
   )
 }
 
+// How long to wait on Stripe's bank window before telling the tenant something
+// is wrong. Long enough for a slow bank login, short enough that nobody sits on
+// a frozen button wondering.
+const CONFIRM_TIMEOUT_MS = 180_000
+
 function PaymentMethodSetupForm({
   method,
+  clientSecret,
   onDone,
   onError,
 }: {
-  method:  'ach' | 'card'
-  onDone:  (result?: { pending?: boolean; message?: string }) => void
+  method:       'ach' | 'card'
+  // Needed by the ACH path, which confirms directly instead of going through
+  // the Elements group.
+  clientSecret: string
+  onDone:  (result?: { pending?: boolean; message?: string; bankName?: string | null; bankLast4?: string | null; microdepositType?: MicrodepositType | null }) => void
   onError: (msg: string) => void
 }) {
   const stripe = useStripe()
@@ -717,15 +755,95 @@ function PaymentMethodSetupForm({
   const [submitting, setSubmitting] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
 
+  // S605 (Nic hit this): "invalid value for stripe.confirmSetup() — elements
+  // should have a mounted Payment Element".
+  //
+  // `useElements()` returns the Elements GROUP, which exists the moment
+  // <Elements> renders — it says nothing about whether the PaymentElement
+  // inside it has mounted. The button was gated on `elements` alone, so it went
+  // live before the payment form was actually there, and clicking it called
+  // confirmSetup against an empty group. Gate on the element's own ready event
+  // instead, which is the only signal that means what we need it to mean.
+  const [elementReady, setElementReady] = useState(false)
+
+  // S605: ACH is collected here rather than by Stripe's element — see the form
+  // below for why. Card still uses the element, so `elementReady` only gates it.
+  const [ach, setAch] = useState({
+    name: '', routing: '', account: '', confirmAccount: '',
+    accountType: 'checking' as 'checking' | 'savings',
+    // S605 (Nic): "somebody on hard times may be getting their rent paid by
+    // somebody else... the person living there may not be the person actually
+    // paying for it." That payer can be a business — an employer, a housing
+    // agency, a church or nonprofit — and Stripe needs the holder type to match
+    // the real account. This was hardcoded to 'individual', which would have
+    // failed every organization-funded tenancy.
+    holderType: 'individual' as 'individual' | 'company',
+  })
+  const routingValid = isValidRoutingNumber(ach.routing)
+  // S605 (Nic): the routing number has a checksum to catch a fat finger; the
+  // account number has NOTHING — any digit string is structurally plausible, so
+  // a typo sails through to Stripe and surfaces days later as a failed deposit
+  // with no clue which digit was wrong. Double entry is the only check available.
+  const accountsMatch = ach.account.length > 0 && ach.account === ach.confirmAccount
+  const accountMismatch = ach.confirmAccount.length > 0 && ach.account !== ach.confirmAccount
+  // Only complain once they've typed all 9 — flagging a half-entered number as
+  // invalid would be wrong and would train them to ignore the message.
+  const routingBad = ach.routing.length === 9 && !routingValid
+  const achComplete = ach.name.trim().length > 1 && routingValid && ach.account.length >= 4 && accountsMatch
+
   const handleConfirm = async () => {
-    if (!stripe || !elements) return
+    if (!stripe) return
+    if (method === 'card' && !elements) return
     setSubmitting(true)
     setLocalError(null)
-    const result = await stripe.confirmSetup({
-      elements,
-      confirmParams: { return_url: window.location.href },
-      redirect:      'if_required',
-    })
+
+    // S605 (Nic hit this): the button stuck on "Linking…" forever with no
+    // message. `stripe.confirmSetup` was awaited bare — anything it THREW
+    // (rather than returned as {error}) escaped this handler unhandled, so
+    // setSubmitting(false) never ran and the tenant was left staring at a dead
+    // button with no way to tell whether it was working or broken. Stripe's
+    // bank flow opens a Financial Connections popup, which is exactly the kind
+    // of thing that can reject or never settle (popup blocked, window closed).
+    //
+    // Two guards: catch anything thrown, and refuse to hang forever. A tenant
+    // trying to pay rent must always end up somewhere they can act on.
+    let result: any
+    try {
+      // ACH never touches confirmSetup/elements — that path is what pulls in
+      // Stripe's instant-verification UI. confirmUsBankAccountSetup takes the
+      // numbers directly and returns a SetupIntent awaiting microdeposits.
+      const confirming = method === 'ach'
+        ? (stripe as any).confirmUsBankAccountSetup(clientSecret, {
+            payment_method: {
+              us_bank_account: {
+                routing_number:      ach.routing,
+                account_number:      ach.account,
+                account_holder_type: ach.holderType,
+                account_type:        ach.accountType,
+              },
+              billing_details: { name: ach.name.trim() },
+            },
+          })
+        // Non-null: the card branch is unreachable without `elements` — the
+        // guard at the top of handleConfirm returns early for card without it.
+        : stripe.confirmSetup({
+            elements:      elements!,
+            confirmParams: { return_url: window.location.href },
+            redirect:      'if_required',
+          })
+      result = await Promise.race([
+        confirming,
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error('TIMEOUT')), CONFIRM_TIMEOUT_MS)),
+      ])
+    } catch (err: any) {
+      setSubmitting(false)
+      setLocalError(err?.message === 'TIMEOUT'
+        ? 'Your bank\'s window didn\'t finish. If a popup was blocked, allow popups for this site and try again — or use "Enter bank details manually" instead.'
+        : err?.message || 'The bank window closed before finishing. Please try again.')
+      return
+    }
+
     if (result.error) {
       setSubmitting(false)
       setLocalError(
@@ -766,7 +884,9 @@ function PaymentMethodSetupForm({
             ? setupIntent.payment_method
             : setupIntent.payment_method.id,
       })
-      onDone(resp?.verified === false ? { pending: true, message: resp?.message } : undefined)
+      onDone(resp?.verified === false
+        ? { pending: true, message: resp?.message, bankName: resp?.bankName, bankLast4: resp?.bankLast4, microdepositType: resp?.microdepositType }
+        : undefined)
     } catch (e: any) {
       setSubmitting(false)
       onError(
@@ -788,7 +908,91 @@ function PaymentMethodSetupForm({
           marginBottom: 12,
         }}
       >
-        <PaymentElement />
+        {method === 'ach' ? (
+          // S605 (Nic, DIRECTIVE): "Instant verification will not be on this
+          // platform at this time." Stripe's PaymentElement cannot do
+          // microdeposit-only — given a us_bank_account SetupIntent it always
+          // leads with "sign in to your bank" (Financial Connections, ~$1.50).
+          // There is no option to hide it. So ACH collects the numbers here and
+          // confirms directly, which never renders or references instant at all.
+          <div style={{ display: 'grid', gap: 10 }}>
+            <div>
+              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Name on the account *</label>
+              <input className="inp" style={{ width: '100%' }} value={ach.name} autoFocus
+                onChange={e => setAch(a => ({ ...a, name: e.target.value }))} placeholder="Jane Q. Renter" />
+            </div>
+            <div>
+              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Routing number *</label>
+              <input className="inp" style={{ width: '100%' }} inputMode="numeric" maxLength={9} value={ach.routing}
+                onChange={e => setAch(a => ({ ...a, routing: e.target.value.replace(/\D/g, '').slice(0, 9) }))} placeholder="9 digits" />
+              {routingBad && (
+                <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 4 }}>
+                  That routing number isn't valid — check the 9 digits on your check or in your banking app.
+                </div>
+              )}
+              {routingValid && (
+                <div style={{ color: 'var(--green)', fontSize: '.7rem', marginTop: 4 }}>
+                  ✓ Valid routing number — we'll confirm your bank's name on the next screen.
+                </div>
+              )}
+            </div>
+            <div>
+              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Account number *</label>
+              <input className="inp" style={{ width: '100%' }} inputMode="numeric" maxLength={17} value={ach.account}
+                onChange={e => setAch(a => ({ ...a, account: e.target.value.replace(/\D/g, '').slice(0, 17) }))} placeholder="Your account number" />
+            </div>
+            <div>
+              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Confirm account number *</label>
+              <input className="inp" style={{ width: '100%' }} inputMode="numeric" maxLength={17} value={ach.confirmAccount}
+                onChange={e => setAch(a => ({ ...a, confirmAccount: e.target.value.replace(/\D/g, '').slice(0, 17) }))}
+                // Pasting here would copy the first field's typo verbatim and
+                // report a match, which is the one outcome this field exists to
+                // prevent. It has to be typed.
+                onPaste={e => e.preventDefault()}
+                onDrop={e => e.preventDefault()}
+                autoComplete="off"
+                placeholder="Type it again" />
+              {accountMismatch && (
+                <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 4 }}>
+                  The account numbers don't match.
+                </div>
+              )}
+              {accountsMatch && (
+                <div style={{ color: 'var(--green)', fontSize: '.7rem', marginTop: 4 }}>✓ Account numbers match</div>
+              )}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <div>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Account type *</label>
+                <select className="inp" style={{ width: '100%' }} value={ach.accountType}
+                  onChange={e => setAch(a => ({ ...a, accountType: e.target.value as 'checking' | 'savings' }))}>
+                  <option value="checking">Checking</option>
+                  <option value="savings">Savings</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Owned by *</label>
+                <select className="inp" style={{ width: '100%' }} value={ach.holderType}
+                  onChange={e => setAch(a => ({ ...a, holderType: e.target.value as 'individual' | 'company' }))}>
+                  <option value="individual">A person</option>
+                  <option value="company">A business or organization</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ fontSize: '.68rem', color: 'var(--t3)', lineHeight: 1.5 }}>
+              These go straight to Stripe — GAM stores only the last 4 digits. The account
+              doesn't have to be in your name; if someone else pays your rent, use their
+              details with their permission. By continuing you confirm you're authorized to
+              debit this account for amounts you approve.
+            </div>
+          </div>
+        ) : (
+          <PaymentElement
+            onReady={() => setElementReady(true)}
+            onLoadError={(e: any) => setLocalError(
+              e?.error?.message || 'The payment form could not load. Please refresh and try again.')}
+          />
+        )}
       </div>
       {localError && (
         <div className="alert a-warn" style={{ marginBottom: 12, fontSize: '.78rem' }}>
@@ -798,7 +1002,7 @@ function PaymentMethodSetupForm({
       <button
         className="btn btn-p"
         style={{ width: '100%' }}
-        disabled={!stripe || !elements || submitting}
+        disabled={!stripe || submitting || (method === 'ach' ? !achComplete : (!elements || !elementReady))}
         onClick={handleConfirm}
       >
         {submitting
@@ -807,7 +1011,9 @@ function PaymentMethodSetupForm({
             : 'Saving…'
           : method === 'ach'
             ? 'Link bank →'
-            : 'Save card →'}
+            : !elementReady
+              ? 'Loading…'
+              : 'Save card →'}
       </button>
     </div>
   )
@@ -874,6 +1080,130 @@ function ModalShell({
         </div>
         {children}
       </div>
+    </div>
+  )
+}
+
+// ── VERIFY MICRODEPOSITS, IN HOUSE (S603, Nic) ────────────────────────────
+// Previously the tenant left GAM: Stripe emailed them a link and they confirmed
+// on a Stripe-hosted page. They still have to look in their own bank to READ the
+// amounts — nothing can change that — but confirming them happens here now.
+//
+// Stripe uses one of two styles depending on the bank: two sub-$1 deposits, or a
+// single 1¢ deposit whose statement descriptor carries a 6-digit code. The
+// server reports which; this asks for the right thing rather than guessing.
+export function VerifyMicrodepositsCard({ onVerified }: { onVerified?: () => void }) {
+  const [state, setState] = useState<{
+    pending: boolean; microdepositType?: string; arrivalDate?: number | null
+  } | null>(null)
+  const [a1, setA1] = useState('')
+  const [a2, setA2] = useState('')
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+
+  useEffect(() => {
+    apiGet<any>('/stripe/tenant/microdeposits')
+      .then(r => setState((r as any)?.data ?? r))
+      .catch(() => setState({ pending: false }))
+  }, [])
+
+  if (!state?.pending || done) return null
+  // S605 (Nic): THREE states, not two. Stripe picks per bank, and when it
+  // hasn't told us we must not guess — an unknown type shows BOTH inputs and
+  // lets the tenant enter whichever their bank actually sent. Guessing strands
+  // whoever got the other kind with no field to type it into.
+  const byCode  = state.microdepositType === 'descriptor_code'
+  const byAmts  = state.microdepositType === 'amounts'
+  const unknown = !byCode && !byAmts
+
+  const submit = async () => {
+    setBusy(true); setError(null)
+    try {
+      // With an unknown type, send whichever the tenant actually filled in.
+      const hasCode = code.trim().length > 0
+      const hasAmts = !!Number(a1) && !!Number(a2)
+      let body: any
+      if (byCode || (unknown && hasCode)) {
+        if (!hasCode) { setError('Enter the code from your statement.'); setBusy(false); return }
+        body = { descriptorCode: code.trim() }
+      } else {
+        if (!hasAmts) {
+          setError(unknown
+            ? 'Enter either the two deposit amounts, or the code from your statement.'
+            : 'Enter both deposit amounts in cents.')
+          setBusy(false); return
+        }
+        body = { amounts: [Math.round(Number(a1)), Math.round(Number(a2))] }
+      }
+      await apiPost('/stripe/tenant/microdeposits/verify', body)
+      setDone(true)
+      onVerified?.()
+    } catch (e: any) {
+      // Stripe's own wording distinguishes "wrong, try again" from "locked, start
+      // over" — surfacing it verbatim beats a generic message that strands them.
+      setError(e?.response?.data?.error?.message || e?.response?.data?.error
+        || e?.message || 'Those amounts did not match.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 16, borderLeft: '3px solid var(--gold)' }}>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Finish setting up your bank account</div>
+      <div style={{ fontSize: '.82rem', color: 'var(--t2)', lineHeight: 1.55, marginBottom: 12 }}>
+        {byCode
+          ? 'We sent a $0.01 deposit to your bank. Find it on your statement — the description contains a 6-digit code. Enter that code below.'
+          : byAmts
+            ? 'We sent two small deposits to your bank. Check your account, then enter both amounts below in cents (for example, 32 and 45).'
+            : 'We sent a verification deposit to your bank. Banks handle this one of two ways — check your statement and use whichever you see: two small deposits (enter both amounts), or a single $0.01 deposit with a 6-digit code in its description (enter the code).'}
+      </div>
+
+      {error && <div className="alert a-warn" style={{ marginBottom: 10, fontSize: '.8rem' }}>{error}</div>}
+
+      {(byCode || unknown) && (
+        <div style={{ marginBottom: 10 }}>
+          {unknown && (
+            <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', marginBottom: 4 }}>
+              If you see one $0.01 deposit with a code
+            </div>
+          )}
+          <input
+            className="input" value={code} onChange={e => setCode(e.target.value)}
+            placeholder="6-digit code" maxLength={12} style={{ width: '100%' }}
+          />
+        </div>
+      )}
+
+      {unknown && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 10px' }}>
+          <div style={{ flex: 1, height: 1, background: 'var(--b1)' }} />
+          <span style={{ fontSize: '.7rem', color: 'var(--t3)' }}>or</span>
+          <div style={{ flex: 1, height: 1, background: 'var(--b1)' }} />
+        </div>
+      )}
+
+      {(byAmts || unknown) && (
+        <div style={{ marginBottom: 10 }}>
+          {unknown && (
+            <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', marginBottom: 4 }}>
+              If you see two small deposits
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 10 }}>
+            <input className="input" inputMode="numeric" value={a1}
+              onChange={e => setA1(e.target.value.replace(/\D/g, '').slice(0, 2))}
+              placeholder="First (¢)" style={{ flex: 1 }} />
+            <input className="input" inputMode="numeric" value={a2}
+              onChange={e => setA2(e.target.value.replace(/\D/g, '').slice(0, 2))}
+              placeholder="Second (¢)" style={{ flex: 1 }} />
+          </div>
+        </div>
+      )}
+
+      <button className="btn btn-p" style={{ width: '100%' }} disabled={busy} onClick={submit}>
+        {busy ? 'Checking…' : 'Verify my bank account'}
+      </button>
     </div>
   )
 }

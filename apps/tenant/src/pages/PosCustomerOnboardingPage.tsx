@@ -5,8 +5,10 @@
  *   1. GET preview from /api/pos-customer-onboarding/:token
  *   2. User reviews details, clicks "Verify my bank"
  *   3. POST /:token/start → server returns SetupIntent client_secret
- *   4. Stripe FC modal opens (collectBankAccountForSetup +
- *      confirmUsBankAccountSetup)
+ *   4. Routing/account collected on THIS page, then confirmUsBankAccountSetup
+ *      (microdeposits). No Financial Connections and no instant verification —
+ *      S605 directive, platform-wide. The stale mention of a "Stripe FC modal /
+ *      collectBankAccountForSetup" here never matched the code below.
  *   5. POST /:token/complete → server stamps pos_customers.ach_verified
  *   6. Success state
  */
@@ -41,6 +43,10 @@ export function PosCustomerOnboardingPage() {
   // deposits, the customer confirms them in 1–3 days.
   const [routing, setRouting] = useState('')
   const [account, setAccount] = useState('')
+  // S605 (Nic): same guard as the tenant bank form — the account number has no
+  // checksum, so double entry is the only way to catch a fat finger before it
+  // becomes a failed deposit days later.
+  const [confirmAccount, setConfirmAccount] = useState('')
   const [holderType, setHolderType] = useState<'individual' | 'company'>('individual')
 
   useEffect(() => {
@@ -58,6 +64,7 @@ export function PosCustomerOnboardingPage() {
     if (!token || !preview) return
     if (!/^\d{9}$/.test(routing.trim())) { setError('Enter a valid 9-digit routing number.'); return }
     if (account.trim().length < 4) { setError('Enter your account number.'); return }
+    if (account.trim() !== confirmAccount.trim()) { setError('The account numbers don\'t match. Please re-enter them.'); return }
     setBusy(true); setError(null)
     try {
       const stripe = await stripePromise
@@ -183,6 +190,22 @@ export function PosCustomerOnboardingPage() {
           <input className="input" inputMode="numeric" value={account}
             onChange={e => setAccount(e.target.value.replace(/\D/g, ''))}
             placeholder="Your account number" style={{ width: '100%', marginTop: 4 }} />
+        </label>
+        <label style={{ fontSize: '.72rem', color: 'var(--t2)' }}>Confirm account number
+          {/* Paste is blocked: pasting copies any typo verbatim and reports a
+              match, defeating the only check this field provides. */}
+          <input className="input" inputMode="numeric" value={confirmAccount}
+            onChange={e => setConfirmAccount(e.target.value.replace(/\D/g, ''))}
+            onPaste={e => e.preventDefault()}
+            onDrop={e => e.preventDefault()}
+            autoComplete="off"
+            placeholder="Type it again" style={{ width: '100%', marginTop: 4 }} />
+          {confirmAccount.length > 0 && account !== confirmAccount && (
+            <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 4 }}>The account numbers don't match.</div>
+          )}
+          {confirmAccount.length > 0 && account === confirmAccount && (
+            <div style={{ color: 'var(--green)', fontSize: '.7rem', marginTop: 4 }}>✓ Account numbers match</div>
+          )}
         </label>
         <label style={{ fontSize: '.72rem', color: 'var(--t2)' }}>Account type
           <select className="input" value={holderType} onChange={e => setHolderType(e.target.value as any)}

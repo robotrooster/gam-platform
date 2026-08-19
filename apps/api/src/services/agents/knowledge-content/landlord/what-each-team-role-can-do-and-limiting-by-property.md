@@ -8,7 +8,7 @@ What each role does:
 
 - Property Manager — the broadest helper. With the right toggles, they can manage properties, units, tenants, and leases. You can also grant or withhold the maintenance-approval permission per manager. You decide which abilities are on; permissions you don't grant stay off.
 - On-Site Manager — handles tasks at the properties you assign, without portfolio-wide reach.
-- Maintenance — receives repair requests tenants file. You can limit a worker to specific job categories (like plumbing, electrical, HVAC, appliance, or landscaping) so they only see work that fits their trade.
+- Maintenance — receives repair requests tenants file. You can limit a worker to specific job categories so they only see work that fits their trade. The twelve categories are general, plumbing, electrical, HVAC, appliance, landscape, pest control, cleaning, roofing, structural, pool and spa, and locksmith. Leave the categories empty and the worker sees every category within their property or unit scope.
 - Bookkeeper — works at the books level with either read-only or read-write access, so you can give an accountant visibility without handing over operational controls.
 
 Limiting access by property or unit:

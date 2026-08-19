@@ -89,6 +89,89 @@ broad public rollout), CSV imports from 8 PM platforms.
 
 ## 3. Post-launch backlog
 
+**Deposit custody — Jiko T-bills, near-term, NOT a launch blocker (Nic, S604).**
+Hold pooled deposit principal in Treasury bills via **Jiko**, in as many states
+as that vehicle is permitted. Two open pieces, both deliberately post-launch:
+1. **The states Jiko can't cover.** 19 states carry trust/escrow or
+   "federally insured depository institution" custody language and 12 require an
+   IN-STATE institution (CT DE GA IL MD MI NC NM NY OH WA WV) — a brokerage-held
+   T-bill is not a federally insured depository account, so those need a
+   different vehicle (FBO demand account, or IntraFi ICS/CDARS for pooled FDIC
+   coverage). Maryland § 8-203 is the one that explicitly permits both insured
+   CDs and federal government securities. Figure out per-state later; do not
+   block launch on it.
+2. **Negative-spread states/unit types.** Where the statutory rate exceeds the
+   net yield (AZ mobile home owes 5% under § 33-1431(B); assume ~3% net after
+   Jiko's cut), GAM loses on custody. Note § 33-1431(B) obligates **the
+   LANDLORD**, not the custodian — GAM taking custody does not make GAM the
+   obligor, and per the standing "GAM never absorbs fees" rule the shortfall
+   should not land on GAM. Options: leave those deposits `held_by='landlord'`,
+   or settle the top-up against the landlord. Needs counsel before it is real.
+
+Liquidity constraint that bounds every vehicle choice: AZ § 33-1431(C) requires
+return within **fourteen days** of termination. That rules out long CD ladders
+as the primary vehicle and sizes the demand buffer.
+
+**NJ + SC — ENCODED (S604). There was NO corpus gap.** Both states' landlord-tenant
+acts were in `state_law_section_texts` all along under act_key
+`general_landlord_tenant` (NJ 43 sections + 50 eviction + 10 manufactured-home-park;
+SC 90 sections = the Residential Landlord and Tenant Act). The earlier "gap" was a
+QUERY FILTER that only looked at `act_key='residential'`. Re-swept with no act_key
+filter, which also turned up **Missouri § 535.300** (verified negative — interest is
+the landlord's) and widened **Illinois** to RV parks. Both NJ/SC rows are now
+confirmed verbatim against the corpus (migrations `20260814190000`, `20260814200000`):
+- **NJ § 46:8-19** — owes `actual_earned`, ALL of it. No administrative retention
+  (unlike NY/PA's 1%), paid annually. GAM spread in NJ is **zero, never
+  negative**. Non-compliance = deposit + 7%/yr against rent. Custody:
+  `needs_research` — an "insured money market fund" is expressly permitted at
+  10+ units (closest any statute comes to allowing GAM's vehicle), but the
+  qualifying criteria are unread and under 10 units an in-state bank is required.
+- **SC § 27-40-410** — no interest requirement, no account restriction, no
+  deposit cap. Custody `supported`, obligation `none`: **pure spread**.
+
+**ALL 50 STATES READ (S604) — interest AND custody. Treasuries lawful in 26.**
+Read per (state, ACT), ~100 pairs — Arizona alone has four tenancy acts and they
+disagree. `supported` (26): AL AR AZ CA HI IN LA MD MN MS MT NE NM NV OH OR RI
+SC SD TX UT VA VT WI WV WY · `blocked` (21): AK CO CT DE FL GA ID IL KY MA ME MI
+MO NC ND NH NY OK PA TN WA · `needs_research` (3): **IA KS NJ — READ, not
+unread.** Their text is recorded; what is unresolved is whether GAM's vehicle
+qualifies under it, which is a counsel/diligence question, not more statute
+reading. IA + KS expressly permit a COMMON (pooled) trust account; NJ permits an
+insured MMF from an investment company "based in this State".
+- **TEXAS is fully open** — largest rental market in the country, zero account
+  requirement and no interest obligation.
+- **MICHIGAN § 554.604(1)** is the best workaround found anywhere: a cash or
+  surety bond filed with the secretary of state lets the landlord "use the
+  moneys so deposited for any purposes he desires". **NC, GA, DE** also offer
+  bond alternatives to the trust account.
+- **OHIO § 5321.16** was a hidden 5% obligation — the earlier flag came from
+  § 4781.25 (manufactured-housing BROKER trust accounts), which is unrelated.
+- 16 obligation rows; only **AZ mobile home (5%), RI mobile home (3%) and OH
+  (5%)** are fixed-rate and can run negative against market yield.
+
+**(superseded) earlier partial read —**
+After re-sweeping with no act_key filter and READING every hit:
+`supported` **AZ MD OR SC** · `blocked` **AK CO DE FL GA ID KY MA ME MO NC ND NY
+OK PA WA** (16 — all require a bank/escrow/trust ACCOUNT at a financial
+institution; a brokerage T-bill is not one) · `needs_research` **CA CT IA IL KS
+MI NJ NM NV OH VA WV** (12 unread).
+- **AZ is supported** — no account requirement anywhere in §§ 33-1321/1431/2121.
+  Oak Park can hold Treasuries.
+- **Bond alternatives** exist in **NC § 42-50, GA, DE** — the realistic path in
+  those states instead of a bank product.
+- **IA + KS expressly permit a COMMON (pooled) trust account** — the most
+  favourable wording found; worth reading closely, they may be cheap wins.
+- **CO § 38-12-207 bars pooling outright** for mobile home parks (separate trust
+  account per deposit, no commingling) — but the landlord keeps the interest.
+
+**Lesson for future statute sweeps:** never filter `state_law_section_texts` by a
+hand-picked act_key list. 16 states file landlord-tenant law under
+`general_landlord_tenant`, and other categories (`commercial`, `rv_park`,
+`eviction`) carry deposit provisions too. Sweep with NO act_key filter and
+exclude only the clearly irrelevant (property_tax, broker_licensing, mortgage).
+
+
+
 **Flex Suite test battery (before ANY flag flips):** supersedence FIFO across
 all sources + boost cap + idempotency; FlexDeposit custody installments (retry
 → 'missed', ACH-return pass-through, $3/mo custody, lease-end disbursement

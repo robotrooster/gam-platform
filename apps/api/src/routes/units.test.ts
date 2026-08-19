@@ -94,7 +94,7 @@ describe('POST /api/units — create', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
         propertyId: f.propertyId,
-        unitNumber: '101',
+        unitNumber: 'Apt 101',   // S605: unit numbers require a prefix
         bedrooms: 2, bathrooms: 1.5, sqft: 850,
         rentAmount: 1450, securityDeposit: 1000,
       })
@@ -110,7 +110,7 @@ describe('POST /api/units — create', () => {
     const res = await request(buildApp())
       .post('/api/units')
       .set('Authorization', `Bearer ${a.landlordToken}`)
-      .send({ propertyId: b.propertyId, unitNumber: '999', rentAmount: 1000 })
+      .send({ propertyId: b.propertyId, unitNumber: 'Apt 999', rentAmount: 1000 })
     expect(res.status).toBe(403)
   })
 })
@@ -437,4 +437,197 @@ describe('POST /api/units/:id/activate', () => {
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/scheduledFor must be in the future/)
   })
+})
+
+
+// ── S605 (Nic): a bare meter must not freeze a unit's number ────────────────
+// Bulk-adding RV sites with electric submetering attached a meter to every
+// unit, which then locked the numbers: "I cannot renumber the units even though
+// no bills have gone out, no anything." Renumbering during onboarding is normal
+// — gaps and 14/14A blocks only become obvious once the list is on screen.
+describe('S605 renumbering during onboarding', () => {
+  it('a meter with NO readings does not block a renumber', async () => {
+    const f = await seedUnitsFixture()
+    const meter = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
+       VALUES ($1,'electric',$2,'submeter',6) RETURNING id`,
+      [f.propertyId, 'RV 03 electric'])
+    await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+      [meter.rows[0].id, f.unitId])
+
+    const res = await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: 'RV 14' })
+    expect(res.status).toBe(200)
+  })
+
+  it('renumbering rewrites the generated meter label', async () => {
+    const f = await seedUnitsFixture()
+    await db.query(`UPDATE units SET unit_number='RV 03' WHERE id=$1`, [f.unitId])
+    const meter = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
+       VALUES ($1,'electric','RV 03 electric','submeter',6) RETURNING id`, [f.propertyId])
+    await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+      [meter.rows[0].id, f.unitId])
+
+    await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: '14A' })
+    const { rows } = await db.query<any>(`SELECT label FROM utility_meters WHERE id=$1`, [meter.rows[0].id])
+    // Canonicalised against the unit's TYPE (the fixture unit is an apartment).
+    expect(rows[0].label).toBe('APT 14A electric')   // not the stale 'RV 03 electric'
+  })
+
+  // The original protection must survive: once a meter has a reading, the number
+  // is genuinely load-bearing on records and stays locked.
+  it('a meter WITH a reading still blocks the renumber', async () => {
+    const f = await seedUnitsFixture()
+    const meter = await db.query<any>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
+       VALUES ($1,'electric','RV 03 electric','submeter',6) RETURNING id`, [f.propertyId])
+    await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+      [meter.rows[0].id, f.unitId])
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+       VALUES ($1,'2026-08-01',1000,'2026-08-01','baseline',$2)`,
+      [meter.rows[0].id, f.landlordUserId])
+
+    const res = await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: 'RV 14' })
+    expect(res.status).toBe(409)
+  })
+})
+
+
+// ── S605: a bare number can no longer be CREATED, because the platform supplies
+// the prefix (see the standardized-numbering describe below). The earlier
+// reject-on-bare-number rule was superseded by canonicalisation — kept here as
+// the behaviour it became, so nobody re-adds a 400 that can never fire.
+describe('S605 bare numbers are canonicalised, not rejected', () => {
+  it('a bare number is accepted and gains the type prefix', async () => {
+    const f = await seedUnitsFixture()
+    const res = await request(buildApp()).post('/api/units')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, unitNumber: '37', unitType: 'rv_spot', rentAmount: 500 })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 37')
+  })
+
+  it('a bare number with a letter suffix keeps the suffix', async () => {
+    const f = await seedUnitsFixture()
+    const res = await request(buildApp()).post('/api/units')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, unitNumber: '14A', unitType: 'rv_spot', rentAmount: 500 })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 14A')
+  })
+
+  it('renaming to a bare number re-canonicalises instead of failing', async () => {
+    const f = await seedUnitsFixture()
+    const res = await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: '37' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.unit_number ?? res.body.data.unitNumber).toMatch(/ 37$/)
+  })
+})
+
+
+// ── S605 (Nic, DIRECTIVE): standard platform prefix per unit type ──────────
+// "Each unit type should have a standard platform prefix. I don't want it to be
+// mobile home site one spelled out on one property and MH one on a different
+// property." The prefix is no longer the landlord's to type or omit.
+describe('S605 standardized unit numbering', () => {
+  const create = (f: any, body: any) =>
+    request(buildApp()).post('/api/units')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, rentAmount: 500, ...body })
+
+  it('supplies the type prefix and zero-pads a single digit', async () => {
+    const f = await seedUnitsFixture()
+    const res = await create(f, { unitNumber: '7', unitType: 'rv_spot' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 07')
+  })
+
+  it('normalises a spelled-out label to the standard prefix', async () => {
+    const f = await seedUnitsFixture()
+    const res = await create(f, { unitNumber: 'Mobile Home Site 1', unitType: 'mobile_home' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('MH 01')
+  })
+
+  it('does not double up when the landlord types the prefix too', async () => {
+    const f = await seedUnitsFixture()
+    const res = await create(f, { unitNumber: 'RV 12', unitType: 'rv_spot' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('RV 12')
+  })
+
+  // Nic: "units could also be a, b, c, d ... apartment a, apartment b".
+  it('keeps a lettered identifier and never mistakes it for a label', async () => {
+    const f = await seedUnitsFixture()
+    const res = await create(f, { unitNumber: 'A', unitType: 'apartment' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.unitNumber ?? res.body.data.unit_number).toBe('APT A')
+  })
+
+  it('renumbering re-canonicalises against the unit type', async () => {
+    const f = await seedUnitsFixture()
+    const made = await create(f, { unitNumber: '3', unitType: 'rv_spot' })
+    const id = made.body.data.id
+    const res = await request(buildApp()).patch(`/api/units/${id}/number`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: '9' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.unit_number ?? res.body.data.unitNumber).toBe('RV 09')
+  })
+})
+
+
+// ── S605 (Nic): the number field is the STARTING NUMBER ────────────────────
+// "The prefix for the unit is automatically chosen by the unit type it's
+// picked. Unit number is a starting point. They add however many units, and it
+// tacks on to the counter."
+describe('S605 bulk numbering starts where the landlord says', () => {
+  it('starts the batch at the typed number', async () => {
+    const f = await seedUnitsFixture()
+    const res = await request(buildApp()).post('/api/units')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, unitNumber: '1', unitType: 'rv_spot',
+              quantity: 3, rentAmount: 500 })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(
+      `SELECT unit_number FROM units WHERE property_id=$1 AND unit_number LIKE 'RV %' ORDER BY unit_number`,
+      [f.propertyId])
+    expect(rows.map((r: any) => r.unit_number)).toEqual(['RV 01', 'RV 02', 'RV 03'])
+  })
+
+  // The second block of a park: RV 20-36 alongside an existing RV 1-3 — the
+  // landlord names where it starts and the counter runs from there.
+  it('a later block starts at its own number, not after the highest', async () => {
+    const f = await seedUnitsFixture()
+    const app = buildApp()
+    await request(app).post('/api/units').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, unitNumber: '1', unitType: 'rv_spot', quantity: 3, rentAmount: 500 })
+    await request(app).post('/api/units').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, unitNumber: '20', unitType: 'rv_spot', quantity: 2, rentAmount: 500 })
+    const { rows } = await db.query<any>(
+      `SELECT unit_number FROM units WHERE property_id=$1 AND unit_number LIKE 'RV %' ORDER BY unit_number`,
+      [f.propertyId])
+    expect(rows.map((r: any) => r.unit_number)).toEqual(['RV 01', 'RV 02', 'RV 03', 'RV 20', 'RV 21'])
+  })
+})
+
+
+// S605 (Nic, DIRECTIVE): "I want consistency platform wide. Remove those number
+// padding options." A client sending padWidth must not be able to bypass it.
+it('S605: padWidth from a client is ignored — always two digits', async () => {
+  const f = await seedUnitsFixture()
+  const res = await request(buildApp()).post('/api/units')
+    .set('Authorization', `Bearer ${f.landlordToken}`)
+    .send({ propertyId: f.propertyId, unitNumber: '8', unitType: 'rv_spot',
+            quantity: 2, padWidth: 1, rentAmount: 500 })
+  expect(res.status).toBe(201)
+  const { rows } = await db.query<any>(
+    `SELECT unit_number FROM units WHERE property_id=$1 AND unit_number LIKE 'RV %' ORDER BY unit_number`,
+    [f.propertyId])
+  expect(rows.map((r: any) => r.unit_number)).toEqual(['RV 08', 'RV 09'])   // not RV 8 / RV 9
 })

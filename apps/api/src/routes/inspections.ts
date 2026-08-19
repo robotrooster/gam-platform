@@ -1367,6 +1367,7 @@ async function compareMoveOutToMoveIn(
     if (!out.condition) continue // not inspected — nothing to compare
     const inCond = inMap.get(`${out.area}|${out.item_label}`)
     if (!inCond) continue // new / not-inspected at move-in
+    if (out.condition === 'na' || inCond === 'na') continue // N/A excluded from the comparison
     if ((INSPECTION_CONDITION_RANK[out.condition] ?? 0) > (INSPECTION_CONDITION_RANK[inCond] ?? 0)) {
       mismatches.push(`${out.area}|${out.item_label}`)
     }

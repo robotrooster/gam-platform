@@ -57,6 +57,15 @@ export const getMyDeposit: AgentTool = {
         damageClaimed: d.damage_claimed,
         disbursedToLandlord: d.disbursed_to_landlord,
         heldBy: d.held_by,
+        // Friendly holder description so the agent never parrots the raw enum.
+        // gam_escrow = GAM holds it in trust (new-tenant deposits); landlord =
+        // the landlord holds it directly (imported/pre-onboarding deposits).
+        heldByLabel:
+          d.held_by === 'gam_escrow'
+            ? 'GAM — held in trust, separate from the landlord (the landlord cannot spend it)'
+            : d.held_by === 'landlord'
+              ? 'the landlord, directly'
+              : null,
       },
       depositReturn: ret[0]
         ? {

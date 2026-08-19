@@ -122,7 +122,7 @@ describe('S562 POST /payments/pay-balance — processing-fee collection', () => 
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
   }
 
-  it('tenant pays fee → lump charge = balance + 1% ACH fee', async () => {
+  it('tenant pays fee → lump charge = balance + flat $6 ACH fee', async () => {
     const f = await ruleFixture('tenant')
     await seedCharge(f, 'rent', 440, '2026-07-01')
     const res = await request(buildApp())
@@ -130,8 +130,9 @@ describe('S562 POST /payments/pay-balance — processing-fee collection', () => 
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
       .send({ amount: 440, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
     expect(res.status).toBe(200)
-    // 1% of 440 = $4.40 (under the $6 cap)
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBeCloseTo(444.40, 2)
+    // S600: ACH is a FLAT $6.00 — the old 1%-capped-at-$6 formula is retired.
+    // 440 + 6.00 = 446.00
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBeCloseTo(446.00, 2)
   })
 
   it('landlord pays fee → lump charge = balance only', async () => {

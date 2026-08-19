@@ -98,6 +98,26 @@ export function DashboardPage() {
   return (
     <div>
       {/* Alerts */}
+      {/* S605 (Nic): FIRST alert, above everything else — until Stripe
+          verification is done NO RENT CAN MOVE, and nothing used to say so. A
+          landlord could spend days adding units and inviting tenants before
+          discovering the blocker buried in Financials → Banking. "If I don't
+          know how to do what I need to do, that's where the friction lives." */}
+      {stats && (stats as any).connectPayoutsEnabled === false && (
+        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/banking')}>
+          <AlertTriangle size={16} />
+          <div>
+            <strong>Tenants can’t pay rent yet</strong> — you need to verify your business with Stripe
+            and add the account rent deposits into.{' '}
+            {(stats as any).connectDetailsSubmitted
+              ? 'Your details are submitted and Stripe is reviewing them.'
+              : 'Takes about 10 minutes; have your EIN and bank details handy.'}
+          </div>
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>
+            {(stats as any).connectDetailsSubmitted ? 'Check status →' : 'Set up →'}
+          </span>
+        </div>
+      )}
       {(stats?.evictionModeUnits || 0) > 0 && (
         <div className="alert alert-danger" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=eviction')}>
           <AlertTriangle size={16} />
@@ -173,7 +193,11 @@ export function DashboardPage() {
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 6'}}>
+        {/* S605 (Nic): "disbursements kpi card on overview is not clickable. i
+            see no way to see the history." Every other KPI here navigates; this
+            one didn't, so the payout history was only reachable by knowing to
+            look under Financials. */}
+        <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/disbursements')}>
           <div className="kpi-label">Next Disbursement</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmtWhole(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
@@ -216,7 +240,15 @@ export function DashboardPage() {
         <div className="card">
           <div className="card-header">
             <span className="card-title">Recent Disbursements</span>
-            <ArrowDownToLine size={16} style={{color:'var(--text-3)'}} />
+            {/* S605: an icon is not a way out. Give the panel a real link to the
+                full history, the way the other dashboard panels do. */}
+            <span style={{display:'flex',alignItems:'center',gap:8}}>
+              <span onClick={()=>navigate('/disbursements')}
+                    style={{fontSize:'.74rem',fontWeight:600,color:'var(--gold)',cursor:'pointer'}}>
+                View all →
+              </span>
+              <ArrowDownToLine size={16} style={{color:'var(--text-3)'}} />
+            </span>
           </div>
           {disbursements?.length ? (
             <table className="data-table">

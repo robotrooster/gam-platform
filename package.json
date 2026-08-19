@@ -10,7 +10,7 @@
     "build": "npm run build --workspaces",
     "db:migrate": "npm run migrate --workspace=apps/api",
     "db:seed": "npm run seed --workspace=apps/api",
-    "schema:dump": "bash scripts/dump-schema.sh"
+    "schema:dump": "bash apps/api/scripts/dump-schema.sh"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

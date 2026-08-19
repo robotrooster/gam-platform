@@ -66,10 +66,10 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   it('Resend success → email_send_log row written with status=sent', async () => {
     resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_real' }, error: null } as any)
     await email.emailInvitation(
-      'recip@example.com', 'Alice', 'property_manager',
+      'recip@mailer-test.co', 'Alice', 'property_manager',
       'https://gam.example/invite/123',
       { invitationId: '00000000-0000-0000-0000-000000000111' })
-    const log = await logRowFor('recip@example.com')
+    const log = await logRowFor('recip@mailer-test.co')
     expect(log.status).toBe('sent')
     expect(log.error_message).toBeNull()
     expect(log.category).toBe('invitation')
@@ -80,28 +80,28 @@ describe('send() behavior (exercised via emailInvitation)', () => {
     resendSendMock.mockResolvedValueOnce({
       data: null, error: { message: 'Domain not verified' },
     } as any)
-    await email.emailInvitation('fail@example.com', 'X', 'property_manager', 'u')
-    const log = await logRowFor('fail@example.com')
+    await email.emailInvitation('fail@mailer-test.co', 'X', 'property_manager', 'u')
+    const log = await logRowFor('fail@mailer-test.co')
     expect(log.status).toBe('failed')
     expect(log.error_message).toBe('Domain not verified')
   })
 
   it('Resend throws → log row status=failed; exception message captured', async () => {
     resendSendMock.mockRejectedValueOnce(new Error('network down'))
-    await email.emailInvitation('throw@example.com', 'X', 'property_manager', 'u')
-    const log = await logRowFor('throw@example.com')
+    await email.emailInvitation('throw@mailer-test.co', 'X', 'property_manager', 'u')
+    const log = await logRowFor('throw@mailer-test.co')
     expect(log.status).toBe('failed')
     expect(log.error_message).toBe('network down')
   })
 
   it('attachments not passed → Resend send args omit attachments key (default senders)', async () => {
-    await email.emailInvitation('noatt@example.com', 'X', 'property_manager', 'u')
+    await email.emailInvitation('noatt@mailer-test.co', 'X', 'property_manager', 'u')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.attachments).toBeUndefined()
   })
 
   it('sender selection: emailInvitation uses "support" sender (process.env.EMAIL_FROM_SUPPORT or fallback)', async () => {
-    await email.emailInvitation('sup@example.com', 'X', 'property_manager', 'u')
+    await email.emailInvitation('sup@mailer-test.co', 'X', 'property_manager', 'u')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     // The support sender: EMAIL_FROM_SUPPORT when configured (S536: the
     // real .env now sets "GAM Support <support@goldassetmanagement.com>"),
@@ -110,7 +110,7 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   })
 
   it('subject + html shape verified via emailInvitation', async () => {
-    await email.emailInvitation('subj@example.com', 'Alice', 'property_manager', 'https://x')
+    await email.emailInvitation('subj@mailer-test.co', 'Alice', 'property_manager', 'https://x')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Alice invited you to join GAM as Property Manager')
     expect(call.html).toContain('Alice')
@@ -119,15 +119,15 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   })
 
   it('ctx.invitationId null/undefined → related_entity_type stays NULL (not "invitation")', async () => {
-    await email.emailInvitation('noctx@example.com', 'X', 'property_manager', 'u')
-    const log = await logRowFor('noctx@example.com')
+    await email.emailInvitation('noctx@mailer-test.co', 'X', 'property_manager', 'u')
+    const log = await logRowFor('noctx@mailer-test.co')
     expect(log.related_entity_type).toBeNull()
     expect(log.related_entity_id).toBeNull()
   })
 
   it('metadata field stored as jsonb (round-trips)', async () => {
-    await email.emailInvitation('meta@example.com', 'X', 'bookkeeper', 'u')
-    const log = await logRowFor('meta@example.com')
+    await email.emailInvitation('meta@mailer-test.co', 'X', 'bookkeeper', 'u')
+    const log = await logRowFor('meta@mailer-test.co')
     expect(log.metadata).toEqual({ role: 'bookkeeper' })
   })
 })
@@ -137,30 +137,30 @@ describe('send() behavior (exercised via emailInvitation)', () => {
 describe('background check emails', () => {
   it('emailNewBackgroundCheck: category=background_new; subject contains tenant name', async () => {
     await email.emailNewBackgroundCheck(
-      'l@example.com', 'Landlord', 'Tenant Jones', 'Sunset', 'A1', 'high')
+      'l@mailer-test.co', 'Landlord', 'Tenant Jones', 'Sunset', 'A1', 'high')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('New background check submitted — Tenant Jones')
-    const log = await logRowFor('l@example.com')
+    const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('background_new')
   })
 
   it('emailBackgroundDecision approved: celebratory subject + portal button + metadata.decision=approved', async () => {
     await email.emailBackgroundDecision(
-      't@example.com', 'Tenant', 'approved', 'Sunset', 'A1', 'Welcome aboard!')
+      't@mailer-test.co', 'Tenant', 'approved', 'Sunset', 'A1', 'Welcome aboard!')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Your application has been approved! 🎉')
     expect(call.html).toContain('Access Your Portal')
-    const log = await logRowFor('t@example.com')
+    const log = await logRowFor('t@mailer-test.co')
     expect(log.metadata).toEqual({ decision: 'approved' })
   })
 
   it('emailBackgroundDecision denied: neutral subject + NO portal button + metadata.decision=denied', async () => {
     await email.emailBackgroundDecision(
-      'd@example.com', 'Tenant', 'denied', 'Sunset', 'A1')
+      'd@mailer-test.co', 'Tenant', 'denied', 'Sunset', 'A1')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Update on your rental application')
     expect(call.html).not.toContain('Access Your Portal')
-    const log = await logRowFor('d@example.com')
+    const log = await logRowFor('d@mailer-test.co')
     expect(log.metadata).toEqual({ decision: 'denied' })
   })
 })
@@ -170,9 +170,9 @@ describe('background check emails', () => {
 describe('e-sign emails', () => {
   it('emailSigningRequest: category=esign_signing_request; subject includes title', async () => {
     await email.emailSigningRequest(
-      's@example.com', 'Signer', 'Lease 2026', 'Unit A1', 'Landlord',
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1', 'Landlord',
       'https://sign/x')
-    const log = await logRowFor('s@example.com')
+    const log = await logRowFor('s@mailer-test.co')
     expect(log.category).toBe('esign_signing_request')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Please sign: Lease 2026')
@@ -180,7 +180,7 @@ describe('e-sign emails', () => {
 
   it('emailSigningCompleted with pdfUrl: button points to PDF', async () => {
     await email.emailSigningCompleted(
-      's@example.com', 'Signer', 'Lease 2026', 'Unit A1',
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1',
       'https://gam.example/executed.pdf')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.html).toContain('Download Signed Document')
@@ -189,14 +189,14 @@ describe('e-sign emails', () => {
 
   it('emailSigningCompleted without pdfUrl: falls back to portal button', async () => {
     await email.emailSigningCompleted(
-      's@example.com', 'Signer', 'Lease 2026', 'Unit A1')
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.html).toContain('View in Portal')
   })
 
   it('emailDocumentDeclined: HTML-escapes signer name + reason (prevents XSS)', async () => {
     await email.emailDocumentDeclined(
-      'l@example.com', 'Landlord', '<script>Bad</script>', 'tenant',
+      'l@mailer-test.co', 'Landlord', '<script>Bad</script>', 'tenant',
       'Lease', 'Unit A1', '<img src=x onerror=alert(1)>')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.html).not.toContain('<script>Bad</script>')
@@ -211,22 +211,22 @@ describe('e-sign emails', () => {
 
   it('emailDocumentDeclined: empty reason → "No reason provided"', async () => {
     await email.emailDocumentDeclined(
-      'l@example.com', 'Landlord', 'Tenant', 'tenant', 'Lease', 'A1', null)
+      'l@mailer-test.co', 'Landlord', 'Tenant', 'tenant', 'Lease', 'A1', null)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.html).toContain('No reason provided')
   })
 
   it('emailDocumentAutoVoided: subject + category', async () => {
     await email.emailDocumentAutoVoided(
-      'l@example.com', 'Landlord', 'Lease 2026', 'Unit A1')
-    const log = await logRowFor('l@example.com')
+      'l@mailer-test.co', 'Landlord', 'Lease 2026', 'Unit A1')
+    const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('esign_document_auto_voided')
   })
 
   it('emailSigningReminder: category', async () => {
     await email.emailSigningReminder(
-      's@example.com', 'Signer', 'Lease', 'A1', 'Landlord', 'https://x')
-    const log = await logRowFor('s@example.com')
+      's@mailer-test.co', 'Signer', 'Lease', 'A1', 'Landlord', 'https://x')
+    const log = await logRowFor('s@mailer-test.co')
     expect(log.category).toBe('esign_signing_reminder')
   })
 })
@@ -236,11 +236,11 @@ describe('e-sign emails', () => {
 describe('PM invitations', () => {
   it('emailPmInvitation: category=pm_invitation; landlord_id=null (PM-scoped); metadata captures company', async () => {
     await email.emailPmInvitation(
-      'pm@example.com', 'Owner', 'Acme PM', 'manager',
+      'pm@mailer-test.co', 'Owner', 'Acme PM', 'manager',
       'https://accept/x',
       { pmCompanyId: '00000000-0000-0000-0000-000000000222',
         invitationId: '00000000-0000-0000-0000-000000000333' })
-    const log = await logRowFor('pm@example.com')
+    const log = await logRowFor('pm@mailer-test.co')
     expect(log.category).toBe('pm_invitation')
     expect(log.landlord_id).toBeNull()
     expect(log.related_entity_type).toBe('pm_invitation')
@@ -252,7 +252,7 @@ describe('PM invitations', () => {
 
   it('emailPmPropertyInvitation: owner_to_pm direction → "inviter invited PM" subject', async () => {
     await email.emailPmPropertyInvitation({
-      to: 'pm@example.com',
+      to: 'pm@mailer-test.co',
       direction: 'owner_to_pm',
       inviterName: 'Owner Bob',
       pmCompanyName: 'Acme PM',
@@ -266,7 +266,7 @@ describe('PM invitations', () => {
 
   it('emailPmPropertyInvitation: pm_to_owner direction → "PM invited you" subject', async () => {
     await email.emailPmPropertyInvitation({
-      to: 'o@example.com',
+      to: 'o@mailer-test.co',
       direction: 'pm_to_owner',
       inviterName: 'PM Carol',
       pmCompanyName: 'Acme PM',
@@ -285,7 +285,7 @@ describe('emailAdverseActionNotice', () => {
   it('returns messageId on success; sender=support; escapes notice HTML', async () => {
     resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_aa_1' }, error: null } as any)
     const id = await email.emailAdverseActionNotice({
-      to: 'a@example.com',
+      to: 'a@mailer-test.co',
       applicantFirstName: 'Pat',
       noticeText: 'Use of <CRA> data per § 615(a)(2)',
     })
@@ -294,14 +294,14 @@ describe('emailAdverseActionNotice', () => {
     expect(call.subject).toBe('Notice of Adverse Action — Fair Credit Reporting Act')
     expect(call.html).toContain('&lt;CRA&gt;')
     expect(call.html).toContain('§ 615(a)(2)')
-    const log = await logRowFor('a@example.com')
+    const log = await logRowFor('a@mailer-test.co')
     expect(log.category).toBe('adverse_action')
   })
 
   it('returns null on Resend error', async () => {
     resendSendMock.mockResolvedValueOnce({ data: null, error: { message: 'bad' } } as any)
     const id = await email.emailAdverseActionNotice({
-      to: 'a2@example.com', applicantFirstName: 'Pat', noticeText: 'X',
+      to: 'a2@mailer-test.co', applicantFirstName: 'Pat', noticeText: 'X',
     })
     expect(id).toBeNull()
   })
@@ -312,11 +312,11 @@ describe('emailAdverseActionNotice', () => {
 describe('emailLandlordBankingNudge', () => {
   it('default sender (noreply); category=landlord_banking_nudge', async () => {
     await email.emailLandlordBankingNudge({
-      to: 'l@example.com', landlordName: 'L', tenantName: 'T',
+      to: 'l@mailer-test.co', landlordName: 'L', tenantName: 'T',
       propertyName: 'Sunset', unitNumber: 'A1',
       bankingUrl: 'https://banking/x',
     })
-    const log = await logRowFor('l@example.com')
+    const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('landlord_banking_nudge')
     expect(log.related_entity_type).toBe('tenant_landlord_nudge')
   })
@@ -325,13 +325,13 @@ describe('emailLandlordBankingNudge', () => {
 describe('late payment sender', () => {
   it('sendLatePaymentNotice: subject contains daysLate; category=late_payment_notice; metadata captures amount', async () => {
     await email.sendLatePaymentNotice({
-      landlordEmail: 'l@example.com', landlordName: 'L',
+      landlordEmail: 'l@mailer-test.co', landlordName: 'L',
       tenantName: 'T', unitNumber: 'A1', propertyName: 'Sunset',
       daysLate: 5, amount: 1200,
     })
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Late payment alert — T — Unit A1 — Day 5')
-    const log = await logRowFor('l@example.com')
+    const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('late_payment_notice')
     expect(log.metadata).toEqual({ days_late: 5, amount: 1200 })
   })
@@ -340,10 +340,10 @@ describe('late payment sender', () => {
 describe('sendNotificationEmail', () => {
   it('category prefixes notif_<type>', async () => {
     await email.sendNotificationEmail({
-      to: 'n@example.com', subject: 'Update', html: '<p>x</p>',
+      to: 'n@mailer-test.co', subject: 'Update', html: '<p>x</p>',
       notificationType: 'rent_due', userId: '00000000-0000-0000-0000-000000000aaa',
     })
-    const log = await logRowFor('n@example.com')
+    const log = await logRowFor('n@mailer-test.co')
     expect(log.category).toBe('notif_rent_due')
     expect(log.metadata).toMatchObject({ user_id: '00000000-0000-0000-0000-000000000aaa' })
   })
@@ -352,9 +352,9 @@ describe('sendNotificationEmail', () => {
 describe('account-management senders', () => {
   it('sendEmailVerification: category=email_verification; no landlordId', async () => {
     const id = await email.sendEmailVerification(
-      'v@example.com', 'Alice', 'https://verify/tok')
+      'v@mailer-test.co', 'Alice', 'https://verify/tok')
     expect(id).toBe('msg_default')
-    const log = await logRowFor('v@example.com')
+    const log = await logRowFor('v@mailer-test.co')
     expect(log.category).toBe('email_verification')
     expect(log.landlord_id).toBeNull()
     const call = (resendSendMock.mock.calls[0] as any[])[0]
@@ -362,25 +362,25 @@ describe('account-management senders', () => {
   })
 
   it('sendEmailVerification with null firstName: uses generic greeting', async () => {
-    await email.sendEmailVerification('vn@example.com', null, 'https://verify/x')
+    await email.sendEmailVerification('vn@mailer-test.co', null, 'https://verify/x')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.html).toContain('Welcome!')
     expect(call.html).not.toContain('Welcome, null')
   })
 
   it('sendPasswordResetEmail: subject + category', async () => {
-    await email.sendPasswordResetEmail('r@example.com', 'Bob', 'https://reset/x')
+    await email.sendPasswordResetEmail('r@mailer-test.co', 'Bob', 'https://reset/x')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('Reset your GAM password')
-    const log = await logRowFor('r@example.com')
+    const log = await logRowFor('r@mailer-test.co')
     expect(log.category).toBe('password_reset')
   })
 
   it('emailTenantOnboarded: uses support sender; category=tenant_onboarded', async () => {
     await email.emailTenantOnboarded(
-      'tn@example.com', 'Tenant', 'Landlord',
+      'tn@mailer-test.co', 'Tenant', 'Landlord',
       '123 Main', 'Unit A1', 'https://activate/x')
-    const log = await logRowFor('tn@example.com')
+    const log = await logRowFor('tn@mailer-test.co')
     expect(log.category).toBe('tenant_onboarded')
     expect(log.metadata).toEqual({ unit_label: 'Unit A1' })
   })
@@ -390,7 +390,7 @@ describe('emailFlexsuiteEnrollment', () => {
   it('flexpay: attaches PDF with FlexPay filename; category prefix includes product', async () => {
     resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_flex' }, error: null } as any)
     const id = await email.emailFlexsuiteEnrollment({
-      to: 'f@example.com', tenantName: 'Alice Jones',
+      to: 'f@mailer-test.co', tenantName: 'Alice Jones',
       product: 'flexpay',
       acceptedAt: new Date('2026-06-01T12:00:00Z'),
       templateVersion: '1.0.0',
@@ -402,14 +402,14 @@ describe('emailFlexsuiteEnrollment', () => {
     expect(call.attachments).toHaveLength(1)
     expect(call.attachments[0].filename).toBe('GAM-FlexPay-Subscription-Terms.pdf')
     expect(call.subject).toBe('Your FlexPay Subscription Terms — enrollment confirmation')
-    const log = await logRowFor('f@example.com')
+    const log = await logRowFor('f@mailer-test.co')
     expect(log.category).toBe('flexsuite_flexpay_enrollment_confirmation')
     expect(log.related_entity_type).toBe('flexsuite_enrollment_acceptance')
   })
 
   it('flexdeposit: different filename + subject', async () => {
     await email.emailFlexsuiteEnrollment({
-      to: 'fd@example.com', tenantName: 'Bob',
+      to: 'fd@mailer-test.co', tenantName: 'Bob',
       product: 'flexdeposit',
       acceptedAt: new Date('2026-06-01T12:00:00Z'),
       templateVersion: '1.0.0',
@@ -425,14 +425,50 @@ describe('emailFlexsuiteEnrollment', () => {
 describe('pool emails', () => {
   it('emailPoolMatchInterest: category', async () => {
     await email.emailPoolMatchInterest(
-      'p@example.com', 'Tenant', 'Landlord', 'Sunset', 'A1', 'Hi there')
-    const log = await logRowFor('p@example.com')
+      'p@mailer-test.co', 'Tenant', 'Landlord', 'Sunset', 'A1', 'Hi there')
+    const log = await logRowFor('p@mailer-test.co')
     expect(log.category).toBe('pool_match_interest')
   })
 
   it('emailPoolTenantInterested: category', async () => {
-    await email.emailPoolTenantInterested('l@example.com', 'Landlord')
-    const log = await logRowFor('l@example.com')
+    await email.emailPoolTenantInterested('l@mailer-test.co', 'Landlord')
+    const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('pool_tenant_interested')
+  })
+})
+
+// S605: RFC 2606 reserved domains are never sendable.
+//
+// The platform-health page surfaced a nightly cron firing real Resend sends at
+// seeded demo data (rita.recurring@example.com). Resend rejects those outright,
+// so every night burned quota and logged a failure that looked like a real
+// deliverability problem. example.com/.org/.net and the .test/.invalid/
+// .localhost/.example TLDs can never receive mail, so sending is always a bug.
+describe('reserved-domain suppression (S605)', () => {
+  const RESERVED = [
+    'someone@example.com', 'someone@example.org', 'someone@example.net',
+    'someone@foo.test', 'someone@foo.invalid', 'someone@foo.localhost',
+  ]
+
+  it('never hits the network for a reserved domain, in any env', async () => {
+    for (const to of RESERVED) {
+      resendSendMock.mockClear()
+      await email.emailInvitation(to, 'Nic', 'property_manager', 'https://x.test/accept')
+      expect(resendSendMock, `should not send to ${to}`).not.toHaveBeenCalled()
+    }
+  })
+
+  it('still writes the audit row, so suppression is visible rather than silent', async () => {
+    await email.emailInvitation('someone@example.com', 'Nic', 'property_manager', 'https://x.test/accept')
+    const rows = await db.query(
+      `SELECT status FROM email_send_log WHERE to_email = 'someone@example.com'`)
+    expect(rows.rows.length).toBe(1)
+    expect(rows.rows[0].status).toBe('sent')   // attempted-and-suppressed, not failed
+  })
+
+  it('a real domain is unaffected', async () => {
+    resendSendMock.mockClear()
+    await email.emailInvitation('real@mailer-test.co', 'Nic', 'property_manager', 'https://x.test/accept')
+    expect(resendSendMock).toHaveBeenCalledTimes(1)
   })
 })

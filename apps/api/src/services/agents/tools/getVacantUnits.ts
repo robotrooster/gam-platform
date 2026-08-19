@@ -23,7 +23,9 @@ export const getVacantUnits: AgentTool = {
     const rows = await query<Row>(
       `SELECT u.unit_number, p.name AS property_name, u.status
          FROM units u JOIN properties p ON p.id = u.property_id
-        WHERE u.landlord_id = $1 AND u.status = ANY($2)
+        -- S605: retired units are never "vacant to fill" — they hold history
+        -- only, and can't take a new lease or booking.
+        WHERE u.landlord_id = $1 AND u.status = ANY($2) AND u.retired_at IS NULL
         ORDER BY p.name, u.unit_number
         LIMIT $3`,
       [actor.profileId, VACANT, limit]

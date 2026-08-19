@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
-import { Clock, Trash2 } from 'lucide-react'
+import { Clock, Trash2, Pencil } from 'lucide-react'
 import { apiDelete, apiGet, apiPatch, apiPut } from '../lib/api'
+import { lateFeeStartDate, nextAccrualDate, computeLateFeeAmount } from '@gam/shared'
 import { UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 
 const UNIT_TYPE_LABELS: Record<string, string> = UNIT_TYPE_LABEL
@@ -100,6 +101,31 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
   const [accrualFrom, setAccrualFrom] = useState<'grace_end' | 'due_date' | 'due_date_inclusive'>('due_date_inclusive')
   const [capAmount, setCapAmount] = useState('')
   const [rowError, setRowError] = useState<string | null>(null)
+  // S604 (Nic): there was NO edit — only a trash button. Changing a late fee
+  // meant deleting it and retyping every field, even with zero leases attached.
+  // The save endpoint is already an UPSERT keyed on (property, unitType), so
+  // editing is just "load the row back into the form".
+  const [editing, setEditing] = useState<string | null>(null)
+
+  const resetForm = () => {
+    setEditing(null); setUnitType(''); setAmount(''); setKind('flat')
+    setAccrualAmount(''); setAccrualPeriod('daily'); setAccrualFrom('due_date_inclusive')
+    setCapAmount(''); setGrace('5'); setRowError(null)
+  }
+
+  const loadForEdit = (o: any) => {
+    setEditing(o.unitType)
+    setUnitType(o.unitType)
+    setGrace(String(o.lateFeeGraceDays ?? 5))
+    setKind(o.lateFeeInitialType || 'flat')
+    setAmount(o.lateFeeInitialAmount != null && Number(o.lateFeeInitialAmount) > 0
+      ? String(Number(o.lateFeeInitialAmount)) : '')
+    setAccrualAmount(o.lateFeeAccrualAmount != null ? String(Number(o.lateFeeAccrualAmount)) : '')
+    setAccrualPeriod(o.lateFeeAccrualPeriod || 'daily')
+    setAccrualFrom(o.lateFeeAccrualFrom || 'due_date_inclusive')
+    setCapAmount(o.lateFeeCapAmount != null ? String(Number(o.lateFeeCapAmount)) : '')
+    setRowError(null)
+  }
 
   // Retroactive (counts back to the due date) + an accrual set = daily-only,
   // no upfront fee (Nic). The server enforces this too.
@@ -111,9 +137,53 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
         initialAmount: retroWithAccrual ? 0 : Number(amount), initialType: kind,
         ...(accrualAmount !== '' ? { accrualAmount: Number(accrualAmount), accrualType: 'flat', accrualPeriod, accrualFrom } : {}),
         ...(capAmount !== '' ? { capAmount: Number(capAmount), capType: 'flat' } : {}) }),
-    { onSuccess: () => { setRowError(null); qc.invalidateQueries(['late-fee-overrides', propertyId]); setUnitType(''); setAmount(''); setAccrualAmount(''); setCapAmount(''); setAccrualFrom('due_date_inclusive') },
+    { onSuccess: () => { qc.invalidateQueries(['late-fee-overrides', propertyId]); resetForm() },
       onError: (e: any) => setRowError(e?.response?.data?.error || 'Could not save the late fee') }
   )
+  // ── S604 (Nic): LIVE SCHEDULE PREVIEW ────────────────────────────────────
+  // "functionally it works, but it is super hard to configure that to be
+  // correct... there's no way to verify that's actually coming out the way you
+  // said. I just have to trust you."
+  //
+  // Calls the SAME shared helpers the billing job runs (nextAccrualDate /
+  // computeLateFeeAmount / lateFeeStartDate) so the preview can never drift
+  // from what actually bills. Modelled on rent due the 1st of a 30-day month.
+  const previewRows = (() => {
+    const g = Math.trunc(Number(grace) || 0)
+    const hasAcc = accrualAmount !== '' && Number(accrualAmount) > 0
+    const initAmt = retroWithAccrual ? 0 : Number(amount) || 0
+    if (!hasAcc && initAmt <= 0) return null
+    const DUE = '2026-09-01'
+    const RENT = 1000  // only used to render % -of-rent policies concretely
+    const gateDate = lateFeeStartDate(DUE, g)
+    const cap = capAmount !== '' ? Number(capAmount) : null
+
+    const totalOn = (dayIso: string): number => {
+      if (dayIso < gateDate) return 0          // grace gates ALL fees
+      let total = 0
+      if (!retroWithAccrual && initAmt > 0) {
+        total += computeLateFeeAmount(kind as any, initAmt, RENT)
+      }
+      if (hasAcc) {
+        for (let occ = 1; occ <= 400; occ++) {
+          const tick = nextAccrualDate(DUE, g, accrualPeriod as any, occ, accrualFrom)
+          if (tick > dayIso) break
+          total += computeLateFeeAmount('flat', Number(accrualAmount), RENT)
+        }
+      }
+      if (cap != null && total > cap) total = cap
+      return Math.round(total * 100) / 100
+    }
+
+    const days = [5, g + 1, 10, 15, 30]
+      .filter((d, i, a) => d >= 1 && d <= 30 && a.indexOf(d) === i)
+      .sort((x, y) => x - y)
+    return days.map(d => {
+      const iso = `2026-09-${String(d).padStart(2, '0')}`
+      return { day: d, iso, amount: totalOn(iso), inGrace: iso < gateDate }
+    })
+  })()
+
   const removeMut = useMutation(
     (ut: string) => apiDelete(`/properties/${propertyId}/late-fee-overrides/${ut}`),
     { onSuccess: () => { setRowError(null); qc.invalidateQueries(['late-fee-overrides', propertyId]) },
@@ -154,6 +224,11 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
                 )
               })()}
               <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', padding: '2px 8px' }}
+                title="Edit this late fee"
+                onClick={() => loadForEdit(o)}>
+                <Pencil size={12} />
+              </button>
+              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px' }}
                 title="Remove this late fee (reverts the type to no late fee)"
                 onClick={() => removeMut.mutate(o.unitType)}>
                 <Trash2 size={12} />
@@ -233,9 +308,52 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
         <button className="btn btn-primary btn-sm"
           disabled={!unitType || (amount === '' && !retroWithAccrual) || upsertMut.isLoading}
           onClick={() => upsertMut.mutate()}>
-          {upsertMut.isLoading ? 'Saving…' : 'Add Late Fee'}
+          {upsertMut.isLoading ? 'Saving…' : (editing ? 'Save Changes' : 'Add Late Fee')}
         </button>
+        {editing && (
+          <button className="btn btn-ghost btn-sm" onClick={resetForm}>Cancel</button>
+        )}
       </div>
+
+      {/* S604: schedule preview — see previewRows. Renders BEFORE saving so the
+          landlord can verify the policy instead of trusting it. */}
+      {previewRows && (
+        <div style={{ marginTop: 12, padding: '10px 12px', background: 'var(--bg-2)',
+                      borderRadius: 8, border: '1px solid var(--border-0)' }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)',
+                        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 2 }}>
+            What this charges
+          </div>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 8 }}>
+            Example: rent due the 1st{kind === 'percent_of_rent' || false ? ' on $1,000 rent' : ''}.
+            {retroWithAccrual
+              ? ' No flat fee — the ongoing charge is counted back to the due date once grace passes.'
+              : ''}
+          </div>
+          <table style={{ width: '100%', fontSize: '.75rem', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-3)', textAlign: 'left' }}>
+                <th style={{ fontWeight: 600, padding: '3px 0' }}>If unpaid on</th>
+                <th style={{ fontWeight: 600, padding: '3px 0', textAlign: 'right' }}>Late fees owed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {previewRows.map(r => (
+                <tr key={r.day} style={{ borderTop: '1px solid var(--border-0)' }}>
+                  <td style={{ padding: '4px 0' }}>
+                    the {r.day}{r.day === 1 ? 'st' : r.day === 2 ? 'nd' : r.day === 3 ? 'rd' : 'th'}
+                    {r.inGrace && <span style={{ color: 'var(--text-3)' }}> · in grace</span>}
+                  </td>
+                  <td style={{ padding: '4px 0', textAlign: 'right', fontFamily: 'var(--font-mono)',
+                               color: r.amount > 0 ? 'var(--text-0)' : 'var(--text-3)' }}>
+                    ${r.amount.toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {!masterEnabled && (rows as any[]).filter((o: any) => !o.noLateFee).length > 0 && (
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 8 }}>

@@ -24,7 +24,7 @@ Each submission also carries a risk score and level. This is an intake-fraud sig
 
 ## Uploaded documents
 
-ID and income documents the applicant attached open from the application detail. Access is locked to you (the owning landlord) and the applicant — no one else can pull those files.
+ID and income documents the applicant attached open from the application detail. Access is checked on every file: only the applicant themselves and your side of the account can open them. "Your side" means you and any team member you have granted the background-check permission — nobody outside that, and no other landlord on the platform, can pull those files even with a direct link.
 
 ## A note on access
 

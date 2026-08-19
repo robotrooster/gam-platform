@@ -36,7 +36,7 @@ async function seedSite(opts: { enabled?: boolean; minStay?: number } = {}) {
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await client.query(
       `UPDATE properties SET public_booking_enabled=$1, booking_slug='sunny-rv-park',
-              booking_intro='Welcome', booking_deposit_pct=25 WHERE id=$2`,
+              booking_intro='Welcome', booking_deposit_pct=20 WHERE id=$2`,
       [opts.enabled !== false, propertyId])
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
     await client.query(
@@ -70,7 +70,7 @@ describe('GET /api/public/property/:slug', () => {
     const res = await request(buildApp()).get('/api/public/property/sunny-rv-park')
     expect(res.status).toBe(200)
     expect(res.body.data.property.name).toBe('Test Property')
-    expect(res.body.data.property.depositPct).toBe(25)
+    expect(res.body.data.property.depositPct).toBe(20)
     // Units without a subtype pool into the 'general' type; unit numbers
     // are never exposed to the public payload.
     expect(res.body.data.siteTypes).toHaveLength(1)
@@ -102,7 +102,7 @@ describe('GET availability', () => {
     expect(res.body.data.available).toBe(true)
     expect(res.body.data.nights).toBe(3)
     expect(res.body.data.total).toBe(300)
-    expect(res.body.data.depositAmount).toBe(75) // 25% of 300
+    expect(res.body.data.depositAmount).toBe(60) // 20% of 300
   })
 
   it('weekly pricing uses weekly_rate', async () => {
@@ -111,7 +111,7 @@ describe('GET availability', () => {
       .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(30)}&checkOut=${plusDays(37)}&stayType=weekly`)
     expect(res.status).toBe(200)
     expect(res.body.data.total).toBe(600)
-    expect(res.body.data.depositAmount).toBe(150)
+    expect(res.body.data.depositAmount).toBe(120) // 20% of 600
   })
 
   it('overlapping booking → unavailable (booked)', async () => {

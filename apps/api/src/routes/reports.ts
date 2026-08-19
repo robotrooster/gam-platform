@@ -1,10 +1,14 @@
 import { Router } from 'express'
 import { query, queryOne } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordIdForUser } from '../lib/scope'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import { computeLandlordPL } from '../services/landlordPL'
+import {
+  runReport, REPORT_LEVELS, REPORT_BUCKETS,
+  type ReportLevel, type ReportBucket,
+} from '../services/reportEngine'
 
 export const reportsRouter = Router()
 // S127: blanket requireLandlord lifted in favor of per-route perm gates.
@@ -760,6 +764,113 @@ reportsRouter.get('/work-trade-1099', requirePerm('books.view'), async (req, res
       success: true,
       data: { year, landlord, agreements, eligible,
         summary: { totalAgreements: agreements.length, eligible1099Count: eligible.length, totalValue } }
+    })
+  } catch (e) { next(e) }
+})
+
+// ============================================================
+// S603 (Nic) — FLEXIBLE REPORTING. "We should be able to generate reports for
+// any combination of events and timelines and tables."
+//
+// Every endpoint above is a fixed-shape report. These two run the shared engine
+// (services/reportEngine.ts) so a new report is a set of PARAMETERS, not a new
+// endpoint: any date range × portfolio|property|unit × total|monthly|daily.
+// ============================================================
+
+// GET /api/reports/query — the general engine.
+//   ?start=YYYY-MM-DD&end=YYYY-MM-DD&level=property&bucket=monthly
+reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+
+    const start = String(req.query.start || '')
+    const end   = String(req.query.end   || '')
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+      throw new AppError(400, 'start and end are required as YYYY-MM-DD')
+    }
+    if (start > end) throw new AppError(400, 'start must be on or before end')
+
+    const level  = String(req.query.level  || 'portfolio') as ReportLevel
+    const bucket = String(req.query.bucket || 'total')     as ReportBucket
+    if (!REPORT_LEVELS.includes(level))   throw new AppError(400, `level must be one of ${REPORT_LEVELS.join(', ')}`)
+    if (!REPORT_BUCKETS.includes(bucket)) throw new AppError(400, `bucket must be one of ${REPORT_BUCKETS.join(', ')}`)
+
+    // A daily bucket over years of data is a self-inflicted denial of service;
+    // cap the row count rather than letting one request scan everything.
+    if (bucket === 'daily') {
+      const days = Math.round(
+        (new Date(end).getTime() - new Date(start).getTime()) / 86400000) + 1
+      if (days > 400) throw new AppError(400, 'A daily report is limited to 400 days — narrow the range or use a monthly bucket.')
+    }
+
+    // Property scope: a team member assigned to specific properties must never
+    // pull portfolio-wide money (gam-audience-data-isolation). null = owner.
+    const scopedIds = await getScopedPropertyIds(req.user)
+
+    const result = await runReport({ landlordId, start, end, level, bucket, propertyIds: scopedIds })
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        meta: {
+          start, end, level, bucket,
+          // Stated, not silent: the platform fee accrues monthly per property,
+          // so a daily bucket cannot attribute it to a day without inventing
+          // precision. Callers must show this rather than imply $0 of fee.
+          platformFeeIncluded: bucket !== 'daily',
+          occupancyBasis: 'current',
+        },
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// GET /api/reports/t12 — trailing twelve months, month by month, per property.
+// The artifact a listing agent, buyer, or lender asks for when a property goes
+// on the market. Deliberately a PRESET over the same engine: if the engine's
+// numbers move, this moves with them and can never tell a different story than
+// the landlord's own P&L.
+reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+
+    // Trailing twelve FULL months ending with last month — the current partial
+    // month is excluded on purpose, because a T-12 that includes a half-finished
+    // month understates income and misleads whoever is reading it.
+    const anchor = req.query.asOf ? new Date(String(req.query.asOf)) : new Date()
+    if (isNaN(anchor.getTime())) throw new AppError(400, 'asOf must be a valid date')
+    const endD   = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 0))
+    const startD = new Date(Date.UTC(endD.getUTCFullYear(), endD.getUTCMonth() - 11, 1))
+    const iso    = (d: Date) => d.toISOString().slice(0, 10)
+
+    const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
+    const scopedIds  = await getScopedPropertyIds(req.user)
+    let propertyIds  = scopedIds
+    if (propertyId) {
+      // An explicit property must still be inside the caller's scope.
+      if (scopedIds && !scopedIds.includes(propertyId)) {
+        throw new AppError(403, 'Property not in your assigned scope')
+      }
+      propertyIds = [propertyId]
+    }
+
+    const result = await runReport({
+      landlordId, start: iso(startD), end: iso(endD),
+      level: 'property', bucket: 'monthly', propertyIds,
+    })
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        meta: {
+          report: 'T-12', start: iso(startD), end: iso(endD),
+          months: 12, level: 'property', bucket: 'monthly',
+          platformFeeIncluded: true, occupancyBasis: 'current',
+          note: 'Trailing twelve complete months. The current partial month is excluded.',
+        },
+      },
     })
   } catch (e) { next(e) }
 })

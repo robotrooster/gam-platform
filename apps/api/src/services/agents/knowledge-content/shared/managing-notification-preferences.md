@@ -22,4 +22,4 @@ Your preferences apply to your own account and don't change what other people on
 - Some account-critical messages — such as security or access-related communications — may still be sent even if you turn off optional notifications, so you don't miss something important.
 - GAM is the platform that delivers these alerts. Decisions about your property, lease, or payments come from your landlord and your lease, not from GAM.
 
-If a notification mentions something you don't recognize or didn't expect, or if you're not receiving alerts you think you should be, reach out and we can help you sort it out — and connect you with a human GAM specialist if needed.
+If a notification mentions something you don't recognize or didn't expect, or if you're not receiving alerts you think you should be, reach out and we can help you sort it out — and connect you with a human GAM Strategist if needed.

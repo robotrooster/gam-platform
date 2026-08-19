@@ -1083,6 +1083,11 @@ export function schedulerInit() {
   // idempotent) so the investor's net (tenant rent − lot rent) stays current.
   cron.schedule('25 4 * * *', async () => {
     try {
+      // S605 (Nic): folded into the sublease shelf — same business case, and
+      // unusable without the outside park on GAM ("everything would have to be
+      // manually input... it's not worth having"). Skip while shelved.
+      const { isFeatureEnabled } = await import('../services/systemFeatures')
+      if (!(await isFeatureEnabled('subleasing_enabled'))) return
       const { accrueLotRentCharges } = await import('../services/lotRent')
       const now = new Date()
       const asOf = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
@@ -1312,6 +1317,67 @@ export function schedulerInit() {
       if (r.assigned > 0) logger.info(r, '[cs-sla]')
     } catch (e) {
       logger.error({ err: e }, '[cs-sla] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S605: bank-feed sync. Stripe backfills a newly linked account
+  // asynchronously ("refresh is still pending"), so the first sync usually
+  // returns nothing — without this the landlord would have to keep pressing
+  // Sync themselves. Hourly is plenty; transactions post daily at best.
+  cron.schedule('40 * * * *', async () => {
+    try {
+      const { syncAllActiveConnections } = await import('../services/bankFeed')
+      const r = await syncAllActiveConnections()
+      if (r.inserted > 0) logger.info(r, '[bank-feed-sync]')
+    } catch (e) {
+      logger.error({ err: e }, '[bank-feed-sync] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S605 (Nic): retry lease drafts still waiting. Saving a template as the
+  // unit-type default fires drafting immediately — this is the backstop for
+  // everything else. Nic: "on the off chance that something does fail, what
+  // initiates the retry?" Without it, a draft that failed for a transient
+  // reason sat unresolved until the landlord happened to re-save a template.
+  //
+  // Hourly: a lease drafting an hour after the invite is invisible to the
+  // landlord (it still waits for their signature either way), and the query is
+  // indexed on unresolved rows so a settled queue is nearly free.
+  cron.schedule('25 * * * *', async () => {
+    try {
+      const { draftAllPendingLeases } = await import('../services/householdLeaseDraft')
+      const r = await draftAllPendingLeases()
+      if (r.drafted > 0) logger.info(r, '[lease-draft-retry]')
+    } catch (e) {
+      logger.error({ err: e }, '[lease-draft-retry] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S605: vendor + own-stack health. Every 15 min, alerting into
+  // admin_notifications only on a TRANSITION into trouble — Nic asked for
+  // notification in the admin portal rather than having to visit four vendor
+  // dashboards to discover something broke.
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      const { runPlatformHealthCheck } = await import('../services/platformHealth')
+      const r = await runPlatformHealthCheck()
+      if (r.alerted.length > 0) logger.warn(r, '[platform-health]')
+    } catch (e) {
+      logger.error({ err: e }, '[platform-health] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S605: post-signup onboarding-call outreach for self-signed-up landlords.
+  // Every 15 min so the note lands close to the intended ~90-minute mark rather
+  // than up to an hour late. The job itself owns the delay, the organic-only
+  // filter, and the business-hours gate — this is just the tick.
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      const { sendLandlordWelcomeOutreach } = await import('./landlordWelcomeOutreach')
+      const r = await sendLandlordWelcomeOutreach()
+      if (r.sent > 0 || r.errors > 0) logger.info(r, '[landlord-outreach]')
+    } catch (e) {
+      logger.error({ err: e }, '[landlord-outreach] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 

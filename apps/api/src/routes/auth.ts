@@ -502,13 +502,24 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
            SELECT 1 FROM user_bank_accounts ba
             WHERE ba.user_id = u.id AND ba.status = 'active'
          ) AS bank_account_ready,
-         -- S575: gates the "Lot Rent & Net" nav item — only surface it once the
-         -- landlord actually has a mobile-home unit (mirrors the tenant-portal
-         -- "only show what applies" principle). Owner landlords only; l.id is
+         -- Gates the "Lot Rent & Net" nav item. Owner landlords only; l.id is
          -- NULL for non-landlord roles so the flag is false for them.
+         --
+         -- S605 (Nic asked "wouldn't net appear regardless of unit type?"): this
+         -- used to test for a mobile_home UNIT, but the feature itself doesn't
+         -- care about unit type at all — services/lotRent.ts accrues on
+         -- properties.operator_owns_land = FALSE AND units.lot_rent_amount > 0.
+         -- The two disagreed in both directions: a landlord with mobile homes on
+         -- land they OWN saw an empty tab, and worse, an operator with lot rent
+         -- on any other unit type (park models / RVs on leased land) had charges
+         -- accruing every month that they could never see or mark paid.
+         --
+         -- Test the real precondition instead: do they operate on land they
+         -- don't own. Not "is lot rent already set" — that would hide the very
+         -- page where they'd go to set it.
          EXISTS (
-           SELECT 1 FROM units un
-            WHERE un.landlord_id = l.id AND un.unit_type = 'mobile_home'
+           SELECT 1 FROM properties pr
+            WHERE pr.landlord_id = l.id AND pr.operator_owns_land = FALSE
          ) AS has_mobile_home_units,
          t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
        FROM users u
@@ -709,11 +720,40 @@ authRouter.post('/forgot-password', async (req, res, next) => {
           WHERE id = $3`,
         [token, RESET_TOKEN_TTL_MINUTES, user.id],
       )
-      // Where the link goes is per-deploy. RESET_PASSWORD_URL points at
-      // whichever portal (tenant by default, but landlord/admin work
-      // too since the underlying form just consumes the token).
-      const base = process.env.RESET_PASSWORD_URL
-        || 'http://localhost:3002/reset-password'
+      // S605: send the landlord BACK TO THE PORTAL THEY ASKED FROM.
+      //
+      // This previously used a single RESET_PASSWORD_URL with a
+      // 'http://localhost:3002/reset-password' fallback. That env var is not
+      // set in production, so every reset email we would ever have sent carried
+      // a LOCALHOST link — on the tenant port, which has no landlord session.
+      // A locked-out landlord had no working recovery path at all.
+      //
+      // The portal that served the form is the right destination, and the
+      // request already tells us: Origin is set by the browser on the
+      // cross-origin POST. Fall back to the explicit env override, then to the
+      // tenant app (the historical default), never to localhost in production.
+      // Explicit env-configured portals, PLUS our own known portal subdomains.
+      // S605: the env vars only cover landlord/tenant/admin/pos — there is no
+      // PM_APP_URL or BUSINESS_APP_URL — so a reset requested from those portals
+      // fell through to the TENANT link and landed the user on the wrong app.
+      // Listing the labels explicitly (rather than accepting any *.our-domain)
+      // keeps a dangling-subdomain takeover from ever receiving a reset token.
+      const PORTAL_LABELS = ['landlord', 'tenant', 'admin', 'pm', 'business', 'pos']
+      const APEX = 'goldassetmanagement.com'
+      const ALLOWED_RESET_ORIGINS = [
+        process.env.LANDLORD_APP_URL, process.env.TENANT_APP_URL,
+        process.env.ADMIN_APP_URL, process.env.POS_APP_URL,
+        ...PORTAL_LABELS.map((l) => `https://${l}.${APEX}`),
+      ].filter(Boolean).map((u) => String(u).replace(/\/$/, ''))
+      const origin = String(req.get('origin') || '').replace(/\/$/, '')
+      // Only ever echo back an origin we recognise — an attacker who could set
+      // Origin freely would otherwise redirect a real reset token to their host.
+      const portalBase = ALLOWED_RESET_ORIGINS.includes(origin)
+        ? origin
+        : (process.env.RESET_PASSWORD_URL
+            ? String(process.env.RESET_PASSWORD_URL).replace(/\/reset-password\/?$/, '')
+            : (process.env.TENANT_APP_URL || 'http://localhost:3002'))
+      const base = `${String(portalBase).replace(/\/$/, '')}/reset-password`
       const resetUrl = `${base}?token=${encodeURIComponent(token)}`
       // Fire-and-forget — don't let email-send latency bound the
       // response time, and don't surface email failures to the

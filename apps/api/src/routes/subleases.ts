@@ -45,6 +45,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { isFeatureEnabled } from '../services/systemFeatures'
 import { appendEvent } from '../services/creditLedger'
 import { logger } from '../lib/logger'
 
@@ -65,6 +66,17 @@ const createSchema = z.object({
 
 subleasesRouter.post('/', async (req, res, next) => {
   try {
+    // S605 (Nic): SHELVED. The flow can't work in the real world — a sublease
+    // can only be recorded if the sublessee is ALREADY a GAM tenant (see the
+    // header), so it requires both sides to be on the platform. Nic: "I know
+    // people that sublease in a variety of parks, they will never be able to
+    // use this until all the landlords are on the same software."
+    //
+    // Only CREATION is blocked. Reads and terminations stay open so anything
+    // that ever exists remains viewable and closeable. Flip the flag to revive.
+    if (!(await isFeatureEnabled('subleasing_enabled'))) {
+      throw new AppError(403, 'Subleases are not available right now.')
+    }
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Only tenants may request a sublease')
     }

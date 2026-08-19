@@ -162,19 +162,25 @@ export const INSPECTION_TYPES = ['move_in', 'move_out', 'periodic', 'turnover'] 
 export type InspectionType = typeof INSPECTION_TYPES[number]
 
 // Per-item condition rating on an inspection checklist item. Single source
-// for the route + agent-tool validators. S573 (Nic): Excellent / Good / Fair /
-// Damaged-or-Missing — NO "N/A" (applicability comes from the unit's setup, an
-// un-inspected item is NULL, not a condition). These are the SELECTABLE values
-// during a walkthrough; the column also allows NULL = not yet inspected.
-export const INSPECTION_ITEM_CONDITIONS = ['excellent', 'good', 'fair', 'damaged_missing'] as const
+// for the route + agent-tool validators. S602 (Nic): Excellent / Good / Fair /
+// Damaged-or-Missing / N/A. "Damaged" and "Missing" stay COMBINED (missing =
+// taken/stolen by the tenant — still a chargeable loss, not "not applicable").
+// "N/A" means the item doesn't apply to THIS unit (e.g. no dishwasher) — a
+// distinct SELECTABLE value, NOT the same as an un-inspected item, which stays
+// NULL. N/A is excluded from the move-out worse-than comparison and never
+// charges. (Reverses S573's removal of N/A.) The column also allows NULL.
+export const INSPECTION_ITEM_CONDITIONS = ['excellent', 'good', 'fair', 'damaged_missing', 'na'] as const
 export type InspectionItemCondition = typeof INSPECTION_ITEM_CONDITIONS[number]
 export const INSPECTION_ITEM_CONDITION_LABEL: Record<InspectionItemCondition, string> = {
   excellent:       'Excellent',
   good:            'Good',
   fair:            'Fair',
   damaged_missing: 'Damaged / Missing',
+  na:              'N/A',
 }
 // Worse-than ordering for the move-out-vs-move-in comparison (higher = worse).
+// 'na' is intentionally omitted — items where either side is N/A are SKIPPED by
+// the comparison (routes/inspections.ts), never flagged as damage.
 export const INSPECTION_CONDITION_RANK: Record<string, number> = {
   excellent: 0, good: 1, fair: 2, damaged_missing: 3,
 }
@@ -240,7 +246,7 @@ export const SERVICE_INTERRUPTION_STATUSES = [
 ] as const
 export type ServiceInterruptionStatus = typeof SERVICE_INTERRUPTION_STATUSES[number]
 
-// ── Sales leads (marketing-site sales agent → Portfolio Specialists) ──
+// ── Sales leads (marketing-site sales agent → Portfolio Strategists) ──
 // S553: single source for the sales_leads.status CHECK (values predate this
 // export; the DB CHECK lists the same five).
 // ── Calendar-day math (S553) ──────────────────────────────────────────
@@ -432,6 +438,146 @@ export const EXPENSE_CATEGORY_LABEL: Record<ExpenseCategory, string> = {
   property_tax: 'Property tax', management: 'Management', supplies: 'Supplies', landscaping: 'Landscaping',
   professional: 'Legal / professional', mortgage_interest: 'Mortgage interest', hoa: 'HOA', advertising: 'Advertising',
   lot_rent: 'Lot rent', bank_fees: 'Bank fees / charges', other: 'Other',
+}
+
+// S605 (Nic): microdeposit verification comes in TWO flavours and STRIPE picks,
+// not us. Nic hit the mismatch live — the app promised "two small deposits" and
+// the verify screen then asked for a six-digit code:
+//
+//   'amounts'         — two deposits under $1; the tenant enters both amounts.
+//   'descriptor_code' — ONE $0.01 deposit whose statement DESCRIPTION carries a
+//                       six-digit code; the tenant enters that code.
+//
+// Hardcoding either one guarantees the instructions contradict the screen for
+// roughly half of banks, which on a rent payment reads as "something is wrong
+// with my account". One helper, used everywhere, so the two can never drift.
+export type MicrodepositType = 'amounts' | 'descriptor_code'
+
+export function microdepositInstruction(type: MicrodepositType | null | undefined): string {
+  if (type === 'descriptor_code') {
+    return 'We sent a $0.01 deposit to your bank. Find it on your statement — its description ' +
+      'contains a six-digit code. Enter that code here to finish setting up your bank.'
+  }
+  if (type === 'amounts') {
+    return 'We sent two small deposits to your bank. Once you see them, enter both amounts ' +
+      'here to finish setting up your bank.'
+  }
+  // Type unknown (Stripe decides at confirm time, and older records predate this
+  // field): describe both rather than promising the wrong one.
+  return 'We sent a small verification deposit to your bank. When it arrives, come back here — ' +
+    'we\'ll ask for either the deposit amounts or the six-digit code in its description, ' +
+    'whichever your bank received.'
+}
+
+// S605 (Nic, DIRECTIVE): "Every unit should be required to have a prefix to
+// eliminate accidents."
+//
+// The accident: adding ONE unit numbered "37" to a park of RV 01…RV 36 created a
+// unit literally called "37", because the number field is a PREFIX when adding a
+// batch and a LITERAL name when adding one. Requiring a prefix removes the
+// ambiguity at the source — "RV 37" means the same thing either way.
+//
+// It also keeps numbers unique across unit types on one property, which the
+// uniqueness index needs: a park numbering mobile homes and RV spots 1..N
+// independently collides on bare numbers but never on "MH 1" vs "RV 1".
+//
+// The rule is deliberately minimal — must not START with a digit — rather than a
+// list of approved prefixes. Parks name things "Site", "Lot", "Space", "Slip",
+// "Pad"; an allow-list would be wrong somewhere immediately.
+//
+// ENFORCED ON WRITE ONLY. Existing unprefixed units keep their names; renaming
+// them is the landlord's call, not a migration's.
+export function unitNumberNeedsPrefix(unitNumber: string): boolean {
+  return /^\s*\d/.test(String(unitNumber ?? ''))
+}
+
+// S605 (Nic, DIRECTIVE): "Each unit type should have a standard platform prefix.
+// I don't want it to be mobile home site one spelled out on one property and MH
+// one on a different property."
+//
+// UNIT_TYPE_PREFIX already existed but was decorative — used once as a display
+// hint and enforced nowhere, so every landlord invented their own convention and
+// the same unit type read differently on every property. It is now the single
+// source of the prefix, and the landlord no longer types one at all: they enter
+// the identifier and the platform supplies the label.
+//
+// That also retires the whole class of accident behind this rule — typing "37"
+// on a single unit can no longer produce a unit called "37", because the prefix
+// is never the landlord's to omit.
+//
+// Identifiers may be numeric OR alphabetic: parks number spaces, buildings often
+// letter apartments (Nic: "apartment a, apartment b, apartment c"). Pure numbers
+// are zero-padded to two so 1..9 sort next to 10+ instead of above them; letters
+// and mixed identifiers ("4B") are left as typed.
+export function canonicalUnitNumber(unitType: UnitType, raw: string): string {
+  const prefix = UNIT_TYPE_PREFIX[unitType] ?? ''
+  let id = String(raw ?? '').trim().toUpperCase().replace(/\s+/g, ' ')
+
+  // Strip the standard prefix if the landlord typed it anyway.
+  if (prefix && (id === prefix || id.startsWith(prefix + ' '))) {
+    id = id.slice(prefix.length).trim()
+  } else {
+    // Strip a spelled-out label in front of a number — "MOBILE HOME SITE 1",
+    // "SPACE 4", "LOT 12" — which is exactly the drift this rule exists to end.
+    // Only when what follows STARTS WITH A DIGIT, so a lettered identifier
+    // ("A", "B") is never mistaken for a label and eaten.
+    const m = id.match(/^[A-Z][A-Z\s.#-]*\s(\d.*)$/)
+    if (m) id = m[1].trim()
+  }
+  id = id.replace(/^#/, '').trim()
+
+  // Zero-pad a pure number to two digits. Anything already 2+ digits, or
+  // containing letters, is left alone.
+  if (/^\d$/.test(id)) id = '0' + id
+
+  return id ? `${prefix} ${id}`.trim() : prefix
+}
+
+export const UNIT_NUMBER_PREFIX_ERROR =
+  'Unit numbers need a label in front of the number — "RV 37", "MH 4", "Apt 101", "Site 12". ' +
+  'A bare number is too easy to mistype into the wrong space, and it collides when two unit ' +
+  'types share a number.'
+
+// S605 (Nic): ABA routing-number checksum.
+//
+// GAM collects routing + account numbers on its own form (microdeposits only —
+// see the no-instant-verification directive), which means no bank-search UI
+// validates the number before it goes to Stripe. Nic: "you don't have to select
+// the institution... I don't know if people would be more suspicious."
+//
+// A picker would be redundant — the routing number already identifies the bank.
+// What a picker actually provides is CONFIDENCE that the number is right, and
+// the checksum gives that instantly and more reliably: every valid US routing
+// number satisfies this weighted mod-10, so a transposed digit is caught as the
+// tenant types instead of surfacing as a failed deposit days later.
+export function isValidRoutingNumber(routing: string): boolean {
+  const d = String(routing).replace(/\D/g, '')
+  if (d.length !== 9) return false
+  const sum =
+    3 * (+d[0] + +d[3] + +d[6]) +
+    7 * (+d[1] + +d[4] + +d[7]) +
+    1 * (+d[2] + +d[5] + +d[8])
+  return sum % 10 === 0
+}
+
+// S605 (Nic): income the landlord receives that GAM did not collect. The mirror
+// of EXPENSE_CATEGORIES — before this, a money-in bank row could only be ignored,
+// so the P&L counted every expense but only GAM-collected income.
+//
+// Deliberately excludes rent: rent reaches the P&L from `payments`, and offering
+// it here would invite double-counting the same money.
+export const OTHER_INCOME_CATEGORIES = [
+  'laundry', 'vending', 'storage', 'utility_reimbursement', 'late_fees', 'application_fees',
+  'pet_fees', 'parking', 'propane_fuel', 'insurance_claim', 'tax_refund', 'sale_proceeds',
+  'owner_contribution', 'interest', 'other',
+] as const
+export type OtherIncomeCategory = typeof OTHER_INCOME_CATEGORIES[number]
+export const OTHER_INCOME_CATEGORY_LABEL: Record<OtherIncomeCategory, string> = {
+  laundry: 'Laundry', vending: 'Vending', storage: 'Storage', utility_reimbursement: 'Utility reimbursement',
+  late_fees: 'Late fees', application_fees: 'Application fees', pet_fees: 'Pet fees', parking: 'Parking',
+  propane_fuel: 'Propane / fuel', insurance_claim: 'Insurance claim', tax_refund: 'Tax refund',
+  sale_proceeds: 'Sale proceeds', owner_contribution: 'Owner contribution', interest: 'Interest earned',
+  other: 'Other income',
 }
 
 // S570 (Nic): bank feed (Stripe Financial Connections). A landlord links their
@@ -1591,6 +1737,10 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
         { key: 'reports.tab.property',  label: 'By property' },
         { key: 'reports.tab.annual',    label: 'Annual & tax', sensitive: true, hint: 'tenant 1099 PII' },
         { key: 'reports.tab.statement', label: 'Owner statement' },
+        // S603: the flexible report builder + T-12. Financial like the rest of
+        // this category — a scoped staffer granted it still only ever sees their
+        // assigned properties (the engine applies property scope server-side).
+        { key: 'reports.tab.custom',    label: 'Custom & T-12' },
       ]},
       { label: 'Actions', items: [
         { key: 'reports.export', label: 'Export / print' },
@@ -1926,7 +2076,18 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
 // Single source of truth for units.status CHECK constraint.
 // direct_pay retired W-15/S531 (migration 20260704150000) — off-platform
 // payment isn't a unit state GAM tracks; rows were merged into 'active'.
-export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended'] as const
+// S604 'owner_use' (Nic): a unit the OWNER occupies — their own home, a
+// manager's residence, a model unit. It has NO lease and collects NO rent, so
+// it is deliberately excluded from every revenue-shaped surface. It is NOT
+// vacant (it cannot be rented or booked) so it counts as occupied for
+// occupancy/availability purposes.
+//
+// The anti-cheat is structural, not a rule: because owner_use carries no lease,
+// the $2/occupied-unit platform fee — which bills DISTINCT UNITS WITH AN ACTIVE
+// LEASE (jobs/platformFeeAccrual.ts) — never charges it. A landlord cannot use
+// the status to dodge the fee on a real tenant, because a unit with no lease
+// also cannot collect rent through GAM.
+export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended', 'owner_use'] as const
 export type UnitStatus = typeof UNIT_STATUSES[number]
 export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   vacant:     'Vacant',
@@ -1934,7 +2095,14 @@ export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   active:     'Active',
   delinquent: 'Delinquent',
   suspended:  'Suspended',
+  owner_use:  'Owner Use',
 }
+
+// Statuses that occupy a unit without producing rent. Excluded from
+// revenue-shaped aggregates (expected rent, rep commission) while still
+// counting as occupied for occupancy/vacancy. Anything reading
+// `status <> 'vacant'` to mean "earning" must subtract these.
+export const NON_REVENUE_OCCUPIED_STATUSES = ['owner_use'] as const
 
 // Unit type values.
 // Single source of truth for units.unit_type CHECK constraint.
@@ -1973,7 +2141,10 @@ export const UNIT_TYPE_PREFIX: Record<UnitType, string> = {
   mobile_home:   'MH',
   hotel_room:    'RM',
   storage:       'STG',
-  parking:       'PKG',
+  // S605 (Nic): was PKG, which reads as "package". STALL is the industry term
+  // for an individual parking space (garages, apartment complexes) and can't be
+  // misread — and it matches SLIP: both are full words for one bounded space.
+  parking:       'STALL',
   boat_slip:     'SLIP',
   land_lot:      'LOT',
   commercial:    'COM',
@@ -3572,9 +3743,19 @@ export interface PaginatedResponse<T> {
 
 // ── STRIPE / PAYMENT CONFIG ────────────────────────────────
 
+// GAM's COST side (what Stripe charges GAM) — distinct from PROCESSING_FEES
+// below, which is what GAM charges the CUSTOMER. Do not confuse the two.
+//
+// S603 (Nic): ACH_RATE/ACH_CAP were 0.8% / $5.00 — Stripe's PUBLIC ACH list
+// price, never GAM's. GAM is on a NEGOTIATED 0.5% capped $3.00, which is what
+// the platform_processing_rates `ach` row has always carried. The stale pair
+// here overstated GAM's ACH cost by up to $2.00/payment, which understated the
+// net on the landlord-facing per-unit economics endpoint (routes/units.ts
+// /:id/economics via calcNetPerUnit). platform_processing_rates is the SOURCE
+// OF TRUTH for processing economics; these constants must mirror it.
 export const STRIPE_CONFIG = {
-  ACH_RATE:        0.008,
-  ACH_CAP:         5.00,
+  ACH_RATE:        0.005,   // negotiated — mirrors platform_processing_rates.ach stripe_cost_percent
+  ACH_CAP:         3.00,    // negotiated — mirrors platform_processing_rates.ach stripe_cost_cap
   PAYOUT_RATE:     0.0025,
   PAYOUT_FLAT:     0.25,
   CONNECT_ACCT_MO: 2.00,
@@ -3587,23 +3768,52 @@ export const STRIPE_CONFIG = {
 // the platform_processing_rates DB rows (allocation engine) — the
 // 20260721 migration seeds those rows from these same numbers; if these
 // change, cut a new migration to match.
-//   Card: 3.25% + $0.26 per transaction (+1.5% on non-US-issued cards).
-//         The 26¢ mirrors the fixed per-transaction cost of GAM's Stripe
-//         IC+ contract (interchange + 0.7% + $0.26) exactly — S552 (Nic),
-//         raised from the earlier $0.10 so no transaction size loses on
-//         the fixed component.
+//   Card: 3.5% + $0.55 per transaction (+1.5% on non-US-issued cards) — S603 (Nic).
+//         The old 26¢ mirrored ONLY the Stripe per-authorization fee. GAM's real
+//         fixed cost per SUCCESSFUL payment is ~$0.55: $0.26 auth + $0.02 Radar +
+//         interchange's own fixed leg ($0.10 credit / $0.21 regulated debit) + an
+//         amortized share of authorizations that earn nothing (card-save
+//         verifications and declines each cost $0.28 with no revenue).
+//         3.25% left only 2.55% for interchange after Stripe's 0.7%, so every
+//         commercial card (~2.70-3.15%) lost money and lost MORE as rent rose.
+//         3.5% clears consumer debit and credit incl. premium (~2.40%); commercial
+//         stays a small accepted loss above ~$113 (-$0.28 on a $300 booking).
+//         See migration 20260812150000_card_fee_35_pct_55_flat.sql.
 //   ACH:  flat $6.00 (S601, Nic). One flat bank fee at any rent — simple to state
 //         honestly ("$6 flat"), no percentage. GAM nets $3–$6 after Stripe's cost
 //         (0.5% capped $3): $3 at the top, more on lower rent. Tiny payments rarely
 //         go ACH (a card is cheaper at that size), so the flat fee doesn't sting there.
 export const PROCESSING_FEES = {
-  CARD_PCT:      0.0325,
-  CARD_FLAT:     0.26,
+  CARD_PCT:      0.035,
+  CARD_FLAT:     0.55,
   CARD_INTL_PCT: 0.015,
   ACH_PCT:       0,
   ACH_FLAT:      6.00,
   ACH_CAP:       6.00,
 } as const
+
+/**
+ * S604: human-readable processing-fee labels, DERIVED from PROCESSING_FEES.
+ *
+ * Every repricing so far has left stale numbers in UI copy — after the S603
+ * card change to 3.5% + $0.55 the landlord onboarding screen and the properties
+ * fee card both still read "3.25% + 26¢", which meant a landlord was agreeing to
+ * terms against a rate that no longer existed. Copy that quotes a price must be
+ * generated from the constant, never typed.
+ */
+export function cardFeeLabel(opts: { intl?: boolean } = {}): string {
+  const pct  = `${(PROCESSING_FEES.CARD_PCT * 100).toFixed(2).replace(/\.?0+$/, '')}%`
+  const flat = `${Math.round(PROCESSING_FEES.CARD_FLAT * 100)}¢`
+  const base = `${pct} + ${flat}`
+  return opts.intl
+    ? `${base} (+${(PROCESSING_FEES.CARD_INTL_PCT * 100).toFixed(1).replace(/\.0$/, '')}% on non-US-issued cards)`
+    : base
+}
+
+/** S604: ACH is a flat fee (S601) — no percentage, no cap language. */
+export function achFeeLabel(): string {
+  return `$${PROCESSING_FEES.ACH_FLAT.toFixed(2)} flat`
+}
 
 export const PLATFORM_FEES = {
   // @deprecated S561 — the per-unit LANDLORD fee tiers below are RETIRED. The
@@ -3883,6 +4093,7 @@ export function formatCurrency(amount: number): string {
 export * from './businessDay'
 export * from './paymentAllocation'
 export * from './camelize'
+export * from './versionWatch'
 
 // ============================================================
 // S26a: Invoice types
@@ -3912,7 +4123,15 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // S562: 'MANUALPAY' (9 chars) for the $10 manual-payment fee; 'FLEXPAY' added
 // to close a long-standing drift (the DB CHECK always carried it).
 // S583: 'FCPAYDOWN' — a customer FlexCharge revolving-balance pay-down.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT', 'FCPAYDOWN'] as const
+// S603: 'DECLINEFEE' (10 chars — the NACHA field limit exactly) for the flat
+// $1.00 declined-card-attempt fee. Distinct from RETURNFEE: that one covers a
+// payment that SETTLED then reversed; this one covers a payment the bank refused
+// outright. See CARD_DECLINE_FEE below.
+// S605: 'BALANCE' — arrears carried in from the landlord's previous system.
+// Its own descriptor rather than 'RENT': this is what the tenant sees on their
+// bank statement, and a debt they recognise as an old balance should not appear
+// as a rent charge they might read as a duplicate.
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
@@ -3927,6 +4146,21 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   cash: 'Cash', check: 'Check', money_order: 'Money order',
 }
 export const MANUAL_PAYMENT_FEE = 10.00
+
+// S603 (Nic): flat $1.00 fee on a DECLINED CARD ATTEMPT (entry_description
+// 'DECLINEFEE'). Stripe bills GAM per AUTHORIZATION, not per successful payment,
+// so a decline costs $0.28 ($0.26 per-auth + $0.02 Radar) with no revenue against
+// it — and the identical $0.28 is spent every time a card is saved or re-saved
+// after being lost, stolen, or reissued. The ~$0.72 surplus over the decline's own
+// cost funds those save authorizations, which is what lets GAM keep card-on-file
+// (and therefore autopay) enabled instead of dropping it to stop the bleed.
+//
+// This is a FLAT FEE, not a pass-through — do NOT describe it to a tenant as
+// "our cost" or "passed through at cost" (the $4 ACH return fee is roughly at
+// cost; this one is not). Tenant-facing wording: "declined-payment fee".
+//
+// CARD ONLY. ACH keeps its own $4.00 return fee (FLEXPAY_ACH_RETURN_FEE).
+export const CARD_DECLINE_FEE = 1.00
 
 // S568 (Nic): the onboarding-transition "prior arrangement" settlement. During
 // a landlord's move onto GAM, an IMPORTED tenant may have already paid the FIRST
@@ -3944,9 +4178,10 @@ export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21
 // are omitted — callers already hide those; only the fee-style codes need a
 // human name. `humanizeEntryDescription` falls back to the raw code.
 export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescription, string>> = {
-  LATEFEE:   'Late fee',
-  RETURNFEE: 'Returned-payment fee',
-  MANUALPAY: 'Manual-payment fee',
+  LATEFEE:    'Late fee',
+  RETURNFEE:  'Returned-payment fee',
+  MANUALPAY:  'Manual-payment fee',
+  DECLINEFEE: 'Declined-payment fee',
   ONTIMEPAY: 'On-time pay',
   FLEXPAY:   'FlexPay',
   HOMEPMT:   'Home payment',
@@ -5099,6 +5334,10 @@ export const METER_READ_REASONS = [
   'stay_turnover',
   'move_out_final',
   'meter_replaced',
+  // S605 (Nic): the opening odometer captured at meter setup. NOT a cycle read —
+  // it never occupies the one-monthly_cycle-read-per-month slot — but it IS what
+  // the first cycle subtracts from. Without it a submeter bills nothing, silently.
+  'baseline',
   'other',
 ] as const
 export type MeterReadReason = typeof METER_READ_REASONS[number]
@@ -5124,6 +5363,7 @@ export const METER_READ_REASON_LABEL: Record<MeterReadReason, string> = {
   stay_turnover:  'Stay turnover',
   move_out_final: 'Move-out (final read)',
   meter_replaced: 'Meter replaced',
+  baseline:       'Opening read (baseline)',
   other:          'Other',
 }
 
@@ -5281,3 +5521,72 @@ export type PaymentReversalStatus = typeof PAYMENT_REVERSAL_STATUS_VALUES[number
 // list these exact values — keep in sync.
 export const SALES_BOOKING_KIND_VALUES = ['demo', 'onboarding'] as const
 export type SalesBookingKind = typeof SALES_BOOKING_KIND_VALUES[number]
+
+// ── S605: Stripe Connect requirement labels ──────────────────────────────
+//
+// Nic: "I want it to be obvious for landlords so they're not like, what am I
+// waiting on? If I don't know how to do what I need to do, that's where the
+// friction lives."
+//
+// The banking page printed Stripe's RAW requirement keys — a landlord saw
+// "individual.id_number, business_profile.mcc, tos_acceptance.date" and had no
+// idea what was being asked. That also violated the no-raw-enums-in-UI rule.
+//
+// Keys are dot-paths and Stripe adds new ones over time, so this maps what we
+// know and `connectRequirementLabel()` degrades gracefully for the rest rather
+// than showing nothing.
+export const CONNECT_REQUIREMENT_LABEL: Record<string, string> = {
+  'business_profile.mcc':              'What kind of business this is',
+  'business_profile.url':              'Business website (or a description instead)',
+  'business_profile.product_description': 'A short description of what you rent',
+  'business_type':                     'Whether you operate as an individual or a company',
+  'company.name':                      'Legal business name',
+  'company.address.line1':             'Business street address',
+  'company.address.city':              'Business city',
+  'company.address.state':             'Business state',
+  'company.address.postal_code':       'Business ZIP code',
+  'company.phone':                     'Business phone number',
+  'company.tax_id':                    'Business EIN',
+  'company.owners_provided':           'Confirmation that all owners are listed',
+  'company.directors_provided':        'Confirmation that all directors are listed',
+  'company.executives_provided':       'Confirmation that all executives are listed',
+  'company.verification.document':     'A photo of your business verification document',
+  'individual.first_name':             'Your first name',
+  'individual.last_name':              'Your last name',
+  'individual.dob.day':                'Your date of birth',
+  'individual.dob.month':              'Your date of birth',
+  'individual.dob.year':               'Your date of birth',
+  'individual.address.line1':          'Your home street address',
+  'individual.address.city':           'Your home city',
+  'individual.address.state':          'Your home state',
+  'individual.address.postal_code':    'Your home ZIP code',
+  'individual.phone':                  'Your phone number',
+  'individual.email':                  'Your email address',
+  'individual.ssn_last_4':             'The last 4 digits of your SSN',
+  'individual.id_number':              'Your full SSN (or tax ID)',
+  'individual.verification.document':  'A photo of your driver’s licence or passport',
+  'individual.verification.additional_document': 'A second ID document',
+  'external_account':                  'The bank account rent should be deposited into',
+  'tos_acceptance.date':               'Accepting Stripe’s terms',
+  'tos_acceptance.ip':                 'Accepting Stripe’s terms',
+  'representative.verification.document': 'A photo of the representative’s ID',
+}
+
+/**
+ * Plain-English label for a Stripe requirement key. Unknown keys are
+ * de-dotted and humanised rather than dropped — a landlord seeing a slightly
+ * clumsy label still learns what is being asked; seeing nothing does not.
+ */
+export function connectRequirementLabel(key: string): string {
+  const known = CONNECT_REQUIREMENT_LABEL[key]
+  if (known) return known
+  // 'person_xxx.verification.document' → strip Stripe's generated person ids.
+  const generic = key.replace(/^person_[A-Za-z0-9]+\./, 'representative.')
+  if (CONNECT_REQUIREMENT_LABEL[generic]) return CONNECT_REQUIREMENT_LABEL[generic]
+  return humanize(key.split('.').pop() || key)
+}
+
+/** De-duplicated, plain-English list — dob.day/month/year collapse to one line. */
+export function connectRequirementLabels(keys: string[]): string[] {
+  return [...new Set((keys || []).map(connectRequirementLabel))]
+}

@@ -24,6 +24,7 @@ import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout } from './components/Layout'
 import { DialogHost } from './components/dialogs'
 import { LoginPage } from './pages/LoginPage'
+import { PmForgotPasswordPage, PmResetPasswordPage } from './pages/PasswordRecoveryPages'
 import { RegisterPage } from './pages/RegisterPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { InvitationsPage } from './pages/InvitationsPage'
@@ -68,6 +69,10 @@ appRoot.render(
         <BrowserRouter>
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
+            {/* S605: the PM portal had NO password recovery — no link, no page,
+                no route — while the API endpoint existed since S289. */}
+            <Route path="/forgot-password" element={<PmForgotPasswordPage />} />
+            <Route path="/reset-password"  element={<PmResetPasswordPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
               <Route index             element={<Navigate to="/dashboard" replace />} />

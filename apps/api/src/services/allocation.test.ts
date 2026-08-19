@@ -102,9 +102,13 @@ describe('executeRentAllocation — ACH', () => {
         [paymentId]
       )
       expect(platLedger.rows).toHaveLength(1)
+      // S603: Stripe bills on what it PROCESSED, not on the rent line. The
+      // tenant pays the fee on top, so a $1,000 rent is a $1,010 charge and
+      // Stripe's 0.5% is $5.05 — not $5.00. Spread is $10.00 - $5.05.
+      // Pre-S603 this asserted $5.00, which was the bug.
       expect(platLedger.rows[0]).toMatchObject({
         type: 'banking_spread',
-        amount: '5.00',
+        amount: '4.95',
       })
     })
   })
@@ -666,6 +670,118 @@ describe('executeRentAllocation — PM company cut', () => {
 
       await expect(executeRentAllocation(client, paymentId, 'ach'))
         .rejects.toThrow(/no bank routing/i)
+    })
+  })
+})
+
+// ══════════════════════════════════════════════════════════════
+// S603 — ONE CHARGE, MANY ROWS. The bug that took real money.
+//
+// Allocation runs once per settled row (webhooks.ts loops `settled.rows`).
+// Pre-S603 each pass recomputed the customer-facing fee from its own row, so a
+// FLAT fee was booked once PER ROW instead of once per charge. With ACH's flat
+// $6 and a charge covering rent + a utility bill that meant $12 booked against
+// $6 actually charged — and with ach_fee_payer='landlord' the extra $6 came straight out of
+// the landlord's share.
+//
+// These use the REAL production shape (flat $6 customer / 0.5% capped $3 cost),
+// not the percentage-only rate the older tests seed — a pure percentage hides
+// the bug, because 1% of each row already sums to 1% of the total.
+// ══════════════════════════════════════════════════════════════
+describe('executeRentAllocation — one charge covering multiple rows (S603)', () => {
+  /**
+   * A UTILITY row settled by the SAME PaymentIntent — the realistic multi-line
+   * charge. Rent itself never stacks: it auto-charges on the due date, a failure
+   * retries with a returned-payment fee, and a second failure ends ACH for that
+   * tenant. What DOES ride along on one payment is rent + a utility bill (or a
+   * late fee) swept up by the FIFO Pay-Now path. Utility runs through this same
+   * allocation engine (S122), so it is allocated alongside the rent row.
+   */
+  async function seedUtilityOnSameCharge(
+    client: any,
+    a: { unitId: string; tenantId: string; landlordId: string; pi: string },
+  ): Promise<string> {
+    const r = await client.query(
+      `INSERT INTO payments
+         (unit_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, stripe_payment_intent_id)
+       VALUES ($1,$2,$3,'utility',500,'settled','UTILITY', CURRENT_DATE, $4)
+       RETURNING id`,
+      [a.unitId, a.tenantId, a.landlordId, a.pi])
+    return r.rows[0].id
+  }
+
+  async function useFlatAchRate(client: any) {
+    await client.query(
+      `UPDATE platform_processing_rates SET effective_until = now()
+        WHERE payment_method='ach' AND effective_until IS NULL`)
+    await client.query(
+      `INSERT INTO platform_processing_rates
+         (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
+          stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
+       VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+  }
+
+  it('books the flat fee ONCE across the charge, not once per row', async () => {
+    await withRollback(async (client) => {
+      await useFlatAchRate(client)
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+
+      // ONE PaymentIntent covering $500 rent + a $500 utility bill — one
+      // Pay-Now payment settling two obligations, which is how a charge really
+      // ends up spanning multiple rows.
+      const pi = 'pi_multi_row_s603'
+      const p1 = await seedRentPayment(client, {
+        unitId, tenantId, landlordId, amount: 500, stripePaymentIntentId: pi })
+      const p2 = await seedUtilityOnSameCharge(client, { unitId, tenantId, landlordId, pi })
+
+      await executeRentAllocation(client, p1, 'ach')
+      await executeRentAllocation(client, p2, 'ach')
+
+      const spread = await client.query(
+        `SELECT COALESCE(SUM(amount),0)::text AS total FROM platform_revenue_ledger
+          WHERE reference_id IN ($1,$2) AND type='banking_spread'`, [p1, p2])
+
+      // Truth: tenant charged $1,000 + one $6 fee = $1,006 processed.
+      // Stripe 0.5% of $1,006 = $5.03, capped at $3.00.
+      // Spread = $6.00 fee - $3.00 cost = $3.00 TOTAL across both rows.
+      // Pre-S603 this produced $7.00 ($6 fee booked twice, cost computed on
+      // $500 per row) — a 133% overstatement of GAM revenue.
+      expect(parseFloat(spread.rows[0].total)).toBeCloseTo(3.00, 2)
+    })
+  })
+
+  it('landlord-paid fee is deducted ONCE across the charge, not once per row', async () => {
+    await withRollback(async (client) => {
+      await useFlatAchRate(client)
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'landlord' })
+
+      const pi = 'pi_multi_row_landlord_s603'
+      const p1 = await seedRentPayment(client, {
+        unitId, tenantId, landlordId, amount: 500, stripePaymentIntentId: pi })
+      const p2 = await seedUtilityOnSameCharge(client, { unitId, tenantId, landlordId, pi })
+
+      await executeRentAllocation(client, p1, 'ach')
+      await executeRentAllocation(client, p2, 'ach')
+
+      const owner = await client.query(
+        `SELECT COALESCE(SUM(amount),0)::text AS total FROM user_balance_ledger
+          WHERE reference_id IN ($1,$2) AND type='allocation_owner_share'`, [p1, p2])
+
+      // The landlord covers ONE $6 fee on a $1,000 charge → $994.00.
+      // Pre-S603 they were charged $6 per row and received $988.00 — $6 of
+      // their own money gone. THIS is the discrepancy that must never exist.
+      expect(parseFloat(owner.rows[0].total)).toBeCloseTo(994.00, 2)
     })
   })
 })

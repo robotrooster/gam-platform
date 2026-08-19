@@ -33,6 +33,52 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
   )
   const rows = data as PropertyUnitSubtype[]
 
+  // S604 (Nic): "adding unit subtypes should be prepopulated with stuff if stuff
+  // was selected at unit onboarding... all this stuff is double inputting."
+  // A landlord who just bulk-added 20 back-in / 30-amp / tenant-owned RV spots
+  // opened this form and found it defaulted to APARTMENT with everything blank.
+  // Derive the defaults from the units that already exist on the property —
+  // the most common unit_type, and the dominant layout/amp/ownership within it.
+  const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
+  const seedFromUnits = (() => {
+    const mine = (allUnits as any[]).filter(u => u.propertyId === propertyId)
+    if (mine.length === 0) return null
+    const mode = <T,>(vals: T[]): T | null => {
+      const counts = new Map<T, number>()
+      for (const v of vals) if (v != null) counts.set(v, (counts.get(v) ?? 0) + 1)
+      let best: T | null = null, n = 0
+      for (const [v, c] of counts) if (c > n) { best = v; n = c }
+      return best
+    }
+    const unitType = mode(mine.map(u => u.unitType))
+    if (!unitType) return null
+    const ofType = mine.filter(u => u.unitType === unitType)
+    // Rates: use the most common non-null value across units of this type.
+    // Nic: "subtypes don't fill in rates that were already set" — the physical
+    // attributes were seeded but the money fields were left blank, which is the
+    // half the landlord actually had to retype.
+    const numMode = (vals: any[]): string => {
+      const nums = vals.map(v => v == null || v === '' ? null : Number(v))
+                       .filter(v => v != null && !Number.isNaN(v) && v > 0)
+      const m = mode(nums as number[])
+      return m == null ? '' : String(m)
+    }
+    return {
+      unitType,
+      rvSiteLayout:      mode(ofType.map(u => u.rvSiteLayout)) ?? 'none',
+      rvAmpService:      mode(ofType.map(u => u.rvAmpService)) ?? 'none',
+      dwellingOwnership: mode(ofType.map(u => u.dwellingOwnership)) ?? 'tenant',
+      bedrooms:          numMode(ofType.map(u => u.bedrooms)),
+      bathrooms:         numMode(ofType.map(u => u.bathrooms)),
+      storageSize:       mode(ofType.map(u => u.storageSize)) ?? '',
+      rentAmount:        numMode(ofType.map(u => u.rentAmount)),
+      securityDeposit:   numMode(ofType.map(u => u.securityDeposit)),
+      nightlyRate:       numMode(ofType.map(u => u.nightlyRate)),
+      weeklyRate:        numMode(ofType.map(u => u.weeklyRate)),
+      monthlyRate:       numMode(ofType.map(u => u.monthlyRate)),
+    }
+  })()
+
   const done = () => {
     setEditing(null)
     setError(null)
@@ -111,13 +157,15 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
       )}
 
       {editing === 'new' && (
-        <SubtypeEditor propertyId={propertyId} initial={null} onDone={done} onCancel={() => setEditing(null)} onError={setError} />
+        <SubtypeEditor propertyId={propertyId} initial={null} seed={seedFromUnits}
+          onDone={done} onCancel={() => setEditing(null)} onError={setError} />
       )}
     </div>
   )
 }
 
-function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
+function SubtypeEditor({ propertyId, initial, seed, onDone, onCancel, onError }: {
+  seed?: any
   propertyId: string
   initial: PropertyUnitSubtype | null
   onDone: () => void
@@ -125,19 +173,19 @@ function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
   onError: (m: string | null) => void
 }) {
   const [f, setF] = useState({
-    unitType:     (initial?.unitType ?? 'apartment') as UnitType,
+    unitType:     (initial?.unitType ?? seed?.unitType ?? 'apartment') as UnitType,
     name:         initial?.name ?? '',
-    bedrooms:     initial?.bedrooms != null ? String(initial.bedrooms) : '',
-    bathrooms:    initial?.bathrooms != null ? String(initial.bathrooms) : '',
-    rvSiteLayout: initial?.rvSiteLayout ?? 'none',
-    rvAmpService: initial?.rvAmpService ?? 'none',
-    dwellingOwnership: initial?.dwellingOwnership ?? 'tenant',
-    storageSize:  initial?.storageSize ?? '',
-    rentAmount:      initial?.rentAmount?.toString() ?? '',
-    securityDeposit: initial?.securityDeposit?.toString() ?? '',
-    nightlyRate:     initial?.nightlyRate?.toString() ?? '',
-    weeklyRate:      initial?.weeklyRate?.toString() ?? '',
-    monthlyRate:     initial?.monthlyRate?.toString() ?? '',
+    bedrooms:     initial?.bedrooms != null ? String(initial.bedrooms) : (seed?.bedrooms ?? ''),
+    bathrooms:    initial?.bathrooms != null ? String(initial.bathrooms) : (seed?.bathrooms ?? ''),
+    rvSiteLayout: initial?.rvSiteLayout ?? seed?.rvSiteLayout ?? 'none',
+    rvAmpService: initial?.rvAmpService ?? seed?.rvAmpService ?? 'none',
+    dwellingOwnership: initial?.dwellingOwnership ?? seed?.dwellingOwnership ?? 'tenant',
+    storageSize:  initial?.storageSize ?? seed?.storageSize ?? '',
+    rentAmount:      initial?.rentAmount?.toString() ?? seed?.rentAmount ?? '',
+    securityDeposit: initial?.securityDeposit?.toString() ?? seed?.securityDeposit ?? '',
+    nightlyRate:     initial?.nightlyRate?.toString() ?? seed?.nightlyRate ?? '',
+    weeklyRate:      initial?.weeklyRate?.toString() ?? seed?.weeklyRate ?? '',
+    monthlyRate:     initial?.monthlyRate?.toString() ?? seed?.monthlyRate ?? '',
   })
   const set = (k: string, v: any) => setF(x => ({ ...x, [k]: v }))
   const isRv = f.unitType === 'rv_spot'

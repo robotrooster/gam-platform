@@ -357,6 +357,11 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM businesses`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
+  // S605: audit_log.user_id FKs users with no ON DELETE, so any test whose
+  // route writes an audit row (e.g. POST /units/:id/retire) would otherwise
+  // fail the users DELETE below with a foreign-key violation — and it would
+  // surface in the NEXT test's beforeEach, not the one that wrote the row.
+  await db.query(`DELETE FROM audit_log`)
   await db.query(`DELETE FROM users`)
 }
 

@@ -21,7 +21,13 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
+    // S605 (Nic, live bug): a wrong password on the SIGN-IN page returns 401,
+    // and this used to hard-navigate to /login for it. Already being on /login,
+    // that is a RELOAD — the form clears and the React state holding the error
+    // is destroyed, so the user sees a blank refresh with no message and cannot
+    // tell a wrong password from a broken app. Auth pages render the server's
+    // error inline; only a 401 on a normal authed request means a dead session.
+    if (err.response?.status === 401 && !String(err.config?.url || '').includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
     }

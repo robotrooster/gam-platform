@@ -1,7 +1,8 @@
 /**
- * S449 route-test slice — money-flow triplet:
- *   - withdrawals.ts (181 lines): Stripe Payouts manual on-demand
- *     (GET /me/withdrawals/preview + POST /me/withdrawals)
+ * S449 route-test slice — money-flow pair:
+ *   (S604: withdrawals.ts was DELETED — the manual on-demand payout route had
+ *   had no UI since S574 and let a landlord pull their Connect balance outside
+ *   the Tuesday batch. Its tests went with it.)
  *   - finances.ts   (138 lines): per-user balance + ledger entries
  *     (GET /me/finances)
  *   - disbursements.ts (45 lines): disbursement list
@@ -60,7 +61,6 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import { errorHandler } from '../middleware/errorHandler'
-import { withdrawalsRouter } from './withdrawals'
 import { financesRouter } from './finances'
 import { disbursementsRouter } from './disbursements'
 import {
@@ -86,7 +86,6 @@ const sign = (claims: any) =>
 function buildApp() {
   const app = express()
   app.use(express.json({ limit: '2mb' }))
-  app.use('/api',                withdrawalsRouter)
   app.use('/api',                financesRouter)
   app.use('/api/disbursements',  disbursementsRouter)
   app.use(errorHandler)
@@ -129,252 +128,6 @@ async function seedUser(opts: {
   } catch (e) { await c.query('ROLLBACK'); throw e }
   finally { c.release() }
 }
-
-// ═══════════════════════════════════════════════════════════════
-//  GET /me/withdrawals/preview
-// ═══════════════════════════════════════════════════════════════
-
-describe('GET /me/withdrawals/preview', () => {
-  it('no Stripe Connect account → 409 onboarding-incomplete', async () => {
-    const u = await seedUser({ hasConnect: false })
-    const res = await request(buildApp())
-      .get('/api/me/withdrawals/preview')
-      .set('Authorization', `Bearer ${u.token}`)
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/onboarding incomplete/i)
-  })
-
-  it('connect_payouts_enabled=false → 409 (KYC not complete)', async () => {
-    const u = await seedUser({ connectReady: false })
-    const res = await request(buildApp())
-      .get('/api/me/withdrawals/preview')
-      .set('Authorization', `Bearer ${u.token}`)
-    expect(res.status).toBe(409)
-  })
-
-  it('happy: $100 standard + $50 instant → shape with fee math', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValueOnce({
-      available:         [{ currency: 'usd', amount: 100 }],
-      pending:           [{ currency: 'usd', amount: 0 }],
-      instant_available: [{ currency: 'usd', amount: 50 }],
-    } as any)
-    const res = await request(buildApp())
-      .get('/api/me/withdrawals/preview')
-      .set('Authorization', `Bearer ${u.token}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.standard).toEqual({ available: 100, eligible: true })
-    // S531 (Nic-set): user-facing instant fee = max(50 * 0.02, $5.00) = $5.00
-    // (INSTANT_WITHDRAWAL_FEE in shared — this suite predated the change).
-    expect(res.body.data.instant.available).toBe(50)
-    expect(res.body.data.instant.fee).toBe(5)
-    // S580 (Nic — no pre-pull): the landlord is paid their NET = available − all-in
-    // fee = 50 − 5 = 45. GAM's margin is recorded owed + collected at the next
-    // disbursement, never netted into this figure. (Supersedes the old W-32
-    // pre-pull math this suite asserted — 45.06.)
-    expect(res.body.data.instant.net).toBe(45)
-    expect(res.body.data.instant.eligible).toBe(true)
-  })
-
-  it('instant fee MIN $5 floor: small balance ($10) → fee = $5.00', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValueOnce({
-      available:         [{ currency: 'usd', amount: 0 }],
-      pending:           [{ currency: 'usd', amount: 0 }],
-      instant_available: [{ currency: 'usd', amount: 10 }],
-    } as any)
-    const res = await request(buildApp())
-      .get('/api/me/withdrawals/preview')
-      .set('Authorization', `Bearer ${u.token}`)
-    expect(res.body.data.instant.fee).toBe(5)   // $5 floor wins over 10*0.02=0.20 (S531)
-    expect(res.body.data.instant.net).toBe(5)
-  })
-
-  it('zero balance → both channels ineligible, no fee on instant', async () => {
-    const u = await seedUser()
-    // Default mock returns zeros.
-    const res = await request(buildApp())
-      .get('/api/me/withdrawals/preview')
-      .set('Authorization', `Bearer ${u.token}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.standard.eligible).toBe(false)
-    expect(res.body.data.instant.eligible).toBe(false)
-    expect(res.body.data.instant.fee).toBe(0)
-  })
-
-  it('no auth header → 401', async () => {
-    const res = await request(buildApp()).get('/api/me/withdrawals/preview')
-    expect(res.status).toBe(401)
-  })
-})
-
-// ═══════════════════════════════════════════════════════════════
-//  POST /me/withdrawals
-// ═══════════════════════════════════════════════════════════════
-
-describe('POST /me/withdrawals', () => {
-  it('no Connect → 409', async () => {
-    const u = await seedUser({ hasConnect: false })
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({})
-    expect(res.status).toBe(409)
-  })
-
-  it('connect_details_submitted=false → 409', async () => {
-    const u = await seedUser({ connectReady: false })
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({})
-    expect(res.status).toBe(409)
-  })
-
-  it('zero available balance → 400', async () => {
-    const u = await seedUser()
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({})
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/No standard balance available/)
-    expect(firePayoutMock).not.toHaveBeenCalled()
-  })
-
-  it('happy standard: fires payout with method=standard + audit row + 0 fee', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValueOnce({
-      available:         [{ currency: 'usd', amount: 250 }],
-      pending:           [],
-      instant_available: [{ currency: 'usd', amount: 100 }],
-    } as any)
-    firePayoutMock.mockResolvedValueOnce({ id: 'po_std_xyz' } as any)
-
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({ method: 'standard' })
-    expect(res.status).toBe(201)
-    expect(res.body.data.stripe_payout_id).toBe('po_std_xyz')
-    expect(res.body.data.amount).toBe(250)
-    expect(res.body.data.method).toBe('standard')
-    expect(res.body.data.fee_charged).toBe(0)
-    expect(res.body.data.net_to_user).toBe(250)
-
-    expect(firePayoutMock).toHaveBeenCalledTimes(1)
-    const call = (firePayoutMock.mock.calls[0] as any[])[0] as any
-    expect(call.method).toBe('standard')
-    expect(call.amount).toBe(250)
-    expect(call.metadata.gam_entity_id).toBe(u.userId)
-    expect(call.idempotencyKey).toMatch(/^manual_standard_acct_test_/)
-
-    // Audit row in disbursements
-    const { rows } = await db.query<any>(
-      `SELECT * FROM disbursements WHERE id = $1`, [res.body.data.disbursement_id])
-    expect(rows).toHaveLength(1)
-    expect(rows[0].trigger_type).toBe('manual_on_demand')
-    expect(rows[0].status).toBe('processing')
-    expect(rows[0].stripe_payout_id).toBe('po_std_xyz')
-    expect(rows[0].fee_charged).toBe('0.00')
-    expect(rows[0].amount).toBe('250.00')
-  })
-
-  it('happy instant: pulls instant_available, stamps projected fee, net subtracts', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValueOnce({
-      available:         [{ currency: 'usd', amount: 250 }],
-      pending:           [],
-      instant_available: [{ currency: 'usd', amount: 100 }],
-    } as any)
-    firePayoutMock.mockResolvedValueOnce({ id: 'po_inst_xyz' } as any)
-
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({ method: 'instant' })
-    expect(res.status).toBe(201)
-    expect(res.body.data.amount).toBe(100)        // instant_available, not available
-    // S580 (Nic — no pre-pull): all-in fee = max(100*0.02, $5) = $5. The landlord
-    // is paid their NET = 100 − 5 = 95. GAM's margin (5 − 1.50 Stripe-projected =
-    // 3.50) is recorded as OWED and collected at the next disbursement — NOT
-    // transferred here. (Supersedes the old W-32 pre-pull math: net 95.05 + a
-    // $3.50 margin Transfer at withdrawal time.)
-    expect(res.body.data.fee_charged).toBe(5)
-    expect(res.body.data.net_to_user).toBe(95)
-    expect(res.body.data.method).toBe('instant')
-    expect(res.body.data.margin_collection).toBe('next_disbursement')
-
-    const call = (firePayoutMock.mock.calls[0] as any[])[0] as any
-    expect(call.method).toBe('instant')
-    // Payout fires for the NET; NO margin pre-pull Transfer at withdrawal time.
-    expect(call.amount).toBe(95)
-    expect(transfersCreateMock).not.toHaveBeenCalled()
-
-    // The margin is recorded as an `owed` receivable tied to this disbursement.
-    const margin = await db.query<any>(
-      `SELECT amount::text AS amount, status FROM landlord_instant_margins
-        WHERE source_disbursement_id = $1`,
-      [res.body.data.disbursement_id])
-    expect(margin.rows).toHaveLength(1)
-    expect(margin.rows[0].status).toBe('owed')
-    expect(Number(margin.rows[0].amount)).toBe(3.5)
-
-    const { rows } = await db.query<any>(
-      `SELECT amount, fee_charged FROM disbursements WHERE id = $1`,
-      [res.body.data.disbursement_id])
-    expect(rows[0].amount).toBe('100.00')
-    expect(rows[0].fee_charged).toBe('5.00')
-  })
-
-  it('default method (omitted) → standard', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValueOnce({
-      available:         [{ currency: 'usd', amount: 50 }],
-      pending:           [],
-      instant_available: [{ currency: 'usd', amount: 50 }],
-    } as any)
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({})
-    expect(res.status).toBe(201)
-    expect(res.body.data.method).toBe('standard')
-  })
-
-  it('invalid method → 400 (zod)', async () => {
-    const u = await seedUser()
-    const res = await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({ method: 'overnight' })
-    expect(res.status).toBeGreaterThanOrEqual(400)
-    expect(res.status).toBeLessThan(500)
-    expect(firePayoutMock).not.toHaveBeenCalled()
-  })
-
-  it('idempotency key embeds method + connect account id (so double-click within same second dedupes)', async () => {
-    const u = await seedUser()
-    getConnectBalanceMock.mockResolvedValue({
-      available:         [{ currency: 'usd', amount: 100 }],
-      pending:           [],
-      instant_available: [{ currency: 'usd', amount: 100 }],
-    } as any)
-    await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({ method: 'standard' })
-    await request(buildApp())
-      .post('/api/me/withdrawals')
-      .set('Authorization', `Bearer ${u.token}`)
-      .send({ method: 'instant' })
-    const callA = (firePayoutMock.mock.calls[0] as any[])[0] as any
-    const callB = (firePayoutMock.mock.calls[1] as any[])[0] as any
-    expect(callA.idempotencyKey).toMatch(/^manual_standard_/)
-    expect(callB.idempotencyKey).toMatch(/^manual_instant_/)
-    expect(callA.idempotencyKey).not.toBe(callB.idempotencyKey)
-  })
-})
 
 // ═══════════════════════════════════════════════════════════════
 //  GET /me/finances

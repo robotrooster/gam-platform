@@ -121,10 +121,21 @@ export async function fetchAccountStatus(connectAccountId: string): Promise<{
   requirements_currently_due: string[]
   requirements_past_due: string[]
   requirements_disabled_reason: string | null
+  /** S605: the account rent actually pays out to — added during Stripe onboarding. */
+  payout_bank: { bank_name: string | null; last4: string | null } | null
 }> {
   const stripe = getStripe()
   const acct = await stripe.accounts.retrieve(connectAccountId)
+  // S605 (Nic): after finishing Stripe onboarding the landlord had already
+  // given Stripe their bank details, but GAM's Banking page still showed an
+  // empty list and asked them to add an account — so it read as "that didn't
+  // save". Surface the account Stripe is actually paying out to instead of
+  // asking a second time. Stripe never returns the full account number, only
+  // the bank name + last4, which is all we need to display.
+  const ext: any = (acct as any).external_accounts?.data?.find((e: any) => e.object === 'bank_account')
+    ?? (acct as any).external_accounts?.data?.[0]
   return {
+    payout_bank: ext ? { bank_name: ext.bank_name ?? null, last4: ext.last4 ?? null } : null,
     charges_enabled:               !!acct.charges_enabled,
     payouts_enabled:               !!acct.payouts_enabled,
     details_submitted:             !!acct.details_submitted,
@@ -237,6 +248,21 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
     payment_method: opts.paymentMethodId,
     payment_method_types: opts.paymentMethodTypes,
     confirm: true,
+    // S603 (Nic): save the card on THIS authorization instead of spending a
+    // separate one on a SetupIntent. Stripe bills $0.26 per authorization — per
+    // BANK ASK, not per successful payment — so the old "add a card, then pay
+    // later" shape cost two asks to collect one rent. Attaching the card to the
+    // charge the tenant is already making costs nothing extra and still leaves
+    // it on file for autopay.
+    //
+    // Card only: a bank mandate is established by its own ACH/microdeposit
+    // flow, and this would conflict with the mandate_data below.
+    //
+    // Harmless when the card is ALREADY saved — Stripe reaffirms the existing
+    // payment method rather than duplicating it.
+    ...(opts.paymentMethodTypes.includes('card')
+      ? { setup_future_usage: 'off_session' as const }
+      : {}),
     description: `${opts.entryDescription} - Gold Asset Management`,
     metadata: { entry_description: opts.entryDescription, platform_held: 'true', ...(opts.metadata ?? {}) },
     ...(opts.paymentMethodTypes.includes('us_bank_account')
@@ -265,11 +291,12 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
  * GAM charges). When 'landlord', the landlord absorbs the fee (so the
  * application_fee_amount equals what GAM charges them, deducted from gross).
  *
- * Rates (S113 locked; S551 added the card per-transaction dime — single
- * source: PROCESSING_FEES in @gam/shared, mirrored into the
- * platform_processing_rates DB rows by the 20260721150000 migration):
- *   ACH:  1.0% capped at $6.00
- *   Card: 3.25% + $0.26 per transaction (S552 — mirrors the IC+ fixed cost)
+ * Rates — single source: PROCESSING_FEES in @gam/shared, mirrored into the
+ * platform_processing_rates DB rows (latest: 20260812150000):
+ *   ACH:  flat $6.00 at any rent (S601)
+ *   Card: 3.5% + $0.55 per transaction (S603 — the $0.55 covers the REAL
+ *         fixed cost: Stripe $0.26/auth + $0.02 Radar + interchange's own
+ *         fixed leg + amortized authorizations that earn nothing)
  *   Non-US-issued card: +1.5% surcharge passed through to tenant
  *
  * @returns dollar amount (not cents) GAM keeps as application fee

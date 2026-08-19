@@ -83,8 +83,15 @@ export async function processCommissionAccrual(now: Date = new Date()): Promise<
       -- new LLCs; pays a co-owner's captured primary).
       ou.referred_by_user_id AS owner_upline_id,
       up.role                AS owner_upline_role,
+      -- S604: commission is a share of GAM's per-occupied-unit revenue, so the
+      -- count must match what GAM actually BILLS, not merely what is non-vacant.
+      --   • 'owner_use'  — the owner lives there: no lease, no rent, no fee.
+      --   • 'available'  — vacant but listed. Empty is empty; GAM collects
+      --     nothing on it. Counting it (pre-S604) paid reps on units that
+      --     generated no fee, and paid more the WORSE occupancy got.
       (SELECT COUNT(*)::int FROM units u
-        WHERE u.landlord_id = l.id AND u.status <> 'vacant') AS occupied
+        WHERE u.landlord_id = l.id
+          AND u.status NOT IN ('vacant', 'available', 'owner_use')) AS occupied
     FROM landlords l
     JOIN users ou      ON ou.id = l.user_id
     LEFT JOIN users up ON up.id = ou.referred_by_user_id

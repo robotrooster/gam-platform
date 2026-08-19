@@ -48,7 +48,7 @@ export function RegisterPage() {
   const [agreed, setAgreed] = useState(false)
   const [form, setForm] = useState({
     firstName: '', lastName: '', email: '', phone: '',
-    password: '', businessName: '', ein: '',
+    password: '', confirmPassword: '', businessName: '', ein: '',
   })
   // S578: mandatory email-2FA at signup — /auth/register returns a pending
   // session + emails a 6-digit code; we verify it here before the account is
@@ -63,6 +63,9 @@ export function RegisterPage() {
     e.preventDefault()
     if (!agreed) { setErr('Please agree to the terms to continue'); return }
     if (form.password.length < 12) { setErr('Password must be at least 12 characters'); return }
+    // S604 (Nic): confirm the password. A single field meant a typo locked the
+    // landlord out of the account they just created, with no way to notice.
+    if (form.password !== form.confirmPassword) { setErr('Passwords do not match'); return }
     setLoading(true); setErr('')
     try {
       const res = await apiPost<any>('/auth/register', { ...form, role: 'landlord', acceptedTerms: true, referralCode })
@@ -231,6 +234,26 @@ export function RegisterPage() {
                 </button>
               </div>
               <PasswordStrength password={form.password} />
+            </div>
+
+            {/* S604: Confirm password — catches a typo before it becomes a lockout. */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Confirm Password *</label>
+              <input
+                className="input"
+                type={showPw ? 'text' : 'password'}
+                placeholder="Re-enter your password"
+                value={form.confirmPassword}
+                onChange={e => set('confirmPassword', e.target.value)}
+                required
+                style={{ width: '100%' }}
+              />
+              {form.confirmPassword !== '' && form.password !== form.confirmPassword && (
+                <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 5 }}>Passwords do not match</div>
+              )}
+              {form.confirmPassword !== '' && form.password === form.confirmPassword && (
+                <div style={{ color: 'var(--green)', fontSize: '.72rem', marginTop: 5 }}>Passwords match</div>
+              )}
             </div>
 
             {/* Terms */}

@@ -21,6 +21,7 @@ import {
   ACCOUNT_HOLDER_TYPE_VALUES,
   AccountType,
   AccountHolderType,
+  connectRequirementLabels,
 } from '@gam/shared'
 import { loadConnectAndInitialize } from '@stripe/connect-js'
 import type { StripeConnectInstance } from '@stripe/connect-js'
@@ -79,7 +80,7 @@ export function BankingPage() {
       <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
           <Landmark size={22} color="var(--gold)" />
-          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Banking</h1>
+          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Disbursement Account</h1>
         </div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
           Your landlord has enabled direct deposit on your account. Link your
@@ -97,7 +98,7 @@ export function BankingPage() {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Landmark size={22} color="var(--gold)" />
-          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Banking</h1>
+          <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Disbursement Account</h1>
         </div>
         {(
           <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
@@ -112,11 +113,19 @@ export function BankingPage() {
             historical/manual ledger payouts. */}
       <StripeConnectSection />
 
+      {/* S605 (Nic): this list is NOT the payout account and never was — rent
+          pays out through Stripe Connect (jobs/autoPayouts.ts fires
+          stripe.payouts.create against the Connect account; it never reads this
+          table). It exists for advanced multi-owner allocation splits. Sitting
+          directly under a completed Stripe section with an empty state reading
+          "Add one to start routing rent payouts", it looked like the Stripe
+          onboarding hadn't saved and the landlord had to enter their bank a
+          second time. Say plainly that it's optional. */}
       <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 18, lineHeight: 1.5 }}>
-        Bank accounts you've added show up as routing options on each property.
-        Multiple properties can share one account — they collapse into a single
-        Friday disbursement. Routing and account numbers are immutable once saved;
-        to change them, add a new account and archive the old one.
+        <strong style={{ color: 'var(--text-2)' }}>Optional — most landlords never need this.</strong>{' '}
+        Rent already pays out to the account you gave Stripe above. Accounts added here are only
+        for splitting a property's income between multiple owners. Routing and account numbers
+        can't be edited once saved; to change one, add a new account and archive the old one.
       </div>
 
       {isLoading && <div style={{ color: 'var(--text-3)' }}>Loading…</div>}
@@ -127,7 +136,7 @@ export function BankingPage() {
           background: 'var(--bg-1)', border: '1px solid var(--border-0)',
           borderRadius: 12, color: 'var(--text-3)', fontSize: '.85rem'
         }}>
-          No bank accounts yet. Add one to start routing rent payouts.
+          Nothing here, and that's normal — your rent payouts are already set up through Stripe above.
         </div>
       )}
 
@@ -367,6 +376,7 @@ function StripeConnectSection() {
     payoutsEnabled?: boolean
     detailsSubmitted?: boolean
     requirementsCurrentlyDue?: string[]
+    payoutBank?: { bankName: string | null; last4: string | null } | null
   }>(
     ['stripe-connect-status', connectEntity, user?.profileId],
     () => apiGet(`/stripe/connect/status?${connectEntityQS}`),
@@ -414,11 +424,18 @@ function StripeConnectSection() {
     <div className="card" style={{ padding: 16, marginBottom: 18 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
-          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Bank Account</div>
+          {/* S605 (Nic): this said "Bank Account" / "Link your bank account",
+              so landlords expected a routing-number form and were blindsided by
+              Stripe asking for an EIN, a date of birth and an SSN. Naming it
+              honestly up front is the whole fix — "if I don't know how to do
+              what I need to do, that's where the friction lives." */}
+          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Verify your business &amp; get paid</div>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4 }}>
             {ready
-              ? 'Banking ready. Rent collected through GAM deposits to your linked account.'
-              : 'Link your bank account before tenants can pay rent through GAM.'}
+              ? (statusQ.data?.payoutBank?.last4
+                  ? `You're all set. Rent deposits to ${statusQ.data.payoutBank.bankName ?? 'your bank'} ••${statusQ.data.payoutBank.last4}.`
+                  : "You're all set. Rent deposits to the account you gave Stripe.")
+              : 'Required before tenants can pay rent. Stripe (our payments partner) verifies who you are, then you add the account rent gets deposited into.'}
           </div>
         </div>
         <span style={{
@@ -431,15 +448,47 @@ function StripeConnectSection() {
 
       {(statusQ.data?.requirementsCurrentlyDue ?? []).length > 0 && (
         <div style={{ marginTop: 12, padding: 10, background: 'var(--bg-2)', borderRadius: 6, fontSize: '.74rem', color: 'var(--text-2)' }}>
-          <strong style={{ color: 'var(--gold)' }}>Outstanding requirements:</strong>{' '}
-          {(statusQ.data?.requirementsCurrentlyDue ?? []).join(', ')}
+          {/* S605: these were printed as raw Stripe dot-paths
+              ("individual.id_number, business_profile.mcc"), which told a
+              landlord nothing about what to actually go and do. */}
+          <strong style={{ color: 'var(--gold)' }}>Stripe still needs:</strong>
+          <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {connectRequirementLabels(statusQ.data?.requirementsCurrentlyDue ?? [])
+              .map((r: string) => <li key={r} style={{ marginBottom: 2 }}>{r}</li>)}
+          </ul>
         </div>
       )}
 
       {!ready && !showOnboarding && (
         <div style={{ marginTop: 14 }}>
+          {/* Gathering an EIN mid-form is where people abandon. Say what to have
+              to hand BEFORE the form opens. */}
+          <div style={{ padding: 12, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 12 }}>
+            <div style={{ fontSize: '.76rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 6 }}>
+              Have these ready — it takes about 10 minutes:
+            </div>
+            <ul style={{ margin: 0, paddingLeft: 18, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.7 }}>
+              <li>Your business legal name and <strong>EIN</strong> (or your SSN if you operate as an individual)</li>
+              <li>Business address and phone</li>
+              <li>Your date of birth, home address, and the last 4 of your SSN — Stripe verifies a real person is behind the account</li>
+              <li>The <strong>routing and account number</strong> rent should be deposited into</li>
+            </ul>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>
+              Handled by Stripe, not stored by GAM. Usually verified within minutes; occasionally Stripe asks for a photo ID.
+            </div>
+            {/* S605 (Nic): the one moment you leave this page is a small Stripe
+                sign-in window (email + phone + a texted code). It is Stripe's
+                anti-account-takeover step and cannot be turned off for our
+                account type. Saying so up front stops it reading as "the app
+                just threw me somewhere else". */}
+            <div style={{ fontSize: '.72rem', color: 'var(--text-2)', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border-0)' }}>
+              <strong style={{ color: 'var(--text-1)' }}>One quick step first:</strong> Stripe opens a small window asking for
+              your email and phone, then texts you a code. That's just to confirm it's you —
+              after that, the rest of the form happens right here without leaving GAM.
+            </div>
+          </div>
           <button className="btn btn-primary" onClick={startOnboarding}>
-            {statusQ.data?.exists ? 'Continue Setup' : 'Link Bank Account'}
+            {statusQ.data?.exists ? 'Continue verification' : 'Start verification'}
           </button>
           {initErr && (
             <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #dc4c4c)' }}>{initErr}</div>

@@ -75,6 +75,9 @@ beforeEach(async () => {
   await db.query(`DELETE FROM landlord_deposit_interest_rate_overrides`)
   // state_deposit_interest_rates has S188 production seed; isolate at 2099.
   await db.query(`DELETE FROM state_deposit_interest_rates WHERE effective_year=2099`)
+  // S604: same isolation for the market-yield side — a rate left behind by a
+  // prior test silently turns "no rate on file" into "earned something".
+  await db.query(`DELETE FROM deposit_pool_yield_rates WHERE effective_month >= '2099-01-01'`)
   await cleanupAllSchema()
   connectionTokensCreateMock.mockReset()
   terminalReadersCreateMock.mockReset()
@@ -296,6 +299,62 @@ describe('depositInterest', () => {
       expect(r!.annual_rate_pct).toBe(2.5)
     })
 
+    // ── S603: unit-type-specific statutory rates ──────────────────────────
+    // Arizona is the real case, straight from GAM's 50-state corpus: a mobile
+    // home owes 5% (A.R.S. § 33-1431(B)) while an apartment (§ 33-1321) and an
+    // RV long-term space (§ 33-2121) owe NOTHING. One state, three unit types,
+    // two obligations. Resolving on state alone was wrong for two of the three.
+    it('S603: unit-type row beats the blanket row, and non-matching types get the blanket', async () => {
+      const c = await db.connect()
+      let landlordId = ''
+      try {
+        await c.query('BEGIN')
+        const { landlordId: lid } = await seedLandlord(c)
+        landlordId = lid
+        await c.query('COMMIT')
+      } finally { c.release() }
+      // A blanket 1% for the state, plus 5% specifically for mobile homes.
+      await db.query(
+        `INSERT INTO state_deposit_interest_rates
+           (state_code, effective_year, annual_rate_pct, statute_citation, unit_types)
+         VALUES ('XA', 2099, 1.0, 'Blanket § 1', '{}')`)
+      await db.query(
+        `INSERT INTO state_deposit_interest_rates
+           (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+         VALUES ('XA', 2099, 5.0, 'Mobile § 2', ARRAY['mobile_home'], 'mobile_home_park')`)
+
+      const mobile = await resolveRateForLandlord(landlordId, 'XA', 2099, 'mobile_home')
+      expect(mobile!.annual_rate_pct).toBe(5.0)
+      expect(mobile!.act_key).toBe('mobile_home_park')
+
+      // An unlisted type falls through to the blanket rule, not to the 5%.
+      const apt = await resolveRateForLandlord(landlordId, 'XA', 2099, 'apartment')
+      expect(apt!.annual_rate_pct).toBe(1.0)
+    })
+
+    it('S603: a unit-type-only state owes NOTHING on other types (the Arizona shape)', async () => {
+      const c = await db.connect()
+      let landlordId = ''
+      try {
+        await c.query('BEGIN')
+        const { landlordId: lid } = await seedLandlord(c)
+        landlordId = lid
+        await c.query('COMMIT')
+      } finally { c.release() }
+      // Arizona's actual shape: a mobile-home rule and NO blanket rule.
+      await db.query(
+        `INSERT INTO state_deposit_interest_rates
+           (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+         VALUES ('XB', 2099, 5.0, 'A.R.S. § 33-1431(B)', ARRAY['mobile_home'], 'mobile_home_park')`)
+
+      expect((await resolveRateForLandlord(landlordId, 'XB', 2099, 'mobile_home'))!.annual_rate_pct).toBe(5.0)
+      // An apartment or RV space in that state accrues nothing — the whole point.
+      expect(await resolveRateForLandlord(landlordId, 'XB', 2099, 'apartment')).toBeNull()
+      expect(await resolveRateForLandlord(landlordId, 'XB', 2099, 'rv_spot')).toBeNull()
+      // No unit type supplied → only a blanket row could match; there is none.
+      expect(await resolveRateForLandlord(landlordId, 'XB', 2099)).toBeNull()
+    })
+
     it('neither source → null', async () => {
       const c = await db.connect()
       let landlordId = ''
@@ -408,7 +467,9 @@ describe('depositInterest', () => {
       leaseId: string
       landlordId: string
     }
-    async function seedAccrualCtx(opts: { state?: string; collected?: number } = {}): Promise<AccrualCtx> {
+    async function seedAccrualCtx(
+      opts: { state?: string; collected?: number; unitType?: string } = {},
+    ): Promise<AccrualCtx> {
       const c = await db.connect()
       try {
         await c.query('BEGIN')
@@ -420,7 +481,7 @@ describe('depositInterest', () => {
           await c.query(`UPDATE properties SET state=$2 WHERE id=$1`,
             [propertyId, opts.state])
         }
-        const unitId = await seedUnit(c, { propertyId, landlordId })
+        const unitId = await seedUnit(c, { propertyId, landlordId, unitType: opts.unitType })
         const tenantId = await seedTenant(c)
         const leaseId = await seedLease(c, { unitId, landlordId })
         const depositId = await seedSecurityDeposit(c, {
@@ -453,11 +514,384 @@ describe('depositInterest', () => {
       expect(r2.skipped_count).toBe(1)
     })
 
-    it('skips deposit when state has no rate registered', async () => {
+    // S604 REVERSAL (Nic): a state with no statutory rate used to be SKIPPED
+    // entirely. That is the majority of deposits and the bucket where GAM keeps
+    // 100% of the yield, so skipping made GAM's biggest earner invisible. It
+    // now accrues with owed = 0.
+    it('state with no rate still ACCRUES, owing nothing', async () => {
       await seedAccrualCtx({ state: 'WY' })  // no rate seeded for WY/2099
+      const r = await runMonthlyAccrual('2099-01-01')
+      expect(r.accrued_count).toBe(1)
+      expect(r.skipped_count).toBe(0)
+      expect(r.total_interest).toBe(0)
+    })
+
+    it('skips a deposit that was not held during the month', async () => {
+      // The remaining real skip case: nothing to accrue because the deposit
+      // was disbursed before the accrual month began.
+      const ctx = await seedAccrualCtx({ state: 'WY' })
+      await db.query(
+        `UPDATE security_deposits SET disbursed_at = '2098-06-01' WHERE id = $1`,
+        [ctx.depositId])
       const r = await runMonthlyAccrual('2099-01-01')
       expect(r.accrued_count).toBe(0)
       expect(r.skipped_count).toBe(1)
+    })
+
+    // S604: the S603 catalog was unit-type aware but the JOB was not — it
+    // resolved on state alone, so the Arizona mobile-home row (the only reason
+    // the catalog gained a unit-type dimension) could never match and Oak Park
+    // would have accrued $0 forever. These two tests run the REAL Arizona
+    // shape end-to-end through the job, not just the resolver.
+    it('S604: mobile home in a unit-type-only state ACCRUES through the job', async () => {
+      const ctx = await seedAccrualCtx({ state: 'XC', unitType: 'mobile_home', collected: 1000 })
+      await db.query(
+        `INSERT INTO state_deposit_interest_rates
+           (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+         VALUES ('XC', 2099, 5.0, 'A.R.S. § 33-1431(B)', ARRAY['mobile_home'], 'mobile_home_park')`)
+
+      const r = await runMonthlyAccrual('2099-01-01')
+      expect(r.accrued_count).toBe(1)
+      // 1000 * 5% * 31/365 = 4.2466
+      expect(r.total_interest).toBeCloseTo(4.2466, 3)
+
+      // The row records WHY it accrued, not just how much.
+      const { rows: [a] } = await db.query<any>(
+        `SELECT unit_type, act_key, rate_source, annual_rate_pct
+           FROM security_deposit_interest_accruals WHERE security_deposit_id=$1`,
+        [ctx.depositId])
+      expect(a.unit_type).toBe('mobile_home')
+      expect(a.act_key).toBe('mobile_home_park')
+      expect(a.rate_source).toBe('statutory')
+      expect(Number(a.annual_rate_pct)).toBe(5)
+    })
+
+    it('S604: an APARTMENT in that same state is OWED nothing', async () => {
+      const ctx = await seedAccrualCtx({ state: 'XD', unitType: 'apartment', collected: 1000 })
+      await db.query(
+        `INSERT INTO state_deposit_interest_rates
+           (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+         VALUES ('XD', 2099, 5.0, 'A.R.S. § 33-1431(B)', ARRAY['mobile_home'], 'mobile_home_park')`)
+
+      // The unit-type rule must not reach a unit type it does not govern:
+      // § 33-1431(B) is the mobile-home statute; an apartment falls under
+      // § 33-1321 and is owed nothing.
+      const r = await runMonthlyAccrual('2099-01-01')
+      expect(r.total_interest).toBe(0)
+      // It still ACCRUES a row — GAM earns on the principal either way (S604
+      // core model); only the OWED side is zero.
+      expect(r.accrued_count).toBe(1)
+      const { rows: [a] } = await db.query<any>(
+        `SELECT interest_amount, annual_rate_pct, rate_source
+           FROM security_deposit_interest_accruals WHERE security_deposit_id=$1`,
+        [ctx.depositId])
+      expect(Number(a.interest_amount)).toBe(0)
+      expect(Number(a.annual_rate_pct)).toBe(0)
+      expect(a.rate_source).toBeNull()
+      // Nothing is credited to the tenant.
+      const { rows: [d] } = await db.query<any>(
+        `SELECT interest_accrued FROM security_deposits WHERE id=$1`, [ctx.depositId])
+      expect(Number(d.interest_accrued)).toBe(0)
+    })
+
+    // S604 CORE MODEL (Nic): "We earn interest on every held deposit any way we
+    // can. We only pay interest on units or states that require it and only the
+    // amount required. Anything above that is ours to keep."
+    describe('S604 earned vs owed', () => {
+      const seedMarket = (pct: number) => db.query(
+        `INSERT INTO deposit_pool_yield_rates (effective_month, annual_rate_pct, source_label)
+         VALUES ('2099-01-01', $1, '4-week T-bill')
+         ON CONFLICT (effective_month) DO UPDATE SET annual_rate_pct = EXCLUDED.annual_rate_pct`,
+        [pct])
+
+      it('no statute → still accrues, owed 0, GAM keeps the whole yield', async () => {
+        // The majority case, and pre-S604 it produced NO ROW at all — GAM's
+        // largest earning bucket was invisible.
+        const ctx = await seedAccrualCtx({ state: 'WY', collected: 1000 })
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.accrued_count).toBe(1)
+        expect(r.total_interest).toBe(0)                  // owed nothing
+        expect(r.total_earned).toBeCloseTo(3.3973, 3)     // 1000 * 4% * 31/365
+        expect(r.total_spread).toBeCloseTo(3.3973, 3)     // all of it is GAM's
+
+        const { rows: [a] } = await db.query<any>(
+          `SELECT interest_amount, earned_amount, spread_amount, rate_source
+             FROM security_deposit_interest_accruals WHERE security_deposit_id=$1`,
+          [ctx.depositId])
+        expect(Number(a.interest_amount)).toBe(0)
+        expect(a.rate_source).toBeNull()
+        // The tenant is credited nothing; interest_accrued stays 0.
+        const { rows: [d] } = await db.query<any>(
+          `SELECT interest_accrued FROM security_deposits WHERE id=$1`, [ctx.depositId])
+        expect(Number(d.interest_accrued)).toBe(0)
+      })
+
+      it('statute below market → GAM keeps only the excess', async () => {
+        await seedAccrualCtx({ state: 'XE', unitType: 'mobile_home', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+           VALUES ('XE', 2099, 1.0, 'Some § 1', ARRAY['mobile_home'], 'mobile_home_park')`)
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBeCloseTo(0.8493, 3)  // owed at 1%
+        expect(r.total_earned).toBeCloseTo(3.3973, 3)    // earned at 4%
+        expect(r.total_spread).toBeCloseTo(2.5479, 3)    // the 3% difference
+      })
+
+      it('statute ABOVE market → spread is NEGATIVE, not clamped', async () => {
+        // Arizona's real shape: a 5% mobile-home statute against a ~4% T-bill.
+        // GAM funds the shortfall, and that is exactly what must be visible.
+        await seedAccrualCtx({ state: 'XF', unitType: 'mobile_home', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+           VALUES ('XF', 2099, 5.0, 'A.R.S. § 33-1431(B)', ARRAY['mobile_home'], 'mobile_home_park')`)
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_spread).toBeLessThan(0)
+        expect(r.total_spread).toBeCloseTo(-0.8493, 3)   // 1% shortfall
+      })
+
+      it('tenant-facing history NEVER exposes earned / market rate / spread', async () => {
+        // GAM's margin on the tenant's own money. Same boundary S603 drew when
+        // calcNetPerUnit leaked to landlords.
+        const ctx = await seedAccrualCtx({ state: 'WY', collected: 1000 })
+        await seedMarket(4.0)
+        await runMonthlyAccrual('2099-01-01')
+
+        const history = await getAccrualHistory(ctx.depositId)
+        expect(history).toHaveLength(1)
+        for (const key of ['earned_amount', 'market_rate_pct', 'spread_amount']) {
+          expect(history[0]).not.toHaveProperty(key)
+        }
+      })
+
+      // S604: not every statute is a flat rate. Encoding MA's lesser-of rule as
+      // a flat 5% was costing more than the harshest statute in the catalog.
+      it('lesser_of_actual (MA shape): owed is capped at what was EARNED', async () => {
+        const ctx = await seedAccrualCtx({ state: 'XH', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis)
+           VALUES ('XH', 2099, 5.0, 'G.L. c. 186 § 15B', '{}', 'lesser_of_actual')`)
+        await seedMarket(3.0)   // statute says 5%, bank paid 3%
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        // Pays 3%, not 5% — "or such lesser amount as has been received".
+        expect(r.total_interest).toBeCloseTo(2.5479, 3)
+        expect(r.total_earned).toBeCloseTo(2.5479, 3)
+        expect(r.total_spread).toBeCloseTo(0, 4)   // exactly break-even, never negative
+        const { rows: [a] } = await db.query<any>(
+          `SELECT rate_basis, annual_rate_pct FROM security_deposit_interest_accruals
+            WHERE security_deposit_id=$1`, [ctx.depositId])
+        // Statutory headline preserved; basis explains why the amount differs.
+        expect(a.rate_basis).toBe('lesser_of_actual')
+        expect(Number(a.annual_rate_pct)).toBe(5)
+      })
+
+      it('lesser_of_actual: when market BEATS the statute, tenant gets the statute', async () => {
+        await seedAccrualCtx({ state: 'XI', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis)
+           VALUES ('XI', 2099, 3.0, 'G.L. c. 186 § 15B', '{}', 'lesser_of_actual')`)
+        await seedMarket(5.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBeCloseTo(2.5479, 3)   // the 3% statute
+        expect(r.total_earned).toBeCloseTo(4.2466, 3)     // earned 5%
+        expect(r.total_spread).toBeGreaterThan(0)         // GAM keeps the excess
+      })
+
+      it('share_of_actual (FL shape): tenant gets 75% of earnings, GAM keeps 25%', async () => {
+        await seedAccrualCtx({ state: 'XJ', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, actual_share_pct)
+           VALUES ('XJ', 2099, 5.0, 'Fla. Stat. § 83.49', '{}', 'share_of_actual', 75.0)`)
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_earned).toBeCloseTo(3.3973, 3)
+        expect(r.total_interest).toBeCloseTo(3.3973 * 0.75, 3)
+        // Structurally positive: 25% of whatever is earned, at any rate level.
+        expect(r.total_spread).toBeCloseTo(3.3973 * 0.25, 3)
+        expect(r.total_spread).toBeGreaterThan(0)
+      })
+
+      it('actual_earned (ND/NH shape): whole yield passes through, spread 0', async () => {
+        await seedAccrualCtx({ state: 'XK', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis)
+           VALUES ('XK', 2099, 0, 'N.D.C.C. § 47-16-07.1', '{}', 'actual_earned')`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_earned).toBeCloseTo(3.3973, 3)
+        expect(r.total_interest).toBeCloseTo(3.3973, 3)
+        expect(r.total_spread).toBeCloseTo(0, 4)
+      })
+
+      it('actual_minus_admin (NY/PA shape): GAM keeps the 1% administrative retention', async () => {
+        await seedAccrualCtx({ state: 'XL', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, admin_retention_pct)
+           VALUES ('XL', 2099, 0, 'N.Y. Gen. Oblig. § 7-103', '{}', 'actual_minus_admin', 1.0)`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        // earned 4% of 1000 for 31 days; landlord retains 1%/yr of principal.
+        const earned = 1000 * 0.04 * 31 / 365
+        const admin  = 1000 * 0.01 * 31 / 365
+        expect(r.total_earned).toBeCloseTo(earned, 3)
+        expect(r.total_interest).toBeCloseTo(earned - admin, 3)
+        expect(r.total_spread).toBeCloseTo(admin, 3)
+      })
+
+      it("'none' is a VERIFIED negative — owes zero even with a rate row present", async () => {
+        // Distinct from "no row": records that someone read the statute and it
+        // owes nothing (CA/IA/KS/NV mobile home, VA).
+        await seedAccrualCtx({ state: 'XM', unitType: 'mobile_home', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis)
+           VALUES ('XM', 2099, 0, 'Cal. Civ. Code § 798.39(f)', ARRAY['mobile_home'], 'none')`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBe(0)
+        expect(r.total_spread).toBeCloseTo(3.3973, 3)   // all GAM's
+      })
+
+    it('TENURE GATE (IA 5yr / NH 1yr / PA 2yr): owes nothing before the gate', async () => {
+        const ctx = await seedAccrualCtx({ state: 'XN', collected: 1000 })
+        // Funded weeks before the accrual month → ~0 months held vs a 12-month
+        // gate. (funded_at falls back to security_deposits.created_at.)
+        await db.query(
+          `UPDATE security_deposits SET created_at = '2098-12-20' WHERE id = $1`,
+          [ctx.depositId])
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, min_tenure_months)
+           VALUES ('XN', 2099, 0, 'N.H. RSA 540-A:6', '{}', 'actual_earned', 12)`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBe(0)
+        expect(r.total_spread).toBeCloseTo(3.3973, 3)   // GAM keeps it pre-gate
+      })
+
+      it('TENURE GATE: the obligation switches on once the gate is passed', async () => {
+        const ctx = await seedAccrualCtx({ state: 'XP', collected: 1000 })
+        // Held two years before the accrual month — past a 12-month gate.
+        await db.query(
+          `UPDATE security_deposits SET created_at = '2097-01-01' WHERE id = $1`,
+          [ctx.depositId])
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, min_tenure_months)
+           VALUES ('XP', 2099, 0, 'N.H. RSA 540-A:6', '{}', 'actual_earned', 12)`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBeCloseTo(3.3973, 3)
+        expect(r.total_spread).toBeCloseTo(0, 4)
+      })
+
+      it('SIZE GATE (IL 25+ homes): a small park owes nothing', async () => {
+        // seedAccrualCtx creates ONE unit, well under a 25-unit threshold.
+        await seedAccrualCtx({ state: 'XO', unitType: 'mobile_home', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, min_property_units)
+           VALUES ('XO', 2099, 3.0, '765 ILCS 745/18', ARRAY['mobile_home'], 'fixed', 25)`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBe(0)
+        expect(r.total_spread).toBeCloseTo(3.3973, 3)
+      })
+
+      // S604: two states condition the obligation on deposit SIZE, in opposite
+      // ways. Collapsing them to one flat rate overpays Ohio ~5x and underpays
+      // New Mexico.
+      it('excess_only (OH § 5321.16): interest runs on the EXCESS only', async () => {
+        // seedAccrualCtx seeds rent_amount = 1000. Deposit 1500 → threshold is
+        // max($50, 1 month rent = 1000) = 1000 → only 500 earns.
+        await seedAccrualCtx({ state: 'XQ', collected: 1500 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, threshold_rule, threshold_amount,
+              threshold_months_rent)
+           VALUES ('XQ', 2099, 5.0, 'Ohio Rev. Code § 5321.16', '{}', 'fixed',
+                   'excess_only', 50.00, 1.00)`)
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        // owed: 500 * 5% * 31/365 = 2.1233   (NOT 1500 * 5% = 6.37)
+        expect(r.total_interest).toBeCloseTo(2.1233, 3)
+        // earned is on the WHOLE 1500 — GAM holds every dollar regardless.
+        expect(r.total_earned).toBeCloseTo(1500 * 0.04 * 31 / 365, 3)
+      })
+
+      it('excess_only: a deposit at or below the threshold owes NOTHING', async () => {
+        await seedAccrualCtx({ state: 'XR', collected: 900 })   // < 1 month rent
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, threshold_rule, threshold_amount,
+              threshold_months_rent)
+           VALUES ('XR', 2099, 5.0, 'Ohio Rev. Code § 5321.16', '{}', 'fixed',
+                   'excess_only', 50.00, 1.00)`)
+        await seedMarket(4.0)
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBe(0)
+        expect(r.total_spread).toBeGreaterThan(0)   // all GAM's
+      })
+
+      it('trigger (NM § 47-8-18): above the threshold the WHOLE deposit earns', async () => {
+        await seedAccrualCtx({ state: 'XS', collected: 1500 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation,
+              unit_types, rate_basis, threshold_rule, threshold_months_rent)
+           VALUES ('XS', 2099, 2.0, 'N.M. Stat. § 47-8-18', '{}', 'index_linked',
+                   'trigger', 1.00)`)
+        await seedMarket(4.0)
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        // Whole 1500 earns at 2% — not just the 500 above one month's rent.
+        expect(r.total_interest).toBeCloseTo(1500 * 0.02 * 31 / 365, 3)
+      })
+
+      it('no market rate on file → earned/spread stay null, owed still accrues', async () => {
+        await seedAccrualCtx({ state: 'XG', unitType: 'mobile_home', collected: 1000 })
+        await db.query(
+          `INSERT INTO state_deposit_interest_rates
+             (state_code, effective_year, annual_rate_pct, statute_citation, unit_types, act_key)
+           VALUES ('XG', 2099, 5.0, 'Some § 1', ARRAY['mobile_home'], 'mobile_home_park')`)
+        // deliberately no deposit_pool_yield_rates row
+
+        const r = await runMonthlyAccrual('2099-01-01')
+        expect(r.total_interest).toBeGreaterThan(0)
+        expect(r.total_earned).toBe(0)
+        // Null, not zero — "we don't know yet" must not read as "earned nothing".
+        const { rows: [a] } = await db.query<any>(
+          `SELECT earned_amount, spread_amount FROM security_deposit_interest_accruals LIMIT 1`)
+        expect(a.earned_amount).toBeNull()
+        expect(a.spread_amount).toBeNull()
+      })
     })
 
     it('getAccrualHistory: returns rows ordered by accrual_month ASC', async () => {

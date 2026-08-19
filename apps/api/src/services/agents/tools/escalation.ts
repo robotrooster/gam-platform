@@ -9,7 +9,7 @@
  *
  *   escalate          — entry agent (Ava/David) hands up to the senior
  *                       agent (Samantha/Sonny).
- *   escalate_to_human — senior agent hands to a human GAM specialist.
+ *   escalate_to_human — senior agent hands to a human GAM Strategist.
  *
  * Each takes a `reason` and a `summary` of what the customer needs and
  * what's been tried, so the next handler never makes them repeat.
@@ -61,7 +61,7 @@ export const escalate: AgentTool = {
 export const escalateToHuman: AgentTool = {
   name: 'escalate_to_human',
   description:
-    'Hand this conversation to a human GAM support specialist. Use for the hard stops you cannot ' +
+    'Hand this conversation to a human GAM Strategist. Use for the hard stops you cannot ' +
     'resolve: moving/refunding/adjusting money, account security or access/permission changes, a ' +
     'legal question or formal dispute, or anything you cannot ground or resolve. Provide the reason ' +
     'and a clear summary of the situation and what has been confirmed.',

@@ -6,7 +6,7 @@ Two-factor authentication (2FA) adds a one-time code to your sign-in, so a stole
 
 ## Setting it up
 
-Enrollment starts from the Security area of your portal. You'll see three steps:
+Enrollment starts from your account's security settings (under **Profile** if you're a tenant, or **Settings** if you're a landlord). You'll see three steps:
 
 1. **Scan the QR code** with any authenticator app — Google Authenticator, Authy, 1Password, and Bitwarden all work. If you can't scan, there's a link to add the account manually.
 2. **Save your recovery codes.** You get 10 one-time codes, shown only once — they are not retrievable later. Store them somewhere safe, like a password manager. You'll confirm you've saved them before you can finish.
@@ -24,4 +24,4 @@ If you've lost both your authenticator app and your recovery codes, there is no 
 
 ## Turning it off
 
-You can disable 2FA any time from the Security page. You'll need to re-enter your password to confirm — that's deliberate, so a stolen session can't quietly remove your second factor.
+You can disable 2FA any time from your account's security settings. You'll need to re-enter your password to confirm — that's deliberate, so a stolen session can't quietly remove your second factor.

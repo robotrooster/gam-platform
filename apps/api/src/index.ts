@@ -111,7 +111,6 @@ import { notificationsRouter } from './routes/notifications'
 import { bankAccountsRouter } from './routes/bankAccounts'
 import { adminBankAccountsRouter } from './routes/admin/bankAccounts'
 import { financesRouter }      from './routes/finances'
-import { withdrawalsRouter }   from './routes/withdrawals'
 import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
 
@@ -207,6 +206,9 @@ app.use(cors({
 
 // Stripe webhooks need raw body — must be before express.json()
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }))
+// S605: Resend delivery webhooks are Svix-signed over the RAW body — parsing it
+// as JSON first would change the bytes and every signature check would fail.
+app.use('/webhooks/resend', express.raw({ type: 'application/json' }))
 
 // S422: background-check provider webhooks (Checkr, etc.) also need
 // raw body for HMAC verification. The provider's HMAC is computed
@@ -220,10 +222,13 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
 // Record per-request latency for the super-admin Scaling Readiness panel (p95).
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   const start = process.hrtime.bigint()
   res.on('finish', () => {
-    recordLatency(Number(process.hrtime.bigint() - start) / 1e6)
+    // S605: pass the path so externally-bound routes (vendor APIs, LLM
+    // inference, Checkr) are excluded — they measure someone else's latency,
+    // not whether the Mac is struggling. See lib/apiMetrics.ts.
+    recordLatency(Number(process.hrtime.bigint() - start) / 1e6, req.path)
   })
   next()
 })
@@ -370,7 +375,6 @@ app.use('/api/notifications',  notificationsRouter)
 app.use('/api/bank-accounts',  bankAccountsRouter)
 app.use('/api/admin',          adminBankAccountsRouter)
 app.use('/api/users',          financesRouter)
-app.use('/api/users',          withdrawalsRouter)
 app.use('/api/books',          booksRouter)
 app.use('/api/scopes',         scopesRouter)
 app.use('/api/invitations',    invitationsRouter)

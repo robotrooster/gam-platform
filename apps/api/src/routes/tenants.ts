@@ -649,6 +649,7 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
       status:             string
       held_by:            string
       state:              string | null
+      unit_type:          string | null
       property_name:      string | null
       created_at:         string
     }>(
@@ -657,7 +658,7 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
               sd.collected_amount::text AS collected_amount,
               sd.interest_accrued::text AS interest_accrued,
               sd.status, sd.held_by,
-              p.state, p.name AS property_name,
+              p.state, u.unit_type, p.name AS property_name,
               sd.created_at::text AS created_at
          FROM security_deposits sd
          JOIN leases    l ON l.id = sd.lease_id
@@ -673,10 +674,17 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
       return res.json({ success: true, data: { deposit: null, rate: null, accruals: [] } })
     }
 
-    // Look up the effective rate for the deposit's state and the
+    // Look up the effective rate for the deposit's state, UNIT TYPE, and the
     // current accrual year. Statutory catalog wins; falls back to the
     // landlord's S190 override for variable-rate states. Returns null
     // if neither has a rate — tenant sees principal-only.
+    //
+    // S604: this used to run its OWN state-only `LIMIT 1` lookup. Once the
+    // S603 catalog became unit-type specific that read the wrong row: an
+    // Arizona APARTMENT tenant was shown 5.0000% citing A.R.S. § 33-1431(B),
+    // the MOBILE HOME statute, for interest they are owed none of — and it
+    // disagreed with what the accrual engine actually booked. There is one
+    // resolver now; the tenant is quoted the same rule that accrues.
     const currentYear = new Date().getUTCFullYear()
     let rate: {
       source:           'statutory' | 'landlord_override'
@@ -688,55 +696,23 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
     } | null = null
 
     if (deposit.state) {
-      const statutory = await queryOne<{
-        state_code:       string
-        effective_year:   number
-        annual_rate_pct:  string
-        statute_citation: string
-        notes:            string | null
-      }>(
-        `SELECT state_code, effective_year,
-                annual_rate_pct::text AS annual_rate_pct,
-                statute_citation, notes
-           FROM state_deposit_interest_rates
-          WHERE state_code = $1 AND effective_year = $2
-          LIMIT 1`,
-        [deposit.state, currentYear],
+      const landlordRow = await queryOne<{ landlord_id: string }>(
+        `SELECT l.landlord_id FROM leases l WHERE l.id = $1`,
+        [deposit.lease_id],
       )
-
-      if (statutory) {
-        rate = { ...statutory, source: 'statutory' }
-      } else {
-        // Fall back to landlord override. Need landlord_id from the
-        // deposit's lease.
-        const landlordRow = await queryOne<{ landlord_id: string }>(
-          `SELECT l.landlord_id FROM leases l WHERE l.id = $1`,
-          [deposit.lease_id],
+      if (landlordRow) {
+        const { resolveRateForLandlord } = await import('../services/depositInterest')
+        const resolved = await resolveRateForLandlord(
+          landlordRow.landlord_id, deposit.state, currentYear, deposit.unit_type,
         )
-        if (landlordRow) {
-          const override = await queryOne<{
-            state_code:      string
-            effective_year:  number
-            annual_rate_pct: string
-            source_notes:    string | null
-          }>(
-            `SELECT state_code, effective_year,
-                    annual_rate_pct::text AS annual_rate_pct,
-                    source_notes
-               FROM landlord_deposit_interest_rate_overrides
-              WHERE landlord_id = $1 AND state_code = $2 AND effective_year = $3
-              LIMIT 1`,
-            [landlordRow.landlord_id, deposit.state, currentYear],
-          )
-          if (override) {
-            rate = {
-              source:           'landlord_override',
-              state_code:       override.state_code,
-              effective_year:   override.effective_year,
-              annual_rate_pct:  override.annual_rate_pct,
-              statute_citation: null,  // overrides don't carry statute text
-              notes:            override.source_notes,
-            }
+        if (resolved) {
+          rate = {
+            source:           resolved.source,
+            state_code:       resolved.state_code,
+            effective_year:   resolved.effective_year,
+            annual_rate_pct:  resolved.annual_rate_pct.toFixed(4),
+            statute_citation: resolved.statute_citation ?? null,
+            notes:            resolved.notes ?? null,
           }
         }
       }
@@ -1633,8 +1609,23 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         [inviteLandlordId, tenantId, inviterPropertyId])
     }
 
-    // Unit assignment happens via e-sign, not invite. Landlord sends lease
-    // through /api/esign once the tenant account exists.
+    // S605 (Nic): remember the unit this invite was for. The lease itself is
+    // still created through e-sign — but without this row nothing knew WHO was
+    // waiting on WHICH unit, so a landlord who invited before setting a lease
+    // template could never have the draft catch up. Setting the default template
+    // for a unit type now refires drafting for every unit still waiting.
+    //
+    // household_order preserves who was invited first: the primary resident
+    // holds the lease, co-tenants follow.
+    if (unitId && tenantId) {
+      const seq = await queryOne<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM pending_lease_drafts WHERE unit_id = $1`, [unitId])
+      await query(
+        `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (unit_id, tenant_user_id) DO NOTHING`,
+        [inviteLandlordId, unitId, user!.id, Number(seq?.n ?? 0)])
+    }
 
     // S410 (S377): store on the purpose-scoped column with a 7-day
     // expiry. Pre-S410 this wrote to email_verify_token (which was

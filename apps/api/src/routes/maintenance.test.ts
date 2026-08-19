@@ -371,10 +371,12 @@ describe('PATCH /maintenance/:id — auto-approval threshold gate', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ status: 'completed', actualCost: 500 })
     expect(res.status).toBe(200)
-    // Fee is computed off the shared constant (deferred contractor-marketplace
-    // rate) — pin it to the single source so an accidental rate drift is caught.
-    expect(Number(res.body.data.platform_fee)).toBeCloseTo(500 * PLATFORM_FEES.MAINTENANCE_PCT, 2)
-    expect(Number(res.body.data.platform_fee)).toBeGreaterThan(0)
+    // S603 (Nic): GAM takes NOTHING on maintenance. In-house work by the
+    // landlord's own staff must never accrue a fee — the 5% MAINTENANCE_PCT is
+    // reserved for the DEFERRED contractor-bid marketplace (brokering an OUTSIDE
+    // contractor), which does not exist. Completing a $500 job must leave the
+    // fee empty, not stamp $25 of phantom revenue on it.
+    expect(res.body.data.platform_fee).toBeNull()
   })
 
   it('rejects when caller is from another landlord', async () => {
@@ -872,5 +874,191 @@ describe('POST/GET /maintenance/:id/media', () => {
       .delete(`/api/maintenance/${reqId}/media/whatever`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(404)
+  })
+})
+
+// ── S603: property-scope enforcement for team roles ────────────────────────
+// Pre-S603, GET /maintenance and GET /maintenance/:id filtered team-role callers
+// by landlord_id ALONE. canAccessLandlordResource proves org membership but
+// carries NO property scope, so a maintenance worker assigned to one property
+// could list every request across the landlord's whole portfolio — tenant names
+// included — and read any single one by id. Sibling surfaces (units, inspections,
+// bookings, utility, balances) already used getScopedPropertyIds; maintenance was
+// missed by that sweep.
+describe('maintenance property-scope (S603)', () => {
+  async function seedScopedWorker(landlordId: string, propertyIds: string[]) {
+    const userId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, first_name, last_name, role)
+       VALUES ($1, $2, 'x', 'Scoped', 'Worker', 'maintenance')`,
+      [userId, `worker-${userId}@test.dev`])
+    await db.query(
+      `INSERT INTO maintenance_worker_scopes
+         (user_id, landlord_id, property_ids, unit_ids, job_categories, all_properties)
+       VALUES ($1, $2, $3, '{}', '{}', false)`,
+      [userId, landlordId, propertyIds])
+    return jwt.sign(
+      { userId, role: 'maintenance', email: 'w@test.dev', profileId: userId,
+        landlordId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+  }
+
+  async function seedReqOn(landlordId: string, unitId: string, tenantId: string, title: string) {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO maintenance_requests
+         (unit_id, tenant_id, landlord_id, title, description, priority, status)
+       VALUES ($1,$2,$3,$4,'desc','normal','open') RETURNING id`,
+      [unitId, tenantId, landlordId, title])
+    return r.rows[0].id
+  }
+
+  it('LIST: a worker scoped to one property sees only that property\'s requests', async () => {
+    // Same landlord, two properties — the in-org leak, not a cross-landlord one.
+    const f = await seedFixture()
+    const client = await db.connect()
+    let otherUnitId = ''
+    try {
+      const otherProp = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      otherUnitId = await seedUnit(client, { propertyId: otherProp, landlordId: f.landlordId })
+    } finally { client.release() }
+
+    await seedReqOn(f.landlordId, f.unitId, f.tenantId, 'IN SCOPE')
+    await seedReqOn(f.landlordId, otherUnitId, f.tenantId, 'OUT OF SCOPE')
+
+    const token = await seedScopedWorker(f.landlordId, [f.propertyId])
+    const res = await request(buildApp())
+      .get('/api/maintenance').set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    const titles = res.body.data.map((r: any) => r.title)
+    expect(titles).toContain('IN SCOPE')
+    expect(titles).not.toContain('OUT OF SCOPE')
+  })
+
+  it('DETAIL: reading an out-of-scope request by id is refused', async () => {
+    const f = await seedFixture()
+    const client = await db.connect()
+    let otherUnitId = ''
+    try {
+      const otherProp = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      otherUnitId = await seedUnit(client, { propertyId: otherProp, landlordId: f.landlordId })
+    } finally { client.release() }
+
+    const outOfScopeId = await seedReqOn(f.landlordId, otherUnitId, f.tenantId, 'OUT OF SCOPE')
+    const token = await seedScopedWorker(f.landlordId, [f.propertyId])
+    const res = await request(buildApp())
+      .get(`/api/maintenance/${outOfScopeId}`).set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('all_properties=true worker is unrestricted (scope returns null)', async () => {
+    const f = await seedFixture()
+    await seedReqOn(f.landlordId, f.unitId, f.tenantId, 'ANY')
+    const userId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, first_name, last_name, role)
+       VALUES ($1, $2, 'x', 'All', 'Worker', 'maintenance')`,
+      [userId, `allworker-${userId}@test.dev`])
+    await db.query(
+      `INSERT INTO maintenance_worker_scopes
+         (user_id, landlord_id, property_ids, unit_ids, job_categories, all_properties)
+       VALUES ($1, $2, '{}', '{}', '{}', true)`,
+      [userId, f.landlordId])
+    const token = jwt.sign(
+      { userId, role: 'maintenance', email: 'aw@test.dev', profileId: userId,
+        landlordId: f.landlordId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp())
+      .get('/api/maintenance').set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((r: any) => r.title)).toContain('ANY')
+  })
+})
+
+// ── S603: internal columns must never reach a tenant ───────────────────────
+// GET /maintenance and /:id both SELECT mr.*, which handed tenants the
+// landlord's repair economics (estimated_cost / actual_cost), internal
+// landlord_notes, and platform_fee — GAM's own maintenance margin, which is
+// reserved for the future contractor marketplace and surfaced nowhere. The
+// is_internal COMMENT filter already existed; the COLUMNS were missed.
+describe('maintenance internal-field redaction (S603)', () => {
+  const HIDDEN = ['estimated_cost', 'actual_cost', 'platform_fee', 'landlord_notes']
+
+  async function seedPricedRequest(f: any): Promise<string> {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO maintenance_requests
+         (unit_id, tenant_id, landlord_id, title, description, priority, status,
+          estimated_cost, actual_cost, platform_fee, landlord_notes)
+       VALUES ($1,$2,$3,'Leak','desc','normal','awaiting_approval',
+               900, 850, 68, 'Internal: get a second quote')
+       RETURNING id`,
+      [f.unitId, f.tenantId, f.landlordId])
+    return r.rows[0].id
+  }
+
+  it('LIST: tenant response omits every internal field', async () => {
+    const f = await seedFixture()
+    await seedPricedRequest(f)
+    const res = await request(buildApp())
+      .get('/api/maintenance').set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.length).toBeGreaterThan(0)
+    for (const row of res.body.data) {
+      for (const field of HIDDEN) expect(row).not.toHaveProperty(field)
+    }
+  })
+
+  it('DETAIL: tenant response omits every internal field', async () => {
+    const f = await seedFixture()
+    const id = await seedPricedRequest(f)
+    const res = await request(buildApp())
+      .get(`/api/maintenance/${id}`).set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    for (const field of HIDDEN) expect(res.body.data).not.toHaveProperty(field)
+    // The tenant still sees the request itself, incl. that it's awaiting a call.
+    expect(res.body.data.status).toBe('awaiting_approval')
+  })
+
+  it('LANDLORD still receives the internal fields (redaction is tenant-only)', async () => {
+    const f = await seedFixture()
+    const id = await seedPricedRequest(f)
+    const res = await request(buildApp())
+      .get(`/api/maintenance/${id}`).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.estimated_cost)).toBe(900)
+    expect(res.body.data.landlord_notes).toBe('Internal: get a second quote')
+  })
+})
+
+
+// S605 (Nic): the same list serves the portfolio-wide screen and a single
+// property's Maintenance tab — "each screen answers a different question.
+// Nothing moves."
+describe('S605 property-scoped maintenance list', () => {
+  it('?propertyId returns only that property’s requests', async () => {
+    const f = await seedFixture()
+    const app = buildApp()
+    const all = await request(app).get('/api/maintenance')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    const scoped = await request(app).get(`/api/maintenance?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(scoped.status).toBe(200)
+    // Everything returned belongs to a unit at that property.
+    for (const r of scoped.body.data as any[]) {
+      const { rows } = await db.query<any>(
+        `SELECT property_id FROM units WHERE id = $1`, [r.unitId ?? r.unit_id])
+      if (rows[0]) expect(rows[0].property_id).toBe(f.propertyId)
+    }
+    expect((scoped.body.data as any[]).length).toBeLessThanOrEqual((all.body.data as any[]).length)
+  })
+
+  it('a property with no requests returns none of them', async () => {
+    const f = await seedFixture()
+    const other = '00000000-0000-0000-0000-0000000000ff'
+    const res = await request(buildApp()).get(`/api/maintenance?propertyId=${other}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
   })
 })

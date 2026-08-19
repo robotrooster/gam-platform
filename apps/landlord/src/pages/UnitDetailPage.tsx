@@ -713,18 +713,40 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' })
 
+  // S605 (Nic hit this): the picker hides utilities the unit already has, so on
+  // a unit with an electric submeter the only option is Water — but the draft
+  // still held 'electric' from its initial state. A <select> whose value matches
+  // no option DISPLAYS the first one while keeping the old value, so the form
+  // showed "water" and submitted "electric". That then failed the
+  // double-billing guard (the unit already has an electric submeter) with an
+  // error that made no sense against what was on screen.
+  //
+  // Derive the options once and force the draft onto a valid one whenever the
+  // list changes, so what's displayed is always what gets sent.
+  const availableTypes = (['electric', 'water'] as const)
+    .filter(t => !mine.some((m: any) => m.utilityType === t))
+  useEffect(() => {
+    if (availableTypes.length && !availableTypes.includes(draft.utilityType as any)) {
+      setDraft(d => ({ ...d, utilityType: availableTypes[0] }))
+    }
+  }, [availableTypes.join(','), draft.utilityType])
+
+  const [baselineFor, setBaselineFor] = useState<any | null>(null)
   const invalidate = () => qc.invalidateQueries(['utility-meters', propertyId])
   const addMut = useMutation(
     async () => {
-      const r: any = await apiPost('/utility/meters', {
+      // S605: ONE call. This was create-then-assign, and when the assign was
+      // refused the meter had already been created and stayed behind as an
+      // orphan — Oak Park collected three before anyone noticed.
+      await apiPost('/utility/meters', {
         propertyId, utilityType: draft.utilityType,
         label: `${unitNumber} ${draft.utilityType}`,
         billingMethod: 'submeter',
         ratePerUnit: draft.rate === '' ? null : Number(draft.rate),
         baseFee: 0, digits: Number(draft.digits) || 6,
         ...(draft.utilityType === 'water' && draft.sewerRate !== '' ? { sewerRatePerUnit: Number(draft.sewerRate) } : {}),
+        assignUnitId: unitId,
       })
-      await apiPost(`/utility/meters/${r.data.id}/units`, { unitId })
     },
     { onSuccess: () => { invalidate(); setAdding(false); setDraft({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' }) },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not add meter') }
@@ -755,14 +777,34 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
             {m.utilityType === 'water' && m.sewerRatePerUnit != null && ` + sewer $${Number(m.sewerRatePerUnit)}/unit`}
           </span>
           <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{m.lastReadingCycle ? `last read ${String(m.lastReadingCycle).slice(0, 7)}` : 'never read'}</span>
+          {/* S605 (Nic): the opening read can always be added LATER — what
+              matters is that it lands before the cycle is billed. Surfaced here
+              as well as on the Utilities page because a landlord setting up a
+              unit works from this screen and would otherwise never see it. */}
+          {m.hasBaseline === false && (
+            <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)', padding: '2px 8px' }}
+              title="This meter has no opening read, so it cannot bill its first cycle"
+              onClick={() => setBaselineFor(m)}>
+              ⚠ add opening read
+            </button>
+          )}
           <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
             onClick={() => { appConfirm(`Remove the ${m.utilityType} meter? Its readings go with it.`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) delMut.mutate(m.id) }) }}>Remove</button>
         </div>
       ))}
-      {adding && (
+      {baselineFor && (
+        <OpeningReadModal meter={baselineFor} onClose={() => setBaselineFor(null)} onSaved={() => { invalidate(); setBaselineFor(null) }} />
+      )}
+      {adding && availableTypes.length === 0 && (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
+          This unit already has a submeter for every utility GAM meters (electric and water).
+          Remove one above to replace it.
+        </div>
+      )}
+      {adding && availableTypes.length > 0 && (
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
           <select className="input" value={draft.utilityType} onChange={e => setDraft(d => ({ ...d, utilityType: e.target.value }))} style={{ width: 120 }}>
-            {['electric', 'water'].filter(t => !mine.some((m: any) => m.utilityType === t)).map(t => <option key={t} value={t}>{ICONS[t]} {t}</option>)}
+            {availableTypes.map(t => <option key={t} value={t}>{ICONS[t]} {t}</option>)}
           </select>
           <input className="input" type="text" inputMode="decimal" placeholder="$/unit e.g. 0.14" value={draft.rate}
             onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, rate: v })) }} style={{ width: 140 }} />
@@ -776,6 +818,60 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
           <button className="btn btn-primary btn-sm" disabled={addMut.isLoading} onClick={() => addMut.mutate()}>Add</button>
         </div>
       )}
+    </div>
+  )
+}
+
+// S605 (Nic): "make sure that if we don't have an opening meter read at the
+// minute we are setting up the meters, we can go back through and add the
+// opening read before the billing cycle is done."
+//
+// The read is BACKDATED on purpose. A submeter's first bill is (cycle read −
+// prior read), and the prior-read lookup is point-in-time: it takes the newest
+// reading dated BEFORE the cycle read. So an opening read entered late still
+// works, as long as its date precedes the reads it is meant to enable. Dating
+// it today would place it after an earlier cycle read and produce nothing —
+// which is why the date is editable and defaults to the start of the month
+// rather than to now.
+function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: () => void; onSaved: () => void }) {
+  const [value, setValue] = useState('')
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 8) + '01')
+  const [err, setErr] = useState('')
+  const save = useMutation(
+    () => apiPost(`/utility/meters/${meter.id}/readings`, {
+      readingValue: Number(value), readingDate: date,
+      billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
+    }),
+    { onSuccess: onSaved,
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save the opening read') },
+  )
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Opening read — {meter.label}</div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.55 }}>
+          Usage is the difference between two reads, so this meter can't bill until it has a
+          starting point. Enter what the meter face read when the tenancy or cycle began —
+          <strong> date it before the reads you want to bill</strong>.
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <input className="input" type="number" value={value} autoFocus
+            onChange={e => setValue(e.target.value)}
+            placeholder={`${meter.digits}-digit read`} style={{ flex: 2 }} />
+          <input className="input" type="date" value={date}
+            onChange={e => setDate(e.target.value)} style={{ flex: 1 }} />
+        </div>
+        {err && (
+          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>{err}</div>
+        )}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={value === '' || save.isLoading}
+            onClick={() => { setErr(''); save.mutate() }}>
+            {save.isLoading ? 'Saving…' : 'Save opening read'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

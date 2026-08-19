@@ -16,11 +16,11 @@ import type { AgentTool, AgentActor } from './types'
 export const captureLead: AgentTool = {
   name: 'capture_lead',
   description:
-    'Save the prospect as a lead so a GAM Portfolio Specialist can follow up. Call this once you have ' +
+    'Save the prospect as a lead so a GAM Portfolio Strategist can follow up. Call this once you have ' +
     'at least their email or phone (confirm it with them first). Fill EVERY other field you can from ' +
     'what they said anywhere in the conversation — states, unit count, property mix — even if you never ' +
     'asked directly; partial is fine, never leave a field empty that the chat answered. After saving, ' +
-    'let them know a Portfolio Specialist will reach out.',
+    'let them know a Portfolio Strategist will reach out.',
   parameters: {
     type: 'object',
     properties: {
@@ -30,7 +30,7 @@ export const captureLead: AgentTool = {
       states: { type: 'string', description: 'State(s) they operate in, in their words (e.g. "Arizona and Utah").' },
       portfolioSize: { type: 'string', description: 'How many units/properties/sites they have, in their words (e.g. "about 40 units", "30-site park").' },
       propertyType: { type: 'string', description: 'Their property mix, in their words (e.g. "mostly RVs, one storage facility, some boat parking").' },
-      notes: { type: 'string', description: 'What they’re interested in / their situation / anything useful for the Specialist’s call.' },
+      notes: { type: 'string', description: 'What they’re interested in / their situation / anything useful for the Strategist’s call.' },
     },
   },
   audiences: ['prospect'],

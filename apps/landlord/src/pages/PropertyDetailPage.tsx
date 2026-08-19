@@ -11,10 +11,14 @@ import { usePerms } from '../lib/permissions'
 // OWNER-DEFINED subtypes (UnitSubtypesSection) — blank until the owner
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
-import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { PropertyLateFeeSection } from './PropertyLateFeeSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
+import { UtilityMetersPage } from './UtilityMetersPage'
+import { AmenitiesPage } from './AmenitiesPage'
+import { InventoryPage } from './InventoryPage'
+import { MaintenancePage } from './MaintenancePage'
+import { PropertyOwnershipTab } from './PropertyOwnershipTab'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
@@ -42,6 +46,39 @@ export function PropertyDetailPage() {
   const revenue   = (units as any[]).filter(u => u.tenantId).reduce((s,u) => s + parseFloat(u.rentAmount||0), 0)
   const occupancy = units.length > 0 ? Math.round((occupied / units.length) * 100) : 0
   const maxRevenue  = (units as any[]).reduce((s, u) => s + parseFloat(u.rentAmount||0), 0)
+
+  // S605 (Nic, DIRECTIVE): property-scoped screens live INSIDE the property.
+  // "Some of these tabs probably need to be sub tabs within a specific property
+  // where different properties would be allowed to have different rates... maybe
+  // other stuff could be hidden within a specific property as well."
+  //
+  // Utilities and Amenities were top-level nav items that each had to re-ask
+  // WHICH property — and the Utilities picker only appeared for landlords with
+  // more than one, so a single-property landlord got no scoping cue at all and
+  // the page read as global. Inside the property there is nothing to ask.
+  //
+  // Inventory and Documents deliberately stay top-level: inventory is
+  // portfolio-wide stock and documents are scoped to a UNIT, not a property.
+  // Moving them here would be tidiness at the cost of being wrong.
+  const TABS = [
+    { key: 'overview',  label: 'Overview' },
+    { key: 'utilities', label: 'Utilities' },
+    { key: 'amenities', label: 'Amenities' },
+    { key: 'inventory', label: 'Equipment' },
+    { key: 'maintenance', label: 'Maintenance' },
+    { key: 'ownership', label: 'Ownership' },
+  ] as const
+  type TabKey = typeof TABS[number]['key']
+  const [tab, setTab] = useState<TabKey>(() =>
+    (new URLSearchParams(window.location.search).get('tab') as TabKey) || 'overview')
+  const goTab = (k: TabKey) => {
+    setTab(k)
+    // Keep the tab in the URL so a refresh, a bookmark or a back button lands
+    // where the landlord was rather than resetting to Overview.
+    const u = new URL(window.location.href)
+    u.searchParams.set('tab', k)
+    window.history.replaceState({}, '', u)
+  }
 
   return (
     <div>
@@ -72,6 +109,32 @@ export function PropertyDetailPage() {
           hedged factual notice here catches the landlord before the
           value propagates to new leases. Auto-hides when empty. */}
       <LawWarningBanner warnings={property.stateLawWarnings} />
+
+      {/* S605: sub-tabs. Everything below is scoped to THIS property. */}
+      <div style={{ display:'flex', gap:4, borderBottom:'1px solid var(--border-0)', marginBottom:20 }}>
+        {TABS.map(t => (
+          <button key={t.key} onClick={() => goTab(t.key)}
+            style={{
+              background:'none', border:'none', cursor:'pointer', padding:'8px 14px',
+              fontSize:'.82rem', fontWeight: tab === t.key ? 700 : 500,
+              color: tab === t.key ? 'var(--gold)' : 'var(--text-3)',
+              borderBottom: `2px solid ${tab === t.key ? 'var(--gold)' : 'transparent'}`,
+              marginBottom:-1,
+            }}>{t.label}</button>
+        ))}
+      </div>
+
+      {tab === 'utilities' && <UtilityMetersPage embeddedPropertyId={id!} />}
+      {tab === 'amenities' && <AmenitiesPage embeddedPropertyId={id!} />}
+      {/* S605 (Nic): "Property inventory is equipment. It's small tractors, weed
+          whackers, tools" — labelled Equipment here so it can't be confused with
+          POS resale stock, which is a different table entirely. */}
+      {tab === 'inventory' && <InventoryPage embeddedPropertyId={id!} />}
+      {tab === 'maintenance' && <MaintenancePage embeddedPropertyId={id!} />}
+      {/* S605 (Nic): selling the property, gated on every owner confirming. */}
+      {tab === 'ownership' && <PropertyOwnershipTab propertyId={id!} propertyName={property.name} />}
+
+      {tab === 'overview' && (<>
 
       {/* Stats */}
       <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:12, marginBottom:24 }}>
@@ -187,6 +250,8 @@ export function PropertyDetailPage() {
         )}
       </div>
 
+      </>)}
+
       {showAddUnit && (
         <AddUnitModal
           preselectedPropertyId={id}
@@ -284,7 +349,11 @@ function PropertyFinances({ propertyId }: { propertyId: string }) {
           `undefined` and both sections 500'd silently (pre-existing bug). */}
       <UnitSubtypesSection propertyId={propertyId} />
 
-      <PropertyAgentPermissionsSection propertyId={propertyId} />
+      {/* S604 (Nic): AI agent permissions REMOVED from the property tab — "it
+          just seems like a weird place to have it". The section component is
+          intentionally left in the codebase (PropertyAgentPermissionsSection);
+          it needs a home on an agent/settings surface, not per-property detail.
+          Do not delete the component when re-homing it. */}
     </div>
   )
 }

@@ -32,7 +32,7 @@ async function seedBookableProperty(opts: { slug: string; backInNightly?: number
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await client.query(
       `UPDATE properties SET public_booking_enabled=TRUE, booking_slug=$2,
-              booking_intro='Welcome to the park', booking_deposit_pct=25, short_term_tax_rate=0 WHERE id=$1`,
+              booking_intro='Welcome to the park', booking_deposit_pct=20, short_term_tax_rate=0 WHERE id=$1`,
       [propertyId, opts.slug])
     const subtype = async (name: string, layout: string, amp: string, nightly: number, weekly: number) => {
       const r = await client.query<{ id: string }>(

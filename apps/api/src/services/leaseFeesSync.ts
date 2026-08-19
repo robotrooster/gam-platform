@@ -137,11 +137,38 @@ export async function syncSecurityDepositRow(
                FROM v_lease_active_tenants vlat
               WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
               LIMIT 1) AS tenant_id,
-            CASE WHEN p.deposit_handling_mode = 'landlord_held'
-                 THEN 'landlord' ELSE 'gam_escrow' END AS held_by
+            -- S602 deposit-trust model (Nic): a NEW-tenant lease (native to GAM —
+            -- esigned/booking_draft/application_draft) ALWAYS has its deposit held
+            -- by GAM in escrow; the tenant pays it through the platform and GAM
+            -- keeps it in the segregated trust pool. Only an IMPORTED lease (the
+            -- tenant existed before the landlord onboarded) stays in the landlord's
+            -- custody — unless the landlord has turned that deposit over to GAM
+            -- (property deposit_handling_mode='gam_escrow' = FlexVault). There is no
+            -- per-property "who holds new deposits" toggle: new = GAM, always.
+            --
+            -- S604 CUSTODY GATE (overrides everything above): GAM may only take
+            -- custody where the state's law permits the vehicle GAM actually
+            -- uses. 21 states require deposits to sit in a bank/escrow/trust
+            -- account at a (sometimes in-state) institution, which a brokerage
+            -- Treasury position is not. Taking custody there would put tenant
+            -- money somewhere unlawful — in Oklahoma, criminally so.
+            --
+            -- FAIL-CLOSED: a state with no row in state_deposit_custody_rules
+            -- resolves to 'landlord'. Silence means "nobody has checked", never
+            -- "go ahead". Flipping a state to supported later automatically
+            -- lets new deposits flow to GAM with no code change.
+            CASE
+              WHEN COALESCE(cr.custody_status, 'needs_research') <> 'supported'
+                THEN 'landlord'
+              WHEN l.lease_source = 'imported'
+                THEN CASE WHEN p.deposit_handling_mode = 'gam_escrow'
+                          THEN 'gam_escrow' ELSE 'landlord' END
+              ELSE 'gam_escrow'
+            END AS held_by
        FROM leases l
        JOIN units u      ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
+       LEFT JOIN state_deposit_custody_rules cr ON cr.state_code = p.state
       WHERE l.id = $1`,
     [leaseId],
   )

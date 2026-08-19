@@ -34,6 +34,13 @@ HEADER='-- ============================================================
 -- answering "what columns does table X have right now?" without
 -- replaying migrations in order.
 --
+-- IT IS ALSO EXECUTED: src/test/globalSetup.ts rebuilds the gam_test
+-- database from this snapshot before the suite runs. A stale or
+-- hand-edited schema.sql therefore breaks tests with confusing
+-- "relation does not exist" / missing-column errors that look like
+-- application bugs. Re-run a migration (or db:dump-schema) after any
+-- schema change so this file and gam_test stay in step.
+--
 -- To regenerate manually:  npm run db:dump-schema
 -- ============================================================'
 

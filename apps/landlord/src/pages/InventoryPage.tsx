@@ -18,9 +18,19 @@ const emptySched = { title:'', description:'', recurrence:'quarterly', nextDue:'
 //    serviceable-asset model (a truck's oil change IS a recurring schedule) —
 //    no new table. Mark Done advances next_due by the recurrence.
 // Daily 9am cron alerts (low_stock + service_due) land back on this page.
-export function InventoryPage() {
+// S605 (Nic, DIRECTIVE): "Inventory needs to be scoped to property. It's not a
+// shared thing... Property inventory is equipment. It's small tractors, weed
+// whackers, tools, other supplies to operate that property."
+//
+// A landlord with four parks previously saw one undifferentiated list and could
+// not answer "which mower is at Oak Park?" — the question the page exists for.
+// `embeddedPropertyId` renders it as a tab inside a property, filtered to that
+// property's equipment and filing anything new against it automatically.
+export function InventoryPage({ embeddedPropertyId }: { embeddedPropertyId?: string } = {}) {
   const qc = useQueryClient()
-  const { data: items = [], isLoading } = useQuery<any[]>('inventory', () => apiGet('/maint-portal/parts'))
+  const { data: items = [], isLoading } = useQuery<any[]>(
+    ['inventory', embeddedPropertyId ?? 'all'],
+    () => apiGet(`/maint-portal/parts${embeddedPropertyId ? `?propertyId=${embeddedPropertyId}` : ''}`))
   const { data: scheduled = [] } = useQuery<any[]>('inventory-scheduled', () => apiGet('/maint-portal/scheduled'))
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
 
@@ -30,7 +40,9 @@ export function InventoryPage() {
   const [showSchedModal, setShowSchedModal] = useState(false)
   const [sched, setSched] = useState<any>(emptySched)
 
-  const itemBody = () => ({ name:form.name.trim(), sku:form.sku.trim()||null, description:form.description.trim()||null, unit:form.unit.trim()||'each', location:form.location.trim()||null, quantity:parseInt(form.quantity)||0, minQuantity:parseInt(form.minQuantity)||0, cost:form.cost!=='' ? parseFloat(form.cost) : null })
+  const itemBody = () => ({ name:form.name.trim(), sku:form.sku.trim()||null, description:form.description.trim()||null, unit:form.unit.trim()||'each', location:form.location.trim()||null, quantity:parseInt(form.quantity)||0, minQuantity:parseInt(form.minQuantity)||0, cost:form.cost!=='' ? parseFloat(form.cost) : null,
+    // Filed against the property it lives at when added from inside one.
+    ...(embeddedPropertyId ? { propertyId: embeddedPropertyId } : {}) })
   const closeItemModal = () => { setShowItemModal(false); setEditingId(null); setForm(emptyItem) }
 
   const saveItemMut = useMutation(
@@ -54,7 +66,10 @@ export function InventoryPage() {
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Inventory</h1><p className="page-subtitle">Business-use supplies (cleaning, toiletries, maintenance) — not POS resale stock</p></div>
+        <div>{!embeddedPropertyId && <>
+          <h1 className="page-title">Inventory</h1>
+          <p className="page-subtitle">Equipment, tools and supplies used to operate your properties — not POS resale stock</p>
+        </>}</div>
       </div>
 
       {/* ── SUPPLIES & PARTS ─────────────────────────────────── */}

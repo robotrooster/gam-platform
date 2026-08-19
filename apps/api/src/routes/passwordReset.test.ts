@@ -106,6 +106,86 @@ describe('POST /api/auth/forgot-password', () => {
     expect(url).toContain(`token=${row.reset_token}`)
   })
 
+  // ── S605: the reset link must point at the portal that asked ──────────
+  // Regression guard for a live lockout: RESET_PASSWORD_URL is not set in
+  // production, so the old single-URL fallback put
+  // 'http://localhost:3002/reset-password' — localhost, on the TENANT port —
+  // into every reset email. A landlord had no working recovery path at all.
+  describe('reset link destination (S605)', () => {
+    const LANDLORD = 'https://landlord.goldassetmanagement.com'
+    const TENANT = 'https://tenant.goldassetmanagement.com'
+
+    beforeEach(() => {
+      process.env.LANDLORD_APP_URL = LANDLORD
+      process.env.TENANT_APP_URL = TENANT
+      delete process.env.RESET_PASSWORD_URL
+    })
+
+    it('sends a LANDLORD link when the landlord portal asked', async () => {
+      await seedUserWithPassword('ll@test.dev', 'oldpass1234')
+      await request(buildApp())
+        .post('/api/auth/forgot-password')
+        .set('Origin', LANDLORD)
+        .send({ email: 'll@test.dev' })
+        .expect(200)
+
+      const url = String(sendResetMock.mock.calls[0][2])
+      expect(url).toContain(`${LANDLORD}/reset-password?token=`)
+      expect(url).not.toContain('localhost')
+    })
+
+    it('sends a TENANT link when the tenant portal asked', async () => {
+      await seedUserWithPassword('t@test.dev', 'oldpass1234')
+      await request(buildApp())
+        .post('/api/auth/forgot-password')
+        .set('Origin', TENANT)
+        .send({ email: 't@test.dev' })
+        .expect(200)
+
+      expect(String(sendResetMock.mock.calls[0][2])).toContain(`${TENANT}/reset-password?token=`)
+    })
+
+    it('IGNORES an unrecognised Origin — a spoofed host must never receive a token', async () => {
+      await seedUserWithPassword('victim@test.dev', 'oldpass1234')
+      await request(buildApp())
+        .post('/api/auth/forgot-password')
+        .set('Origin', 'https://evil.example.com')
+        .send({ email: 'victim@test.dev' })
+        .expect(200)
+
+      const url = String(sendResetMock.mock.calls[0][2])
+      expect(url).not.toContain('evil.example.com')
+      expect(url).toContain(TENANT)   // falls back, never echoes the attacker
+    })
+
+    it('routes PM and business portals to themselves, not to the tenant app', async () => {
+      // S605: there is no PM_APP_URL / BUSINESS_APP_URL env var, so these used
+      // to fall through to the TENANT link and drop the user on the wrong app.
+      for (const label of ['pm', 'business']) {
+        const origin = `https://${label}.goldassetmanagement.com`
+        sendResetMock.mockClear()
+        await seedUserWithPassword(`${label}@test.dev`, 'oldpass1234')
+        await request(buildApp())
+          .post('/api/auth/forgot-password').set('Origin', origin)
+          .send({ email: `${label}@test.dev` }).expect(200)
+
+        const url = String(sendResetMock.mock.calls[0][2])
+        expect(url, label).toContain(`${origin}/reset-password?token=`)
+        expect(url, label).not.toContain(TENANT)
+      }
+    })
+
+    it('never emits a localhost link when the portal env vars are set', async () => {
+      await seedUserWithPassword('nolocal@test.dev', 'oldpass1234')
+      await request(buildApp())
+        .post('/api/auth/forgot-password')
+        .send({ email: 'nolocal@test.dev' })
+        .expect(200)
+
+      expect(String(sendResetMock.mock.calls[0][2])).not.toContain('localhost')
+    })
+  })
+
   it('unknown email: 200 (same shape), no token written, no email sent', async () => {
     const res = await request(buildApp())
       .post('/api/auth/forgot-password')

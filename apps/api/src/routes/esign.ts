@@ -37,6 +37,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { logger } from '../lib/logger'
+import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType } from '../services/householdLeaseDraft'
 
 export const esignRouter = Router()
 
@@ -189,6 +190,9 @@ export async function createDocumentRecord(client: any, opts: {
   // lease — completion copies the predecessor's deposits + the lease-end
   // processor hands the unit off instead of vacating.
   renewsLeaseId?: string | null,
+  // S604 (Nic): the landlord ALREADY holds this tenant's deposit — migration
+  // onboarding. The lease still states the deposit; it just isn't billed.
+  depositAlreadyHeld?: boolean,
   signers: Array<{ userId: string, role: string, name: string, email: string, phone?: string | null, orderIndex?: number }>
 }): Promise<any> {
   // INSERT lease_documents — includes document_type and addendum-specific FKs
@@ -197,15 +201,31 @@ export async function createDocumentRecord(client: any, opts: {
       template_id, landlord_id, unit_id, lease_id,
       title, base_pdf_url,
       document_type, target_lease_tenant_id, promote_lease_tenant_id,
-      renews_lease_id
-    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10)
+      renews_lease_id, deposit_already_held
+    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11)
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
       opts.title, opts.basePdfUrl,
       opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId,
-      opts.renewsLeaseId || null
+      opts.renewsLeaseId || null,
+      opts.depositAlreadyHeld === true
     ]).then((r: any) => r.rows[0])
+
+  // S605 (Nic): "if a previous run drafted the lease, then it should know that
+  // now that it's saving it." ANY original lease created for a unit — drafted
+  // here, or sent by hand through e-sign — closes out that unit's waiting
+  // invites. Without this, a manually-sent lease left its rows open forever and
+  // every future template save retried and skipped the same unit.
+  //
+  // This choke point is the right home for it: every lease document in the
+  // system is created through this function, so no path can leave stale rows.
+  if (opts.unitId && opts.documentType === 'original_lease') {
+    await client.query(
+      `UPDATE pending_lease_drafts
+          SET resolved_at = now(), resolved_document_id = $2
+        WHERE unit_id = $1 AND resolved_at IS NULL`, [opts.unitId, doc.id])
+  }
 
   // INSERT signers
   for (const s of opts.signers) {
@@ -864,6 +884,58 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   if (!Number.isFinite(rentAmountNum) || rentAmountNum <= 0) {
     throw new AppError(400, `Invalid rent_amount: ${vals.rent_amount}`)
   }
+  // ────────────────────────────────────────────────────────────────────────
+  // S604 (Nic): DEPOSIT ALREADY IN CUSTODY — migration onboarding.
+  //
+  // A landlord moving EXISTING tenants onto GAM has them e-sign a new lease.
+  // Without this, generateMoveInInvoice bills the security deposit to a tenant
+  // whose deposit the landlord has held for years. Oak Park would have invoiced
+  // 19 sitting tenants $350 each on day one.
+  //
+  // The lease still STATES the deposit (the lease_fees row above is written
+  // normally) so the signed document is correct and the move-out sweep still
+  // sees it — only the BILLING is suppressed.
+  //
+  // Implemented by pre-creating the custody row as already funded and marking it
+  // 'carried_forward', which is the same signal the S516 double-charge guard in
+  // generateMoveInInvoice already honours for a deposit carried between GAM
+  // leases. Reusing that guard rather than adding a second suppression path
+  // keeps one code path responsible for "never bill a deposit twice".
+  if (doc.deposit_already_held) {
+    const depFee = await client.query(
+      `SELECT amount::text AS amount FROM lease_fees
+        WHERE lease_id = $1 AND fee_type = 'security_deposit' AND due_timing = 'move_in'
+        LIMIT 1`,
+      [lease.id])
+    const heldAmount = Number((depFee.rows[0] as any)?.amount ?? 0)
+    if (heldAmount > 0 && primarySigner.tenant_id) {
+      // held_by mirrors the S604 custody gate: GAM only takes custody where the
+      // state permits its vehicle. A migrated deposit the landlord physically
+      // holds stays with the landlord regardless, so this is landlord-held.
+      // security_deposits has NO unique constraint on lease_id, so this is a
+      // check-then-act rather than an upsert. Safe: buildLeaseFromDocument runs
+      // inside one transaction holding an advisory lock on this document.
+      const existingDep = await client.query(
+        `SELECT id FROM security_deposits WHERE lease_id = $1 LIMIT 1`, [lease.id])
+      if (existingDep.rows[0]) {
+        await client.query(
+          `UPDATE security_deposits
+              SET total_amount = $2, collected_amount = $2, status = 'funded',
+                  held_by = 'landlord', portability_status = 'carried_forward',
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [(existingDep.rows[0] as any).id, heldAmount.toFixed(2)])
+      } else {
+        await client.query(
+          `INSERT INTO security_deposits
+             (unit_id, lease_id, tenant_id, total_amount, collected_amount,
+              status, held_by, portability_status)
+           VALUES ($1, $2, $3, $4, $4, 'funded', 'landlord', 'carried_forward')`,
+          [doc.unit_id, lease.id, primarySigner.tenant_id, heldAmount.toFixed(2)])
+      }
+    }
+  }
+
   // S196: security_deposit no longer passed as a separate input — it
   // flows in via the lease_fees move_in iteration inside
   // generateMoveInInvoice.
@@ -1429,7 +1501,21 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
       `UPDATE lease_templates SET is_unit_type_default=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
       [makeDefault, t.id])
     await client.query('COMMIT')
-    res.json({ success: true, data: updated.rows[0] })
+
+    // S605 (Nic): "if somebody does forget to add the template first... when
+    // they add it, it refires." Every unit of this type with tenants invited but
+    // no lease drafted gets drafted now. Outside the transaction and fully
+    // best-effort — setting a default template must succeed even if drafting
+    // hits a snag, and the retry is repeatable.
+    let retried: { drafted: number; skipped: number } | null = null
+    if (makeDefault && t.unit_type) {
+      retried = await draftPendingForUnitType({
+        landlordId: req.user!.profileId,
+        unitType: t.unit_type,
+        propertyId: t.property_id ?? null,
+      }).catch(() => null)
+    }
+    res.json({ success: true, data: updated.rows[0], pendingDrafts: retried })
   } catch (e) {
     await client.query('ROLLBACK')
     next(e)
@@ -1668,7 +1754,7 @@ async function resolveUnitFromPrefill(
 esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { templateId, unitId, title, signers, basePdfUrl, prefillValues } = req.body
+    const { templateId, unitId, title, signers, basePdfUrl, prefillValues, depositAlreadyHeld } = req.body
     if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
 
     // Validate signer shape
@@ -1766,6 +1852,10 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       documentType: docType,
       targetLeaseTenantId: null,
       promoteLeaseTenantId: null,
+      // S604: migration onboarding — the landlord already holds this deposit,
+      // so state it on the lease but never bill it. Only meaningful on an
+      // original_lease; an addendum has no move-in invoice.
+      depositAlreadyHeld: docType === 'original_lease' && depositAlreadyHeld === true,
       signers,
       prefillValues: prefillValues || {}
     } as any)
@@ -3948,5 +4038,46 @@ esignRouter.get('/files/:filename', requireAuth, async (req: any, res: any, next
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 
     res.sendFile(filePath)
+  } catch (e) { next(e) }
+})
+
+// ── S605 (Nic): DRAFT A HOUSEHOLD LEASE FROM THE UNIT TYPE'S TEMPLATE ────────
+//
+// Closes the invite → lease gap. Nic wanted the chain to run itself after one
+// click, and to be built GENERICALLY: "the chain needs to look for that unit
+// type's default lease template. When nothing is set, it can't fire, but you can
+// build the structure so that as soon as I add a template it would fire."
+//
+// So this never asks WHICH template — it resolves the default for the unit's
+// type and reports plainly when a landlord hasn't configured one. Landlords with
+// templates get drafts today; landlords without get a message naming what to set
+// up, and the same call starts working the moment they set it.
+//
+// Returns 200 with drafted:false rather than an error when no template exists:
+// the invites DID go out and the accounts ARE real, so this is information about
+// an optional next step, not a failure of the thing the landlord just did.
+esignRouter.post('/draft-household', requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      unitId: z.string().uuid(),
+      // Household order — first email is the primary resident.
+      emails: z.array(z.string().email()).min(1).max(8),
+    }).parse(req.body)
+
+    const unit = await queryOne<any>(
+      `SELECT u.id, p.landlord_id FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`, [body.unitId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const residents = await resolveHouseholdByEmail(unit.landlord_id, body.emails)
+    if (!residents.length) {
+      return res.json({ success: true, data: { drafted: false,
+        reason: 'None of those residents have tenant accounts under this landlord yet.' } })
+    }
+    const result = await draftHouseholdLease({
+      landlordId: unit.landlord_id, unitId: body.unitId, residents,
+    })
+    res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })

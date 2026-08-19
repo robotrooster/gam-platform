@@ -21,6 +21,6 @@ The reset link is sent to the email on file for your account. If it doesn't arri
 
 ## Still can't get in?
 
-If you don't receive the reset email, can't access the inbox tied to your account, or think someone else may have access to your account, this is an account-access and security matter. Don't keep retrying on your own — we can connect you with a human GAM specialist who can help you recover access securely.
+If you don't receive the reset email, can't access the inbox tied to your account, or think someone else may have access to your account, this is an account-access and security matter. Don't keep retrying on your own — we can connect you with a human GAM Strategist who can help you recover access securely.
 
 GAM is the platform you use to manage your rental relationship; account access issues are handled by the GAM support team, separate from your landlord.

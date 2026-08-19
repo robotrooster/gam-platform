@@ -2,9 +2,14 @@
 scope: tenant
 title: Setting up bank (ACH) payments to pay your rent
 ---
-Paying rent straight from your bank account (ACH) is the lowest-cost way to pay in GAM — the fee is a flat $6.00 per payment, no matter the amount — so on any decent-sized rent it never costs more than six dollars. Paying by card works too, but it costs more (3.25% plus $0.26 per transaction). So if you can, connecting a bank account is the way to go.
+Paying rent straight from your bank account (ACH) is the lowest-cost way to pay in GAM — the fee is a flat $6.00 per payment, no matter the amount — so on any decent-sized rent it never costs more than six dollars. Paying by card works too, but it costs more (3.5% plus $0.55 per transaction). So if you can, connecting a bank account is the way to go.
 
-You set this up in the **Payments** section of your portal. To add a bank account, you connect it instantly: sign in to your bank through a secure connection and pick the account. There are no micro-deposits and no waiting — it verifies right away, so you can pay by bank immediately.
+You set this up in the **Payments** section of your portal. To add a bank account, you enter your account and routing number. To confirm the account is yours, Stripe sends a small verification deposit — it usually lands in **one to three business days**. Depending on your bank, you'll confirm it one of two ways, and the portal tells you which one applies to you:
+
+- **Two small deposits** — you come back and enter both amounts.
+- **One $0.01 deposit** — its description on your statement contains a **six-digit code**, and you enter that code.
+
+Stripe decides which method your bank gets; you don't choose. Once it's verified, you can pay rent by bank.
 
 GAM only ever stores and shows the last four digits of the account — your full account and routing numbers aren't exposed in the portal.
 

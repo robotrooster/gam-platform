@@ -139,7 +139,7 @@ describe('runAgentSession', () => {
 
     expect(res.shed).toBe(true)
     expect(res.reply).toMatch(/high volume/i)
-    expect(res.reply).not.toMatch(/specialist/i) // not the human-handoff copy
+    expect(res.reply).not.toMatch(/(specialist|strategist)/i) // not the human-handoff copy
     expect(mockRun).not.toHaveBeenCalled() // never touched the model
     // S553: shed turns ARE logged (outcome 'shed' via deriveOutcome) — shed
     // volume drives the capacity alarm on the admin Agent Analytics page.

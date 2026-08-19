@@ -88,13 +88,20 @@ describe('landlord expenses', () => {
     expect(await landlordExpensesTotal(f.landlordId, '2026-08-01', '2026-08-31')).toBe(700)
   })
 
-  it('common expense NOT allocated → not divided into per-unit', async () => {
+  // S603 (Nic): allocation is now UNCONDITIONAL. Any expense not tied to one
+  // unit spreads across all units on the property, whether or not the landlord
+  // ticked allocate_per_unit. Leaving a cost unspread made per-unit operating
+  // cost read lower than reality — the very number an owner uses to judge
+  // whether a unit earns its keep. The flag no longer affects reporting.
+  it('common expense spreads per-unit even when allocatePerUnit is false', async () => {
     const f = await seed()
     await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${f.token}`)
       .send(mk({ propertyId: f.propertyId, category: 'landscaping', amount: 200, isCommon: true, allocatePerUnit: false }))
       .expect(200)
-    expect(await unitAllocatedExpenses(f.unitA, '2026-08-01', '2026-08-31')).toBe(0)  // not per-unit
-    expect(await landlordExpensesTotal(f.landlordId, '2026-08-01', '2026-08-31')).toBe(200)  // still in landlord total
+    // 2 units on the property → $200 / 2 = $100 each, not $0.
+    expect(await unitAllocatedExpenses(f.unitA, '2026-08-01', '2026-08-31')).toBe(100)
+    expect(await unitAllocatedExpenses(f.unitB, '2026-08-01', '2026-08-31')).toBe(100)
+    expect(await landlordExpensesTotal(f.landlordId, '2026-08-01', '2026-08-31')).toBe(200)
   })
 
   it('void removes it from totals', async () => {

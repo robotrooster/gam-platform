@@ -4,12 +4,11 @@
 // a 2-click categorize into the P&L. The landlord ALWAYS confirms and ALWAYS
 // picks scope (a unit, or the property split/common across units); auto-suggest
 // only pre-fills from what this landlord chose for the same merchant before.
-import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useMemo, useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe } from '@stripe/stripe-js'
-import { apiGet, apiPost } from '../lib/api'
-import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL } from '@gam/shared'
+import { apiGet, apiPost , apiPut } from '../lib/api'
+import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 import { Landmark, RefreshCw, Check, X, Plus } from 'lucide-react'
 
@@ -23,15 +22,29 @@ const fmt = (n: any) => {
 }
 const fmtDate = (d: any) => (d ? String(d).slice(0, 10) : '—')
 
+// S603 (Nic): property_common and property_allocate now do the SAME thing —
+// every cost not tied to one unit is split across that property's units. Both
+// labels say so, so the list can't imply a difference that no longer exists.
+// (The duplicate enum value itself needs a migration to retire.)
 const SCOPE_LABEL: Record<string, string> = {
   unit: 'One unit',
-  property_common: 'Whole property (common)',
+  property_common: 'Whole property, split per unit',
   property_allocate: 'Whole property, split per unit',
 }
 
+// What the PICKER offers. SCOPE_LABEL above still maps both property values so
+// an existing rule saved as property_allocate still displays correctly, but the
+// dropdown must not show the same choice twice.
+const SCOPE_CHOICES: [string, string][] = [
+  ['unit', SCOPE_LABEL.unit],
+  ['property_common', SCOPE_LABEL.property_common], // wire-ok: local constant map, not an API response
+]
+
 type Draft = { category: string; scopeKind: string; propertyId: string; unitId: string }
 
-export function BankFeedPage() {
+// S605 (Nic): merged into a single "Bank" tab alongside reconciliation.
+// `embedded` renders this as a section of BankPage rather than its own screen.
+export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient()
   const [linking, setLinking] = useState(false)
   const [linkErr, setLinkErr] = useState<string | null>(null)
@@ -49,7 +62,9 @@ export function BankFeedPage() {
   // Per-row categorize draft, pre-seeded from the merchant suggestion.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const draftFor = (t: any): Draft => drafts[t.id] || {
-    category: t.suggestedCategory || 'repairs',
+    // Income rows must not default to an expense category — confirming without
+    // touching the dropdown would file a deposit as 'repairs'.
+    category: t.suggestedCategory || (Number(t.amount) > 0 ? 'other' : 'repairs'),
     scopeKind: t.suggestedScopeKind || 'unit',
     propertyId: t.suggestedPropertyId || '',
     unitId: t.suggestedUnitId || '',
@@ -77,16 +92,44 @@ export function BankFeedPage() {
       qc.invalidateQueries(['bank-txns'])
       toast('Bank linked. Syncing transactions…')
     } catch (e: any) {
-      setLinkErr(e?.response?.data?.message || e?.message || 'Could not link the bank.')
+      // S605: this read data.message, but the API's error shape is
+      // { success:false, error } — so it was ALWAYS undefined and every
+      // failure here degraded to axios's raw "Request failed with status
+      // code 400", hiding what Stripe actually said.
+      setLinkErr(e?.response?.data?.error || e?.response?.data?.message || e?.message || 'Could not link the bank.')
     } finally {
       setLinking(false)
     }
   }
 
+  // S605 (Nic): "when a landlord wants to onboard, say, October first, do we
+  // wanna offer the option to not count previous transactions?" Linking pulls
+  // the bank's whole history — Oak Park imported 112 rows back to February.
+  // Anything before this date is kept but auto-ignored, so the review queue is
+  // only the GAM era. Retroactive and reversible; categorized rows are never
+  // touched.
+  const { data: me } = useQuery<any>('landlord-books-start', () => apiGet('/landlords/me'))
+  const [booksStart, setBooksStart] = useState<string>('')
+  useEffect(() => {
+    if (me?.booksStartDate) setBooksStart(String(me.booksStartDate).slice(0, 10))
+  }, [me?.booksStartDate])
+
+  const saveBooksStart = useMutation(
+    (date: string | null) => apiPut('/bank-feed/books-start-date', { date }),
+    { onSuccess: (r: any) => {
+        qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('landlord-books-start')
+        const ig = r?.data?.ignored ?? 0, re = r?.data?.restored ?? 0
+        toast(ig || re
+          ? `Updated — ${ig} hidden, ${re} brought back for review.`
+          : 'Start date saved.')
+      },
+      onError: (e: any) => toast(e?.response?.data?.error || 'Could not save the start date.') },
+  )
+
   const sync = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/sync`, {}), {
     onSuccess: (d: any) => { qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('bank-connections')
       const n = d?.data?.inserted; toast(n ? `${n} new transaction(s).` : 'Up to date.') },
-    onError: (e: any) => toast(e?.response?.data?.message || 'Sync failed.'),
+    onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Sync failed.'),
   })
 
   const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, {}), {
@@ -95,8 +138,11 @@ export function BankFeedPage() {
 
   const categorize = useMutation(
     ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, body), {
-    onSuccess: () => { qc.invalidateQueries(['bank-txns']); toast('Categorized → added to your expenses.') },
-    onError: (e: any) => toast(e?.response?.data?.message || 'Could not categorize.'),
+    onSuccess: (r: any) => { qc.invalidateQueries(['bank-txns'])
+      // The API returns incomeId for money in, expenseId for money out — say
+      // which side it landed on rather than always claiming "expenses".
+      toast(r?.data?.incomeId ? 'Categorized → added to your income.' : 'Categorized → added to your expenses.') },
+    onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Could not categorize.'),
   })
 
   const ignore = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/ignore`, {}), {
@@ -117,33 +163,66 @@ export function BankFeedPage() {
 
   return (
     <div>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Bank Feed</h1>
-          <p className="page-subtitle">
-            Link your operating bank read-only. GAM hides the money it already tracks (rent payouts)
-            and surfaces the rest — your own spending — to categorize into your P&L in two clicks.
-          </p>
+      {embedded ? (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, margin: '26px 0 12px' }}>
+          <div>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Your spending</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+              Link your bank read-only. Rent payouts GAM already knows about are hidden; the rest is
+              yours to categorize into your P&L.
+            </div>
+          </div>
+          <button className="btn btn-primary" onClick={link} disabled={linking}>
+            <Plus size={16} /> {linking ? 'Linking…' : 'Connect a bank'}
+          </button>
         </div>
-        <button className="btn btn-primary" onClick={link} disabled={linking}>
-          <Plus size={16} /> {linking ? 'Linking…' : 'Connect a bank'}
-        </button>
-      </div>
+      ) : (
+        <div className="page-header">
+          <div>
+            <h1 className="page-title">Bank Feed</h1>
+            <p className="page-subtitle">
+              Link your operating bank read-only. GAM hides the money it already tracks (rent payouts)
+              and surfaces the rest — your own spending — to categorize into your P&L in two clicks.
+            </p>
+          </div>
+          <button className="btn btn-primary" onClick={link} disabled={linking}>
+            <Plus size={16} /> {linking ? 'Linking…' : 'Connect a bank'}
+          </button>
+        </div>
+      )}
       {linkErr && <div className="card" style={{ borderColor: 'var(--danger)', color: 'var(--danger)', marginBottom: 16 }}>{linkErr}</div>}
 
       {/* S576 (B-5): signpost the sibling workflow so the two "bank" tabs read as
           distinct jobs — this one CATEGORIZES spend; the other MATCHES a statement. */}
-      <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 16, lineHeight: 1.5 }}>
-        This is for <strong>categorizing spending</strong> from a linked bank into your P&L.
-        To check that a month's deposits match what GAM sent you, use{' '}
-        <Link to="/bank-reconciliation" style={{ color: 'var(--gold)', fontWeight: 600 }}>Bank Reconciliation</Link>.
-      </div>
+      {!embedded && (
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 16, lineHeight: 1.5 }}>
+          This is for <strong>categorizing spending</strong> from a linked bank into your P&L.
+        </div>
+      )}
 
       {/* Linked banks */}
       <div className="card" style={{ marginBottom: 20 }}>
         <div className="card-title" style={{ marginBottom: 12 }}>Linked banks</div>
         {connections.length === 0
-          ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>No banks linked yet. Connect one to start pulling transactions.</div>
+          ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem', lineHeight: 1.6 }}>
+              No banks linked yet.
+              {/* S605 (Nic): he finished Stripe payout setup and reasonably expected
+                  this to fill in. It can't. Stripe Connect tells GAM WHERE TO SEND
+                  money; this needs READ access to the bank's transaction history,
+                  which is a different permission the bank itself must grant — even
+                  for the same account. Say so here, because the Banking page had
+                  exactly this confusion and it cost real time. */}
+              <div style={{ marginTop: 8, color: 'var(--text-2)' }}>
+                <strong style={{ color: 'var(--text-1)' }}>This is separate from your payout setup.</strong>{' '}
+                Verifying with Stripe told GAM where to <em>send</em> your rent. This asks your bank for
+                read-only permission to <em>see</em> what you spend, so it can land in your P&L —
+                a different permission, so your bank has to approve it even if it's the same account.
+              </div>
+              <div style={{ marginTop: 8 }}>
+                Hit <strong>Connect a bank</strong> above and sign in to your bank. Read-only —
+                nothing can move money from here.
+              </div>
+            </div>
           : <div style={{ display: 'grid', gap: 8 }}>
               {connections.map((c: any) => (
                 <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
@@ -155,6 +234,22 @@ export function BankFeedPage() {
                       {c.status === 'error' && c.lastSyncError ? ` · error: ${c.lastSyncError}` : ''}
                     </div>
                   </div>
+                  {/* S605: the account balance, which is what a landlord looks
+                      for first on a page about their bank. Absent for links made
+                      before balances consent — those show a re-link prompt
+                      instead of a blank, so the fix is discoverable. */}
+                  <div style={{ textAlign: 'right', marginRight: 4 }}>
+                    {c.currentBalance != null
+                      ? <>
+                          <div style={{ fontWeight: 700, fontSize: '.95rem' }}>{fmt(c.currentBalance)}</div>
+                          <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>
+                            balance{c.balanceAsOf ? ` · ${fmtDate(c.balanceAsOf)}` : ''}
+                          </div>
+                        </>
+                      : <div style={{ fontSize: '.68rem', color: 'var(--text-3)', maxWidth: 150 }}>
+                          Balance needs a quick re-link
+                        </div>}
+                  </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => sync.mutate(c.id)} disabled={sync.isLoading}>
                     <RefreshCw size={14} /> Sync
                   </button>
@@ -165,6 +260,28 @@ export function BankFeedPage() {
               ))}
             </div>}
       </div>
+
+      {/* S605: books start date */}
+      {connections.length > 0 && (
+        <div className="card" style={{ marginBottom: 12, padding: 12, display: 'flex',
+          alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 260 }}>
+            <div style={{ fontWeight: 600, fontSize: '.82rem' }}>Start my books from</div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
+              Anything before this stays on file but is hidden from review — use it to skip spending
+              from before you joined GAM. Already-categorized transactions are never changed.
+            </div>
+          </div>
+          <input className="form-input" type="date" value={booksStart} style={{ width: 'auto' }}
+            onChange={e => setBooksStart(e.target.value)} />
+          <button className="btn btn-primary btn-sm" disabled={saveBooksStart.isLoading || !booksStart}
+            onClick={() => saveBooksStart.mutate(booksStart)}>Apply</button>
+          {me?.booksStartDate && (
+            <button className="btn btn-ghost btn-sm" disabled={saveBooksStart.isLoading}
+              onClick={() => { setBooksStart(''); saveBooksStart.mutate(null) }}>Clear</button>
+          )}
+        </div>
+      )}
 
       {/* Transaction views */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
@@ -194,16 +311,31 @@ export function BankFeedPage() {
                           {t.description && t.description !== t.normalizedMerchant ? ` · ${t.description}` : ''}
                         </div>
                       </div>
-                      <div style={{ fontWeight: 700, color: isExpense ? 'var(--text-0)' : 'var(--success, #3fb950)' }}>{fmt(t.amount)}</div>
+                      {/* S605 (Nic): colour alone didn't say which way the money
+                          went — "green numbers and white numbers" was a guess.
+                          Label it. These are single transaction amounts, not a
+                          running balance. */}
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontWeight: 700, color: isExpense ? 'var(--text-0)' : 'var(--success, #3fb950)' }}>{fmt(t.amount)}</div>
+                        <div style={{ fontSize: '.64rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                          {isExpense ? 'money out' : 'money in'}
+                        </div>
+                      </div>
                     </div>
 
-                    {view === 'needs_review' && isExpense && (
+                    {/* S605 (Nic): "if the only option is to ignore it, why are we even
+                        showing it on this page?" — money in used to be a dead end here.
+                        It now categorizes as income exactly like money out categorizes as
+                        an expense; only the category list differs. */}
+                    {view === 'needs_review' && (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' }}>
                         <select className="input input-sm" value={d.category} onChange={e => setDraft(t.id, { category: e.target.value })}>
-                          {EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{EXPENSE_CATEGORY_LABEL[c]}</option>)}
+                          {isExpense
+                            ? EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{EXPENSE_CATEGORY_LABEL[c]}</option>)
+                            : OTHER_INCOME_CATEGORIES.map(c => <option key={c} value={c}>{OTHER_INCOME_CATEGORY_LABEL[c]}</option>)}
                         </select>
                         <select className="input input-sm" value={d.scopeKind} onChange={e => setDraft(t.id, { scopeKind: e.target.value })}>
-                          {Object.entries(SCOPE_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                          {SCOPE_CHOICES.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                         </select>
                         {d.scopeKind === 'unit' ? (
                           <>
@@ -230,17 +362,10 @@ export function BankFeedPage() {
                       </div>
                     )}
 
-                    {view === 'needs_review' && !isExpense && (
-                      <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
-                        <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-                          Money in — not a GAM payout we recognized. Only expenses (money out) are categorized here.
-                        </span>
-                        <button className="btn btn-ghost btn-sm" onClick={() => ignore.mutate(t.id)}><X size={14} /> Ignore</button>
-                      </div>
-                    )}
-
                     {view === 'categorized' && (
-                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Added to your expenses.</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        Added to your {isExpense ? 'expenses' : 'income'}.
+                      </div>
                     )}
                   </div>
                 )

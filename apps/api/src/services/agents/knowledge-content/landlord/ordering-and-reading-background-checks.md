@@ -24,7 +24,7 @@ Results arrive automatically from the provider; you do not need to refresh or ch
 
 ## What screening costs you
 
-The applicant pays the screening cost up front where their state allows it — passed through at exactly the provider’s price, never marked up, plus the standard card processing fee where state law allows it. Your side is a flat $5 per screening that goes through (if a check is cancelled without a report, the fee is voided), covering GAM’s screening administration and the customer-vetting compliance work. In states that cap or prohibit applicant screening fees, the portion the applicant legally could not be charged is billed to you instead. Both amounts arrive as line items on your monthly platform-fee statement — nothing to pay per-check.
+The applicant pays for screening up front wherever their state allows it, so **in the normal case screening costs you nothing** — the applicant covers it, and if a check is cancelled without a report, their payment is refunded automatically. In states that cap or prohibit applicant-paid screening fees, the portion the applicant legally could not be charged is billed to you instead, as a line item on your monthly platform-fee statement.
 
 ## Reading the report
 

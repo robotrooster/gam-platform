@@ -2,8 +2,8 @@
 
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
-Effective Date: [DATE OF PUBLIC LAUNCH]
-Last Updated: [DATE]
+Effective Date: August 10, 2026
+Last Updated: August 10, 2026
 
 ---
 
@@ -26,7 +26,7 @@ These Consumer Terms of Service (the "**Terms**") form a binding legal agreement
 
 By creating an account, accessing, or otherwise using the GAM platform as a Tenant — including the tenant portal, mobile-responsive surfaces, and related services we operate under the Gold Asset Management brand (collectively, the "**Platform**") — you agree to these Terms and to the [Consumer Privacy Policy](./CONSUMER_PRIVACY_POLICY.md), which is incorporated by reference. If you do not agree, you must not use the Platform.
 
-You also agree to the additional service-specific terms presented within the Platform at the time you enroll in or use a specific feature (e.g., the FlexDeposit Service-Level Agreement, FlexPay subscription terms, FlexCharge Business Account Agreement, FlexCredit third-party lender disclosure, lease electronic-signature consent, and background-check authorization). Those service-specific terms are incorporated by reference and prevail to the extent they conflict with these Terms for the specific feature they govern.
+You also agree to the additional service-specific terms presented within the Platform at the time you enroll in or use a specific feature (e.g., the FlexDeposit Custody Agreement, FlexPay subscription terms, FlexCharge Business Account Agreement, FlexCredit third-party lender disclosure, lease electronic-signature consent, and background-check authorization). Those service-specific terms are incorporated by reference and prevail to the extent they conflict with these Terms for the specific feature they govern.
 
 ## 2. Eligibility
 
@@ -70,7 +70,7 @@ We may require additional verification (including identity verification through 
 
 GAM uses Stripe, Inc. ("**Stripe**") as its payment processor. When you pay rent, utility charges, late fees, or other charges through the Platform, the payment moves through Stripe Connect. By using the Platform's payment features, you also agree to Stripe's applicable terms of service.
 
-GAM does not custody funds intended for your Landlord. Subject to Section 5.5 below (Payment Routing) and Section 5.6 (Unpaid Rent), each rent payment settles to your Landlord's Stripe Connect balance and is paid out to your Landlord per their Stripe payout schedule. GAM holds deposits in a separate pooled custody account, as described in Section 6.
+Subject to Section 5.5 below (Payment Routing) and Section 5.6 (Unpaid Rent), each rent payment you authorize is received into GAM's platform account, and the amount owed to your Landlord is disbursed to your Landlord's Stripe Connect balance on a regular batch schedule (currently weekly) before paying out to your Landlord's linked bank account. GAM holds funds in transit only to make that disbursement; it does not hold them as your Landlord's trustee or fiduciary. GAM holds security deposits separately, in a pooled custody account, as described in Section 6.
 
 ### 5.2 Fees You May Pay
 
@@ -78,16 +78,17 @@ You pay the Platform's payment-processing fees on your payments by default, and 
 
 When fees are passed through, the rates are:
 
-- **ACH (bank account) payment processing**: 1.0% of the transaction amount, capped at $6.00 per transaction.
-- **Card payment processing**: 3.25% of the transaction amount, flat (no cap). A 1.5% surcharge is added to charges paid with a non-United States–issued card, passed through to the cardholder.
+- **ACH (bank account) payment processing**: a flat $6.00 per transaction.
+- **Card payment processing**: 3.5% of the transaction amount plus $0.55 per transaction (no cap). A 1.5% surcharge is added to charges paid with a non-United States–issued card, passed through to the cardholder.
+- **Declined card attempt**: a flat **$1.00 declined-payment fee** per card payment attempt that your bank or card issuer refuses. This fee applies to card attempts only — declined bank (ACH) payments are covered by Section 5.4 instead. Because a declined attempt collects no funds, the fee cannot be charged to the refused card; it is added to your Platform balance and collected from your next successful payment. The fee applies per refused attempt, so repeated attempts on a card that keeps being declined will each carry it.
 
 If you enroll in FlexPay, the FlexPay enrollment terms disclose the monthly subscription fee (a flat $25.00 per month — see Section 9.2 below); the fee is charged to you separately from your rent on the cadence disclosed at enrollment.
 
 If you enroll in FlexDeposit, the FlexDeposit terms (Section 9.1) govern the installment schedule for funding your security deposit into GAM custody, plus the $3.00 monthly custody fee.
 
-### 5.3 No Cash, No Check
+### 5.3 Electronic Payments and Recorded Off-Platform Payments
 
-The Platform supports electronic payments only (ACH and card). Cash, checks, money orders, and other paper instruments are not supported. Any in-person payment to your Landlord must be handled outside the Platform; your Platform account will continue to reflect the unpaid balance until the payment is recorded electronically.
+The Platform processes electronic payments (ACH and card). If you pay your Landlord off-platform — by cash, check, or money order — your Landlord or their staff can **record that payment** on the Platform so your balance reflects it. Recording an off-platform payment carries a **$10.00 manual-payment fee, charged to you.** This fee is waived only for your first recorded rent payment during a property's initial onboarding window — the first few weeks after the property is brought onto the Platform, while existing tenancies are being migrated over. Tenants who join after that onboarding window are charged the fee even on a first recorded payment. Until an off-platform payment is recorded, your Platform account will continue to reflect the unpaid balance.
 
 ### 5.4 Failed ACH Pulls, Retries, Chargebacks, and Pass-Through Fees
 
@@ -99,7 +100,7 @@ If you initiate a chargeback or your ACH payment is returned, the Platform will 
 
 **Each retry pull attempts to collect:**
 
-- **(a) The underlying amount then due under the applicable agreement.** This amount does **not** change on a retry: FlexPay's monthly fee is a flat $25.00 that is not recalculated by retry date (Section 9.2 and FlexPay Subscription Terms § 4.1), and FlexDeposit SLA installments (Section 9.1) likewise retry for the same installment amount as originally scheduled.
+- **(a) The underlying amount then due under the applicable agreement.** This amount does **not** change on a retry: FlexPay's monthly fee is a flat $25.00 that is not recalculated by retry date (Section 9.2 and FlexPay Subscription Terms § 4.1), and FlexDeposit custody installments (Section 9.1) likewise retry for the same installment amount as originally scheduled.
 - **(b) Plus pass-through fees** (described below) applicable to **all** failed pulls under **all** products, regardless of whether the underlying amount is recalculated under (a) or remains fixed.
 
 If all retry attempts under GAM's failed-pull retry policy fail, the unpaid balance (computed under the foregoing rules, inclusive of accumulated pass-through fees) is added to your GAM-platform-side balance and is subject to the GAM-First payment-routing rules in Section 5.5.
@@ -114,7 +115,7 @@ Pass-through fees are **not** GAM service fees and are **not** a finance charge 
 
 When you authorize an ACH pull, card payment, or other electronic payment through the Platform — whether for rent, recurring charges, or any other amount you direct to your tenant account — **GAM applies that payment first to any outstanding balance you owe GAM** before settling any remainder to your Landlord's Stripe Connect balance. Outstanding balances owed to GAM may include, without limitation:
 
-- FlexDeposit Service-Level Agreement installments (see Section 9.1) that are then due;
+- FlexDeposit custody installments (see Section 9.1) that are then due;
 - FlexPay subscription fees (see Section 9.2) that are then due;
 - Payment-processing fees that pass through to you under Section 5.2;
 - Any other fee you have agreed to under these Terms or a service-specific agreement.
@@ -129,7 +130,7 @@ By authorizing the payment, you authorize this routing. The Platform discloses t
 
 ### 5.6 Unpaid Rent and Collections
 
-If you fall behind on rent owed to your Landlord, your Landlord has the option, through the Platform, to engage a third-party collections partner (the "**Collections Partner**") to recover the unpaid rent on the Landlord's behalf. **The Collections Partner is engaged solely for landlord-owed unpaid rent.** It is not engaged for any FlexDeposit, FlexPay, or other GAM Service-Level Agreement amount.
+If you fall behind on rent owed to your Landlord, your Landlord has the option, through the Platform, to engage a third-party collections partner (the "**Collections Partner**") to recover the unpaid rent on the Landlord's behalf. **The Collections Partner is engaged solely for landlord-owed unpaid rent.** It is not engaged for any FlexDeposit custody installment, FlexPay subscription fee, or other GAM-owed balance.
 
 If the Collections Partner is engaged:
 
@@ -140,7 +141,7 @@ If the Collections Partner is engaged:
 
 **GAM's role on Section 5.6 collections is limited to facilitating the Landlord's engagement of the Collections Partner.** GAM is not the creditor on the unpaid rent (the Landlord is); GAM is not the collector (the Collections Partner is); GAM does not separately furnish unpaid-rent data to consumer reporting agencies on the Landlord's behalf.
 
-**This Section 5.6 has no application to GAM Service-Level Agreement amounts.** Per Section 9.1, GAM does not engage any collections partner, does not pursue legal action, and does not report to consumer reporting agencies for unpaid FlexDeposit Service-Level Agreement installments. Section 5.6 applies only to landlord-owed unpaid rent.
+**This Section 5.6 has no application to GAM-owed balances.** Per Section 9.1, GAM does not engage any collections partner, does not pursue legal action, and does not report to consumer reporting agencies for unpaid FlexDeposit custody installments. Section 5.6 applies only to landlord-owed unpaid rent.
 
 ## 6. Tenant Deposits Held by GAM
 

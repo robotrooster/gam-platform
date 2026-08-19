@@ -1,10 +1,10 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, METER_READ_REASONS } from '@gam/shared'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { canAccessLandlordResource } from '../middleware/scope'
+import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import {
   generateBillsForMeter,
   generateBillsForProperty,
@@ -105,6 +105,14 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
       SELECT m.*, p.name AS property_name,
         (SELECT COUNT(*)::int FROM utility_meter_units WHERE meter_id = m.id) AS unit_count,
         (SELECT MAX(billing_cycle_month) FROM utility_meter_readings WHERE meter_id = m.id) AS last_reading_cycle,
+        -- S605 (Nic): a submeter with no read at all cannot produce a bill —
+        -- there is no prior value to subtract from — and today that failure is
+        -- SILENT. Surfacing it per meter lets the utilities page say so before
+        -- the cycle closes instead of the landlord discovering a missing bill
+        -- after the fact. Only submeters are affected: RUBS and master-bill
+        -- allocate from the property invoice and never read an odometer.
+        (m.billing_method <> 'submeter'
+         OR EXISTS (SELECT 1 FROM utility_meter_readings WHERE meter_id = m.id)) AS has_baseline,
         -- W-36 (S531): assigned unit ids ride along so the management UI can
         -- render/edit assignments without an N+1 per meter.
         ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids
@@ -135,7 +143,27 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
       // Sewer rides the water meter (S533) — same reading bills sewer
       // at this rate. Water meters only; there is no sewer meter.
       sewerRatePerUnit: z.number().nonnegative().nullable().optional(),
+      // S605 (Nic): the OPENING READ. A submeter's first cycle produces no bill
+      // — there is nothing to subtract from — and the engine says so only in a
+      // preview the landlord may never open. A landlord onboarding mid-month who
+      // enters just the end-of-month read gets NO bill and NO warning, and by
+      // the time that is visible the cycle has closed. Capturing the baseline
+      // WITH the meter is the only point where it is obvious what it's for.
+      // Optional here (a meter can be created before anyone walks the property)
+      // but its absence is surfaced loudly — see hasBaseline on GET /meters.
+      baselineReading:  z.number().nonnegative().nullable().optional(),
+      baselineDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+      // S605 (Nic hit this): creating a meter and assigning it to a unit were
+      // two separate client calls, so when the assignment was refused the meter
+      // had ALREADY been created and stayed behind. Three attempts left three
+      // orphaned meters on Oak Park with no unit and no way to notice them.
+      // Passing the unit here makes it one transaction: either both happen or
+      // neither does.
+      assignUnitId:     z.string().uuid().nullable().optional(),
     }).parse(req.body)
+    if (body.baselineReading != null && !body.baselineDate) {
+      throw new AppError(400, 'An opening read needs the date it was taken')
+    }
     if (body.sewerRatePerUnit != null && body.utilityType !== 'water') {
       throw new AppError(400, 'Sewer rate only applies to water meters — sewer bills off the water reading')
     }
@@ -156,14 +184,63 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
       throw new AppError(403, 'Forbidden')
     }
 
-    const meter = await queryOne<any>(`
-      INSERT INTO utility_meters
-        (property_id, utility_type, label, billing_method, rate_per_unit,
-         base_fee, rubs_allocation_method, digits, sewer_rate_per_unit)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [body.propertyId, body.utilityType, body.label, body.billingMethod,
-       body.ratePerUnit ?? null, body.baseFee,
-       body.rubsAllocationMethod ?? null, body.digits, body.sewerRatePerUnit ?? null])
+    // S605: the double-billing guard is checked BEFORE the meter exists, so a
+    // refused assignment can no longer leave a half-created meter behind.
+    if (body.assignUnitId) {
+      const unit = await queryOne<any>(
+        `SELECT id FROM units WHERE id = $1 AND landlord_id = $2`,
+        [body.assignUnitId, property.landlord_id])
+      if (!unit) throw new AppError(404, 'Unit not found under this landlord')
+      const clash = await queryOne<{ label: string }>(
+        `SELECT m.label FROM utility_meter_units mu
+           JOIN utility_meters m ON m.id = mu.meter_id
+          WHERE mu.unit_id = $1 AND m.utility_type = $2
+            AND (m.billing_method = 'submeter') = ($3 = 'submeter')
+          LIMIT 1`,
+        [body.assignUnitId, body.utilityType, body.billingMethod])
+      if (clash) {
+        throw new AppError(400,
+          `This unit is already on "${clash.label}" for ${body.utilityType}. ` +
+          `A unit can only be on one ${body.billingMethod === 'submeter' ? 'submeter' : 'master meter'} ` +
+          `per utility, or it would be billed twice.`)
+      }
+    }
+
+    const client = await getClient()
+    let meter: any
+    try {
+      await client.query('BEGIN')
+      const created = await client.query<any>(`
+        INSERT INTO utility_meters
+          (property_id, utility_type, label, billing_method, rate_per_unit,
+           base_fee, rubs_allocation_method, digits, sewer_rate_per_unit)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [body.propertyId, body.utilityType, body.label, body.billingMethod,
+         body.ratePerUnit ?? null, body.baseFee,
+         body.rubsAllocationMethod ?? null, body.digits, body.sewerRatePerUnit ?? null])
+      meter = created.rows[0]
+
+      // Stamped as reason 'baseline' rather than 'monthly_cycle': it is the
+      // starting odometer, not a cycle read, and must never be mistaken for one
+      // by the cycle-usage query. billing_cycle_month is the month it was taken.
+      if (body.baselineReading != null && body.baselineDate) {
+        await client.query(`
+          INSERT INTO utility_meter_readings
+            (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+          VALUES ($1,$2,$3,$4,'baseline',$5)`,
+          [meter.id, body.baselineDate, body.baselineReading,
+           body.baselineDate.slice(0, 7) + '-01', req.user!.userId])
+      }
+      if (body.assignUnitId) {
+        await client.query(
+          `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)
+           ON CONFLICT DO NOTHING`, [meter.id, body.assignUnitId])
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK'); throw e
+    } finally { client.release() }
+
     res.status(201).json({ success: true, data: meter })
   } catch (e) { next(e) }
 })
@@ -306,6 +383,35 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
       }
     }
 
+    // S604 (Nic): DOUBLE-BILLING GUARD. Nothing previously stopped the same unit
+    // being attached to two meters of the SAME utility — e.g. RV 01 on two water
+    // RUBS masters — and billing iterates meters, so that unit would receive two
+    // water charges every cycle with nothing to flag it.
+    //
+    // The ONE legitimate same-utility overlap is S558's metered exclusion: a unit
+    // with its own submeter that is ALSO in a RUBS master's served group, so its
+    // usage can be subtracted from the pool before the split (Oak Park's
+    // submetered mobile homes on the shared water master). That pairs exactly one
+    // submeter with exactly one non-submeter meter, so it stays allowed.
+    const clash = await queryOne<{ label: string; billing_method: string }>(
+      `SELECT m.label, m.billing_method
+         FROM utility_meter_units mu
+         JOIN utility_meters m ON m.id = mu.meter_id
+        WHERE mu.unit_id = $1
+          AND m.id <> $2
+          AND m.utility_type = $3
+          -- allow the submeter + master pairing, block a second meter of the
+          -- same KIND (two masters, or two submeters)
+          AND (m.billing_method = 'submeter') = ($4 = 'submeter')
+        LIMIT 1`,
+      [unitId, req.params.id, meter.utility_type, meter.billing_method])
+    if (clash) {
+      throw new AppError(400,
+        `This unit is already on "${clash.label}" for ${meter.utility_type}. ` +
+        `A unit can only be on one ${meter.billing_method === 'submeter' ? 'submeter' : 'master meter'} ` +
+        `per utility, or it would be billed twice. Remove it there first.`)
+    }
+
     await query(`
       INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)
       ON CONFLICT DO NOTHING
@@ -360,6 +466,13 @@ utilityRouter.post('/meters/:id/readings', requirePerm('properties.edit'), async
       readingDate:        z.string(),                  // YYYY-MM-DD
       readingValue:       z.number(),
       billingCycleMonth:  z.string(),                  // YYYY-MM-01
+      // S605 (Nic): this route is the BACKDATABLE one — it takes an explicit
+      // reading date, which is what an opening read needs (Oak Park's baselines
+      // have to be dated before the reads they enable). Only 'baseline' is
+      // accepted from a caller; every other reason is stamped by the system from
+      // the calendar, and letting a client claim 'monthly_cycle' here would let
+      // it forge the billed read.
+      reason:             z.literal('baseline').optional(),
     }).parse(req.body)
     const meter = await queryOne<any>(
       `SELECT m.*, p.landlord_id FROM utility_meters m
@@ -371,10 +484,10 @@ utilityRouter.post('/meters/:id/readings', requirePerm('properties.edit'), async
     }
     const reading = await queryOne<any>(`
       INSERT INTO utility_meter_readings
-        (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
-      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [req.params.id, body.readingDate, body.readingValue,
-       body.billingCycleMonth, req.user!.userId])
+       body.billingCycleMonth, body.reason ?? 'monthly_cycle', req.user!.userId])
     res.status(201).json({ success: true, data: reading })
   } catch (e) { next(e) }
 })
@@ -963,3 +1076,62 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── S605 (Nic, DIRECTIVE): PROPERTY-LEVEL UTILITY RATES ─────────────────────
+// "Make utility rates set at the property level. Adding each unit is redundant
+// and possible discrimination."
+//
+// Pricing is policy, decided once per property per utility, not per tenant. The
+// billing engine reads these and they override the meter columns — so two
+// neighbours on the same water main cannot be charged different rates because
+// of who entered their unit. Same posture as the S535 property-level late fees.
+utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
+  try {
+    const propertyId = String(req.query.propertyId || '')
+    if (!propertyId) throw new AppError(400, 'propertyId is required')
+    const property = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT utility_type, rate_per_unit, base_fee, sewer_rate_per_unit, updated_at
+         FROM property_utility_rates WHERE property_id = $1 ORDER BY utility_type`, [propertyId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+utilityRouter.post('/property-rates', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      propertyId:       z.string().uuid(),
+      utilityType:      z.enum(utilityTypeEnum),
+      ratePerUnit:      z.number().nonnegative().nullable().optional(),
+      baseFee:          z.number().nonnegative().default(0),
+      sewerRatePerUnit: z.number().nonnegative().nullable().optional(),
+    }).parse(req.body)
+    if (body.sewerRatePerUnit != null && body.utilityType !== 'water') {
+      throw new AppError(400, 'Sewer rate only applies to water — sewer bills off the water reading')
+    }
+    const property = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const row = await queryOne<any>(
+      `INSERT INTO property_utility_rates
+         (property_id, utility_type, rate_per_unit, base_fee, sewer_rate_per_unit)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (property_id, utility_type)
+       DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit,
+                     base_fee = EXCLUDED.base_fee,
+                     sewer_rate_per_unit = EXCLUDED.sewer_rate_per_unit,
+                     updated_at = now()
+       RETURNING *`,
+      [body.propertyId, body.utilityType, body.ratePerUnit ?? null,
+       body.baseFee, body.sewerRatePerUnit ?? null])
+
+    // Changing policy must not rewrite bills already issued — utility_bills
+    // snapshots the rate each bill was charged at. This only affects what is
+    // generated from here on.
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})

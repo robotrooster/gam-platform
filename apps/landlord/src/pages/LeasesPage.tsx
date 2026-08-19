@@ -33,6 +33,7 @@ export function LeasesPage() {
   // S511 #15: confirmed leases open read-only (terms locked once signed); only
   // needs-review imports open editable so the owner can confirm defaults.
   const [viewOnly, setViewOnly] = useState(false)
+  const [carriedLease, setCarriedLease] = useState<any | null>(null)
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
@@ -367,6 +368,20 @@ export function LeasesPage() {
                             <FileText size={12} /> Bill fee
                           </button>
                         )}
+                        {/* S605 (Nic): arrears from the landlord's previous
+                            system. Sits beside Bill fee because it is the same
+                            act — a landlord adding a charge — but it is entered
+                            ONCE per lease at migration, not recurring. */}
+                        {can('leases.bill_fee') && l.status === 'active' && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="Record a balance this tenant already owed before moving onto GAM"
+                            onClick={() => setCarriedLease(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <FileText size={12} /> Carried balance
+                          </button>
+                        )}
                         {can('leases.create') && l.status === 'active' && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -434,6 +449,12 @@ export function LeasesPage() {
         <BillFeeModal
           lease={billFeeLease}
           onClose={() => setBillFeeLease(null)}
+        />
+      )}
+      {carriedLease && (
+        <CarriedBalanceModal
+          lease={carriedLease}
+          onClose={() => setCarriedLease(null)}
         />
       )}
 
@@ -746,6 +767,90 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
         </div>
         <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5 }}>
           The tenant will see this on their Payments page as a pending charge. If unpaid at move-out it sweeps into the deposit deduction automatically.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── S605 (Nic): CARRIED BALANCE ─────────────────────────────────────────────
+// "No way to carry a tenant's OUTSTANDING BALANCE onto the platform." A landlord
+// migrating from another system had no way to record what a tenant already owed,
+// so the debt lived off-platform and the books never reconciled.
+//
+// The late-fee choice is the part that matters and is why it is a visible
+// decision rather than a hidden default: the nightly engine walks unpaid
+// invoices, so without the exemption a carried balance starts compounding the
+// day it is entered. Nic: a tenant on a catch-up plan shouldn't be fined for
+// arrears from the old system.
+function CarriedBalanceModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [amount, setAmount] = useState('')
+  const [description, setDescription] = useState('')
+  const [accruesLateFees, setAccruesLateFees] = useState(false)
+  const [error, setError] = useState('')
+
+  const save = useMutation(
+    () => apiPost(`/leases/${lease.id}/carried-balance`, {
+      amount: Number(amount),
+      description: description.trim() || undefined,
+      accruesLateFees,
+    }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('leases'); qc.invalidateQueries('payments')
+        toast('Carried balance recorded.')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not record the balance'),
+    },
+  )
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Carried balance</div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.55 }}>
+          What this tenant already owed before moving onto GAM. It becomes a charge
+          they can pay in their portal, and it shows on their statement as "BALANCE"
+          so it doesn't read as a duplicate rent charge.
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Amount owed *</label>
+          <input className="input" type="number" step="0.01" min="0" value={amount} autoFocus
+            onChange={e => setAmount(e.target.value)} placeholder="2000.00" style={{ width: '100%' }} />
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>What it's for</label>
+          <input className="input" value={description} onChange={e => setDescription(e.target.value)}
+            placeholder="Balance from previous management" style={{ width: '100%' }} />
+        </div>
+
+        <label style={{ display: 'flex', gap: 9, alignItems: 'flex-start', cursor: 'pointer', padding: 10, borderRadius: 8, background: 'var(--bg-2)', marginBottom: 14 }}>
+          <input type="checkbox" checked={accruesLateFees} onChange={e => setAccruesLateFees(e.target.checked)} style={{ marginTop: 2 }} />
+          <span style={{ fontSize: '.8rem', lineHeight: 1.5 }}>
+            <strong>Charge late fees on this balance</strong>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+              Off by default — a tenant catching up on an old balance isn't fined for it.
+              Turn this on only if the debt was already accruing fees before the move.
+            </div>
+          </span>
+        </label>
+
+        {error && (
+          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!Number(amount) || save.isLoading}
+            onClick={() => { setError(''); save.mutate() }}>
+            {save.isLoading ? 'Saving…' : 'Record balance'}
+          </button>
         </div>
       </div>
     </div>

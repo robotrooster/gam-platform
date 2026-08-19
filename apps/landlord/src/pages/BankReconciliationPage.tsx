@@ -6,7 +6,6 @@
 // "manual until Plaid" note was removed: the live feed exists now (Stripe FC);
 // this manual charge-log is the fallback for un-linked banks / missed charges.
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { toast } from '../components/dialogs'
@@ -19,7 +18,13 @@ const monthBounds = (ym: string) => {
   return { from, to }
 }
 
-export function BankReconciliationPage() {
+// S605 (Nic): merged into a single "Bank" tab. Reconciliation was built (S568)
+// as the MANUAL stand-in while waiting for a bank feed — its own header said
+// "manual for now (no bank feed until Plaid)". The feed landed two sessions
+// later (S570) and nobody merged them, leaving a workaround sitting in the nav
+// beside the automated version of itself. `embedded` renders this as a section
+// of BankPage instead of a standalone screen.
+export function BankReconciliationPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient()
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
   const { from, to } = monthBounds(month)
@@ -45,21 +50,30 @@ export function BankReconciliationPage() {
 
   return (
     <div>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Bank Reconciliation</h1>
-          <p className="page-subtitle">Match your statement to what GAM sent you, and categorize bank charges into your P&L.</p>
+      {embedded ? (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
+          <div>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Does this month balance?</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>What GAM sent you, versus what actually hit your bank.</div>
+          </div>
+          <input className="form-input" type="month" value={month} onChange={e => { setMonth(e.target.value); setCharge(c => ({ ...c, expenseDate: e.target.value + '-01' })) }} style={{ width: 'auto' }} />
         </div>
-        <input className="form-input" type="month" value={month} onChange={e => { setMonth(e.target.value); setCharge(c => ({ ...c, expenseDate: e.target.value + '-01' })) }} style={{ width: 'auto' }} />
-      </div>
+      ) : (
+        <div className="page-header">
+          <div>
+            <h1 className="page-title">Bank Reconciliation</h1>
+            <p className="page-subtitle">Match your statement to what GAM sent you, and categorize bank charges into your P&L.</p>
+          </div>
+          <input className="form-input" type="month" value={month} onChange={e => { setMonth(e.target.value); setCharge(c => ({ ...c, expenseDate: e.target.value + '-01' })) }} style={{ width: 'auto' }} />
+        </div>
+      )}
 
-      {/* S576 (B-5): signpost the sibling workflow — this MATCHES a statement;
-          Bank Feed CATEGORIZES linked-bank spend. */}
-      <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 16, lineHeight: 1.5 }}>
-        This <strong>matches a month's deposits</strong> to what GAM sent you. To pull and
-        categorize spending from a linked bank into your P&L, use{' '}
-        <Link to="/bank-feed" style={{ color: 'var(--gold)', fontWeight: 600 }}>Bank Feed</Link>.
-      </div>
+      {/* S605: the sibling-tab signpost is gone — they are one tab now. */}
+      {!embedded && (
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 16, lineHeight: 1.5 }}>
+          This <strong>matches a month's deposits</strong> to what GAM sent you.
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12, marginBottom: 20 }}>
         {[['GAM sent you', fmt(gamDisbursed)], ['Bank charges logged', fmt(bankChargesTotal)],
@@ -75,7 +89,7 @@ export function BankReconciliationPage() {
         <div className="card-title" style={{ marginBottom: 12 }}>Log a bank charge</div>
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10 }}>
           Bank fees, wire fees, NSF charges — recorded as expenses and flow into your P&L.
-          If your bank is linked in <Link to="/bank-feed" style={{ color: 'var(--gold)' }}>Bank Feed</Link>, these get captured there automatically — use this for manual entry.
+          If your bank is linked below, these get captured automatically — use this for anything it missed.
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
           <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Amount

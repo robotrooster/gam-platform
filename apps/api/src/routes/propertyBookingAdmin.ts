@@ -105,7 +105,10 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
       // S602 personalization sections — the landlord's story + local-area guide.
       about:      z.string().max(8000).nullable().optional(),
       area:       z.string().max(8000).nullable().optional(),
-      depositPct: z.number().min(0).max(100).optional(),
+      // S602 spec (Nic): booking deposit is 5–20% in 5-point steps only (default 10%).
+      depositPct: z.number().refine((v) => [5, 10, 15, 20].includes(v), {
+        message: 'Booking deposit must be 5, 10, 15, or 20 percent',
+      }).optional(),
       // Flat deposit for 30+ night stays (null = platform default). The quote
       // layer additionally hard-caps it at one month's rent per site type.
       monthlyDeposit: z.number().min(0).nullable().optional(),

@@ -84,6 +84,10 @@ export async function findAvailableUnits(opts: {
     JOIN properties p ON p.id = u.property_id
     LEFT JOIN property_unit_subtypes s ON s.id = u.subtype_id
     WHERE u.landlord_id = $1 ${filter}
+      -- S605: a retired unit keeps its history but is never offered again. The
+      -- DB triggers already refuse a new lease/booking on one; this keeps it out
+      -- of the picker so nobody is shown a choice that would then be rejected.
+      AND u.retired_at IS NULL
       AND NOT EXISTS (
         SELECT 1 FROM unit_bookings b
         WHERE b.unit_id = u.id AND b.status NOT IN ('cancelled')

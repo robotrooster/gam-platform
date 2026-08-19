@@ -15,7 +15,7 @@ You can change how you pay rent in GAM at any time. GAM supports electronic paym
 A processing fee may apply based on how you pay, and your payment screen shows it before you confirm:
 
 - **ACH (bank account):** a flat $6.00 per payment.
-- **Card:** 3.25% plus $0.26 per transaction.
+- **Card:** 3.5% plus $0.55 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 
 Whether you or your landlord covers this fee is a per-property setting. For larger payments, paying from a bank account is often the lowest-cost choice because the ACH fee is a flat $6 (for a small payment a card can be cheaper).
@@ -24,4 +24,4 @@ Whether you or your landlord covers this fee is a per-property setting. For larg
 
 If a card was declined or a bank transfer was returned, updating to a working payment method and trying again is usually the fix. A failed payment leaves the balance still owing until it's paid.
 
-Need a hand updating your method, or running into trouble with account access or security while doing it? We can help — and anything involving account security or money movement is handed to a human GAM specialist.
+Need a hand updating your method, or running into trouble with account access or security while doing it? We can help — and anything involving account security or money movement is handed to a human GAM Strategist.

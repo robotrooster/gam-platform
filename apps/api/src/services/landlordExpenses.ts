@@ -16,7 +16,6 @@ export interface CreateExpenseInput {
   vendor?: string | null
   expenseDate: string          // YYYY-MM-DD
   isCommon?: boolean
-  allocatePerUnit?: boolean
 }
 
 export async function createLandlordExpense(input: CreateExpenseInput) {
@@ -37,7 +36,11 @@ export async function createLandlordExpense(input: CreateExpenseInput) {
     const p = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [propertyId])
     if (!p || p.landlord_id !== input.landlordId) throw new AppError(400, 'Property does not belong to you')
   }
-  const allocate = isCommon && !!input.allocatePerUnit
+  // S603 (Nic): allocation is unconditional now — any non-unit-linked cost is
+  // split across the property's units at report time. The column is retained
+  // (keep-everything) and written TRUE so historical rows read consistently,
+  // but nothing consults it any more.
+  const allocate = isCommon
 
   const row = await queryOne<any>(
     `INSERT INTO landlord_expenses
@@ -105,8 +108,20 @@ export async function landlordExpensesTotal(landlordId: string, from: string, to
 
 /**
  * Expense attributable to a single UNIT in a range, for per-unit P&L:
- * unit-linked expenses in full + each allocate_per_unit common expense on the
- * unit's property divided by that property's unit count.
+ * unit-linked expenses in full + EVERY non-unit-linked expense on the unit's
+ * property divided by that property's unit count.
+ *
+ * S603 (Nic): allocation is unconditional. Any cost not tied to one unit gets
+ * spread across all of them — "there's no reason to just have it sit higher at a
+ * property level and not get factored into a per-unit cost." Pre-S603 this
+ * required the landlord to tick `allocate_per_unit`, so an un-ticked insurance
+ * bill dropped out of per-unit cost entirely and made units look cheaper to run
+ * than they are. Divided by ALL units, not just occupied ones — a vacant unit
+ * still carries its share, and dividing by occupied would spike costs as
+ * occupancy falls.
+ *
+ * Must stay in lockstep with services/reportEngine.ts, which applies the same
+ * rule; if these two drift, a landlord's per-unit cost differs by screen.
  */
 export async function unitAllocatedExpenses(unitId: string, from: string, to: string): Promise<number> {
   const direct = await queryOne<{ total: string }>(
@@ -119,7 +134,7 @@ export async function unitAllocatedExpenses(unitId: string, from: string, to: st
        JOIN units target ON target.id = $1
        JOIN LATERAL (SELECT COUNT(*)::int AS n FROM units u2 WHERE u2.property_id = target.property_id) uc ON TRUE
       WHERE e.property_id = target.property_id AND e.unit_id IS NULL
-        AND e.is_common = TRUE AND e.allocate_per_unit = TRUE AND e.status='active'
+        AND e.status='active'
         AND e.expense_date >= $2 AND e.expense_date <= $3`,
     [unitId, from, to])
   return Math.round((parseFloat(direct?.total ?? '0') + parseFloat(allocated?.total ?? '0')) * 100) / 100

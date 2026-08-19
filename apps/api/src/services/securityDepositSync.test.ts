@@ -38,7 +38,13 @@ interface Stack {
 // transaction. depositMode sets the property's deposit_handling_mode.
 async function buildStack(
   client: PoolClient,
-  opts: { depositMode?: 'landlord_held' | 'gam_escrow'; attachTenant?: boolean } = {},
+  opts: {
+    depositMode?: 'landlord_held' | 'gam_escrow'
+    attachTenant?: boolean
+    leaseSource?: 'esigned' | 'imported'
+    custodyState?: string
+    custodyStatus?: 'supported' | 'blocked'
+  } = {},
 ): Promise<Omit<Stack, 'client'>> {
   const { userId: ownerUserId, landlordId } = await seedLandlord(client)
   const propertyId = await seedProperty(client, {
@@ -50,8 +56,27 @@ async function buildStack(
       [opts.depositMode, propertyId],
     )
   }
+  // S604: GAM may only take custody where the state's law permits its vehicle,
+  // and the gate FAILS CLOSED — a state with no custody row resolves to
+  // 'landlord'. gam_test is rebuilt from the schema dump so the catalog is
+  // empty; seed the property's state as supported unless a test wants the
+  // blocked path.
+  const stateCode = opts.custodyState ?? 'XZ'
+  await client.query(`UPDATE properties SET state = $1 WHERE id = $2`, [stateCode, propertyId])
+  if (opts.custodyStatus !== 'blocked') {
+    await client.query(
+      `INSERT INTO state_deposit_custody_rules
+         (state_code, custody_status, allows_treasury_bills, statute_citation)
+       VALUES ($1, 'supported', true, 'test')
+       ON CONFLICT (state_code) DO UPDATE SET custody_status='supported'`,
+      [stateCode])
+  }
   const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
   const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 1000, status: 'pending' })
+  // S602: lease_source drives who holds the deposit (native → GAM escrow; imported → landlord).
+  if (opts.leaseSource) {
+    await client.query(`UPDATE leases SET lease_source = $1 WHERE id = $2`, [opts.leaseSource, leaseId])
+  }
   const tenantId = await seedTenant(client)
   if (opts.attachTenant !== false) {
     await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
@@ -82,24 +107,57 @@ async function withTx(fn: (client: PoolClient, s: Omit<Stack, 'client'>) => Prom
 }
 
 describe('syncSecurityDepositRow — creation', () => {
-  it('creates a pending row with held_by=landlord for a landlord_held property', async () => {
+  it('new (native) lease → held_by=gam_escrow even on a landlord_held property', async () => {
+    // S602: GAM holds ALL new-tenant deposits in escrow. Default property mode is
+    // landlord_held; a native (non-imported) lease overrides it to gam_escrow.
     await withTx(async (client, s) => {
       await syncSecurityDepositRow(s.leaseId, 1200, client)
       const dep = await getDeposit(client, s.leaseId)
       expect(dep).not.toBeNull()
       expect(dep.status).toBe('pending')
-      expect(dep.held_by).toBe('landlord')
+      expect(dep.held_by).toBe('gam_escrow')
       expect(Number(dep.total_amount)).toBe(1200)
       expect(Number(dep.collected_amount)).toBe(0)
     })
   })
 
-  it('maps a gam_escrow property to held_by=gam_escrow', async () => {
+  // S604 custody gate — the state's law overrides the lease-source rule.
+  it('S604: a state GAM cannot custody in forces held_by=landlord, even for a NEW lease', async () => {
+    // Washington requires a trust account at an institution located in WA; a
+    // brokerage Treasury position does not qualify, so GAM must not take custody
+    // no matter that this is a native GAM lease.
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1200, client)
+      const dep = await getDeposit(client, s.leaseId)
+      expect(dep.held_by).toBe('landlord')
+    }, { custodyState: 'XY', custodyStatus: 'blocked' })
+  })
+
+  it('S604: FAILS CLOSED — an unresearched state also resolves to landlord', async () => {
+    // No row in the catalog must never read as permission.
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1200, client)
+      const dep = await getDeposit(client, s.leaseId)
+      expect(dep.held_by).toBe('landlord')
+    }, { custodyState: 'XW', custodyStatus: 'blocked' })
+  })
+
+  it('imported lease on a landlord_held property → held_by=landlord', async () => {
+    // Existing (pre-onboarding) tenant: the deposit stays in the landlord's custody.
+    await withTx(async (client, s) => {
+      await syncSecurityDepositRow(s.leaseId, 1200, client)
+      const dep = await getDeposit(client, s.leaseId)
+      expect(dep.held_by).toBe('landlord')
+    }, { leaseSource: 'imported' })
+  })
+
+  it('imported lease turned over to GAM (gam_escrow property) → held_by=gam_escrow', async () => {
+    // FlexVault: the landlord turned an existing deposit over to GAM.
     await withTx(async (client, s) => {
       await syncSecurityDepositRow(s.leaseId, 800, client)
       const dep = await getDeposit(client, s.leaseId)
       expect(dep.held_by).toBe('gam_escrow')
-    }, { depositMode: 'gam_escrow' })
+    }, { leaseSource: 'imported', depositMode: 'gam_escrow' })
   })
 
   it('skips creation when no primary tenant is attached yet', async () => {

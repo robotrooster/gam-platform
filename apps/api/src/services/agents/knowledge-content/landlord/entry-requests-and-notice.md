@@ -1,27 +1,23 @@
 ---
 scope: landlord
-title: Scheduling Entry to a Unit & Giving Proper Notice
+title: Entry Requests — the record of notice given to enter a unit
 ---
-The **Entry Requests** page is GAM's notice-of-entry workflow: you propose a visit, the tenant is notified and responds, and the actual entry is recorded afterward — creating a clean paper trail that notice was given.
+Entering a tenant's unit requires proper notice, and GAM builds that into the workflows where entry actually comes up — you don't create an entry request on its own. An entry request is generated as part of the job that needs access: scheduling a **maintenance** visit that requires going into the unit, or a **periodic inspection**. Each one carries the required notice to the tenant and records their response, so there's a clean, legal paper trail.
 
-## Sending a notice
+## Where they live
 
-Click **New Request** and fill in the unit, tenant, a reason category (maintenance, inspection, showing, emergency, or other), reason details (visible to the tenant), and a proposed entry window with a start and end time.
+The **Entry Requests** tab on your **Maintenance** page is the **record** of every entry request across your properties — a history you can review and filter by status. It's a log; entry requests are initiated through the proper workflow (a maintenance visit or an inspection that needs entry), not created ad hoc from this tab.
 
-As you pick the window, the form shows how many hours of notice you're giving. The standard is **24 hours** — below that, the form warns you to send only if circumstances justify it (an emergency reason bypasses the notice-window check). After sending, you may also see informational notes: an **outside typical hours** flag, and any state-law notices about entry-notice requirements in your area. These are informational only — the notice still goes to the tenant.
+## Notice and response
+
+When a request is generated, the tenant is notified with the reason, the proposed entry window, and how much notice they're being given — the standard is **24 hours**, and emergencies are handled differently from planned visits. The tenant responds, granted or denied, from their portal.
 
 ## The lifecycle
 
-Each request moves through statuses you can filter by on the list page:
-
-- **Pending** — sent, awaiting the tenant's response.
+- **Pending** — the tenant has been notified and hasn't responded yet.
 - **Granted / Denied** — the tenant's answer. A denial is informational; it doesn't delete the request.
-- **Completed** — after the visit, you record the actual entry time. An entry within the proposed window with the tenant's grant records as proper notice given.
+- **Completed** — after the visit, the actual entry time is recorded. An entry within the proposed window with the tenant's grant records as proper notice given.
 - **Breached** — the recorded entry fell outside the window, or happened without a grant.
-- **Cancelled** — you can cancel any request before recording the entry.
+- **Cancelled** — a request can be cancelled before the entry is recorded, and stale requests auto-cancel.
 
-## Why record the entry
-
-Recording the actual entry moment closes the loop: it timestamps that the visit happened as noticed, and both proper notice and breaches are tracked on the record. Entry requests that go stale without an entry are cancelled automatically.
-
-Team members need the entry-request permissions to create and manage requests. Local entry-notice laws vary — GAM surfaces general warnings, but check your local rules for what applies to your property.
+Recording the actual entry closes the loop and timestamps that the visit happened as noticed. How much notice is required, and your rights around entry, depend on your local law — GAM surfaces general warnings, but check your local rules for your property.

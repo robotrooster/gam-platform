@@ -19,7 +19,7 @@ Contact us right away if you:
 - Can no longer sign in or have lost access to your account email
 - Think someone else may have your password
 
-Account security and access issues are always escalated to a human GAM specialist, who can help you recover and secure your account safely. Don't keep retrying on your own if you're locked out — reach out and ask to be connected.
+Account security and access issues are always escalated to a human GAM Strategist, who can help you recover and secure your account safely. Don't keep retrying on your own if you're locked out — reach out and ask to be connected.
 
 ## A note on roles
 

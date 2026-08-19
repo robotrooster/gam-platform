@@ -221,6 +221,58 @@ describe('PATCH /api/units/:id/status', () => {
       .send({ status: 'nonsense_status' })
     expect(res.status).toBe(400)
   })
+
+  // S604 owner_use: the status means "the owner lives here" — no lease, no
+  // rent, off the market. Both halves of that are enforced, not documented.
+  it('S604: owner_use takes the unit off the market (not listed, not bookable)', async () => {
+    const f = await seed()
+    await db.query(
+      `UPDATE units SET listed_vacant = TRUE, is_bookable = TRUE WHERE id = $1`,
+      [f.aUnitId])
+
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/status`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'owner_use' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('owner_use')
+    // Leaving these set would keep an owner-occupied unit accepting bookings.
+    expect(res.body.data.listed_vacant).toBe(false)
+    expect(res.body.data.is_bookable).toBe(false)
+  })
+
+  it('S604: a unit with a live lease CANNOT be flipped to owner_use', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid })
+      await c.query('COMMIT')
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/status`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'owner_use' })
+    // Otherwise a landlord could keep a paying tenant while dropping the unit
+    // out of every revenue-shaped aggregate.
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/active or pending lease/i)
+  })
+
+  it('S604: a lease CANNOT be created on an owner_use unit (DB trigger)', async () => {
+    const f = await seed()
+    await db.query(`UPDATE units SET status = 'owner_use' WHERE id = $1`, [f.aUnitId])
+    // Guarded at the DB, not the call site — leases are created from five
+    // different code paths.
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await expect(seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid }))
+        .rejects.toThrow(/owner-occupied/i)
+      await c.query('ROLLBACK')
+    } finally { c.release() }
+  })
 })
 
 // ─── POST /api/units/:id/eviction-mode ─────────────────────
@@ -625,5 +677,161 @@ describe('POST /api/units — dwelling_ownership (S550)', () => {
        VALUES ($1, 'mobile_home', 'Park Model Rental', 800, 'landlord') RETURNING id`,
       [f.aPropId])
     expect(await createUnit(f, { subtypeId: sub.rows[0].id })).toBe('landlord')
+  })
+})
+
+// ─── S604: bulk numbering must be able to match a real park's signage ───────
+describe('POST /api/units — startAt / padWidth', () => {
+  it('startAt names a block at an arbitrary number (Oak Park RV 20-36)', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .post('/api/units')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'RV', quantity: 3, startAt: 20,
+              unitType: 'rv_spot', rentAmount: 440 })
+    expect(res.status).toBe(201)
+    const nums = (res.body.data.units as any[]).map(u => u.unit_number)
+    expect(nums).toEqual(['RV 20', 'RV 21', 'RV 22'])
+  })
+
+  it('without startAt it still continues after the highest existing number', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'RV', quantity: 2, unitType: 'rv_spot', rentAmount: 440 })
+    const res = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'RV', quantity: 2, unitType: 'rv_spot', rentAmount: 440 })
+    expect(res.status).toBe(201)
+    expect((res.body.data.units as any[]).map(u => u.unit_number)).toEqual(['RV 03', 'RV 04'])
+  })
+
+  it('padWidth controls zero padding', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .post('/api/units')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'Lot', quantity: 2, startAt: 8, padWidth: 1,
+              unitType: 'mobile_home', rentAmount: 500 })
+    expect(res.status).toBe(201)
+    expect((res.body.data.units as any[]).map(u => u.unit_number)).toEqual(['Lot 8', 'Lot 9'])
+  })
+
+  it('the same number under a DIFFERENT prefix is allowed (MH 01 alongside RV 01)', async () => {
+    // Uniqueness is (property, lower(trim(unit_number))) — the whole string —
+    // so parks that number mobile homes and RV spots 1..N independently must
+    // use distinct prefixes. This pins that it works.
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'RV', quantity: 1, startAt: 1, unitType: 'rv_spot', rentAmount: 440 })
+    const res = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'MH', quantity: 1, startAt: 1, unitType: 'mobile_home', rentAmount: 500 })
+    expect(res.status).toBe(201)
+  })
+})
+
+// ─── S604: renumber + delete ───────────────────────────────────────────────
+describe('PATCH /api/units/:id/number', () => {
+  // NOTE: f.aUnitId carries a booking from the fixture, so it is LOCKED (see the
+  // history test below). These use freshly-created, history-free units.
+  const freshUnit = async (f: any, app: any, number: string) => {
+    const r = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: number, quantity: 1, unitType: 'rv_spot', rentAmount: 440 })
+    return r.body.data.id as string
+  }
+
+  it('renames a unit', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const id = await freshUnit(f, app, 'Tmp 01')
+    const res = await request(app).patch(`/api/units/${id}/number`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 07' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.unit_number).toBe('RV 07')
+  })
+
+  it('409s on a collision, naming the prefix workaround', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const id = await freshUnit(f, app, 'Tmp 01')
+    await freshUnit(f, app, 'RV 07')
+    const res = await request(app).patch(`/api/units/${id}/number`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 07' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/already used/i)
+  })
+
+  it('cross-landlord → 403', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).patch(`/api/units/${f.bUnitId}/number`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'X 1' })
+    expect(res.status).toBe(403)
+  })
+
+  // S604 (Nic): "I wouldn't allow a rename of a unit after data is on something."
+  // Nothing snapshots unit_number, so a rename rewrites how years of invoices
+  // display. Retire + replace is the intended path instead.
+  it('LOCKS the number once the unit has history (seed puts a booking on A)', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).patch(`/api/units/${f.aUnitId}/number`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 99' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/number is locked/i)
+    expect(res.body.error).toMatch(/retire/i)
+  })
+
+  it('still allows renaming a freshly-created unit with no history', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'Typo 01', quantity: 1, unitType: 'rv_spot', rentAmount: 440 })
+    const res = await request(app).patch(`/api/units/${made.body.data.id}/number`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 42' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.unit_number).toBe('RV 42')
+  })
+})
+
+describe('DELETE /api/units/:id', () => {
+  it('deletes a unit created by mistake (no history)', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'Oops 01', quantity: 1, unitType: 'rv_spot', rentAmount: 440 })
+    const id = made.body.data.id
+    const res = await request(app).delete(`/api/units/${id}`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    const { rows } = await db.query('SELECT 1 FROM units WHERE id=$1', [id])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('REFUSES a unit with a lease — GAM keeps history', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const res = await request(buildApp()).delete(`/api/units/${f.aUnitId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/lease on record/i)
+    expect(res.body.error).toMatch(/out of service/i)
+  })
+
+  it('REFUSES a unit with a booking', async () => {
+    // seed() puts a booking on A's unit.
+    const f = await seed()
+    const res = await request(buildApp()).delete(`/api/units/${f.aUnitId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(409)
+  })
+
+  it('cross-landlord → 403', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).delete(`/api/units/${f.bUnitId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(403)
   })
 })

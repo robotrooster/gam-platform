@@ -4,7 +4,7 @@
 // finalize / syncConnection's pull, which are exercised in the route/integration
 // layer; here we drive upsertTransactions directly with normalized rows.
 import { describe, it, expect, beforeEach } from 'vitest'
-import { db } from '../db'
+import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 import {
   upsertTransactions, autoMatchLandlord, categorizeTransaction, ignoreTransaction,
@@ -141,14 +141,57 @@ describe('categorize', () => {
     expect(sug?.unitId).toBe(f.unitB)
   })
 
-  it('rejects categorizing an inbound (money-in) transaction', async () => {
+  // S605 (Nic): "if the only option is to ignore it, why are we even showing it
+  // on this page?" — inbound money used to be rejected outright, which meant any
+  // income GAM didn't collect (laundry, an insurance claim, cash rent deposited)
+  // could never reach the P&L. It now books to landlord_other_income.
+  it('categorizes an inbound (money-in) transaction as income', async () => {
     const f = await seed()
     await upsertTransactions(f.connectionId, f.landlordId, [
-      { externalId: 'in_x', postedDate: '2026-08-10', amount: 500, description: 'SOMETHING' },
+      { externalId: 'in_x', postedDate: '2026-08-10', amount: 500, description: 'COINMACH LAUNDRY' },
     ])
     const [txn] = await listTransactions(f.landlordId, { status: 'needs_review' })
-    await expect(categorizeTransaction(f.landlordId, txn.id, { category: 'other', scopeKind: 'unit', unitId: f.unitA }))
-      .rejects.toThrow(/money-out/i)
+    const res = await categorizeTransaction(f.landlordId, txn.id,
+      { category: 'laundry', scopeKind: 'unit', unitId: f.unitA })
+    expect(res.incomeId).toBeTruthy()
+    expect(res.expenseId).toBeUndefined()   // must NOT land on the expense side
+
+    const [inc] = await query<any>('SELECT * FROM landlord_other_income WHERE id = $1', [res.incomeId])
+    expect(Number(inc.amount)).toBe(500)    // stored positive, not as a negative expense
+    expect(inc.category).toBe('laundry')
+  })
+
+  // The sign of the amount decides the side, so neither category set may cross
+  // over — otherwise a deposit could be filed as 'repairs' and quietly reduce
+  // reported profit instead of raising it.
+  it('refuses an income category on money out, and an expense category on money in', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'out_y', postedDate: '2026-08-10', amount: -80, description: 'ACE HARDWARE' },
+      { externalId: 'in_y', postedDate: '2026-08-10', amount: 80, description: 'DEPOSIT' },
+    ])
+    const txns = await listTransactions(f.landlordId, { status: 'needs_review' })
+    const out = txns.find((t: any) => Number(t.amount) < 0)
+    const inn = txns.find((t: any) => Number(t.amount) > 0)
+
+    await expect(categorizeTransaction(f.landlordId, out.id,
+      { category: 'laundry', scopeKind: 'unit', unitId: f.unitA })).rejects.toThrow(/expense category/i)
+    await expect(categorizeTransaction(f.landlordId, inn.id,
+      { category: 'repairs', scopeKind: 'unit', unitId: f.unitA })).rejects.toThrow(/income category/i)
+  })
+
+  // Money GAM already sent the landlord reaches the P&L through `payments`.
+  // Booking it again here would report the same rent twice.
+  it('refuses to book a matched GAM disbursement as income', async () => {
+    const f = await seed()
+    await upsertTransactions(f.connectionId, f.landlordId, [
+      { externalId: 'in_matched', postedDate: '2026-08-10', amount: 500, description: 'GAM PAYOUT' },
+    ])
+    const [txn] = await query<any>(
+      `UPDATE bank_transactions SET status='matched' WHERE landlord_id=$1 AND external_id='in_matched' RETURNING *`,
+      [f.landlordId])
+    await expect(categorizeTransaction(f.landlordId, txn.id,
+      { category: 'other', scopeKind: 'unit', unitId: f.unitA })).rejects.toThrow(/double/i)
   })
 
   it('unit scope requires a unit; property scope requires a property', async () => {

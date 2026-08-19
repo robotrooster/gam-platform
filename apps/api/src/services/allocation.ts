@@ -44,6 +44,7 @@ interface PaymentRow {
   status: string
   gam_supersedence_amount: string
   sublease_markup_amount: string
+  stripe_payment_intent_id: string | null
 }
 
 interface PropertyAndRuleRow {
@@ -89,6 +90,87 @@ interface ProcessingRateRow {
   stripe_cost_cap: string | null
 }
 
+/**
+ * S603: what did Stripe ACTUALLY process, and which rows did it cover?
+ *
+ * A single charge can settle several payment rows (the FIFO lump in
+ * /pay-balance stamps its PaymentIntent on every covered row). The processing
+ * fee was charged ONCE against the whole lump, so allocation must reason about
+ * the charge — not the row it happens to be looking at.
+ *
+ *   feeBase       — the sum the fee was computed against, i.e. what the tenant
+ *                   chose to pay. Matches /pay-balance's `body.amount`.
+ *   allocTotal    — sum of the rows allocation actually runs for (rent/utility),
+ *                   which is what the fee gets apportioned across.
+ *   isLastRow     — deterministic (id order) so exactly one row absorbs the
+ *                   rounding remainder.
+ *
+ * A payment with no PaymentIntent (a recorded cash/check payment) is its own
+ * charge of one row, which collapses to the pre-S603 behaviour.
+ */
+interface ChargeContext {
+  feeBase:    number
+  allocTotal: number
+  isLastRow:  boolean
+  priorRows:  { id: string; amount: number }[]
+}
+
+async function resolveChargeContext(
+  client: PoolClient,
+  payment: PaymentRow,
+): Promise<ChargeContext> {
+  const amount = parseFloat(payment.amount)
+  const pi = payment.stripe_payment_intent_id
+  if (!pi) {
+    return { feeBase: amount, allocTotal: amount, isLastRow: true, priorRows: [] }
+  }
+
+  // Every row this charge settled. feeBase counts them ALL (a fee row swept up
+  // by FIFO was part of what the tenant paid, so the fee was computed on it);
+  // the apportionment set is only the rent/utility rows, because those are the
+  // ones that produce ledger entries.
+  const res = await client.query<{ id: string; amount: string; type: string }>(
+    `SELECT id, amount::text AS amount, type
+       FROM payments
+      WHERE stripe_payment_intent_id = $1 AND status = 'settled'
+      ORDER BY id`,
+    [pi],
+  )
+  const all = res.rows
+  if (all.length === 0) {
+    return { feeBase: amount, allocTotal: amount, isLastRow: true, priorRows: [] }
+  }
+
+  const feeBase = round2(all.reduce((sum, r) => sum + parseFloat(r.amount), 0))
+  const allocRows = all
+    .filter(r => r.type === 'rent' || r.type === 'utility')
+    .map(r => ({ id: r.id, amount: parseFloat(r.amount) }))
+  const allocTotal = round2(allocRows.reduce((sum, r) => sum + r.amount, 0))
+
+  const idx = allocRows.findIndex(r => r.id === payment.id)
+  return {
+    feeBase,
+    allocTotal: allocTotal > 0 ? allocTotal : amount,
+    isLastRow: idx === -1 || idx === allocRows.length - 1,
+    priorRows: idx > 0 ? allocRows.slice(0, idx) : [],
+  }
+}
+
+/**
+ * S603: this row's share of a charge-wide amount, by its share of the covered
+ * rows. The last row takes `whole - everything already given out` so the pieces
+ * sum to the whole exactly — never a cent lost or invented.
+ */
+function apportion(whole: number, charge: ChargeContext, rowAmount: number): number {
+  if (charge.allocTotal <= 0) return whole
+  if (charge.isLastRow) {
+    const given = charge.priorRows.reduce(
+      (sum, r) => sum + round2(whole * (r.amount / charge.allocTotal)), 0)
+    return round2(whole - given)
+  }
+  return round2(whole * (rowAmount / charge.allocTotal))
+}
+
 export async function executeRentAllocation(
   client: PoolClient,
   paymentId: string,
@@ -119,14 +201,59 @@ export async function executeRentAllocation(
   const cfCap = rate.customer_facing_cap != null ? parseFloat(rate.customer_facing_cap) : Infinity
   const scCap = rate.stripe_cost_cap != null ? parseFloat(rate.stripe_cost_cap) : Infinity
 
-  const customerFacingFee = round2(Math.min(cfFlat + gross * (cfPercent / 100), cfCap))
-  const stripeCost = round2(Math.min(scFlat + gross * (scPercent / 100), scCap))
+  // S603 (Nic): "We cannot have a discrepancy between landlord and the platform
+  // with how much was processed... We have to be 100% accurate everywhere."
+  //
+  // Pre-S603 this computed BOTH fees from THIS ROW ALONE, which was wrong twice:
+  //
+  //   (A) The customer-facing fee was re-derived per row. Allocation runs once
+  //       per settled row (webhooks.ts loops `settled.rows`), so a single charge
+  //       covering a rent row AND a utility row booked the FLAT $6 ACH fee
+  //       TWICE — $12 booked against $6 actually charged. With
+  //       ach_fee_payer='landlord' that came straight out of the landlord's
+  //       share (`splittable = gross - fee`), so the landlord was short real
+  //       money. With the tenant paying, GAM booked revenue that never existed.
+  //
+  //   (B) Stripe's cost was measured against the RENT line, but Stripe bills on
+  //       what it actually PROCESSED — rent plus any tenant-borne fee riding on
+  //       top. Proven on the S600 live charge: $2.33 processed ($2.00 rent +
+  //       $0.33 fee) was billed a $0.02 volume fee; 0.7% x $2.33 = $0.0163 -> 2c,
+  //       whereas 0.7% x $2.00 would be 1c. Stripe has no idea part of the
+  //       amount is GAM's fee.
+  //
+  // Fix: compute the fee and the cost ONCE for the whole charge — exactly as
+  // routes/payments.ts /pay-balance did when it created it — then apportion
+  // both across the rows that charge covered, by amount. Totals across all the
+  // per-row allocations now equal what actually happened, penny for penny.
+  const charge = await resolveChargeContext(client, payment)
+
+  const wholeCustomerFee = round2(Math.min(cfFlat + charge.feeBase * (cfPercent / 100), cfCap))
+
+  // A landlord-paid fee is DEDUCTED from the rent rather than added on top, so
+  // Stripe only ever processed the rent itself. Tenant-paid rides on top and
+  // Stripe takes its percentage of the grossed-up total.
+  const feePayerForBase = paymentMethod === 'ach' ? prop.ach_fee_payer : prop.card_fee_payer
+  const processedAmount = feePayerForBase === 'landlord'
+    ? charge.feeBase
+    : round2(charge.feeBase + wholeCustomerFee)
+
+  const wholeStripeCost = round2(Math.min(scFlat + processedAmount * (scPercent / 100), scCap))
+
+  // Apportion by this row's share of the charge. The LAST row (deterministic
+  // id order) absorbs the rounding remainder so the per-row pieces sum to the
+  // whole exactly — otherwise a 3-way split loses or invents a cent.
+  const customerFacingFee = apportion(wholeCustomerFee, charge, gross)
+  const stripeCost        = apportion(wholeStripeCost, charge, gross)
   const bankingSpread = round2(customerFacingFee - stripeCost)
 
   // S116: pick the right fee toggle based on the payment method.
   // ach_fee_payer applies to ACH; card_fee_payer applies to card.
   // platform_fee_payer is unrelated to per-payment processing — it
   // governs the monthly platform fee accrual (S120).
+  // Same toggle as feePayerForBase above; kept as its own name because the
+  // split math below reads it. `customerFacingFee` here is THIS ROW'S SHARE of
+  // the one real fee, so a landlord-paid fee is deducted once across the
+  // charge rather than once per row.
   const processingFeePayer = paymentMethod === 'ach'
     ? prop.ach_fee_payer
     : prop.card_fee_payer
@@ -303,7 +430,8 @@ async function fetchPayment(client: PoolClient, paymentId: string): Promise<Paym
   const res = await client.query<PaymentRow>(
     `SELECT id, unit_id, type, amount::text AS amount, status,
             gam_supersedence_amount::text AS gam_supersedence_amount,
-            sublease_markup_amount::text AS sublease_markup_amount
+            sublease_markup_amount::text AS sublease_markup_amount,
+            stripe_payment_intent_id
        FROM payments WHERE id=$1 FOR UPDATE`,
     [paymentId]
   )

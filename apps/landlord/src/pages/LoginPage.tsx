@@ -22,7 +22,18 @@ export function LoginPage() {
       else if (r.kind === 'email_otp_required') { setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false) }
       else navigate('/')
     }
-    catch (e: any) { setErr(e.response?.data?.error || 'Login failed') }
+    catch (e: any) {
+      // S605: distinguish "the server said no" from "we never reached the
+      // server". Both used to read 'Login failed', which told the user nothing
+      // and — combined with the old 401 interceptor reloading the page — made a
+      // wrong password look identical to a broken app.
+      setErr(
+        e.response?.data?.error
+        || (e.response
+              ? 'Login failed. Please try again.'
+              : "Couldn't reach the server. Check your connection, then reload this page and try again.")
+      )
+    }
     finally { setLoading(false) }
   }
 
@@ -185,7 +196,13 @@ export function LoginPage() {
               {loading ? <span className="spinner" /> : 'Sign in'}
             </button>
           </form>
-          <p style={{textAlign:'center',marginTop:20,fontSize:'.82rem',color:'var(--text-3)'}}>
+          {/* S605: there was no way to recover a forgotten password from this
+              page, so a landlord who mistyped the password they set at signup
+              was locked out for good. */}
+          <p style={{textAlign:'center',marginTop:16,fontSize:'.82rem'}}>
+            <Link to="/forgot-password" style={{color:'var(--text-2)'}}>Forgot your password?</Link>
+          </p>
+          <p style={{textAlign:'center',marginTop:12,fontSize:'.82rem',color:'var(--text-3)'}}>
             No account? <Link to="/register">Register as landlord</Link>
           </p>
         </div>

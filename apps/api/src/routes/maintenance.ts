@@ -5,7 +5,7 @@ import crypto from 'crypto'
 import multer from 'multer'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification, notifyMaintenanceUpdated, createNotification } from '../services/notifications'
@@ -28,6 +28,12 @@ maintenanceRouter.get('/', async (req, res, next) => {
     const unitFilter = req.query.unitId
       ? `AND mr.unit_id = $${params.push(req.query.unitId)}`
       : ''
+    // S605 (Nic): property scoping, so the same list can serve the
+    // portfolio-wide screen AND a single property's Maintenance tab. Requests
+    // hang off a unit, so the property is reached through it.
+    const propertyFilter = req.query.propertyId
+      ? `AND mr.unit_id IN (SELECT id FROM units WHERE property_id = $${params.push(req.query.propertyId)})`
+      : ''
     // S69: explicit branches per role. Pre-S69 used `role !== 'admin'`,
     // which (a) trapped super_admin into a profileId filter, and (b)
     // routed team-role users (PM, onsite_manager, maintenance) to the
@@ -46,6 +52,16 @@ maintenanceRouter.get('/', async (req, res, next) => {
       return res.json({ success: true, data: [] })
     }
 
+    // S603: property-scope filter. Pre-S603 a team-role caller was filtered by
+    // landlord_id ALONE, so a maintenance worker (or PM/onsite manager) assigned
+    // to ONE property could list every request across the landlord's entire
+    // portfolio — tenant names included. The scope tables carry property_ids /
+    // unit_ids and every sibling read surface already honors them (units,
+    // inspections, bookings, utility, balances); maintenance was simply missed by
+    // that sweep. Returns null for owners/all_properties (unrestricted).
+    const scopedPropIds = await getScopedPropertyIds(req.user)
+    const scopeFilter = `AND ($${params.push(scopedPropIds)}::uuid[] IS NULL OR u.property_id = ANY($${params.length}))`
+
     const requests = await query<any>(`
       SELECT mr.*,
         u.unit_number, p.name as property_name,
@@ -58,19 +74,45 @@ maintenanceRouter.get('/', async (req, res, next) => {
       LEFT JOIN tenants t ON t.id = mr.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
       LEFT JOIN users au ON au.id = mr.assigned_to
-      WHERE 1=1 ${roleFilter} ${unitFilter}
+      WHERE 1=1 ${roleFilter} ${unitFilter} ${propertyFilter} ${scopeFilter}
       ORDER BY
         CASE mr.priority WHEN 'emergency' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
         mr.created_at DESC`, params)
-    res.json({ success: true, data: requests })
+    res.json({ success: true, data: requests.map(r => stripInternalFields(r, role)) })
   } catch (e) { next(e) }
 })
+
+// S603: `SELECT mr.*` hands the caller every column, and these four are INTERNAL
+// to the landlord side. A tenant was receiving:
+//   estimated_cost / actual_cost — the landlord's private repair economics
+//   landlord_notes               — internal notes (the is_internal COMMENT filter
+//                                  already exists, but the notes COLUMN was missed)
+//   platform_fee                 — NOT a real fee. GAM charges NOTHING for
+//                                  maintenance (Nic, S603). This is a 5% figure
+//                                  computed and stored for the DEFERRED
+//                                  contractor-bid marketplace (PLATFORM_FEES
+//                                  .MAINTENANCE_PCT, S585) and billed to nobody.
+//                                  It must not reach a tenant, who would
+//                                  reasonably read a stored "platform fee" on
+//                                  their repair as a charge that exists.
+// Stripped at the response boundary rather than by per-role SELECT lists so a
+// future column added to the table can't silently leak through a wildcard.
+const TENANT_HIDDEN_MAINTENANCE_FIELDS = [
+  'estimated_cost', 'actual_cost', 'platform_fee', 'landlord_notes',
+] as const
+
+function stripInternalFields<T extends Record<string, any>>(row: T, role: string): T {
+  if (role !== 'tenant') return row
+  const out = { ...row }
+  for (const f of TENANT_HIDDEN_MAINTENANCE_FIELDS) delete out[f]
+  return out
+}
 
 // GET /api/maintenance/:id
 maintenanceRouter.get('/:id', async (req, res, next) => {
   try {
     const request = await queryOne<any>(`
-      SELECT mr.*,
+      SELECT mr.*, u.property_id,
         u.unit_number, u.rent_amount, p.name as property_name, p.street1, p.city,
         tu.first_name as tenant_first, tu.last_name as tenant_last,
         tu.email as tenant_email, tu.phone as tenant_phone,
@@ -92,6 +134,15 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
       }
     } else if (!canAccessLandlordResource(req.user, request.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    } else {
+      // S603: canAccessLandlordResource only proves the caller belongs to this
+      // LANDLORD — it carries no property scope (see middleware/scope.ts). A
+      // scoped worker must additionally be assigned to this request's property,
+      // or they can read any request in the portfolio by guessing its id.
+      const scoped = await getScopedPropertyIds(req.user)
+      if (scoped && !scoped.includes(request.property_id)) {
+        throw new AppError(403, 'Property not in your assigned scope')
+      }
     }
 
     const comments = await query<any>(`
@@ -102,7 +153,10 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
       ${req.user!.role === 'tenant' ? "AND mc.is_internal = FALSE" : ''}
       ORDER BY mc.created_at ASC`, [req.params.id])
 
-    res.json({ success: true, data: { ...request, comments } })
+    res.json({
+      success: true,
+      data: { ...stripInternalFields(request, req.user!.role), comments },
+    })
   } catch (e) { next(e) }
 })
 
@@ -192,7 +246,20 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
       }
     }
 
-    const platformFee = actualCost ? actualCost * PLATFORM_FEES.MAINTENANCE_PCT : null
+    // S603 (Nic): GAM takes NOTHING on maintenance. Pre-S603 this stamped 5% of
+    // every completed job's actual_cost onto the request — including work done
+    // IN HOUSE by the landlord's own maintenance staff. If your maintenance guy
+    // fixes a $100 water fixture, GAM is not owed $5 and never was: the 5%
+    // (PLATFORM_FEES.MAINTENANCE_PCT) belongs to the DEFERRED contractor-bid
+    // marketplace, where GAM would broker an OUTSIDE contractor. That
+    // marketplace does not exist, so today every job is in-house and the correct
+    // fee is nothing.
+    //
+    // Nobody was ever billed this — it was written to the row and read by no
+    // report — but it was phantom revenue sitting in the database against real
+    // repairs, and it was being sent to tenants until this session. When the
+    // marketplace is built, compute it there, on marketplace jobs only.
+    const platformFee = null
 
     const updated = await queryOne<any>(`
       UPDATE maintenance_requests SET
@@ -560,15 +627,24 @@ maintenanceRouter.get('/stats/summary', requirePerm('work_orders.complete', 'wor
     } else if (!isAdmin) {
       return res.json({ success: true, data: {} })
     }
+    // S603: same property-scope gap as the list route — a scoped worker's
+    // dashboard counts must cover only their assigned properties, otherwise the
+    // totals leak portfolio-wide volume and spend they can't otherwise see.
+    const statsScopedIds = await getScopedPropertyIds(req.user)
+    const statsScopeFilter = where
+      ? `AND ($${params.push(statsScopedIds)}::uuid[] IS NULL OR u.property_id = ANY($${params.length}))`
+      : `WHERE ($${params.push(statsScopedIds)}::uuid[] IS NULL OR u.property_id = ANY($${params.length}))`
     const stats = await queryOne<any>(`
       SELECT
-        COUNT(*) FILTER (WHERE status = 'open') as open_count,
-        COUNT(*) FILTER (WHERE status = 'assigned') as assigned_count,
-        COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress_count,
-        COUNT(*) FILTER (WHERE status = 'completed') as completed_count,
-        COUNT(*) FILTER (WHERE priority = 'emergency' AND status != 'completed') as emergency_count,
-        COALESCE(SUM(actual_cost) FILTER (WHERE status = 'completed'), 0) as total_cost
-      FROM maintenance_requests ${where}`, params)
+        COUNT(*) FILTER (WHERE mr.status = 'open') as open_count,
+        COUNT(*) FILTER (WHERE mr.status = 'assigned') as assigned_count,
+        COUNT(*) FILTER (WHERE mr.status = 'in_progress') as in_progress_count,
+        COUNT(*) FILTER (WHERE mr.status = 'completed') as completed_count,
+        COUNT(*) FILTER (WHERE mr.priority = 'emergency' AND mr.status != 'completed') as emergency_count,
+        COALESCE(SUM(mr.actual_cost) FILTER (WHERE mr.status = 'completed'), 0) as total_cost
+      FROM maintenance_requests mr
+      JOIN units u ON u.id = mr.unit_id
+      ${where.replace(/\blandlord_id\b/, 'mr.landlord_id')} ${statsScopeFilter}`, params)
     res.json({ success: true, data: stats })
   } catch (e) { next(e) }
 })

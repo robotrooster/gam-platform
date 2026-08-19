@@ -73,8 +73,20 @@ async function send(
   // ever arrives. Suppressing them is strictly better AND lets test logins work:
   // the suppressed branch logs the subject, which for a login code contains the
   // code, so it's retrievable from /tmp/gam-api.log. Applies in every env.
-  const TEST_DOMAINS = ['@tenant.dev', '@demo.dev', '@test.dev', '@x.dev', '@poser.dev', '@gam.dev']
-  const isTestAddress = TEST_DOMAINS.some((d) => (to || '').toLowerCase().endsWith(d))
+  // S605: the platform-health page immediately surfaced a nightly cron firing
+  // real Resend sends at seeded demo data (rita.recurring@example.com), which
+  // Resend rejects outright — burning quota and logging a failure every night.
+  // example.com/.org/.net and the .test/.invalid/.localhost/.example TLDs are
+  // RFC 2606 reserved and can NEVER receive mail, so sending to one is always a
+  // mistake, in any environment.
+  const TEST_DOMAINS = [
+    '@tenant.dev', '@demo.dev', '@test.dev', '@x.dev', '@poser.dev', '@gam.dev',
+    '@example.com', '@example.org', '@example.net',
+  ]
+  const RESERVED_TLDS = ['.test', '.invalid', '.localhost', '.example']
+  const toLower = (to || '').toLowerCase()
+  const isTestAddress = TEST_DOMAINS.some((d) => toLower.endsWith(d))
+    || RESERVED_TLDS.some((t) => toLower.endsWith(t))
   const willSend = (nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1') && !isTestAddress
   let status: 'sent' | 'failed' = 'sent'
   let errorMessage: string | null = null
@@ -106,14 +118,19 @@ async function send(
   // Best-effort log — never let logging failure break a user-facing flow.
   try {
     await query(
+      // S605: provider_message_id is the JOIN KEY for delivery webhooks. Without
+      // it an inbound 'bounced' event has no row to attach to, so a landlord
+      // whose address is dead would look identical to one who received us fine.
       `INSERT INTO email_send_log (
          to_email, subject, category, status, error_message,
-         landlord_id, related_entity_type, related_entity_id, metadata
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+         landlord_id, related_entity_type, related_entity_id, metadata,
+         provider_message_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [
         to, subject, ctx.category ?? null, status, errorMessage,
         ctx.landlordId ?? null, ctx.relatedEntityType ?? null, ctx.relatedEntityId ?? null,
         ctx.metadata ? JSON.stringify(ctx.metadata) : null,
+        messageId,
       ]
     )
   } catch (logErr) {
@@ -439,6 +456,79 @@ export async function emailCustomerPortalLink(to: string, businessName: string, 
 // land them as employees of a third-party PM company, not as a landlord's
 // in-house worker. Different copy, different role enum, different accept
 // endpoint (POST /api/pm/invitations/accept).
+// S605 (Nic): co-owner invite for a landlord ENTITY (not a PM company).
+//
+// The wording carries the thing partners actually worry about: accepting does
+// not merge their business into the inviter's. Nic, on a three-member
+// partnership: "I don't necessarily need to be part of his other operation."
+// Say that plainly in the invite so nobody has to ask.
+export async function emailLandlordCoOwnerInvitation(
+  to: string,
+  inviterName: string,
+  entityName: string,
+  acceptUrl: string,
+  ctx?: { landlordId?: string; invitationId?: string },
+) {
+  await send(to, `${inviterName} added you as an owner of ${entityName} on GAM`,
+    base(
+      h(`You've been added as an owner of ${entityName}`) +
+      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${entityName}</strong> on GAM as a co-owner.`) +
+      p('You\'ll see everything for that property — the rent roll, tenants, payments and reporting — the same as any other owner.') +
+      p('Accepting also sets up <strong style="color:#eef1f8">your own account</strong>. Anything you add later that isn\'t part of ' +
+        `${entityName} stays yours: your other properties, your own numbers, private to you. The two portfolios never mix.`) +
+      p('This invitation expires in 7 days.') +
+      btn('Accept invitation', acceptUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you weren't expecting this, you can ignore this email.</div>`
+    ),
+    {
+      category: 'landlord_coowner_invitation',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.invitationId ? 'landlord_member_invitation' : null,
+      relatedEntityId: ctx?.invitationId ?? null,
+      metadata: { entity_name: entityName },
+    },
+    'support',
+  )
+}
+
+// S605 (Nic): every owner must confirm a property sale. "So that one person
+// can't just accidentally sell or transfer account ownership out from underneath
+// other people."
+//
+// The code goes in the EMAIL and is typed into the portal — deliberately not a
+// one-click link, because a link in a forwarded email is a signature anyone can
+// apply. This is the highest-consequence confirmation in the product.
+export async function emailPropertyTransferApproval(
+  to: string,
+  args: {
+    propertyName: string
+    initiatorName: string
+    buyerName: string
+    code: string
+    isInitiator: boolean
+  },
+) {
+  await send(to, `Confirm the sale of ${args.propertyName}`,
+    base(
+      h(`Confirm the sale of ${args.propertyName}`) +
+      p(args.isInitiator
+        ? `You started a transfer of <strong style="color:#eef1f8">${args.propertyName}</strong> to <strong style="color:#eef1f8">${args.buyerName}</strong>. Confirm it below to record your approval.`
+        : `<strong style="color:#eef1f8">${args.initiatorName}</strong> has started a transfer of <strong style="color:#eef1f8">${args.propertyName}</strong> to <strong style="color:#eef1f8">${args.buyerName}</strong>. It cannot go ahead without your approval.`) +
+      p('This moves the property, its units, leases, deposits and equipment to the new owner, and rent from that point on goes to them. It cannot be undone from inside GAM.') +
+      p('Your confirmation code:') +
+      `<div style="margin:18px 0;padding:14px 18px;border-radius:10px;background:#12151c;border:1px solid #2a2f3a;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.6rem;letter-spacing:.35em;color:#e8c766">${args.code}</div>` +
+      p('Enter it on the property\'s Ownership tab. The request expires in 7 days.') +
+      `<div style="margin-top:16px;font-size:.78rem;color:#c0392b"><strong>If you were not expecting this, do not enter the code.</strong> Decline it in the portal and speak to your co-owners — a sale needs every owner's approval, so declining stops it.</div>`
+    ),
+    {
+      category: 'property_transfer_approval',
+      landlordId: null,
+      metadata: { property_name: args.propertyName },
+    },
+    'support',
+  )
+}
+
 export async function emailPmInvitation(
   to: string,
   inviterName: string,
@@ -1465,7 +1555,7 @@ export async function emailPosReceipt(
     [{ filename: `receipt-${receiptNumber}.pdf`, content: pdf }])
 }
 
-// ── S553: sales-call scheduling (Portfolio Specialist funnel) ─────────
+// ── S553: sales-call scheduling (Portfolio Strategist funnel) ─────────
 export async function sendSalesCallConfirmation({ to, name, when, mode }: {
   to: string; name: string; when: string; mode: 'video' | 'phone'
 }) {
@@ -1473,10 +1563,10 @@ export async function sendSalesCallConfirmation({ to, name, when, mode }: {
   await send(to, `Your GAM call is booked — ${when}`,
     base(
       h(`You're on the calendar`) +
-      p(`Hi ${first} — your call with a GAM Portfolio Specialist is confirmed:`) +
+      p(`Hi ${first} — your call with a GAM Portfolio Strategist is confirmed:`) +
       `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
         <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
-        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — your Specialist will email you the meeting link before the call.' : 'Phone call — your Specialist will call the number you provided.'}</div>
+        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — your Strategist will email you the meeting link before the call.' : 'Phone call — your Strategist will call the number you provided.'}</div>
       </div>` +
       p(`We'll walk through your portfolio, show you the platform live, and lay out exact pricing for your setup. If you need to reschedule, just reply to this email.`)
     ),
@@ -1492,10 +1582,10 @@ export async function sendSalesCallReminder({ to, name, when, mode }: {
   await send(to, `Reminder: your GAM call is coming up — ${when}`,
     base(
       h(`See you soon`) +
-      p(`Hi ${first} — a quick reminder that your call with a GAM Portfolio Specialist is coming up:`) +
+      p(`Hi ${first} — a quick reminder that your call with a GAM Portfolio Strategist is coming up:`) +
       `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
         <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
-        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — watch for the meeting link from your Specialist.' : 'Phone call — your Specialist will call you.'}</div>
+        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — watch for the meeting link from your Strategist.' : 'Phone call — your Strategist will call you.'}</div>
       </div>`
     ),
     { category: 'sales_call_reminder', landlordId: null },
@@ -1606,5 +1696,70 @@ export async function sendLandlordSignupHeadsUp({
     ),
     { category: 'landlord_signup', landlordId: null },
     'noreply',
+  )
+}
+
+// ── S605: post-signup onboarding-call outreach (self-signed-up landlords) ──
+// Nic's brief: it must feel like a real person noticed the signup, not like an
+// autoresponder. Three deliberate departures from every other email in this
+// file, all in service of that:
+//
+//   1. NO base() chrome. The dark/gold branded shell with a gold CTA button is
+//      unmistakably a system email. This one uses a plain light body with a
+//      normal font stack — the way a person's mail client would actually send.
+//   2. NO button, no images, no tracking. A CTA button is the single loudest
+//      "this is marketing" signal; the call to action is "reply to this email",
+//      which is also the response we actually want.
+//   3. SUPPORT sender, not noreply. Replies have to reach a human — support@
+//      forwards to the owner. A noreply address would make the "just reply"
+//      ask a lie.
+//
+// The timing (~90 min after signup, business hours only) lives in the job, not
+// here. See jobs/landlordWelcomeOutreach.ts.
+export async function emailLandlordWelcomeOutreach(args: {
+  to: string
+  firstName: string
+  /** True when they haven't added a property yet — shifts one sentence. */
+  stalledInSetup: boolean
+  /** Token-prefilled onboarding-call booking link. Omitted → reply-only copy. */
+  bookingUrl?: string | null
+  ctx?: { landlordId?: string | null; userId?: string | null }
+}): Promise<string | null> {
+  const greetingName = (args.firstName || '').trim() || 'there'
+  // The one adaptive sentence. Someone still sitting at an empty account needs
+  // "I'll help you get the first property in"; someone already entering data
+  // needs the offer without the implication that they're stuck.
+  const offer = args.stalledInSetup
+    ? 'Twenty minutes on a video call and we&rsquo;ll get your first property and units into the system together, rather than leaving you to work through the setup on your own.'
+    : 'Twenty minutes on a video call to walk through the parts you&rsquo;ll actually use day to day, and make sure nothing is set up in a way that bites you later.'
+
+  const paras = [
+    `Hi ${escapeHtml(greetingName)},`,
+    'Thanks for creating your Gold Asset Management account. I&rsquo;m Nic &mdash; I run GAM.',
+    `I&rsquo;d like to offer you a short onboarding call. ${offer} Anything you&rsquo;re wondering about &mdash; rent collection, payouts to your bank, maintenance, leases, how the pricing actually works &mdash; bring it and I&rsquo;ll answer it straight.`,
+    'Worth knowing up front: you&rsquo;re not billed anything until you&rsquo;re actually collecting rent through the platform. Setting up costs you nothing.',
+    // With a booking link, "pick a time" is one click and the times are live.
+    // Without one, fall back to reply-and-I'll-schedule so the email still works
+    // if token minting ever fails — never leave the reader with no way to act.
+    args.bookingUrl
+      ? `I hold onboarding calls weekday afternoons, 1:00&ndash;4:00 PM Arizona time. <a href="${args.bookingUrl}" style="color:#8a6d1f;font-weight:600">Pick a time that works for you here</a> &mdash; it already knows who you are, so it&rsquo;s just choosing a slot.`
+      : 'I hold onboarding calls weekday afternoons, 1:00&ndash;4:00 PM Arizona time. Reply with a day and time that suits you and I&rsquo;ll send the video link.',
+    'And if you&rsquo;d rather just ask a question or two over email first, that works too &mdash; reply here and it comes straight to me.',
+  ]
+
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:560px">
+${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
+  <p style="margin:24px 0 0">Nic Rhoades<br>Gold Asset Management</p>
+</div>`
+
+  return send(args.to, 'Getting you set up on GAM', html,
+    {
+      category: 'landlord_welcome_outreach',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'user',
+      relatedEntityId: args.ctx?.userId ?? null,
+      metadata: { stalled_in_setup: args.stalledInSetup },
+    },
+    'support',
   )
 }

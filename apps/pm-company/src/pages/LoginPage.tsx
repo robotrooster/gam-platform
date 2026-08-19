@@ -96,7 +96,13 @@ export function LoginPage() {
               </button>
             </form>
 
-            <div style={{ marginTop: 16, textAlign: 'center', fontSize: '.78rem', color: 'var(--text-3)' }}>
+            {/* S605: no recovery path existed, so a mistyped password meant
+                permanent lockout. */}
+            <div style={{ marginTop: 14, textAlign: 'center', fontSize: '.78rem' }}>
+              <Link to="/forgot-password" style={{ color: 'var(--text-3)' }}>Forgot your password?</Link>
+            </div>
+
+            <div style={{ marginTop: 12, textAlign: 'center', fontSize: '.78rem', color: 'var(--text-3)' }}>
               No account? <Link to="/register" style={{ color: 'var(--gold)' }}>Register a PM company</Link>
             </div>
           </>

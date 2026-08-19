@@ -11,6 +11,7 @@ import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
+import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
 export const leasesRouter = Router()
 leasesRouter.use(requireAuth)
@@ -1171,6 +1172,69 @@ leasesRouter.post('/:id/resume', requirePerm('leases.edit'), async (req, res, ne
   } catch (e) { await client.query('ROLLBACK').catch(() => {}); next(e) } finally { client.release() }
 })
 
+// S602 Snowbird Phase 2b: seasonal-tenancy config. The landlord sets/reads a
+// lease's recurring season window (month/day) + the priority marker. The yearly
+// generation job (still to build) materializes the spot-locked recurring
+// reservation from this row. One config per lease (upsert). See SNOWBIRD_SEASONAL_SPEC.md.
+const seasonalConfigSchema = z.object({
+  seasonStartMonth: z.number().int().min(1).max(12),
+  seasonStartDay:   z.number().int().min(1).max(31),
+  seasonEndMonth:   z.number().int().min(1).max(12),
+  seasonEndDay:     z.number().int().min(1).max(31),
+  isPriority:       z.boolean().optional(),
+})
+
+leasesRouter.put('/:id/seasonal', requirePerm('leases.edit'), async (req, res, next) => {
+  try {
+    const body = seasonalConfigSchema.parse(req.body)
+    const lease = await queryOne<{ id: string; landlord_id: string; unit_id: string; tenant_id: string | null }>(
+      `SELECT l.id, l.landlord_id, l.unit_id,
+              (SELECT lt.tenant_id FROM lease_tenants lt
+                WHERE lt.lease_id = l.id AND lt.role = 'primary' AND lt.status = 'active' LIMIT 1) AS tenant_id
+         FROM leases l WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const row = await queryOne<any>(
+      `INSERT INTO seasonal_tenancies
+         (lease_id, unit_id, tenant_id, season_start_month, season_start_day,
+          season_end_month, season_end_day, is_priority)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (lease_id) DO UPDATE SET
+         unit_id = EXCLUDED.unit_id, tenant_id = EXCLUDED.tenant_id,
+         season_start_month = EXCLUDED.season_start_month, season_start_day = EXCLUDED.season_start_day,
+         season_end_month = EXCLUDED.season_end_month, season_end_day = EXCLUDED.season_end_day,
+         is_priority = EXCLUDED.is_priority, active = TRUE, updated_at = NOW()
+       RETURNING *`,
+      [lease.id, lease.unit_id, lease.tenant_id,
+       body.seasonStartMonth, body.seasonStartDay, body.seasonEndMonth, body.seasonEndDay,
+       body.isPriority ?? false])
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+leasesRouter.get('/:id/seasonal', async (req, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM leases WHERE id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const row = await queryOne<any>(`SELECT * FROM seasonal_tenancies WHERE lease_id = $1`, [req.params.id])
+    res.json({ success: true, data: row ?? null })
+  } catch (e) { next(e) }
+})
+
+leasesRouter.delete('/:id/seasonal', requirePerm('leases.edit'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      `SELECT id, landlord_id FROM leases WHERE id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`DELETE FROM seasonal_tenancies WHERE lease_id = $1`, [req.params.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 leasesRouter.post('/:id/offer-renewal', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(`
@@ -1598,5 +1662,97 @@ leasesRouter.post('/:id/terminate-early/cancel', async (req, res, next) => {
     if (existing.tenant_id !== u.profileId) throw new AppError(403, 'Not your request')
     const updated = await cancelRequest(existing.id)
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// ── S605 (Nic): CARRIED BALANCE — arrears from the landlord's prior system ───
+//
+// "No way to carry a tenant's OUTSTANDING BALANCE onto the platform." Every
+// charge in GAM is engine-generated from a lease, so a tenant who already owed
+// money when their landlord migrated had that debt stranded off-platform —
+// which breaks the reconciliation the bank feed exists to give them.
+//
+// Cut as a real invoice so it is payable through the normal path and shows up
+// in the tenant's portal like anything else. Late fees are OFF by default: the
+// nightly engine walks unpaid invoices, so an un-exempted $2,000 carried
+// balance would begin compounding the day it was entered. Nic: a tenant on a
+// catch-up plan shouldn't be fined for arrears from the old system.
+// Same permission as the landlord-initiated one-off charge (bill-fee): both are
+// a landlord adding a charge to a tenant's ledger. 'payments.record' does not
+// exist in the catalog — an invented name here would have gated the route on a
+// permission nobody can hold.
+leasesRouter.post('/:id/carried-balance', requirePerm('leases.bill_fee'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      amount:      z.number().positive().max(1_000_000),
+      description: z.string().max(300).optional(),
+      dueDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      // Opt a specific debt back IN — for arrears that were already accruing
+      // fees before the move. Deliberately not the default.
+      accruesLateFees: z.boolean().default(false),
+    }).parse(req.body)
+
+    const lease = await queryOne<any>(
+      `SELECT l.id, l.landlord_id, l.unit_id, lt.tenant_id
+         FROM leases l
+         LEFT JOIN LATERAL (
+           SELECT tenant_id FROM lease_tenants WHERE lease_id = l.id ORDER BY created_at LIMIT 1
+         ) lt ON TRUE
+        WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!lease.tenant_id) throw new AppError(409, 'This lease has no tenant to bill')
+
+    // One carried balance per lease. A second would almost always be a
+    // double-entry of the same debt, and the amount is editable until paid.
+    const existing = await queryOne<{ id: string }>(
+      `SELECT id FROM invoices WHERE lease_id = $1 AND is_opening_balance = TRUE`, [req.params.id])
+    if (existing) {
+      throw new AppError(409, 'This lease already has a carried balance. Edit or void the existing one instead.')
+    }
+
+    const due = body.dueDate ?? new Date().toISOString().slice(0, 10)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, new Date().getFullYear())
+      const inv = await client.query<{ id: string }>(
+        `INSERT INTO invoices (
+           landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
+           subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
+           is_opening_balance, late_fee_exempt
+         ) VALUES ($1,$2,$3,$4,$5,$6, 0, 0, 0, $7, TRUE, $8)
+         RETURNING id`,
+        [lease.landlord_id, lease.tenant_id, lease.id, lease.unit_id,
+         invoiceNumber, due, body.amount.toFixed(2), !body.accruesLateFees])
+      const invoiceId = inv.rows[0].id
+      await client.query(
+        `INSERT INTO payments (
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes
+         ) VALUES ($1,$2,$3,$4,$5,'carried_balance',$6,'pending',$7,'BALANCE',$8)`,
+        [invoiceId, lease.unit_id, lease.id, lease.tenant_id, lease.landlord_id,
+         body.amount.toFixed(2), due,
+         body.description ?? 'Balance carried over from previous management'])
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { invoiceId, invoiceNumber } })
+    } catch (e) {
+      await client.query('ROLLBACK'); throw e
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// Read it back so the lease page can show what was carried and whether it is
+// accruing — a landlord must be able to see the fee decision after the fact.
+leasesRouter.get('/:id/carried-balance', async (req, res, next) => {
+  try {
+    const row = await queryOne<any>(
+      `SELECT i.id, i.invoice_number, i.due_date, i.total_amount, i.status,
+              i.late_fee_exempt, l.landlord_id
+         FROM invoices i JOIN leases l ON l.id = i.lease_id
+        WHERE i.lease_id = $1 AND i.is_opening_balance = TRUE`, [req.params.id])
+    if (!row) return res.json({ success: true, data: null })
+    if (!canAccessLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
+    res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })

@@ -1,9 +1,10 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
+import { db, query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
 import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
@@ -51,6 +52,12 @@ unitsRouter.get('/', async (req, res, next) => {
     const propertyFilter = req.query.propertyId
       ? `AND u.property_id = $${params.push(req.query.propertyId)}`
       : ''
+    // S605: retired units are EXCLUDED by default — fail-closed. Any frontend
+    // that feeds a dropdown from this endpoint would otherwise silently offer a
+    // unit the server will refuse to lease or book, and a long-lived park would
+    // accumulate retired rows in its working list forever. Surfaces that show
+    // history (the Units page, reports) opt in explicitly.
+    const retiredFilter = req.query.includeRetired === 'true' ? '' : 'AND u.retired_at IS NULL'
     const units = await query<any>(`
       SELECT u.*,
         p.name AS property_name, p.street1, p.city, p.state, p.zip,
@@ -67,7 +74,7 @@ unitsRouter.get('/', async (req, res, next) => {
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       LEFT JOIN tenants pt ON pt.id = vuo.primary_tenant_id
-      WHERE 1=1 ${landlordFilter} ${propertyFilter}
+      WHERE 1=1 ${landlordFilter} ${propertyFilter} ${retiredFilter}
       ORDER BY p.name, u.unit_number
     `, params)
     res.json({ success: true, data: units })
@@ -157,6 +164,15 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       unitNumber:      z.string(),
       subtypeId:       z.string().uuid().nullable().optional(),
       quantity:        z.number().int().min(1).max(200).default(1),
+      // S604 (Nic): real parks have signage the software must match, not the
+      // other way round. Oak Park runs RV 1-3, apartments 4-5, motel 6-12,
+      // apartments 13-19, then RV 20-36 — the second RV block cannot be created
+      // by "continue after the highest", which would produce RV 04. startAt lets
+      // the landlord name a block to match the ground.
+      startAt:         z.number().int().min(1).max(100000).optional(),
+      // S605: IGNORED — padding is fixed at 2 platform-wide. Kept in the schema
+      // only so an older client sending it doesn't get a validation error.
+      padWidth:        z.number().int().min(1).max(6).optional(),
       unitType:        z.enum(UNIT_TYPES as unknown as [string, ...string[]]).optional(),
       bedrooms:        z.number().int().min(0).optional(),
       bathrooms:       z.number().min(0).optional(),
@@ -265,21 +281,48 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     const features: Record<string, boolean> = {}
     if (body.features) for (const [k, v] of Object.entries(body.features)) if (offeredKeys.has(k)) features[k] = !!v
 
-    // quantity > 1: unitNumber is the PREFIX; continue numbering after the
-    // highest existing "<prefix> <n>" on the property (old bulk-route logic).
+    // S605 (Nic): the field means ONE thing everywhere — the unit NUMBER. The
+    // prefix comes from the unit type, and for a batch the number is the
+    // STARTING point that the counter runs on from.
     const unitNumbers: string[] = []
     if (body.quantity > 1) {
-      const pfx = formatUnitNumber(body.unitNumber)
+      // The prefix is the unit TYPE's, platform-wide — never what was typed.
+      // "I don't want it to be mobile home site one spelled out on one property
+      // and MH one on a different property."
+      const pfx = (UNIT_TYPE_PREFIX as any)[unitType] ?? formatUnitNumber(body.unitNumber)
       const existing = await query<{ unit_number: string }>(
         `SELECT unit_number FROM units WHERE property_id=$1 AND LOWER(unit_number) LIKE LOWER($2)`,
         [body.propertyId, `${pfx} %`]
       )
       const nums = existing.map(r => { const m = r.unit_number.match(/\s(\d+)$/); return m ? parseInt(m[1]) : 0 })
-      const start = nums.length ? Math.max(...nums) + 1 : 1
-      for (let i = 0; i < body.quantity; i++) unitNumbers.push(`${pfx} ${String(start + i).padStart(2, '0')}`)
+      // When the prefix moved to the unit type, nothing took over reading the
+      // typed value — so a landlord entering "1" as their starting number had it
+      // silently discarded and got numbering continued from somewhere else.
+      // The typed number wins; startAt stays as the explicit override; otherwise
+      // continue after the highest existing number with this prefix.
+      const typedStart = /^\d+$/.test(String(body.unitNumber ?? '').trim())
+        ? parseInt(String(body.unitNumber).trim(), 10)
+        : null
+      const start = typedStart ?? body.startAt ?? (nums.length ? Math.max(...nums) + 1 : 1)
+      // S605 (Nic, DIRECTIVE): "I want consistency platform wide. Remove those
+      // number padding options." Padding is FIXED at two digits — a per-batch
+      // choice meant one property could render "RV 8" while another rendered
+      // "RV 08", which is the same drift the standard prefixes just ended.
+      // padWidth is still accepted so older clients don't 400; it is ignored.
+      const pad = 2
+      for (let i = 0; i < body.quantity; i++) {
+        unitNumbers.push(`${pfx} ${String(start + i).padStart(pad, '0')}`)
+      }
     } else {
-      unitNumbers.push(formatUnitNumber(body.unitNumber))
+      // Canonical form: standard prefix + identifier, single digits zero-padded.
+      // Accepts "7", "RV 7" or "Space 7" and stores "RV 07" for all three.
+      unitNumbers.push(canonicalUnitNumber(unitType as any, body.unitNumber))
     }
+
+    // S605: no bare-number guard is needed here any more — canonicalUnitNumber
+    // supplies the unit type's standard prefix, so "37" becomes "RV 37" and a
+    // prefix-less name can no longer be constructed. Enforced by construction
+    // rather than by rejection.
 
     const created: any[] = []
     for (const unitNumber of unitNumbers) {
@@ -334,6 +377,253 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
   } catch (e) { next(e) }
 })
 
+// ─── S604 (Nic): RENAME + DELETE ────────────────────────────────────────────
+// Neither existed. A unit's number was permanent from creation and there was no
+// way to remove one created by mistake — "accidental creation just means I have
+// to, what, delete a whole thing... that's not a good look."
+//
+// Renaming is safe at the data layer: invoices, leases, payments and meters all
+// reference unit_id, never the number. The only constraint is the unique index
+// on (property_id, lower(trim(unit_number))).
+
+/** S604: does this unit carry history that must stay attached to it?
+ *  Used by BOTH rename and delete. Nic's rule: a unit is freely editable during
+ *  onboarding, and permanent the moment anything real touches it — a lease of
+ *  ANY status (including ended), a booking, a payment, a deposit, a meter link
+ *  or a maintenance request. */
+async function unitHistoryBlocker(unitId: string): Promise<string | null> {
+  const probes: Array<{ label: string; sql: string }> = [
+    { label: 'a lease',               sql: 'SELECT 1 FROM leases WHERE unit_id=$1 LIMIT 1' },
+    { label: 'a payment',             sql: 'SELECT 1 FROM payments WHERE unit_id=$1 LIMIT 1' },
+    { label: 'a booking',             sql: 'SELECT 1 FROM unit_bookings WHERE unit_id=$1 LIMIT 1' },
+    { label: 'a security deposit',    sql: 'SELECT 1 FROM security_deposits WHERE unit_id=$1 LIMIT 1' },
+    // S605 (Nic): a meter LINK is not history — it is setup. Bulk-adding RV
+    // sites with electric submetering attached a meter to every unit, which
+    // then froze the numbers: "I cannot renumber the units even though no bills
+    // have gone out, no anything." Renumbering during onboarding is normal —
+    // gaps, and blocks like 14/14A, only become obvious once the list is on
+    // screen.
+    //
+    // A meter blocks only once it carries something real: a READING or a BILL.
+    // Until then the unit is still being set up, which is exactly the rule this
+    // function was written to express.
+    { label: 'a utility meter with readings',
+      sql: `SELECT 1 FROM utility_meter_units mu
+             WHERE mu.unit_id = $1
+               AND (EXISTS (SELECT 1 FROM utility_meter_readings r WHERE r.meter_id = mu.meter_id)
+                 OR EXISTS (SELECT 1 FROM utility_bills b WHERE b.meter_id = mu.meter_id))
+             LIMIT 1` },
+    { label: 'a maintenance request', sql: 'SELECT 1 FROM maintenance_requests WHERE unit_id=$1 LIMIT 1' },
+  ]
+  for (const p of probes) {
+    if (await queryOne<any>(p.sql, [unitId])) return p.label
+  }
+  return null
+}
+
+// PATCH /api/units/:id/number — renumber a unit.
+unitsRouter.patch('/:id/number', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const { unitNumber } = z.object({ unitNumber: z.string().min(1).max(40) }).parse(req.body)
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const next_ = canonicalUnitNumber(unit.unit_type, unitNumber)
+    if (next_.toLowerCase() === String(unit.unit_number).toLowerCase()) {
+      return res.json({ success: true, data: unit })   // no-op
+    }
+
+    // S604 (Nic): NO rename once the unit carries data. Nothing snapshots
+    // unit_number — every invoice and payment renders the CURRENT value — so a
+    // rename would retroactively rewrite how years of records display, while
+    // executed lease PDFs keep the original and silently disagree. The intended
+    // path is to RETIRE the unit and create its replacement under the new
+    // number, keeping one physical space as two clean database records.
+    const blocker = await unitHistoryBlocker(req.params.id)
+    if (blocker) {
+      throw new AppError(409,
+        `This unit has ${blocker} on record, so its number is locked — renaming it would change how past invoices and records display. ` +
+        `Retire this unit and add its replacement under the new number instead.`)
+    }
+    // Surface the collision as a friendly 409 rather than a 500 from the index.
+    const clash = await queryOne<{ id: string }>(
+      `SELECT id FROM units
+        WHERE property_id = $1 AND lower(btrim(unit_number)) = lower(btrim($2)) AND id <> $3`,
+      [unit.property_id, next_, req.params.id])
+    if (clash) {
+      throw new AppError(409, `"${next_}" is already used by another unit on this property. Unit numbers are unique per property regardless of unit type — use a prefix (e.g. "RV 01" vs "MH 01") if two types share a number.`)
+    }
+    const [updated] = await query<any>(
+      `UPDATE units SET unit_number=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [next_, req.params.id])
+
+    // S605: meter labels are generated as "<unit number> <utility>" when a unit
+    // is created, so a renumber leaves them pointing at the OLD number — the
+    // reading run would then send someone to "RV 03 electric" for a spot now
+    // called RV 14. Only labels still matching the generated pattern are
+    // rewritten; anything the landlord renamed by hand is theirs and is left
+    // alone.
+    const relabelled = await query<{ id: string }>(
+      `UPDATE utility_meters m
+          SET label = $3 || substring(m.label from char_length($2) + 1), updated_at = NOW()
+        FROM utility_meter_units mu
+       WHERE mu.meter_id = m.id
+         AND mu.unit_id = $1
+         AND lower(m.label) LIKE lower($2) || ' %'
+       RETURNING m.id`,
+      [req.params.id, unit.unit_number, next_])
+
+    res.json({ success: true, data: updated, metersRelabelled: relabelled.length })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/units/:id — remove a unit created by mistake.
+//
+// GAM never erases data (retention rule), so this is deliberately NOT a general
+// delete: it is refused the moment a unit has ANY history. A unit with a lease,
+// payment, booking, deposit or meter link carries records that must survive, and
+// those are handled by taking the unit out of service, not by deleting it.
+unitsRouter.delete('/:id', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const blocker = await unitHistoryBlocker(req.params.id)
+    if (blocker) {
+      throw new AppError(409,
+        `This unit has ${blocker} on record, so it can't be deleted — GAM keeps that history. ` +
+        `Take it out of service instead (set it vacant, or owner-use if you occupy it).`)
+    }
+    await query('DELETE FROM units WHERE id=$1', [req.params.id])
+    res.json({ success: true, data: { deleted: true } })
+  } catch (e) { next(e) }
+})
+
+// ── S605: RETIRE & REPLACE (Nic's design, decided S604) ───────────────────
+//
+// A unit that carries data can't be renumbered (nothing snapshots unit_number,
+// so a rename rewrites how years of records display). Instead the one physical
+// space becomes two records: retire the old, create the replacement under the
+// new number, link them both ways. History stays exactly where it was written.
+//
+// The replacement inherits every physical/pricing attribute. That list is
+// explicit rather than `SELECT *` because a handful of columns MUST NOT carry
+// over — and `unitCloneColumns.test.ts` fails if a new `units` column is added
+// without being classified here, so the list can't silently go stale.
+
+/** Columns copied verbatim onto the replacement unit. */
+export const UNIT_CLONE_COPIED = [
+  'property_id', 'landlord_id', 'bedrooms', 'bathrooms', 'sqft',
+  'rent_amount', 'security_deposit', 'listed_vacant', 'available_date',
+  'listing_description', 'unit_type', 'nightly_rate', 'weekly_rate',
+  'monthly_rate', 'is_bookable', 'lease_types_allowed', 'check_in_time',
+  'check_out_time', 'amenities', 'unit_description', 'min_stay_nights',
+  'max_stay_nights', 'import_extra_data', 'rv_site_layout', 'rv_amp_service',
+  'storage_size', 'subtype_id', 'dwelling_ownership', 'occupancy_mode',
+  'lot_rent_amount', 'is_multi_level', 'is_ada_accessible', 'floor_level',
+  'features', 'living_areas',
+] as const
+
+/**
+ * Columns deliberately NOT copied, with the reason each is reset.
+ * Keyed so the drift test can assert every units column is accounted for.
+ */
+export const UNIT_CLONE_RESET: Record<string, string> = {
+  id:                      'new identity',
+  unit_number:             'the whole point — the replacement takes the new number',
+  created_at:              'the replacement is created now',
+  updated_at:              'the replacement is created now',
+  status:                  "starts 'vacant' — a fresh unit holds no lease",
+  retired_at:              'the replacement is live',
+  superseded_by_unit_id:   'nothing supersedes the replacement yet',
+  replaces_unit_id:        'set to the retired unit',
+  payment_block:           'eviction state belongs to the old tenancy, never carried',
+  payment_block_set_at:    'eviction state belongs to the old tenancy, never carried',
+  payment_block_set_by:    'eviction state belongs to the old tenancy, never carried',
+  status_before_block:     'eviction state belongs to the old tenancy, never carried',
+  scheduled_activation_at: 'a pending activation refers to the old record',
+  scheduled_activation_by: 'a pending activation refers to the old record',
+  on_time_pay_active:      'an enrollment belongs to the old unit/tenancy',
+}
+
+// POST /api/units/:id/retire — retire this unit, create its replacement.
+unitsRouter.post('/:id/retire', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const { unitNumber, reason } = z.object({
+      unitNumber: z.string().min(1).max(40),
+      reason:     z.string().trim().max(500).optional(),
+    }).parse(req.body)
+
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (unit.retired_at) throw new AppError(409, 'This unit is already retired.')
+
+    const newNumber = formatUnitNumber(unitNumber)
+    if (newNumber.toLowerCase() === String(unit.unit_number).toLowerCase()) {
+      throw new AppError(400, 'The replacement needs a different number — retiring a unit to the same number would leave two records claiming it.')
+    }
+    const clash = await queryOne<{ id: string }>(
+      `SELECT id FROM units WHERE property_id = $1 AND lower(btrim(unit_number)) = lower(btrim($2))`,
+      [unit.property_id, newNumber])
+    if (clash) throw new AppError(409, `"${newNumber}" is already used by another unit on this property.`)
+
+    // The unit must be FREE before it retires. This is what makes "a retired
+    // unit is never billed" structural rather than a filter we have to remember:
+    // platform-fee billing counts units with an ACTIVE LEASE plus short-stay
+    // booking nights, and the DB triggers block any NEW lease or booking once
+    // retired_at is set. End or transfer the tenancy first.
+    const liveLease = await queryOne<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id=$1 AND status IN ('active','pending') LIMIT 1`, [req.params.id])
+    if (liveLease) {
+      throw new AppError(409,
+        'This unit still has an active or pending lease. End or transfer the tenancy before retiring it, ' +
+        'so the replacement starts clean and nothing keeps billing against the old record.')
+    }
+    const futureBooking = await queryOne<{ id: string }>(
+      `SELECT id FROM unit_bookings
+        WHERE unit_id=$1 AND status NOT IN ('cancelled','no_show') AND check_out > now() LIMIT 1`,
+      [req.params.id])
+    if (futureBooking) {
+      throw new AppError(409,
+        'This unit has an upcoming booking. Move or cancel it before retiring the unit — a retired unit can’t be checked into.')
+    }
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const cols = UNIT_CLONE_COPIED.join(', ')
+      const [replacement] = await client.query<any>(
+        `INSERT INTO units (unit_number, status, replaces_unit_id, ${cols})
+         SELECT $2, 'vacant', $1, ${cols} FROM units WHERE id = $1
+         RETURNING *`,
+        [req.params.id, newNumber]
+      ).then((r: any) => r.rows)
+
+      const [retired] = await client.query<any>(
+        `UPDATE units
+            SET retired_at = now(), superseded_by_unit_id = $2, updated_at = now()
+          WHERE id = $1 RETURNING *`,
+        [req.params.id, replacement.id]
+      ).then((r: any) => r.rows)
+
+      await client.query(
+        `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+         VALUES ($1, 'unit_retired', 'unit', $2, $3::jsonb, $4::jsonb)`,
+        [req.user!.userId, req.params.id,
+         JSON.stringify({ unit_number: unit.unit_number }),
+         JSON.stringify({ replacement_unit_id: replacement.id, unit_number: newNumber, reason: reason ?? null })]
+      ).catch(() => {})
+
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { retired, replacement } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/units/:id/status — set unit status
 unitsRouter.patch('/:id/status', requirePerm('units.set_status'), async (req, res, next) => {
   try {
@@ -356,8 +646,31 @@ unitsRouter.patch('/:id/status', requirePerm('units.set_status'), async (req, re
     if (unit.status === 'suspended') {
       throw new AppError(400, 'This unit is in eviction mode. Turn eviction mode off to change its status')
     }
+    // S604: 'owner_use' means the OWNER occupies it — no lease, no rent. A unit
+    // with a live lease has a tenant in it, so the two states are mutually
+    // exclusive. Enforced rather than documented: without this a landlord could
+    // flip an occupied, rent-paying unit to owner_use and keep the tenancy
+    // while dropping out of every revenue-shaped aggregate.
+    if (status === 'owner_use') {
+      const live = await queryOne<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM leases
+          WHERE unit_id = $1 AND status IN ('active','pending')`,
+        [req.params.id],
+      )
+      if (Number(live?.n ?? 0) > 0) {
+        throw new AppError(400, 'This unit has an active or pending lease. End the lease before marking it owner-occupied.')
+      }
+    }
+    // Setting owner_use also takes the unit off the market: it is neither
+    // listed to renters nor bookable for short stays. Leaving those flags set
+    // would keep an owner-occupied unit accepting reservations.
     const [updated] = await query<any>(
-      `UPDATE units SET status = $1 WHERE id = $2 RETURNING *`, [status, req.params.id]
+      `UPDATE units
+          SET status = $1,
+              listed_vacant = CASE WHEN $1 = 'owner_use' THEN FALSE ELSE listed_vacant END,
+              is_bookable   = CASE WHEN $1 = 'owner_use' THEN FALSE ELSE is_bookable   END,
+              updated_at = NOW()
+        WHERE id = $2 RETURNING *`, [status, req.params.id]
     )
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -449,7 +762,14 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
     const months = fp ? Math.floor((Date.now() - fp.getTime()) / (1000*60*60*24*30)) : 0
     const lc = parseFloat(ps && ps.total_collected || 0)
     const lm = parseFloat(ms && ms.total_cost || 0)
-    res.json({ success: true, data: { ...econ, platformFee: fee, reserveRate: rate, occupiedPortfolio: count, netRentMonthly: unit.rent_amount - feeNum, netRentYearly: (unit.rent_amount - feeNum) * 12, netThisMonth: parseFloat(ps && ps.this_month || 0) - feeNum - parseFloat(ms && ms.this_month_cost || 0), netThisYear: parseFloat(ps && ps.this_year || 0) - (feeNum*12) - lm, tenantMonths: months, lifetimeCollected: lc, lifetimeMaintCost: lm, lifetimeNet: lc - (feeNum*months) - lm, lifetimePlatformFees: feeNum*months, settledCount: parseInt(ps && ps.settled_count || 0), failedCount: parseInt(ps && ps.failed_count || 0), totalRequests: parseInt(ms && ms.total_requests || 0) } })
+    // S603: `econ` (calcNetPerUnit) is GAM's OWN margin math — gross platform
+    // fee, GAM's Stripe cost, GAM's reserve rate and net kept. That is GAM's
+    // markup, and it must never reach a landlord (same rule the agents run
+    // under). The landlord portal renders none of it; it was only ever leaking
+    // over the wire. Admin keeps the full view.
+    const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    const gamInternals = isAdmin ? { ...econ, reserveRate: rate } : {}
+    res.json({ success: true, data: { ...gamInternals, platformFee: fee, occupiedPortfolio: count, netRentMonthly: unit.rent_amount - feeNum, netRentYearly: (unit.rent_amount - feeNum) * 12, netThisMonth: parseFloat(ps && ps.this_month || 0) - feeNum - parseFloat(ms && ms.this_month_cost || 0), netThisYear: parseFloat(ps && ps.this_year || 0) - (feeNum*12) - lm, tenantMonths: months, lifetimeCollected: lc, lifetimeMaintCost: lm, lifetimeNet: lc - (feeNum*months) - lm, lifetimePlatformFees: feeNum*months, settledCount: parseInt(ps && ps.settled_count || 0), failedCount: parseInt(ps && ps.failed_count || 0), totalRequests: parseInt(ms && ms.total_requests || 0) } })
   } catch (e) { next(e) }
 })
 

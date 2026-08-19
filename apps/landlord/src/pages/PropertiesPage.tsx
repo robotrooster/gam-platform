@@ -1,12 +1,14 @@
+import { SUBLEASING_SHELVED } from '../components/layout/Layout'
 import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark, Globe } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
@@ -527,6 +529,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               When on, individual leases can still further restrict via
               leases.subleasingAllowed. */}
           {/* S568 (Nic): investor-operator model — do you own the land here? */}
+          {/* S605: land-ownership capture drives lot rent, which is shelved
+              with subleasing — see SUBLEASING_SHELVED in Layout. */}
+          {!SUBLEASING_SHELVED && (<>
           <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
               Land ownership
@@ -546,7 +551,10 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               </div>
             </label>
           </div>
+          </>)}
 
+          {/* S605: subleasing shelved — see SUBLEASING_SHELVED in Layout. */}
+          {!SUBLEASING_SHELVED && (<>
           <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
               Subleasing policy
@@ -603,6 +611,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               </div>
             )}
           </div>
+          </>)}
 
           {/* 16a allocation rule.
               S172: ACH / card / platform fee_payer toggles + payout bank
@@ -629,7 +638,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             {/* S513 lock (#2): card is always the tenant's — not selectable. */}
             <div style={{ marginBottom: 12 }}>
               <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Card processing</div>
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>3.25% + 26¢ per card charge (+1.5% on non-US-issued cards)</div>
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>{cardFeeLabel({ intl: true })} per card charge</div>
               <div style={{ padding: '6px 10px', borderRadius: 8, fontSize: '.74rem', border: '1px solid var(--border-0)', background: 'var(--bg-2)', color: 'var(--text-2)' }}>
                 Tenant pays — always (landlords never cover card)
               </div>
@@ -931,13 +940,24 @@ export function PropertiesPage() {
 // done (cached `payoutsEnabled` = true).
 function ConnectReadinessBanner() {
   const navigate = useNavigate()
+  const { user } = useAuth()
   // S321: snake_case reads were silently undefined post-S312 (response
   // interceptor camelizes), so this banner never auto-hid after the
   // landlord finished Stripe Connect onboarding. Reading camelCase
   // now picks up the bridged values correctly.
+  //
+  // S605 (Nic): it STILL didn't hide. It asked for the USER-level Connect
+  // account, but S554 re-anchored owner accounts to the LANDLORD entity — so
+  // for an owner this looked up an account that is legitimately NULL and nagged
+  // "Bank account setup incomplete" at a landlord whose Stripe verification was
+  // complete, charges and payouts enabled. Resolve the same entity BankingPage
+  // does.
+  const isOwner = user?.role === 'landlord'
+  const qs = isOwner ? `entity=landlord&entityId=${user!.profileId}` : 'entity=user'
   const { data } = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
-    'stripe-connect-status-user',
-    () => apiGet('/stripe/connect/status?entity=user'),
+    ['stripe-connect-status-banner', isOwner ? 'landlord' : 'user', user?.profileId],
+    () => apiGet(`/stripe/connect/status?${qs}`),
+    { enabled: !!user },
   )
   if (!data) return null
   if (data.payoutsEnabled && data.detailsSubmitted) return null

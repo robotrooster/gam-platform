@@ -96,6 +96,14 @@ function buildApp() {
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  // S605: subleasing is SHELVED behind `subleasing_enabled` (see the migration).
+  // cleanupAllSchema wipes system_features, so turn it on here — these suites
+  // exercise the feature itself, which still works when enabled. The gate's own
+  // behaviour is asserted separately below.
+  await db.query(
+    `INSERT INTO system_features (key, enabled, description)
+     VALUES ('subleasing_enabled', TRUE, 'test')
+     ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
   appendEventMock.mockClear()
   generateSubleaseDocumentMock.mockClear()
   sendSubleaseInviteMock.mockClear()
@@ -729,5 +737,43 @@ describe('GET /subleases/:id', () => {
       .get(`/api/subleases/${randomUUID()}`)
       .set('Authorization', `Bearer ${f.sublessorToken}`)
     expect(res.status).toBe(404)
+  })
+})
+
+// S605 (Nic): subleasing is SHELVED. "I know people that sublease in a variety
+// of parks, they will never be able to use this until all the landlords are on
+// the same software." The nav item was already hidden, but /api/subleases was
+// still mounted and would accept writes — so data capture was still possible.
+// These assert the gate, and that shelving did NOT strand existing records.
+describe('shelved: subleasing_enabled = false (S605)', () => {
+  const shelve = () => db.query(
+    `INSERT INTO system_features (key, enabled, description)
+     VALUES ('subleasing_enabled', FALSE, 'test')
+     ON CONFLICT (key) DO UPDATE SET enabled = FALSE`)
+
+  it('refuses to create a sublease when shelved', async () => {
+    const f = await seedFixture({ subleasingAllowed: 'allowed' })
+    await shelve()
+    const res = await request(buildApp())
+      .post('/api/subleases')
+      .set('Authorization', `Bearer ${f.sublessorToken}`)
+      .send(reqBody(f))
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/not available/i)
+  })
+
+  it('still allows READING — shelving must not strand an existing sublease', async () => {
+    const f = await seedFixture({ subleasingAllowed: 'allowed' })
+    const created = await request(buildApp())
+      .post('/api/subleases')
+      .set('Authorization', `Bearer ${f.sublessorToken}`)
+      .send(reqBody(f))
+    expect(created.status).toBe(201)
+
+    await shelve()
+    const list = await request(buildApp())
+      .get('/api/subleases')
+      .set('Authorization', `Bearer ${f.sublessorToken}`)
+    expect(list.status).toBe(200)
   })
 })

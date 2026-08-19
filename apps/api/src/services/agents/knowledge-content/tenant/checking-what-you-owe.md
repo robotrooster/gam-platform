@@ -19,10 +19,10 @@ Sign in to your tenant portal and open your payments area. There you can see:
 - **Settled:** The payment has cleared. This is the "done, paid" state.
 - **Failed / Returned:** The payment didn't go through — for example, a card was declined or a bank transfer was returned. This leaves the balance still owing, so you'll want to try again or use another payment method.
 
-## A note on cash payments
+## A note on off-platform payments
 
-GAM is electronic-only. If you paid your landlord in cash outside the platform, that won't appear here, and the balance will continue to show as unpaid in GAM until an electronic payment is made.
+If you paid your landlord off-platform — cash, check, or money order — it shows as unpaid here until your landlord records that payment. Once they record it, your balance updates to reflect it.
 
 ## If your records don't match
 
-GAM is the platform that records and moves payments — your landlord sets the rent amount, due dates, and any fees in your lease. If a balance looks wrong, first check your lease and recent payment history. If something still doesn't add up — especially anything involving a refund or money that may have moved incorrectly — we'll connect you with a human GAM specialist.
+GAM is the platform that records and moves payments — your landlord sets the rent amount, due dates, and any fees in your lease. If a balance looks wrong, first check your lease and recent payment history. If something still doesn't add up — especially anything involving a refund or money that may have moved incorrectly — we'll connect you with a human GAM Strategist.

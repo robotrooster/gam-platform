@@ -8,6 +8,7 @@ import {
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
+import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -88,23 +89,6 @@ export function dueDatesInRange(
  * Uses INSERT ... ON CONFLICT UPDATE to atomically reserve a number.
  * MUST be called inside a transaction on the provided client.
  */
-async function allocateInvoiceNumber(
-  client: PoolClient,
-  landlordId: string,
-  year: number
-): Promise<string> {
-  const r = await client.query(
-    `INSERT INTO invoice_sequences (landlord_id, year, next_number)
-     VALUES ($1, $2, 2)
-     ON CONFLICT (landlord_id, year)
-     DO UPDATE SET next_number = invoice_sequences.next_number + 1
-     RETURNING next_number`,
-    [landlordId, year]
-  )
-  const nextAfter = r.rows[0].next_number as number
-  const sequenceUsed = nextAfter - 1
-  return formatInvoiceNumber(year, sequenceUsed)
-}
 
 /**
  * S548 (Nic — immediate move-out settlement). When the FINAL meter read

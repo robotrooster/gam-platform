@@ -1,6 +1,6 @@
 # Snowbird / Seasonal Tenancy — Design Spec (S576)
 
-Status: DESIGN LOCKED (Nic, S576). Not yet built. Build in phases (bottom of doc).
+Status: DESIGN LOCKED (Nic, S576). BUILD IN PROGRESS (S602 audit) — see per-phase status at "Phased build order" (bottom). Phase 1 done; Phase 2 data foundation landed (`seasonal_tenancies` table); Phases 2b–6 remain.
 
 ## Problem
 
@@ -227,20 +227,27 @@ No extra resume-time read flag is needed. (See utility turnover-reads system.)
 - **Account:** landlord-set "snowbird / priority" marker on the tenant/lease.
 - **Work trade:** already has active/paused — couple to lease hibernation.
 
-## Phased build order
+## Phased build order — STATUS (S602 audit)
 
-1. **Hibernating lease + work-trade lockstep** — flip off/on; invoice-gen skips
-   hibernating (final-utility-settled first); deposit held; work-trade
-   pauses/resumes with it; ACH mandate untouched.
-2. **Auto-recurring, spot-locked seasonal reservation** — season config +
-   yearly generation, coupled to the lease window.
-3. **Priority accounts + auto-relocation** — priority marker wired to the
-   EXISTING `relocateBlockingBookings`; audit log. (Engine mostly built.)
-4. **Guest-friction layer** — downgrade/auto-upgrade offer flow, min-rate rule,
-   structural type-claim protection, offer-window timing.
-5. **Reservation deposits + payment split** — booking deposit (10% def, 5–20%),
-   card-transient / ACH-recurring.
-6. **Tenant self-service reservation editing** — portal surface, same rule.
+1. ✅ **DONE** — **Hibernating lease + work-trade lockstep.** `/leases/:id/hibernate`
+   + `/resume`, `leases.is_hibernating`, invoice-gen skips it, platform-fee accrual
+   skips it (no $2 off-season), work-trade `paused_by_hibernation` (S594),
+   final-utility settled first. Tested (leaseLifecycle.test).
+2. 🟡 **IN PROGRESS** — **Auto-recurring, spot-locked seasonal reservation.**
+   ✅ 2a: `seasonal_tenancies` table (S602 migration — season window month/day,
+   `is_priority`, `last_generated_year`, one row per lease, applied).
+   ⬜ 2b: config endpoints (`PUT/GET /leases/:id/seasonal`) + the yearly generation
+   job that materializes the spot-locked (`locked_to_unit`) recurring reservation
+   in `unit_bookings`, resolving the cross-year window and coupling to hibernate/resume.
+3. ⬜ **TODO** — **Priority accounts + auto-relocation.** Wire `seasonal_tenancies.is_priority`
+   to the EXISTING `relocateBlockingBookings`; add a relocation audit log. (Engine built.)
+4. ⬜ **TODO** — **Guest-friction layer** — downgrade/auto-upgrade offer flow, min-rate
+   rule, structural type-claim protection, offer-window timing. (Nothing built.)
+5. 🟡 **PARTIAL / OFF-SPEC** — **Reservation deposits + payment split.**
+   `properties.booking_deposit_pct` exists but defaults **25%** with a **0–100** range;
+   spec wants **10% default, 5–20% in 5-point steps**. Card-transient / ACH-recurring
+   split not specifically built. Reconcile to spec (or confirm 25% is the new intent).
+6. ⬜ **TODO** — **Tenant self-service reservation editing** — portal surface, same rule.
 
 ## Decisions locked (S576)
 - Scope general (all snowbirds, not just work-trade). ✔

@@ -638,6 +638,47 @@ webhooksRouter.post('/stripe', async (req, res) => {
         updatedRow = r.length > 0 ? r[0] : null
       }
 
+      // S603: declined-CARD-attempt fee ($1.00, entry_description
+      // 'DECLINEFEE'). Stripe bills per AUTHORIZATION, so EVERY refused attempt
+      // costs GAM $0.28 ($0.26 per-auth + $0.02 Radar) with no revenue — hence
+      // this fires on every decline, not just the terminal one. The surplus over
+      // that $0.28 funds card-save / re-save authorizations, which is what keeps
+      // card-on-file (and autopay) viable. ACH is excluded: it carries its own
+      // $4.00 RETURNFEE. POS terminal declines already returned above.
+      //
+      // Idempotent by PaymentIntent: the raw-event insert uses ON CONFLICT DO
+      // NOTHING but does NOT stop reprocessing, so a Stripe redelivery would
+      // otherwise double-bill. The deterministic notes string keyed to pi.id is
+      // the dedupe key.
+      const pmType = (pi.last_payment_error as any)?.payment_method?.type
+      const isCardAttempt = pmType
+        ? pmType === 'card'
+        : (pi.payment_method_types || []).includes('card')
+            && !(pi.payment_method_types || []).includes('us_bank_account')
+      if (updatedRow && isCardAttempt) {
+        try {
+          const { CARD_DECLINE_FEE } = await import('@gam/shared')
+          const declineNote = `Declined card attempt — ${pi.id}`
+          await query(
+            `INSERT INTO payments
+               (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                entry_description, due_date, invoice_id, notes)
+             SELECT p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, 'fee', $2,
+                    'pending', 'DECLINEFEE', CURRENT_DATE, p.invoice_id, $3
+               FROM payments p
+              WHERE p.id = $1
+                AND p.tenant_id IS NOT NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM payments d
+                   WHERE d.entry_description = 'DECLINEFEE' AND d.notes = $3
+                )`,
+            [updatedRow.id, CARD_DECLINE_FEE.toFixed(2), declineNote])
+        } catch (e) {
+          logger.error({ err: e, payment_id: updatedRow.id, pi: pi.id },
+            'decline-fee insert failed')
+        }
+      }
+
       // Credit ledger: emit payment_failed_nsf when the failure is
       // terminal (retries exhausted, no next_retry_at). A still-retrying
       // payment is alive — the tenant's record only takes a hit when
@@ -1246,3 +1287,94 @@ function extractPaymentMethod(charge: Stripe.Charge | null | undefined): Payment
   if (type === 'card') return 'card'
   return null
 }
+
+// ── S605: Resend delivery events ─────────────────────────────────────────
+//
+// Nic asked whether we can tell if a self-signed-up landlord actually received
+// (and read) their outreach email. Delivery is the reliable half and this is it:
+// Resend posts `email.delivered` / `email.bounced` / `email.complained` /
+// `email.delivery_delayed`, and we stamp them onto the send-log row.
+//
+// This is NOT open tracking. Opens need a 1x1 pixel, and Apple Mail Privacy
+// Protection pre-fetches remote images for every message, so "opened" is a
+// false positive for a large share of recipients (and a false negative for
+// anyone blocking images). The outreach email is deliberately image-free so it
+// reads as a person rather than a campaign. The honest engagement signal is the
+// booking-link click, recorded in routes/agent.ts on the prefill call.
+//
+// A BOUNCE is the actionable one: it means every future email to that landlord
+// is going nowhere, which previously looked identical to healthy delivery.
+//
+// Raw body is required for signature verification — mounted with express.raw()
+// in index.ts alongside the Stripe webhook.
+webhooksRouter.post('/resend', async (req, res) => {
+  const secret = process.env.RESEND_WEBHOOK_SECRET
+  if (!secret) {
+    // Fail CLOSED and loudly. Accepting unverified payloads would let anyone
+    // mark a landlord's address bounced; silently 200-ing would hide that the
+    // endpoint was never configured.
+    logger.error('[resend-webhook] RESEND_WEBHOOK_SECRET is not set — rejecting')
+    return res.status(503).json({ error: 'Webhook not configured' })
+  }
+
+  let event: any
+  try {
+    // Resend signs with Svix headers (svix-id / svix-timestamp / svix-signature).
+    // The Webhook class does constant-time comparison and enforces the
+    // timestamp window, so replayed or tampered payloads are rejected.
+    const { Webhook } = await import('svix')
+    const payload = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body)
+    event = new Webhook(secret).verify(payload, {
+      'svix-id':        String(req.headers['svix-id'] ?? ''),
+      'svix-timestamp': String(req.headers['svix-timestamp'] ?? ''),
+      'svix-signature': String(req.headers['svix-signature'] ?? ''),
+    })
+  } catch (err: any) {
+    logger.warn({ err: err?.message }, '[resend-webhook] signature verification failed')
+    return res.status(400).json({ error: 'Invalid signature' })
+  }
+
+  // e.g. 'email.delivered' → 'delivered'
+  const type = String(event?.type ?? '')
+  const kind = type.startsWith('email.') ? type.slice('email.'.length) : type
+  const messageId = event?.data?.email_id ?? event?.data?.id ?? null
+
+  // Ack anything we don't model — Resend must not retry forever over an event
+  // type we simply don't record.
+  if (!messageId || !['delivered', 'bounced', 'complained', 'delivery_delayed'].includes(kind)) {
+    return res.json({ received: true, ignored: true })
+  }
+
+  try {
+    // Only move the state FORWARD in time. Svix delivers at-least-once and out
+    // of order is possible, so a late 'delivered' must never overwrite a
+    // 'bounced' that happened after it.
+    const updated = await query<{ id: string; to_email: string; landlord_id: string | null }>(
+      `UPDATE email_send_log
+          SET last_event = $2, last_event_at = $3::timestamptz
+        WHERE provider_message_id = $1
+          AND (last_event_at IS NULL OR last_event_at < $3::timestamptz)
+      RETURNING id, to_email, landlord_id`,
+      [messageId, kind, event?.created_at ?? new Date().toISOString()])
+
+    // A hard bounce or spam complaint on a landlord we're trying to onboard is
+    // worth a human looking at — everything else is just bookkeeping.
+    if (updated[0] && (kind === 'bounced' || kind === 'complained')) {
+      await createAdminNotification({
+        severity: 'warn',
+        category: 'email_delivery_failure',
+        title: `Email ${kind}: ${updated[0].to_email}`,
+        body: kind === 'bounced'
+          ? `Mail to ${updated[0].to_email} bounced, so every future email to this address is going nowhere. Check the address before more outreach.`
+          : `${updated[0].to_email} marked GAM mail as spam. Stop emailing this address.`,
+        context: { toEmail: updated[0].to_email, landlordId: updated[0].landlord_id, messageId, kind },
+      }).catch(() => {})
+    }
+  } catch (err) {
+    logger.error({ err, messageId }, '[resend-webhook] failed to record event')
+    // 500 so Svix retries — losing a bounce is worse than a duplicate.
+    return res.status(500).json({ error: 'Failed to record' })
+  }
+
+  res.json({ received: true })
+})

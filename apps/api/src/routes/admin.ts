@@ -5,7 +5,7 @@ import { Router, type Request } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL } from '../middleware/auth'
-import { latencyP95, sampleSize } from '../lib/apiMetrics'
+import { latencyP95, sampleSize, MIN_SAMPLES } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
@@ -77,6 +77,245 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
         ) AS csv_imports_pending_review
     `)
     res.json({ success: true, data: platform })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/deposit-trust/summary — S602. What SHOULD be sitting in the
+// segregated deposit trust account right now: every tenant deposit GAM is
+// holding in escrow (held_by='gam_escrow', collected, not yet disbursed). The
+// principal is the cash GAM must have in trust; interest_accrued is the extra
+// GAM owes the tenants on top (funded by the trust's own investment return).
+// Powers the admin Overview trust tile + by-state pie so we can reconcile the
+// on-book liability against the actual account balance once it's stood up.
+adminRouter.get('/deposit-trust/summary', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const HELD = `sd.held_by = 'gam_escrow'
+        AND sd.status IN ('funded','partial','claimed')
+        AND sd.disbursed_at IS NULL
+        AND sd.collected_amount > 0`
+    const [totals] = await query<any>(`
+      SELECT
+        COUNT(*)::int AS held_count,
+        COALESCE(SUM(sd.collected_amount), 0)                              AS total_principal,
+        COALESCE(SUM(COALESCE(sd.interest_accrued, 0)), 0)                 AS total_interest,
+        COALESCE(SUM(sd.collected_amount + COALESCE(sd.interest_accrued,0)), 0) AS total_liability
+      FROM security_deposits sd
+      WHERE ${HELD}
+    `)
+    const byState = await query<any>(`
+      SELECT COALESCE(NULLIF(p.state,''),'—') AS state,
+             COUNT(*)::int AS count,
+             COALESCE(SUM(sd.collected_amount),0)                AS principal,
+             COALESCE(SUM(COALESCE(sd.interest_accrued,0)),0)    AS interest
+        FROM security_deposits sd
+        JOIN leases l     ON l.id = sd.lease_id
+        JOIN units u      ON u.id = l.unit_id
+        JOIN properties p ON p.id = u.property_id
+       WHERE ${HELD}
+       GROUP BY COALESCE(NULLIF(p.state,''),'—')
+       ORDER BY principal DESC
+    `)
+    res.json({ success: true, data: {
+      heldCount:            totals.held_count,
+      totalPrincipal:       Number(totals.total_principal),
+      totalInterestAccrued: Number(totals.total_interest),
+      totalLiability:       Number(totals.total_liability),
+      byState: byState.map((r: any) => ({
+        state: r.state, count: r.count,
+        principal: Number(r.principal), interest: Number(r.interest),
+      })),
+    } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/platform-health — S605 (Nic).
+//
+// "I'd like to not have to go on those dashboards to know if there's a problem."
+// One read-only roll-up of every vendor we depend on (Cloudflare tunnel, Stripe,
+// Resend, Vercel) plus our own stack (database, nightly backup, 24h email
+// deliverability). Detects and reports; fixing still happens in the vendor's
+// console, whose URL each row carries.
+//
+// SUPER-ADMIN only: this is infrastructure posture, not landlord-facing data.
+adminRouter.get('/platform-health', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { getPlatformHealth } = await import('../services/platformHealth')
+    // ?force=1 skips the 60s cache for a deliberate re-check from the UI.
+    res.json({ success: true, data: await getPlatformHealth({ force: req.query.force === '1' }) })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/outreach-status — S605. Did our post-signup outreach actually
+// land, and did anyone act on it?
+//
+// Nic's question was "can we tell if Charlie ever opened the email". Opens are
+// not on this list on purpose (pixel + Apple Mail pre-fetch = a number that
+// lies in both directions). What IS here is trustworthy: whether the recipient
+// server accepted it, whether it bounced, and whether they clicked the booking
+// link — which is first-party and proves intent.
+adminRouter.get('/outreach-status', requireAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(`
+      SELECT l.id AS landlord_id,
+             u.first_name, u.last_name, u.email,
+             l.created_at              AS signed_up_at,
+             l.welcome_outreach_sent_at,
+             (SELECT count(*)::int FROM properties p WHERE p.landlord_id = l.id) AS property_count,
+             u.last_login_at,
+             e.created_at   AS email_sent_at,
+             e.status       AS send_status,
+             e.last_event, e.last_event_at,
+             t.first_clicked_at, t.click_count,
+             s.starts_at    AS booked_call_at, s.status AS booked_call_status
+        FROM landlords l
+        JOIN users u ON u.id = l.user_id
+        -- the most recent outreach email for this landlord
+        LEFT JOIN LATERAL (
+          SELECT created_at, status, last_event, last_event_at
+            FROM email_send_log
+           WHERE landlord_id = l.id
+             AND category IN ('landlord_welcome_outreach', 'landlord_onboarding_outreach')
+           ORDER BY created_at DESC LIMIT 1
+        ) e ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT first_clicked_at, click_count
+            FROM landlord_onboarding_booking_tokens
+           WHERE landlord_id = l.id
+           ORDER BY created_at DESC LIMIT 1
+        ) t ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT starts_at, status FROM sales_call_slots
+           WHERE kind = 'onboarding' AND lower(prospect_email) = lower(u.email)
+           ORDER BY starts_at DESC LIMIT 1
+        ) s ON TRUE
+       WHERE l.is_demo = FALSE AND l.is_system = FALSE
+         AND e.created_at IS NOT NULL
+       ORDER BY e.created_at DESC
+       LIMIT 200`)
+
+    res.json({ success: true, data: rows.map((r: any) => ({
+      landlordId: r.landlord_id,
+      name: [r.first_name, r.last_name].filter(Boolean).join(' ').trim() || r.email,
+      email: r.email,
+      signedUpAt: r.signed_up_at,
+      emailSentAt: r.email_sent_at,
+      sendStatus: r.send_status,
+      // null = no delivery event seen yet (webhook not configured, or in flight)
+      deliveryEvent: r.last_event,
+      deliveryEventAt: r.last_event_at,
+      clickedAt: r.first_clicked_at,
+      clickCount: r.click_count ?? 0,
+      bookedCallAt: r.booked_call_at,
+      bookedCallStatus: r.booked_call_status,
+      // The funnel, in the order it actually happens.
+      stage: r.booked_call_at ? 'booked'
+           : r.first_clicked_at ? 'clicked'
+           : r.last_event === 'bounced' || r.last_event === 'complained' ? 'undeliverable'
+           : r.last_event === 'delivered' ? 'delivered'
+           : r.send_status === 'sent' ? 'sent'
+           : 'failed',
+      propertyCount: r.property_count,
+      lastLoginAt: r.last_login_at,
+    })) })
+  } catch (e) { next(e) }
+})
+
+// ── S605: deposit-interest catalog + pool spread (super-admin only) ───────
+//
+// S604 built the whole 50-state interest/custody catalog and the earned-vs-owed
+// spread engine, but left them with no route and no UI — the only way to read
+// either was psql. This is GAM's largest earning bucket, so "visible only to
+// whoever remembers the table names" is not a place to leave it.
+//
+// SUPER-ADMIN ONLY, deliberately. `spread`, `earned` and `market_rate_pct` are
+// GAM's margin. S603/S604 already drew this boundary twice — calcNetPerUnit
+// leaked to landlords, and getAccrualHistory (tenant portal) had to have
+// earned/market_rate/spread stripped out. Same rule here: this data never
+// crosses to a landlord or tenant surface.
+adminRouter.get('/deposit-interest/spread', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const q = z.object({
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }).parse(req.query)
+    const { getPoolSpreadByMonth } = await import('../services/depositInterest')
+    const months = await getPoolSpreadByMonth({ from: q.from, to: q.to })
+    res.json({ success: true, data: {
+      months: months.map((m) => ({
+        accrualMonth:  m.accrual_month,
+        deposits:      m.deposits,
+        principal:     Number(m.principal ?? 0),
+        owed:          Number(m.owed ?? 0),
+        earned:        Number(m.earned ?? 0),
+        spread:        Number(m.spread ?? 0),
+        marketRatePct: m.market_rate_pct == null ? null : Number(m.market_rate_pct),
+      })),
+      totals: {
+        principal: months.reduce((s, m) => s + Number(m.principal ?? 0), 0),
+        owed:      months.reduce((s, m) => s + Number(m.owed ?? 0), 0),
+        earned:    months.reduce((s, m) => s + Number(m.earned ?? 0), 0),
+        spread:    months.reduce((s, m) => s + Number(m.spread ?? 0), 0),
+      },
+    } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/deposit-interest/catalog — the 50-state obligation + custody
+// read, joined. Answers the two questions that actually get asked: "what do we
+// owe tenants here?" and "may the money physically sit in T-bills here?".
+adminRouter.get('/deposit-interest/catalog', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(`
+      SELECT
+        COALESCE(r.state_code, c.state_code) AS state_code,
+        r.effective_year, r.annual_rate_pct, r.rate_basis, r.unit_types,
+        r.statute_citation, r.actual_share_pct, r.admin_retention_pct,
+        r.min_tenure_months, r.min_property_units,
+        r.threshold_rule, r.threshold_amount, r.threshold_months_rent,
+        c.custody_status, c.allows_treasury_bills, c.institution_test,
+        c.geography_test, c.qualifies_with_segregated_account,
+        c.statute_citation AS custody_citation
+      FROM state_deposit_interest_rates r
+      FULL OUTER JOIN state_deposit_custody_rules c ON c.state_code = r.state_code
+      WHERE r.effective_year IS NULL
+         OR r.effective_year = (SELECT MAX(effective_year) FROM state_deposit_interest_rates)
+      ORDER BY 1, r.unit_types
+    `)
+    // An 'index_linked' state with no published index yet computes $0 owed,
+    // which is silently WRONG rather than merely unknown — flag it here so the
+    // gap is visible on the surface instead of buried in a notes column.
+    const data = rows.map((r: any) => ({
+      stateCode: r.state_code,
+      effectiveYear: r.effective_year,
+      annualRatePct: r.annual_rate_pct == null ? null : Number(r.annual_rate_pct),
+      rateBasis: r.rate_basis,
+      unitTypes: r.unit_types ?? [],
+      statuteCitation: r.statute_citation,
+      actualSharePct: r.actual_share_pct == null ? null : Number(r.actual_share_pct),
+      adminRetentionPct: r.admin_retention_pct == null ? null : Number(r.admin_retention_pct),
+      minTenureMonths: r.min_tenure_months,
+      minPropertyUnits: r.min_property_units,
+      thresholdRule: r.threshold_rule,
+      thresholdAmount: r.threshold_amount == null ? null : Number(r.threshold_amount),
+      thresholdMonthsRent: r.threshold_months_rent == null ? null : Number(r.threshold_months_rent),
+      custodyStatus: r.custody_status ?? 'needs_research',
+      allowsTreasuryBills: r.allows_treasury_bills ?? false,
+      institutionTest: r.institution_test,
+      geographyTest: r.geography_test,
+      qualifiesWithSegregatedAccount: r.qualifies_with_segregated_account,
+      custodyCitation: r.custody_citation,
+      needsIndexValue: r.rate_basis === 'index_linked' && Number(r.annual_rate_pct ?? 0) === 0,
+    }))
+    res.json({ success: true, data: {
+      states: data,
+      summary: {
+        obligations:      data.filter((d) => d.rateBasis && d.rateBasis !== 'none').length,
+        noObligation:     data.filter((d) => d.rateBasis === 'none').length,
+        custodySupported: data.filter((d) => d.custodyStatus === 'supported').length,
+        custodyBlocked:   data.filter((d) => d.custodyStatus === 'blocked').length,
+        needsIndexValue:  data.filter((d) => d.needsIndexValue).map((d) => d.stateCode),
+      },
+    } })
   } catch (e) { next(e) }
 })
 
@@ -170,9 +409,16 @@ adminRouter.get('/infra-readiness', requireSuperAdmin, async (_req, res, next) =
       { key: 'dbConnections', label: 'Postgres connections', value: conns, display: `${conns} / ${maxConns}`,
         watchAt: Math.round(maxConns * 0.7), moveAt: Math.round(maxConns * 0.85), status: statusOf(connPct, 70, 85),
         note: `${conns} of ${maxConns} max connections in use. Regularly near the cap = the database should move first.` },
-      { key: 'apiLatency', label: 'API p95 latency', value: p95 == null ? 0 : Math.round(p95), display: p95 == null ? '—' : Math.round(p95) + ' ms',
+      // S605: below MIN_SAMPLES the p95 IS the slowest single request, so it
+      // swung 25ms↔465ms and flipped the whole panel to "Move" on one slow call
+      // — especially right after a deploy, since the buffer is in-memory and
+      // starts empty. Say "warming up" instead of inventing a verdict.
+      { key: 'apiLatency', label: 'API p95 latency', value: p95 == null ? 0 : Math.round(p95),
+        display: p95 == null ? `warming up (${sampleSize()}/${MIN_SAMPLES})` : Math.round(p95) + ' ms',
         watchAt: 300, moveAt: 500, status: p95 == null ? 'ok' : statusOf(p95, 300, 500),
-        note: `95th-percentile response time over the last ${sampleSize()} requests.` },
+        note: p95 == null
+          ? `Needs ${MIN_SAMPLES} requests before a p95 means anything; ${sampleSize()} so far since the last API restart. Vendor-bound routes (LLM, Stripe, Cloudflare, the health panel itself) are excluded — this tracks the Mac, not someone else's servers.`
+          : `95th-percentile response time over the last ${sampleSize()} requests. Excludes vendor-bound routes (LLM, Stripe, Checkr, the health panel) so it measures the Mac, not third parties.` },
     ]
     const rank: Record<string, number> = { ok: 0, watch: 1, move: 2 }
     const overall = metrics.reduce((worst, m) => (rank[m.status] > rank[worst] ? m.status : worst), 'ok')

@@ -50,6 +50,12 @@ function renderLegalPage(mdFile, title, audience /* 'business' | 'consumer' */) 
 }
 
 function wrapLegalPage(bodyHtml, title, audience) {
+  // S603: 'general' = a page that belongs to NO audience track (the support
+  // page). It reuses this chrome but must not claim to be the tenant edition of
+  // anything, and must not offer a "see the other version" switch — there is no
+  // other version, and someone checking an unfamiliar charge is not necessarily
+  // a tenant at all.
+  const isGeneral = audience === 'general'
   const isBusiness = audience === 'business'
   const audienceLabel = isBusiness ? 'For Landlords & PM Companies' : 'For Tenants'
   const counterpartPath = isBusiness ? '/consumer' : '/business'
@@ -59,7 +65,7 @@ function wrapLegalPage(bodyHtml, title, audience) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${title} (${audienceLabel}) — Gold Asset Management</title>
+<title>${isGeneral ? title : `${title} (${audienceLabel})`} — Gold Asset Management</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -128,8 +134,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;background:var(--bg2)}
   </div>
 </nav>
 <div class="audience-banner">
-  <div class="current">Showing: ${audienceLabel}</div>
-  <div class="switch">Looking for the other version? <a href="${counterpartPath}/${title.toLowerCase().includes('terms') ? 'terms' : 'privacy'}">${counterpartLabel}</a></div>
+  <div class="current">${isGeneral ? '' : `Showing: ${audienceLabel}`}</div>
+  <div class="switch">${isGeneral ? '' : `Looking for the other version? <a href="${counterpartPath}/${title.toLowerCase().includes('terms') ? 'terms' : 'privacy'}">${counterpartLabel}</a>`}</div>
 </div>
 <div class="doc">
 ${bodyHtml}
@@ -254,12 +260,80 @@ try {
   TERMS_PICKER = PRIVACY_PICKER = fallback
 }
 
+
+// ── SUPPORT PAGE (S603, Nic) ─────────────────────────────────────────────
+// The URL Stripe prints on every receipt and submits as dispute evidence.
+//
+// Its job is narrow and worth stating: a cardholder sees an unfamiliar charge on
+// their statement and has two options — look it up, or call their bank. This page
+// exists to win that fork. It leads with the statement descriptor so the charge is
+// recognisable on sight, then gives a human to contact. A chargeback avoided here
+// costs nothing; one fought later costs the dispute fee win or lose.
+//
+// Deliberately NOT the sales chat (Lucy). Someone querying a charge is not a lead,
+// and dropping them into a lead-gen agent is how you earn a chargeback. Reuses the
+// legal-page chrome so it cannot drift from the rest of the site.
+const SUPPORT_HTML = wrapLegalPage(`
+  <h1>Support</h1>
+  <p>Gold Asset Management is the payments and management platform your landlord,
+     property, or business uses to bill rent, stays, utilities, and services.</p>
+
+  <h2>Recognise a charge on your statement?</h2>
+  <p>Payments we process appear on your bank or card statement as
+     <strong>GDMGMT</strong> or <strong>GOLD ASSET MGMT</strong>. The amount is set by your
+     landlord or the business you paid &mdash; we move the money, we do not set the price.</p>
+  <p>If a charge does not look right, <strong>email us before contacting your bank.</strong>
+     We can identify the payment and sort it out quickly. A bank dispute takes weeks, and we
+     may not be able to reach you during it.</p>
+
+  <h2>Contact us</h2>
+  <ul>
+    <li><strong>Email:</strong> <a href="mailto:support@goldassetmanagement.com">support@goldassetmanagement.com</a></li>
+    <li><strong>Phone:</strong> <a href="tel:+18018604506">(801) 860-4506</a></li>
+    <li><strong>Hours:</strong> Monday&ndash;Friday, 9am&ndash;5pm Arizona time</li>
+  </ul>
+  <p>Include the <strong>amount</strong>, the <strong>date</strong>, and the
+     <strong>last four digits</strong> of the card or bank account. That is enough for us to find it.</p>
+
+  <h2>Tenants and residents</h2>
+  <p>For rent, your lease, maintenance, or your balance, sign in at
+     <a href="https://tenant.goldassetmanagement.com">tenant.goldassetmanagement.com</a>.
+     Rent amounts, due dates, and late fees come from the lease you signed with your landlord
+     &mdash; not from us.</p>
+
+  <h2>Landlords and businesses</h2>
+  <p>Sign in at <a href="https://landlord.goldassetmanagement.com">landlord.goldassetmanagement.com</a>.</p>
+
+  <h2>Terms and privacy</h2>
+  <p><a href="/terms">Terms of Service</a> &middot; <a href="/privacy">Privacy Policy</a></p>
+`, 'Support', 'general')
+
 http.createServer((req, res) => {
   const url = (req.url || '/').split('?')[0].replace(/\/$/, '') || '/'
   const send = (html) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(html)
   }
+
+  // S605: portal shortcuts. These paths used to fall through to the default
+  // case at the bottom, which serves the MARKETING HOMEPAGE for any unknown
+  // URL — so goldassetmanagement.com/landlord returned 200 with the landing
+  // page and looked, to a landlord trying to get back in, like nothing loaded.
+  // Nic hit this on the real Oak Park account. Redirect to the actual portal
+  // instead of silently pretending the path exists.
+  const LANDLORD = (process.env.LANDLORD_URL || LANDLORD_URL).replace(/\/$/, '')
+  const TENANT = (process.env.TENANT_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')
+  const redirect = (to) => { res.writeHead(302, { Location: to }); res.end() }
+  if (url === '/landlord' || url === '/login' || url === '/signin' || url === '/sign-in') {
+    return redirect(LANDLORD + '/login')
+  }
+  if (url === '/register' || url === '/signup' || url === '/sign-up') {
+    return redirect(LANDLORD + '/register')
+  }
+  if (url === '/tenant' || url === '/tenants') return redirect(TENANT + '/login')
+
+  // S603: support page — the URL Stripe prints on receipts + dispute evidence.
+  if (url === '/support' || url === '/help') return send(SUPPORT_HTML)
 
   // Audience-scoped legal pages
   if (url === '/business/terms')   return send(BUSINESS_TERMS_HTML)

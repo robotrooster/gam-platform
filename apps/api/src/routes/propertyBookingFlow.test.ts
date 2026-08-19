@@ -53,7 +53,7 @@ async function seedSite(opts: { connect?: boolean } = {}) {
     }
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await client.query(
-      `UPDATE properties SET public_booking_enabled=TRUE, booking_slug='sunny', booking_deposit_pct=25 WHERE id=$1`,
+      `UPDATE properties SET public_booking_enabled=TRUE, booking_slug='sunny', booking_deposit_pct=20 WHERE id=$1`,
       [propertyId])
     const unitId = await seedUnit(client, { propertyId, landlordId })
     await client.query(
@@ -77,11 +77,11 @@ describe('POST /book', () => {
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     expect(res.status).toBe(200)
     expect(res.body.data.checkoutUrl).toContain('checkout.stripe.test')
-    expect(res.body.data.depositAmount).toBe(75) // 25% of 300
+    expect(res.body.data.depositAmount).toBe(60) // 20% of 300
     const bk = await db.query<any>('SELECT * FROM unit_bookings WHERE id=$1', [res.body.data.bookingId])
     expect(bk.rows[0].status).toBe('tentative')
     expect(bk.rows[0].source).toBe('public')
-    expect(Number(bk.rows[0].deposit_amount)).toBe(75)
+    expect(Number(bk.rows[0].deposit_amount)).toBe(60) // 20% of 300
     expect(bk.rows[0].stripe_checkout_session_id).toMatch(/^cs_test_/)
     expect(bk.rows[0].hold_expires_at).not.toBeNull()
   })
