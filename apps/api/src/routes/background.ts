@@ -1247,9 +1247,8 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // for the preset-rent fallback below.
     const unit = unitId
       ? await queryOne<any>(
-          `SELECT u.*, p.name as property_name, s.rent_amount AS subtype_rent_amount
+          `SELECT u.*, p.name as property_name
            FROM units u JOIN properties p ON p.id=u.property_id
-           LEFT JOIN property_unit_subtypes s ON s.id=u.subtype_id
            WHERE u.id=$1 AND u.landlord_id=$2`,
           [unitId, req.user!.profileId]
         )
@@ -1259,9 +1258,10 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       const conflict = await findStayConflict(unit.id, { checkIn: new Date().toISOString().slice(0, 10) })
       if (conflict) throw new AppError(409, 'That unit isn\u2019t available — it has an active lease or an upcoming reservation')
     }
-    // W-48: monthly rent comes from the landlord's preset unit info (unit
-    // override, else subtype pricing) — nobody types it.
-    const monthlyRent = unit ? (unit.rent_amount ?? unit.subtype_rent_amount ?? null) : null
+    // W-48: monthly rent comes from the landlord's preset unit info — nobody
+    // types it. S613: the unit carries its subtype's price (the subtype owns
+    // it), so there is no longer a second number to fall back to.
+    const monthlyRent = unit ? (unit.rent_amount ?? null) : null
 
     const match = await queryOne<any>(`
       INSERT INTO pool_match_requests (pool_entry_id, landlord_id, unit_id, status, landlord_message)

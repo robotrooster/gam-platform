@@ -19,16 +19,20 @@
  *            push, not a live inheritance — editing the subtype later never
  *            silently rewrites units that were minted from it.
  *
- * Applying splits by what a signed lease commits:
+ * S613 (Nic): a class OWNS the price of the units in it. Linking a unit to a
+ * class therefore sets that unit's rent, deposit and stay rates — that is what
+ * belonging to a class means, and it is why editing a class moves every unit in
+ * it (the DB trigger in 20260820170000). A unit in NO class keeps its own
+ * price, editable on the unit itself.
  *
- *   PHYSICAL facts (layout, amp service, bed/bath, storage size, who owns the
- *   dwelling) are facts about the space. Recording that space 12 really is a
- *   50-amp back-in is a correction, and correcting it matters — the booking
- *   engine and the utility splits read those columns. Allowed while leased.
+ * That is safe on an occupied unit because the unit's price is the ASKING
+ * price: a long-term tenant is billed from leases.rent_amount and the lease is
+ * law. The 12-year tenant at $380 under a $440 class keeps paying $380.
  *
- *   PRICING (rent, deposit, nightly/weekly/monthly) is committed to the signed
- *   lease. Never touched while a lease is active or pending; the caller is told
- *   which units were held back rather than being left to assume it applied.
+ * `applyDetails` now covers only the PHYSICAL facts (layout, amp service,
+ * bed/bath, storage size, who owns the dwelling), which is a separate question
+ * — a landlord may want a space counted in a class without restating that the
+ * pad is 50 amp.
  */
 import { PoolClient } from 'pg'
 import { db, query, queryOne } from '../db'
@@ -56,8 +60,6 @@ export interface ApplySubtypeResult {
   linked: number
   /** Units that had their physical facts copied from the subtype. */
   detailsApplied: number
-  /** Unit numbers whose PRICING was held back because they are leased. */
-  pricingHeldBack: string[]
 }
 
 export async function loadSubtype(subtypeId: string, propertyId: string): Promise<UnitSubtypeRow | null> {
@@ -113,13 +115,13 @@ export async function setSubtypeUnits(
       [subtype.id, unitIds],
     )
 
-    const result: ApplySubtypeResult = { linked: targets.length, detailsApplied: 0, pricingHeldBack: [] }
+    const result: ApplySubtypeResult = { linked: targets.length, detailsApplied: 0 }
     for (const u of targets) {
       await client.query(`UPDATE units SET subtype_id=$1, updated_at=NOW() WHERE id=$2`, [subtype.id, u.id])
+      await applyPricingToUnit(client, subtype, u)
       if (!opts.applyDetails) continue
       await applyDetailsToUnit(client, subtype, u)
       result.detailsApplied++
-      if (u.leased) result.pricingHeldBack.push(u.unit_number)
     }
 
     await client.query('COMMIT')
@@ -132,11 +134,37 @@ export async function setSubtypeUnits(
   }
 }
 
-/** Copy the subtype's values onto ONE unit. Pricing is skipped while leased. */
+/**
+ * The class owns the price, so a linked unit carries the class's numbers —
+ * no COALESCE: a class that clears its nightly rate means the units in it have
+ * no nightly rate, not that they keep the last one. rent_amount is NOT NULL on
+ * units, so a class with no rent leaves the unit's last number standing rather
+ * than failing the landlord's save (same rule as the DB trigger).
+ */
+async function applyPricingToUnit(
+  client: PoolClient,
+  s: UnitSubtypeRow,
+  u: { id: string },
+): Promise<void> {
+  const isRv = s.unit_type === 'rv_spot'
+  await client.query(
+    `UPDATE units SET
+       rent_amount      = COALESCE($2::numeric, rent_amount),
+       security_deposit = COALESCE($3::numeric, 0),
+       nightly_rate     = CASE WHEN $4 THEN $5::numeric ELSE nightly_rate END,
+       weekly_rate      = CASE WHEN $4 THEN $6::numeric ELSE weekly_rate  END,
+       monthly_rate     = CASE WHEN $4 THEN $7::numeric ELSE monthly_rate END,
+       updated_at = NOW()
+     WHERE id = $1`,
+    [u.id, s.rent_amount, s.security_deposit, isRv, s.nightly_rate, s.weekly_rate, s.monthly_rate],
+  )
+}
+
+/** Copy the subtype's PHYSICAL facts onto ONE unit. */
 async function applyDetailsToUnit(
   client: PoolClient,
   s: UnitSubtypeRow,
-  u: { id: string; leased: boolean },
+  u: { id: string },
 ): Promise<void> {
   const isRv = s.unit_type === 'rv_spot'
   const hasBeds = ['apartment', 'single_family', 'mobile_home'].includes(s.unit_type)
@@ -162,30 +190,23 @@ async function applyDetailsToUnit(
      ownershipRelevant, s.dwelling_ownership],
   )
 
-  if (u.leased) return   // rent and deposit belong to the signed lease
-
-  await client.query(
-    `UPDATE units SET
-       rent_amount      = COALESCE($2::numeric, rent_amount),
-       security_deposit = COALESCE($3::numeric, security_deposit),
-       nightly_rate     = CASE WHEN $4 THEN COALESCE($5::numeric, nightly_rate) ELSE nightly_rate END,
-       weekly_rate      = CASE WHEN $4 THEN COALESCE($6::numeric, weekly_rate)  ELSE weekly_rate  END,
-       monthly_rate     = CASE WHEN $4 THEN COALESCE($7::numeric, monthly_rate) ELSE monthly_rate END,
-       updated_at = NOW()
-     WHERE id = $1`,
-    [u.id, s.rent_amount, s.security_deposit, isRv, s.nightly_rate, s.weekly_rate, s.monthly_rate],
-  )
 }
 
-/** Link ONE unit (or clear it with subtypeId = null). Used by the unit page. */
+/**
+ * Move ONE unit into a class, or out of every class with subtypeId = null.
+ *
+ * Leaving a class does NOT reprice the unit: it keeps the numbers it has and
+ * they simply become its own again, editable on the unit. Repricing someone's
+ * unit as a side effect of un-grouping it would be a surprise, and a silent one.
+ */
 export async function linkUnitToSubtype(
-  unit: { id: string; unit_number: string; unit_type: string; property_id: string; leased: boolean },
+  unit: { id: string; unit_number: string; unit_type: string; property_id: string },
   subtypeId: string | null,
   opts: { applyDetails: boolean },
-): Promise<{ subtype: UnitSubtypeRow | null; pricingHeldBack: boolean }> {
+): Promise<{ subtype: UnitSubtypeRow | null }> {
   if (subtypeId === null) {
     await query(`UPDATE units SET subtype_id=NULL, updated_at=NOW() WHERE id=$1`, [unit.id])
-    return { subtype: null, pricingHeldBack: false }
+    return { subtype: null }
   }
   const s = await loadSubtype(subtypeId, unit.property_id)
   if (!s) throw new Error('That subtype is not on this property.')
@@ -198,6 +219,7 @@ export async function linkUnitToSubtype(
   try {
     await client.query('BEGIN')
     await client.query(`UPDATE units SET subtype_id=$1, updated_at=NOW() WHERE id=$2`, [s.id, unit.id])
+    await applyPricingToUnit(client, s, unit)
     if (opts.applyDetails) await applyDetailsToUnit(client, s, unit)
     await client.query('COMMIT')
   } catch (e) {
@@ -206,5 +228,5 @@ export async function linkUnitToSubtype(
   } finally {
     client.release()
   }
-  return { subtype: s, pricingHeldBack: opts.applyDetails && unit.leased }
+  return { subtype: s }
 }

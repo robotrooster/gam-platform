@@ -340,6 +340,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     // prefix-less name can no longer be constructed. Enforced by construction
     // rather than by rejection.
 
+    // S613 (Nic): a subtype is OPTIONAL. With one, the unit takes the class's
+    // price and every unit in that class matches. Without one, the unit carries
+    // its own price — which is why a landlord adding a single unit never has to
+    // learn what a subtype is.
     const created: any[] = []
     for (const unitNumber of unitNumbers) {
       // W-16: the units_property_unit_number_uniq index rejects duplicate
@@ -945,6 +949,8 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
       bedrooms:        z.number().int().min(0).max(30).optional(),
       bathrooms:       z.number().min(0).max(30).optional(),
       sqft:            z.number().int().min(0).nullable().optional(),
+      // S613 (Nic): accepted for a unit with NO subtype, refused for one in a
+      // subtype — the subtype sets the price for every unit in it.
       rentAmount:      z.number().min(0).optional(),
       securityDeposit: z.number().min(0).optional(),
       dwellingOwnership: z.enum(DWELLING_OWNERSHIP_VALUES as unknown as [string, ...string[]]).optional(),
@@ -969,6 +975,27 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    // S613 (Nic, DIRECTIVE): "when there is a subtype set, all units with that
+    // subtype have to be the same price because it's set at the subtype level.
+    // If one doesn't exist, then it can be a different price."
+    //
+    // So the price fields live here for an unclassed unit and are refused for a
+    // classed one — accepting them there would let two units of one class drift
+    // apart, which is the whole thing a class prevents. Refusing out loud beats
+    // ignoring: a save that reports success and changes nothing is how the
+    // subtype overwrite went unnoticed for a session.
+    const priceFields = ['rentAmount', 'securityDeposit', 'nightlyRate', 'weeklyRate', 'monthlyRate'] as const
+    const sentPrice = priceFields.filter(k => (body as any)[k] !== undefined)
+    const classOwnsPrice = !!unit.subtype_id
+    if (sentPrice.length && classOwnsPrice) {
+      const sub = await queryOne<any>(
+        `SELECT name FROM property_unit_subtypes WHERE id=$1`, [unit.subtype_id])
+      throw new AppError(400,
+        `This unit is a "${sub?.name ?? 'subtype'}", and that subtype sets the price for every unit ` +
+        'in it. Change it on the subtype and they all follow — or take this unit out of the subtype ' +
+        'to price it on its own.')
+    }
 
     // Lease-lock — the whole point of this workflow (Nic): no edits while a
     // lease is active/pending; everything is editable only between leases.
@@ -1014,11 +1041,14 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
     const bedrooms   = body.bedrooms ?? unit.bedrooms
     const bathrooms  = body.bathrooms ?? unit.bathrooms
     const sqft       = body.sqft === undefined ? unit.sqft : body.sqft
-    const rentAmount = body.rentAmount ?? Number(unit.rent_amount)
-    const securityDeposit = body.securityDeposit ?? Number(unit.security_deposit)
-    const nightlyRate = body.nightlyRate === undefined ? unit.nightly_rate : body.nightlyRate
-    const weeklyRate  = body.weeklyRate  === undefined ? unit.weekly_rate  : body.weeklyRate
-    const monthlyRate = body.monthlyRate === undefined ? unit.monthly_rate : body.monthlyRate
+    // S613: a CLASSED unit carries these through untouched — its subtype writes
+    // them, via the trigger when the class is edited and via the link when the
+    // unit moves class. An unclassed unit owns them, as it always did.
+    const rentAmount = classOwnsPrice ? Number(unit.rent_amount) : (body.rentAmount ?? Number(unit.rent_amount))
+    const securityDeposit = classOwnsPrice ? Number(unit.security_deposit) : (body.securityDeposit ?? Number(unit.security_deposit))
+    const nightlyRate = classOwnsPrice || body.nightlyRate === undefined ? unit.nightly_rate : body.nightlyRate
+    const weeklyRate  = classOwnsPrice || body.weeklyRate  === undefined ? unit.weekly_rate  : body.weeklyRate
+    const monthlyRate = classOwnsPrice || body.monthlyRate === undefined ? unit.monthly_rate : body.monthlyRate
     const lotRentAmount = body.lotRentAmount ?? Number(unit.lot_rent_amount ?? 0)
     const occupancyMode = body.occupancyMode ?? unit.occupancy_mode
     // S573: living-area count (bedroom types only) + feature map (only keys the
@@ -1058,14 +1088,15 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
 // links those."
 //
 // Deliberately NOT part of PATCH /:id/details, which is locked whole while a
-// lease is active because rent is committed to the signed document. Saying
-// which class a space belongs to commits nothing, so it stays available on an
-// occupied unit — otherwise a full park could never classify a single space.
-// Applying the subtype's values is the part that respects the lock: physical
-// facts always, pricing only between leases (see services/unitSubtype).
+// lease is active. Moving a space between classes stays available on an
+// occupied unit — otherwise a full park could never classify a single space,
+// and it is safe because the unit's price is the ASKING price: a tenant is
+// billed from leases.rent_amount and the lease is law (S613).
 unitsRouter.patch('/:id/subtype', requirePerm('schedule.configure_unit'), async (req, res, next) => {
   try {
     const body = z.object({
+      // null = no class. The unit then owns its price again, keeping whatever
+      // it currently has — leaving a class is not a reason to reprice a unit.
       subtypeId:    z.string().uuid().nullable(),
       applyDetails: z.boolean().optional(),
     }).parse(req.body)
@@ -1084,7 +1115,6 @@ unitsRouter.patch('/:id/subtype', requirePerm('schedule.configure_unit'), async 
       res.json({ success: true, data: {
         subtypeId: out.subtype?.id ?? null,
         subtypeName: out.subtype?.name ?? null,
-        pricingHeldBack: out.pricingHeldBack,
       } })
     } catch (e: any) {
       throw new AppError(400, e?.message || 'Could not set that subtype')

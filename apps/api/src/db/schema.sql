@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 2iI6W1RzV4c0O2NcbDEOwdzT6oZbXaY1lbosMSkRVOp3Ju2U1kJ2ibd5QaLfa5Y
+\restrict w6dT4OD0F4LzJ9vSwF2jh92b1TgxuVNabjFl9RIvi6HXigCVuF9Fbsh1PFWRLv7
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -137,6 +137,35 @@ BEGIN
     RETURN OLD;
   END IF;
   RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: enforce_subtype_pricing(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_subtype_pricing() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE s RECORD;
+BEGIN
+  IF NEW.subtype_id IS NULL OR NEW.retired_at IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  SELECT rent_amount, security_deposit, nightly_rate, weekly_rate, monthly_rate
+    INTO s FROM property_unit_subtypes WHERE id = NEW.subtype_id;
+  IF NOT FOUND THEN
+    RETURN NEW;
+  END IF;
+  -- rent_amount is NOT NULL on units: a class with no rent set leaves the unit's
+  -- own number rather than failing the write.
+  NEW.rent_amount      := COALESCE(s.rent_amount, NEW.rent_amount);
+  NEW.security_deposit := COALESCE(s.security_deposit, 0);
+  NEW.nightly_rate     := s.nightly_rate;
+  NEW.weekly_rate      := s.weekly_rate;
+  NEW.monthly_rate     := s.monthly_rate;
+  RETURN NEW;
 END;
 $$;
 
@@ -307,6 +336,35 @@ BEGIN
       (item_id, old_price, new_price, old_cost, new_cost, changed_by)
     VALUES
       (NEW.id, OLD.sell_price, NEW.sell_price, OLD.cost_price, NEW.cost_price, actor_id);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: propagate_subtype_pricing(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.propagate_subtype_pricing() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.rent_amount      IS DISTINCT FROM OLD.rent_amount
+  OR NEW.security_deposit IS DISTINCT FROM OLD.security_deposit
+  OR NEW.nightly_rate     IS DISTINCT FROM OLD.nightly_rate
+  OR NEW.weekly_rate      IS DISTINCT FROM OLD.weekly_rate
+  OR NEW.monthly_rate     IS DISTINCT FROM OLD.monthly_rate THEN
+    UPDATE units u SET
+      -- rent_amount is NOT NULL on units; a class that clears its rent leaves
+      -- the last known number rather than failing the landlord's save.
+      rent_amount      = COALESCE(NEW.rent_amount, u.rent_amount),
+      security_deposit = COALESCE(NEW.security_deposit, 0),
+      nightly_rate     = NEW.nightly_rate,
+      weekly_rate      = NEW.weekly_rate,
+      monthly_rate     = NEW.monthly_rate,
+      updated_at       = NOW()
+     WHERE u.subtype_id = NEW.id AND u.retired_at IS NULL;
   END IF;
   RETURN NEW;
 END;
@@ -17501,6 +17559,13 @@ CREATE TRIGGER trg_emergency_contacts_updated_at BEFORE UPDATE ON public.emergen
 
 
 --
+-- Name: units trg_enforce_subtype_pricing; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_enforce_subtype_pricing BEFORE INSERT OR UPDATE ON public.units FOR EACH ROW EXECUTE FUNCTION public.enforce_subtype_pricing();
+
+
+--
 -- Name: generated_routes trg_generated_routes_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -17603,6 +17668,13 @@ CREATE TRIGGER trg_payments_invoice_status_rollup AFTER INSERT OR DELETE OR UPDA
 --
 
 CREATE TRIGGER trg_pool_match_requests_updated_at BEFORE UPDATE ON public.pool_match_requests FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: property_unit_subtypes trg_propagate_subtype_pricing; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_propagate_subtype_pricing AFTER UPDATE ON public.property_unit_subtypes FOR EACH ROW EXECUTE FUNCTION public.propagate_subtype_pricing();
 
 
 --
@@ -23335,5 +23407,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 2iI6W1RzV4c0O2NcbDEOwdzT6oZbXaY1lbosMSkRVOp3Ju2U1kJ2ibd5QaLfa5Y
+\unrestrict w6dT4OD0F4LzJ9vSwF2jh92b1TgxuVNabjFl9RIvi6HXigCVuF9Fbsh1PFWRLv7
 

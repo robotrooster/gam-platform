@@ -97,9 +97,10 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
         <div style={{ flex: 1 }}>
           <h2 style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: '1.05rem', color: 'var(--text-0)' }}>Unit Subtypes</h2>
           <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 4 }}>
-            Your own named unit classes — "Studio", "Pull-through 50 amp", "10x10". Adding a unit
-            picks a subtype and prefills its details and pricing. Fees are not set here: each tenant
-            is charged per their signed lease.
+            Your own named unit classes — "Studio", "Pull-through 50 amp", "10x10".
+            <strong> A subtype sets one price for every unit in it</strong>: change the rent here and
+            they all follow. Subtypes are optional — a unit in none prices on its own. Fees are not
+            set here: each tenant is charged per their signed lease.
           </div>
         </div>
         {editing === null && (
@@ -393,12 +394,7 @@ function SubtypeUnitsModal({ propertyId, subtype, onClose, onSaved }: {
       { unitIds: Array.from(current), applyDetails }),
     {
       onSuccess: (res: any) => {
-        const held: string[] = res?.pricingHeldBack ?? []
-        if (held.length) {
-          toast(
-            `Saved. Rent and deposit were left alone on ${held.length === 1 ? 'unit' : 'units'} ` +
-            `${held.join(', ')} — ${held.length === 1 ? 'it has' : 'they have'} an active lease.`)
-        }
+        if (res?.linked) toast(`${res.linked === 1 ? '1 unit is' : `${res.linked} units are`} now ${subtype.name}.`)
         onSaved()
       },
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save that'),
@@ -413,8 +409,10 @@ function SubtypeUnitsModal({ propertyId, subtype, onClose, onSaved }: {
       <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
         Tick every {UNIT_TYPE_LABEL[subtype.unitType].toLowerCase()} that is a{' '}
         <strong style={{ color: 'var(--text-1)' }}>{subtype.name}</strong>
-        {facts ? ` (${facts})` : ''}. Unticking one leaves the unit exactly as it is — it just
-        stops being counted as this subtype.
+        {facts ? ` (${facts})` : ''}. Those units take this subtype&apos;s
+        {subtype.rentAmount != null ? ` rent of ${fmt(subtype.rentAmount)}` : ' pricing'} — one price
+        for every unit in it. Untick one and it prices on its own again, keeping the number it has.
+        A tenant already under a signed lease keeps paying what their lease says.
       </div>
 
       {err && (
@@ -445,7 +443,7 @@ function SubtypeUnitsModal({ propertyId, subtype, onClose, onSaved }: {
                 {u.leased && <span className="badge badge-green" style={{ fontSize: '.62rem' }}>Leased</span>}
                 {elsewhere && (
                   <span style={{ fontSize: '.7rem', color: 'var(--text-3)', marginLeft: 'auto' }}>
-                    currently “{elsewhere}”
+                    currently “{elsewhere}” — ticking moves it here
                   </span>
                 )}
               </label>
@@ -454,17 +452,17 @@ function SubtypeUnitsModal({ propertyId, subtype, onClose, onSaved }: {
         </div>
       )}
 
-      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, cursor: 'pointer' }}>
-        <input type="checkbox" checked={applyDetails} onChange={e => setApplyDetails(e.target.checked)} style={{ marginTop: 3 }} />
-        <span style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-          Also copy this subtype's details onto those units{facts ? ` (${facts})` : ''}
-          {subtype.rentAmount != null ? ` and its rent` : ''}.
-          <span style={{ display: 'block', color: 'var(--text-3)', fontSize: '.72rem' }}>
-            Leave this off to only label the units. Rent and deposit are never changed on a unit with
-            an active lease — that is committed to the signed lease.
+      {facts && (
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, cursor: 'pointer' }}>
+          <input type="checkbox" checked={applyDetails} onChange={e => setApplyDetails(e.target.checked)} style={{ marginTop: 3 }} />
+          <span style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            Also set those units&apos; details to match ({facts}).
+            <span style={{ display: 'block', color: 'var(--text-3)', fontSize: '.72rem' }}>
+              Leave off if the spaces differ physically — pricing follows the subtype either way.
+            </span>
           </span>
-        </span>
-      </label>
+        </label>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
         <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>

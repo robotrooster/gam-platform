@@ -106,8 +106,12 @@ export function UnitDetailPage() {
       bedrooms: num(f.bedrooms),
       bathrooms: num(f.bathrooms),
       sqft: f.sqft === '' ? null : Number(f.sqft),
-      rentAmount: num(f.rentAmount),
-      securityDeposit: num(f.securityDeposit),
+      // S613: only a unit outside a subtype owns its price. Sending these for a
+      // classed unit is refused by the API rather than silently ignored.
+      ...(unit.subtypeId ? {} : {
+        rentAmount: num(f.rentAmount),
+        securityDeposit: num(f.securityDeposit),
+      }),
       dwellingOwnership: f.dwellingOwnership,
       ownerHouseholdSize: Math.max(1, Number(f.ownerHouseholdSize) || 1),
       isMultiLevel: f.isMultiLevel,
@@ -278,8 +282,30 @@ export function UnitDetailPage() {
                     <div className="data-row"><span className="data-key">Bathrooms</span><input {...inpS} type="number" min={0} step={0.5} value={editForm.bathrooms} onChange={e => set('bathrooms', e.target.value)} /></div>
                     <div className="data-row"><span className="data-key">Sq ft</span><input {...inpS} type="number" min={0} value={editForm.sqft} onChange={e => set('sqft', e.target.value)} /></div>
                   </>}
-                  <div className="data-row"><span className="data-key">Rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.rentAmount} onChange={e => set('rentAmount', e.target.value)} /></div>
-                  <div className="data-row"><span className="data-key">Deposit</span><input {...inpS} type="number" min={0} value={editForm.securityDeposit} onChange={e => set('securityDeposit', e.target.value)} /></div>
+                  {/* S613 (Nic, DIRECTIVE): "when there is a subtype set, all
+                      units with that subtype have to be the same price... if one
+                      doesn't exist, then it can be a different price." So these
+                      are fields on a unit that stands alone and a readout on one
+                      that belongs to a class. */}
+                  {unit.subtypeId ? (
+                    <>
+                      <div className="data-row"><span className="data-key">Rent (/mo)</span>
+                        <span className="data-val mono">{fmt(unit.rentAmount)}
+                          <span style={{ color: 'var(--text-3)', fontSize: '.7rem', marginLeft: 6, fontFamily: 'inherit' }}>
+                            set by {unit.subtypeName}
+                          </span>
+                        </span>
+                      </div>
+                      <div className="data-row"><span className="data-key">Deposit</span>
+                        <span className="data-val mono">{fmt(unit.securityDeposit)}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="data-row"><span className="data-key">Rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.rentAmount} onChange={e => set('rentAmount', e.target.value)} /></div>
+                      <div className="data-row"><span className="data-key">Deposit</span><input {...inpS} type="number" min={0} value={editForm.securityDeposit} onChange={e => set('securityDeposit', e.target.value)} /></div>
+                    </>
+                  )}
                   {(isRv || editForm.unitType === 'mobile_home') && (
                     <div className="data-row"><span className="data-key">{isRv ? 'RV owner' : 'Home owner'}</span>
                       <select {...selS} value={editForm.dwellingOwnership} onChange={e => set('dwellingOwnership', e.target.value)}>
@@ -432,7 +458,15 @@ export function UnitDetailPage() {
               <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
               <UnitSubtypeRow unit={unit} />
               <div className="data-row"><span className="data-key">Leasing</span><span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span></div>
-              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
+              <div className="data-row"><span className="data-key">Rent</span>
+                <span className="data-val mono">{fmt(unit.rentAmount)}/mo
+                  {unit.subtypeName && (
+                    <span style={{ color: 'var(--text-3)', fontSize: '.7rem', marginLeft: 6, fontFamily: 'inherit' }}>
+                      set by {unit.subtypeName}
+                    </span>
+                  )}
+                </span>
+              </div>
               <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
               {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
                 <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
@@ -788,11 +822,8 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
   const linkMut = useMutation(
     (body: { subtypeId: string | null; applyDetails?: boolean }) => apiPatch(`/units/${unit.id}/subtype`, body),
     {
-      onSuccess: (data: any) => {
+      onSuccess: () => {
         setErr('')
-        if (data?.pricingHeldBack) {
-          toast('Details applied. Rent and deposit were left alone — this unit has an active lease.')
-        }
         qc.invalidateQueries(['unit', unit.id])
         qc.invalidateQueries(['property-unit-subtypes', unit.propertyId])
       },
@@ -814,19 +845,18 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
       if (differs(current.bathrooms, unit.bathrooms)) diffs.push(`${current.bathrooms} bath`)
     }
     if (unit.unitType === 'storage' && differs(current.storageSize, unit.storageSize)) diffs.push(String(current.storageSize))
-    if (!unit.hasActiveLease) {
-      if (differs(current.rentAmount, unit.rentAmount)) diffs.push(`rent ${fmt(current.rentAmount)}`)
-      if (differs(current.securityDeposit, unit.securityDeposit)) diffs.push(`deposit ${fmt(current.securityDeposit)}`)
-    }
+    // Prices are NOT compared: the subtype owns them, so a linked unit always
+    // carries its class's numbers. Only the physical facts can drift.
   }
 
   if (forType.length === 0 && !current) {
-    // Nothing to pick from is itself an answer — say where subtypes come from
-    // rather than showing an empty dropdown that looks broken.
+    // No subtypes on the property is a perfectly normal state — this unit just
+    // prices on its own. Say where they come from without implying something
+    // is missing.
     return (
       <div className="data-row"><span className="data-key">Subtype</span>
         <span className="data-val" style={{ color: 'var(--text-3)', fontSize: '.76rem' }}>
-          None defined — add them on the property page
+          None — this unit prices on its own. Subtypes are added on the property page.
         </span>
       </div>
     )
@@ -835,11 +865,16 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
   return (
     <>
       <div className="data-row"><span className="data-key">Subtype</span>
+        {/* S613: this is where the unit's rent comes from — changing it here
+            moves the unit into another class and onto that class's price. */}
         {can('schedule.configure_unit') ? (
           <select className="form-select" style={{ maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' }}
             value={unit.subtypeId || ''} disabled={linkMut.isLoading}
             onChange={e => linkMut.mutate({ subtypeId: e.target.value || null })}>
-            <option value="">— none —</option>
+            {/* S613 (Nic): a subtype is optional. In one, the unit takes the
+                class price and matches every other unit in it. In none, the
+                unit prices on its own — the fields below become editable. */}
+            <option value="">No subtype — price this unit on its own</option>
             {forType.map(s => (
               <option key={s.id} value={s.id}>
                 {s.name}{unitSubtypeFactsLabel(s) ? ` (${unitSubtypeFactsLabel(s)})` : ''}
@@ -853,7 +888,7 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
       {err && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginBottom: 6 }}>{err}</div>}
       {current && diffs.length > 0 && can('schedule.configure_unit') && (
         <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '-2px 0 8px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span>This unit doesn&apos;t match it: {diffs.join(', ')}.</span>
+          <span>This unit&apos;s details don&apos;t match it: {diffs.join(', ')}.</span>
           <button className="btn btn-secondary btn-sm" style={{ padding: '1px 8px', fontSize: '.7rem' }}
             disabled={linkMut.isLoading}
             onClick={() => linkMut.mutate({ subtypeId: current.id!, applyDetails: true })}>

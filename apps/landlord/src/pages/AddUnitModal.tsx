@@ -87,7 +87,6 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     water:    false,
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [prefilledFrom, setPrefilledFrom] = useState<string | null>(null)
 
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   // The property's owner-defined subtypes — feeds the subtype picker + prefill.
@@ -156,21 +155,6 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     setErrors(e => ({ ...e, [key]: '' }))
   }
 
-  // Entering the pricing step: prefill from the picked subtype. Only fills
-  // what's still empty — never clobbers something the landlord already typed.
-  const applyPricingDefaults = () => {
-    if (!selectedSubtype) { setPrefilledFrom(null); return }
-    const s = selectedSubtype
-    setForm(f => ({
-      ...f,
-      rentAmount:      f.rentAmount      || (s.rentAmount      != null ? String(s.rentAmount)      : f.rentAmount),
-      securityDeposit: f.securityDeposit || (s.securityDeposit != null ? String(s.securityDeposit) : f.securityDeposit),
-      nightlyRate:     f.nightlyRate     || (s.nightlyRate     != null ? String(s.nightlyRate)     : f.nightlyRate),
-      weeklyRate:      f.weeklyRate      || (s.weeklyRate      != null ? String(s.weeklyRate)      : f.weeklyRate),
-    }))
-    setPrefilledFrom(s.name)
-  }
-
   const validateStep = () => {
     const errs: Record<string, string> = {}
     if (step === 0 && !form.propertyId) errs.propertyId = 'Select a property'
@@ -179,7 +163,9 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       const q = parseInt(form.quantity)
       if (form.quantity && (isNaN(q) || q < 1 || q > 200)) errs.quantity = '1–200'
     }
-    if (step === 2) {
+    if (step === 2 && !selectedSubtype) {
+      // S613: with a subtype picked the rent comes from it — validating a field
+      // the landlord can no longer see would be a dead end.
       if (!form.rentAmount || isNaN(Number(form.rentAmount)) || Number(form.rentAmount) <= 0)
         errs.rentAmount = 'Valid rent amount required'
       if (form.securityDeposit && isNaN(Number(form.securityDeposit)))
@@ -191,7 +177,6 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
 
   const next = () => {
     if (!validateStep()) return
-    if (step === 1) applyPricingDefaults()
     setStep(s => s + 1)
   }
   const back = () => setStep(s => s - 1)
@@ -207,8 +192,10 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       bedrooms:        s ? undefined : (hasBeds ? Number(form.bedrooms) || 0 : 0),
       bathrooms:       s ? undefined : (hasBeds ? Number(form.bathrooms) || 0 : 0),
       sqft:            form.sqft ? Number(form.sqft) : null,
-      rentAmount:      Number(form.rentAmount),
-      securityDeposit: Number(form.securityDeposit) || 0,
+      ...(s ? {} : {
+        rentAmount:      Number(form.rentAmount),
+        securityDeposit: Number(form.securityDeposit) || 0,
+      }),
       ...(isRv && !s ? {
         rvSiteLayout: form.rvSiteLayout,
         rvAmpService: form.rvAmpService,
@@ -672,15 +659,33 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
         {step === 2 && (
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 8 }}>
-              Set the rent and deposit for {qty > 1 ? <strong style={{ color: 'var(--text-0)' }}>{qty} units numbered "{form.unitNumber} 01", "{form.unitNumber} 02", …</strong> : <strong style={{ color: 'var(--text-0)' }}>unit {form.unitNumber}</strong>}
+              {selectedSubtype ? <>What {qty > 1 ? 'these units' : `unit ${form.unitNumber}`} will rent for</>
+                : <>Set the rent and deposit for {qty > 1 ? <strong style={{ color: 'var(--text-0)' }}>{qty} units numbered "{form.unitNumber} 01", "{form.unitNumber} 02", …</strong> : <strong style={{ color: 'var(--text-0)' }}>unit {form.unitNumber}</strong>}</>}
             </div>
-            {prefilledFrom && (
-              <div style={{ fontSize: '.72rem', color: 'var(--gold)', background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.25)', borderRadius: 6, padding: '6px 10px', marginBottom: 14 }}>
-                Prefilled from your "{prefilledFrom}" subtype — adjust for {qty > 1 ? 'these units' : 'this unit'} if needed.
+            {/* S613 (Nic, DIRECTIVE): price belongs to the SUBTYPE. With one
+                picked there is nothing to type — showing an editable field here
+                is what made the same number live in two places. Without one, what
+                you type here BECOMES a subtype, so the number still has one home. */}
+            {selectedSubtype ? (
+              <div style={{ fontSize: '.76rem', color: 'var(--text-2)', background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.25)', borderRadius: 6, padding: '10px 12px', marginBottom: 14, lineHeight: 1.6 }}>
+                <strong style={{ color: 'var(--gold)' }}>{selectedSubtype.name}</strong> —
+                {selectedSubtype.rentAmount != null ? ` ${fmt(Number(selectedSubtype.rentAmount))}/mo` : ' no rent set'}
+                {selectedSubtype.securityDeposit != null ? `, ${fmt(Number(selectedSubtype.securityDeposit))} deposit` : ''}
+                {selectedSubtype.nightlyRate != null ? `, ${fmt(Number(selectedSubtype.nightlyRate))}/night` : ''}
+                {selectedSubtype.weeklyRate != null ? `, ${fmt(Number(selectedSubtype.weeklyRate))}/week` : ''}.
+                <span style={{ display: 'block', color: 'var(--text-3)', fontSize: '.72rem', marginTop: 4 }}>
+                  Set on the subtype, so every unit in it shares this price and changing it there
+                  moves them all. To price {qty > 1 ? 'these units' : 'this unit'} differently, go
+                  back and pick a different subtype — or none, and set the price here.
+                </span>
+              </div>
+            ) : (
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.55 }}>
+                No subtype, so {qty > 1 ? 'these units carry' : 'this unit carries'} its own price.
               </div>
             )}
 
-            <div style={{ marginBottom: 14 }}>
+            <div style={{ marginBottom: 14, display: selectedSubtype ? 'none' : undefined }}>
               <label style={labelStyle}>Monthly Rent *</label>
               <div style={{ position: 'relative' }}>
                 <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
@@ -715,7 +720,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
             </div>
             )}
 
-            <div style={{ marginBottom: isRv ? 14 : 20 }}>
+            <div style={{ marginBottom: isRv ? 14 : 20, display: selectedSubtype ? 'none' : undefined }}>
               <label style={labelStyle}>Security Deposit</label>
               <div style={{ position: 'relative' }}>
                 <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
@@ -731,7 +736,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               {errors.securityDeposit && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.securityDeposit}</div>}
             </div>
 
-            {isRv && (
+            {isRv && !selectedSubtype && (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
                 <div>
                   <label style={labelStyle}>Nightly Rate (short-term)</label>
@@ -776,8 +781,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 { label: 'Type', val: `${UNIT_TYPE_ICON[form.unitType]} ${UNIT_TYPE_LABEL[form.unitType]}${subtypeSummary ? ` · ${subtypeSummary}` : ''}` },
                 qty > 1 ? { label: 'Quantity', val: `${qty} units` } : null,
                 form.sqft ? { label: 'Square feet', val: `${Number(form.sqft).toLocaleString()} sq ft` } : null,
-                { label: 'Monthly rent', val: `${fmt(Number(form.rentAmount))}${qty > 1 ? ' each' : ''}` },
-                { label: 'Security deposit', val: form.securityDeposit ? fmt(Number(form.securityDeposit)) : '$0.00' },
+                { label: 'Monthly rent', val: `${fmt(Number(selectedSubtype?.rentAmount ?? form.rentAmount))}${qty > 1 ? ' each' : ''}` },
+                { label: 'Security deposit', val: fmt(Number(selectedSubtype?.securityDeposit ?? form.securityDeposit ?? 0)) },
                 isRv && form.nightlyRate ? { label: 'Nightly rate', val: fmt(Number(form.nightlyRate)) } : null,
                 isRv && form.weeklyRate ? { label: 'Weekly rate', val: fmt(Number(form.weeklyRate)) } : null,
               ].filter(Boolean).map((row: any) => (

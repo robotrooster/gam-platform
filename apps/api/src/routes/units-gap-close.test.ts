@@ -339,18 +339,34 @@ describe('POST /api/units/:id/eviction-mode', () => {
 
 // ─── PATCH /api/units/:id/details (S573 consolidated editor) ──────
 describe('PATCH /api/units/:id/details', () => {
-  it('vacant unit: updates rent, deposit, bed/bath, and inspection flags', async () => {
+  // S613 (Nic, DIRECTIVE): rent and deposit left this endpoint — they belong to
+  // the unit's subtype, which is the one place they are set and the place a
+  // change reaches every unit of that class.
+  it('vacant unit: updates bed/bath and inspection flags', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .patch(`/api/units/${f.aUnitId}/details`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ bedrooms: 3, bathrooms: 2, rentAmount: 1875, securityDeposit: 1875, isMultiLevel: true, isAdaAccessible: true, floorLevel: 'ground_floor' })
+      .send({ bedrooms: 3, bathrooms: 2, isMultiLevel: true, isAdaAccessible: true, floorLevel: 'ground_floor' })
     expect(res.status).toBe(200)
     expect(res.body.data.bedrooms).toBe(3)
-    expect(Number(res.body.data.rent_amount)).toBe(1875)
     expect(res.body.data.is_multi_level).toBe(true)
     expect(res.body.data.is_ada_accessible).toBe(true)
     expect(res.body.data.floor_level).toBe('ground_floor')
+  })
+
+  // S613 (Nic): a unit in NO subtype prices on its own — this is the ordinary
+  // case and it still works here. A unit inside a subtype is refused instead,
+  // covered in unitSubtypeLink.test.ts where a subtype exists to put it in.
+  it('S613: a unit with no subtype still sets its own rent here', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ rentAmount: 1875, securityDeposit: 1875 })
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.rent_amount)).toBe(1875)
+    expect(Number(res.body.data.security_deposit)).toBe(1875)
   })
 
   it('S573: persists living_areas + features (sanitized to offered keys)', async () => {
@@ -374,7 +390,7 @@ describe('PATCH /api/units/:id/details', () => {
     const res = await request(buildApp())
       .patch(`/api/units/${f.aUnitId}/details`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ rentAmount: 2000 })
+      .send({ bedrooms: 3 })
     expect(res.status).toBe(409)
   })
 
@@ -398,9 +414,9 @@ describe('PATCH /api/units/:id/details', () => {
     const res = await request(buildApp())
       .patch(`/api/units/${f.aUnitId}/details`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ rentAmount: 2100 })
+      .send({ bedrooms: 4 })
     expect(res.status).toBe(200)
-    expect(Number(res.body.data.rent_amount)).toBe(2100)
+    expect(res.body.data.bedrooms).toBe(4)
   })
 
   it('403s another landlord', async () => {

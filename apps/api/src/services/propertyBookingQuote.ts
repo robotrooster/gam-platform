@@ -118,12 +118,18 @@ export function resolveSiteType(units: any[], siteTypeId: string): SiteType {
   if (!t) throw new AppError(404, 'Site type not found')
   return t
 }
-/** Representative rates for a type: subtype rates, else the first unit's. */
+/** Representative rates for a type — read off the unit.
+ *
+ *  S613: this used to prefer the SUBTYPE's rate over the unit's while the
+ *  renter-pool match preferred the opposite, so which number a guest saw
+ *  depended on which screen asked. Price now lives on the subtype and reaches
+ *  its units through the DB trigger, so the unit IS the class rate and there is
+ *  one number to read. */
 export function typeRates(t: SiteType) {
   const u = t.units[0]
   return {
-    nightly: (u.subtype_nightly ?? u.nightly_rate) != null ? Number(u.subtype_nightly ?? u.nightly_rate) : null,
-    weekly:  (u.subtype_weekly ?? u.weekly_rate) != null ? Number(u.subtype_weekly ?? u.weekly_rate) : null,
+    nightly: u.nightly_rate != null ? Number(u.nightly_rate) : null,
+    weekly:  u.weekly_rate  != null ? Number(u.weekly_rate)  : null,
   }
 }
 
@@ -160,7 +166,7 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
   // tax on stays under 30 nights. Rates: subtype, else unit, else property.
   const rep = freeUnit ?? siteType.units[0]
   const rates = {
-    nightly: rep.subtype_nightly ?? rep.nightly_rate ?? prop.nightly_rate,
+    nightly: rep.nightly_rate ?? prop.nightly_rate,
     weekly:  rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate,
     monthly: rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate,
   }
@@ -253,7 +259,7 @@ export async function listSiteTypePricing(prop: PropertyRow) {
       name: t.name,
       layout: t.requiredLayout,               // 'back_in' | 'pull_through' | 'none' | null
       ampService: t.requiredAmp,              // 'none' | '30' | '50' | 'both' | null
-      nightlyRate: num(rep.subtype_nightly ?? rep.nightly_rate ?? prop.nightly_rate),
+      nightlyRate: num(rep.nightly_rate ?? prop.nightly_rate),
       weeklyRate:  num(rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate),
       monthlyRate: num(rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate),
       minStayNights: rep.min_stay_nights ?? null,
