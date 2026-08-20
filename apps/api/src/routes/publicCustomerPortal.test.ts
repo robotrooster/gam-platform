@@ -195,12 +195,18 @@ async function addSkippedStop(businessId: string, apptId: string, opts: { reason
 }
 
 describe('GET /api/public/customer/:token/service', () => {
+  // S609: these dates were hardcoded to June 2026 while the route returns only
+  // the last 60 days. It passed when written and then rotted silently as the
+  // calendar moved past the window — a test that fails on a date rather than on
+  // a change. Anchored to "now" so it can never rot again.
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString()
+
   it('reports completed / skipped / scheduled with timestamps + skip reason', async () => {
     const { businessId, customerId } = await seed()
-    await addAppointment(businessId, customerId, { status: 'completed', scheduledFor: '2026-06-20T15:00:00Z', completedAt: '2026-06-20T15:11:00Z' })
-    const skipAppt = await addAppointment(businessId, customerId, { status: 'no_show', scheduledFor: '2026-06-19T15:00:00Z' })
-    await addSkippedStop(businessId, skipAppt, { reason: 'Gate locked', departedAt: '2026-06-19T15:20:00Z' })
-    await addAppointment(businessId, customerId, { status: 'scheduled', scheduledFor: '2026-06-25T15:00:00Z' })
+    await addAppointment(businessId, customerId, { status: 'completed', scheduledFor: daysAgo(10), completedAt: daysAgo(10) })
+    const skipAppt = await addAppointment(businessId, customerId, { status: 'no_show', scheduledFor: daysAgo(11) })
+    await addSkippedStop(businessId, skipAppt, { reason: 'Gate locked', departedAt: daysAgo(11) })
+    await addAppointment(businessId, customerId, { status: 'scheduled', scheduledFor: daysAgo(-5) })
     const { token } = await getOrCreateCustomerPortalToken({ businessId, customerId })
 
     const res = await request(buildApp()).get(`/api/public/customer/${token}/service`)

@@ -65,7 +65,7 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
             <strong style={{ color: 'var(--text-0)' }}>{propertyName}</strong> would transfer to{' '}
             <strong style={{ color: 'var(--text-0)' }}>{request.buyerName || 'the buyer'}</strong>.
             It will not go ahead until <strong style={{ color: 'var(--text-0)' }}>every owner</strong> confirms.
-            Expires {String(request.expiresAt ?? request.expires_at).slice(0, 10)}.
+            Expires {String(request.expiresAt).slice(0, 10)}.
           </p>
           {request.note && (
             <div style={{ fontSize: '.8rem', color: 'var(--text-3)', fontStyle: 'italic', marginBottom: 10 }}>
@@ -75,17 +75,17 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
 
           <div style={{ margin: '14px 0' }}>
             {(request.approvals ?? []).map((a: any) => (
-              <div key={a.userId ?? a.user_id} style={{ display: 'flex', alignItems: 'center', gap: 10,
+              <div key={a.userId} style={{ display: 'flex', alignItems: 'center', gap: 10,
                 padding: '7px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.84rem' }}>
-                {a.approvedAt || a.approved_at
+                {a.approvedAt
                   ? <Check size={15} style={{ color: 'var(--green)' }} />
-                  : a.declinedAt || a.declined_at
+                  : a.declinedAt
                     ? <X size={15} style={{ color: 'var(--red)' }} />
                     : <span style={{ width: 15, textAlign: 'center', color: 'var(--text-3)' }}>·</span>}
                 <span style={{ flex: 1 }}>{a.name || a.email}</span>
                 <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
-                  {a.approvedAt || a.approved_at ? 'confirmed'
-                    : a.declinedAt || a.declined_at ? 'declined' : 'waiting'}
+                  {a.approvedAt ? 'confirmed'
+                    : a.declinedAt ? 'declined' : 'waiting'}
                 </span>
               </div>
             ))}

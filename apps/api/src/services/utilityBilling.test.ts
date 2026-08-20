@@ -6,7 +6,7 @@
  *   - master_bill_to_landlord — no bills generated
  *   - submeter — usage = cycle − prior; charge = usage × rate + base
  *   - rubs — split cycle across units by allocation_method
- *     (equal_split / sqft / bedrooms / occupant_count)
+ *     (rented_spaces / sqft / bedrooms / occupant_count)
  *
  * Gates:
  *   - utility_meter_units row(s) required
@@ -27,7 +27,7 @@ import {
 } from '../test/dbHelpers'
 import {
   generateBillsForMeter, generateBillsForProperty, generateBillsForLandlord,
-  billMoveOutRead,
+  billMoveOutRead, ensureBillsForUnit,
 } from './utilityBilling'
 
 beforeEach(async () => {
@@ -97,12 +97,17 @@ async function attachMeterToUnit(meterId: string, unitId: string): Promise<void>
 async function seedReading(
   meterId: string, cycleMonthIso: string, value: number,
   landlordUserId: string,
+  // S609: a `bill_amount` master's cycle entry carries the provider's DOLLAR
+  // total alongside (or instead of) a usage figure — that is how a trash or
+  // water bill is divided without an odometer.
+  opts: { billAmount?: number } = {},
 ): Promise<void> {
   await db.query(
     `INSERT INTO utility_meter_readings
-       (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [meterId, cycleMonthIso, value, cycleMonthIso, landlordUserId])
+       (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, bill_amount)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [meterId, cycleMonthIso, value, cycleMonthIso, landlordUserId,
+     opts.billAmount ?? null])
 }
 
 async function setMeterRateBase(
@@ -115,7 +120,7 @@ async function setMeterRateBase(
 
 async function setMeterRubs(
   meterId: string,
-  method: 'equal_split' | 'sqft' | 'bedrooms' | 'occupant_count',
+  method: 'rented_spaces' | 'sqft' | 'bedrooms' | 'occupant_count',
 ): Promise<void> {
   await db.query(
     `UPDATE utility_meters SET billing_method='rubs', rubs_allocation_method=$2
@@ -408,7 +413,7 @@ describe('generateBillsForMeter — submeter', () => {
 
 describe('generateBillsForMeter — rubs', () => {
   async function seedRubsMeter(base: BaseCtx,
-    method: 'equal_split' | 'sqft' | 'bedrooms' | 'occupant_count',
+    method: 'rented_spaces' | 'sqft' | 'bedrooms' | 'occupant_count',
   ): Promise<string> {
     const c = await db.connect()
     let meterId = ''
@@ -424,9 +429,9 @@ describe('generateBillsForMeter — rubs', () => {
     return meterId
   }
 
-  it('equal_split: 3 units → each gets totalCharge / 3', async () => {
+  it('rented_spaces: 3 rented units → each gets totalCharge / 3', async () => {
     const base = await seedBaseProperty()
-    const meterId = await seedRubsMeter(base, 'equal_split')
+    const meterId = await seedRubsMeter(base, 'rented_spaces')
     await setMeterRateBase(meterId, 1, 30)  // rate 1, base 30
     const u1 = await seedUnitWithActiveTenant(base)
     const u2 = await seedUnitWithActiveTenant(base)
@@ -445,7 +450,7 @@ describe('generateBillsForMeter — rubs', () => {
     for (const r of rows) {
       expect(Number(r.charge_amount)).toBe(40)
       expect(Number(r.base_fee_share)).toBe(10)  // 30/3
-      expect(r.allocation_method).toBe('equal_split')
+      expect(r.allocation_method).toBe('rented_spaces')
       expect(Number(r.allocation_basis)).toBe(1)
     }
   })
@@ -689,6 +694,9 @@ describe('generateBillsForMeter — rubs metered exclusion (S558)', () => {
 // ─── S558: flat-rate ─────────────────────────────────────────
 
 describe('generateBillsForMeter — flat_rate (S558)', () => {
+  // S609 (Nic): the flat amount now comes from the PROPERTY rate, not the meter
+  // — a per-meter amount would let two identical units be billed differently for
+  // the same service. The helper sets the property rate accordingly.
   async function seedFlatMeter(base: BaseCtx, flatAmount: number): Promise<string> {
     const c = await db.connect()
     let meterId = ''
@@ -698,7 +706,12 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
       await c.query('COMMIT')
     } finally { c.release() }
     await db.query(`UPDATE utility_meters SET billing_method='flat_rate' WHERE id=$1`, [meterId])
-    await setMeterRateBase(meterId, 0, flatAmount) // flat amount lives on base_fee
+    const { rows: [m] } = await db.query<any>(`SELECT utility_type FROM utility_meters WHERE id=$1`, [meterId])
+    await db.query(
+      `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
+       VALUES ($1,$2,$3,0)
+       ON CONFLICT (property_id, utility_type) DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit`,
+      [base.propertyId, m.utility_type, flatAmount])
     return meterId
   }
 
@@ -732,13 +745,60 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
     expect(res.unitsSkipped).toBe(1)
   })
 
-  it('no amount set (base fee 0) → noop with reason', async () => {
+  it('no PROPERTY rate set → noop, and the reason says where to set it', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedFlatMeter(base, 0)
     await attachMeterToUnit(meterId, (await seedUnitWithActiveTenant(base)).unitId)
     const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
     expect(res.billsCreated).toBe(0)
-    expect(res.reason).toMatch(/no amount/i)
+    // S609: the amount is the property rate, so the reason points at the Rates
+    // panel rather than a meter field that no longer exists.
+    expect(res.reason).toMatch(/rate set for this property/i)
+  })
+
+  // S609 (Nic, DIRECTIVE): "It's a discrimination thing. If you're billing a flat
+  // rate per unit, it needs to not be editable. It needs to be set at the
+  // property level the same way late fees are... anybody that's opted into it
+  // automatically gets the flat twenty five dollars."
+  it('EVERY unit on a flat-rate meter bills the SAME property amount', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)
+    const a = await seedUnitWithActiveTenant(base)
+    const b = await seedUnitWithActiveTenant(base)
+    const c = await seedUnitWithActiveTenant(base)
+    for (const u of [a, b, c]) await attachMeterToUnit(meterId, u.unitId)
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(3)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(rows.map(r => Number(r.charge_amount))).toEqual([25, 25, 25])
+  })
+
+  it('a meter-level amount can no longer change what a unit is billed', async () => {
+    // The old behaviour read base_fee off the meter. Setting it now must have no
+    // effect — that field is exactly the discrimination lever being removed.
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)
+    await db.query(`UPDATE utility_meters SET base_fee = 999 WHERE id=$1`, [meterId])
+    await attachMeterToUnit(meterId, (await seedUnitWithActiveTenant(base)).unitId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(Number(bill.charge_amount)).toBe(25)
+  })
+
+  it('a unit not assigned to the meter is not billed — the opt-out', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)
+    const onIt = await seedUnitWithActiveTenant(base)
+    const hauler = await seedUnitWithActiveTenant(base)   // hauls their own trash
+    await attachMeterToUnit(meterId, onIt.unitId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(
+      `SELECT unit_id FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(onIt.unitId)
+    expect(rows[0].unit_id).not.toBe(hauler.unitId)
   })
 })
 
@@ -1051,5 +1111,259 @@ describe('S605 property utility rates', () => {
     const { rows } = await db.query<any>(
       `SELECT rate_per_unit FROM utility_bills WHERE meter_id=$1`, [meterId])
     expect(Number(rows[0].rate_per_unit)).toBeCloseTo(0.05, 5)   // untouched
+  })
+})
+
+// S607 (Nic): "did we ever add trash as an item? We just do that at a flat rate
+// per household because they have individual cans."
+//
+// Trash and flat_rate both existed, but ensureBillsForUnit — the primary billing
+// path since S534 — selected only submeter/rubs meters and required a reading
+// row. A flat-rate meter has neither by design, so trash billed ONLY as a side
+// effect of a reading run completing.
+describe('S607: flat-rate meters bill on the per-unit path', () => {
+  it('bills a flat-rate trash meter with no reading and no reading run', async () => {
+    const c = await db.connect()
+    let unitId = '', meterId = '', leaseId = ''
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      leaseId = await seedLease(c, { unitId, landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'trash',TRUE)`, [leaseId])
+      // $28 a household — individual cans, no meter, nothing to read.
+      // S609: the amount is the PROPERTY's trash rate, not a figure on the
+      // meter — every unit on it pays the same by construction.
+      await c.query(
+        `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
+         VALUES ($1,'trash',28,0)`, [propertyId])
+      const r = await c.query(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
+         VALUES ($1,'trash','Trash','flat_rate',6,0) RETURNING id`, [propertyId])
+      meterId = r.rows[0].id
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [meterId, unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+
+    // No readings anywhere, no reading run — exactly a trash-only property.
+    const created = await ensureBillsForUnit(unitId, '2026-07-15')
+    expect(created).toBe(1)
+    const bill = (await db.query(
+      `SELECT charge_amount, billing_cycle_month FROM utility_bills WHERE meter_id=$1`, [meterId])).rows[0]
+    expect(Number(bill.charge_amount)).toBeCloseTo(28, 2)
+
+    // Idempotent — a second invoice run must not double-bill the household.
+    expect(await ensureBillsForUnit(unitId, '2026-07-15')).toBe(0)
+  })
+})
+
+/**
+ * S609 (Nic): OWNER-OCCUPIED UNITS IN A RUBS SPLIT.
+ *
+ * "The system doesn't invoice the landlord for their own occupied spot, but the
+ * ratio for the utilities is set to go out against all occupied spots. But the
+ * owner occupied spots never get an invoice. So where does that leave that?
+ * That's kind of a hiccup that could affect a situation."
+ *
+ * It left the TENANTS paying for it. An owner-occupied unit has no lease, so it
+ * scored a zero basis and contributed nothing to the divisor — which means the
+ * remaining tenants' shares summed to the whole bill, the owner's usage
+ * included. Invisible: every tenant's bill looked entirely reasonable.
+ *
+ * Now the unit takes a real share and that share is WITHHELD — billed to nobody
+ * and recorded, so the exclusion is provable in an audit.
+ */
+describe('S609 owner-occupied units in a RUBS split', () => {
+  async function seedOwnerOccupiedUnit(base: BaseCtx, householdSize: number): Promise<string> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      await c.query(
+        `UPDATE units SET status='owner_use', owner_household_size=$2 WHERE id=$1`,
+        [unitId, householdSize])
+      await c.query('COMMIT')
+      return unitId
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  async function rubsMeter(base: BaseCtx, method: 'rented_spaces' | 'occupant_count'): Promise<string> {
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(meterId, method)
+    return meterId
+  }
+
+  it('THE FIX: the owner\'s share is withheld, so tenants split only their own', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const t1 = await seedUnitWithActiveTenant(base)
+    const t2 = await seedUnitWithActiveTenant(base)
+    const owner = await seedOwnerOccupiedUnit(base, 1)
+    await attachMeterToUnit(meterId, t1.unitId)
+    await attachMeterToUnit(meterId, t2.unitId)
+    await attachMeterToUnit(meterId, owner)
+    await seedReading(meterId, '2026-05-01', 300, base.landlordUserId)
+
+    // $300 across THREE occupied spaces = $100 each. Before this, the owner
+    // scored 0 and the two tenants paid $150 apiece — the owner's $100 spread
+    // across them.
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(2)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(rows).toHaveLength(2)
+    for (const r of rows) expect(Number(r.charge_amount)).toBe(100)
+  })
+
+  it('the withheld share is RECORDED for audit, not silently dropped', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const t1 = await seedUnitWithActiveTenant(base)
+    const owner = await seedOwnerOccupiedUnit(base, 1)
+    await attachMeterToUnit(meterId, t1.unitId)
+    await attachMeterToUnit(meterId, owner)
+    await seedReading(meterId, '2026-05-01', 200, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount, allocation_basis
+         FROM utility_owner_use_absorptions WHERE meter_id=$1`, [meterId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(owner)
+    expect(Number(rows[0].charge_amount)).toBe(100)
+
+    // The auditor's sum: billed out + kept back = the whole pool.
+    const { rows: [billed] } = await db.query<any>(
+      `SELECT COALESCE(SUM(charge_amount),0) AS s FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(Number(billed.s) + Number(rows[0].charge_amount)).toBe(200)
+  })
+
+  it('an owner household counts its people under an occupancy split', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const t1 = await seedUnitWithActiveTenant(base)          // 1 tenant
+    const owner = await seedOwnerOccupiedUnit(base, 3)       // 3 in the household
+    await attachMeterToUnit(meterId, t1.unitId)
+    await attachMeterToUnit(meterId, owner)
+    await seedReading(meterId, '2026-05-01', 400, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // 4 people total: the tenant pays 1/4 = $100, the owner absorbs 3/4 = $300.
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [t1.unitId])
+    expect(Number(bill.charge_amount)).toBe(100)
+    const { rows: [abs] } = await db.query<any>(
+      `SELECT charge_amount, allocation_basis FROM utility_owner_use_absorptions WHERE unit_id=$1`, [owner])
+    expect(Number(abs.charge_amount)).toBe(300)
+    expect(Number(abs.allocation_basis)).toBe(3)
+  })
+
+  it('re-running a cycle updates the record instead of stacking duplicates', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const t1 = await seedUnitWithActiveTenant(base)
+    const owner = await seedOwnerOccupiedUnit(base, 1)
+    await attachMeterToUnit(meterId, t1.unitId)
+    await attachMeterToUnit(meterId, owner)
+    await seedReading(meterId, '2026-05-01', 200, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM utility_owner_use_absorptions WHERE meter_id=$1`, [meterId])
+    expect(rows[0].n).toBe(1)
+  })
+
+  it('a VACANT unit still takes nothing — that exclusion is correct', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+    const t1 = await seedUnitWithActiveTenant(base)
+    const vacant = await seedOwnerOccupiedUnit(base, 1)
+    await db.query(`UPDATE units SET status='vacant' WHERE id=$1`, [vacant])
+    await attachMeterToUnit(meterId, t1.unitId)
+    await attachMeterToUnit(meterId, vacant)
+    await seedReading(meterId, '2026-05-01', 200, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // A vacant space draws nothing and the AZ RV statute names rented-spaces as
+    // the basis — the one tenant carries the bill, and nothing is absorbed.
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [t1.unitId])
+    expect(Number(bill.charge_amount)).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM utility_owner_use_absorptions WHERE meter_id=$1`, [meterId])
+    expect(rows[0].n).toBe(0)
+  })
+})
+
+/**
+ * S609 (Nic): TRASH IS NOT LOCKED TO FLAT RATE.
+ *
+ *   "Trash should also be billable through a RUBS system if that's how the
+ *    landlord wants to operate. You keep writing inside the lines to deal with a
+ *    specific type of property instead of making it work for how each landlord
+ *    might operate in a different capacity."
+ *
+ * A landlord who gets ONE hauler bill for the property and divides it across
+ * units by occupancy is doing trash by RUBS. Nothing about trash forces a flat
+ * per-unit price — that is just the shape Oak Park uses.
+ */
+describe('S609 trash billed as RUBS, not only flat rate', () => {
+  it('splits one hauler bill across units by occupancy', async () => {
+    const base = await seedBaseProperty()
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, {
+        propertyId: base.propertyId, utilityType: 'trash', billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    // RUBS master over trash, priced from the hauler's actual bill.
+    await db.query(
+      `UPDATE utility_meters
+          SET billing_method='rubs', rubs_allocation_method='occupant_count',
+              rubs_basis='bill_amount', rate_per_unit=0, base_fee=0
+        WHERE id=$1`, [meterId])
+
+    const u1 = await seedUnitWithActiveTenant(base)
+    const u2 = await seedUnitWithActiveTenant(base)
+    for (const u of [u1, u2]) {
+      await attachMeterToUnit(meterId, u.unitId)
+      // A unit bills for a utility only where its LEASE says the tenant is
+      // responsible — the flag, not the meter, decides. The seed helper marks
+      // water; trash is its own line.
+      await db.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'trash',TRUE)`, [u.leaseId])
+    }
+    // One tenant each → the $180 hauler bill splits evenly.
+    await seedReading(meterId, '2026-05-01', 0, base.landlordUserId, { billAmount: 180 })
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(2)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount, allocation_method FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(rows).toHaveLength(2)
+    for (const r of rows) {
+      expect(Number(r.charge_amount)).toBe(90)
+      expect(r.allocation_method).toBe('occupant_count')
+    }
   })
 })

@@ -40,6 +40,9 @@ export const apiPost = <T = any>(url: string, body?: any): Promise<T> =>
 export const apiPatch = <T = any>(url: string, body?: any): Promise<T> =>
   api.patch<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
 
+export const apiPut = <T = any>(url: string, body?: any): Promise<T> =>
+  api.put<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
+
 // Multipart upload (photos/video). axios sets the multipart boundary itself.
 export const apiUpload = <T = any>(url: string, form: FormData): Promise<T> =>
   api.post<{ success: boolean; data: T }>(url, form).then(r => r.data.data)

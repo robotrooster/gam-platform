@@ -208,6 +208,16 @@ async function notifyReadingRunOpened(
 export async function getRunMeters(runId: string) {
   return query<any>(
     `SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits,
+            m.rubs_basis,
+            -- S607: does this master have submetered units on it? Decides
+            -- whether the walk must insist on a usage total (needed to carve
+            -- those units out of the pool) or can take the bill alone.
+            EXISTS (SELECT 1 FROM utility_meter_units mmu
+                      JOIN utility_meter_units smu ON smu.unit_id = mmu.unit_id
+                      JOIN utility_meters sm ON sm.id = smu.meter_id
+                                            AND sm.billing_method = 'submeter'
+                                            AND sm.utility_type = m.utility_type
+                     WHERE mmu.meter_id = m.id) AS has_submetered_units,
             u.id AS unit_id, u.unit_number,
             (cur.id IS NOT NULL) AS is_read,
             (t.tenant_id IS NOT NULL) AS will_bill

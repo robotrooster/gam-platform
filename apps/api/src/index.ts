@@ -76,6 +76,7 @@ import { subleasesRouter }    from './routes/subleases'
 import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
 import { posCustomerOnboardingRouter } from './routes/posCustomerOnboarding'
 import { paymentsRouter }     from './routes/payments'
+import { tenantAutopayRouter } from './routes/tenantAutopay'
 import { balancesRouter }     from './routes/balances'
 import { disbursementsRouter } from './routes/disbursements'
 import { maintenanceRouter }  from './routes/maintenance'
@@ -338,6 +339,7 @@ app.use('/api/subleases',     subleasesRouter)
 app.use('/api/sublease-invitations', subleaseInvitationsRouter)
 app.use('/api/pos-customer-onboarding', posCustomerOnboardingRouter)
 app.use('/api/payments',      paymentsRouter)
+app.use('/api/autopay',       tenantAutopayRouter)
 app.use('/api/balances',      balancesRouter)
 app.use('/api/disbursements', disbursementsRouter)
 app.use('/api/maintenance',   maintenanceRouter)

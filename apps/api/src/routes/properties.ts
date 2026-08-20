@@ -12,6 +12,7 @@ import { canAccessLandlordResource, canManageLandlordResource } from '../middlew
 import { suggestBookingSlug } from './propertyBookingAdmin'
 import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from '../services/onboardingWindow'
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
+import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
 import {
   FEE_PAYER_VALUES,
@@ -20,6 +21,8 @@ import {
   AGENT_REVENUE_CAPABILITIES,
   UNIT_TYPES,
   OCCUPANCY_MODES,
+  LISTING_MIN_PHOTOS_BY_UNIT_TYPE,
+  LISTING_MIN_PHOTOS_DEFAULT,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -87,7 +90,14 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       allocationRule: z.object({
         achFeePayer:        z.enum(FEE_PAYER_VALUES).optional(),
         cardFeePayer:       z.enum(FEE_PAYER_VALUES).optional(),
+        // S607 lock (Nic): the platform fee is ALWAYS the landlord's — GAM's
+        // volume discounts must never reach a tenant's bill. Accepted for
+        // backward compatibility with older clients, then ignored below.
         platformFeePayer:   z.enum(FEE_PAYER_VALUES).default('landlord'),
+        // S607 (Nic): who reimburses the $10 cash/check/money-order fee.
+        // Defaults to the tenant — a landlord who has not opted in has not
+        // agreed to absorb anything.
+        manualFeePayer:     z.enum(FEE_PAYER_VALUES).default('tenant'),
         // Deprecated S116 — accepted for backward compat; if set, mirrors
         // into achFeePayer + cardFeePayer when those aren't supplied.
         bankingFeePayer:    z.enum(FEE_PAYER_VALUES).optional(),
@@ -260,20 +270,22 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     const landlordAchDefault = dfltRes.rows[0]?.default_ach_fee_payer ?? 'tenant'
     const achFeePayer       = ar.achFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
     const cardFeePayer      = 'tenant'
-    const platformFeePayer  = ar.platformFeePayer ?? 'landlord'
+    const platformFeePayer  = 'landlord'   // S607 lock — never from the request
     await client.query(`
       INSERT INTO property_allocation_rules
         (property_id, ach_fee_payer, card_fee_payer, platform_fee_payer,
+         manual_fee_payer,
          rent_percent, rent_percent_floor, rent_percent_ceiling,
          flat_monthly_fee, per_unit_fee,
          placement_fee_type, placement_fee_value,
          maintenance_markup_percent, owner_bank_account_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      VALUES ($1,$2,$3,$4,$14,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [prop.id, achFeePayer, cardFeePayer, platformFeePayer,
        ar.rentPercent ?? null, ar.rentPercentFloor ?? null, ar.rentPercentCeiling ?? null,
        ar.flatMonthlyFee ?? null, ar.perUnitFee ?? null,
        ar.placementFeeType ?? null, ar.placementFeeValue ?? null,
-       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null])
+       ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null,
+       ar.manualFeePayer ?? 'tenant'])
 
     await client.query('COMMIT')
 
@@ -442,13 +454,21 @@ propertiesRouter.get('/:id/unit-subtypes', async (req, res, next) => {
     const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
     if (!p) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    // S613: dwelling_ownership was never SELECTed here, so the editor read it
+    // back as undefined and defaulted the dropdown to 'tenant' — editing a
+    // "Park Model Rental" subtype for any other reason silently flipped it to
+    // tenant-owned. unit_count answers "which units is this subtype on?", the
+    // question that had no answer anywhere in the product.
     const rows = await query<any>(
-      `SELECT id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
-              rv_amp_service, storage_size, rent_amount, security_deposit,
-              nightly_rate, weekly_rate, monthly_rate, created_at, updated_at
-         FROM property_unit_subtypes
-        WHERE property_id = $1
-        ORDER BY unit_type, name`,
+      `SELECT s.id, s.unit_type, s.name, s.bedrooms, s.bathrooms, s.rv_site_layout,
+              s.rv_amp_service, s.storage_size, s.dwelling_ownership,
+              s.rent_amount, s.security_deposit,
+              s.nightly_rate, s.weekly_rate, s.monthly_rate, s.created_at, s.updated_at,
+              (SELECT count(*) FROM units u
+                WHERE u.subtype_id = s.id AND u.retired_at IS NULL)::int AS unit_count
+         FROM property_unit_subtypes s
+        WHERE s.property_id = $1
+        ORDER BY s.unit_type, s.name`,
       [req.params.id],
     )
     res.json({ success: true, data: rows })
@@ -499,6 +519,41 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
       ownershipRelevant ? body.dwellingOwnership ?? null : null,
     ]
 
+    // S613 (Nic, DATA LOSS): a create whose name already existed used to
+    // ON CONFLICT DO UPDATE — it overwrote the existing subtype in place and
+    // returned 200, so the landlord saw a save succeed and one subtype in the
+    // list. Nic built "Back In / 50 amp" and then "Back In / 30 amp" at Oak
+    // Park and the second silently ate the first; the audit log shows the amp
+    // flipping 50→30→50→30 on ONE row while he tried again.
+    //
+    // A property can carry as many subtypes per unit type as the landlord has
+    // variations. What it cannot carry is two with the SAME name — the name is
+    // how a human picks one when adding a unit, and two identical rows in that
+    // picker are unusable. So the collision is refused out loud, naming what
+    // already exists and what it holds, instead of being resolved by deletion.
+    const clash = await queryOne<any>(
+      `SELECT id, name, rv_site_layout, rv_amp_service, bedrooms, bathrooms, storage_size
+         FROM property_unit_subtypes
+        WHERE property_id=$1 AND unit_type=$2 AND lower(btrim(name))=lower(btrim($3))
+          AND ($4::uuid IS NULL OR id <> $4)`,
+      [req.params.id, body.unitType, body.name, body.id ?? null],
+    )
+    if (clash) {
+      const facts = [
+        clash.bedrooms != null ? (clash.bedrooms === 0 ? 'studio' : `${clash.bedrooms} bed`) : null,
+        clash.rv_site_layout && clash.rv_site_layout !== 'none'
+          ? (clash.rv_site_layout === 'pull_through' ? 'pull-through' : 'back-in') : null,
+        clash.rv_amp_service && clash.rv_amp_service !== 'none'
+          ? (clash.rv_amp_service === 'both' ? '30/50 amp' : `${clash.rv_amp_service} amp`) : null,
+        clash.storage_size || null,
+      ].filter(Boolean).join(', ')
+      throw new AppError(409,
+        `You already have a subtype called "${clash.name}" for this unit type` +
+        (facts ? ` (${facts})` : '') +
+        '. Give this one a different name — "Back-in 50 amp" and "Back-in 30 amp" are two subtypes, ' +
+        'not one — or edit the existing subtype instead.')
+    }
+
     let row
     if (body.id) {
       row = await queryOne<any>(
@@ -519,19 +574,60 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
             rv_amp_service, storage_size, rent_amount, security_deposit,
             nightly_rate, weekly_rate, monthly_rate, dwelling_ownership)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-         ON CONFLICT (property_id, unit_type, name) DO UPDATE
-           SET bedrooms=EXCLUDED.bedrooms, bathrooms=EXCLUDED.bathrooms,
-               rv_site_layout=EXCLUDED.rv_site_layout, rv_amp_service=EXCLUDED.rv_amp_service,
-               storage_size=EXCLUDED.storage_size, rent_amount=EXCLUDED.rent_amount,
-               security_deposit=EXCLUDED.security_deposit, nightly_rate=EXCLUDED.nightly_rate,
-               weekly_rate=EXCLUDED.weekly_rate, monthly_rate=EXCLUDED.monthly_rate,
-               dwelling_ownership=EXCLUDED.dwelling_ownership,
-               updated_at=NOW()
          RETURNING *`,
         vals,
       )
     }
     res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// GET /api/properties/:id/unit-subtypes/:rowId/units — which units carry this
+// subtype, plus every unit on the property that COULD (same unit type). S613:
+// the answer to "where does a subtype link to units" — there was no such
+// screen, so the link existed in the database and nowhere a person could see.
+propertiesRouter.get('/:id/unit-subtypes/:rowId/units', async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const s = await loadSubtype(req.params.rowId, req.params.id)
+    if (!s) throw new AppError(404, 'Subtype not found')
+    const rows = await query<any>(
+      `SELECT u.id, u.unit_number, u.subtype_id,
+              EXISTS (SELECT 1 FROM leases l WHERE l.unit_id = u.id
+                        AND l.status IN ('active','pending')) AS leased,
+              st.name AS current_subtype_name
+         FROM units u
+         LEFT JOIN property_unit_subtypes st ON st.id = u.subtype_id
+        WHERE u.property_id = $1 AND u.unit_type = $2 AND u.retired_at IS NULL
+        ORDER BY u.unit_number`,
+      [req.params.id, s.unit_type],
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// PUT /api/properties/:id/unit-subtypes/:rowId/units — set which units carry
+// this subtype. MEMBERSHIP: unchecked units currently on it are unlinked.
+propertiesRouter.put('/:id/unit-subtypes/:rowId/units', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const body = z.object({
+      unitIds: z.array(z.string().uuid()).max(2000),
+      // Off by default: linking is classification. Applying rewrites the units.
+      applyDetails: z.boolean().optional(),
+    }).parse(req.body)
+    const s = await loadSubtype(req.params.rowId, req.params.id)
+    if (!s) throw new AppError(404, 'Subtype not found')
+    try {
+      const result = await setSubtypeUnits(s, body.unitIds, { applyDetails: !!body.applyDetails })
+      res.json({ success: true, data: result })
+    } catch (e: any) {
+      throw new AppError(400, e?.message || 'Could not assign those units')
+    }
   } catch (e) { next(e) }
 })
 
@@ -1040,6 +1136,7 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       achFeePayer:        z.enum(FEE_PAYER_VALUES).optional(),
       cardFeePayer:       z.enum(FEE_PAYER_VALUES).optional(),
       platformFeePayer:   z.enum(FEE_PAYER_VALUES).optional(),
+      manualFeePayer:     z.enum(FEE_PAYER_VALUES).optional(),
     }).parse(req.body)
 
     const prop = await queryOne<any>(
@@ -1074,6 +1171,10 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       params.push(body.ownerBankAccountId)
       sets.push(`owner_bank_account_id = $${params.length}`)
     }
+    if (body.manualFeePayer !== undefined) {
+      params.push(body.manualFeePayer)
+      sets.push(`manual_fee_payer = $${params.length}`)
+    }
     if (body.achFeePayer !== undefined) {
       params.push(body.achFeePayer)
       sets.push(`ach_fee_payer = $${params.length}`)
@@ -1084,10 +1185,11 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       params.push('tenant')
       sets.push(`card_fee_payer = $${params.length}`)
     }
-    if (body.platformFeePayer !== undefined) {
-      params.push(body.platformFeePayer)
-      sets.push(`platform_fee_payer = $${params.length}`)
-    }
+    // S607 lock (Nic): platformFeePayer is deliberately NOT patchable — the
+    // platform fee is always the landlord's, so GAM's volume discounts can
+    // never reach a tenant's bill. The field is still accepted in the body for
+    // older clients and simply ignored; a DB CHECK backs the rule up so no
+    // future route, script or manual UPDATE can quietly reintroduce it.
     if (sets.length === 0) {
       throw new AppError(400, 'No allocation-rule fields supplied')
     }
@@ -1427,8 +1529,24 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFil
 // Tier 3 (background-check approved): POST .../apply files the application and
 //   reveals the landlord contact — the ONLY path that ever does. See below.
 // A unit is listable only when vacant + explicitly listed + has beds/baths +
-// at least 5 photos. Neither read exposes the landlord (contact = tier 3), so
+// enough photos. Neither read exposes the landlord (contact = tier 3), so
 // the landlords/users join is gone from both.
+//
+// S609 (Nic): the photo minimum DEPENDS ON THE UNIT TYPE. A flat five is right
+// for somewhere people live inside and impossible for a bare site — an RV spot
+// is a patch of ground with a hookup and the renter tows in the thing that would
+// have been photographed. One is the honest requirement there; five stopped real
+// listings going out.
+//
+// Built from LISTING_MIN_PHOTOS_BY_UNIT_TYPE so SQL and application agree — the
+// values are the shared single source, not a second copy that can drift. The
+// CASE is generated rather than written out for the same reason.
+const MIN_PHOTO_CASE = `CASE u.unit_type ${
+  Object.entries(LISTING_MIN_PHOTOS_BY_UNIT_TYPE)
+    .map(([t, n]) => `WHEN '${t}' THEN ${n}`)
+    .join(' ')
+} ELSE ${LISTING_MIN_PHOTOS_DEFAULT} END`
+
 const LISTABLE_FILTER = `
       FROM units u
       JOIN properties p ON p.id = u.property_id
@@ -1436,7 +1554,7 @@ const LISTABLE_FILTER = `
       WHERE u.status = 'vacant' AND u.listed_vacant = TRUE
         AND u.bedrooms IS NOT NULL AND u.bathrooms IS NOT NULL
       GROUP BY u.id, p.id
-      HAVING COUNT(up.id) >= 5
+      HAVING COUNT(up.id) >= ${MIN_PHOTO_CASE}
       ORDER BY u.rent_amount ASC`
 
 // GET /api/public/properties/listing-photo/:filename — PUBLIC unit photo.

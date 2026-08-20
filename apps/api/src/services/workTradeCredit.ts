@@ -6,7 +6,21 @@ import type { PoolClient } from 'pg'
 //
 // Locked model (Nic 2026-06-26): rent is traded as a PERCENT of hours
 // worked. Each verified hour is worth 1/target of the TOTAL monthly invoice
-// (rent + utilities + fees). The target is PER AGREEMENT (W-56, Nic:
+// (rent + utilities + fees + propane).
+//
+// S609 (Nic): PROPANE COUNTS. It was excluded as a "fixed contractual split
+// amount", which meant a full trade month still left a propane bill:
+//
+//   "We need to find a way to include propane in there too, because at a
+//    different property I own we do dispense propane, and we give our seasonal
+//    help free propane in the winter. We don't actually invoice them anything.
+//    I just need a way to track it — what's being given out, the total value of
+//    what's been given, for what work has been done."
+//
+// Running it through the credit is what makes that visible rather than
+// informal: the fill is billed at its real value, the credit cancels it, and the
+// invoice records both. The value given and the hours worked end up on the same
+// document instead of in someone's head. The target is PER AGREEMENT (W-56, Nic:
 // different rents and different work don't translate equally — the
 // property value is only the default for new agreements). A full
 // target month covers 100% of the invoice; fewer hours cover a proportional
@@ -36,6 +50,8 @@ export interface CreditDistribution {
   rentNet: number
   utilityNets: number[]
   feeNets: number[]
+  /** S609: propane installment nets, in the order supplied. */
+  propaneNets: number[]
   creditApplied: number   // exact dollars removed = sum(gross) − sum(nets)
 }
 
@@ -56,6 +72,7 @@ export function distributeWorkTradeCredit(
   utilities: number[],
   fees: number[],
   creditAmount: number,
+  propane: number[] = [],
 ): CreditDistribution {
   let remaining = round2(Math.max(0, creditAmount))
   const take = (gross: number): number => {
@@ -66,9 +83,15 @@ export function distributeWorkTradeCredit(
   const rentNet = take(rent)
   const utilityNets = utilities.map(take)
   const feeNets = fees.map(take)
-  const grossSum = round2(rent + utilities.reduce((s, u) => s + u, 0) + fees.reduce((s, f) => s + f, 0))
-  const netSum = round2(rentNet + utilityNets.reduce((s, u) => s + u, 0) + feeNets.reduce((s, f) => s + f, 0))
-  return { rentNet, utilityNets, feeNets, creditApplied: round2(grossSum - netSum) }
+  // S609: propane is taken LAST, so a partial month covers the recurring cost of
+  // living here before it touches a one-off fill. Only a near-full month reaches
+  // it — which matches how it is actually used (Nic gives seasonal help their
+  // winter propane outright, and they are working a full trade).
+  const propaneNets = propane.map(take)
+  const sum = (xs: number[]) => xs.reduce((s, x) => s + x, 0)
+  const grossSum = round2(rent + sum(utilities) + sum(fees) + sum(propane))
+  const netSum = round2(rentNet + sum(utilityNets) + sum(feeNets) + sum(propaneNets))
+  return { rentNet, utilityNets, feeNets, propaneNets, creditApplied: round2(grossSum - netSum) }
 }
 
 export interface WorkTradeCreditContext {

@@ -342,28 +342,69 @@ describe('executeRentAllocation — ACH', () => {
     })
   })
 
-  it('rejects payment.type outside (rent, utility)', async () => {
-    // The engine accepts rent + utility (same allocation math per S122).
-    // Anything else — fee, deposit, late_fee, etc. — is a routing bug
-    // and gets a 400.
+  // S609 (Nic, DIRECTIVE): "Late fees that come from the lease and are on the
+  // invoice need to go to the landlord according to the lease... those also need
+  // to go to the landlord. I don't know why that would go to GAM."
+  //
+  // Until S609 a late fee got NO allocation, so the tenant paid it and the money
+  // stopped on GAM's books — invisible from both sides.
+  async function feeFixture(client: any, opts: { type: string; desc: string; owner?: string }) {
+    const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+    const tenantId = await seedTenant(client)
+    const propertyId = await seedProperty(client, {
+      landlordId, ownerUserId, managedByUserId: ownerUserId,
+    })
+    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+    await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+    const res = await client.query(
+      `INSERT INTO payments
+         (unit_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, revenue_owner)
+       VALUES ($1, $2, $3, $4, 100, 'settled', $5, CURRENT_DATE, $6)
+       RETURNING id`,
+      [unitId, tenantId, landlordId, opts.type, opts.desc, opts.owner ?? 'landlord'])
+    return { paymentId: res.rows[0].id, ownerUserId }
+  }
+
+  it('THE FIX: a late fee off the lease pays the landlord', async () => {
     await withRollback(async (client) => {
-      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
-      const tenantId = await seedTenant(client)
-      const propertyId = await seedProperty(client, {
-        landlordId, ownerUserId, managedByUserId: ownerUserId,
-      })
-      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
-      const res = await client.query<{ id: string }>(
-        `INSERT INTO payments
-           (unit_id, tenant_id, landlord_id, type, amount, status,
-            entry_description, due_date)
-         VALUES ($1, $2, $3, 'fee', 100, 'settled', 'LATEFEE', CURRENT_DATE)
-         RETURNING id`,
-        [unitId, tenantId, landlordId]
-      )
-      await expect(executeRentAllocation(client, res.rows[0].id, 'ach'))
-        .rejects.toThrow(/payment\.type IN \('rent','utility'\)/)
+      const { paymentId, ownerUserId } = await feeFixture(client, { type: 'late_fee', desc: 'LATEFEE' })
+      await executeRentAllocation(client, paymentId, 'ach')
+      const led = await client.query(
+        `SELECT amount::float AS amount, user_id FROM user_balance_ledger
+          WHERE reference_id = $1 AND type = 'allocation_owner_share'`, [paymentId])
+      expect(led.rowCount).toBe(1)
+      expect(led.rows[0].user_id).toBe(ownerUserId)
+    })
+  })
+
+  it('a fee the landlord billed by hand pays the landlord', async () => {
+    await withRollback(async (client) => {
+      const { paymentId } = await feeFixture(client, { type: 'fee', desc: 'SUBSCRIP' })
+      await executeRentAllocation(client, paymentId, 'ach')
+      const led = await client.query(
+        `SELECT 1 FROM user_balance_ledger
+          WHERE reference_id = $1 AND type = 'allocation_owner_share'`, [paymentId])
+      expect(led.rowCount).toBe(1)
+    })
+  })
+
+  it("GAM's own fee is refused — it has no owner share", async () => {
+    // Same type and description as the landlord's fee above. Only
+    // revenue_owner separates them, which is exactly why it exists: both are
+    // written as 'SUBSCRIP' and are otherwise identical rows.
+    await withRollback(async (client) => {
+      const { paymentId } = await feeFixture(client, { type: 'fee', desc: 'SUBSCRIP', owner: 'gam' })
+      await expect(executeRentAllocation(client, paymentId, 'ach'))
+        .rejects.toThrow(/GAM revenue/)
+    })
+  })
+
+  it('a deposit is refused — it is held in trust, not split', async () => {
+    await withRollback(async (client) => {
+      const { paymentId } = await feeFixture(client, { type: 'deposit', desc: 'DEPOSIT' })
+      await expect(executeRentAllocation(client, paymentId, 'ach'))
+        .rejects.toThrow(/payment\.type IN/)
     })
   })
 

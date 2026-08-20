@@ -18,7 +18,9 @@ import { logger } from '../lib/logger'
 //       occupant_count — number of active lease tenants per unit
 //       sqft           — units.sqft
 //       bedrooms       — units.bedrooms
-//       equal_split    — 1/N where N is unit count served by the meter
+//       rented_spaces  — 1/N across the units actually LEASED
+//       fixture_count  — units.water_fixture_count
+//       unit_type_weight / hybrid — see rubs_weights
 //     Each unit's share of the base_fee is allocated by the same ratio.
 //     S558: metered exclusion (UNIT-DRIVEN) — a served unit that has its own
 //     same-utility submeter is billed on that submeter and its cycle usage is
@@ -172,6 +174,95 @@ async function lowestComparableUsage(args: {
 }
 
 
+/** S607: the blended per-unit rate a `bill_amount` master prices its whole line
+ *  at for one cycle — the provider's actual dollar charge divided by the total
+ *  usage that charge covered.
+ *
+ *  Returned for a UNIT, because the submeter branch needs it too: a submetered
+ *  unit sitting under a bill_amount master bills its MEASURED usage at this
+ *  same rate, which is what makes the line recover exactly the bill and no more.
+ *  Everyone on the line pays the park's true cost per gallon.
+ *
+ *  The provider's service charge and taxes are already inside the dollar figure,
+ *  so they ride within the rate — Nic: "if they see it nickel and dimed as
+ *  separate charges, here's the water rate, here's the fee for the water,
+ *  they're not gonna like it... that just needs to have a blended rate on the
+ *  back end to include any fee." One line item on the tenant's bill.
+ *
+ *  null whenever the unit is not on such a master, the dollar bill has not been
+ *  entered, or the cycle recorded no usage to divide by — every one of which
+ *  falls back to the ordinary rate path rather than blocking. */
+async function blendedRateForUnit(
+  unitId: string, utilityType: string, cycleIso: string,
+): Promise<{ rate: number; masterLabel: string } | null> {
+  const row = await queryOne<{ label: string; bill_amount: string; reading_value: string }>(`
+    SELECT m.label, rd.bill_amount, rd.reading_value
+      FROM utility_meter_units mu
+      JOIN utility_meters m ON m.id = mu.meter_id
+                           AND m.billing_method = 'rubs'
+                           AND m.rubs_basis = 'bill_amount'
+                           AND m.utility_type = $2
+      JOIN utility_meter_readings rd ON rd.meter_id = m.id
+                                    AND rd.billing_cycle_month = $3
+                                    AND rd.reason = 'monthly_cycle'
+     WHERE mu.unit_id = $1
+       AND m.rubs_submeter_rate = 'blended'
+       AND rd.bill_amount IS NOT NULL
+       AND rd.needs_review = FALSE
+       AND rd.reading_value > 0
+     LIMIT 1`, [unitId, utilityType, cycleIso])
+  if (!row) return null
+  return { rate: Number(row.bill_amount) / Number(row.reading_value), masterLabel: row.label }
+}
+
+/** S607: the rate a submetered unit on a master's line actually bills its
+ *  consumption at — the same number the submeter branch will use, so the pool
+ *  can subtract the DOLLARS that unit was charged instead of assuming a rate.
+ *
+ *  'blended' follows the master (dollars ÷ usage): everyone on the line pays an
+ *  identical cost per unit and the pool carries no variance.
+ *  'property_rate' (default) uses the rate the landlord published — Nic's penny
+ *  a gallon for the mobile homes: the same number every month, checkable at the
+ *  door, with the variance landing on the pool instead of the metered tenant.
+ *
+ *  Deliberately NOT capped by the prevailing-residential ceiling. Where that
+ *  ceiling reduces a submetered tenant's bill, the shortfall is the landlord's
+ *  to absorb — subtracting the uncapped amount keeps it off the neighbouring
+ *  units, who did not cause it and cannot see it. */
+async function submeterConsumptionRate(
+  submeterId: string, blendedRate: number | null, mode: string,
+): Promise<number> {
+  if (mode === 'blended' && blendedRate != null) return blendedRate
+  const sm = await queryOne<{ rate_per_unit: string | null; property_id: string; utility_type: string }>(
+    `SELECT rate_per_unit, property_id, utility_type FROM utility_meters WHERE id = $1`, [submeterId])
+  if (!sm) return 0
+  const pr = await queryOne<{ rate_per_unit: string | null }>(
+    `SELECT rate_per_unit FROM property_utility_rates
+      WHERE property_id = $1 AND utility_type = $2`, [sm.property_id, sm.utility_type])
+  return Number((pr?.rate_per_unit ?? sm.rate_per_unit) || 0)
+}
+
+/** S607: the statutory ceiling on what a SUBMETERED tenant may be charged per
+ *  unit of usage — A.R.S. § 33-1413.01(B) for mobile home parks and
+ *  § 33-2107(B)(3) for RV spaces both cap the landlord at "the prevailing basic
+ *  service single family residential rate charged by the serving utility".
+ *
+ *  It bites specifically in blended mode: a park master usually sits on a bigger
+ *  meter with a bigger service charge than a house, so dollars ÷ gallons can
+ *  land above what a single-family customer pays for the same water.
+ *
+ *  NULL (not looked up yet) means no cap — this must never block a bill. Where
+ *  it does apply the LANDLORD absorbs the difference; see the caller in the RUBS
+ *  branch, which subtracts the uncapped amount from the pool so the shortfall is
+ *  never quietly pushed onto the neighbouring spaces. */
+async function prevailingRateCap(propertyId: string, utilityType: string): Promise<number | null> {
+  const r = await queryOne<{ prevailing_residential_rate: string | null }>(
+    `SELECT prevailing_residential_rate FROM property_utility_rates
+      WHERE property_id = $1 AND utility_type = $2`, [propertyId, utilityType])
+  const v = r?.prevailing_residential_rate
+  return v == null ? null : Number(v)
+}
+
 /** S605: overlay the property's utility pricing onto a meter row, in place.
  *
  *  Mutates the row the billing math reads rather than threading a second rate
@@ -192,6 +283,122 @@ async function applyPropertyRates(meter: any): Promise<void> {
   if (pr.rate_per_unit != null) meter.rate_per_unit = pr.rate_per_unit
   if (pr.base_fee != null) meter.base_fee = pr.base_fee
   if (pr.sewer_rate_per_unit != null) meter.sewer_rate_per_unit = pr.sewer_rate_per_unit
+}
+
+/** S607: per-unit allocation basis for every supported RUBS split.
+ *
+ *  Returns one basis per unit; the caller divides each by their sum. A unit
+ *  whose basis is 0 never bills and is counted as skipped, which is what keeps
+ *  a vacancy (or a unit missing the data a basis needs) from silently absorbing
+ *  someone else's share.
+ *
+ *  The menu is deliberately wider than any one state requires — Nic: "we need a
+ *  wider window scope for available options, and we narrow it on our property
+ *  setup." Nothing here decides what a landlord may use; it decides what they
+ *  CAN use.
+ *
+ *  Config for the bases that need it lives on utility_meters.rubs_weights. */
+async function allocationBases(
+  method: string, weights: any, rubsUnits: any[], cycleIso: string,
+): Promise<Array<{ unitId: string; basis: number }>> {
+  const w = weights || {}
+
+  /** Active-lease headcount on a unit. */
+  const occupants = async (unitId: string): Promise<number> => {
+    const c = await queryOne<{ count: string }>(`
+      SELECT COUNT(*)::text AS count
+        FROM v_lease_active_tenants
+       WHERE EXISTS (
+         SELECT 1 FROM leases l
+          WHERE l.id = v_lease_active_tenants.lease_id
+            AND l.unit_id = $1 AND l.status = 'active')`, [unitId])
+    return Number(c?.count || 0)
+  }
+
+  /** Is this space rented for the cycle? Measured the same way tryInsertBill
+   *  attributes a bill — the lease covering the START of the cycle month — so a
+   *  space that turned over mid-month counts once, not twice. */
+  const isRented = async (unitId: string): Promise<boolean> => {
+    const r = await queryOne<{ n: string }>(`
+      SELECT COUNT(*)::text AS n FROM leases l
+       WHERE l.unit_id = $1
+         AND l.status IN ('active', 'expired', 'terminated')
+         AND l.start_date <= $2::date
+         AND COALESCE(l.end_date, '9999-12-31'::date) > $2::date`, [unitId, cycleIso])
+    return Number(r?.n || 0) > 0
+  }
+
+  const out: Array<{ unitId: string; basis: number }> = []
+  for (const u of rubsUnits) {
+    let basis = 0
+    switch (method) {
+      // An equal share per RENTED space — the only equal-split the platform
+      // offers, because the naive version (every unit on the meter) hands a
+      // VACANT space a full share that then finds no tenant and is never
+      // billed, leaving the landlord to eat it. Also the basis the Arizona RV
+      // statute names, which is why it exists in this shape.
+      case 'rented_spaces':
+        // S609: an owner-occupied space has no lease, so isRented() is false —
+        // but unlike a VACANT space it is lived in and drawing water. It takes
+        // a full share, which the landlord then absorbs rather than bills.
+        basis = (u.status === 'owner_use' || await isRented(u.unit_id)) ? 1 : 0
+        break
+      case 'sqft':
+        basis = Number(u.sqft || 0)
+        break
+      case 'bedrooms':
+        basis = Number(u.bedrooms || 0)
+        break
+      // S609: an owner-occupied unit has NO LEASE, so there are no tenants to
+      // count — it would score 0 and its usage would land on the paying
+      // tenants instead. The landlord states the household size; it is a real
+      // occupied home and never counts as nobody.
+      case 'occupant_count':
+        basis = u.status === 'owner_use'
+          ? Math.max(1, Number(u.owner_household_size || 1))
+          : await occupants(u.unit_id)
+        break
+      // Per plumbing fixture — an old and still widespread water basis, on the
+      // theory that fixtures proxy draw better than floor area. A unit with no
+      // count recorded contributes 0 and is reported as skipped rather than
+      // quietly taking a share it has no basis for.
+      case 'fixture_count':
+        basis = Number(u.water_fixture_count || 0)
+        break
+      // Landlord-set weight per unit type, so a park can say a mobile home draws
+      // 1.5× an RV spot without inventing square footage for either.
+      case 'unit_type_weight':
+        basis = (await isRented(u.unit_id)) ? Number(w[u.unit_type] || 0) : 0
+        break
+      default:
+        basis = 0
+    }
+    out.push({ unitId: u.unit_id, basis })
+  }
+
+  // A percentage blend of two other bases (50% sq ft + 50% occupancy is the
+  // common third-party RUBS split). Each side is normalised to shares FIRST, so
+  // the blend is of proportions rather than of raw numbers — otherwise square
+  // footage, being in the hundreds, would swamp a headcount in the ones.
+  // The result already sums to 1, which the caller's divide handles unchanged.
+  if (method === 'hybrid') {
+    const primary   = String(w.primary || 'sqft')
+    const secondary = String(w.secondary || 'occupant_count')
+    const pct = Math.min(100, Math.max(0, w.primaryPct != null ? Number(w.primaryPct) : 50)) / 100
+    // Guard against a config that points at itself — that would recurse forever.
+    if (primary === 'hybrid' || secondary === 'hybrid') return out
+    const a = await allocationBases(primary, w, rubsUnits, cycleIso)
+    const b = await allocationBases(secondary, w, rubsUnits, cycleIso)
+    const sumA = a.reduce((s, x) => s + x.basis, 0)
+    const sumB = b.reduce((s, x) => s + x.basis, 0)
+    return a.map((x, i) => ({
+      unitId: x.unitId,
+      basis: (sumA > 0 ? pct * (x.basis / sumA) : 0)
+           + (sumB > 0 ? (1 - pct) * (b[i].basis / sumB) : 0),
+    }))
+  }
+
+  return out
 }
 
 export async function generateBillsForMeter(
@@ -242,7 +449,11 @@ export async function generateBillsForMeter(
   // submeter: utility_meter_units row(s) — usually one. RUBS: many.
   const units = await query<any>(`
     SELECT u.id AS unit_id, u.unit_number, u.sqft, u.bedrooms,
-           u.unit_type, u.rv_amp_service
+           u.unit_type, u.rv_amp_service, u.water_fixture_count,
+           -- S609: an owner-occupied unit takes a real share of the pool that
+           -- the LANDLORD absorbs, so the basis needs to know which units those
+           -- are and how many people live in them.
+           u.status, u.owner_household_size
       FROM utility_meter_units mu
       JOIN units u ON u.id = mu.unit_id
      WHERE mu.meter_id = $1
@@ -255,14 +466,35 @@ export async function generateBillsForMeter(
 
   if (meter.billing_method === 'flat_rate') {
     // S558 (Nic): fixed per-unit charge with NO meter reading (e.g. a flat trash
-    // buildback). Each served unit bills the flat amount (base_fee) as its own
-    // line item so the tenant sees exactly what they pay for, instead of it
-    // being folded into rent. Utility-neutral. tryInsertBill still gates on the
-    // per-unit tenant_responsible flag.
-    const flatAmount = Number(meter.base_fee || 0)
+    // buildback). Each served unit bills the flat amount as its own line item so
+    // the tenant sees exactly what they pay for, instead of it being folded into
+    // rent. Utility-neutral. tryInsertBill still gates on the per-unit
+    // tenant_responsible flag.
+    //
+    // S609 (Nic, DIRECTIVE): THE AMOUNT COMES FROM THE PROPERTY, NOT THE METER.
+    //
+    //   "It's a discrimination thing. If you're billing a flat rate per unit, it
+    //    needs to not be editable. It needs to be set at the property level the
+    //    same way late fees are... anybody that's opted into it automatically
+    //    gets the flat twenty five dollars."
+    //
+    // He is right, and this is the same rule that already governs processing
+    // fees: a per-PROPERTY setting, never a per-unit one. A flat charge that
+    // could be edited per meter is a mechanism for billing two identical units
+    // two different amounts for the same service, which is exactly the shape of
+    // a discrimination claim. Reading it from property_utility_rates makes
+    // "everyone on this pays the same" structural rather than a matter of care.
+    //
+    // What stays per-unit is WHETHER the unit is on the meter at all — a
+    // resident hauling their own trash is simply not assigned.
+    const propertyRate = await queryOne<{ rate_per_unit: string }>(
+      `SELECT rate_per_unit FROM property_utility_rates
+        WHERE property_id = $1 AND utility_type = $2`,
+      [meter.property_id, meter.utility_type])
+    const flatAmount = Number(propertyRate?.rate_per_unit || 0)
     if (flatAmount <= 0) {
       return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
-        reason: 'flat_rate meter has no amount set (base fee = 0)' }
+        reason: `no ${meter.utility_type} rate set for this property — set it on the Utilities page (Rates) and every unit on this meter bills that amount` }
     }
     let created = 0, skipped = 0
     for (const unit of units) {
@@ -339,7 +571,7 @@ export async function generateBillsForMeter(
 
   // Get the cycle reading. Both submeter and RUBS need this.
   const cycleReading = await queryOne<any>(`
-    SELECT reading_value, is_rollover, needs_review, reading_date, created_at
+    SELECT reading_value, is_rollover, needs_review, reading_date, created_at, bill_amount
       FROM utility_meter_readings
      WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'
      ORDER BY reading_date DESC LIMIT 1
@@ -368,7 +600,7 @@ export async function generateBillsForMeter(
     // cycle read. That's what keeps a departed short-term guest's usage off
     // the next occupant's bill.
     const priorReading = await queryOne<any>(`
-      SELECT reading_value
+      SELECT reading_value, reading_date
         FROM utility_meter_readings
        WHERE meter_id = $1
          AND (reading_date, created_at) < ($2, $3)
@@ -403,7 +635,34 @@ export async function generateBillsForMeter(
         `, [meter.property_id]))?.tax_rate_pct || 0)
       : 0
     for (const unit of units) {
-      const baseCharge = usage * Number(meter.rate_per_unit || 0) + Number(meter.base_fee || 0)
+      // S607: a submetered unit sitting under a `bill_amount` master bills its
+      // MEASURED usage at that master's blended rate — the same cost per gallon
+      // the pooled spaces on the same line pay. That is what makes the line
+      // recover exactly the provider's bill: measured units take their true
+      // share, the pool takes the rest.
+      //
+      // Blended mode substitutes the RATE and nothing else. Everything the
+      // landlord layered on — base fee, sewer rate, tax rate — still applies on
+      // top, because in this mode the provider's own charges are already inside
+      // the dollar figure, so anything configured here is by definition the
+      // LANDLORD'S OWN addition (the admin/margin lever every RUBS biller
+      // charges). Zeroing them out, as this first did, silently removed that
+      // lever from every landlord on the platform. GAM does not decide what a
+      // landlord may charge — it bills what they configure. Nic: "we are not
+      // enforcing legality... we offer the flexibility for all the different
+      // options to be billed in all the ways that are common use."
+      //
+      // With those fields left at 0/unset — the common case, and Oak Park's —
+      // the line recovers exactly the provider's bill and no more.
+      //
+      // The prevailing-residential cap applies only when the landlord has
+      // recorded one. Unset = uncapped: an opt-in tool, never a gate.
+      const blended = await blendedRateForUnit(unit.unit_id, meter.utility_type, cycleIso)
+      const cap = blended ? await prevailingRateCap(meter.property_id, meter.utility_type) : null
+      const effRate = blended
+        ? (cap != null ? Math.min(blended.rate, cap) : blended.rate)
+        : Number(meter.rate_per_unit || 0)
+      const baseCharge = usage * effRate + Number(meter.base_fee || 0)
       const sewerCharge = usage * sewerRate
       const taxAmount = Math.round(baseCharge * taxRatePct + sewerCharge * sewerTaxRatePct) / 100
       const inserted = await tryInsertBill({
@@ -413,7 +672,7 @@ export async function generateBillsForMeter(
         usageAmount: usage,
         allocationMethod: 'submeter',
         allocationBasis: null,
-        ratePerUnit: Number(meter.rate_per_unit || 0),
+        ratePerUnit: effRate,
         baseFeeShare: Number(meter.base_fee || 0),
         chargeAmount: baseCharge + sewerCharge,
         taxRatePct,
@@ -421,6 +680,8 @@ export async function generateBillsForMeter(
         sewerRatePerUnit: sewerRate > 0 ? sewerRate : null,
         readingStart: Number(priorReading.reading_value),
         readingEnd: Number(cycleReading.reading_value),
+        readingStartDate: priorReading.reading_date ?? null,
+        readingEndDate: cycleReading.reading_date ?? null,
       })
       if (inserted) billsCreated++
       else unitsSkipped++
@@ -437,7 +698,33 @@ export async function generateBillsForMeter(
   // same-utility submeter fall out automatically (no manual linking). If any
   // such submeter can't be resolved this cycle, the pool is unknowable — do NOT
   // bill (would over-charge the RUBS units the submetered units' usage).
+  // S607: a master total the entry guard doubts (an implausible jump against
+  // the master's own history) must not price the pool. A submeter is held by
+  // the same rule, but this one number bills EVERY unit the master feeds, and
+  // the flagged-readings card is the only second look it ever gets — masters
+  // are not in the blind verification walk. Holding here is also what keeps
+  // the correction path working: bills generated off a suspect total would
+  // survive the landlord's correction, because the per-cycle UNIQUE turns the
+  // regenerate into a no-op. Resolving the flag re-runs this meter.
+  if (cycleReading.needs_review) {
+    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+      reason: 'master usage total awaiting double-check — no bills until resolved' }
+  }
+
   const masterUsage = Number(cycleReading.reading_value)
+  // S607 (Nic, DIRECTIVE): `bill_amount` masters divide the provider's ACTUAL
+  // dollar charge instead of pricing usage at a rate we chose. Nic: "you're
+  // allowed to take the total dollar value of the bill and divide it out, not
+  // just the gallons usage — that way you're recouping the full cost of the
+  // bill. On a bill with low gallon usage and then your base fee, you're not
+  // recouping that." Resolved before the exclusion loop because the loop needs
+  // the blended rate to price a submeter set to follow it.
+  //
+  // usage_rate masters (the default, and every existing master) fall through
+  // completely unchanged.
+  const billAmount = meter.rubs_basis === 'bill_amount' && cycleReading.bill_amount != null
+    ? Number(cycleReading.bill_amount) : null
+  const blendedRate = billAmount != null && masterUsage > 0 ? billAmount / masterUsage : null
   const subOnUnit = await query<{ unit_id: string; submeter_id: string }>(
     `SELECT smu.unit_id, sm.id AS submeter_id
        FROM utility_meter_units smu
@@ -456,10 +743,24 @@ export async function generateBillsForMeter(
   // always bills. Anything inferred is collected and reported so the landlord
   // knows which meters to chase, rather than the whole bill silently vanishing.
   const estimatedNotes: string[] = []
+  // S607 (Nic, DIRECTIVE): the pool subtracts DOLLARS, not usage. Nic: "we set
+  // the utility rate at a penny per gallon for submeter usage for water. We bill
+  // the entire rate, and then we need to subtract not the usage from the pool
+  // for the RUBS, but the remaining dollar amount. That way it still zeros out."
+  //
+  // Subtracting usage × the master's blended rate only closes when the submeters
+  // are billed at that same blended rate. The moment they are billed at a
+  // published rate instead — a predictable penny a gallon the tenant can check —
+  // the arithmetic stops closing and the pool silently runs short or over.
+  // Subtracting what those units were ACTUALLY charged for consumption always
+  // closes, whatever rate each one paid.
+  let excludedDollars = 0
   for (const s of subOnUnit) {
     const r = await submeterCycleUsageForExclusion(s.submeter_id, cycleIso)
     if (r.estimated) estimatedNotes.push(r.estimated)
     excludedUsage += r.usage
+    excludedDollars += r.usage * await submeterConsumptionRate(
+      s.submeter_id, blendedRate, meter.rubs_submeter_rate)
   }
   // S605: exclusions exceeding the master reading means a bad read somewhere,
   // but aborting is still the wrong response — it was the abort that lost the
@@ -470,36 +771,90 @@ export async function generateBillsForMeter(
       `submetered usage (${excludedUsage}) exceeded the master reading (${masterUsage}) — check the readings`)
     excludedUsage = masterUsage
   }
+  if (billAmount != null && excludedDollars > billAmount) {
+    estimatedNotes.push(
+      `submetered charges ($${excludedDollars.toFixed(2)}) exceeded the bill ($${billAmount.toFixed(2)}) — check the readings and the rate`)
+    excludedDollars = billAmount
+  }
   // Only the units WITHOUT their own submeter split the remaining pool.
   const rubsUnits = units.filter((u: any) => !excludedUnitIds.has(u.unit_id))
   const totalUsage = masterUsage - excludedUsage
+  if (meter.rubs_basis === 'bill_amount' && billAmount == null) {
+    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+      reason: 'this master bills from the utility bill total, which has not been entered for this cycle' }
+  }
+  // S607 (Nic): "we need the entire bill to be able to input as a total dollar
+  // amount." Usage is NOT required to divide a bill — an electric bill with peak
+  // and off-peak tiers, demand charges and riders has no single usage×rate to
+  // reconstruct, and forcing a usage figure to make the arithmetic work would be
+  // asking the landlord to invent one.
+  //
+  // The one case that genuinely needs it: when submetered units sit on this line,
+  // their share has to be carved out of the pool, and that carve-out is measured
+  // in usage. With no submeters there is nothing to carve — the whole bill simply
+  // divides across the units.
+  if (billAmount != null && masterUsage <= 0 && subOnUnit.length > 0) {
+    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+      reason: `total usage is needed on this master — ${subOnUnit.length} submetered `
+        + `unit${subOnUnit.length === 1 ? '' : 's'} on this line must be subtracted from the pool` }
+  }
+  // Blended mode substitutes the RATE only. A base fee configured here is the
+  // LANDLORD'S own addition on top of the provider's bill — the admin/margin
+  // lever RUBS billers normally charge — so it still applies. Left at 0 (the
+  // common case, and Oak Park's) the pool recovers exactly the bill.
   const totalBaseFee = Number(meter.base_fee || 0)
-  const ratePerUnit = Number(meter.rate_per_unit || 0)
-  const totalCharge = totalUsage * ratePerUnit + totalBaseFee
+  const ratePerUnit = blendedRate ?? Number(meter.rate_per_unit || 0)
+  // S607: sewer rides the water MASTER exactly as it rides a water submeter
+  // (S533) — there is no sewer meter in the field and the tenant sees one line
+  // item. Without this, a park that submeters its mobile homes and RUBS-splits
+  // its spots billed sewer on the mobile homes and silently dropped it on the
+  // spots, off the same property water policy. Inert until a sewer rate is set.
+  //
+  // Both stay live in blended mode too. Anything configured here is the
+  // landlord's own layer on top of the provider's bill, and GAM does not decide
+  // which layers a landlord is allowed — it bills what they set up. Unset, as at
+  // Oak Park, they contribute nothing and the pool is exactly the bill.
+  //
+  // Either way the tenant sees ONE line: every component collapses into a single
+  // charge_amount. Nic: "that just needs to have a blended rate on the back end
+  // to include any fee... that way it's not a separate line item."
+  const sewerRate = meter.utility_type === 'water' ? Number(meter.sewer_rate_per_unit || 0) : 0
+  const effTaxRatePct = taxRatePct
+  const sewerTaxRatePct = sewerRate > 0
+    ? Number((await queryOne<{ tax_rate_pct: string }>(`
+        SELECT tax_rate_pct FROM property_utility_tax_rates
+         WHERE property_id = $1 AND utility_type = 'sewer'
+      `, [meter.property_id]))?.tax_rate_pct || 0)
+    : 0
+  // In blended mode the pool is DOLLARS: the whole bill, less what the submetered
+  // units on this line bill at the same blended rate. When no usage was recorded
+  // (bill-total-only, above) there is nothing to subtract and the pool is simply
+  // the bill.
+  // S607 (Nic, DIRECTIVE): the carve-out is the landlord's CHOICE.
+  //   'usage'   — take the submetered units' measured usage off the top and
+  //               price what is left. The long-standing behaviour, and the
+  //               default, so no master changes shape without being told to.
+  //   'dollars' — take off what those units were actually invoiced. Closes at
+  //               any submeter rate, because it subtracts the invoices rather
+  //               than re-deriving them from a rate they may not have used.
+  // Identical whenever the submeters bill at the master's blended rate; they
+  // diverge exactly when the landlord publishes a separate submeter rate.
+  const totalWaterCharge = billAmount != null
+    ? (blendedRate == null
+        // Bill-total-only (no usage figure recorded). There is nothing to carve
+        // out — the guard above refuses this shape when submetered units are on
+        // the line — so the bill divides whole, whichever carve-out is selected.
+        ? billAmount
+        : meter.rubs_exclusion_mode === 'dollars'
+          ? (billAmount - excludedDollars)
+          : totalUsage * ratePerUnit) + totalBaseFee
+    : totalUsage * ratePerUnit + totalBaseFee
+  const totalSewerCharge = totalUsage * sewerRate
+  const totalCharge = totalWaterCharge + totalSewerCharge
 
   // Compute per-unit basis, then divide.
-  const unitBases: Array<{ unitId: string; basis: number }> = []
-  for (const u of rubsUnits) {
-    let basis = 0
-    if (meter.rubs_allocation_method === 'equal_split') {
-      basis = 1
-    } else if (meter.rubs_allocation_method === 'sqft') {
-      basis = Number(u.sqft || 0)
-    } else if (meter.rubs_allocation_method === 'bedrooms') {
-      basis = Number(u.bedrooms || 0)
-    } else if (meter.rubs_allocation_method === 'occupant_count') {
-      const c = await queryOne<{ count: string }>(`
-        SELECT COUNT(*)::text AS count
-          FROM v_lease_active_tenants
-         WHERE EXISTS (
-           SELECT 1 FROM leases l
-            WHERE l.id = v_lease_active_tenants.lease_id
-              AND l.unit_id = $1 AND l.status = 'active')
-      `, [u.unit_id])
-      basis = Number(c?.count || 0)
-    }
-    unitBases.push({ unitId: u.unit_id, basis })
-  }
+  const unitBases = await allocationBases(
+    meter.rubs_allocation_method, meter.rubs_weights, rubsUnits, cycleIso)
 
   const totalBasis = unitBases.reduce((s, u) => s + u.basis, 0)
   if (totalBasis === 0) {
@@ -518,20 +873,69 @@ export async function generateBillsForMeter(
   unitsSkipped += unitBases.length - billable.length
   const alloc = billable.map(ub => {
     const share = ub.basis / totalBasis
+    const waterShare = round2(totalWaterCharge * share)
+    const sewerShare = round2(totalSewerCharge * share)
     return {
       unitId:       ub.unitId,
       basis:        ub.basis,
       baseFeeShare: round2(totalBaseFee * share),
-      chargeAmount: round2(totalCharge * share),
+      chargeAmount: round2(waterShare + sewerShare),
+      waterShare,
+      sewerShare,
     }
   })
+  let ownerUseWithheld = 0
   const residual = round2(totalCharge - alloc.reduce((s, a) => s + a.chargeAmount, 0))
   if (residual !== 0 && alloc.length > 0) {
     let lo = alloc[0]
     for (const a of alloc) if (a.chargeAmount < lo.chargeAmount) lo = a
     lo.chargeAmount = round2(lo.chargeAmount + residual)
   }
+  // S609 (Nic, DIRECTIVE): the OWNER'S OWN SHARE IS WITHHELD, NOT BILLED.
+  //
+  // An owner-occupied unit now scores a real basis above, so it takes a genuine
+  // slice of the pool — which is the point: the tenants' shares no longer add up
+  // to the whole bill, so they stop paying for the owner's water. That slice is
+  // simply not charged to anyone. The landlord already paid the utility company;
+  // this is the part they don't get back.
+  //
+  // It is RECORDED rather than quietly dropped. Nic: "We need that as a line
+  // item on a specific utility cost that's owner use that is not passed through.
+  // That way, if there's ever an audit, the landlord can provide, hey, these
+  // utilities were not factored into being billed back to people."
+  //
+  // A bill row with status 'owner_use' and no tenant or lease is exactly that
+  // record: it sits in the same ledger as every other bill for the cycle, so
+  // "the master's pool, less what was billed out" reconciles to it. It carries
+  // no payment and is never invoiced — nothing collects a bill that has no
+  // tenant on it.
+  const ownerUnitIds = new Set(
+    rubsUnits.filter((u: any) => u.status === 'owner_use').map((u: any) => u.unit_id))
   for (const a of alloc) {
+    if (ownerUnitIds.has(a.unitId)) {
+      // Recorded in its own ledger rather than as a bill: utility_bills requires
+      // a tenant and a lease (every bill has a payer, which is an invariant
+      // worth keeping), and an owner-occupied unit has neither. Re-runnable —
+      // the unique index makes a repeated cycle a no-op, same as tryInsertBill.
+      await query(`
+        INSERT INTO utility_owner_use_absorptions
+          (meter_id, unit_id, landlord_id, utility_type, billing_cycle_month,
+           allocation_method, allocation_basis, charge_amount, base_fee_share, notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT (meter_id, unit_id, billing_cycle_month) DO UPDATE
+          SET charge_amount   = EXCLUDED.charge_amount,
+              allocation_basis = EXCLUDED.allocation_basis,
+              base_fee_share  = EXCLUDED.base_fee_share,
+              updated_at      = NOW()
+      `, [
+        meterId, a.unitId, landlordId, meter.utility_type, cycleIso,
+        meter.rubs_allocation_method, a.basis,
+        a.chargeAmount.toFixed(2), a.baseFeeShare.toFixed(2),
+        'Owner-occupied unit — its share of the pool, absorbed by the landlord and billed to nobody.',
+      ])
+      ownerUseWithheld = round2(ownerUseWithheld + a.chargeAmount)
+      continue
+    }
     const inserted = await tryInsertBill({
       meterId, unitId: a.unitId, landlordId,
       utilityType: meter.utility_type,
@@ -542,7 +946,18 @@ export async function generateBillsForMeter(
       ratePerUnit,
       baseFeeShare: a.baseFeeShare,
       chargeAmount: a.chargeAmount,
-      taxRatePct,
+      taxRatePct: effTaxRatePct,
+      // Each portion taxed at its own type's landlord rate, as on a submeter
+      // bill. With no sewer rate configured this is left undefined so
+      // tryInsertBill keeps computing tax off the final (post-residual)
+      // charge exactly as before — no sewer, no behaviour change.
+      ...(sewerRate > 0
+        ? { taxAmount: Math.round(a.waterShare * effTaxRatePct + a.sewerShare * sewerTaxRatePct) / 100,
+            sewerRatePerUnit: sewerRate }
+        : {}),
+      // The dates both statutes require alongside the readings. A pooled space
+      // has no meter of its own; the master's cycle read dates the period.
+      readingEndDate: cycleReading.reading_date ?? null,
     })
     if (inserted) billsCreated++
     else unitsSkipped++
@@ -685,6 +1100,14 @@ interface InsertBillArgs {
   /** Begin/end odometer reads for tenant-invoice transparency (submeter only). */
   readingStart?: number | null
   readingEnd?: number | null
+  /** S607: the DATES of those reads. Not decoration — A.R.S. § 33-1413.01(A)
+   *  and § 33-1314.01(E)(1) both require each utility bill to show the opening
+   *  and closing readings *and the dates they were taken*. We snapshotted the
+   *  readings and dropped the dates, so no bill we produced was compliant on
+   *  its face. A pooled RUBS space has no reads of its own but still carries the
+   *  master's closing date, which is what dates its billing period. */
+  readingStartDate?: string | Date | null
+  readingEndDate?: string | Date | null
 }
 
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
@@ -741,8 +1164,8 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
          billing_cycle_month, usage_amount, allocation_method,
          allocation_basis, rate_per_unit, base_fee_share, charge_amount,
          tax_rate_pct, tax_amount, utility_type, sewer_rate_per_unit,
-         reading_start, reading_end)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         reading_start, reading_end, reading_start_date, reading_end_date)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
     `, [
       args.meterId, args.unitId, lt.tenant_id, lt.lease_id, args.landlordId,
       args.cycleMonth, args.usageAmount, args.allocationMethod,
@@ -753,6 +1176,8 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
       args.sewerRatePerUnit ?? null,
       args.readingStart ?? null,
       args.readingEnd ?? null,
+      args.readingStartDate ?? null,
+      args.readingEndDate ?? null,
     ])
     return true
   } catch (e: any) {
@@ -824,8 +1249,40 @@ export async function ensureBillsForUnit(
             AND ub.billing_cycle_month = rd.billing_cycle_month)
   `, [unitId, throughDate])
 
+  // S607 (Nic): FLAT-RATE meters bill here too, and did not before.
+  //
+  // Nic: "did we ever add trash as an item? We just do that at a flat rate per
+  // household because they have individual cans."
+  //
+  // Trash exists as a utility type and flat_rate is exactly that fixed
+  // per-household charge — but this function, which is the PRIMARY billing path
+  // since S534, selected only submeter/rubs meters AND required a
+  // utility_meter_readings row. A flat-rate meter has neither: no reading, by
+  // design. So trash only billed when a reading RUN completed
+  // (generateBillsForProperty sweeps every meter), which produced two failures:
+  //
+  //   1. A property with ONLY a flat-rate meter never opens a reading run at all
+  //      (openReadingRun requires a readable meter), so its trash NEVER billed.
+  //   2. At a property like Oak Park, one unread water meter left the run open
+  //      and took the trash charge down with it — even though trash needs no
+  //      reading whatsoever. That is precisely the coupling S534 exists to
+  //      prevent: "one unread meter elsewhere never holds a unit's charges."
+  //
+  // Cycle is the invoice's own month; there is no reading to date it from.
+  const flat = await query<{ meter_id: string; cycle: string }>(`
+    SELECT m.id AS meter_id, to_char(date_trunc('month', $2::date), 'YYYY-MM-DD') AS cycle
+      FROM utility_meter_units mu
+      JOIN utility_meters m ON m.id = mu.meter_id AND m.billing_method = 'flat_rate'
+     WHERE mu.unit_id = $1
+       AND NOT EXISTS (
+         SELECT 1 FROM utility_bills ub
+          WHERE ub.meter_id = m.id
+            AND ub.unit_id = mu.unit_id
+            AND ub.billing_cycle_month = date_trunc('month', $2::date)::date)
+  `, [unitId, throughDate])
+
   let created = 0
-  for (const p of pending) {
+  for (const p of [...pending, ...flat]) {
     const r = await generateBillsForMeter(p.meter_id, new Date(p.cycle + 'T00:00:00Z'))
     created += r.billsCreated
   }

@@ -238,10 +238,19 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
+          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name,
+          -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
+          -- payment is scheduled and on which day, so a quiet lease does not
+          -- read as a tenant who stopped paying. They can never CHANGE it — a
+          -- landlord able to move the date could manufacture late fees, which
+          -- is why the setting lives on its own tenant-owned table and no
+          -- landlord route writes to it. Do not add one.
+          ap.enabled AS autopay_enabled,
+          ap.pull_day AS autopay_pull_day
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
+        LEFT JOIN tenant_autopay ap ON ap.lease_id = l.id
         WHERE l.landlord_id = $1
         ORDER BY l.start_date DESC`, [req.user!.profileId])
     } else if (isTeamRole && req.user!.landlordId) {
@@ -253,10 +262,19 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
+          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name,
+          -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
+          -- payment is scheduled and on which day, so a quiet lease does not
+          -- read as a tenant who stopped paying. They can never CHANGE it — a
+          -- landlord able to move the date could manufacture late fees, which
+          -- is why the setting lives on its own tenant-owned table and no
+          -- landlord route writes to it. Do not add one.
+          ap.enabled AS autopay_enabled,
+          ap.pull_day AS autopay_pull_day
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
+        LEFT JOIN tenant_autopay ap ON ap.lease_id = l.id
         WHERE l.landlord_id = $1
         ORDER BY l.start_date DESC`, [req.user!.landlordId])
     } else if (role === 'tenant') {
@@ -1442,6 +1460,70 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
         fee_type:    fee.fee_type,
         amount:      Number(fee.amount),
         due_date:    result.dueDate,
+        description: result.description,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// S607 (Nic, DIRECTIVE): a genuine ONE-OFF charge — amount and description, no
+// lease fee defined in advance.
+//
+// Nic: "the landlord's always gonna have some random thing, a rule change, or
+// whatever, addendum that people get a notice for parking violation. All that
+// little stuff is not gonna be added into the lease... people aren't gonna sign
+// addendums every time. People operate in the real world."
+//
+// /bill-fee could not do this: it requires a lease_fees row to already exist on
+// the lease, so charging for a broken gate arm meant first defining "broken gate
+// arm" as a recurring fee type. This posts the charge directly.
+//
+// Deliberately NOT a late fee: it sits outside late-fee reporting and does not
+// count against the lease's late-fee cap (Nic: "that's fine"). A landlord with
+// late fees switched off at the property can still charge the occasional tenant
+// without turning the whole policy on.
+//
+// The DESCRIPTION is required, not optional — an unexplained charge on a
+// tenant's balance is the thing that generates the phone call, and the tenant
+// sees this text on their bill.
+const oneOffChargeSchema = z.object({
+  amount:      z.number().positive().max(100000),
+  description: z.string().trim().min(3).max(200),
+  dueDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+})
+
+leasesRouter.post('/:id/charge', requirePerm('leases.bill_fee'), async (req, res, next) => {
+  try {
+    const body = oneOffChargeSchema.parse(req.body)
+    const lease = await queryOne<{
+      id: string; landlord_id: string; unit_id: string; tenant_id: string | null
+    }>(
+      `SELECT l.id, l.landlord_id, l.unit_id,
+              (SELECT vlat.tenant_id FROM v_lease_active_tenants vlat
+                WHERE vlat.lease_id = l.id AND vlat.role = 'primary' LIMIT 1) AS tenant_id
+         FROM leases l WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!lease.tenant_id) throw new AppError(400, 'This lease has no active tenant to charge')
+
+    const { createLeaseFeePayment } = await import('../services/leaseFees')
+    const result = await createLeaseFeePayment({
+      landlordId:  lease.landlord_id,
+      tenantId:    lease.tenant_id,
+      leaseId:     lease.id,
+      unitId:      lease.unit_id,
+      feeType:     'one_off',
+      amount:      Math.round(body.amount * 100) / 100,
+      description: body.description,
+      dueDate:     body.dueDate,
+      source:      'admin',
+    })
+    res.status(201).json({
+      success: true,
+      data: {
+        paymentId:   result.paymentId,
+        amount:      Math.round(body.amount * 100) / 100,
+        dueDate:     result.dueDate,
         description: result.description,
       },
     })

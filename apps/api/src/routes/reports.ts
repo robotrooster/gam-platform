@@ -377,7 +377,14 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
       ORDER BY created_at DESC`, [landlordId, start, end])
 
     // ── P&L calculations ──────────────────────────────────────
-    const settled = payments.filter((p:any) => p.status === 'settled')
+    // S609: a settled charge is only the LANDLORD'S income if it is their money.
+    // The tenant also pays GAM directly through this same ledger — an ACH-return
+    // fee, a card-decline fee, the manual-payment fee, an opt-in subscription —
+    // and those were being counted as landlord income, overstating this
+    // statement by every fee GAM collected. They are stamped revenue_owner='gam'
+    // at creation; everything else is the landlord's.
+    const settled = payments.filter((p:any) =>
+      p.status === 'settled' && p.revenue_owner !== 'gam')
     const sumTypes = (types: string[]) => round2(settled
       .filter((p:any) => types.includes(p.type))
       .reduce((s:number, p:any) => s + parseFloat(p.amount||0), 0))

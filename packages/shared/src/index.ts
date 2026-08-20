@@ -456,7 +456,8 @@ export type MicrodepositType = 'amounts' | 'descriptor_code'
 export function microdepositInstruction(type: MicrodepositType | null | undefined): string {
   if (type === 'descriptor_code') {
     return 'We sent a $0.01 deposit to your bank. Find it on your statement — its description ' +
-      'contains a six-digit code. Enter that code here to finish setting up your bank.'
+      'contains a code starting with SM. Enter that code here to finish setting up your bank. ' +
+      'Your bank may print its own reference number alongside it; the one we need is the SM code.'
   }
   if (type === 'amounts') {
     return 'We sent two small deposits to your bank. Once you see them, enter both amounts ' +
@@ -465,7 +466,7 @@ export function microdepositInstruction(type: MicrodepositType | null | undefine
   // Type unknown (Stripe decides at confirm time, and older records predate this
   // field): describe both rather than promising the wrong one.
   return 'We sent a small verification deposit to your bank. When it arrives, come back here — ' +
-    'we\'ll ask for either the deposit amounts or the six-digit code in its description, ' +
+    'we\'ll ask for either the deposit amounts or the code starting with SM in its description, ' +
     'whichever your bank received.'
 }
 
@@ -605,7 +606,10 @@ export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
 // FORCED on for these regardless of the user's preference (they can't toggle it
 // off in the UI), because missing them causes real harm (a failed rent payment
 // slipping to a late fee / eviction clock). In-app is always on already.
-export const CRITICAL_NOTIFICATION_TYPES = ['payment_failed'] as const
+// S609: a failed AUTOPAY pull belongs here for the same reason. The tenant
+// believes their rent is handled and has no reason to check — silence is the
+// worst possible outcome, and it ends in a late fee they never saw coming.
+export const CRITICAL_NOTIFICATION_TYPES = ['payment_failed', 'autopay_failed'] as const
 export type CriticalNotificationType = typeof CRITICAL_NOTIFICATION_TYPES[number]
 export const isCriticalNotificationType = (t: string): boolean =>
   (CRITICAL_NOTIFICATION_TYPES as readonly string[]).includes(t)
@@ -2258,6 +2262,8 @@ export interface PropertyUnitSubtype {
   nightlyRate: number | string | null
   weeklyRate: number | string | null
   monthlyRate: number | string | null
+  /** S613: how many live units carry this subtype (read-only, from the list). */
+  unitCount?: number
 }
 
 // Human summary of a subtype's facts for chips/rows, e.g.
@@ -2270,6 +2276,20 @@ export function unitSubtypeFactsLabel(s: PropertyUnitSubtype): string {
   if (s.rvAmpService && s.rvAmpService !== 'none') parts.push(s.rvAmpService === 'both' ? '30/50 amp' : `${s.rvAmpService} amp`)
   if (s.storageSize?.trim()) parts.push(s.storageSize.trim())
   return parts.join(' · ')
+}
+
+// S613 (Nic): a NAME suggested from the facts the landlord just picked.
+//
+// He built "Back In" as a 50-amp back-in, then "Back In" as a 30-amp back-in,
+// and the second silently overwrote the first — he was naming the CLASS and
+// letting the dropdowns carry the variation, which is a perfectly reasonable
+// way to think and which the name-keyed model cannot hold. Two subtypes need
+// two names, so the form fills the name in from the facts as they are chosen
+// (still free to overtype). "Back-in 50 amp" and "Back-in 30 amp" then happen
+// by default instead of by warning.
+export function suggestUnitSubtypeName(s: PropertyUnitSubtype): string {
+  const facts = unitSubtypeFactsLabel(s).replace(/ · /g, ' ')
+  return facts.trim()
 }
 
 // Single source of truth for units.rv_site_layout / unit_bookings.required_site_layout
@@ -3299,9 +3319,31 @@ export type UtilityBillingMethod = 'submeter' | 'rubs' | 'master_bill_to_landlor
 export const UTILITY_BILLING_METHODS: readonly UtilityBillingMethod[] =
   ['submeter', 'rubs', 'master_bill_to_landlord'] as const
 
-export type RubsAllocationMethod = 'occupant_count' | 'sqft' | 'bedrooms' | 'equal_split'
+// S607: `rented_spaces` — an equal share across only the units currently
+// LEASED. Added because some jurisdictions require that basis outright, and
+// because a naive equal split hands a VACANT unit a share that then finds no
+// tenant and is never billed, leaving the landlord short on a bill he has
+// already paid. Counting only leased units recovers the whole pool.
+// S607: widened to what landlords across the country actually use. None of
+// these narrows anything — every basis stays available and each new one is
+// inert until selected. Config for the ones that need it lives on
+// utility_meters.rubs_weights.
+//   fixture_count      — per plumbing fixture (units.water_fixture_count)
+//   unit_type_weight   — landlord-set weight per unit type
+//   hybrid             — a percentage blend of two other bases
+//
+// S607: 'equal_split' and 'weighted_occupancy' were REMOVED (Nic). equal_split
+// gave a vacant unit a full share that then billed to nobody, so the landlord
+// silently ate it — rented_spaces is the same idea done correctly.
+// weighted_occupancy was complexity nobody would pick. Options nobody would
+// choose are not flexibility; they are noise on the screen that decides how
+// every tenant on a meter is charged.
+export type RubsAllocationMethod =
+  | 'occupant_count' | 'sqft' | 'bedrooms' | 'rented_spaces'
+  | 'fixture_count' | 'unit_type_weight' | 'hybrid'
 export const RUBS_ALLOCATION_METHODS: readonly RubsAllocationMethod[] =
-  ['occupant_count', 'sqft', 'bedrooms', 'equal_split'] as const
+  ['occupant_count', 'sqft', 'bedrooms', 'rented_spaces',
+   'fixture_count', 'unit_type_weight', 'hybrid'] as const
 
 // ============================================================================
 // LATE FEE ENUMS (properties.* + leases.* column value domains, consumed S26)
@@ -3815,6 +3857,70 @@ export function achFeeLabel(): string {
   return `$${PROCESSING_FEES.ACH_FLAT.toFixed(2)} flat`
 }
 
+/**
+ * S607 — THE processing-fee formula. One definition, used by the code that
+ * CHARGES (services/stripeConnect.computeApplicationFee delegates here) and by
+ * the code that QUOTES a price to a tenant before they choose a method.
+ *
+ * Nic asked the invoice to show what each payment method would cost. A display
+ * formula written separately from the charging formula is a quote that goes
+ * stale the next time either is repriced — and the tenant would have chosen a
+ * method based on a number we then did not honour. Same reasoning as S604's
+ * derived labels, one level deeper: derive the FIGURES too, not just the words.
+ */
+export function processingFeeFor(opts: {
+  amount: number
+  paymentMethod: 'ach' | 'card'
+  cardCountry?: string | null
+}): number {
+  if (opts.paymentMethod === 'ach') {
+    return round2(Math.min(
+      opts.amount * PROCESSING_FEES.ACH_PCT + PROCESSING_FEES.ACH_FLAT,
+      PROCESSING_FEES.ACH_CAP))
+  }
+  let pct: number = PROCESSING_FEES.CARD_PCT
+  if (opts.cardCountry && opts.cardCountry !== 'US') pct += PROCESSING_FEES.CARD_INTL_PCT
+  return round2(opts.amount * pct + PROCESSING_FEES.CARD_FLAT)
+}
+
+export interface PaymentMethodCost {
+  method: 'ach' | 'card' | 'manual'
+  /** Short label for the row, e.g. "Bank account". */
+  label: string
+  /** The fee added on top of the balance for this method. */
+  fee: number
+  /** What the tenant actually pays, all in. */
+  total: number
+}
+
+/**
+ * S607 (Nic): every way to pay this balance, priced, for the invoice.
+ *
+ * Nic: "maybe on the invoice, it can show a breakdown of what each bill would be
+ * by payment method... that way they see all the avenues and the price at the
+ * point the invoice comes out."
+ *
+ * `manualFee` is passed in rather than assumed, because whether the cash/check/
+ * money-order fee applies depends on the tenant's own history and the property's
+ * onboarding window — a rule this pure function has no business guessing at.
+ * Pass 0 when it is waived.
+ */
+export function paymentMethodCosts(
+  amount: number,
+  opts: { manualFee?: number; cardCountry?: string | null } = {},
+): PaymentMethodCost[] {
+  const ach  = processingFeeFor({ amount, paymentMethod: 'ach' })
+  const card = processingFeeFor({ amount, paymentMethod: 'card', cardCountry: opts.cardCountry })
+  const manual = round2(opts.manualFee ?? 0)
+  return [
+    { method: 'ach',    label: 'Bank account',            fee: ach,    total: round2(amount + ach) },
+    { method: 'card',   label: 'Card or debit',           fee: card,   total: round2(amount + card) },
+    { method: 'manual', label: 'Cash, check or money order', fee: manual, total: round2(amount + manual) },
+  ]
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100
+
 export const PLATFORM_FEES = {
   // @deprecated S561 — the per-unit LANDLORD fee tiers below are RETIRED. The
   // LIVE landlord fee is LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT ($2/occupied
@@ -4143,9 +4249,25 @@ export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
 export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
-  cash: 'Cash', check: 'Check', money_order: 'Money order',
+  cash: 'Cash',
+  // S607 (Nic): a cashier's check is a CHECK. Deliberately NOT its own value —
+  // the fee is for a payment handled and recorded BY HAND, not for the paper it
+  // arrived on, so splitting instruments would create work with no difference in
+  // outcome and simply move the argument to the next one (certified check, bank
+  // draft, traveller's cheque). The label names the common variants instead, so
+  // "it doesn't say cashier's check" is not an argument anyone can make.
+  check: 'Check (incl. cashier\'s or certified)',
+  money_order: 'Money order',
 }
 export const MANUAL_PAYMENT_FEE = 10.00
+
+/** S607 (Nic): the ONE description of what the manual-payment fee covers, so no
+ *  surface can quietly disagree with another. Category first, examples second,
+ *  explicitly open-ended — the fee attaches to how the payment is handled, never
+ *  to which instrument it happens to be. */
+export const MANUAL_PAYMENT_FEE_SCOPE =
+  'any payment handed to the office instead of made in the app — cash, a personal, ' +
+  'cashier\'s or certified check, a money order, or a bank draft'
 
 // S603 (Nic): flat $1.00 fee on a DECLINED CARD ATTEMPT (entry_description
 // 'DECLINEFEE'). Stripe bills GAM per AUTHORIZATION, not per successful payment,
@@ -4254,6 +4376,27 @@ export function computeAmortization(financedAmount: number, annualRatePercent: n
 }
 export function humanizeEntryDescription(code: string): string {
   return PAYMENT_ENTRY_DESCRIPTION_LABELS[code as PaymentEntryDescription] ?? code
+}
+
+/**
+ * S607 (Nic) — what a charge should be CALLED on a tenant's bill.
+ *
+ * entry_description is a NACHA transaction code ('SUBSCRIP', 'RENT'), useful to
+ * a bank and meaningless to a person. Every landlord-billed charge already
+ * carries the landlord's own wording in `notes`, stamped by
+ * createLeaseFeePayment as "admin-billed: <type> — <description>". Showing the
+ * bank code instead was fine while every fee was a known kind; it stops being
+ * fine the moment a landlord can post "Parking violation — gate arm" as a
+ * one-off, which is exactly the charge a tenant will ring up about.
+ *
+ * Falls back to the humanised code whenever there is no landlord wording, so
+ * rent, late fees and everything predating this read exactly as before.
+ */
+export function chargeLabel(entryDescription?: string | null, notes?: string | null): string {
+  const m = notes ? /^[a-z]+-billed:\s*[a-z_]+\s*—\s*(.+)$/i.exec(notes.trim()) : null
+  const landlordWording = m?.[1]?.trim()
+  if (landlordWording) return landlordWording
+  return humanizeEntryDescription(entryDescription ?? '')
 }
 
 export const DISBURSEMENT_STATUSES = ['pending', 'processing', 'settled', 'failed'] as const
@@ -5305,6 +5448,60 @@ export const METER_USAGE_ALERT_THRESHOLDS: Record<string, number | null> = {
   trash: null,
 }
 
+// RUBS master plausibility factor (S607). A master's monthly entry is a USAGE
+// TOTAL off the utility's own bill, not an odometer read — the billing engine
+// bills reading_value directly — so none of the odometer guards apply to it. A
+// total LOWER than last month just means the park used less water; treating
+// that as a rollover held every RUBS tenant's whole invoice for nothing.
+//
+// What a master does need is a typo guard, because it is the one reading with
+// no second look behind it: the blind verification walk is submeters only, and
+// one number prices every unit on the pool. 900000 typed for 90000 bills the
+// whole park ten times over. A total above this multiple of the master's own
+// previous total is flagged for the landlord to confirm or correct. Set wide
+// enough that a real seasonal swing (a snowbird park filling in November)
+// passes untouched — this is catching a slipped digit, not a busy month.
+//
+// S607 (Nic): widened 5× → 10×. A master pool legitimately swings far harder
+// than any one submeter — a park fills for the season, and a single leak (a
+// running toilet in one camper) moves the whole master with no entry error at
+// all. Under RUBS that leak already spreads across every space, so flagging it
+// here would hold the park's rent over something the flag cannot fix. 10× still
+// catches the failure this guard exists for: a slipped digit. Finding the leak
+// is a usage-anomaly job, not an entry-validation job.
+export const MASTER_TOTAL_JUMP_FACTOR = 10
+// What a RUBS master prices its pool FROM (S607).
+//   usage_rate  — usage × the property's rate + base fee. The default, and how
+//                 every master behaved before this existed.
+//   bill_amount — divide the utility provider's actual dollar charge for the
+//                 cycle. Blended into one per-usage rate so the provider's
+//                 service charge and taxes ride inside the rate instead of
+//                 landing on the tenant's bill as extra line items.
+// Both are first-class: some jurisdictions cap recovery at the landlord's
+// actual charges, others allow billing a published rate. The landlord picks.
+export const RUBS_BASES = ['usage_rate', 'bill_amount'] as const
+export type RubsBasis = typeof RUBS_BASES[number]
+
+// What rate a SUBMETERED unit on a RUBS master's line is billed at (S607).
+//   property_rate — the rate the landlord published (default). A predictable
+//                   figure the tenant can check, unchanged from how a submeter
+//                   behaves on the usage_rate basis.
+//   blended       — the master's dollars ÷ usage, so every unit on the line
+//                   pays an identical cost per unit.
+export const RUBS_SUBMETER_RATES = ['property_rate', 'blended'] as const
+export type RubsSubmeterRate = typeof RUBS_SUBMETER_RATES[number]
+
+// How a RUBS master removes its submetered units from the pool (S607).
+//   usage   — subtract their measured usage, then price the remainder. The
+//             classic carve-out, and the default: no master changes shape
+//             without the landlord asking for it.
+//   dollars — subtract what those units were actually invoiced, so the bill
+//             closes at any submeter rate.
+// The two agree whenever submeters bill at the blended rate; they diverge when
+// the landlord publishes a separate submeter rate.
+export const RUBS_EXCLUSION_MODES = ['usage', 'dollars'] as const
+export type RubsExclusionMode = typeof RUBS_EXCLUSION_MODES[number]
+
 // Double-check verification phase (Nic, S533): after the main walk, the
 // system generates a blind re-read list — every suspicious meter plus
 // random clean ones so the list always has at least MIN entries and the
@@ -5590,3 +5787,81 @@ export function connectRequirementLabel(key: string): string {
 export function connectRequirementLabels(keys: string[]): string[] {
   return [...new Set((keys || []).map(connectRequirementLabel))]
 }
+
+// ─── S609: WHO A CHARGE'S MONEY BELONGS TO ────────────────────────────────
+//
+// NIC, DIRECTIVE: "Late fees that come from the lease and are on the invoice
+// need to go to the landlord according to the lease. If you're talking about
+// late fees that would be in the one-off charges, those also need to go to the
+// landlord. I don't know why that would go to GAM. The only fees we collect are
+// retries on ACH, pass-through on card processing, and the subscription for
+// various tenant opt-in products."
+//
+// THE DEFECT THIS EXISTS TO FIX. Only rent and utilities were ever split out to
+// the landlord. Every other charge — a late fee off the signed lease, a one-off
+// charge a landlord billed by hand — settled with no owner share at all, so the
+// tenant paid it and the money stopped on GAM's books. Silent: the tenant's
+// balance was right, and the landlord had no line to miss.
+//
+// WHY A COLUMN AND NOT A RULE ABOUT TYPES. `entry_description` cannot carry this.
+// A landlord's hand-billed lease fee and a GAM tenant subscription are BOTH
+// written as 'SUBSCRIP' (services/leaseFees.ts and the FlexPay path), so the two
+// are indistinguishable after the fact. Ownership is a fact about why a charge
+// was created, known only at the moment of creation — so it is stamped then, by
+// whoever creates it, and never inferred afterwards.
+//
+// The rule for anything new: if the tenant owes it because their LEASE says so,
+// it is 'landlord'. If they owe it because they used a GAM service — a returned
+// bank payment, a declined card, an opt-in product — it is 'gam'. When in doubt
+// it is the landlord's; GAM's list is short, closed, and above.
+export const REVENUE_OWNERS = ['landlord', 'gam'] as const
+export type RevenueOwner = typeof REVENUE_OWNERS[number]
+
+// The complete list of what GAM keeps (Nic). Everything not here is the
+// landlord's. Kept as codes so a reader can check a payments row against it.
+//
+//   RETURNFEE  — a bank payment came back; NACHA retry cost passed through
+//   DECLINEFEE — a card was declined; the authorization cost passed through
+//   MANUALPAY  — recording a payment handed to the office (Nic confirmed S609
+//                this stays GAM's: it covers manual reconciliation and both
+//                Terms documents already disclose it that way)
+//   FLEXPAY / SUBSCRIP(subscription) / FCPAYDOWN / ONTIMEPAY
+//              — tenant opt-in products
+//
+// NOTE 'SUBSCRIP' is deliberately ABSENT: it is written by both the subscription
+// path and the landlord's hand-billed lease fees, so it proves nothing on its
+// own. Those two callers stamp revenue_owner explicitly instead.
+export const GAM_REVENUE_ENTRY_DESCRIPTIONS = [
+  'RETURNFEE', 'DECLINEFEE', 'MANUALPAY', 'FLEXPAY', 'FCPAYDOWN', 'ONTIMEPAY',
+] as const
+
+// ─── S609: HOW MANY PHOTOS A UNIT NEEDS BEFORE IT CAN BE LISTED ───────────
+//
+// NIC: "RV spots to be published for rent on the booking site or anywhere else
+// we're planning on listing it — make the required photos one, because people
+// are bringing their own unit. When we are booking something like an Airbnb
+// style situation where there's interior pictures to be had, make it five, like
+// for apartments."
+//
+// A flat five applied to everything, which is the right number for a dwelling
+// and an impossible one for a bare site. An RV spot is a patch of ground with a
+// hookup — the renter arrives towing the thing that would have been photographed
+// — so five angles of the same gravel pad is busywork that stops real listings
+// going out. A place someone LIVES INSIDE is the opposite: five is barely enough
+// to decide from, and a one-photo listing there is a bad listing.
+//
+// Keyed by unit type so the rule is legible and one place changes it. Anything
+// not named falls back to the dwelling standard, which is the safe direction:
+// a new interior type should not quietly inherit the bare-site minimum.
+export const LISTING_MIN_PHOTOS_DEFAULT = 5
+export const LISTING_MIN_PHOTOS_BY_UNIT_TYPE: Partial<Record<UnitType, number>> = {
+  // Bare sites — the renter brings the dwelling. One photo of the site.
+  rv_spot:   1,
+  campsite:  1,
+  parking:   1,
+  boat_slip: 1,
+  land_lot:  1,
+  storage:   1,
+}
+export const listingMinPhotos = (unitType: string): number =>
+  LISTING_MIN_PHOTOS_BY_UNIT_TYPE[unitType as UnitType] ?? LISTING_MIN_PHOTOS_DEFAULT

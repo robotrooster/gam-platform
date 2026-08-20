@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, METER_READ_REASONS } from '@gam/shared'
+import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -63,8 +63,15 @@ utilityRouter.get('/bills', async (req, res, next) => {
 // the unit-config view, since meter config sits alongside unit setup.
 
 const utilityTypeEnum = ['water','gas','electric','sewer','trash'] as const
+// S609 (Nic): PROPANE has a property-level price per gallon too — "we need a way
+// to also set the rate for the propane at the property level, that way when
+// we're putting in gallons it can calculate the bill for that tenant correctly."
+// It is NOT a meterable utility (there is no propane meter — fills are events),
+// so it belongs in the RATES list without joining the meter list.
+const rateUtilityTypeEnum = [...utilityTypeEnum, 'propane'] as const
 const billingMethodEnum = ['submeter','rubs','master_bill_to_landlord','flat_rate'] as const
-const rubsMethodEnum = ['occupant_count','sqft','bedrooms','equal_split'] as const
+// Single source of truth lives in @gam/shared — never re-declare here.
+const rubsMethodEnum = RUBS_ALLOCATION_METHODS
 
 utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
   try {
@@ -115,7 +122,15 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
          OR EXISTS (SELECT 1 FROM utility_meter_readings WHERE meter_id = m.id)) AS has_baseline,
         -- W-36 (S531): assigned unit ids ride along so the management UI can
         -- render/edit assignments without an N+1 per meter.
-        ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids
+        ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids,
+        -- S609 (Nic): has this meter actually MEASURED or BILLED anything yet?
+        -- Until it has, every setting on it can still be corrected — including
+        -- the utility and billing method. The edit form reads this to decide
+        -- what to offer; PATCH enforces the same rule server-side.
+        -- Unit assignments deliberately do NOT count: they are configuration,
+        -- and a landlord fixing a wrong setup should keep them.
+        (EXISTS (SELECT 1 FROM utility_meter_readings WHERE meter_id = m.id)
+         OR EXISTS (SELECT 1 FROM utility_bills WHERE meter_id = m.id)) AS has_history
       FROM utility_meters m
       JOIN properties p ON p.id = m.property_id
       ${where}
@@ -134,7 +149,16 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
       billingMethod:  z.enum(billingMethodEnum),
       ratePerUnit:    z.number().nonnegative().nullable().optional(),
       baseFee:        z.number().nonnegative().default(0),
-      rubsAllocationMethod: z.enum(rubsMethodEnum).nullable().optional(),
+      rubsAllocationMethod: z.enum(rubsMethodEnum as unknown as [string, ...string[]]).nullable().optional(),
+      // S607: how a RUBS master prices its pool — usage × rate (default), or
+      // divide the provider's actual dollar bill. Landlord's choice per master.
+      rubsBasis: z.enum(RUBS_BASES as unknown as [string, ...string[]]).optional(),
+      rubsSubmeterRate: z.enum(RUBS_SUBMETER_RATES as unknown as [string, ...string[]]).optional(),
+      rubsExclusionMode: z.enum(RUBS_EXCLUSION_MODES as unknown as [string, ...string[]]).optional(),
+      // S607: config for the allocation bases that need one (unit_type_weight,
+      // hybrid). Shape differs per basis — see the column
+      // comment on utility_meters.rubs_weights.
+      rubsWeights: z.record(z.any()).nullable().optional(),
       // Odometer width — how many digits the physical meter face has.
       digits:         z.number().int().refine(
         d => (METER_READING_DIGIT_OPTIONS as readonly number[]).includes(d),
@@ -213,11 +237,16 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
       const created = await client.query<any>(`
         INSERT INTO utility_meters
           (property_id, utility_type, label, billing_method, rate_per_unit,
-           base_fee, rubs_allocation_method, digits, sewer_rate_per_unit)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+           base_fee, rubs_allocation_method, digits, sewer_rate_per_unit, rubs_basis,
+           rubs_submeter_rate, rubs_exclusion_mode, rubs_weights)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
         [body.propertyId, body.utilityType, body.label, body.billingMethod,
          body.ratePerUnit ?? null, body.baseFee,
-         body.rubsAllocationMethod ?? null, body.digits, body.sewerRatePerUnit ?? null])
+         body.rubsAllocationMethod ?? null, body.digits, body.sewerRatePerUnit ?? null,
+         body.rubsBasis ?? 'usage_rate',
+         body.rubsSubmeterRate ?? 'property_rate',
+         body.rubsExclusionMode ?? 'usage',
+         body.rubsWeights ? JSON.stringify(body.rubsWeights) : null])
       meter = created.rows[0]
 
       // Stamped as reason 'baseline' rather than 'monthly_cycle': it is the
@@ -258,9 +287,26 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
 
     const body = z.object({
       label:          z.string().min(1).optional(),
+      // S609 (Nic, DIRECTIVE): "Every feature needs to be editable on meters
+      // when there is no history. Only lock it once there's history, not once
+      // it's created. Somebody accidentally setting something up the wrong way
+      // needs to be able to change it so they don't have to redo potentially
+      // everything. That's gonna be a friction point during onboarding."
+      //
+      // So these two — which decide how a reading is interpreted and how a bill
+      // is calculated — are editable right up until the meter has actually
+      // measured or billed something. After that they are frozen, because
+      // changing them would silently re-interpret readings already taken and
+      // bills already sent rather than correct anything.
+      utilityType:    z.enum(utilityTypeEnum).optional(),
+      billingMethod:  z.enum(billingMethodEnum).optional(),
       ratePerUnit:    z.number().nonnegative().nullable().optional(),
       baseFee:        z.number().nonnegative().optional(),
-      rubsAllocationMethod: z.enum(rubsMethodEnum).nullable().optional(),
+      rubsAllocationMethod: z.enum(rubsMethodEnum as unknown as [string, ...string[]]).nullable().optional(),
+      rubsBasis: z.enum(RUBS_BASES as unknown as [string, ...string[]]).optional(),
+      rubsSubmeterRate: z.enum(RUBS_SUBMETER_RATES as unknown as [string, ...string[]]).optional(),
+      rubsExclusionMode: z.enum(RUBS_EXCLUSION_MODES as unknown as [string, ...string[]]).optional(),
+      rubsWeights: z.record(z.any()).nullable().optional(),
       digits:         z.number().int().refine(
         d => (METER_READING_DIGIT_OPTIONS as readonly number[]).includes(d),
         `digits must be one of ${METER_READING_DIGIT_OPTIONS.join(', ')}`,
@@ -271,8 +317,54 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // date going in, clears it on repair.
       outOfService:   z.boolean().optional(),
     }).parse(req.body)
-    if (body.sewerRatePerUnit != null && meter.utility_type !== 'water') {
-      throw new AppError(400, 'Sewer rate only applies to water meters — sewer bills off the water reading')
+    // What a meter has actually DONE. Unit and lease assignments are config, not
+    // history — they deliberately survive an edit, which is the whole point:
+    // fixing a wrong setup must not mean redoing the assignments too.
+    const structural = body.utilityType !== undefined || body.billingMethod !== undefined
+    const history = await queryOne<{ readings: string; bills: string }>(
+      `SELECT (SELECT COUNT(*) FROM utility_meter_readings WHERE meter_id = $1)::text AS readings,
+              (SELECT COUNT(*) FROM utility_bills          WHERE meter_id = $1)::text AS bills`,
+      [req.params.id])
+    const hasHistory = Number(history?.readings ?? 0) > 0 || Number(history?.bills ?? 0) > 0
+    if (structural && hasHistory) {
+      throw new AppError(409,
+        Number(history?.bills ?? 0) > 0
+          ? 'This meter has already billed a tenant, so its utility and billing method are fixed — changing them now would re-interpret bills that have already gone out. Add the meter you meant and retire this one.'
+          : 'This meter already has readings recorded, so its utility and billing method are fixed — changing them now would re-interpret readings already taken. Add the meter you meant and retire this one.')
+    }
+
+    // The values AFTER this edit, so every rule below is checked against what
+    // the meter is about to become rather than what it used to be.
+    const nextUtility = body.utilityType ?? meter.utility_type
+    const nextMethod  = body.billingMethod ?? meter.billing_method
+    const nextAlloc   = body.rubsAllocationMethod !== undefined
+      ? body.rubsAllocationMethod
+      : meter.rubs_allocation_method
+
+    // utility_meters_check: a RUBS master must carry an allocation method, and
+    // anything else must not. Switching method without fixing the allocation
+    // would hit the constraint as a raw database error, so it is caught here in
+    // words the landlord can act on.
+    if (nextMethod === 'rubs' && !nextAlloc) {
+      throw new AppError(400, 'A RUBS master needs a split method — choose how the bill is divided.')
+    }
+    if (nextMethod !== 'rubs' && nextAlloc) {
+      throw new AppError(400, 'A split method only applies to a RUBS master.')
+    }
+
+    // Sewer rides the water reading; there is no sewer meter. Checked against
+    // the utility this meter is BECOMING, and a stored rate that no longer
+    // applies is cleared rather than left behind to bill from.
+    const nextSewer = body.sewerRatePerUnit !== undefined
+      ? body.sewerRatePerUnit
+      : (meter.sewer_rate_per_unit != null ? Number(meter.sewer_rate_per_unit) : null)
+    if (nextSewer != null && nextUtility !== 'water') {
+      if (body.sewerRatePerUnit != null) {
+        throw new AppError(400, 'Sewer rate only applies to water meters — sewer bills off the water reading')
+      }
+      // Switching a water meter to another utility: drop the now-meaningless
+      // sewer rate instead of leaving it to be billed from later.
+      body.sewerRatePerUnit = null
     }
     // S558: metered exclusion is UNIT-DRIVEN — a submeter is excluded from a
     // RUBS pool simply by sharing a served unit with the master. No manual
@@ -291,12 +383,18 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
 
     const updated = await queryOne<any>(`
       UPDATE utility_meters SET
+        utility_type = COALESCE($16, utility_type),
+        billing_method = COALESCE($17, billing_method),
         label = COALESCE($1, label),
         rate_per_unit = COALESCE($2, rate_per_unit),
         base_fee = COALESCE($3, base_fee),
         rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
         digits = COALESCE($6, digits),
         sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
+        rubs_basis = COALESCE($11, rubs_basis),
+        rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
+        rubs_exclusion_mode = COALESCE($13, rubs_exclusion_mode),
+        rubs_weights = CASE WHEN $14::text = '__keep__' THEN rubs_weights ELSE $15::jsonb END,
         out_of_service = COALESCE($10, out_of_service),
         out_of_service_since = CASE
           WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
@@ -315,6 +413,13 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         body.sewerRatePerUnit === undefined ? null : body.sewerRatePerUnit,
         req.params.id,
         body.outOfService ?? null,
+        body.rubsBasis ?? null,
+        body.rubsSubmeterRate ?? null,
+        body.rubsExclusionMode ?? null,
+        body.rubsWeights === undefined ? '__keep__' : 'set',
+        body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
+        body.utilityType ?? null,
+        body.billingMethod ?? null,
       ])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -355,9 +460,34 @@ utilityRouter.delete('/meters/:id', requirePerm('properties.edit'), async (req, 
 })
 
 // ── METER ↔ UNIT ASSIGNMENT ──────────────────────────────────
+/**
+ * Assign one or MANY units to a meter.
+ *
+ * S609 (Nic): "Every time I click add a unit and then click the unit from that
+ * drop down, it takes a second to load, and then it moves my button over, and it
+ * puts it at the end of the list. So I have to keep moving the mouse to the new
+ * button spot to click and add the next submeter. I want to have it where it
+ * opens a little window, and I just can checkbox all the units that get applied
+ * to that master meter."
+ *
+ * Oak Park's water master serves 27 units. One-at-a-time meant 27 round trips
+ * with the target moving after every one.
+ *
+ * `unitIds` takes the whole selection. Each unit is judged on its own and the
+ * response says what happened to each: a unit that clashes with another meter is
+ * SKIPPED with the reason, and the rest still go on. All-or-nothing would be
+ * worse here — one bad unit would silently discard a selection of twenty-six.
+ *
+ * `unitId` (singular) still works so nothing that already calls this breaks.
+ */
 utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (req, res, next) => {
   try {
-    const { unitId } = z.object({ unitId: z.string().uuid() }).parse(req.body)
+    const body = z.object({
+      unitId:  z.string().uuid().optional(),
+      unitIds: z.array(z.string().uuid()).min(1).max(500).optional(),
+    }).refine(b => b.unitId || b.unitIds, 'unitId or unitIds is required')
+      .parse(req.body)
+    const requested = body.unitIds ?? [body.unitId!]
     const meter = await queryOne<any>(
       `SELECT m.*, p.landlord_id FROM utility_meters m
          JOIN properties p ON p.id = m.property_id
@@ -366,10 +496,23 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // A submeter measures exactly ONE unit, so a multi-select against one is a
+    // mistake worth naming rather than half-applying.
+    if (meter.billing_method === 'submeter' && requested.length > 1) {
+      throw new AppError(400, 'A submeter measures a single unit. Pick one, or use a RUBS master to serve several.')
+    }
+
+    const added: string[] = []
+    // `status` is carried so a single-unit call can rethrow with the code it
+    // always used — 404 for "no such unit of yours", 400 for a rule refusing it.
+    // The multi-unit response drops it; the caller only needs the reason.
+    const skipped: { unitId: string; reason: string; status: number }[] = []
+
+    for (const unitId of requested) {
     const unit = await queryOne<any>(
       `SELECT id FROM units WHERE id = $1 AND landlord_id = $2`,
       [unitId, meter.landlord_id])
-    if (!unit) throw new AppError(404, 'Unit not found under this landlord')
+    if (!unit) { skipped.push({ unitId, reason: 'Unit not found under this landlord', status: 404 }); continue }
 
     // S558: a submeter measures exactly ONE unit (its reading IS that unit's
     // usage). Multiple units only make sense for a RUBS master (the group that
@@ -379,7 +522,8 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
         `SELECT COUNT(*)::text AS n FROM utility_meter_units WHERE meter_id = $1 AND unit_id <> $2`,
         [req.params.id, unitId])
       if (Number(existing?.n || 0) >= 1) {
-        throw new AppError(400, 'A submeter measures a single unit. Remove the current unit first, or use a RUBS master to serve multiple units.')
+        skipped.push({ unitId, status: 400, reason: 'A submeter measures a single unit. Remove the current unit first, or use a RUBS master to serve multiple units.' })
+        continue
       }
     }
 
@@ -406,17 +550,29 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
         LIMIT 1`,
       [unitId, req.params.id, meter.utility_type, meter.billing_method])
     if (clash) {
-      throw new AppError(400,
-        `This unit is already on "${clash.label}" for ${meter.utility_type}. ` +
-        `A unit can only be on one ${meter.billing_method === 'submeter' ? 'submeter' : 'master meter'} ` +
-        `per utility, or it would be billed twice. Remove it there first.`)
+      skipped.push({ unitId, status: 400, reason:
+        `Already on "${clash.label}" for ${meter.utility_type} — a unit can only be on one ` +
+        `${meter.billing_method === 'submeter' ? 'submeter' : 'master meter'} per utility, ` +
+        `or it would be billed twice. Remove it there first.` })
+      continue
     }
 
     await query(`
       INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)
       ON CONFLICT DO NOTHING
     `, [req.params.id, unitId])
-    res.status(201).json({ success: true })
+    added.push(unitId)
+    }
+
+    // A single-unit call keeps its original all-or-nothing contract: one unit
+    // that could not be assigned is an error, not a silent skip.
+    if (!body.unitIds && skipped.length > 0) {
+      throw new AppError(skipped[0].status, skipped[0].reason)
+    }
+    res.status(201).json({
+      success: true,
+      data: { added, skipped: skipped.map(({ unitId, reason }) => ({ unitId, reason })) },
+    })
   } catch (e) { next(e) }
 })
 
@@ -626,7 +782,12 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     // Reads are odometer values; the digit width is per-meter (landlord
     // setting). Bounds are checked against the meter's own capacity
     // after the meter row is fetched below.
-    const body = z.object({ readingValue: z.number().int().min(0) }).parse(req.body)
+    const body = z.object({
+      readingValue: z.number().int().min(0),
+      // S607: a RUBS master on the bill_amount basis also carries the utility
+      // provider's dollar charge for the cycle. Ignored on every other meter.
+      billAmount: z.number().min(0).max(10_000_000).optional(),
+    }).parse(req.body)
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
@@ -640,8 +801,18 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
         WHERE m.id = $1 AND m.property_id = $2`, [req.params.meterId, run.property_id])
     if (!meter) throw new AppError(404, 'Meter not found on this run')
     const modulus = meterReadingModulus(meter.digits)
-    if (body.readingValue >= modulus) {
+    // S607: the digit cap is an ODOMETER bound — it describes the face of a
+    // physical dial, and only a submeter has one. A RUBS master records a period
+    // TOTAL off the utility's bill, which is bounded by how much the park used,
+    // not by a dial width; a big park clears a 6-digit master's 999,999 in a
+    // month. Capping it there would have made the total unenterable with no way
+    // to tell why.
+    if (meter.billing_method !== 'rubs' && body.readingValue >= modulus) {
       throw new AppError(400, `Reading exceeds this meter's ${meter.digits}-digit capacity`)
+    }
+    const isDollarMaster = meter.billing_method === 'rubs' && meter.rubs_basis === 'bill_amount'
+    if (isDollarMaster && body.billAmount == null) {
+      throw new AppError(400, 'This master bills from the utility bill total — enter the amount charged for this cycle')
     }
 
     // Below-previous handling (S533): rollover is AUTOMATIC — RV parks
@@ -669,7 +840,17 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     // its own usage. Accept the read as-is — never flag it for reread and
     // never let it hold the end-of-month billing flow. (It can still be
     // caught by the RANDOM reread padding; that's harmless.)
-    if (!meter.out_of_service && prior && body.readingValue < Number(prior.reading_value)) {
+    // S607 (Nic): SUBMETERS ONLY. A RUBS master's entry is the cycle's USAGE
+    // TOTAL off the utility's own bill — generateBillsForMeter bills
+    // reading_value directly, with no prior subtracted — so there is no
+    // odometer to wrap and "below the previous reading" carries no meaning.
+    // Ungated, this flagged the master every time the park simply used less
+    // water than the month before (any decrease produces a wrap ≥ half the
+    // range), and invoiceGeneration's flagHold then held the WHOLE invoice,
+    // rent included, for every unit that master feeds until a human cleared
+    // it. Seasonal drops are normal; they must not hold the park's rent.
+    if (!meter.out_of_service && meter.billing_method === 'submeter'
+        && prior && body.readingValue < Number(prior.reading_value)) {
       const wrap = (modulus - Number(prior.reading_value)) + body.readingValue
       if (wrap < modulus / 2) isRollover = true
       else {
@@ -692,22 +873,39 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
         reviewNote = `Unusually high usage this cycle (${usage.toLocaleString()}) — double-check the meter`
       }
     }
+    // Master typo guard (S607) — RUBS MASTERS ONLY, the mirror of the submeter
+    // check above. A master total is the one reading with nothing behind it:
+    // the blind verification walk builds its list from submeters, so a slipped
+    // digit here is never re-read, and it prices every unit on the pool at
+    // once. Compared against the master's OWN previous total rather than a
+    // fixed threshold — park sizes differ by an order of magnitude, so no
+    // single gallon figure fits them all.
+    if (!meter.out_of_service && !needsReview && meter.billing_method === 'rubs' && prior) {
+      const priorTotal = Number(prior.reading_value)
+      if (priorTotal > 0 && body.readingValue > priorTotal * MASTER_TOTAL_JUMP_FACTOR) {
+        needsReview = true
+        reviewNote = `Usage total is ${(body.readingValue / priorTotal).toFixed(1)}× last cycle's `
+          + `(${priorTotal.toLocaleString()} → ${body.readingValue.toLocaleString()}) — `
+          + `check it against the utility bill`
+      }
+    }
 
     const reading = await queryOne<any>(
       `INSERT INTO utility_meter_readings
          (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id,
-          needs_review, review_note, is_rollover, reason)
-       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle')
+          needs_review, review_note, is_rollover, reason, bill_amount)
+       VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, 'monthly_cycle', $8)
        ON CONFLICT (meter_id, billing_cycle_month) WHERE reason = 'monthly_cycle'
        DO UPDATE SET reading_value = EXCLUDED.reading_value,
                      reading_date = EXCLUDED.reading_date,
                      created_by_user_id = EXCLUDED.created_by_user_id,
                      needs_review = EXCLUDED.needs_review,
                      review_note = EXCLUDED.review_note,
-                     is_rollover = EXCLUDED.is_rollover
+                     is_rollover = EXCLUDED.is_rollover,
+                     bill_amount = EXCLUDED.bill_amount
        RETURNING id, meter_id, billing_cycle_month`,
       [meter.id, body.readingValue, run.billing_cycle_month, req.user!.userId,
-       needsReview, reviewNote, isRollover])
+       needsReview, reviewNote, isRollover, isDollarMaster ? body.billAmount : null])
 
     // When the last meter is read, the run moves to its VERIFICATION
     // phase (S533) — the system builds the blind double-check list and
@@ -740,7 +938,12 @@ utilityRouter.get('/reading-runs/:id/double-checks', requirePerm('units.edit', '
 
 utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
   try {
-    const body = z.object({ readingValue: z.number().int().min(0) }).parse(req.body)
+    const body = z.object({
+      readingValue: z.number().int().min(0),
+      // S607: a RUBS master on the bill_amount basis also carries the utility
+      // provider's dollar charge for the cycle. Ignored on every other meter.
+      billAmount: z.number().min(0).max(10_000_000).optional(),
+    }).parse(req.body)
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
@@ -1093,7 +1296,8 @@ utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_statu
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
     const rows = await query<any>(
-      `SELECT utility_type, rate_per_unit, base_fee, sewer_rate_per_unit, updated_at
+      `SELECT utility_type, rate_per_unit, base_fee, sewer_rate_per_unit,
+              prevailing_residential_rate, updated_at
          FROM property_utility_rates WHERE property_id = $1 ORDER BY utility_type`, [propertyId])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -1103,10 +1307,18 @@ utilityRouter.post('/property-rates', requirePerm('properties.edit'), async (req
   try {
     const body = z.object({
       propertyId:       z.string().uuid(),
-      utilityType:      z.enum(utilityTypeEnum),
+      // S609: includes 'propane' — a per-gallon price set once for the property,
+      // so recording gallons is enough to bill a fill correctly.
+      utilityType:      z.enum(rateUtilityTypeEnum),
       ratePerUnit:      z.number().nonnegative().nullable().optional(),
       baseFee:          z.number().nonnegative().default(0),
       sewerRatePerUnit: z.number().nonnegative().nullable().optional(),
+      // S607: optional CEILING on what a submetered tenant may be charged per
+      // unit of usage — the serving utility's ordinary residential rate. Several
+      // states cap a landlord reselling a utility at that rate; where it applies
+      // and the landlord has recorded it, the charge is held to it and the
+      // landlord absorbs the difference. Unset = no cap, so it never blocks.
+      prevailingResidentialRate: z.number().nonnegative().nullable().optional(),
     }).parse(req.body)
     if (body.sewerRatePerUnit != null && body.utilityType !== 'water') {
       throw new AppError(400, 'Sewer rate only applies to water — sewer bills off the water reading')
@@ -1118,16 +1330,51 @@ utilityRouter.post('/property-rates', requirePerm('properties.edit'), async (req
 
     const row = await queryOne<any>(
       `INSERT INTO property_utility_rates
-         (property_id, utility_type, rate_per_unit, base_fee, sewer_rate_per_unit)
-       VALUES ($1,$2,$3,$4,$5)
+         (property_id, utility_type, rate_per_unit, base_fee, sewer_rate_per_unit,
+          prevailing_residential_rate)
+       VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT (property_id, utility_type)
        DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit,
                      base_fee = EXCLUDED.base_fee,
                      sewer_rate_per_unit = EXCLUDED.sewer_rate_per_unit,
+                     prevailing_residential_rate = EXCLUDED.prevailing_residential_rate,
                      updated_at = now()
        RETURNING *`,
       [body.propertyId, body.utilityType, body.ratePerUnit ?? null,
-       body.baseFee, body.sewerRatePerUnit ?? null])
+       body.baseFee, body.sewerRatePerUnit ?? null,
+       body.prevailingResidentialRate ?? null])
+
+    // S609 (Nic): TRASH IS NOT A METER. "It's not a master meter. It's a toggle
+    // on or off for people that have it or don't. It's a flat rate."
+    //
+    // He is right, and asking him to "add a meter" for trash was an
+    // implementation detail leaking into his workflow — there is nothing to
+    // meter and nothing to read. Billing still needs a row to hang the per-unit
+    // membership off, so setting the RATE creates it silently. The landlord's
+    // whole interaction is: set the price here, toggle it on for the units that
+    // have it.
+    //
+    // Only for utilities that are inherently unmetered. Water/gas/electric are
+    // read from a meter someone installs, and creating one implicitly would
+    // invent equipment that does not exist.
+    //
+    // The guard checks for ANY trash setup, not just a flat-rate one (Nic):
+    // "Trash should also be billable through a RUBS system if that's how the
+    // landlord wants to operate. You keep writing inside the lines to deal with
+    // a specific type of property." Right — a landlord who splits one hauler
+    // bill across units by occupancy is doing trash by RUBS, and auto-creating a
+    // flat-rate meter underneath them would give them TWO trash meters and trip
+    // the double-billing guard. Setting a price only creates the simple case
+    // when nothing else is set up; it never overrides a choice already made.
+    if (body.utilityType === 'trash' && (body.ratePerUnit ?? 0) > 0) {
+      await query(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee)
+         SELECT $1, 'trash', 'Trash', 'flat_rate', 0
+          WHERE NOT EXISTS (
+            SELECT 1 FROM utility_meters
+             WHERE property_id = $1 AND utility_type = 'trash')`,
+        [body.propertyId])
+    }
 
     // Changing policy must not rewrite bills already issued — utility_bills
     // snapshots the rate each bill was charged at. This only affects what is

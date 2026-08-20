@@ -705,7 +705,16 @@ describe('POST /api/units — startAt / padWidth', () => {
     expect((res.body.data.units as any[]).map(u => u.unit_number)).toEqual(['RV 03', 'RV 04'])
   })
 
-  it('padWidth controls zero padding', async () => {
+  // S609: this test described a feature that was DELIBERATELY REMOVED. The unit
+  // numbering standard makes the prefix a function of the unit TYPE — a mobile
+  // home is "MH", whatever the caller types — and pads to two digits. routes/
+  // units.ts still ACCEPTS padWidth so older clients don't break, and ignores it
+  // ("padWidth is still accepted so older clients don't 400; it is ignored").
+  //
+  // Rewritten to pin the rule that actually holds, which is worth more than
+  // deleting it: a caller asking for "Lot" with padWidth 1 gets the standard
+  // anyway, and that must not silently regress.
+  it('the unit-type standard wins over the caller: prefix and padding are not negotiable', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post('/api/units')
@@ -713,7 +722,7 @@ describe('POST /api/units — startAt / padWidth', () => {
       .send({ propertyId: f.aPropId, unitNumber: 'Lot', quantity: 2, startAt: 8, padWidth: 1,
               unitType: 'mobile_home', rentAmount: 500 })
     expect(res.status).toBe(201)
-    expect((res.body.data.units as any[]).map(u => u.unit_number)).toEqual(['Lot 8', 'Lot 9'])
+    expect((res.body.data.units as any[]).map(u => u.unit_number)).toEqual(['MH 08', 'MH 09'])
   })
 
   it('the same number under a DIFFERENT prefix is allowed (MH 01 alongside RV 01)', async () => {

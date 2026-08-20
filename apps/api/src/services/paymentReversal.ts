@@ -133,8 +133,10 @@ export async function handlePaymentReversal(input: PaymentReversalInput): Promis
       await client.query(
         `INSERT INTO payments
            (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-            entry_description, due_date, invoice_id, notes)
-         VALUES ($1,$2,$3,$4,'fee',$5,'pending','RETURNFEE', CURRENT_DATE, $6, $7)`,
+            entry_description, due_date, invoice_id, notes, revenue_owner)
+         -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share. An ACH retry is one of the three
+         -- Nic named as GAM's.
+         VALUES ($1,$2,$3,$4,'fee',$5,'pending','RETURNFEE', CURRENT_DATE, $6, $7, 'gam')`,
         [pay.unit_id, pay.lease_id, pay.tenant_id, pay.landlord_id,
          input.reversalFee, pay.invoice_id, feeDescription]
       )

@@ -1140,3 +1140,61 @@ describe('lease hibernation ↔ work-trade pause provenance', () => {
     expect(wt.paused_by_hibernation).toBe(false)
   })
 })
+
+// S607 (Nic, DIRECTIVE): a genuine one-off charge. "The landlord's always gonna
+// have some random thing... a notice for parking violation. All that little
+// stuff is not gonna be added into the lease."
+describe('POST /leases/:id/charge — one-off charge with a description', () => {
+  it('posts an ad-hoc charge with no lease fee defined in advance', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post(`/api/leases/${f.leaseId}/charge`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 45, description: 'Parking violation — blocked the gate arm' })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.amount)).toBeCloseTo(45, 2)
+
+    const row = (await db.query<{ type: string; status: string; amount: string; notes: string }>(
+      `SELECT type, status, amount::text, notes FROM payments WHERE id=$1`,
+      [res.body.data.paymentId])).rows[0]
+    expect(row.type).toBe('fee')
+    expect(row.status).toBe('pending')
+    expect(Number(row.amount)).toBeCloseTo(45, 2)
+    // The landlord's wording is carried on the row so the tenant sees WHY.
+    expect(row.notes).toContain('Parking violation')
+  })
+
+  it('requires a description — an unexplained charge is what generates the call', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post(`/api/leases/${f.leaseId}/charge`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 45 })
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects a zero or negative amount', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post(`/api/leases/${f.leaseId}/charge`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 0, description: 'nope' })
+    expect(res.status).toBe(400)
+  })
+
+  it('refuses a tenant — only the landlord side may post a charge', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post(`/api/leases/${f.leaseId}/charge`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ amount: 45, description: 'Parking violation' })
+    expect(res.status).toBeGreaterThanOrEqual(403)
+  })
+
+  // It is a plain charge, not a late fee: no late-fee reporting, no cap impact.
+  it('is not a late fee', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp()).post(`/api/leases/${f.leaseId}/charge`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 45, description: 'Gate remote replacement' })
+    const row = (await db.query<{ type: string }>(
+      `SELECT type FROM payments WHERE id=$1`, [res.body.data.paymentId])).rows[0]
+    expect(row.type).not.toBe('late_fee')
+  })
+})

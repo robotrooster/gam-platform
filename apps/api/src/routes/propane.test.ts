@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
@@ -98,15 +99,20 @@ describe('propane fills', () => {
     expect(again.status).toBe(200)
     expect(again.body.idempotent).toBe(true)
     expect(again.body.data.id).toBe(first.body.data.id)
-    // Exactly one fill and one propane charge — no double-billing.
+    // Exactly one fill and one scheduled installment — no double-billing.
+    // S609: nothing is charged at record time any more, so the guard is on the
+    // SCHEDULE rather than on an immediate payments row.
     const fillsN = await db.query<{ n: number }>(`SELECT count(*)::int n FROM propane_fills WHERE unit_id=$1`, [f.unitAId])
     expect(fillsN.rows[0].n).toBe(1)
-    const paysN = await db.query<{ n: number }>(
-      `SELECT count(*)::int n FROM payments WHERE unit_id=$1 AND type='utility' AND entry_description='PROPANE'`, [f.unitAId])
-    expect(paysN.rows[0].n).toBe(1)
+    const instN = await db.query<{ n: number }>(
+      `SELECT count(*)::int n FROM propane_fill_installments i
+         JOIN propane_fills fl ON fl.id = i.fill_id WHERE fl.unit_id=$1`, [f.unitAId])
+    expect(instN.rows[0].n).toBe(1)
   })
 
-  it('bills gallons × per-fill PPG + landlord propane tax; first payment due immediately', async () => {
+  // S609 (Nic): "All decided before any money moves." Nothing is charged at
+  // record time — the first installment rides the NEXT monthly invoice.
+  it('bills gallons × per-fill PPG + tax, scheduled onto next month — nothing charged now', async () => {
     const app = buildApp()
     const f = await seed()
     await setTax(app, f, 'propane', 8)
@@ -116,14 +122,23 @@ describe('propane fills', () => {
     expect(Number(res.body.data.total_amount)).toBeCloseTo(75.6, 2)
     expect(Number(res.body.data.tax_amount)).toBeCloseTo(5.6, 2)
 
+    // NOTHING is charged yet — no payments row exists until the invoice runs.
     const pay = await db.query(
-      `SELECT amount, type, entry_description, status, due_date, invoice_id
-         FROM payments WHERE entry_description = 'PROPANE'`)
-    expect(pay.rows).toHaveLength(1)
-    expect(Number(pay.rows[0].amount)).toBeCloseTo(75.6, 2)
-    expect(pay.rows[0].type).toBe('utility')
-    expect(pay.rows[0].status).toBe('pending')
-    expect(pay.rows[0].invoice_id).toBeNull() // standalone, due now
+      `SELECT id FROM payments WHERE entry_description = 'PROPANE'`)
+    expect(pay.rows).toHaveLength(0)
+
+    // The whole schedule is written up front, starting NEXT month.
+    const inst = await db.query<any>(
+      `SELECT installment_number, amount, gallons, billing_cycle_month::text AS cycle, payment_id
+         FROM propane_fill_installments ORDER BY installment_number`)
+    expect(inst.rows).toHaveLength(1)
+    expect(Number(inst.rows[0].amount)).toBeCloseTo(75.6, 2)
+    expect(Number(inst.rows[0].gallons)).toBeCloseTo(20, 2)
+    expect(inst.rows[0].payment_id).toBeNull()   // not billed yet
+    const nextMonth = new Date()
+    nextMonth.setUTCDate(1)
+    nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1)
+    expect(inst.rows[0].cycle).toBe(nextMonth.toISOString().slice(0, 10))
   })
 
   it('splits: <40 gal never; 40-99 gal 2 only; 100+ gal 2 or 4; property must opt in', async () => {
@@ -165,141 +180,61 @@ describe('propane fills', () => {
     expect((await setSetting(app, f, { splitFourMinGallons: 5 })).status).toBe(400)
   })
 
-  it('4-way split schedules consecutive cycles, first billed now, last takes the rounding remainder', async () => {
+  // S609 (Nic): the split is in GALLONS — "if it's a hundred and ninety gallons,
+  // you do three forty-eights and then a forty-six" — and EVERY installment is a
+  // future charge until its month comes, exactly like next month's rent.
+  it('4-way split: even gallons, remainder on the last, all scheduled as future charges', async () => {
     const app = buildApp()
     const f = await seed()
     await setSetting(app, f, { allowInstallments: true })
-    // 111.11 gal × $3 = 333.33 → 83.33 × 3 + 83.34 last
-    const res = await postFill(app, f, { unitId: f.unitAId, gallons: 111.11, pricePerGallon: 3, installments: 4 })
+    // 190 gal over 4 → 48, 48, 48, 46 gallons.
+    const res = await postFill(app, f, { unitId: f.unitAId, gallons: 190, pricePerGallon: 3, installments: 4 })
     expect(res.status).toBe(201)
     const inst = await db.query(
-      `SELECT installment_number, amount, billing_cycle_month, payment_id
+      `SELECT installment_number, amount, gallons, billing_cycle_month, payment_id
          FROM propane_fill_installments ORDER BY installment_number`)
     expect(inst.rows).toHaveLength(4)
-    expect(inst.rows.map((r: any) => Number(r.amount))).toEqual([83.33, 83.33, 83.33, 83.34])
-    expect(Number(inst.rows.reduce((s: number, r: any) => s + Number(r.amount), 0))).toBeCloseTo(333.33, 2)
-    expect(inst.rows[0].payment_id).not.toBeNull()   // #1 billed immediately
-    expect(inst.rows[1].payment_id).toBeNull()       // rest wait for their cycle
-    const months = inst.rows.map((r: any) => String(r.billing_cycle_month).slice(0, 7))
-    expect(new Set(months).size).toBe(4)             // four consecutive cycles
+    expect(inst.rows.map((r: any) => Number(r.gallons))).toEqual([48, 48, 48, 46])
+    // Gallons reconcile to the fill exactly — no propane invented by rounding.
+    expect(inst.rows.reduce((s: number, r: any) => s + Number(r.gallons), 0)).toBe(190)
+    // And the money still reconciles to the fill total.
+    expect(inst.rows.reduce((s: number, r: any) => s + Number(r.amount), 0)).toBeCloseTo(570, 2)
+
+    // NOTHING is payable yet. Every installment is a future charge — the same
+    // way October's rent isn't owed in August.
+    for (const r of inst.rows as any[]) expect(r.payment_id).toBeNull()
+    const pays = await db.query(`SELECT id FROM payments WHERE entry_description='PROPANE'`)
+    expect(pays.rows).toHaveLength(0)
+
+    // Four consecutive months, starting NEXT month.
+    const months = (inst.rows as any[]).map(r => String(r.billing_cycle_month).slice(0, 7))
+    expect(new Set(months).size).toBe(4)
   })
 
-  it('acceleration: a new fill makes every remaining prior installment due immediately', async () => {
+  // S609 (Nic): ACCELERATION REMOVED. A new fill used to make every remaining
+  // prior installment due immediately. That is incompatible with the model Nic
+  // specified — "all decided before any money moves", each installment landing on
+  // a known future invoice — and it re-created the harm the immediate charge was
+  // removed for: a mid-month due-now row that, under pay-in-full, can block the
+  // tenant paying their RENT.
+  it('a second fill does NOT accelerate the first — both just run their schedules', async () => {
     const app = buildApp()
     const f = await seed()
     await setSetting(app, f, { allowInstallments: true })
-    // Fill 1: 120 gal × $3 = $360, 4-way split → $90 now + 3 × $90 scheduled.
     await postFill(app, f, { unitId: f.unitAId, gallons: 120, pricePerGallon: 3, installments: 4 })
-    let due = await db.query(
-      `SELECT COUNT(*)::int AS n FROM payments WHERE entry_description = 'PROPANE'`)
-    expect(due.rows[0].n).toBe(1) // only payment 1 billed so far
-
-    // Fill 2 lands while $270 is still scheduled — the truck already
-    // filled the tank, so the prior balance accelerates to due-now.
     const fill2 = await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3, installments: 1 })
     expect(fill2.status).toBe(201)
 
-    // Prior fill: no unbilled installments remain; each got a due-now payment.
-    const unbilled = await db.query(
+    // Nothing became payable. Five scheduled installments across two fills,
+    // every one still a future charge waiting for its month.
+    const unbilled = await db.query<{ n: number }>(
       `SELECT COUNT(*)::int AS n FROM propane_fill_installments WHERE payment_id IS NULL`)
-    expect(unbilled.rows[0].n).toBe(0)
-    const payments = await db.query(
-      `SELECT amount, due_date, invoice_id FROM payments
-        WHERE entry_description = 'PROPANE' ORDER BY created_at`)
-    // 1 (fill1 first) + 3 (accelerated) + 1 (fill2 first) = 5, all standalone.
-    expect(payments.rows).toHaveLength(5)
-    expect(payments.rows.every((p: any) => p.invoice_id === null)).toBe(true)
-    const total = payments.rows.reduce((s: number, p: any) => s + Number(p.amount), 0)
-    expect(total).toBeCloseTo(360 + 60, 2) // full fill-1 total + fill-2 payment
-
-    // Accelerated rows are flagged; the fill's own first payments are not.
-    const flags = await db.query(
-      `SELECT accelerated, COUNT(*)::int AS n FROM propane_fill_installments
-        WHERE payment_id IS NOT NULL GROUP BY accelerated ORDER BY accelerated`)
-    expect(flags.rows).toEqual([
-      expect.objectContaining({ accelerated: false, n: 2 }), // fill1 #1 + fill2 #1
-      expect.objectContaining({ accelerated: true,  n: 3 }), // fill1 #2-#4
-    ])
+    expect(unbilled.rows[0].n).toBe(5)
+    const pays = await db.query(`SELECT id FROM payments WHERE entry_description='PROPANE'`)
+    expect(pays.rows).toHaveLength(0)
   })
 
-  it('settle-time redistribution: rent funds apply to accelerated propane first, rent splits, ACH never blocked', async () => {
-    const app = buildApp()
-    const f = await seed()
-    await setSetting(app, f, { allowInstallments: true })
-    // Fill 1 four-way ($90 now + 3 × $90), then fill 2 accelerates $270.
-    await postFill(app, f, { unitId: f.unitAId, gallons: 120, pricePerGallon: 3, installments: 4 })
-    await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3, installments: 1 })
 
-    // Rent payment of $800 settles (simulating the webhook flip)...
-    const rent = await db.query<any>(
-      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1, $2, $3, $4, 'rent', 800, 'settled', CURRENT_DATE, 'RENT')
-       RETURNING id, tenant_id, amount::text AS amount, due_date::text AS due_date`,
-      [f.unitAId, f.leaseAId, f.tenantAId, f.landlordAId])
-
-    // ...and redistribution applies the funds propane-first.
-    const client = await db.connect()
-    let result: any
-    try {
-      await client.query('BEGIN')
-      result = await applyAcceleratedPropane(client, rent.rows[0])
-      await client.query('COMMIT')
-    } finally { client.release() }
-
-    expect(result.applied).toBeCloseTo(270, 2)         // 3 × $90 accelerated rows
-    expect(result.rentRemainder).toBeCloseTo(270, 2)
-    // Accelerated propane rows are settled.
-    const accel = await db.query(
-      `SELECT p.status FROM payments p JOIN propane_fill_installments i ON i.payment_id = p.id
-        WHERE i.accelerated`)
-    expect(accel.rows).toHaveLength(3)
-    expect(accel.rows.every((r: any) => r.status === 'settled')).toBe(true)
-    // Rent row shrank to what the funds still covered; a pending
-    // remainder row carries the rest. Total rent ledger unchanged.
-    const rentRows = await db.query(
-      `SELECT amount, status FROM payments WHERE type = 'rent' ORDER BY created_at`)
-    expect(rentRows.rows).toHaveLength(2)
-    expect(Number(rentRows.rows[0].amount)).toBeCloseTo(530, 2)
-    expect(rentRows.rows[0].status).toBe('settled')
-    expect(Number(rentRows.rows[1].amount)).toBeCloseTo(270, 2)
-    expect(rentRows.rows[1].status).toBe('pending')
-
-    // Idempotent-ish: nothing left to redistribute on a second pass.
-    const client2 = await db.connect()
-    try {
-      await client2.query('BEGIN')
-      const again = await applyAcceleratedPropane(client2, rent.rows[0])
-      await client2.query('COMMIT')
-      expect(again).toBeNull()
-    } finally { client2.release() }
-  })
-
-  it('redistribution satisfies whole rows only — a sliver of rent survives when it cannot cover the next row', async () => {
-    const app = buildApp()
-    const f = await seed()
-    await setSetting(app, f, { allowInstallments: true })
-    await postFill(app, f, { unitId: f.unitAId, gallons: 120, pricePerGallon: 3, installments: 4 })
-    await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3, installments: 1 })
-    // $200 rent covers only 2 of the 3 accelerated $90 rows.
-    const rent = await db.query<any>(
-      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1, $2, $3, $4, 'rent', 200, 'settled', CURRENT_DATE, 'RENT')
-       RETURNING id, tenant_id, amount::text AS amount, due_date::text AS due_date`,
-      [f.unitAId, f.leaseAId, f.tenantAId, f.landlordAId])
-    const client = await db.connect()
-    let result: any
-    try {
-      await client.query('BEGIN')
-      result = await applyAcceleratedPropane(client, rent.rows[0])
-      await client.query('COMMIT')
-    } finally { client.release() }
-    expect(result.applied).toBeCloseTo(180, 2)  // 2 whole rows; $20 stays on rent
-    const stillOwed = await db.query(
-      `SELECT COUNT(*)::int AS n FROM payments p
-         JOIN propane_fill_installments i ON i.payment_id = p.id
-        WHERE i.accelerated AND p.status = 'pending'`)
-    expect(stillOwed.rows[0].n).toBe(1)
-  })
 
   it('400s a fill on a unit without an active lease; 403 cross-landlord', async () => {
     const app = buildApp()
@@ -340,5 +275,206 @@ describe('utility tax on metered bills', () => {
     expect(Number(bill.rows[0].charge_amount)).toBeCloseTo(35.0, 2)  // 250 × 0.14
     expect(Number(bill.rows[0].tax_rate_pct)).toBeCloseTo(5.6, 2)
     expect(Number(bill.rows[0].tax_amount)).toBeCloseTo(1.96, 2)     // separate line
+  })
+})
+
+/**
+ * S609 (Nic): ONE MASTER BILL, SEVERAL TANKS.
+ *
+ * "We use separate tanks filled on one invoice (master) and then charge tenants
+ * according to their gallons that went into their tank... It's already on the
+ * bill in terms of gallons, so we just need to be able to type in this many
+ * gallons at this unit or some units that don't have it, don't get those gallons
+ * because they don't have propane. It's a per time fill... it may be once every
+ * three months."
+ *
+ * Recording that meant the single-fill form once per tank, retyping the same
+ * price each pass. A delivery is one document, so it is entered as one thing.
+ */
+describe('S609 POST /propane/deliveries', () => {
+  async function unitWithTenant(f: Fixture): Promise<string> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId: f.landlordAId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query('COMMIT')
+      return unitId
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const postDelivery = (app: express.Express, f: Fixture, body: any) =>
+    request(app).post('/api/propane/deliveries').set('Authorization', `Bearer ${f.tokenA}`).send(body)
+
+  it('records one fill per tank at the invoice price', async () => {
+    const f = await seed()
+    const u2 = await unitWithTenant(f)
+    const res = await postDelivery(buildApp(), f, {
+      propertyId: f.propertyAId,
+      pricePerGallon: 3.25,
+      lines: [
+        { unitId: f.unitAId, gallons: 40 },
+        { unitId: u2,        gallons: 22.5 },
+      ],
+    })
+    expect(res.status).toBe(201)
+    expect(res.body.data.tanks).toBe(2)
+    expect(res.body.data.totalGallons).toBeCloseTo(62.5, 2)
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, gallons, price_per_gallon, total_amount
+         FROM propane_fills ORDER BY gallons DESC`)
+    expect(rows).toHaveLength(2)
+    expect(Number(rows[0].gallons)).toBe(40)
+    // Each tank is charged its OWN gallons at the one invoice price.
+    expect(Number(rows[0].total_amount)).toBeCloseTo(40 * 3.25, 2)
+    expect(Number(rows[1].total_amount)).toBeCloseTo(22.5 * 3.25, 2)
+    for (const r of rows) expect(Number(r.price_per_gallon)).toBeCloseTo(3.25, 2)
+  })
+
+  it('a unit not on the delivery is not billed — it has no propane', async () => {
+    const f = await seed()
+    const u2 = await unitWithTenant(f)
+    await postDelivery(buildApp(), f, {
+      propertyId: f.propertyAId, pricePerGallon: 3,
+      lines: [{ unitId: f.unitAId, gallons: 30 }],
+    })
+    const { rows } = await db.query<any>(`SELECT unit_id FROM propane_fills`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(f.unitAId)
+    expect(rows[0].unit_id).not.toBe(u2)
+  })
+
+  it('ALL OR NOTHING — one bad line records nothing', async () => {
+    // Transcribing one invoice must not leave some tanks in and some out.
+    const f = await seed()
+    const res = await postDelivery(buildApp(), f, {
+      propertyId: f.propertyAId, pricePerGallon: 3,
+      lines: [
+        { unitId: f.unitAId,      gallons: 30 },
+        { unitId: f.vacantUnitId, gallons: 20 },   // no active lease
+      ],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no active lease/i)
+    const { rows } = await db.query<any>(`SELECT id FROM propane_fills`)
+    expect(rows).toHaveLength(0)
+  })
+
+  it('the same unit twice on one delivery is refused', async () => {
+    const f = await seed()
+    const res = await postDelivery(buildApp(), f, {
+      propertyId: f.propertyAId, pricePerGallon: 3,
+      lines: [
+        { unitId: f.unitAId, gallons: 30 },
+        { unitId: f.unitAId, gallons: 10 },
+      ],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/twice/i)
+  })
+
+  it('a repeat submit of the same delivery is a no-op', async () => {
+    const f = await seed()
+    const key = randomUUID()
+    const body = {
+      propertyId: f.propertyAId, pricePerGallon: 3,
+      lines: [{ unitId: f.unitAId, gallons: 30 }], clientKey: key,
+    }
+    await postDelivery(buildApp(), f, body).expect(201)
+    const again = await postDelivery(buildApp(), f, body)
+    expect(again.status).toBe(200)
+    expect(again.body.data.idempotent).toBe(true)
+    const { rows } = await db.query<any>(`SELECT id FROM propane_fills`)
+    expect(rows).toHaveLength(1)
+  })
+
+  it('another landlord cannot record a delivery here', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ propertyId: f.propertyAId, pricePerGallon: 3, lines: [{ unitId: f.unitAId, gallons: 10 }] })
+    expect(res.status).toBe(403)
+  })
+
+  it('a unit at another property cannot be slipped onto the delivery', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let foreignUnit = ''
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const otherProp = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      foreignUnit = await seedUnit(c, { propertyId: otherProp, landlordId })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const res = await postDelivery(buildApp(), f, {
+      propertyId: f.propertyAId, pricePerGallon: 3,
+      lines: [{ unitId: foreignUnit, gallons: 10 }],
+    })
+    expect(res.status).toBe(404)
+  })
+  // S609 (Nic): the settle-time PROPANE REDISTRIBUTION tests are gone with the
+  // behaviour they covered. That path applied a tenant's rent money to
+  // accelerated propane FIRST — the exact rent-supersession Nic ruled out:
+  // "it's gonna apply the payment to the oldest charge, which would supersede
+  // the rent, which would still end up letting the tenant acquire late fees."
+  // Acceleration is removed, so nothing marks an installment `accelerated` and
+  // the path is unreachable. services/propaneRedistribution is dead code kept
+  // only until it can be deleted deliberately — see the note in that file.
+
+})
+
+/**
+ * S609 (Nic): FILLS QUEUE BEHIND EACH OTHER.
+ *
+ *   "It needs to queue behind. It shouldn't overlap on the December invoice.
+ *    That's not really a thing."
+ *
+ * An invoice carries at most ONE propane installment. A refill starts after the
+ * last installment already scheduled, not next month.
+ */
+describe('S609 propane fills queue behind each other', () => {
+  it('a second fill starts after the first fill\'s last installment', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await setSetting(app, f, { allowInstallments: true })
+    // Fill 1, 4 ways → the next four months.
+    await postFill(app, f, { unitId: f.unitAId, gallons: 120, pricePerGallon: 3, installments: 4 })
+    // Fill 2 lands while all four are still scheduled.
+    await postFill(app, f, { unitId: f.unitAId, gallons: 40, pricePerGallon: 3, installments: 2 })
+
+    const inst = await db.query<any>(
+      `SELECT i.billing_cycle_month::text AS cycle
+         FROM propane_fill_installments i
+         JOIN propane_fills fl ON fl.id = i.fill_id
+        WHERE fl.unit_id = $1 ORDER BY i.billing_cycle_month`, [f.unitAId])
+    expect(inst.rows).toHaveLength(6)
+
+    // SIX distinct months — never two installments sharing an invoice.
+    const months = inst.rows.map((r: any) => r.cycle)
+    expect(new Set(months).size).toBe(6)
+
+    // And they are consecutive: fill 2 picks up right after fill 1 ends.
+    for (let i = 1; i < months.length; i++) {
+      const prev = new Date(months[i - 1] + 'T00:00:00Z')
+      prev.setUTCMonth(prev.getUTCMonth() + 1)
+      expect(months[i]).toBe(prev.toISOString().slice(0, 10))
+    }
+  })
+
+  it('a fill on a unit with nothing queued still starts next month', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3, installments: 1 })
+    const inst = await db.query<any>(
+      `SELECT billing_cycle_month::text AS cycle FROM propane_fill_installments`)
+    const next = new Date()
+    next.setUTCDate(1)
+    next.setUTCMonth(next.getUTCMonth() + 1)
+    expect(inst.rows[0].cycle).toBe(next.toISOString().slice(0, 10))
   })
 })

@@ -358,6 +358,28 @@ export async function createOrFetchDraft(
   )
   if (existing) return existing
 
+  // S609 (Nic): scheduled propane comes due IN FULL on the final bill —
+  // "that's the only place where acceleration would still be needed." A
+  // scheduled installment is not a payments row until its month arrives, so
+  // without this the sweep below cannot see propane that has already been
+  // delivered and burned, and it would never be billed to anyone.
+  // Idempotent, and this runs only when the draft is first created.
+  {
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const { billRemainingPropaneAtMoveOut } = await import('./propaneFill')
+      const r = await billRemainingPropaneAtMoveOut(client, leaseId)
+      await client.query('COMMIT')
+      if (r.billed > 0) {
+        logger.info({ leaseId, ...r }, '[deposit-return] remaining propane billed at move-out')
+      }
+    } catch (e) {
+      await client.query('ROLLBACK')
+      throw e
+    } finally { client.release() }
+  }
+
   const calc = await calculateDepositReturn(leaseId)
   if (!calc) throw new Error(`Lease ${leaseId} not found`)
   if (!calc.lease.tenant_id) throw new Error(`Lease ${leaseId} has no primary tenant`)

@@ -12,8 +12,9 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { formatCurrency, humanize, humanizeEntryDescription } from '@gam/shared'
+import { formatCurrency, humanize, humanizeEntryDescription, chargeLabel, MANUAL_PAYMENT_FEE_SCOPE } from '@gam/shared'
 import { apiGet } from '../lib/api'
+import { AutopaySection } from './AutopayCard'
 import {
   AddPaymentMethodModal,
   PayNowModal,
@@ -30,6 +31,9 @@ interface Payment {
   amount:           number
   status:           string
   entryDescription: string
+  // S607: the landlord's own wording for a charge they billed (e.g. "Parking
+  // violation"). chargeLabel prefers it over the NACHA code.
+  notes?:           string | null
 }
 
 // S539: per-line FIFO application breakdown ("where every dollar went")
@@ -64,6 +68,78 @@ const STATUS_BADGE: Record<string, string> = {
   processing: 'b-gold',
 }
 
+// S607 (Nic): "maybe on the invoice, it can show a breakdown of what each bill
+// would be by payment method... that way they see all the avenues and the price
+// at the point the invoice comes out."
+//
+// Every way to pay this balance, priced, before the tenant picks one. The
+// figures come from the server, computed with the same formula that actually
+// charges — so what is shown here is what gets taken.
+//
+// When the landlord is covering the cash fee, the row deliberately shows the
+// full price struck through with the saving named, rather than quietly showing a
+// smaller number. Nic: the tenant "needs to know that the landlord is actively
+// covering that and that they may choose to stop covering that at any time" — so
+// if a $10 ever does appear later, they recognise it as the landlord stopping
+// rather than a new charge nobody warned them about.
+function WaysToPay({ lease }: { lease: any }) {
+  const costs: any[] = lease?.methodCosts ?? []
+  if (!costs.length) return null
+  const covered = !!lease.manualFeeCoveredByLandlord
+  const firstFree = !!lease.manualFeeFirstFree
+  const absorbed = Number(lease.manualFeeAbsorbed || 0)
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--bd)' }}>
+      <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+        Ways to pay
+      </div>
+      {costs.map((c) => {
+        const isCash = c.method === 'manual'
+        return (
+          <div key={c.method} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, padding: '3px 0', fontSize: '.78rem' }}>
+            <span style={{ color: 'var(--t2)' }}>
+              {isCash ? 'Cash, check or money order' : c.label}
+              {c.fee > 0 && (
+                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · +{formatCurrency(c.fee)} fee</span>
+              )}
+              {isCash && covered && (
+                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · {formatCurrency(absorbed)} fee covered by your landlord</span>
+              )}
+              {isCash && !covered && firstFree && (
+                <span style={{ color: 'var(--t3)', fontSize: '.72rem' }}> · no fee this time</span>
+              )}
+            </span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--t0)', whiteSpace: 'nowrap' }}>
+              {formatCurrency(c.total)}
+            </span>
+          </div>
+        )
+      })}
+      {covered && (
+        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+          Your landlord is currently covering the {formatCurrency(absorbed)} handling fee on
+          {' '}{MANUAL_PAYMENT_FEE_SCOPE}. They can stop covering it at any time, and it would then
+          appear on your bill.
+        </div>
+      )}
+      {!covered && firstFree && (
+        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+          The handling fee is waived on your <strong>first payment only</strong>. If you pay a
+          different way this time, later payments handed to the office will include it.
+          It applies to {MANUAL_PAYMENT_FEE_SCOPE}.
+        </div>
+      )}
+      {!covered && !firstFree && (
+        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+          A {formatCurrency(costs.find(c => c.method === 'manual')?.fee || 0)} handling fee applies
+          to {MANUAL_PAYMENT_FEE_SCOPE}. It is waived on a first payment only.
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   const qc = useQueryClient()
 
@@ -78,6 +154,9 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     leases: {
       leaseId: string; propertyName: string; unitNumber: string
       paymentBlocked: boolean; outstanding: number
+      // S609: balance + roughly the rest of the lease term. A SUGGESTION for
+      // the amount box, not a ceiling — there is no cap on paying ahead.
+      suggestedPayAhead?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
@@ -105,7 +184,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // S581: each LEASE is paid as its own charge (separate ACH/card + receipt), so
   // a tenant with two leases (overlap move, or two landlords) pays each on its
   // own — a shortfall or an eviction hold on one never blocks the other.
-  const openPayLease = (leaseId: string, outstanding: number) => {
+  const openPayLease = (leaseId: string, outstanding: number, suggestedPayAhead?: number) => {
     if (!(outstanding > 0)) return
     setPayTarget({
       target: {
@@ -115,6 +194,8 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         kind:      'rent',
         sendAmountInBody: true,
         leaseId,
+        // S609: lets the modal offer an amount box for paying months ahead.
+        suggestedPayAhead,
       },
     })
   }
@@ -192,7 +273,30 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         </div>
       )}
 
+      {/* S609 (Nic): "I want the tenant portal to still show how much
+          outstanding credit they have. If it's ten thousand dollars in
+          prepayments, it should show that they have ten thousand dollars in
+          credit." Top of the page, not tucked into a history card. */}
+      {(remitData?.prepaidRemaining ?? 0) > 0 && (
+        <div className="card" style={{ padding: 16, marginTop: 16, borderColor: 'var(--green)' }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+            Account credit
+          </div>
+          <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--green)' }}>
+            {formatCurrency(remitData!.prepaidRemaining)}
+          </div>
+          <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4, lineHeight: 1.5 }}>
+            Money you&apos;ve paid ahead. It comes off each bill automatically as it arrives — you don&apos;t
+            need to do anything. Anything still unused comes back to you when you move out.
+          </div>
+        </div>
+      )}
+
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
+
+      {/* S609: the tenant's autopay control. There is deliberately no landlord
+          equivalent — the pull day is the tenant's alone (Nic). */}
+      <AutopaySection />
 
       {/* S570 (Nic): removed the cash/check/MO fee banner — a tenant can't
           initiate a cash payment through the portal (they hand cash to the
@@ -245,9 +349,10 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   Rent is paid in full — this covers your entire balance on this lease,
                   oldest charges first.
                 </div>
+                <WaysToPay lease={lg} />
               </div>
               <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding)}>
+                <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding, lg.suggestedPayAhead)}>
                   Pay {formatCurrency(lg.outstanding)}
                 </button>
               </div>
@@ -296,7 +401,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                         </span>
                       </td>
                       <td style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
-                        {humanizeEntryDescription(p.entryDescription)}
+                        {chargeLabel(p.entryDescription, p.notes)}
                       </td>
 
                     </tr>

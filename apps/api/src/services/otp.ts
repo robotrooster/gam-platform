@@ -329,8 +329,9 @@ export async function processMonthlyAdvance(now: Date = new Date()): Promise<Adv
         const pay = await client.query<{ id: string }>(
           `INSERT INTO payments (
              landlord_id, tenant_id, lease_id, unit_id,
-             type, amount, status, entry_description, due_date, notes
-           ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'ONTIMEPAY', $6, $7)
+             type, amount, status, entry_description, due_date, notes, revenue_owner
+           -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share.
+           ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'ONTIMEPAY', $6, $7, 'gam')
            RETURNING id`,
           [
             c.landlord_id, c.tenant_id, c.lease_id, c.unit_id,

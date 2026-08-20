@@ -21,6 +21,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canAccessLandlordResource } from '../middleware/scope'
+import { validateFillLine, recordFill } from '../services/propaneFill'
 
 export const propaneRouter = Router()
 propaneRouter.use(requireAuth)
@@ -65,6 +66,10 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
   } catch (e) { next(e) }
 })
 
+const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
+              p.propane_allow_installments,
+              p.propane_split_min_gallons, p.propane_split_four_min_gallons`
+
 propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const body = z.object({
@@ -78,9 +83,7 @@ propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, ne
     }).parse(req.body)
 
     const unit = await queryOne<any>(
-      `SELECT u.id, u.landlord_id, u.property_id, u.unit_number,
-              p.propane_allow_installments,
-              p.propane_split_min_gallons, p.propane_split_four_min_gallons
+      `SELECT ${UNIT_FILL_COLS}
          FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id = $1`, [body.unitId])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -88,56 +91,13 @@ propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, ne
       throw new AppError(403, 'Forbidden')
     }
 
-    // The fill bills a tenant — needs an active lease with a primary.
-    const lt = await queryOne<{ lease_id: string; tenant_id: string }>(
-      `SELECT vlat.lease_id, vlat.tenant_id
-         FROM v_lease_active_tenants vlat
-         JOIN leases l ON l.id = vlat.lease_id
-        WHERE l.unit_id = $1 AND l.status = 'active' AND vlat.role = 'primary'
-        LIMIT 1`, [body.unitId])
-    if (!lt) throw new AppError(400, 'No active lease on this unit — propane fills bill the tenant')
-
-    // Split gate: property opt-in + gallon eligibility (2 or 4 only).
-    // S534 (Nic): the gallon thresholds are landlord-set per property —
-    // the shared constants are only the new-property defaults.
-    if (body.installments > 1) {
-      if (!unit.propane_allow_installments) {
-        throw new AppError(400, 'Split payments are not enabled for this property')
-      }
-      const opts = propaneSplitOptions(
-        body.gallons,
-        Number(unit.propane_split_min_gallons),
-        Number(unit.propane_split_four_min_gallons))
-      if (!opts.includes(body.installments)) {
-        throw new AppError(400, `A ${body.gallons} gal fill can't split into ${body.installments} payments`)
-      }
-    }
-
-    // Landlord-configured propane tax (S533) — snapshot on the fill;
-    // installments split the tax-inclusive total.
-    const taxRow = await queryOne<{ tax_rate_pct: string }>(
-      `SELECT tax_rate_pct FROM property_utility_tax_rates
-        WHERE property_id = $1 AND utility_type = 'propane'`, [unit.property_id])
-    const taxRatePct = Number(taxRow?.tax_rate_pct || 0)
-    const subtotal = Math.round(body.gallons * body.pricePerGallon * 100) / 100
-    const taxAmount = Math.round(subtotal * taxRatePct) / 100
-    const total = Math.round((subtotal + taxAmount) * 100) / 100
-    // Even installments; the LAST one takes the rounding remainder
-    // (user-favor rounding, W-32 precedent).
-    const base = Math.floor((total / body.installments) * 100) / 100
-    const amounts = Array.from({ length: body.installments }, (_, i) =>
-      i === body.installments - 1
-        ? Math.round((total - base * (body.installments - 1)) * 100) / 100
-        : base)
-
     const client = await getClient()
     try {
       await client.query('BEGIN')
       // Idempotency (money path): serialize concurrent submits for this unit,
       // then short-circuit a repeat of the same fill intent. Without this a
       // lost-response retry / second open tab records a second fill and
-      // double-charges the tenant (the immediate installment-#1 charge + the
-      // prior-balance acceleration both re-fire). See migration 20260806150000.
+      // double-charges the tenant. See migration 20260806150000.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`propane_fill:${body.unitId}`])
       if (body.clientKey) {
         const dupe = await client.query<any>('SELECT * FROM propane_fills WHERE client_key = $1', [body.clientKey])
@@ -146,69 +106,121 @@ propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, ne
           return res.status(200).json({ success: true, data: dupe.rows[0], idempotent: true })
         }
       }
-      const fill = await client.query<any>(
-        `INSERT INTO propane_fills
-           (property_id, landlord_id, unit_id, lease_id, tenant_id, gallons,
-            price_per_gallon, total_amount, installment_count, created_by_user_id,
-            tax_rate_pct, tax_amount, client_key)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-        [unit.property_id, unit.landlord_id, body.unitId, lt.lease_id, lt.tenant_id,
-         body.gallons, body.pricePerGallon, total, body.installments, req.user!.userId,
-         taxRatePct, taxAmount, body.clientKey ?? null])
-      const fillId = fill.rows[0].id
-      const cycle0 = monthStart(new Date())
+      const { leaseId, tenantId } = await validateFillLine(client, unit, {
+        gallons: body.gallons, installments: body.installments })
+      const fill = await recordFill(client, {
+        unit, leaseId, tenantId,
+        gallons: body.gallons, pricePerGallon: body.pricePerGallon,
+        installments: body.installments, createdByUserId: req.user!.userId,
+        clientKey: body.clientKey ?? null,
+      })
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: fill })
+    } catch (e) {
+      await client.query('ROLLBACK')
+      throw e
+    } finally { client.release() }
+  } catch (e) { next(e) }
+})
 
-      // Installment #1 bills IMMEDIATELY: standalone payments row due
-      // today, payable through the normal tenant payment flow. PROPANE
-      // marker = reporting handle.
-      const firstPayment = await client.query<{ id: string }>(
-        `INSERT INTO payments
-           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-            due_date, entry_description, notes)
-         VALUES ($1,$2,$3,$4,'utility',$5,'pending',CURRENT_DATE,'PROPANE',$6)
-         RETURNING id`,
-        [body.unitId, lt.lease_id, lt.tenant_id, unit.landlord_id,
-         amounts[0].toFixed(2),
-         `Propane fill ${body.gallons} gal @ $${body.pricePerGallon}/gal` +
-         (body.installments > 1 ? ` — payment 1 of ${body.installments}` : '')])
+/**
+ * POST /api/propane/deliveries — ONE master bill, several tanks.
+ *
+ * NIC: "We use separate tanks filled on one invoice (master) and then charge
+ * tenants according to their gallons that went into their tank... It's already
+ * on the bill in terms of gallons, so we just need to be able to type in this
+ * many gallons at this unit or some units that don't have it, don't get those
+ * gallons because they don't have propane."
+ *
+ * Recording that meant opening the fill form once per tank and retyping the same
+ * price per gallon each time — eight passes for eight homes, transcribing one
+ * document.
+ *
+ * ALL OR NOTHING, deliberately. Every line is validated before any money row is
+ * written, so a unit with no active lease stops the whole delivery instead of
+ * leaving six tanks recorded and two missing against a bill that has to
+ * reconcile. The landlord fixes the one problem and submits the same bill again.
+ *
+ * A unit with no propane simply isn't in `lines` — nothing to opt out of.
+ */
+propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      propertyId:     z.string().uuid(),
+      // One price for the whole delivery — it is what the invoice charged.
+      pricePerGallon: z.number().nonnegative().max(999),
+      installments:   z.number().int().refine(n => [1, 2, 4].includes(n), 'installments must be 1, 2, or 4').default(1),
+      lines: z.array(z.object({
+        unitId:  z.string().uuid(),
+        gallons: z.number().positive().max(9999),
+      })).min(1).max(200),
+      clientKey: z.string().uuid().optional(),
+    }).parse(req.body)
 
-      for (let i = 0; i < body.installments; i++) {
-        await client.query(
-          `INSERT INTO propane_fill_installments
-             (fill_id, installment_number, amount, billing_cycle_month, payment_id)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [fillId, i + 1, amounts[i].toFixed(2), addMonths(cycle0, i),
-           i === 0 ? firstPayment.rows[0].id : null])
+    // One unit can't appear twice on one delivery — that is a transcription
+    // slip, and silently summing it would overbill.
+    const seen = new Set<string>()
+    for (const l of body.lines) {
+      if (seen.has(l.unitId)) throw new AppError(400, 'The same unit is listed twice on this delivery')
+      seen.add(l.unitId)
+    }
+
+    const property = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id = $1', [body.propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      if (body.clientKey) {
+        const dupe = await client.query<any>(
+          'SELECT id FROM propane_fills WHERE client_key = $1 LIMIT 1', [body.clientKey])
+        if (dupe.rows.length) {
+          await client.query('COMMIT')
+          return res.status(200).json({ success: true, data: { idempotent: true } })
+        }
       }
 
-      // ACCELERATION (Nic): a new fill makes the ENTIRE prior balance
-      // due immediately — every not-yet-billed installment from earlier
-      // fills on this unit becomes a standalone due-now payment instead
-      // of riding future invoices. (Already-billed unpaid rows are
-      // already due; nothing to do for those.)
-      const priorUnbilled = await client.query<any>(
-        `SELECT i.id, i.amount, i.installment_number, f.installment_count, f.gallons
-           FROM propane_fill_installments i
-           JOIN propane_fills f ON f.id = i.fill_id
-          WHERE f.unit_id = $1 AND f.id <> $2 AND i.payment_id IS NULL
-          ORDER BY f.fill_date, i.installment_number`,
-        [body.unitId, fillId])
-      for (const pi of priorUnbilled.rows) {
-        const accel = await client.query<{ id: string }>(
-          `INSERT INTO payments
-             (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-              due_date, entry_description, notes)
-           VALUES ($1,$2,$3,$4,'utility',$5,'pending',CURRENT_DATE,'PROPANE',$6)
-           RETURNING id`,
-          [body.unitId, lt.lease_id, lt.tenant_id, unit.landlord_id,
-           Number(pi.amount).toFixed(2),
-           `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count} (due now: new fill recorded)`])
-        await client.query(
-          `UPDATE propane_fill_installments SET payment_id = $1, accelerated = TRUE WHERE id = $2`,
-          [accel.rows[0].id, pi.id])
+      // Lock every unit up front, in a stable order, so two deliveries recorded
+      // at once can't interleave into a double charge.
+      for (const unitId of [...seen].sort()) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`propane_fill:${unitId}`])
+      }
+
+      // Resolve + validate EVERY line before writing anything.
+      const prepared: any[] = []
+      for (const line of body.lines) {
+        const unit = await client.query<any>(
+          `SELECT ${UNIT_FILL_COLS}
+             FROM units u JOIN properties p ON p.id = u.property_id
+            WHERE u.id = $1 AND u.property_id = $2`, [line.unitId, body.propertyId])
+        if (!unit.rows[0]) throw new AppError(404, 'A unit on this delivery is not at this property')
+        const { leaseId, tenantId } = await validateFillLine(client, unit.rows[0], {
+          gallons: line.gallons, installments: body.installments })
+        prepared.push({ unit: unit.rows[0], leaseId, tenantId, gallons: line.gallons })
+      }
+
+      const fills = []
+      for (const [i, p] of prepared.entries()) {
+        fills.push(await recordFill(client, {
+          unit: p.unit, leaseId: p.leaseId, tenantId: p.tenantId,
+          gallons: p.gallons, pricePerGallon: body.pricePerGallon,
+          installments: body.installments, createdByUserId: req.user!.userId,
+          // The key marks the delivery; only the first line carries it, which is
+          // enough for the repeat-submit check above.
+          clientKey: i === 0 ? (body.clientKey ?? null) : null,
+        }))
       }
       await client.query('COMMIT')
-      res.status(201).json({ success: true, data: fill.rows[0] })
+      const totalGallons = body.lines.reduce((s, l) => s + l.gallons, 0)
+      res.status(201).json({ success: true, data: {
+        fills,
+        tanks: fills.length,
+        totalGallons: Math.round(totalGallons * 100) / 100,
+        totalAmount: Math.round(fills.reduce((s, f) => s + Number(f.total_amount), 0) * 100) / 100,
+      } })
     } catch (e) {
       await client.query('ROLLBACK')
       throw e

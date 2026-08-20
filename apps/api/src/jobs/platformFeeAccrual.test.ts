@@ -5,8 +5,8 @@
  *   - landlord-payer happy path: posts platform_fee_accruals +
  *     platform_revenue_ledger entry
  *   - min-per-property floor: rate × billable < min → totalAmount = min
- *   - tenant-payer: accrual row only, no platform_revenue_ledger entry
- *     (the rent-charge path picks it up later — out of scope here)
+ *   - S607: the platform fee is LOCKED to the landlord, so the old tenant-payer
+ *     branch is unreachable; the lock itself is what is now under test
  *
  * Short-stay nights branch deferred; the math is exercised inline by
  * the SUM(LEAST/GREATEST) clamp which would need a unit_bookings
@@ -153,31 +153,26 @@ describe('processPlatformFeeAccrual', () => {
     })
   })
 
-  it('tenant-payer: accrual row written, platform_revenue_ledger entry skipped', async () => {
-    const stack = await buildPlatformStack({
-      unitCount: 1, platformFeePayer: 'tenant',
-    })
+  // S607 (Nic, DIRECTIVE): the tenant-payer branch is GONE — not by deleting the
+  // code path, but by making the state unreachable. "The landlord cannot toggle
+  // the platform fee because when we change for volume discounts or things like
+  // that, that needs to not affect what the tenants are paying."
+  //
+  // This test used to seed platform_fee_payer='tenant' and assert the deferred
+  // revenue post. That scenario can no longer exist, so asserting it would be
+  // asserting fiction. What is worth guarding is the LOCK itself.
+  it('a property can no longer be set to bill the platform fee to tenants', async () => {
+    await expect(buildPlatformStack({ unitCount: 1, platformFeePayer: 'tenant' as any }))
+      .rejects.toThrow(/platform_fee_payer/)
+  })
+
+  it('every accrual posts against the landlord', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
     const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
     expect(result.feesAccrued).toBe(1)
-
-    const accrual = await db.query<{
-      payer: string; total_amount: string; platform_revenue_ledger_id: string | null
-    }>(
-      `SELECT payer, total_amount::text, platform_revenue_ledger_id
-         FROM platform_fee_accruals WHERE property_id=$1`,
-      [stack.propertyId]
-    )
-    expect(accrual.rows[0].payer).toBe('tenant')
-    expect(accrual.rows[0].total_amount).toBe('10.00')
-    // No ledger entry — the tenant-payer path defers the revenue post
-    // until the next rent charge rolls it into application_fee_amount.
-    expect(accrual.rows[0].platform_revenue_ledger_id).toBeNull()
-
-    const ledgerCount = await db.query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM platform_revenue_ledger WHERE property_id=$1`,
-      [stack.propertyId]
-    )
-    expect(ledgerCount.rows[0].n).toBe('0')
+    const accrual = await db.query<{ payer: string }>(
+      `SELECT payer FROM platform_fee_accruals WHERE property_id=$1`, [stack.propertyId])
+    expect(accrual.rows[0].payer).toBe('landlord')
   })
 
   it('idempotent: re-running the same month returns skippedAlreadyAccrued and writes no extra rows', async () => {

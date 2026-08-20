@@ -75,10 +75,15 @@ describe('isAssistantHidden', () => {
   beforeEach(() => { vi.clearAllMocks() })
   afterEach(() => { delete process.env.AGENT_ABUSE_AUTOHIDE })
 
+  // S609: these were hardcoded to July 2026. The hide lasts a fixed number of
+  // days AFTER the last offending day, so once the calendar moved past that
+  // window the test failed on a date rather than on a change. Anchored to "now".
+  const dayStr = (n: number) =>
+    new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10)
   const offendingWeek = [
-    { day: '2026-07-21', n: 5 },
-    { day: '2026-07-22', n: 6 },
-    { day: '2026-07-23', n: 9 },
+    { day: dayStr(3), n: 5 },
+    { day: dayStr(2), n: 6 },
+    { day: dayStr(1), n: 9 },
   ]
 
   it('DARK by default — never hides, never queries', async () => {

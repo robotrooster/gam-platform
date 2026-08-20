@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiDelete, apiPatch } from '../lib/api'
 import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench } from 'lucide-react'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 
@@ -13,8 +13,8 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 const fmtRead = (v: any, digits: any) => String(Math.trunc(Number(v))).padStart(Number(digits) || METER_READING_DEFAULT_DIGITS, '0')
 const lbl: CSSProperties = { fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }
 
-const UTILITY_ICONS: Record<string, string> = { water:'💧', gas:'🔥', electric:'⚡', sewer:'🚰', trash:'🗑️' }
-const UTILITY_UNITS: Record<string, string> = { water:'gal', gas:'therms', electric:'kWh', sewer:'gal', trash:'' }
+const UTILITY_ICONS: Record<string, string> = { water:'💧', gas:'🔥', electric:'⚡', sewer:'🚰', trash:'🗑️', propane:'🛢️' }
+const UTILITY_UNITS: Record<string, string> = { water:'gal', gas:'therms', electric:'kWh', sewer:'gal', trash:'', propane:'gal' }
 const BILL_STATUS: Record<string, string> = { unbilled:'badge-muted', billed:'badge-amber', paid:'badge-green', waived:'badge-muted' }
 
 const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00:00Z')
@@ -451,6 +451,9 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
       : `/utility/reading-runs/${run.id}/meters`))
   const [stepIdx, setStepIdx] = useState(0)
   const [values, setValues] = useState<Record<string, string>>({})
+  // S607: a bill_amount master needs a second number — the provider's dollar
+  // charge for the cycle — kept beside the usage entry, keyed the same way.
+  const [bills, setBills] = useState<Record<string, string>>({})
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
   const [summary, setSummary] = useState<any | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -490,11 +493,17 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
   // convention — cycled-over meters are entered with leading zeros,
   // e.g. 000133). RUBS masters record a usage total: any length up to
   // the width.
+  // S607: a master on the bill total needs a usage figure ONLY when submetered
+  // units sit on its line — that carve-out is measured in usage. Otherwise the
+  // bill alone is enough, which is what an electric bill with peak/off-peak
+  // tiers, demand charges and riders leaves you with.
+  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount' && !m.hasSubmeteredUnits
   const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
     ? new RegExp(`^\\d{${m.digits}}$`).test(v)
-    : new RegExp(`^\\d{1,${m.digits}}$`).test(v)
+    : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
+  const billOk = (m: any, v: string) => m.rubsBasis !== 'bill_amount' || /^\d+(\.\d{1,2})?$/.test(v)
   const stepComplete = !!step && step.meters.every(m =>
-    savedIds.has(m.meterId) || readOk(m, values[m.meterId] ?? ''))
+    savedIds.has(m.meterId) || (readOk(m, values[m.meterId] ?? '') && billOk(m, bills[m.meterId] ?? '')))
 
   const [saving, setSaving] = useState(false)
   const next = async () => {
@@ -509,7 +518,8 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
         const r: any = await apiPost(mode === 'verify'
           ? `/utility/reading-runs/${run.id}/double-checks/${m.meterId}`
           : `/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
-          { readingValue: Number(values[m.meterId]) })
+          { readingValue: Number(values[m.meterId] || 0),
+            ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(bills[m.meterId]) } : {}) })
         saved.add(m.meterId)
         last = r?.data
       }
@@ -575,19 +585,59 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
                     className="form-input mono"
                     type="text"
                     inputMode="numeric"
-                    maxLength={m.digits}
+                    maxLength={m.billingMethod === 'submeter' ? m.digits : 12}
                     autoComplete="off"
                     autoFocus={i === 0}
                     placeholder={m.billingMethod === 'submeter' ? `${m.digits}-digit read, e.g. ${'0'.repeat(Math.max(0, m.digits - 3))}133` : `usage total (up to ${m.digits} digits)`}
                     disabled={savedIds.has(m.meterId)}
                     value={savedIds.has(m.meterId) ? '✓ recorded' : (values[m.meterId] ?? '')}
                     onChange={e => {
-                      const v = e.target.value.replace(/\D/g, '').slice(0, m.digits)
+                      const v = e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12)
                       setValues(prev => ({ ...prev, [m.meterId]: v }))
                     }}
                     onKeyDown={e => { if (e.key === 'Enter' && stepComplete && !saving) next() }}
                     style={{ width:'100%', fontSize:'1.05rem', letterSpacing:'.12em' }}
                   />
+                  {/* S607 (Nic): the master step is the one place in the walk
+                      where the number asked for is NOT the number on the meter
+                      face. A master records the cycle's TOTAL USE off the
+                      utility's own bill — the engine bills it directly, with no
+                      prior read subtracted — so an odometer typed here prices
+                      the whole park off a lifetime total. Say so at the field. */}
+                  {m.billingMethod === 'rubs' && (
+                    <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4, lineHeight:1.45 }}>
+                      {usageOptional(m)
+                        ? 'Optional — leave blank if the bill has no single usage figure. The bill amount below is divided on its own.'
+                        : 'Total used this cycle, from the utility bill — not the reading on the meter face. Required here: submetered units on this meter are subtracted from the pool.'}
+                    </div>
+                  )}
+                  {/* S607: the dollar figure off the same bill. Entered here so
+                      both numbers come from the one document in front of you —
+                      splitting them across two screens is how they end up from
+                      two different cycles. */}
+                  {m.rubsBasis === 'bill_amount' && !savedIds.has(m.meterId) && (
+                    <div style={{ marginTop:10 }}>
+                      <span style={lbl}>Amount the utility charged</span>
+                      <input
+                        className="form-input mono"
+                        type="text"
+                        inputMode="decimal"
+                        autoComplete="off"
+                        placeholder="total on the bill, e.g. 1284.50"
+                        value={bills[m.meterId] ?? ''}
+                        onChange={e => {
+                          const v = e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1')
+                          setBills(prev => ({ ...prev, [m.meterId]: v }))
+                        }}
+                        onKeyDown={e => { if (e.key === 'Enter' && stepComplete && !saving) next() }}
+                        style={{ width:'100%', fontSize:'1.05rem', letterSpacing:'.12em' }}
+                      />
+                      <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:4, lineHeight:1.45 }}>
+                        The whole bill — service charges and taxes included. It is divided across
+                        the units on this meter, so the tenants see one blended rate.
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -647,7 +697,7 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
     <>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', margin:'24px 0 12px' }}>
         <h2 style={{ fontSize:'.95rem', margin:0 }}>🔥 Propane</h2>
-        <button className="btn btn-primary btn-sm" onClick={()=>setFillModal(true)}>Record Tank Fill</button>
+        <button className="btn btn-primary btn-sm" onClick={()=>setFillModal(true)}>Record Delivery</button>
       </div>
       <div className="card" style={{ padding:0 }}>
         <div style={{ display:'flex', gap:24, padding:'10px 16px', borderBottom:'1px solid var(--border-1)', flexWrap:'wrap' }}>
@@ -707,7 +757,7 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
         )}
       </div>
       {fillModal && (
-        <PropaneFillModal propertyId={propertyId} units={units} allowSplits={allowSplits}
+        <PropaneDeliveryModal propertyId={propertyId} units={units} allowSplits={allowSplits}
           splitMin={splitMin} splitFourMin={splitFourMin}
           onClose={()=>{ setFillModal(false); qc.invalidateQueries(['propane-fills', propertyId]); onChanged() }}/>
       )}
@@ -715,84 +765,168 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
   )
 }
 
-function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourMin, onClose }: { propertyId: string; units: any[]; allowSplits: boolean; splitMin: number; splitFourMin: number; onClose: () => void }) {
-  const [unitId, setUnitId] = useState('')
+/**
+ * S609 (Nic): record a propane DELIVERY — one master bill, several tanks.
+ *
+ * "There is a master bill that comes to the property, and we assign out each
+ *  station that had their fill. It's already on the bill in terms of gallons, so
+ *  we just need to be able to type in this many gallons at this unit or some
+ *  units that don't have it, don't get those gallons because they don't have
+ *  propane. It's a per time fill... it may be once every three months."
+ *
+ * So: the price once (it is what the invoice charged), then a gallons box beside
+ * each unit. Blank means that tank wasn't filled — there is nothing to opt out
+ * of. The running totals are there to check against the invoice before saving,
+ * because a mistyped tank becomes a tenant's bill.
+ */
+function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitFourMin, onClose }: {
+  propertyId: string; units: any[]; allowSplits: boolean
+  splitMin: number; splitFourMin: number; onClose: () => void
+}) {
+  // S609 (Nic): the property's propane price per gallon — "we need a way to also
+  // set the rate for the propane at the property level, that way when we're
+  // putting in gallons it can calculate the bill for that tenant correctly."
+  // Prefilled here so a delivery is usually just gallons; still editable,
+  // because the truck's price genuinely moves between deliveries.
+  const { data: propertyRates = [] } = useQuery<any[]>(
+    ['utility-property-rates', propertyId], () => apiGet(`/utility/property-rates?propertyId=${propertyId}`))
+  const propaneRate = (propertyRates as any[]).find((r: any) => r.utilityType === 'propane')?.ratePerUnit
+  const [ppg, setPpg] = useState('')
+  useEffect(() => {
+    if (ppg === '' && propaneRate != null) setPpg(String(Number(propaneRate)))
+  }, [propaneRate])
+  const [gallonsBy, setGallonsBy] = useState<Record<string, string>>({})
+  // S609: what each unit still owes on EARLIER fills. Recording a new fill
+  // ACCELERATES that balance — every unbilled installment becomes due at once
+  // (the truck doesn't coordinate with the office). The old one-tank form warned
+  // about this and the first version of the delivery form lost it; on a delivery
+  // it matters more, not less, because one submit can accelerate several tenants
+  // at the same time.
   const { data: fills = [] } = useQuery<any[]>(
     ['propane-fills', propertyId], () => apiGet(`/propane/fills?propertyId=${propertyId}`))
-  const priorBalance = (fills as any[])
-    .filter((f:any) => f.unitId === unitId)
-    .reduce((s:number, f:any) => s + Number(f.balanceRemaining || 0), 0)
-  const [gallons, setGallons] = useState('')
-  const [ppg, setPpg] = useState('')
+  const priorBalanceFor = (unitId: string) => (fills as any[])
+    .filter((f: any) => f.unitId === unitId)
+    .reduce((sum: number, f: any) => sum + Number(f.balanceRemaining || 0), 0)
   const [installments, setInstallments] = useState(1)
-  // One stable idempotency key per fill intent (this modal mount). Reused across
-  // any retry/re-click so the server records the fill — and its charge — once.
   const [clientKey] = useState(() => crypto.randomUUID())
   const { data: taxRates = [] } = useQuery<any[]>(
     ['utility-tax-rates', propertyId], () => apiGet(`/utility/tax-rates?propertyId=${propertyId}`))
-  const taxPct = Number((taxRates as any[]).find((r:any)=>r.utilityType==='propane')?.taxRatePct || 0)
+  const taxPct = Number((taxRates as any[]).find((r: any) => r.utilityType === 'propane')?.taxRatePct || 0)
 
-  const g = Number(gallons) || 0
-  const subtotal = Math.round(g * (Number(ppg) || 0) * 100) / 100
+  const lines = Object.entries(gallonsBy)
+    .map(([unitId, g]) => ({ unitId, gallons: Number(g) || 0 }))
+    .filter(l => l.gallons > 0)
+  const totalGallons = lines.reduce((s, l) => s + l.gallons, 0)
+  const subtotal = Math.round(totalGallons * (Number(ppg) || 0) * 100) / 100
   const tax = Math.round(subtotal * taxPct) / 100
   const total = Math.round((subtotal + tax) * 100) / 100
-  const splitOpts = allowSplits ? propaneSplitOptions(g, splitMin, splitFourMin) : [1]
-  useEffect(() => { if (!splitOpts.includes(installments)) setInstallments(1) }, [gallons, allowSplits])
+
+  // Splits are gated by the SMALLEST tank on the delivery — every fill on it is
+  // recorded with the same installment count, so the tightest line governs.
+  const smallest = lines.length ? Math.min(...lines.map(l => l.gallons)) : 0
+  const splitOpts = allowSplits && lines.length ? propaneSplitOptions(smallest, splitMin, splitFourMin) : [1]
+  useEffect(() => { if (!splitOpts.includes(installments)) setInstallments(1) }, [totalGallons, allowSplits, smallest])
 
   const mut = useMutation(
-    () => apiPost('/propane/fills', { unitId, gallons: g, pricePerGallon: Number(ppg), installments, clientKey }),
-    { onSuccess: onClose, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record fill') }
+    () => apiPost('/propane/deliveries', {
+      propertyId, pricePerGallon: Number(ppg), installments, lines, clientKey,
+    }),
+    { onSuccess: onClose,
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record this delivery') }
   )
+
+  const canSave = lines.length > 0 && Number(ppg) > 0 && !mut.isLoading
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth:440 }} onClick={e=>e.stopPropagation()}>
-        <div className="modal-title">Record Tank Fill</div>
-        <div style={{ display:'grid', gap:10 }}>
-          <div><span style={lbl}>Unit</span>
-            <select className="form-select" value={unitId} onChange={e=>setUnitId(e.target.value)} style={{ width:'100%' }}>
-              <option value="" disabled>Select unit…</option>
-              {units.map((u:any)=><option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
-            </select>
-          </div>
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }}>
-            <div><span style={lbl}>Gallons</span>
-              <input className="form-input mono" type="text" inputMode="decimal" placeholder="e.g. 120"
-                value={gallons} onChange={e=>{ const v=e.target.value; if (v===''||/^\d*\.?\d*$/.test(v)) setGallons(v) }} style={{ width:'100%' }}/></div>
-            <div><span style={lbl}>Price per gallon ($)</span>
-              <input className="form-input mono" type="text" inputMode="decimal" placeholder="e.g. 3.49"
-                value={ppg} onChange={e=>{ const v=e.target.value; if (v===''||/^\d*\.?\d*$/.test(v)) setPpg(v) }} style={{ width:'100%' }}/></div>
-          </div>
-          <div><span style={lbl}>Payment plan</span>
-            <div style={{ display:'flex', gap:8 }}>
-              {[1,2,4].map(n => (
-                <label key={n} style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:6, padding:'8px 4px', borderRadius:8,
-                    background:'var(--bg-2)', cursor: splitOpts.includes(n) ? 'pointer' : 'not-allowed', opacity: splitOpts.includes(n) ? 1 : .35, fontSize:'.8rem' }}>
-                  <input type="radio" name="propane-split" disabled={!splitOpts.includes(n)} checked={installments===n} onChange={()=>setInstallments(n)}/>
-                  {n === 1 ? 'Pay in full' : `${n} payments`}
-                </label>
-              ))}
-            </div>
-            {!allowSplits && <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginTop:4 }}>Splits are off for this property (toggle above).</div>}
-            {allowSplits && g > 0 && g < splitMin && <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginTop:4 }}>Fills under {splitMin} gal can't split.</div>}
-            {allowSplits && g >= splitMin && g < splitFourMin && <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginTop:4 }}>4-payment plans need a {splitFourMin}+ gal fill.</div>}
-          </div>
-          {priorBalance > 0 && (
-            <div style={{ fontSize:'.75rem', color:'var(--amber, #d97706)' }}>
-              This unit has {fmt(priorBalance)} outstanding from a previous fill — recording this fill makes that entire balance due immediately.
+      <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Record propane delivery</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+          Straight off the delivery invoice: the price once, then the gallons that went into each
+          tank. Leave a unit blank if it wasn&apos;t filled.
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={lbl}>Price per gallon (from the invoice)</label>
+          <input className="input" type="number" step="0.001" value={ppg} autoFocus
+            onChange={e => setPpg(e.target.value)} placeholder="e.g. 3.25" style={{ width: 140 }} />
+          {propaneRate != null && (
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
+              Prefilled from this property&apos;s propane rate. Change it if this delivery was priced differently.
             </div>
           )}
-          <div style={{ background:'var(--bg-2)', borderRadius:10, padding:'10px 14px', fontSize:'.82rem' }}>
-            <div style={{ display:'flex', justifyContent:'space-between' }}><span style={{ color:'var(--text-3)' }}>Propane</span><span className="mono">{fmt(subtotal)}</span></div>
-            {taxPct > 0 && <div style={{ display:'flex', justifyContent:'space-between', marginTop:4 }}><span style={{ color:'var(--text-3)' }}>Tax ({taxPct}%)</span><span className="mono">{fmt(tax)}</span></div>}
-            <div style={{ display:'flex', justifyContent:'space-between', marginTop:4, fontWeight:700 }}><span>Total</span><span className="mono" style={{ color:'var(--gold)' }}>{fmt(total)}</span></div>
-            {installments > 1 && <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginTop:6 }}>Payment 1 of {installments} ({fmt(Math.floor(total/installments*100)/100)}) is due now; the rest ride the next monthly invoices.</div>}
+        </div>
+
+        <label style={lbl}>Gallons per tank</label>
+        <div style={{ maxHeight: 280, overflowY: 'auto', border: '1px solid var(--border-1)', borderRadius: 8, marginTop: 4 }}>
+          {units.map((u: any) => (
+            <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 10px',
+                                     borderBottom: '1px solid var(--border-1)' }}>
+              <span style={{ fontSize: '.82rem', color: 'var(--text-1)', flex: 1 }}>Unit {u.unitNumber}</span>
+              {priorBalanceFor(u.id) > 0 && (
+                <span title="Recording a fill here makes this whole balance due immediately"
+                  style={{ fontSize: '.68rem', color: 'var(--amber)', whiteSpace: 'nowrap' }}>
+                  {fmt(priorBalanceFor(u.id))} owing
+                </span>
+              )}
+              <input className="input" type="number" step="0.1" min={0}
+                value={gallonsBy[u.id] ?? ''}
+                onChange={e => setGallonsBy(prev => ({ ...prev, [u.id]: e.target.value }))}
+                placeholder="—" style={{ width: 90, textAlign: 'right' }} />
+              <span style={{ fontSize: '.7rem', color: 'var(--text-3)', width: 26 }}>gal</span>
+            </div>
+          ))}
+        </div>
+
+        {allowSplits && splitOpts.length > 1 && (
+          <div style={{ marginTop: 12 }}>
+            <label style={lbl}>Split each tank&apos;s charge into</label>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {splitOpts.map(n => (
+                <button key={n} className={`btn btn-sm ${installments === n ? 'btn-primary' : 'btn-ghost'}`}
+                  onClick={() => setInstallments(n)}>
+                  {n === 1 ? 'One payment' : `${n} payments`}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Check against the invoice before it becomes somebody's bill. */}
+        <div style={{ marginTop: 14, padding: 10, borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-2)' }}>
+            <span>{lines.length} tank{lines.length === 1 ? '' : 's'} · {totalGallons.toLocaleString()} gal</span>
+            <span className="mono">{fmt(subtotal)}</span>
+          </div>
+          {taxPct > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-3)', marginTop: 3, fontSize: '.74rem' }}>
+              <span>Tax ({taxPct}%)</span><span className="mono">{fmt(tax)}</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, color: 'var(--text-0)', marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border-1)' }}>
+            <span>Delivery total</span><span className="mono">{fmt(total)}</span>
+          </div>
+          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.45 }}>
+            Should match the invoice. Each tenant is billed their own tank&apos;s gallons at this price.
           </div>
         </div>
+
+        {(() => {
+          const accelerating = lines.filter(l => priorBalanceFor(l.unitId) > 0)
+          const owed = accelerating.reduce((s, l) => s + priorBalanceFor(l.unitId), 0)
+          return accelerating.length > 0 ? (
+            <div className="alert a-warn" style={{ marginTop: 10, fontSize: '.76rem', lineHeight: 1.5 }}>
+              {accelerating.length} of these tenant{accelerating.length === 1 ? '' : 's'} still owe
+              {accelerating.length === 1 ? 's' : ''} {fmt(owed)} from an earlier fill. Recording this
+              delivery makes those balances due immediately, on top of the new charge.
+            </div>
+          ) : null
+        })()}
+
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" disabled={!unitId || g <= 0 || ppg === '' || mut.isLoading} onClick={()=>mut.mutate()}>
-            {mut.isLoading ? 'Saving…' : 'Record Fill'}
+          <button className="btn btn-primary" disabled={!canSave} onClick={() => mut.mutate()}>
+            {mut.isLoading ? 'Recording…' : `Record ${lines.length || ''} fill${lines.length === 1 ? '' : 's'}`.replace('  ', ' ')}
           </button>
         </div>
       </div>
@@ -800,19 +934,21 @@ function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourM
   )
 }
 
-// ── UTILITY TAX RATES (landlord-entered) ─────────────────────────────
-// S605 (Nic, DIRECTIVE): "Make utility rates set at the property level. Adding
-// each unit is redundant and possible discrimination."
-//
-// One rate per utility for the whole property. Every tenant pays the same price
-// for the same utility, and the landlord types it once instead of once per unit
-// with a chance to fat-finger each one. Overrides whatever a meter carries.
+/* S609: PropaneFillModal (one tank at a time) removed — the delivery flow
+   supersedes it. A single tank is just a delivery with one line, and keeping
+   both would be two screens recording the same money a different way. */
+
 function PropertyRatesCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
   const { data: rates = [] } = useQuery<any[]>(
     ['property-utility-rates', propertyId], () => apiGet(`/utility/property-rates?propertyId=${propertyId}`))
   const [draft, setDraft] = useState<Record<string, { rate: string; sewer: string }>>({})
-  const TYPES = ['electric', 'water', 'gas', 'trash']
+  // S609 (Nic): PROPANE has a property price per gallon — "we need a way to also
+  // set the rate for the propane at the property level, that way when we're
+  // putting in gallons it can calculate the bill for that tenant correctly."
+  // It has no meter (fills are events, not readings), so it appears here in
+  // Rates and nowhere in the meter list.
+  const TYPES = ['electric', 'water', 'gas', 'trash', 'propane']
   const row = (t: string) => (rates as any[]).find((r: any) => r.utilityType === t)
 
   const mut = useMutation(
@@ -846,7 +982,18 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
               </span>
               <input className="input input-sm" type="number" step="0.00001" value={d.rate}
                 onChange={e => set('rate', e.target.value)}
-                placeholder={`$ per ${UTILITY_UNITS[t] || 'unit'}`} style={{ width: 150 }} />
+                placeholder={t === 'trash' ? '$ per unit / cycle' : `$ per ${UTILITY_UNITS[t] || 'unit'}`}
+                style={{ width: 150 }} />
+              {t === 'propane' && (
+                <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>
+                  prefills a delivery; editable per delivery
+                </span>
+              )}
+              {t === 'trash' && (
+                <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>
+                  the flat charge every unit on a trash meter pays
+                </span>
+              )}
               {t === 'water' && (
                 <input className="input input-sm" type="number" step="0.00001" value={d.sewer}
                   onChange={e => set('sewer', e.target.value)}
@@ -913,12 +1060,15 @@ function TaxRatesCard({ propertyId }: { propertyId: string }) {
 // RUBS group of units to a master, and flat-rate meters. Supports the one-master
 // park layout: a RUBS master carrying BOTH submeters (their usage excluded) AND
 // a RUBS unit group (the remainder, split by occupancy).
-const RUBS_ALLOC_LABEL: Record<string,string> = { occupant_count:'by occupancy (headcount)', sqft:'by sq ft', bedrooms:'by bedrooms', equal_split:'equal split' }
+const RUBS_ALLOC_LABEL: Record<string,string> = { occupant_count:'by occupancy (headcount)', sqft:'by sq ft', bedrooms:'by bedrooms', rented_spaces:'equal split across rented units', fixture_count:'by plumbing fixtures', unit_type_weight:'by unit type weight', hybrid:'blended split' }
+const RUBS_BASIS_LABEL: Record<string,string> = { usage_rate:'priced at your rate', bill_amount:'divides the utility bill' }
 function rateLabel(m: any) { return m.ratePerUnit != null ? `${fmt(m.ratePerUnit)}/${UTILITY_UNITS[m.utilityType] || 'unit'}` : 'no rate set' }
 function methodLabel(m: any): string {
-  if (m.billingMethod === 'rubs') return `RUBS master · ${RUBS_ALLOC_LABEL[m.rubsAllocationMethod] || m.rubsAllocationMethod} · ${rateLabel(m)}`
+  if (m.billingMethod === 'rubs') return `RUBS master · ${RUBS_ALLOC_LABEL[m.rubsAllocationMethod] || m.rubsAllocationMethod} · ${m.rubsBasis === 'bill_amount' ? RUBS_BASIS_LABEL['bill_amount'] : rateLabel(m)}`
   if (m.billingMethod === 'submeter') return `Submeter · ${rateLabel(m)}`
-  if (m.billingMethod === 'flat_rate') return `Flat rate · ${fmt(m.baseFee)}/unit`
+  // S609: the amount lives on the property rate now, not the meter, so the card
+  // names the rule instead of printing a figure the meter does not hold.
+  if (m.billingMethod === 'flat_rate') return `Flat rate · property ${m.utilityType} rate, same for every unit on it`
   if (m.billingMethod === 'master_bill_to_landlord') return 'Master meter · landlord pays'
   return m.billingMethod
 }
@@ -927,6 +1077,10 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   propertyId: string; meters: any[]; units: any[]; onChanged: () => void
 }) {
   const [showAdd, setShowAdd] = useState(false)
+  // S609: the meter currently being edited (null = none open).
+  const [editMeter, setEditMeter] = useState<any>(null)
+  // S609: the meter whose units are being picked (null = picker closed).
+  const [pickFor, setPickFor] = useState<any>(null)
   const unitLabel = (id: string) => { const u = units.find(x => x.id === id); return u ? `Unit ${u.unitNumber}` : id.slice(0, 8) }
   const masters = meters.filter(m => m.billingMethod === 'rubs')
   const submeters = meters.filter(m => m.billingMethod === 'submeter')
@@ -935,6 +1089,23 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   // same-utility submeter — derived from shared unit membership, no manual link.
   const unitHasSubmeter = (unitId: string, utilityType: string) =>
     meters.some(x => x.billingMethod === 'submeter' && x.utilityType === utilityType && (x.assignedUnitIds || []).includes(unitId))
+
+  // S609 (Nic): which OTHER meter has already claimed this unit for this utility,
+  // if any. Mirrors the double-billing rule the API enforces: a unit may be on one
+  // submeter AND one master for a utility (the metered-exclusion pairing), but
+  // never two of the same KIND — that unit would be billed twice.
+  //
+  // The picker was offering units already on another master and letting the
+  // server refuse them one by one. Nic: "it shouldn't even show those as
+  // selectable on the other meter." Right — the screen should know the rule, not
+  // discover it. Returns the blocking meter so the reason can be shown rather
+  // than the unit just quietly vanishing.
+  const conflictingMeterFor = (unitId: string, meter: any) =>
+    meters.find(x =>
+      x.id !== meter.id &&
+      x.utilityType === meter.utilityType &&
+      (x.billingMethod === 'submeter') === (meter.billingMethod === 'submeter') &&
+      (x.assignedUnitIds || []).includes(unitId)) || null
 
   const del = useMutation((id: string) => apiDelete(`/utility/meters/${id}`),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Delete failed') })
@@ -946,7 +1117,14 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
 
   function UnitAssigner({ m }: { m: any }) {
     const assigned: string[] = m.assignedUnitIds || []
-    const available = units.filter(u => !assigned.includes(u.id))
+    // S609 (Nic): only what can actually be picked. The SUBMETER dropdown had the
+    // same flaw as the master picker — with eight mobile-home submeters already
+    // set up, adding a ninth listed every unit the other eight had taken, and the
+    // server refused whichever you chose. Same rule as the picker: a unit already
+    // on another meter of this KIND for this utility would be billed twice.
+    const available = units
+      .filter(u => !assigned.includes(u.id))
+      .filter(u => !conflictingMeterFor(u.id, m))
     // A submeter measures exactly ONE unit — cap it at 1. Only RUBS masters
     // (the group that splits the pool) and flat-rate serve multiple units.
     const isSubmeter = m.billingMethod === 'submeter'
@@ -973,12 +1151,23 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
             )
           })}
           {assigned.length === 0 && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>none yet</span>}
-          {canAddMore && (
+          {/* S609 (Nic): a submeter takes exactly one unit, so the dropdown is
+              still the quickest thing for it. A MASTER can serve dozens — Oak
+              Park's water master serves 27 — and picking them one at a time
+              meant the control jumped to the end of the chip list after every
+              save, so the button was never where the mouse was. Masters and
+              flat-rate meters get a checkbox picker instead. */}
+          {canAddMore && (isSubmeter ? (
             <select className="form-select" style={{ width: 'auto', fontSize: '.74rem', padding: '2px 6px' }} value="" onChange={e => { if (e.target.value) assign.mutate({ id: m.id, unitId: e.target.value }) }}>
-              <option value="">{isSubmeter ? 'set unit…' : '+ add unit…'}</option>
+              <option value="">set unit…</option>
               {available.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
             </select>
-          )}
+          ) : (
+            <button className="btn btn-ghost btn-sm" style={{ fontSize: '.74rem', padding: '2px 8px' }}
+              onClick={() => setPickFor(m)}>
+              + add units…
+            </button>
+          ))}
         </div>
       </div>
     )
@@ -995,6 +1184,11 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
             <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{m.label}</div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{methodLabel(m)}</div>
           </div>
+          {/* S609 (Nic): a meter used to be uneditable once created — a typo in
+              the label meant deleting a master and losing its unit assignments. */}
+          <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
+            <Pencil size={13} style={{ color: 'var(--text-3)' }} />
+          </button>
           <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete master "${m.label}"? Its submeters stay.`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
         </div>
         <UnitAssigner m={m} />
@@ -1087,6 +1281,9 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
               <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
             </button>
           )}
+          <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
+            <Pencil size={13} style={{ color: 'var(--text-3)' }} />
+          </button>
           <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete meter "${m.label}"?`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
         </div>
         {m.billingMethod !== 'master_bill_to_landlord' && <UnitAssigner m={m} />}
@@ -1108,18 +1305,236 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
       {masters.map(m => <MasterCard key={m.id} m={m} />)}
       {submeters.map(m => <PlainCard key={m.id} m={m} />)}
       {others.map(m => <PlainCard key={m.id} m={m} />)}
-      {showAdd && <AddMeterModal propertyId={propertyId} onClose={() => setShowAdd(false)} onCreated={onChanged} />}
+      {showAdd && <MeterModal propertyId={propertyId} onClose={() => setShowAdd(false)} onSaved={onChanged} />}
+      {editMeter && <MeterModal propertyId={propertyId} meter={editMeter}
+        onClose={() => setEditMeter(null)} onSaved={onChanged} />}
+      {pickFor && <UnitPickerModal meter={pickFor} units={units}
+        unitHasSubmeter={unitHasSubmeter} unitLabel={unitLabel}
+        conflictingMeterFor={conflictingMeterFor}
+        onClose={() => setPickFor(null)} onSaved={onChanged} />}
     </div>
   )
 }
 
-function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string; onClose: () => void; onCreated: () => void }) {
-  const [utilityType, setUtilityType] = useState('water')
-  const [label, setLabel] = useState('')
-  const [method, setMethod] = useState('rubs')
+/**
+ * S609 (Nic): pick MANY units for a meter at once.
+ *
+ * "Every time I click add a unit and then click the unit from that drop down, it
+ * takes a second to load, and then it moves my button over, and it puts it at
+ * the end of the list. So I have to keep moving the mouse to the new button spot
+ * to click and add the next submeter. I want to have it where it opens a little
+ * window, and I just can checkbox all the units that get applied to that master
+ * meter."
+ *
+ * The old control was a dropdown sitting AFTER the assigned chips, so every save
+ * grew the chip list and pushed the dropdown somewhere new. Twenty-seven units
+ * meant twenty-seven round trips, each one chasing the control across the card.
+ *
+ * Nothing is saved until Add is pressed — ticking is free, so a mis-click costs
+ * nothing and there is no per-unit wait.
+ */
+function UnitPickerModal({ meter, units, unitHasSubmeter, unitLabel, conflictingMeterFor, onClose, onSaved }: {
+  meter: any; units: any[]
+  unitHasSubmeter: (unitId: string, utilityType: string) => boolean
+  unitLabel: (id: string) => string
+  conflictingMeterFor: (unitId: string, meter: any) => any | null
+  onClose: () => void; onSaved: () => void
+}) {
+  const assigned: string[] = meter.assignedUnitIds || []
+  // ONLY the units that can actually be picked. S609 (Nic) — he overruled the
+  // first version, which greyed out the taken ones and kept them in the list:
+  //
+  //   "The drop down is still too long. You have all the list in there of all
+  //    the units just not selectable, and that looks like shit. It only needs to
+  //    be the ones that are selectable... I don't want them to be grayed out
+  //    because then I still have to scroll around looking for just the odd one
+  //    or two."
+  //
+  // Right, and the earlier reasoning (a missing row raises "where did it go?")
+  // only holds at three units. Oak Park's water master serves 27 — by the third
+  // meter the list is almost entirely dead rows and the few live ones are
+  // needles. The count of what was hidden is shown at the bottom instead, so
+  // nothing is unexplained without costing a scroll.
+  const takenElsewhere = units
+    .filter(u => !assigned.includes(u.id))
+    .filter(u => !!conflictingMeterFor(u.id, meter))
+  const available = units
+    .filter(u => !assigned.includes(u.id))
+    .filter(u => !conflictingMeterFor(u.id, meter))
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [skipped, setSkipped] = useState<{ unitId: string; reason: string }[]>([])
+
+  const toggle = (id: string) => setPicked(prev => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
+
+  const add = useMutation(
+    () => apiPost(`/utility/meters/${meter.id}/units`, { unitIds: [...picked] }),
+    {
+      onSuccess: (res: any) => {
+        const result = res?.data ?? res
+        const wasSkipped = result?.skipped ?? []
+        onSaved()
+        // A unit already on another meter of this utility is refused for a good
+        // reason (it would be billed twice). Say WHICH and WHY rather than
+        // silently adding fewer than were ticked.
+        if (wasSkipped.length > 0) { setSkipped(wasSkipped); setPicked(new Set()) }
+        else onClose()
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not add units'),
+    })
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add units to {meter.label}</div>
+
+        {available.length === 0 ? (
+          <div style={{ fontSize: '.82rem', color: 'var(--text-3)', padding: '8px 0', lineHeight: 1.5 }}>
+            {takenElsewhere.length > 0
+              ? `No units left to add — every other unit at this property is already on another ${meter.utilityType} meter.`
+              : 'Every unit at this property is already on this meter.'}
+          </div>
+        ) : (
+          <>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <button className="btn btn-ghost btn-sm"
+                onClick={() => setPicked(new Set(available.map(u => u.id)))}>Select all</button>
+              {picked.size > 0 && (
+                <button className="btn btn-ghost btn-sm" onClick={() => setPicked(new Set())}>Clear</button>
+              )}
+              <div style={{ marginLeft: 'auto', fontSize: '.74rem', color: 'var(--text-3)', alignSelf: 'center' }}>
+                {picked.size} selected
+              </div>
+            </div>
+            <div style={{ maxHeight: 320, overflowY: 'auto', border: '1px solid var(--border-1)', borderRadius: 8 }}>
+              {available.map(u => {
+                const sub = unitHasSubmeter(u.id, meter.utilityType)
+                return (
+                  <label key={u.id}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px',
+                             borderBottom: '1px solid var(--border-1)', cursor: 'pointer', fontSize: '.82rem' }}>
+                    <input type="checkbox" checked={picked.has(u.id)} onChange={() => toggle(u.id)} />
+                    <span style={{ color: 'var(--text-1)' }}>Unit {u.unitNumber}</span>
+                    {/* A unit with its own submeter still belongs on the master —
+                        its usage is subtracted from the pool rather than split. */}
+                    {sub && meter.billingMethod === 'rubs' && (
+                      <span style={{ marginLeft: 'auto', fontSize: '.68rem', color: 'var(--gold)' }}>
+                        🔌 submetered — billed directly, subtracted from the pool
+                      </span>
+                    )}
+                  </label>
+                )
+              })}
+            </div>
+            {/* The hidden ones are accounted for in one line, so nothing is
+                unexplained — without costing a scroll through dead rows. */}
+            {takenElsewhere.length > 0 && (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.45 }}>
+                {takenElsewhere.length} other unit{takenElsewhere.length === 1 ? ' is' : 's are'} already on
+                another {meter.utilityType} meter and can&apos;t be added here — a unit on two would be billed twice.
+              </div>
+            )}
+          </>
+        )}
+
+        {skipped.length > 0 && (
+          <div className="alert a-warn" style={{ marginTop: 10, fontSize: '.76rem', lineHeight: 1.5 }}>
+            <strong>{skipped.length} couldn&apos;t be added:</strong>
+            <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+              {skipped.map(sk => (
+                <li key={sk.unitId}>{unitLabel(sk.unitId)} — {sk.reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>{skipped.length > 0 ? 'Done' : 'Cancel'}</button>
+          <button className="btn btn-primary" disabled={picked.size === 0 || add.isLoading}
+            onClick={() => add.mutate()}>
+            {add.isLoading ? 'Adding…' : `Add ${picked.size || ''} unit${picked.size === 1 ? '' : 's'}`.trim()}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * S609 (Nic): add OR edit a meter — one form, both jobs.
+ *
+ * "I have no button to edit my first master meter that I added. I didn't label
+ * it the way I wanted to, and there's no way to change it. I don't wanna have
+ * to delete it and then add it again."
+ *
+ * He was right, and it was worse than a missing rename: a meter was FROZEN the
+ * moment it was created. Label, base fee, split method, what the split is priced
+ * from — all of it could only be set here, at creation, and afterwards the only
+ * actions on a meter were "mark broken" and "delete". Deleting a master to fix a
+ * typo would take its unit assignments with it.
+ *
+ * It also made a documented setup step impossible: the S608 handoff tells Nic to
+ * switch Oak Park's master to the utility-bill basis and rented-units split.
+ * There was no way to do it.
+ *
+ * ONE component for both so they cannot drift — a create form and an edit form
+ * that disagree about what a field means is how a landlord ends up with a meter
+ * configured differently depending on which screen touched it last.
+ *
+ * WHAT IS LOCKED, AND WHEN (Nic, DIRECTIVE — this replaced an earlier version
+ * that froze the utility and billing method the moment a meter was created):
+ *
+ *   "Every feature needs to be editable on meters when there is no history.
+ *    Only lock it once there's history, not once it's created. Somebody
+ *    accidentally setting something up the wrong way needs to be able to change
+ *    it so they don't have to redo potentially everything. That's gonna be a
+ *    friction point during onboarding."
+ *
+ * He is right, and locking at creation was the wrong trigger. A meter that has
+ * never been read and never billed has no history to protect — the only thing
+ * the lock achieved was making a setup typo unfixable during the exact phase
+ * where typos happen.
+ *
+ * So: EVERYTHING is editable until the meter has actually measured or billed
+ * something. Once it has, the utility and billing method freeze — from then on
+ * changing them would re-interpret readings already taken and bills already
+ * sent, which is rewriting history rather than correcting a mistake.
+ *
+ * Unit assignments are NOT history. They survive an edit, which is the point:
+ * fixing a wrong setup must not mean redoing the assignments as well.
+ */
+function MeterModal({ propertyId, meter, onClose, onSaved }: {
+  propertyId: string; meter?: any; onClose: () => void; onSaved: () => void
+}) {
+  const editing = !!meter
+  // S609: locked by USE, not by existence. A meter with no readings and no
+  // bills is still fully editable. PATCH enforces the same rule server-side.
+  const locked = editing && meter.hasHistory === true
+  const [utilityType, setUtilityType] = useState(meter?.utilityType ?? 'water')
+  const [label, setLabel] = useState(meter?.label ?? '')
+  const [method, setMethod] = useState(meter?.billingMethod ?? 'rubs')
+  const [basis, setBasis] = useState(meter?.rubsBasis ?? 'usage_rate')
+  const [subRate, setSubRate] = useState(meter?.rubsSubmeterRate ?? 'property_rate')
+  const [exclMode, setExclMode] = useState(meter?.rubsExclusionMode ?? 'usage')
   const [rate] = useState('')   // S605: rates are property policy; kept only for the create payload
-  const [baseFee, setBaseFee] = useState('')
-  const [alloc, setAlloc] = useState('occupant_count')
+  // S609: no longer editable — the flat-rate amount is the property rate, and a
+  // RUBS master's own base fee is set with the property rates. Kept so the value
+  // round-trips unchanged on an edit rather than being zeroed.
+  const [baseFee] = useState(meter?.baseFee != null ? String(meter.baseFee) : '')
+  const [alloc, setAlloc] = useState(meter?.rubsAllocationMethod ?? 'occupant_count')
+  // S607: config for the bases that need one. Kept as discrete pieces of state
+  // rather than a JSON box — a landlord should never be asked to type JSON.
+  const [hybA, setHybA] = useState(meter?.rubsWeights?.primary ?? 'sqft')
+  const [hybB, setHybB] = useState(meter?.rubsWeights?.secondary ?? 'occupant_count')
+  const [hybPct, setHybPct] = useState(String(meter?.rubsWeights?.primaryPct ?? '50'))
+  // "mobile_home:1.5, rv_spot:1" — rebuilt from the saved weights when editing.
+  const [typeWeights, setTypeWeights] = useState(
+    meter?.rubsAllocationMethod === 'unit_type_weight' && meter?.rubsWeights
+      ? Object.entries(meter.rubsWeights).map(([k, v]) => `${k}:${v}`).join(', ')
+      : '')
   // S605 (Nic): the OPENING READ. A submeter bills the difference between two
   // reads, so without a starting value its first cycle produces no bill and
   // says nothing about why. Asking here — the one moment it's obvious what the
@@ -1129,36 +1544,102 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
   const [baselineDate, setBaselineDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [error, setError] = useState('')
 
-  const create = useMutation(
-    () => apiPost('/utility/meters', {
+  // The RUBS weight payload — identical for create and edit, built once.
+  const weightsPayload = () =>
+    method !== 'rubs' ? undefined
+      : alloc === 'hybrid' ? { primary: hybA, secondary: hybB, primaryPct: Number(hybPct) || 50 }
+      : alloc === 'unit_type_weight'
+        ? Object.fromEntries(typeWeights.split(',').map(p => p.split(':'))
+            .filter(p => p.length === 2 && p[0].trim())
+            .map(p => [p[0].trim(), Number(p[1]) || 0]))
+        : null
+
+  const save = useMutation(
+    () => editing
+      // Edit sends ONLY what may change on a live meter. Utility and billing
+      // method are absent on purpose — see the note on this component.
+      ? apiPatch(`/utility/meters/${meter.id}`, {
+          label,
+          baseFee: Number(baseFee || 0),
+          // S609: until a meter has readings or bills, the utility and billing
+          // method are fixable too — sending them only when they are actually
+          // editable keeps a locked meter's payload identical to before.
+          ...(locked ? {} : { utilityType, billingMethod: method }),
+          // The split method must match the billing method or the database
+          // rejects the row: a RUBS master requires one, anything else must
+          // have none. Sending null explicitly is what CLEARS it when someone
+          // switches a master to a submeter.
+          rubsAllocationMethod: method === 'rubs' ? alloc : null,
+          ...(method === 'rubs' ? {
+            rubsBasis: basis,
+            rubsWeights: weightsPayload(),
+            rubsSubmeterRate: subRate,
+            rubsExclusionMode: exclMode,
+          } : {}),
+        })
+      : apiPost('/utility/meters', {
       propertyId, utilityType, label,
       billingMethod: method,
       ratePerUnit: method === 'flat_rate' || method === 'master_bill_to_landlord' ? null : (rate === '' ? null : Number(rate)),
       baseFee: method === 'flat_rate' ? Number(baseFee || 0) : Number(baseFee || 0),
       rubsAllocationMethod: method === 'rubs' ? alloc : null,
+      rubsBasis: method === 'rubs' ? basis : undefined,
+      rubsWeights: weightsPayload() ?? undefined,
+      rubsSubmeterRate: method === 'rubs' ? subRate : undefined,
+      rubsExclusionMode: method === 'rubs' ? exclMode : undefined,
       ...(method === 'submeter' && baselineReading !== ''
         ? { baselineReading: Number(baselineReading), baselineDate }
         : {}),
     }),
-    { onSuccess: () => { onCreated(); onClose() }, onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not create meter') }
+    { onSuccess: () => { onSaved(); onClose() },
+      onError: (e: any) => setError(e?.response?.data?.error || e?.message ||
+        (editing ? 'Could not save this meter' : 'Could not create meter')) }
   )
-  const canSave = !!label && (method !== 'flat_rate' || Number(baseFee) > 0)
-  const noBaseline = method === 'submeter' && baselineReading === ''
+  // S609: a flat-rate meter no longer carries its own amount — the property rate
+  // is the amount — so there is nothing to require here beyond the label.
+  const canSave = !!label
+  // Opening reads are a create-time question only; an existing meter fixes a
+  // missing one from its own card (BaselineFixer).
+  const noBaseline = !editing && method === 'submeter' && baselineReading === ''
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Add meter</div>
+        <div className="modal-title">{editing ? 'Edit meter' : 'Add meter'}</div>
+        {locked ? (
+          // Fixed for a reason, and the reason is shown rather than left to be
+          // discovered: this meter has already measured or billed something, so
+          // these two decide how that existing history is read.
+          <div style={{ marginBottom: 10, padding: 10, borderRadius: 8,
+                        background: 'rgba(255,255,255,.03)', border: '1px solid var(--border-1)' }}>
+            <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600 }}>
+              {UTILITY_ICONS[utilityType]} {utilityType[0].toUpperCase() + utilityType.slice(1)}
+              {' · '}
+              {method === 'rubs' ? 'RUBS master'
+                : method === 'submeter' ? 'Submeter'
+                : method === 'flat_rate' ? 'Flat rate'
+                : 'Master — landlord pays'}
+            </div>
+            <div style={{ marginTop: 4, fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.45 }}>
+              This meter has readings or bills against it, so the utility and billing method are
+              now fixed — they decide how that history is read, and changing them would rewrite it
+              rather than correct it. Everything below can still be changed at any time. If one of
+              these two is genuinely wrong, add the meter you meant and retire this one.
+            </div>
+          </div>
+        ) : (
         <div style={{ marginBottom: 10 }}>
           <label style={lbl}>Utility</label>
           <select className="form-select" value={utilityType} onChange={e => setUtilityType(e.target.value)} style={{ width: '100%' }}>
             {['water', 'gas', 'electric', 'sewer', 'trash'].map(u => <option key={u} value={u}>{UTILITY_ICONS[u]} {u[0].toUpperCase() + u.slice(1)}</option>)}
           </select>
         </div>
+        )}
         <div style={{ marginBottom: 10 }}>
           <label style={lbl}>Label</label>
           <input className="input" value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Master C — city water" style={{ width: '100%' }} autoFocus />
         </div>
+        {!locked && (
         <div style={{ marginBottom: 10 }}>
           <label style={lbl}>Billing method</label>
           <select className="form-select" value={method} onChange={e => setMethod(e.target.value)} style={{ width: '100%' }}>
@@ -1168,16 +1649,110 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
             <option value="master_bill_to_landlord">Master — landlord pays, no tenant bills</option>
           </select>
         </div>
+        )}
         {method === 'rubs' && (
-          <div style={{ marginBottom: 10 }}>
-            <label style={lbl}>Split method</label>
-            <select className="form-select" value={alloc} onChange={e => setAlloc(e.target.value)} style={{ width: '100%' }}>
-              <option value="occupant_count">By occupancy (headcount)</option>
-              <option value="equal_split">Equal split</option>
-              <option value="sqft">By square footage</option>
-              <option value="bedrooms">By bedrooms</option>
-            </select>
-          </div>
+          <>
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>Split method</label>
+              <select className="form-select" value={alloc} onChange={e => setAlloc(e.target.value)} style={{ width: '100%' }}>
+                <option value="occupant_count">By occupancy (headcount)</option>
+                <option value="rented_spaces">Equal split across rented units</option>
+                <option value="sqft">By square footage</option>
+                <option value="bedrooms">By bedrooms</option>
+                <option value="fixture_count">By plumbing fixture count</option>
+                <option value="unit_type_weight">By unit type, your own weights</option>
+                <option value="hybrid">Blend of two of the above</option>
+              </select>
+              {alloc === 'unit_type_weight' && (
+                <div style={{ marginTop: 8 }}>
+                  <label style={lbl}>Weight per unit type</label>
+                  <input className="form-input" value={typeWeights} placeholder="mobile_home:1.5, rv_spot:1"
+                    onChange={e => setTypeWeights(e.target.value)} />
+                  <div style={{ marginTop: 4, fontSize: '.7rem', color: 'var(--text-3)' }}>
+                    One pair per unit type. A type you leave out gets no share.
+                  </div>
+                </div>
+              )}
+              {alloc === 'hybrid' && (
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={lbl}>Blend</label>
+                    <select className="form-select" value={hybA} onChange={e => setHybA(e.target.value)}>
+                      <option value="sqft">Square footage</option>
+                      <option value="occupant_count">Occupancy</option>
+                      <option value="bedrooms">Bedrooms</option>
+                      <option value="rented_spaces">Equal across rented units</option>
+                      <option value="fixture_count">Fixtures</option>
+                    </select>
+                  </div>
+                  <div style={{ width: 78 }}>
+                    <label style={lbl}>%</label>
+                    <input className="form-input" value={hybPct} onChange={e => setHybPct(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={lbl}>with</label>
+                    <select className="form-select" value={hybB} onChange={e => setHybB(e.target.value)}>
+                      <option value="occupant_count">Occupancy</option>
+                      <option value="sqft">Square footage</option>
+                      <option value="bedrooms">Bedrooms</option>
+                      <option value="rented_spaces">Equal across rented units</option>
+                      <option value="fixture_count">Fixtures</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+              <div style={{ marginTop: 4, fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.45 }}>
+                Rented-units-only leaves vacancies out of the split, so the whole bill lands on
+                the units actually leased. Every-unit keeps vacancies in, and their share goes
+                unbilled.
+              </div>
+            </div>
+            {/* S607 (Nic, DIRECTIVE): the dollar-divide model is an OPTION, not a
+                replacement. "We don't wanna restrict how people bill. We want the
+                full functionality where they can operate in accordance with their
+                state's laws, whatever that may be." usage_rate stays the default
+                and every existing master keeps it. */}
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>What the split is priced from</label>
+              <select className="form-select" value={basis} onChange={e => setBasis(e.target.value)} style={{ width: '100%' }}>
+                <option value="usage_rate">Your rate — usage × the property rate, plus base fee</option>
+                <option value="bill_amount">The utility bill — divide what you were actually charged</option>
+              </select>
+              <div style={{ marginTop: 4, fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.45 }}>
+                {basis === 'bill_amount'
+                  ? 'Each cycle you enter the bill total alongside the usage. It blends into one rate, so the tenant sees a single line. Any base fee you set is added on top of the bill.'
+                  : 'The property rate prices the usage. Anything the provider charges beyond that — service fees, taxes — stays with you.'}
+              </div>
+            </div>
+            {/* S607 (Nic, DIRECTIVE): "we're going for flexibility here." How a
+                master shares its line with submetered units is TWO independent
+                choices, both defaulting to what the platform already did. */}
+            {basis === 'bill_amount' && (
+              <div style={{ marginBottom: 10, padding: 10, borderRadius: 8,
+                            background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.18)' }}>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.45 }}>
+                  Only applies where some units on this meter have their own submeter.
+                </div>
+                <label style={lbl}>Submetered units are billed at</label>
+                <select className="form-select" value={subRate} onChange={e => setSubRate(e.target.value)} style={{ width: '100%', marginBottom: 8 }}>
+                  <option value="property_rate">Your published rate</option>
+                  <option value="blended">The blended rate off this bill</option>
+                </select>
+                <label style={lbl}>Take them out of the pool by</label>
+                <select className="form-select" value={exclMode} onChange={e => setExclMode(e.target.value)} style={{ width: '100%' }}>
+                  <option value="usage">Their usage — price whatever is left</option>
+                  <option value="dollars">Their invoiced dollars — the bill closes exactly</option>
+                </select>
+                <div style={{ marginTop: 6, fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.45 }}>
+                  {subRate === 'property_rate' && exclMode === 'usage'
+                    ? 'Heads up: with a published submeter rate, subtracting usage can leave the pool over or short of the bill. Subtracting dollars closes it.'
+                    : exclMode === 'dollars'
+                      ? 'Every dollar of the bill lands on somebody, whatever rate each submetered unit paid.'
+                      : 'Everyone on the line ends up at the same cost per unit.'}
+                </div>
+              </div>
+            )}
+          </>
         )}
         {/* S605 (Nic, DIRECTIVE): "make utility rates set at the property level.
             Adding each unit is redundant and possible discrimination." The rate
@@ -1192,7 +1767,7 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
         )}
         {/* S605 (Nic): opening read — submeters only. RUBS and master-bill
             allocate off the property invoice and never read an odometer. */}
-        {method === 'submeter' && (
+        {!editing && method === 'submeter' && (
           <div style={{ marginBottom: 10, padding: 10, borderRadius: 8, background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)' }}>
             <label style={lbl}>Opening read (current meter face)</label>
             <div style={{ display: 'flex', gap: 8 }}>
@@ -1209,16 +1784,35 @@ function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string;
             </div>
           </div>
         )}
+        {/* S609 (Nic, DIRECTIVE): a flat per-unit charge is NOT editable here.
+            "It's a discrimination thing. If you're billing a flat rate per unit,
+             it needs to not be editable. It needs to be set at the property level
+             the same way late fees are... anybody that's opted into it
+             automatically gets the flat twenty five dollars."
+            An editable-per-meter amount is a way to bill two identical units two
+            different amounts for the same service. The rate lives on the property
+            (Rates, above); what stays per-unit is only WHETHER the unit is on the
+            meter — a resident hauling their own trash is simply not assigned. */}
         {method === 'flat_rate' && (
-          <div style={{ marginBottom: 10 }}>
-            <label style={lbl}>Flat amount per unit ($/cycle) *</label>
-            <input className="input" type="number" step="0.01" value={baseFee} onChange={e => setBaseFee(e.target.value)} placeholder="e.g. 20.00" style={{ width: '100%' }} />
+          <div style={{ marginBottom: 10, padding: 10, borderRadius: 8,
+                        background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)' }}>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 4 }}>
+              The amount comes from this property&apos;s {utilityType} rate
+            </div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+              Every unit on this meter is billed the same amount, set once in <strong>Rates</strong> at
+              the top of this page — so two identical units can never be charged differently for the
+              same service. Choose which units are on it after you create the meter; anyone who opts
+              out simply isn&apos;t assigned.
+            </div>
           </div>
         )}
         {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginBottom: 8 }}>{error}</div>}
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" disabled={!canSave || create.isLoading} onClick={() => create.mutate()}>{create.isLoading ? 'Adding…' : 'Add meter'}</button>
+          <button className="btn btn-primary" disabled={!canSave || save.isLoading} onClick={() => save.mutate()}>
+            {save.isLoading ? (editing ? 'Saving…' : 'Adding…') : (editing ? 'Save changes' : 'Add meter')}
+          </button>
         </div>
       </div>
     </div>

@@ -19,7 +19,7 @@ import type { ScheduledTask } from 'node-cron'
 import { query } from '../db'
 import { logger } from '../lib/logger'
 
-export type EngineId = 'lateFees' | 'invoices'
+export type EngineId = 'lateFees' | 'invoices' | 'autopay'
 
 interface EngineConfig {
   /** IANA cron expression, evaluated in the property's local timezone. */

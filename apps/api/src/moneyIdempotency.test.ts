@@ -31,6 +31,12 @@ const IDEMPOTENT_BY_OTHER: Record<string, string> = {
   deposit:      'one-shot at move-in (jobs/moveInBundle) — not recurring',
   float_fee:    'FlexPay accrual is guarded upstream in services/flexpay (per-cycle), not re-billed by a payments cron',
   platform_fee: 'platform-fee accrual is guarded in jobs/platformFeeAccrual (per unit/month), not re-billed by a payments cron',
+  // S609: found BY this guard — carried_balance shipped without a declaration.
+  // A landlord types an opening balance in by hand; there is no cron. The route
+  // checked for an existing one and then inserted, which races, so S609 added
+  // ux_invoices_one_opening_balance_per_lease to make the rule real. The route's
+  // own check stays for the friendly 409.
+  carried_balance: 'ux_invoices_one_opening_balance_per_lease — one opening-balance invoice per lease, DB-enforced (S609); landlord-entered one-shot, no cron',
 }
 
 function parsePaymentTypes(): string[] {

@@ -1,4 +1,23 @@
 /**
+ * S609 — DEAD CODE, PENDING DELIBERATE REMOVAL.
+ *
+ * This applied a tenant's rent money to accelerated propane FIRST. Nic ruled
+ * that out explicitly:
+ *
+ *   "It's gonna apply the payment to the oldest charge, which would supersede
+ *    the rent, which would still end up letting the tenant acquire late fees if
+ *    the tenant can't pay the whole thing."
+ *
+ * Late fees are computed on RENT alone, so anything that lets propane take money
+ * ahead of rent manufactures the late fee it was trying to avoid.
+ *
+ * Acceleration was removed in S609, so NOTHING sets propane_fill_installments
+ * .accelerated any more and the query below can never match. Left in place
+ * rather than deleted under context pressure at the end of a long session —
+ * removing a money-path subsystem deserves its own pass. Delete the service, its
+ * call in routes/webhooks, and the `accelerated` column together.
+ */
+/**
  * Accelerated-propane payment redistribution (Nic, S533).
  *
  * Priority order for tenant funds: GAM balance → accelerated propane →

@@ -10,6 +10,7 @@ import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { promoteNextWaitlister } from '../services/propertyBooking'
+import { linkUnitToSubtype } from '../services/unitSubtype'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
 import { unitPendingReads } from '../services/utilityReadingRuns'
@@ -135,8 +136,12 @@ unitsRouter.get('/:id', async (req, res, next) => {
         -- S573: unit settings lock while a lease is active/pending (rent is
         -- committed to the signed doc). Free to edit only between leases.
         EXISTS (SELECT 1 FROM leases le WHERE le.unit_id = u.id
-                  AND le.status IN ('active','pending')) AS has_active_lease
+                  AND le.status IN ('active','pending')) AS has_active_lease,
+        -- S613: the unit's subtype, so the page can SHOW what class this space
+        -- is. subtype_id has been stored since S527 and displayed nowhere.
+        st.name AS subtype_name
       FROM units u
+      LEFT JOIN property_unit_subtypes st ON st.id = u.subtype_id
       JOIN properties p ON p.id = u.property_id
       JOIN landlords l ON l.id = u.landlord_id
       JOIN users ul ON ul.id = l.user_id
@@ -206,7 +211,18 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // stripped it — the "Initial Status" picker was a silent no-op and
       // every unit was born vacant. Suspended stays excluded (eviction-mode
       // coupling, S524). direct_pay retired W-15/S531.
-      status:          z.enum(['vacant', 'active']).default('vacant'),
+      // S609 (Nic): OWNER-OCCUPIED is settable at creation. It was only
+      // available by creating the unit and then changing it in the units list,
+      // which is why Nic was marking his own occupied spots VACANT: "I'm marking
+      // them all vacant on setup because there's no way to mark them owner
+      // occupied." A vacant-marked owner unit is not cosmetic — it takes no
+      // share of a RUBS split, so the owner's own utility usage lands on the
+      // paying tenants.
+      status:          z.enum(['vacant', 'active', 'owner_use']).default('vacant'),
+      // How many people live in an owner-occupied unit. Read only when
+      // status='owner_use' — such a unit has no lease, so there are no tenants
+      // to count for a headcount-based utility split.
+      ownerHouseholdSize: z.number().int().min(1).max(30).optional(),
     }).parse(req.body)
 
     // Verify the calling user can manage units on this property's landlord.
@@ -340,9 +356,9 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
-                           is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, occupancy_mode)
+                           is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, owner_household_size, occupancy_mode)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb,
+                $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb, $27,
                 -- S558: new unit inherits the property's default occupancy mode
                 -- (a seed, not a governing setting — the unit owns it after).
                 (SELECT default_occupancy_mode FROM properties WHERE id=$1))
@@ -350,7 +366,8 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
          nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
-         isRv, leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features)]
+         isRv, leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features),
+         body.ownerHouseholdSize ?? 1]
       )
       created.push(unit)
       } catch (err: any) {
@@ -524,6 +541,20 @@ export const UNIT_CLONE_COPIED = [
   'storage_size', 'subtype_id', 'dwelling_ownership', 'occupancy_mode',
   'lot_rent_amount', 'is_multi_level', 'is_ada_accessible', 'floor_level',
   'features', 'living_areas',
+  // S609: added by the S608 utility work and never classified — the drift guard
+  // caught it. It COPIES: how many water fixtures a space has is a fact about
+  // the physical space, and retire-and-replace is the same space under a new
+  // number. Left uncopied it would silently reset to nothing, and a unit on a
+  // fixture-count water split would then contribute zero — under-billing that
+  // unit and over-billing every neighbour on the same meter.
+  'water_fixture_count',
+  // S609: same reasoning. Retire-and-replace is a RENUMBERING of one physical
+  // space, not a turnover — the same household is still in it. Resetting this to
+  // 1 would silently shrink an owner-occupied unit's share of a utility split
+  // the next time it is marked owner-occupied, pushing the difference onto the
+  // tenants. (Status itself still resets to vacant; this is a fact about the
+  // household preserved, not an occupancy state carried over.)
+  'owner_household_size',
 ] as const
 
 /**
@@ -927,6 +958,8 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
       rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
       storageSize:     z.string().max(40).nullable().optional(),
       lotRentAmount:   z.number().min(0).optional(),
+      // S609: household size for an OWNER-OCCUPIED unit — see the migration.
+      ownerHouseholdSize: z.number().int().min(1).max(30).optional(),
       nightlyRate:     z.number().min(0).nullable().optional(),
       weeklyRate:      z.number().min(0).nullable().optional(),
       monthlyRate:     z.number().min(0).nullable().optional(),
@@ -1008,13 +1041,54 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
         rv_site_layout=$11, rv_amp_service=$12, storage_size=$13,
         lot_rent_amount=$14, nightly_rate=$15, weekly_rate=$16, monthly_rate=$17,
         is_bookable=$18, lease_types_allowed=$19::text[], floor_level=$21,
-        living_areas=$22, features=$23::jsonb, updated_at=NOW()
+        living_areas=$22, features=$23::jsonb,
+        owner_household_size=COALESCE($24, owner_household_size), updated_at=NOW()
       WHERE id=$20 RETURNING *`,
       [unitType, bedrooms, bathrooms, sqft, rentAmount, securityDeposit, dwellingOwnership,
        isMultiLevel, isAdaAccessible, occupancyMode, rvLayout, rvAmp, storageSize,
        lotRentAmount, nightlyRate, weeklyRate, monthlyRate, isBookable, leaseTypesAllowed,
-       req.params.id, floorLevel, livingAreas, JSON.stringify(features)])
+       req.params.id, floorLevel, livingAreas, JSON.stringify(features),
+       body.ownerHouseholdSize ?? null])
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/subtype — S613 (Nic): "I wanna figure out how to link
+// subtypes to different units because there's nowhere that I can see that
+// links those."
+//
+// Deliberately NOT part of PATCH /:id/details, which is locked whole while a
+// lease is active because rent is committed to the signed document. Saying
+// which class a space belongs to commits nothing, so it stays available on an
+// occupied unit — otherwise a full park could never classify a single space.
+// Applying the subtype's values is the part that respects the lock: physical
+// facts always, pricing only between leases (see services/unitSubtype).
+unitsRouter.patch('/:id/subtype', requirePerm('schedule.configure_unit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      subtypeId:    z.string().uuid().nullable(),
+      applyDetails: z.boolean().optional(),
+    }).parse(req.body)
+
+    const unit = await queryOne<any>(`
+      SELECT u.id, u.unit_number, u.unit_type, u.property_id, u.landlord_id, u.retired_at,
+             EXISTS (SELECT 1 FROM leases l WHERE l.unit_id = u.id
+                       AND l.status IN ('active','pending')) AS leased
+        FROM units u WHERE u.id = $1`, [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (unit.retired_at) throw new AppError(409, 'A retired unit keeps the details it was retired with.')
+
+    try {
+      const out = await linkUnitToSubtype(unit, body.subtypeId, { applyDetails: !!body.applyDetails })
+      res.json({ success: true, data: {
+        subtypeId: out.subtype?.id ?? null,
+        subtypeName: out.subtype?.name ?? null,
+        pricingHeldBack: out.pricingHeldBack,
+      } })
+    } catch (e: any) {
+      throw new AppError(400, e?.message || 'Could not set that subtype')
+    }
   } catch (e) { next(e) }
 })
 

@@ -15,13 +15,15 @@
  *   - <SavedMethodsCard methods={...} /> — read-only summary surface
  *   - Types: SavedPaymentMethod / SavedAch / SavedCard / PayTarget
  *
- * Backend pricing math lives in services/stripeConnect.computeApplicationFee
- * (S113/S552: flat $6 ACH; 3.25% + $0.26/txn card, +1.5% non-US-issued).
- * Frontend never computes the fee — it's shown in the authorization line
- * as customer-facing copy only.
+ * Backend pricing math lives in services/stripeConnect.computeApplicationFee.
+ * Frontend never computes a fee and never types one: any price shown here comes
+ * from achFeeLabel() / cardFeeLabel(), which derive from PROCESSING_FEES.
+ * (This header used to quote "flat $6 ACH; 3.25% + $0.26/txn card" — already two
+ * repricings out of date by S607, which is precisely why S604 made the labels
+ * derived rather than written.)
  */
 import { useState, useEffect, useMemo } from 'react'
-import { isValidRoutingNumber, microdepositInstruction, type MicrodepositType } from '@gam/shared'
+import { isValidRoutingNumber, microdepositInstruction, achFeeLabel, cardFeeLabel, type MicrodepositType } from '@gam/shared'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
@@ -69,6 +71,11 @@ export interface PayTarget {
   // fee). When set, `amount` is the aggregate shown in the header; the per-lease
   // amounts come from here. Overrides leaseId/sendAmountInBody.
   batch?: { leaseId: string; amount: number }[]
+  // S609 pay-ahead (Nic): roughly what the balance plus the rest of the lease
+  // term comes to — a SUGGESTION shown beside the box, never a limit. Present =
+  // the amount box is offered. Absent = the old fixed-amount behaviour, which is
+  // what every non-rent target (a utility bill, a single charge) still wants.
+  suggestedPayAhead?: number
 }
 
 interface PayResponse {
@@ -190,6 +197,12 @@ export function PayNowModal({
   // S571: pre-select the tenant's default method (ACH by default).
   const initialId  = payable.find((m) => m.isDefault)?.id ?? payable[0]?.id ?? ''
   const [selectedId, setSelectedId] = useState<string>(initialId)
+  // S609: what the tenant is actually paying. Starts at their balance — the
+  // common case is still "pay what I owe" and that must stay one click. Typing
+  // a bigger number pays future months ahead.
+  const canPayAhead = target.suggestedPayAhead != null
+  const [amount, setAmount] = useState<number>(target.amount)
+  const [amountText, setAmountText] = useState<string>(target.amount.toFixed(2))
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -207,13 +220,13 @@ export function PayNowModal({
     { base: number; fee: number; total: number; method: 'ach' | 'card'; tenantPaysFee: boolean; intlCardSurcharge: boolean } | null
   >(null)
   useEffect(() => {
-    if ((target.batch && target.batch.length > 0) || !selectedType) { setQuote(null); return }
+    if ((target.batch && target.batch.length > 0) || !selectedType || !(amount > 0)) { setQuote(null); return }
     let cancelled = false
-    apiPost<any>('/payments/quote', { amount: target.amount, method: selectedType, leaseId: target.leaseId })
+    apiPost<any>('/payments/quote', { amount, method: selectedType, leaseId: target.leaseId })
       .then((res: any) => { if (!cancelled) setQuote(res?.data ?? null) })
       .catch(() => { if (!cancelled) setQuote(null) })
     return () => { cancelled = true }
-  }, [selectedType, target.amount, target.leaseId])
+  }, [selectedType, amount, target.leaseId])
 
   const submit = async () => {
     if (!selectedMethod) {
@@ -274,7 +287,7 @@ export function PayNowModal({
       const res = await apiPost<PayResponse>(target.endpoint, {
         paymentMethodId:   selectedMethod.id,
         paymentMethodType: selectedMethod.type,
-        ...(target.sendAmountInBody ? { amount: target.amount } : {}),
+        ...(target.sendAmountInBody ? { amount } : {}),
         ...(target.leaseId ? { leaseId: target.leaseId } : {}),
       })
       const status = (res as any)?.data?.status
@@ -299,10 +312,17 @@ export function PayNowModal({
     }
   }
 
+  // Batch ("pay all") keeps its fixed per-lease amounts — the box is not offered
+  // there, so nothing to validate.
+  const amountInvalid = !target.batch?.length && (
+    !(amount > 0) ||
+    amount < target.amount - 0.005
+  )
+
   const noMethods = methods.length === 0
 
   return (
-    <ModalShell onClose={onClose} title={`Pay ${formatCurrency(target.amount)}`}>
+    <ModalShell onClose={onClose} title={`Pay ${formatCurrency(target.batch?.length ? target.amount : amount)}`}>
       <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginBottom: 12 }}>
         {target.subheader}
       </div>
@@ -332,6 +352,68 @@ export function PayNowModal({
         </div>
       ) : (
         <>
+          {/* S609 pay-ahead (Nic): "if somebody prepays a full year ahead of
+              time, that money sits on GAM's books, and we disburse to the
+              landlord each month as invoice comes due."
+
+              The box starts at the balance, so paying what you owe is still one
+              click and nobody has to think about this. Typing MORE pays future
+              months ahead. Typing LESS is refused — rent is paid in full, and a
+              partial payment can restart an eviction clock. */}
+          {canPayAhead && !success && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginBottom: 6 }}>Amount</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ position: 'relative', flex: 1 }}>
+                  <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--t3)', fontFamily: 'var(--font-mono)' }}>$</span>
+                  <input
+                    className="inp"
+                    inputMode="decimal"
+                    value={amountText}
+                    onChange={(e) => {
+                      const raw = e.target.value.replace(/[^0-9.]/g, '')
+                      setAmountText(raw)
+                      const n = Number(raw)
+                      setAmount(Number.isFinite(n) ? Math.round(n * 100) / 100 : 0)
+                    }}
+                    onBlur={() => setAmountText(amount > 0 ? amount.toFixed(2) : '')}
+                    style={{ width: '100%', paddingLeft: 24, fontFamily: 'var(--font-mono)', fontWeight: 700 }}
+                  />
+                </div>
+                {Math.abs(amount - target.amount) > 0.005 && (
+                  <button
+                    className="btn btn-g btn-sm"
+                    onClick={() => { setAmount(target.amount); setAmountText(target.amount.toFixed(2)) }}
+                  >
+                    Just what I owe
+                  </button>
+                )}
+              </div>
+              {/* S609 (Nic): NO CEILING. The suggestion below is guidance, not a
+                  limit — utilities aren't known until a meter is read, so any cap
+                  lands wrong at the end of a lease and forces a refund. */}
+              {amount < target.amount - 0.005 ? (
+                <div style={{ fontSize: '.74rem', color: 'var(--warn)', marginTop: 6, lineHeight: 1.5 }}>
+                  Rent is paid in full — the least you can pay is {formatCurrency(target.amount)}.
+                </div>
+              ) : amount > target.amount + 0.005 ? (
+                <div style={{ fontSize: '.74rem', color: 'var(--green)', marginTop: 6, lineHeight: 1.5 }}>
+                  {formatCurrency(target.amount)} clears your balance and the extra{' '}
+                  <strong>{formatCurrency(Math.round((amount - target.amount) * 100) / 100)}</strong> is held
+                  as credit on your account. It comes off each bill automatically as it arrives — rent,
+                  utilities, everything — and anything left over comes back to you when you move out.
+                </div>
+              ) : (
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+                  You can pay more than you owe to cover future months — there&apos;s no limit.
+                  {(target.suggestedPayAhead ?? 0) > target.amount + 0.005 && (
+                    <> About {formatCurrency(target.suggestedPayAhead ?? 0)} covers the rest of your lease.</>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginBottom: 6 }}>Pay from</div>
 
           {achMethods.length > 0 && (
@@ -460,14 +542,14 @@ export function PayNowModal({
           <button
             className="btn btn-p"
             style={{ width: '100%' }}
-            disabled={!selectedId || submitting || !!success || selectedPending}
+            disabled={!selectedId || submitting || !!success || selectedPending || amountInvalid}
             onClick={submit}
           >
             {submitting
               ? 'Submitting…'
               : success
                 ? '✓ Submitted'
-                : `Pay ${formatCurrency(quote?.total ?? target.amount)}`}
+                : `Pay ${formatCurrency(quote?.total ?? (target.batch?.length ? target.amount : amount))}`}
           </button>
           <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 10, lineHeight: 1.5 }}>
             {authorizationCopy(selectedType, target.kind)}
@@ -602,7 +684,7 @@ export function AddPaymentMethodModal({
   const titleVerb  = method === 'ach' ? 'bank account' : 'card'
   const idleCopy   =
     method === 'ach'
-      ? 'Enter your bank\'s routing and account numbers. Stripe then sends a small verification deposit — depending on your bank you\'ll confirm either the deposit amounts or a six-digit code from your statement, usually within 1–3 business days. No fees. Need to pay right now? Use a card instead.'
+      ? 'Enter your bank\'s routing and account numbers. Stripe then sends a small verification deposit — depending on your bank you\'ll confirm either the deposit amounts or a short code from your statement, usually within 1–3 business days. No fees. Need to pay right now? Use a card instead.'
       : 'We\'ll collect your card securely through Stripe. Card details never touch GAM\'s servers; we only see the last 4 digits, brand, and expiration once Stripe attaches the card to your account.'
   const loadingCopy = method === 'ach' ? 'Preparing secure bank form…' : 'Preparing secure card form…'
   const doneCopy    = method === 'ach' ? '✓ Bank account verified' : '✓ Card saved'
@@ -1109,7 +1191,29 @@ export function VerifyMicrodepositsCard({ onVerified }: { onVerified?: () => voi
       .catch(() => setState({ pending: false }))
   }, [])
 
-  if (!state?.pending || done) return null
+  // S607 (Nic): "I thought inputting the code was completing the verification."
+  // It does — but the card used to just VANISH on success, which reads as the
+  // submission having gone nowhere, and the "Pending verification" badge beside
+  // it stayed up for a moment longer (see the refetch schedule in submit()).
+  // Confirm plainly instead of disappearing.
+  if (done) {
+    return (
+      <div className="card" style={{ marginBottom: 16, borderLeft: '3px solid var(--green, #16a34a)' }}>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>✓ Code accepted — your bank is verified</div>
+        <div style={{ fontSize: '.82rem', color: 'var(--t2)', lineHeight: 1.55 }}>
+          {/* S607 (Nic): the promotion is disclosed, never silent. Which account
+              rent comes out of is a money setting, and the tenant should learn
+              it from us rather than from a statement. The switch back is one tap
+              on the payment-method list below. */}
+          We've made this bank your <strong>default</strong> — paying by bank is {achFeeLabel()},
+          instead of {cardFeeLabel()} on a card. You can switch back to a card any time below.
+          If it still shows as pending, give it a few seconds — we're confirming with your bank
+          and the page updates on its own.
+        </div>
+      </div>
+    )
+  }
+  if (!state?.pending) return null
   // S605 (Nic): THREE states, not two. Stripe picks per bank, and when it
   // hasn't told us we must not guess — an unknown type shows BOTH inputs and
   // lets the tenant enter whichever their bank actually sent. Guessing strands
@@ -1139,7 +1243,15 @@ export function VerifyMicrodepositsCard({ onVerified }: { onVerified?: () => voi
       }
       await apiPost('/stripe/tenant/microdeposits/verify', body)
       setDone(true)
+      // S607 (Nic): the code is accepted here, but the tenant is not marked
+      // verified until Stripe's setup_intent.succeeded webhook lands — which is
+      // fast, but NOT instant (0.16s in the live WAFD test, and slower under
+      // load). A single refetch fired now races that webhook and usually loses,
+      // which is why the "Pending verification" badge survived a successful
+      // verification with nothing scheduled to look again. Re-check on a short
+      // schedule so the badge clears itself instead of needing a reload.
       onVerified?.()
+      for (const ms of [1500, 4000, 9000]) setTimeout(() => onVerified?.(), ms)
     } catch (e: any) {
       // Stripe's own wording distinguishes "wrong, try again" from "locked, start
       // over" — surfacing it verbatim beats a generic message that strands them.
@@ -1153,10 +1265,10 @@ export function VerifyMicrodepositsCard({ onVerified }: { onVerified?: () => voi
       <div style={{ fontWeight: 600, marginBottom: 4 }}>Finish setting up your bank account</div>
       <div style={{ fontSize: '.82rem', color: 'var(--t2)', lineHeight: 1.55, marginBottom: 12 }}>
         {byCode
-          ? 'We sent a $0.01 deposit to your bank. Find it on your statement — the description contains a 6-digit code. Enter that code below.'
+          ? 'We sent a $0.01 deposit to your bank. Find it on your statement — the description contains a code starting with SM. Enter that code below. Your bank may print its own reference number next to it; the one we need is the SM code.'
           : byAmts
             ? 'We sent two small deposits to your bank. Check your account, then enter both amounts below in cents (for example, 32 and 45).'
-            : 'We sent a verification deposit to your bank. Banks handle this one of two ways — check your statement and use whichever you see: two small deposits (enter both amounts), or a single $0.01 deposit with a 6-digit code in its description (enter the code).'}
+            : 'We sent a verification deposit to your bank. Banks handle this one of two ways — check your statement and use whichever you see: two small deposits (enter both amounts), or a single $0.01 deposit with a code starting with SM in its description (enter the code).'}
       </div>
 
       {error && <div className="alert a-warn" style={{ marginBottom: 10, fontSize: '.8rem' }}>{error}</div>}
@@ -1165,12 +1277,20 @@ export function VerifyMicrodepositsCard({ onVerified }: { onVerified?: () => voi
         <div style={{ marginBottom: 10 }}>
           {unknown && (
             <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--t3)', marginBottom: 4 }}>
-              If you see one $0.01 deposit with a code
+              If you see one $0.01 deposit with an SM code
             </div>
           )}
           <input
-            className="input" value={code} onChange={e => setCode(e.target.value)}
-            placeholder="6-digit code" maxLength={12} style={{ width: '100%' }}
+            className="input" value={code}
+            // S607 (Nic): force upper case as they type, so what the tenant sees
+            // is exactly what we send. The API upper-cases too, but a field that
+            // silently transforms on submit is its own small betrayal — and a
+            // wrong guess here is not free, Stripe locks the verification after
+            // a few.
+            onChange={e => setCode(e.target.value.toUpperCase())}
+            autoCapitalize="characters" autoCorrect="off" spellCheck={false}
+            placeholder="SM1234" maxLength={12}
+            style={{ width: '100%', textTransform: 'uppercase' }}
           />
         </div>
       )}

@@ -8,7 +8,7 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, type FeePayer } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, MANUAL_PAYMENT_FEE, MANUAL_PAYMENT_FEE_SCOPE, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
@@ -65,7 +65,7 @@ function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
   if (!allocationRule) return null
   const ach      = (allocationRule.achFeePayer      || allocationRule.bankingFeePayer || 'tenant') as FeePayer
   const card     = (allocationRule.cardFeePayer     || allocationRule.bankingFeePayer || 'tenant') as FeePayer
-  const platform = (allocationRule.platformFeePayer || 'landlord')                                  as FeePayer
+  const manual   = (allocationRule.manualFeePayer   || 'tenant')                                    as FeePayer
   const chip = (label: string, payer: FeePayer) => (
     <span
       key={label}
@@ -93,7 +93,7 @@ function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
       {chip('ACH', ach)}
       {chip('Card', card)}
-      {chip('SaaS', platform)}
+      {chip('Cash', manual)}
     </div>
   )
 }
@@ -215,6 +215,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       cardFeePayer: 'tenant' as FeePayer,
       platformFeePayer:
         (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
+      // S607 (Nic): who reimburses the $10 cash/check/money-order fee.
+      manualFeePayer:
+        (property?.allocationRule?.manualFeePayer || 'tenant') as FeePayer,
       rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',
       rentPercentFloor: property?.allocationRule?.rentPercentFloor != null ? String(property.allocationRule.rentPercentFloor) : '',
       rentPercentCeiling: property?.allocationRule?.rentPercentCeiling != null ? String(property.allocationRule.rentPercentCeiling) : '',
@@ -267,6 +270,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         const oldAch       = arOld.achFeePayer       || arOld.bankingFeePayer || 'tenant'
         const oldCard      = arOld.cardFeePayer      || arOld.bankingFeePayer || 'tenant'
         const oldPlatform  = arOld.platformFeePayer  || 'landlord'
+        const oldManual    = arOld.manualFeePayer    || 'tenant'
+        if (arNew.manualFeePayer   && arNew.manualFeePayer   !== oldManual)   allocPatch.manualFeePayer   = arNew.manualFeePayer
         if (arNew.achFeePayer      && arNew.achFeePayer      !== oldAch)      allocPatch.achFeePayer      = arNew.achFeePayer
         if (arNew.cardFeePayer     && arNew.cardFeePayer     !== oldCard)     allocPatch.cardFeePayer     = arNew.cardFeePayer
         if (arNew.platformFeePayer && arNew.platformFeePayer !== oldPlatform) allocPatch.platformFeePayer = arNew.platformFeePayer
@@ -342,6 +347,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       ...form,
       allocationRule: {
         achFeePayer:       ar.achFeePayer,
+        manualFeePayer:    ar.manualFeePayer,
         cardFeePayer:      ar.cardFeePayer,
         platformFeePayer:  ar.platformFeePayer,
         rentPercent: num(ar.rentPercent),
@@ -631,7 +637,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
 
             <FeePayerToggle
               label="ACH processing"
-              hint="1.0% capped at $6.00 per ACH debit"
+              hint={`${achFeeLabel()} per bank debit`}
               value={form.allocationRule.achFeePayer}
               onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, achFeePayer: v } }))}
             />
@@ -643,12 +649,30 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 Tenant pays — always (landlords never cover card)
               </div>
             </div>
+            {/* S607 (Nic): "we need a toggle for them to cover old-fashioned
+                payment costs if they want to... that way the landlord isn't
+                surprised." GAM recovers the $10 from the landlord's collections
+                either way; this decides only whether the TENANT is invoiced to
+                reimburse them. Every tenant's FIRST payment is free regardless. */}
             <FeePayerToggle
-              label="Platform SaaS fee"
-              hint="$2 per occupied unit per month (min $10/property/mo)"
-              value={form.allocationRule.platformFeePayer}
-              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, platformFeePayer: v } }))}
+              label="Cash, check or money order"
+              hint={`$${MANUAL_PAYMENT_FEE.toFixed(2)} per payment: ${MANUAL_PAYMENT_FEE_SCOPE}. Waived on a tenant's FIRST payment only — and only if that first payment is one of these. Pay by card first and there is no waiver later.`}
+              value={form.allocationRule.manualFeePayer}
+              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, manualFeePayer: v } }))}
             />
+            {/* S607 lock (Nic): "the landlord cannot toggle the platform fee
+                because when we change for volume discounts or things like that,
+                that needs to not affect what the tenants are paying." GAM's
+                commercial terms with a landlord must never reach a tenant's
+                bill. Shown but not selectable — same treatment as the card lock,
+                for the mirror-image reason. */}
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Platform SaaS fee</div>
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>$2 per occupied unit per month (min $10/property/mo)</div>
+              <div style={{ padding: '6px 10px', borderRadius: 8, fontSize: '.74rem', border: '1px solid var(--border-0)', background: 'var(--bg-2)', color: 'var(--text-2)' }}>
+                You pay — always (never passed to tenants)
+              </div>
+            </div>
 
             {!isEdit && <>
               <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 6, marginTop: 10, color: 'var(--text-2)' }}>

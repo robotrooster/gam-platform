@@ -5,12 +5,14 @@ import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
-         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE,
+         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE, paymentMethodCosts,
          PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computeApplicationFee, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
+import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
+         suggestedPayAheadFor } from '../services/rentCharge'
 import { allocateOldestFirst } from '@gam/shared'
 import { getClient } from '../db'
 import { logger } from '../lib/logger'
@@ -205,8 +207,9 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         if (unit.float_fee_active) {
           await query(`
             INSERT INTO payments
-              (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
-            VALUES ($1,$2,$3,'float_fee',$4,'pending','ONTIMEPAY',$5)`,
+              (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, revenue_owner)
+            -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share.
+            VALUES ($1,$2,$3,'float_fee',$4,'pending','ONTIMEPAY',$5,'gam')`,
             [unit.id, unit.tenant_profile_id, unit.landlord_id, PLATFORM_FEES.FLOAT_FEE_MO, dueDate]
           )
         }
@@ -583,16 +586,73 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
 // S537: everything the tenant's Pay Now card needs in one fetch — the
 // outstanding oldest-first ledger + the total. Rent is pay-in-full only
 // (Nic) — no partial-payment concept, so nothing about partials is sent.
+// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
+// visible to them so they can track it. If the landlord is not covering the ten
+// dollars, it doesn't need to be visible to them."
+//
+// When the tenant reimburses it, the landlord is whole and the fee is none of
+// their business — it appears on the tenant's bill and nowhere else. When the
+// landlord ABSORBS it, it is a real cost that reduces their payout, and an
+// unexplained deduction is exactly the surprise the onboarding toggle exists to
+// prevent: ten cash payments is $100 off a disbursement with nothing naming it.
+//
+// Reads platform_revenue_ledger, which is otherwise admin-only (finances.ts
+// deliberately does not expose it) — so this endpoint is narrowly scoped to ONE
+// reference_type and to properties the caller actually owns or manages.
+paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
+  try {
+    const role = req.user!.role
+    const landlordId = role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    if (!landlordId) throw new AppError(403, 'Landlord scope required')
+    const months = Math.min(24, Math.max(1, Number(req.query.months) || 6))
+
+    const rows = await query<any>(`
+      SELECT prl.id, prl.amount::float AS amount, prl.created_at, prl.notes,
+             p.id AS property_id, p.name AS property_name,
+             u.unit_number
+        FROM platform_revenue_ledger prl
+        JOIN properties p ON p.id = prl.property_id
+        LEFT JOIN payments pay ON pay.id = prl.reference_id
+        LEFT JOIN units u ON u.id = pay.unit_id
+       WHERE prl.reference_type = 'manual_payment_fee'
+         AND p.landlord_id = $1
+         AND prl.created_at >= NOW() - ($2::int * INTERVAL '1 month')
+       ORDER BY prl.created_at DESC
+       LIMIT 500`, [landlordId, months])
+
+    const total = Math.round(rows.reduce((s: number, r: any) => s + r.amount, 0) * 100) / 100
+    res.json({ success: true, data: { total, count: rows.length, months, rows } })
+  } catch (e) { next(e) }
+})
+
 paymentsRouter.get('/balance-context', async (req: any, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
     const rows = await query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
-              p.entry_description, p.lease_id, u.payment_block,
-              u.unit_number, pr.name AS property_name
+              p.entry_description, p.notes, p.lease_id, u.payment_block,
+              u.unit_number, pr.name AS property_name,
+              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
+              -- S607: has this tenant ever had rent satisfied? The first manual
+              -- payment is free, so the quote must know which side of that the
+              -- tenant is on rather than promising a discount they already spent.
+              --
+              -- Scoped EXACTLY as record-manual scopes it: by lease when the row
+              -- carries one, otherwise by tenant. record-manual falls back the
+              -- same way (scopeCol = lease_id when present, else tenant_id),
+              -- and a quote that scopes differently from the charge is the drift
+              -- this whole breakdown exists to avoid.
+              NOT EXISTS (
+                SELECT 1 FROM payments pp
+                 WHERE pp.type = 'rent'
+                   AND pp.status IN ('settled', 'paid_via_deposit')
+                   AND (CASE WHEN p.lease_id IS NOT NULL
+                             THEN pp.lease_id = p.lease_id
+                             ELSE pp.tenant_id = p.tenant_id END)) AS manual_first_free
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
+         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
@@ -606,18 +666,42 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     const byLease = new Map<string, {
       leaseId: string; propertyName: string; unitNumber: string
       paymentBlocked: boolean; outstanding: number; rows: any[]
+      manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
     }>()
     for (const r of rows) {
       let g = byLease.get(r.lease_id)
       if (!g) {
         g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
-              paymentBlocked: !!r.payment_block, outstanding: 0, rows: [] }
+              paymentBlocked: !!r.payment_block, outstanding: 0, rows: [],
+              manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
         byLease.set(r.lease_id, g)
       }
       g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
       g.rows.push(r)
     }
-    const leases = [...byLease.values()]
+    // S607 (Nic): "maybe on the invoice, it can show a breakdown of what each
+    // bill would be by payment method... that way they see all the avenues and
+    // the price at the point the invoice comes out." Priced from the same
+    // formula that charges (processingFeeFor), so the quote is honoured.
+    const leases = await Promise.all([...byLease.values()].map(async l => {
+      const landlordCovers = l.manualFeePayer === 'landlord'
+      const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
+      return {
+        ...l,
+        methodCosts: paymentMethodCosts(l.outstanding, { manualFee }),
+        manualFeeCoveredByLandlord: landlordCovers,
+        manualFeeFirstFree: l.manualFirstFree,
+        // What the landlord is absorbing on their behalf, so the tenant can see
+        // it as a line rather than only as an absence.
+        manualFeeAbsorbed: landlordCovers ? MANUAL_PAYMENT_FEE : 0,
+        // S609: a SUGGESTION for the amount box — roughly what the balance plus
+        // the rest of the lease term's rent comes to. NOT a limit (Nic): a
+        // tenant may pay any amount above their balance, because utilities are
+        // unknowable until a meter is read and any ceiling lands wrong at the
+        // end of a lease.
+        suggestedPayAhead: Math.round((l.outstanding + await suggestedPayAheadFor(l.leaseId)) * 100) / 100,
+      }
+    }))
 
     res.json({ success: true, data: {
       totalOutstanding: total,
@@ -688,291 +772,27 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
 })
 
 paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
-  const client = await getClient()
   try {
-    const body = z.object({
-      amount:            z.number().positive(),
-      paymentMethodId:   z.string().min(1),
-      paymentMethodType: z.enum(['ach', 'card']),
-      // S581 (Nic): ONE lease per charge. A tenant with two leases (an overlap
-      // while moving to a bigger place, or two different landlords) pays each
-      // lease as its OWN ACH/card charge with its OWN receipt. Separate charges
-      // mean: (a) a bank shortfall fails only that lease, not both — the other
-      // still has a chance to clear; (b) the capped processing fee is charged
-      // per lease (one combined charge would let two people sharing a bank
-      // account share a single capped fee — a revenue leak AND a scam vector);
-      // (c) an eviction hold on one landlord's lease never blocks paying an
-      // unrelated landlord's lease. Omitted for the single-lease case (launch
-      // norm) — the one outstanding lease is resolved automatically.
-      leaseId:           z.string().uuid().optional(),
-    }).parse(req.body)
-
+    const body = chargeLeaseBalanceSchema.parse(req.body)
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Only tenants can call this endpoint')
     }
     const tenantId = req.user!.profileId
+    const leaseId = await resolveTargetLease(tenantId, body.leaseId ?? null)
 
-    // Resolve the ONE lease this charge settles. With an explicit leaseId, pay
-    // that lease; without one, fall back to the tenant's single outstanding
-    // lease (legacy one-button path) and refuse when they span several — the
-    // client must pick which lease to pay so each gets its own charge + receipt.
-    const outstandingLeases = await query<{ lease_id: string }>(
-      `SELECT DISTINCT p.lease_id
-         FROM payments p
-        WHERE p.tenant_id = $1
-          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
-               OR p.status = 'failed')`,
-      [tenantId])
-    if (outstandingLeases.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
-    let targetLeaseId = body.leaseId ?? null
-    if (targetLeaseId) {
-      if (!outstandingLeases.some(l => l.lease_id === targetLeaseId)) {
-        throw new AppError(409, 'That lease has nothing outstanding to pay')
-      }
-    } else if (outstandingLeases.length === 1) {
-      targetLeaseId = outstandingLeases[0].lease_id
-    } else {
-      throw new AppError(400, 'You have balances on more than one lease — pay each one separately.')
-    }
-
-    // The tenant's outstanding ledger FOR THIS LEASE, oldest first. Every row
-    // shares one lease → one unit → one landlord → one property, so ctx (row 0)
-    // is representative of the whole charge (incl. the eviction-hold check).
-    const rows = await query<any>(
-      `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
-              p.lease_id, p.unit_id, p.landlord_id,
-              u.property_id, u.payment_block,
-              t.stripe_customer_id,
-              l.user_id AS landlord_user_id,
-              -- S554 Connect re-anchor: entity account + its flags preferred,
-              -- founding-owner user account as transition fallback.
-              COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted,
-              -- S562: fee-payer toggle (see /:id/pay note) — from the allocation rule.
-              par.ach_fee_payer, par.card_fee_payer
-         FROM payments p
-         JOIN units u ON u.id = p.unit_id
-         JOIN tenants t ON t.id = p.tenant_id
-         JOIN landlords l ON l.id = p.landlord_id
-         JOIN users lu ON lu.id = l.user_id
-         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
-        WHERE p.tenant_id = $1
-          AND p.lease_id = $2
-          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
-               OR p.status = 'failed')
-        ORDER BY p.due_date ASC, p.created_at ASC`,
-      [tenantId, targetLeaseId]
-    )
-    if (rows.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
-    const ctx = rows[0]
-    if (ctx.payment_block) {
-      throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
-    }
-    if (!ctx.stripe_customer_id) {
-      throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
-    }
-
-    const totalOutstanding = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
-    // PAY-IN-FULL ONLY (Nic — supersedes the S537 per-property accept_partial
-    // toggle, now removed). Rent is ALWAYS the entire outstanding balance:
-    // reject any under-payment (a partial can reset a landlord's eviction clock)
-    // AND any over-payment (no pay-ahead — the UI has no amount field). The
-    // client sends the full balance; this is the server-side guarantee.
-    if (Math.abs(body.amount - totalOutstanding) > 0.005) {
-      throw new AppError(422,
-        `Rent must be paid in full — the outstanding balance is $${totalOutstanding.toFixed(2)}.`)
-    }
-
-    const plan = allocateOldestFirst(
-      rows.map((r: any) => ({ id: r.id, amount: r.amount, due_date: r.due_date })),
-      body.amount
-    )
-    const appliedTotal = Math.round((body.amount - plan.unapplied) * 100) / 100
-    const rowById = new Map(rows.map((r: any) => [r.id, r]))
-
-    const landlordConnectReady =
-      !!ctx.stripe_connect_account_id &&
-      ctx.connect_charges_enabled === true &&
-      ctx.connect_details_submitted === true
-
-    const stripe = getStripe()
-    let cardCountry: string | null = null
-    if (body.paymentMethodType === 'card') {
-      const pm = await stripe.paymentMethods.retrieve(body.paymentMethodId)
-      cardCountry = pm.card?.country ?? null
-    }
-
-    const baseApplicationFee = computeApplicationFee({
-      amount: body.amount,
-      paymentMethod: body.paymentMethodType,
-      cardCountry,
+    // S609: the charge itself lives in services/rentCharge so the autopay
+    // runner charges through the exact same code — one implementation of "how
+    // rent is charged", never two that can drift.
+    const result = await chargeLeaseBalance({
+      tenantId,
+      leaseId,
+      amount:            body.amount,
+      paymentMethodId:   body.paymentMethodId,
+      paymentMethodType: body.paymentMethodType,
+      source:            'portal',
     })
-
-    // Tenant-payer platform fee passthrough — same as /:id/pay.
-    const unpaidAccruals = await query<{ id: string; total_amount: string }>(
-      `SELECT id, total_amount FROM platform_fee_accruals
-        WHERE property_id = $1 AND payer = 'tenant'
-          AND tenant_charge_id IS NULL AND total_amount > 0`,
-      [ctx.property_id]
-    )
-    const passthroughAmount = unpaidAccruals.reduce((sum, r) => sum + parseFloat(r.total_amount), 0)
-
-    // Sublease markup — applies per covered RENT month (rare; sublessee pays
-    // marked-up rent, the markup goes to the sublessor at settle). S581: the
-    // per-month markup is STAMPED on each covered rent row below
-    // (sublease_markup_amount) so allocation subtracts it from the landlord's
-    // owner_share and the sublessor is credited that same amount — see the
-    // migration + the /:id/pay note. The aggregate here feeds display only.
-    let subleaseMarkup = 0
-    let subleasePerMonth = 0
-    const coveredRentIds: string[] = plan.lines
-      .filter(ln => rowById.get(ln.payment_id)?.type === 'rent'
-        && Math.abs(ln.amount_applied - rowById.get(ln.payment_id)!.amount) < 0.005)
-      .map(ln => ln.payment_id)
-    {
-      const sub = await queryOne<{ sub: string; master: string }>(
-        `SELECT s.sub_monthly_amount::text AS sub, s.master_share_amount::text AS master
-           FROM subleases s JOIN leases l ON l.id = s.master_lease_id
-          WHERE l.unit_id = $1 AND s.sublessee_tenant_id = $2 AND s.status = 'active'
-          LIMIT 1`,
-        [ctx.unit_id, tenantId],
-      )
-      if (sub) {
-        subleasePerMonth = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
-        subleaseMarkup = subleasePerMonth * coveredRentIds.length
-      }
-    }
-
-    const gamSupersedenceAmount = Math.min(body.amount, await computeTenantGamOutstandingTotal(tenantId))
-    const applicationFeeAmount = Math.round(
-      (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100) / 100
-
-    // S562: tenant-borne processing fee rides on top of the lump charge (see
-    // /:id/pay note). Fee-payer resolved from the first row's property (ctx) —
-    // same context the rest of this route uses; a single ACH/card transaction
-    // means one capped customer-facing fee on the whole lump, matching Stripe's
-    // single-transaction cost. Mirrors allocation.ts (`=== 'landlord'` only).
-    const feePayer = body.paymentMethodType === 'ach' ? ctx.ach_fee_payer : ctx.card_fee_payer
-    const tenantPaysProcessingFee = feePayer !== 'landlord'
-    // S562: processing fee (when tenant-borne) + tenant-payer platform-fee
-    // passthrough ride on top of the lump (see /:id/pay note). passthroughAmount
-    // is $0 when the platform fee is landlord-paid (launch default).
-    const tenantBorneOnTop = (tenantPaysProcessingFee ? baseApplicationFee : 0) + passthroughAmount
-    const chargeAmount = Math.round((body.amount + tenantBorneOnTop) * 100) / 100
-
-    // Create the remittance BEFORE the Stripe call so the PI metadata can
-    // carry its id; stamp the PI after.
-    await client.query('BEGIN')
-    const rem = await client.query<{ id: string }>(
-      `INSERT INTO tenant_remittances
-         (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, payment_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [tenantId, ctx.lease_id, ctx.landlord_id, body.amount.toFixed(2),
-       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), body.paymentMethodType])
-    const remittanceId = rem.rows[0].id
-
-    // Apply the plan: split the partial row, record every line.
-    const fullyCoveredIds: string[] = []
-    for (const line of plan.lines) {
-      const row = rowById.get(line.payment_id)!
-      const isFull = Math.abs(line.amount_applied - row.amount) < 0.005
-      let coveredPaymentId = line.payment_id
-      if (!isFull) {
-        // Split (propaneRedistribution pattern): the applied slice takes
-        // the charge; a remainder row stays pending — late fees remain
-        // truthful about the unpaid portion ("short is short").
-        const remainder = Math.round((row.amount - line.amount_applied) * 100) / 100
-        await client.query(
-          `UPDATE payments SET amount = $2::numeric,
-                  notes = COALESCE(notes || ' — ', '') || 'partially covered by Pay Now (FIFO application); $' || $3 || ' remains on a separate row'
-            WHERE id = $1`,
-          [row.id, line.amount_applied.toFixed(2), remainder.toFixed(2)])
-        await client.query(
-          `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id,
-                                 type, amount, status, due_date, entry_description, notes, is_remainder)
-           SELECT unit_id, lease_id, tenant_id, landlord_id, invoice_id,
-                  type, $2::numeric, 'pending', due_date, entry_description,
-                  'Remainder after FIFO application of a partial payment', TRUE
-             FROM payments WHERE id = $1`,
-          [row.id, remainder.toFixed(2)])
-      }
-      fullyCoveredIds.push(coveredPaymentId)
-      await client.query(
-        `INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied)
-         VALUES ($1, $2, $3)`,
-        [remittanceId, coveredPaymentId, line.amount_applied.toFixed(2)])
-    }
-
-    // S560 money-flow rebuild (Phase 1): ALWAYS platform charge — money held by
-    // GAM, batched to the landlord on the weekly run. See the /:id/pay note.
-    const intent = await createRentPlatformCharge({
-      amount: chargeAmount,
-      stripeCustomerId: ctx.stripe_customer_id,
-      paymentMethodId: body.paymentMethodId,
-      paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-      entryDescription: 'BALANCE',
-      metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
-    })
-
-    // Stamp the PI on every covered row — the standard webhook settle
-    // path (allocation engine, credit ledger, propane, supersedence)
-    // picks them ALL up by PI id, unchanged.
-    await client.query(
-      `UPDATE payments SET status = 'processing', stripe_payment_intent_id = $1,
-              platform_held = TRUE
-        WHERE id = ANY($2::uuid[])`,
-      [intent.id, fullyCoveredIds])
-    // S581: stamp the per-month sublease markup on each covered rent row so
-    // allocation nets it out of the landlord's owner_share (the sublessor is
-    // credited the same amount at settle). No-op when there's no markup.
-    if (subleasePerMonth > 0 && coveredRentIds.length > 0) {
-      await client.query(
-        `UPDATE payments SET sublease_markup_amount = $1 WHERE id = ANY($2::uuid[])`,
-        [subleasePerMonth.toFixed(2), coveredRentIds])
-    }
-    await client.query(
-      `UPDATE tenant_remittances SET stripe_payment_intent_id = $1, updated_at = NOW() WHERE id = $2`,
-      [intent.id, remittanceId])
-    if (unpaidAccruals.length > 0) {
-      // Claim passthrough accruals against the oldest covered row (the
-      // reconciliation anchor) — same one-winner semantics as /:id/pay.
-      await client.query(
-        `UPDATE platform_fee_accruals SET tenant_charge_id = $1, updated_at = NOW()
-          WHERE id = ANY($2::uuid[]) AND tenant_charge_id IS NULL`,
-        [fullyCoveredIds[0], unpaidAccruals.map(r => r.id)])
-    }
-    await client.query('COMMIT')
-
-    if (!landlordConnectReady) {
-      // Held fine; can't batch out until this landlord finishes Connect onboarding.
-      await createAdminNotification({
-        severity: 'warn',
-        category: 'platform_held_rent_charge',
-        title: `Held balance payment can't batch out — landlord ${ctx.landlord_user_id} not Connect-ready`,
-        body: `Remittance ${remittanceId} for $${body.amount.toFixed(2)} is held on the GAM platform balance. It batches to the landlord once they finish Connect onboarding.`,
-        context: { remittance_id: remittanceId, landlord_id: ctx.landlord_id, amount: body.amount },
-      })
-    }
-
-    res.json({
-      success: true,
-      data: {
-        remittanceId,
-        paymentIntentId: intent.id,
-        status: intent.status,
-        appliedTotal,
-        payAhead: plan.unapplied,
-        lines: plan.lines,
-        applicationFeeAmount,
-      },
-    })
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    next(e)
-  } finally {
-    client.release()
-  }
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
 })
 
 // POST /api/payments/:id/record-manual — S562.
@@ -1007,13 +827,15 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
 
     // Lock the rent row so a concurrent /pay can't settle it underneath us.
     const pmt = (await client.query<any>(
+      // S607: the properties join is gone with the 21-day gate it fed — nothing
+      // else in this route needed it.
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
               u.payment_block,
-              (pr.created_at > NOW() - INTERVAL '21 days') AS property_in_window
+              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer
          FROM payments p
          JOIN units u ON u.id = p.unit_id
-         JOIN properties pr ON pr.id = u.property_id
+         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = $1
           FOR UPDATE OF p`,
       [req.params.id])).rows[0]
@@ -1033,16 +855,27 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
     }
 
-    // Waiver (Nic, S570): the $10 manual fee is waived ONLY when BOTH hold:
-    //  (a) this is the tenant's FIRST satisfied rent on the lease, paid via THIS
-    //      manual recording — count prior SATISFIED rent rows (Stripe-settled or
-    //      already recorded manual/deposit). If they already paid an earlier
-    //      invoice (e.g. by card), priorPaid > 0 and there is no waiver on a later
-    //      manual payment; the waiver is first-invoice-and-paid-manually only.
-    //  (b) the property is inside its 21-day onboarding (migration) window. A
-    //      tenant who onboards after that window pays the fee even on their first
-    //      payment — the free pass is for the initial migration cohort, not for
-    //      every new tenant a landlord adds later.
+    // Waiver (Nic, S607 — supersedes the S570 two-part rule): the $10 manual fee
+    // is waived when this is the tenant's FIRST satisfied rent on the lease.
+    // Because this code only runs inside record-manual, that is exactly Nic's
+    // rule: "only the first payment ran through the platform, and only if it was
+    // cash on that first payment. If they pay card the first time, they lose that
+    // freebie." A tenant who paid an earlier invoice by card has priorPaid > 0 and
+    // gets no waiver on a later manual payment.
+    //
+    // THE 21-DAY PROPERTY-CREATION GATE IS GONE (Nic): "the anchor is wrong."
+    // It counted from properties.created_at, so it burned down during the
+    // landlord's SETUP — meters, units, templates, invites — and tenants
+    // inherited whatever slice was left. At Oak Park that was four days. The
+    // waiver is meant to give each tenant one gentle first payment, not to reward
+    // whoever happened to pay while the park was still being configured.
+    //
+    // Deliberately NO date gate of any kind. Nic: "I like not gating it because I
+    // specifically have people at Oak Park that come in on the fifth because of
+    // the grace period." A tenant paying September rent on the 10th still gets
+    // their one free manual payment — they simply owe whatever LATE FEES have
+    // accrued by then, which is a separate charge on a separate clock.
+    //
     // Rent rows carry a lease_id in production; fall back to tenant_id if absent.
     const scopeCol = pmt.lease_id ? 'lease_id' : 'tenant_id'
     const scopeVal = pmt.lease_id ?? pmt.tenant_id
@@ -1052,7 +885,21 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
           AND status IN ('settled', 'paid_via_deposit')
           AND id <> $2`,
       [scopeVal, pmt.id])).rows[0]
-    const feeWaived = parseInt(priorPaid.n, 10) === 0 && pmt.property_in_window === true
+    // S607 (Nic): exactly ONE thing makes this fee free — the tenant's FIRST
+    // rent payment, paid this way. Nothing else.
+    //
+    //   "It's only free the first payment and only if they do cash. If they do
+    //    any old school payments any other months, that's not free."
+    //
+    // The landlord's toggle does NOT waive the fee, it MOVES it. An earlier cut
+    // of this treated 'landlord covers' as 'nobody pays', which quietly billed
+    // GAM's $10 to no one at all. Nic: "if they use cash the second month and the
+    // landlord covers, that means the LANDLORD gets charged."
+    const landlordCovers = pmt.manual_fee_payer === 'landlord'
+    const firstPayment = parseInt(priorPaid.n, 10) === 0
+    const feeWaived = firstPayment                    // free — and only this
+    const feeToLandlord = !feeWaived && landlordCovers // moved, not erased
+    const feeToTenant  = !feeWaived && !landlordCovers
 
     // Satisfy the rent obligation off-platform. platform_held stays FALSE.
     const refNote = body.reference ? ` (ref ${body.reference})` : ''
@@ -1064,14 +911,39 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         WHERE id = $1`,
       [pmt.id, body.method, `Recorded as manual ${body.method} payment${refNote}`])
 
-    // The flat manual-payment fee — GAM revenue, tenant pays via the normal flow.
+    // The flat manual-payment fee — GAM revenue either way. Billed to the tenant
+    // as an ordinary charge, or posted straight to GAM's revenue ledger when the
+    // landlord absorbs it (their payouts net it out, the same route the
+    // landlord-borne platform fee takes).
     let feePaymentId: string | null = null
-    if (!feeWaived) {
+    if (feeToLandlord) {
+      const prev = await client.query<{ balance_after: string }>(
+        `SELECT balance_after FROM platform_revenue_ledger
+          ORDER BY created_at DESC, id DESC LIMIT 1`)
+      const prevBal = prev.rowCount ? parseFloat(prev.rows[0].balance_after) : 0
+      // Idempotent on (reference_id, reference_type, type) — a retried recording
+      // cannot post the fee twice.
+      await client.query(
+        `INSERT INTO platform_revenue_ledger
+           (type, amount, balance_after, reference_id, reference_type, property_id, notes)
+         SELECT 'manual_withdrawal_fee', $1, $2, $3, 'manual_payment_fee', u.property_id, $4
+           FROM units u WHERE u.id = $5
+         ON CONFLICT (reference_id, reference_type, type) WHERE reference_id IS NOT NULL
+         DO NOTHING`,
+        [MANUAL_PAYMENT_FEE.toFixed(2),
+         (Math.round((prevBal + MANUAL_PAYMENT_FEE) * 100) / 100).toFixed(2),
+         pmt.id,
+         `$${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee absorbed by the landlord — ${body.method} rent payment due ${pmt.due_date}`,
+         pmt.unit_id])
+    }
+    if (feeToTenant) {
       feePaymentId = (await client.query<{ id: string }>(
         `INSERT INTO payments
            (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-            entry_description, due_date, notes)
-         VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'MANUALPAY', CURRENT_DATE, $6)
+            entry_description, due_date, notes, revenue_owner)
+         -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share. Nic confirmed S609 this one stays
+         -- GAM's: it covers manual reconciliation and both Terms documents say so.
+         VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'MANUALPAY', CURRENT_DATE, $6, 'gam')
          RETURNING id`,
         [pmt.unit_id, pmt.lease_id, pmt.tenant_id, pmt.landlord_id,
          MANUAL_PAYMENT_FEE.toFixed(2),
@@ -1087,8 +959,17 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         method:       body.method,
         feeWaived,
         feeAmount:    feeWaived ? 0 : MANUAL_PAYMENT_FEE,
+        // Who the fee landed on. 'tenant' raises a charge they must pay;
+        // 'landlord' posts it to GAM revenue and nets out of their payout;
+        // 'none' only ever means the free first payment.
+        feeBilledTo:  feeWaived ? 'none' : (landlordCovers ? 'landlord' : 'tenant'),
         feePaymentId,
-        firstPayment: feeWaived,
+        // S607: these are now TWO different reasons a fee was not raised, and
+        // the caller must be able to tell them apart — "your first one is free"
+        // and "your landlord covers this" are different things to say to a
+        // tenant, and only one of them stops being true next month.
+        firstPayment: parseInt(priorPaid.n, 10) === 0,
+        coveredByLandlord: landlordCovers,
       },
     })
   } catch (e) {

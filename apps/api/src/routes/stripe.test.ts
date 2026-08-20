@@ -689,6 +689,22 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
       expect(stripeMocks.verifyMicrodeposits).toHaveBeenCalledWith('seti_pending', { descriptor_code: 'SM1234' })
     })
 
+    // S607 (Nic): "is it case sensitive because the field is letting me type
+    // lowercase? Should we lock the field to capital letters?" Stripe issues the
+    // code upper case and a statement may render it either way. A wrong guess is
+    // not free — Stripe counts them and locks the SetupIntent — so the code is
+    // normalised on the SERVER, covering every client rather than only the one
+    // field that was fixed alongside it.
+    it('upper-cases a lower-case descriptor code before it reaches Stripe', async () => {
+      const { tenantId, userId } = await seedTenantWithStripe()
+      stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pending] } as any)
+      const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+      const res = await request(buildApp()).post('/api/stripe/tenant/microdeposits/verify')
+        .set('Authorization', `Bearer ${token}`).send({ descriptorCode: '  sm12ab ' })
+      expect(res.status).toBe(200)
+      expect(stripeMocks.verifyMicrodeposits).toHaveBeenCalledWith('seti_pending', { descriptor_code: 'SM12AB' })
+    })
+
     it('accepts two amounts', async () => {
       const { tenantId, userId } = await seedTenantWithStripe()
       stripeMocks.setupIntentsList.mockResolvedValueOnce({ data: [pending] } as any)

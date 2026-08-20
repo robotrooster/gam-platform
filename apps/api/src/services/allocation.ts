@@ -29,6 +29,18 @@ import { AppError } from '../middleware/errorHandler'
 
 export type PaymentMethod = 'ach' | 'card'
 
+/**
+ * S609: the charge kinds that carry an owner share. `late_fee` and `fee` joined
+ * `rent`/`utility` on Nic's directive that lease-derived fees are the
+ * landlord's. Membership here is necessary but NOT sufficient — the row must
+ * also be revenue_owner='landlord' (a 'fee' row can be either side's).
+ *
+ * NOT included: `deposit` (held in trust, released at move-out by
+ * services/depositReturn), `platform_fee` / `float_fee` (GAM's by definition),
+ * `home_payment` and `carried_balance` (their own settlement paths).
+ */
+export const ALLOCATABLE_PAYMENT_TYPES = ['rent', 'utility', 'late_fee', 'fee'] as const
+
 const ALLOCATION_TYPES = [
   'allocation_owner_share',
   'allocation_manager_fee',
@@ -42,6 +54,7 @@ interface PaymentRow {
   type: string
   amount: string
   status: string
+  revenue_owner: string
   gam_supersedence_amount: string
   sublease_markup_amount: string
   stripe_payment_intent_id: string | null
@@ -129,8 +142,8 @@ async function resolveChargeContext(
   // by FIFO was part of what the tenant paid, so the fee was computed on it);
   // the apportionment set is only the rent/utility rows, because those are the
   // ones that produce ledger entries.
-  const res = await client.query<{ id: string; amount: string; type: string }>(
-    `SELECT id, amount::text AS amount, type
+  const res = await client.query<{ id: string; amount: string; type: string; revenue_owner: string }>(
+    `SELECT id, amount::text AS amount, type, revenue_owner
        FROM payments
       WHERE stripe_payment_intent_id = $1 AND status = 'settled'
       ORDER BY id`,
@@ -141,9 +154,27 @@ async function resolveChargeContext(
     return { feeBase: amount, allocTotal: amount, isLastRow: true, priorRows: [] }
   }
 
-  const feeBase = round2(all.reduce((sum, r) => sum + parseFloat(r.amount), 0))
+  // S609 pay-ahead: the tenant may have paid MORE than their open charges, with
+  // the surplus banked as prepaid credit rather than settling a row. Stripe
+  // charged us on every dollar it processed, and routes computed the customer
+  // fee on the full amount the tenant chose to pay — so the surplus belongs in
+  // feeBase. Reading it back off the remittance keeps this in step with
+  // rentCharge.ts without inventing a phantom payment row. NOT in allocTotal:
+  // the surplus produces no ledger entry until the month it is earned.
+  const surplusRow = await client.query<{ unapplied_amount: string }>(
+    `SELECT unapplied_amount FROM tenant_remittances
+      WHERE stripe_payment_intent_id = $1`,
+    [pi])
+  const surplus = round2(surplusRow.rows.reduce((sum, r) => sum + parseFloat(r.unapplied_amount ?? '0'), 0))
+
+  const feeBase = round2(all.reduce((sum, r) => sum + parseFloat(r.amount), 0) + surplus)
+  // Rows that produce ledger entries — the set the processing fee is
+  // apportioned across. S609: widened with late fees and landlord fees, which
+  // now carry an owner share too. GAM-owned rows are excluded: they are part of
+  // feeBase (the tenant paid them) but produce no owner split.
   const allocRows = all
-    .filter(r => r.type === 'rent' || r.type === 'utility')
+    .filter(r => (ALLOCATABLE_PAYMENT_TYPES as readonly string[]).includes(r.type)
+              && r.revenue_owner === 'landlord')
     .map(r => ({ id: r.id, amount: parseFloat(r.amount) }))
   const allocTotal = round2(allocRows.reduce((sum, r) => sum + r.amount, 0))
 
@@ -171,10 +202,27 @@ function apportion(whole: number, charge: ChargeContext, rowAmount: number): num
   return round2(whole * (rowAmount / charge.allocTotal))
 }
 
+export interface AllocationOptions {
+  /**
+   * S609 pay-ahead: the processing fee on this row was ALREADY collected, at
+   * the moment the tenant paid ahead. Set when releasing prepaid credit to the
+   * landlord — the money is months old, it has been sitting on GAM's balance
+   * since the original charge, and Stripe was paid its cut back then (the
+   * surplus is inside that charge's feeBase). Charging a second fee now would
+   * bill the same dollar twice and shrink the owner share.
+   *
+   * Only the FEE is suppressed. Manager fee, PM company cut, supersedence and
+   * sublease markup all still apply — the landlord's split of rent does not
+   * change because the tenant paid it early.
+   */
+  feeAlreadyCollected?: boolean
+}
+
 export async function executeRentAllocation(
   client: PoolClient,
   paymentId: string,
-  paymentMethod: PaymentMethod
+  paymentMethod: PaymentMethod,
+  opts: AllocationOptions = {}
 ): Promise<void> {
   // 1. Lock + fetch payment row
   const payment = await fetchPayment(client, paymentId)
@@ -242,8 +290,12 @@ export async function executeRentAllocation(
   // Apportion by this row's share of the charge. The LAST row (deterministic
   // id order) absorbs the rounding remainder so the per-row pieces sum to the
   // whole exactly — otherwise a 3-way split loses or invents a cent.
-  const customerFacingFee = apportion(wholeCustomerFee, charge, gross)
-  const stripeCost        = apportion(wholeStripeCost, charge, gross)
+  // S609: a prepaid-credit release carries no fee of its own — see
+  // AllocationOptions.feeAlreadyCollected. Zeroing all three here (rather than
+  // skipping the ledger write later) also makes `splittable` the full gross, so
+  // a landlord-payer property is not charged the fee a second time.
+  const customerFacingFee = opts.feeAlreadyCollected ? 0 : apportion(wholeCustomerFee, charge, gross)
+  const stripeCost        = opts.feeAlreadyCollected ? 0 : apportion(wholeStripeCost, charge, gross)
   const bankingSpread = round2(customerFacingFee - stripeCost)
 
   // S116: pick the right fee toggle based on the payment method.
@@ -428,7 +480,7 @@ export async function executeRentAllocation(
 
 async function fetchPayment(client: PoolClient, paymentId: string): Promise<PaymentRow> {
   const res = await client.query<PaymentRow>(
-    `SELECT id, unit_id, type, amount::text AS amount, status,
+    `SELECT id, unit_id, type, amount::text AS amount, status, revenue_owner,
             gam_supersedence_amount::text AS gam_supersedence_amount,
             sublease_markup_amount::text AS sublease_markup_amount,
             stripe_payment_intent_id
@@ -439,11 +491,29 @@ async function fetchPayment(client: PoolClient, paymentId: string): Promise<Paym
   if (!payment) throw new AppError(404, `Payment ${paymentId} not found`)
   // S122: utility payments use the same allocation engine — same
   // banking-fee math, same owner/PM split, just a different
-  // entry_description on the payment row. Webhook handler routes both
-  // types here; reject anything else.
-  if (payment.type !== 'rent' && payment.type !== 'utility') {
+  // entry_description on the payment row.
+  //
+  // S609 (Nic, DIRECTIVE): late fees and landlord-billed fees join them.
+  // "Late fees that come from the lease and are on the invoice need to go to
+  // the landlord according to the lease. If you're talking about late fees that
+  // would be in the one-off charges, those also need to go to the landlord. I
+  // don't know why that would go to GAM."
+  //
+  // He is right, and until now they didn't: only rent and utilities were split
+  // out, so a late fee off the signed lease settled with NO owner share and the
+  // money stopped on GAM's books. Silent — the tenant's balance was correct and
+  // the landlord had no line to miss.
+  //
+  // The gate is `revenue_owner`, NOT the type: a 'fee' row can belong to either
+  // side (a landlord's hand-billed lease fee and a GAM subscription are both
+  // written as 'SUBSCRIP'). Callers stamp ownership at creation; this reads it.
+  if (!ALLOCATABLE_PAYMENT_TYPES.includes(payment.type as any)) {
     throw new AppError(400,
-      `executeRentAllocation requires payment.type IN ('rent','utility'), got '${payment.type}' (payment ${paymentId})`)
+      `executeRentAllocation requires payment.type IN (${ALLOCATABLE_PAYMENT_TYPES.join(',')}), got '${payment.type}' (payment ${paymentId})`)
+  }
+  if (payment.revenue_owner !== 'landlord') {
+    throw new AppError(400,
+      `Payment ${paymentId} is GAM revenue (revenue_owner='${payment.revenue_owner}') — it has no owner share.`)
   }
   if (payment.status !== 'settled') {
     throw new AppError(400,

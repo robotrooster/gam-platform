@@ -78,3 +78,35 @@ describe('retroactive late-fee billing', () => {
     expect(total).toBe(60)
   })
 })
+
+// S607 (Nic): "if a landlord gives credit for an accidental late fee or part of
+// a late fee, and there's still a balance outstanding, that is outside of the
+// accrual where that late fee is not gonna keep adding more late fees."
+//
+// Already true by construction — the fee basis is the invoice's RENT rows only
+// (jobs/lateFees.ts sums `type='rent'`), so nothing else on the invoice can
+// inflate it. This holds that in place: a future change that based the fee on
+// the whole outstanding balance would compound fees on fees, and would break
+// here rather than on somebody's bill.
+describe('S607: late fees never compound on late fees', () => {
+  it('an unpaid late fee does not raise the next late fee', async () => {
+    const { invoiceId } = await seedRetroLease('grace_end',
+      { grace: 2, accrual: 5, initial: 20, daysOverdue: 6, rent: 1000 })
+
+    await generateLateFeesForTimezone(TZ)
+    const first = (await lateFeeRows(invoiceId)).reduce((s, r) => s + Number(r.amount), 0)
+    expect(first).toBeGreaterThan(0)
+
+    // Those late fees are now sitting unpaid on the invoice. Re-running must not
+    // treat them as part of the amount being penalised.
+    await generateLateFeesForTimezone(TZ)
+    const second = (await lateFeeRows(invoiceId)).reduce((s, r) => s + Number(r.amount), 0)
+
+    // Only the flat per-period accrual may have moved; the BASIS is unchanged.
+    const basis = (await db.query<{ t: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS t FROM payments
+        WHERE invoice_id = $1 AND type = 'rent'`, [invoiceId])).rows[0].t
+    expect(Number(basis)).toBeCloseTo(1000, 2)
+    expect(second).toBeCloseTo(first, 2)   // same day, no new ticks
+  })
+})

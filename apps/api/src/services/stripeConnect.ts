@@ -21,7 +21,7 @@
 // the session token.
 
 import Stripe from 'stripe'
-import { PROCESSING_FEES } from '@gam/shared'
+import { PROCESSING_FEES, processingFeeFor } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
@@ -306,15 +306,11 @@ export function computeApplicationFee(opts: {
   paymentMethod: 'ach' | 'card'
   cardCountry?: string | null  // Stripe payment_method.card.country
 }): number {
-  if (opts.paymentMethod === 'ach') {
-    // S601: flat $6 bank fee at any rent (ACH_PCT=0, ACH_FLAT=$6, cap $6).
-    return Math.round((Math.min(opts.amount * PROCESSING_FEES.ACH_PCT + PROCESSING_FEES.ACH_FLAT, PROCESSING_FEES.ACH_CAP)) * 100) / 100
-  }
-  let pct: number = PROCESSING_FEES.CARD_PCT
-  if (opts.cardCountry && opts.cardCountry !== 'US') {
-    pct += PROCESSING_FEES.CARD_INTL_PCT
-  }
-  return Math.round((opts.amount * pct + PROCESSING_FEES.CARD_FLAT) * 100) / 100
+  // S607: delegates to the shared formula so the fee a tenant is QUOTED on the
+  // invoice and the fee they are CHARGED come from one definition. Two copies
+  // of this arithmetic is how a repricing lands in one place and not the other,
+  // and the tenant picks a method on a number we then do not honour.
+  return processingFeeFor(opts)
 }
 
 // ── PM COMPANY TRANSFERS (S119) ───────────────────────────────────────────

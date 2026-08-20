@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink, Lock, Pencil } from 'lucide-react'
-import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, type UnitType, type FloorLevel } from '@gam/shared'
+import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, listingMinPhotos, unitSubtypeFactsLabel, type PropertyUnitSubtype, type UnitType, type FloorLevel } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -84,6 +84,7 @@ export function UnitDetailPage() {
       rentAmount: unit.rentAmount != null ? String(unit.rentAmount) : '',
       securityDeposit: unit.securityDeposit != null ? String(unit.securityDeposit) : '',
       dwellingOwnership: unit.dwellingOwnership || 'tenant',
+      ownerHouseholdSize: String(unit.ownerHouseholdSize ?? 1),
       isMultiLevel: !!unit.isMultiLevel,
       isAdaAccessible: !!unit.isAdaAccessible,
       floorLevel: unit.floorLevel || '',
@@ -108,6 +109,7 @@ export function UnitDetailPage() {
       rentAmount: num(f.rentAmount),
       securityDeposit: num(f.securityDeposit),
       dwellingOwnership: f.dwellingOwnership,
+      ownerHouseholdSize: Math.max(1, Number(f.ownerHouseholdSize) || 1),
       isMultiLevel: f.isMultiLevel,
       isAdaAccessible: f.isAdaAccessible,
       floorLevel: f.floorLevel || null,
@@ -286,6 +288,18 @@ export function UnitDetailPage() {
                       </select>
                     </div>
                   )}
+                  {/* S609 (Nic): only for an owner-occupied unit. It has no lease,
+                      so a headcount utility split has nobody to count — this is
+                      what it weighs the unit by, and weighing it is what keeps the
+                      owner's own usage off the tenants' bills. */}
+                  {unit.status === 'owner_use' && (
+                    <div className="data-row"><span className="data-key">People living here</span>
+                      <input {...inpS} type="number" min={1} max={30}
+                        style={{ ...inpS.style, maxWidth: 90 }}
+                        value={editForm.ownerHouseholdSize}
+                        onChange={e => set('ownerHouseholdSize', e.target.value)} />
+                    </div>
+                  )}
                   {isInterior && <>
                     <div className="data-row"><span className="data-key">Multi-level</span>
                       <select {...selS} value={editForm.isMultiLevel ? 'yes' : 'no'} onChange={e => set('isMultiLevel', e.target.value === 'yes')}>
@@ -339,12 +353,46 @@ export function UnitDetailPage() {
                   {editForm.unitType === 'storage' && (
                     <div className="data-row"><span className="data-key">Size</span><input {...inpS} style={{ ...inpS.style, maxWidth: 160 }} placeholder="10x10" value={editForm.storageSize} onChange={e => set('storageSize', e.target.value)} /></div>
                   )}
-                  {(editForm.unitType === 'mobile_home' || isRv) && (
+                  {/* LOT RENT — MOBILE HOMES ONLY (Nic, S609):
+                      "Subleasing would only be on mobile home units. RV units have
+                       no need to have that because the space rent is the space rent.
+                       There's no lot rent, trailer rent kind of difference like there
+                       is on mobile homes."
+                      On a mobile home the land and the home are genuinely separate —
+                      the resident may own the home, or be buying it — so lot rent is
+                      a real, distinct number. On an RV spot the space rent IS the
+                      rent, and this field read as a second competing rent right below
+                      the first. Someone subletting their own RV is an arrangement
+                      outside the platform. */}
+                  {editForm.unitType === 'mobile_home' && (
                     <div className="data-row"><span className="data-key">Lot rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.lotRentAmount} onChange={e => set('lotRentAmount', e.target.value)} /></div>
                   )}
-                  {/* S573: what this unit HAS — gates which items appear on its
-                      inspections. Optional (presets cover a unit with zero config). */}
-                  {featuresForType(editForm.unitType).length > 0 && (() => {
+                  {/* S609 (Nic, DIRECTIVE): "Anything to do with editing a unit
+                      should be in the unit details portal... you need to add any
+                      submeters there, kind of between the unit details and the
+                      features of the unit. Features of the unit should be below
+                      the submeters."
+
+                      It used to be its own card at the very bottom of the page,
+                      under the whole listing/photos block — which is why a unit
+                      that was created without a submeter looked like it could
+                      never be given one. Editing a unit now means everything
+                      about that unit is in one place, in the order you set it up:
+                      details, then meters, then features. */}
+                  <div style={{ marginTop: 8, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
+                    <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} embedded />
+                  </div>
+                  {/* S609 (Nic): the per-unit inspection features are hidden on RV
+                      SPOTS — "those should just go away, it's just extra clutter",
+                      about the picnic table / fire ring / gate code ticks under an RV
+                      spot's electrical field.
+
+                      Still shown for every other unit type, where the list is about
+                      what is actually inside a home. An RV spot with no ticks falls
+                      back to the preset list for its type, which was always the
+                      behaviour for an unconfigured unit — and any ticks already saved
+                      are preserved, since the form still round-trips `features`. */}
+                  {!isRv && featuresForType(editForm.unitType).length > 0 && (() => {
                     const offered = featuresForType(editForm.unitType)
                     const groups = Array.from(new Set(offered.map(f => f.group)))
                     const toggle = (k: string, v: boolean) => setEditForm((ef: any) => ({ ...ef, features: { ...ef.features, [k]: v } }))
@@ -382,6 +430,7 @@ export function UnitDetailPage() {
             <>
               <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{humanize(unit.status)}</span></div>
               <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
+              <UnitSubtypeRow unit={unit} />
               <div className="data-row"><span className="data-key">Leasing</span><span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span></div>
               <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
               <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
@@ -406,6 +455,12 @@ export function UnitDetailPage() {
                   <Lock size={12} /> Settings are locked while this unit has an active lease. Edit between leases.
                 </div>
               )}
+              {/* S609: also visible WITHOUT entering edit — a leased unit's
+                  settings are locked, but its meters still need adding and
+                  reading. Same section, same place on the card either way. */}
+              <div style={{ marginTop: 10, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
+                <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} embedded />
+              </div>
             </>
           )}
         </div>
@@ -496,8 +551,12 @@ export function UnitDetailPage() {
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             {/* S508 (#9): photos only matter when actually listing the unit.
                 Don't nag GAM-imported / occupied units that aren't being listed. */}
-            {listingForm.listedVacant && (photos as any[]).length < 5 && <span style={{ fontSize: '.72rem', color: 'var(--amber)', fontWeight: 600 }}>⚠ {5 - (photos as any[]).length} more photo(s) needed to publish</span>}
-            {listingForm.listedVacant && (photos as any[]).length >= 5 && <span style={{ fontSize: '.72rem', color: 'var(--green)', fontWeight: 600 }}>✓ Ready to publish</span>}
+            {/* S609 (Nic): the minimum depends on the unit TYPE — one photo for a
+                bare site (the renter tows in the dwelling), five where people live
+                inside. Read from the shared rule the listing query uses, so this
+                badge can never promise a different number than the one enforced. */}
+            {listingForm.listedVacant && (photos as any[]).length < listingMinPhotos(unit.unitType) && <span style={{ fontSize: '.72rem', color: 'var(--amber)', fontWeight: 600 }}>⚠ {listingMinPhotos(unit.unitType) - (photos as any[]).length} more photo(s) needed to publish</span>}
+            {listingForm.listedVacant && (photos as any[]).length >= listingMinPhotos(unit.unitType) && <span style={{ fontSize: '.72rem', color: 'var(--green)', fontWeight: 600 }}>✓ Ready to publish</span>}
             <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: '.82rem', fontWeight: 600 }}>
               <span style={{ color: 'var(--text-2)' }}>Listed</span>
               <div style={{ position: 'relative', width: 40, height: 22 }} onClick={() => setListingForm(f => ({ ...f, listedVacant: !f.listedVacant }))}>
@@ -563,10 +622,6 @@ export function UnitDetailPage() {
           )}
         </div>
       </div>
-
-      {/* S533 (Nic): meters live on the UNIT — this card is the only
-          meter config surface (the utilities page has no meters list). */}
-      {unit && <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} />}
 
       {activateModal && (
         <div className="modal-overlay" onClick={() => setActivateModal(false)}>
@@ -700,9 +755,129 @@ export function UnitDetailPage() {
 
 
 // ── UNIT METERS (S533) ───────────────────────────────────────────────
-// Sub-meters belong to the unit: add/edit/remove them here. Readings
-// happen through the monthly reading run; billing is automatic.
-function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; propertyId: string; unitNumber: string }) {
+// Sub-meters belong to the unit: add/edit/remove them here. Readings happen
+// through the monthly reading run; billing is automatic.
+//
+// S613 (Nic): "I also wanna figure out how to link subtypes to different units
+// because there's nowhere that I can see that links those."
+//
+// He was right — `units.subtype_id` was written when a unit was created and
+// then displayed nowhere and editable nowhere. A landlord who defines his
+// subtypes AFTER adding his spaces (which is the normal order, because you
+// discover the classes by looking at what you have) could never say which
+// space was which.
+//
+// Deliberately OUTSIDE the lease lock that covers the rest of this card. Saying
+// which class a space belongs to commits no money and changes no lease term, so
+// it works on an occupied unit — at Oak Park almost every space is occupied,
+// and a classification you can only set between tenancies is a classification
+// nobody can set. Copying the subtype's VALUES is the separate, explicit second
+// step below, and it never moves rent on a leased unit.
+function UnitSubtypeRow({ unit }: { unit: any }) {
+  const qc = useQueryClient()
+  const { can } = usePerms()
+  const [err, setErr] = useState('')
+  const { data: subtypes = [] } = useQuery<PropertyUnitSubtype[]>(
+    ['property-unit-subtypes', unit.propertyId],
+    () => apiGet(`/properties/${unit.propertyId}/unit-subtypes`),
+    { enabled: !!unit.propertyId },
+  )
+  const forType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === unit.unitType)
+  const current = forType.find(s => s.id === unit.subtypeId) || null
+
+  const linkMut = useMutation(
+    (body: { subtypeId: string | null; applyDetails?: boolean }) => apiPatch(`/units/${unit.id}/subtype`, body),
+    {
+      onSuccess: (data: any) => {
+        setErr('')
+        if (data?.pricingHeldBack) {
+          toast('Details applied. Rent and deposit were left alone — this unit has an active lease.')
+        }
+        qc.invalidateQueries(['unit', unit.id])
+        qc.invalidateQueries(['property-unit-subtypes', unit.propertyId])
+      },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not set that subtype'),
+    },
+  )
+
+  // What the unit would gain by applying — shown so "Apply" is never a leap of
+  // faith. Blank subtype fields say nothing about the unit and are skipped.
+  const diffs: string[] = []
+  if (current) {
+    const differs = (a: any, b: any) => a != null && a !== '' && a !== 'none' && String(a) !== String(b)
+    if (unit.unitType === 'rv_spot') {
+      if (differs(current.rvSiteLayout, unit.rvSiteLayout)) diffs.push(current.rvSiteLayout === 'pull_through' ? 'pull-through' : 'back-in')
+      if (differs(current.rvAmpService, unit.rvAmpService)) diffs.push(current.rvAmpService === 'both' ? '30/50 amp' : `${current.rvAmpService} amp`)
+    }
+    if (UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType]) {
+      if (differs(current.bedrooms, unit.bedrooms)) diffs.push(`${current.bedrooms} bed`)
+      if (differs(current.bathrooms, unit.bathrooms)) diffs.push(`${current.bathrooms} bath`)
+    }
+    if (unit.unitType === 'storage' && differs(current.storageSize, unit.storageSize)) diffs.push(String(current.storageSize))
+    if (!unit.hasActiveLease) {
+      if (differs(current.rentAmount, unit.rentAmount)) diffs.push(`rent ${fmt(current.rentAmount)}`)
+      if (differs(current.securityDeposit, unit.securityDeposit)) diffs.push(`deposit ${fmt(current.securityDeposit)}`)
+    }
+  }
+
+  if (forType.length === 0 && !current) {
+    // Nothing to pick from is itself an answer — say where subtypes come from
+    // rather than showing an empty dropdown that looks broken.
+    return (
+      <div className="data-row"><span className="data-key">Subtype</span>
+        <span className="data-val" style={{ color: 'var(--text-3)', fontSize: '.76rem' }}>
+          None defined — add them on the property page
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <>
+      <div className="data-row"><span className="data-key">Subtype</span>
+        {can('schedule.configure_unit') ? (
+          <select className="form-select" style={{ maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' }}
+            value={unit.subtypeId || ''} disabled={linkMut.isLoading}
+            onChange={e => linkMut.mutate({ subtypeId: e.target.value || null })}>
+            <option value="">— none —</option>
+            {forType.map(s => (
+              <option key={s.id} value={s.id}>
+                {s.name}{unitSubtypeFactsLabel(s) ? ` (${unitSubtypeFactsLabel(s)})` : ''}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="data-val">{current ? current.name : '—'}</span>
+        )}
+      </div>
+      {err && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginBottom: 6 }}>{err}</div>}
+      {current && diffs.length > 0 && can('schedule.configure_unit') && (
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '-2px 0 8px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span>This unit doesn&apos;t match it: {diffs.join(', ')}.</span>
+          <button className="btn btn-secondary btn-sm" style={{ padding: '1px 8px', fontSize: '.7rem' }}
+            disabled={linkMut.isLoading}
+            onClick={() => linkMut.mutate({ subtypeId: current.id!, applyDetails: true })}>
+            Copy onto this unit
+          </button>
+        </div>
+      )}
+    </>
+  )
+}
+
+// S609: the old note here said "the utilities page has no meters list" — that
+// stopped being true when the Utilities page grew its own meter management, so
+// a submeter can now be created from EITHER screen. That is duplication worth
+// naming rather than quietly leaving: the two must keep agreeing about what a
+// submeter is (one unit, one utility, an opening read). They share the same
+// endpoint, which is what keeps them honest — if that ever forks, consolidate
+// on one screen rather than maintaining two.
+function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
+  unitId: string; propertyId: string; unitNumber: string
+  /** S609: rendered INSIDE the Unit Details card — drop the card chrome so it
+   *  reads as a section of that form rather than a card nested in a card. */
+  embedded?: boolean
+}) {
   const qc = useQueryClient()
   const { data: meters = [] } = useQuery<any[]>(
     ['utility-meters', propertyId],
@@ -710,6 +885,58 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
     { enabled: !!propertyId }
   )
   const mine = (meters as any[]).filter((m: any) => (m.assignedUnitIds || []).includes(unitId) && m.billingMethod === 'submeter')
+
+  // S609 (Nic): the PROPERTY's shared charges, and whether THIS unit is on each.
+  //
+  // "I have set the trash rate, but where do you attach it to each unit? At Oak
+  // Park we have some people that opt to not use our trash cans, and they run
+  // their own trash down to the transfer station."
+  //
+  // It was always per-unit — a unit is billed only if it is assigned to the
+  // meter — but the only place to say so was the Utilities page, unit by unit
+  // from the meter's side. Asking "is THIS unit on trash?" meant opening a
+  // different screen and reading a list backwards. Now it is a switch on the
+  // unit, which is where the question gets asked.
+  //
+  // Landlord-pays masters are deliberately absent: nothing bills a tenant from
+  // them, so a per-unit switch would imply a choice that changes nothing.
+  // S609 (Nic): FLAT CHARGES AND SHARED METERS ARE DIFFERENT THINGS and must not
+  // sit in one list. "You put trash as a master meter. It's not a master meter.
+  // It's a toggle on or off for people that have it or don't. It's a flat rate."
+  //
+  // A shared master is a real meter someone reads and a pool that gets divided.
+  // Trash is a fixed price and a yes/no. Listing them together made trash look
+  // like equipment.
+  // S613 (Nic): the two are no longer one list, and only ONE of them is a
+  // switch here.
+  //
+  // "It shows all of the shared meters for the property, not just the one that
+  //  that unit is part of... and then it lets you select back and forth willy
+  //  nilly instead of actually going into the utilities page. That just needs to
+  //  show which one it's a part of. It's informational only."
+  //
+  // He is right that these are different kinds of decision. A FLAT CHARGE is a
+  // per-resident yes/no — the household that hauls its own trash — and the unit
+  // page is exactly where that question gets asked. A SHARED METER is a piece of
+  // plumbing: which master actually feeds this space, what the pool is, who else
+  // divides it. Moving a unit between masters silently re-cuts every other
+  // tenant's share on both meters, and it belongs on the Utilities page next to
+  // the pool it changes — where the meter's own unit list makes the consequence
+  // visible. Here it is a fact to read, not a control.
+  const flatCharges = (meters as any[]).filter((m: any) => m.billingMethod === 'flat_rate')
+  const onMeter = (m: any) => (m.assignedUnitIds || []).includes(unitId)
+  const sharedMeters = (meters as any[]).filter((m: any) => m.billingMethod === 'rubs' && onMeter(m))
+
+  const toggleMut = useMutation(
+    async ({ meter, on }: { meter: any; on: boolean }) => {
+      if (on) await apiPost(`/utility/meters/${meter.id}/units`, { unitId })
+      else await apiDelete(`/utility/meters/${meter.id}/units/${unitId}`)
+    },
+    { onSuccess: () => qc.invalidateQueries(['utility-meters', propertyId]),
+      // The server refuses a unit that is already on another meter of the same
+      // kind for this utility — it would be billed twice. Surface that wording
+      // rather than a silent no-op.
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change that') })
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' })
 
@@ -723,6 +950,9 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
   //
   // Derive the options once and force the draft onto a valid one whenever the
   // list changes, so what's displayed is always what gets sent.
+  // Only electric and water have an odometer a walker can read. Trash is a flat
+  // property charge and propane is a delivered fill — neither is a submeter, and
+  // both are explained under Property charges below.
   const availableTypes = (['electric', 'water'] as const)
     .filter(t => !mine.some((m: any) => m.utilityType === t))
   useEffect(() => {
@@ -758,9 +988,11 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
   const ICONS: Record<string, string> = { water: '💧', electric: '⚡', sewer: '🚰', trash: '🗑️' }
 
   return (
-    <div className="card" style={{ marginTop: 16 }}>
+    <div className={embedded ? '' : 'card'} style={embedded ? undefined : { marginTop: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <h3 style={{ fontSize: '.9rem', margin: 0 }}>Sub-meters</h3>
+        {embedded
+          ? <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Sub-meters</div>
+          : <h3 style={{ fontSize: '.9rem', margin: 0 }}>Sub-meters</h3>}
         <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add Meter'}</button>
       </div>
       {mine.length === 0 && !adding && (
@@ -768,6 +1000,102 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
           No sub-meters on this unit. Metered utilities bill the tenant through the monthly reading run; sewer bills off the water reading as part of the same line item.
         </div>
       )}
+      {/* S609 (Nic): shared property charges, switchable per unit — see the note
+          where propertyMeters is built. */}
+      {/* S609 (Nic): shown even with NOTHING to list. A landlord with no trash
+          meter yet saw an empty space and reasonably concluded there was nowhere
+          to link trash — "I still don't see where to add trash into any sort of
+          unit linkage." The answer is that the meter has to exist first, so the
+          empty state says so instead of showing nothing. */}
+      <div style={{ marginTop: mine.length || adding ? 12 : 10, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>
+            Flat charges
+          </div>
+          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.5 }}>
+            Switch one off and this unit isn&apos;t billed for it — a resident hauling their own
+            trash, for instance.
+          </div>
+          {/* S613: the nudge to "set a trash price in Rates" is WRONG for a
+              landlord who bills trash by RUBS — following it creates a second
+              trash meter and the double-billing guard then blocks his units.
+              Only offered when the property has no trash setup at all. */}
+          {flatCharges.length === 0 && ((meters as any[]).some((m: any) => m.utilityType === 'trash') ? (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 4 }}>
+              Nothing to switch here — this property bills trash on a shared meter, not as a flat
+              charge. It&apos;s below.
+            </div>
+          ) : (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 4 }}>
+              Nothing to switch yet. A flat charge like <strong>trash</strong> appears here as soon as
+              you set its price in <strong>Rates</strong> on the Utilities page — every unit starts
+              off it, and you switch on the ones that have it.
+            </div>
+          ))}
+          {flatCharges.map((m: any) => {
+            const on = onMeter(m)
+            return (
+              <label key={m.id}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                         borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6,
+                         cursor: toggleMut.isLoading ? 'wait' : 'pointer', fontSize: '.8rem' }}>
+                <input type="checkbox" checked={on} disabled={toggleMut.isLoading}
+                  onChange={() => toggleMut.mutate({ meter: m, on: !on })} />
+                <span style={{ fontWeight: 600 }}>
+                  {ICONS[m.utilityType]} {m.utilityType[0].toUpperCase() + m.utilityType.slice(1)}
+                </span>
+                {/* The price lives on the property rate, not the row — see the
+                    anti-discrimination note in services/utilityBilling. */}
+                <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                  flat charge — the property rate, same for everyone on it
+                </span>
+                {!on && (
+                  <span style={{ marginLeft: 'auto', fontSize: '.68rem', color: 'var(--text-3)' }}>
+                    not billed here
+                  </span>
+                )}
+              </label>
+            )
+          })}
+
+          {/* S613 (Nic): READ-ONLY, and only the masters this unit is actually
+              on. Which master feeds a space is set on the Utilities page, beside
+              the pool it divides. */}
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>
+              Shared meters
+            </div>
+            {sharedMeters.length === 0 ? (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+                This unit isn&apos;t on a shared meter. Which master serves a unit is set on the
+                <strong> Utilities</strong> page, on the meter itself.
+              </div>
+            ) : (
+              <>
+                {sharedMeters.map((m: any) => (
+                  <div key={m.id}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                             borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6, fontSize: '.8rem' }}>
+                    <span style={{ fontWeight: 600 }}>{ICONS[m.utilityType]} {m.label}</span>
+                    <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                      split across the units on it
+                    </span>
+                  </div>
+                ))}
+                <div style={{ fontSize: '.66rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+                  Change which units a master serves on the <strong>Utilities</strong> page — moving one
+                  re-cuts everybody else&apos;s share of both meters.
+                </div>
+              </>
+            )}
+          </div>
+          {/* Propane has no meter anywhere — a fill is an event, not a reading —
+              so it is worth saying rather than leaving someone hunting. */}
+          <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+            Propane isn&apos;t linked to a unit: there is no propane meter. Set the price per gallon
+            in <strong>Rates</strong>, then use <strong>Record Delivery</strong> and enter the gallons
+            that went into this tank.
+          </div>
+      </div>
       {mine.map((m: any) => (
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6 }}>
           <span style={{ fontSize: '.82rem', fontWeight: 600, minWidth: 110, textTransform: 'capitalize' }}>{ICONS[m.utilityType]} {m.utilityType}</span>

@@ -664,7 +664,7 @@ describe('POST /meters/:id/units — same-utility overlap', () => {
                                      rate_per_unit, rubs_allocation_method)
          VALUES ($1,$2,$3,$4, 0.01, $5) RETURNING id`,
         [propertyId, utilityType, label, billingMethod,
-         billingMethod === 'rubs' ? 'equal_split' : null])
+         billingMethod === 'rubs' ? 'rented_spaces' : null])
       return rows[0].id as string
     } finally { c.release() }
   }
@@ -749,7 +749,7 @@ describe('S605 meter baselines', () => {
     await request(buildApp()).post('/api/utility/meters')
       .set('Authorization', `Bearer ${token}`)
       .send({ propertyId, utilityType: 'water', label: 'RUBS master', billingMethod: 'rubs',
-              rubsAllocationMethod: 'equal_split', ratePerUnit: 0.01 })
+              rubsAllocationMethod: 'rented_spaces', ratePerUnit: 0.01 })
     const res = await request(buildApp()).get(`/api/utility/meters?propertyId=${propertyId}`)
       .set('Authorization', `Bearer ${token}`)
     const m = (camelCaseKeys(res.body.data) as any[]).find(x => x.label === 'RUBS master')
@@ -854,5 +854,292 @@ describe('S605 meter + unit assignment is atomic', () => {
     const { rows } = await db.query<any>(
       `SELECT id FROM utility_meters WHERE label = 'X'`)
     expect(rows).toHaveLength(0)   // and nothing created
+  })
+})
+
+/**
+ * S609 (Nic): "I have no button to edit my first master meter that I added. I
+ * didn't label it the way I wanted to, and there's no way to change it. I don't
+ * wanna have to delete it and then add it again."
+ *
+ * A meter was FROZEN once created — the landlord page could only mark one broken
+ * or delete it, so fixing a typo meant destroying a master and its unit
+ * assignments. It also made a documented Oak Park setup step impossible: switch
+ * the master to the utility-bill basis and the rented-units split.
+ *
+ * The API already accepted the change; nothing sent it. These pin the exact
+ * payload the edit form now sends, so a renamed field can't quietly stop saving.
+ */
+describe('S609 PATCH /meters/:id — editing a meter after it exists', () => {
+  it('renames a master without touching anything else', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ label: 'Master 22658 — city water' })
+    expect(res.status).toBe(200)
+    const row = await db.query<{ label: string }>(
+      `SELECT label FROM utility_meters WHERE id=$1`, [id])
+    expect(row.rows[0].label).toBe('Master 22658 — city water')
+  })
+
+  it('saves the whole edit payload the form sends for a RUBS master', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      // Exactly what MeterModal sends in edit mode — this is the Oak Park
+      // change the S608 handoff asks for and the UI could not make.
+      .send({
+        label: 'Master 22658',
+        baseFee: 0,
+        rubsAllocationMethod: 'rented_spaces',
+        rubsBasis: 'bill_amount',
+        rubsWeights: null,
+        rubsSubmeterRate: 'property_rate',
+        rubsExclusionMode: 'dollars',
+      })
+    expect(res.status).toBe(200)
+    const row = await db.query<any>(
+      `SELECT label, rubs_allocation_method, rubs_basis, rubs_submeter_rate, rubs_exclusion_mode
+         FROM utility_meters WHERE id=$1`, [id])
+    expect(row.rows[0]).toMatchObject({
+      label: 'Master 22658',
+      rubs_allocation_method: 'rented_spaces',
+      rubs_basis: 'bill_amount',
+      rubs_submeter_rate: 'property_rate',
+      rubs_exclusion_mode: 'dollars',
+    })
+  })
+
+  it("another landlord cannot edit this meter", async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ label: 'not yours' })
+    expect(res.status).toBe(403)
+  })
+})
+
+/**
+ * S609 (Nic, DIRECTIVE): "Every feature needs to be editable on meters when
+ * there is no history. Only lock it once there's history, not once it's
+ * created. Somebody accidentally setting something up the wrong way needs to be
+ * able to change it so they don't have to redo potentially everything. That's
+ * gonna be a friction point during onboarding."
+ *
+ * Locking at creation was the wrong trigger: a meter that has never been read
+ * and never billed has nothing to protect, and the lock only made a setup typo
+ * unfixable during the exact phase where typos happen.
+ */
+describe('S609 meters are locked by USE, not by existence', () => {
+  async function readingOn(meterId: string, f: Fixture) {
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, billing_cycle_month, reading_date, reading_value, created_by_user_id)
+       VALUES ($1, date_trunc('month', CURRENT_DATE)::date, CURRENT_DATE, 1000, $2)`,
+      [meterId, f.landlordAUserId])
+  }
+
+  it('a fresh meter can change its utility AND billing method', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ utilityType: 'electric', billingMethod: 'submeter', rubsAllocationMethod: null })
+    expect(res.status).toBe(200)
+    const row = await db.query<any>(
+      `SELECT utility_type, billing_method, rubs_allocation_method FROM utility_meters WHERE id=$1`, [id])
+    expect(row.rows[0]).toMatchObject({
+      utility_type: 'electric', billing_method: 'submeter', rubs_allocation_method: null,
+    })
+  })
+
+  it('ONCE IT HAS A READING the utility and method freeze', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    await readingOn(id, f)
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ billingMethod: 'rubs', rubsAllocationMethod: 'occupant_count' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/readings/i)
+  })
+
+  it('a meter with history can still be renamed and re-rated', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    await readingOn(id, f)
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ label: 'Renamed after billing', baseFee: 4 })
+    expect(res.status).toBe(200)
+    const row = await db.query<{ label: string }>(
+      `SELECT label FROM utility_meters WHERE id=$1`, [id])
+    expect(row.rows[0].label).toBe('Renamed after billing')
+  })
+
+  it('switching to a RUBS master without a split method is refused in words', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ billingMethod: 'rubs' })
+    // The database constraint would reject this as a raw error; the route
+    // catches it first and says what to do.
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/split method/i)
+  })
+
+  it('moving a water meter to another utility drops its sewer rate', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    await db.query(`UPDATE utility_meters SET sewer_rate_per_unit = 0.004 WHERE id=$1`, [id])
+    const res = await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ utilityType: 'gas' })
+    expect(res.status).toBe(200)
+    // Left behind it would be a rate on a meter that can never bill sewer.
+    const row = await db.query<any>(
+      `SELECT sewer_rate_per_unit FROM utility_meters WHERE id=$1`, [id])
+    expect(row.rows[0].sewer_rate_per_unit).toBeNull()
+  })
+
+  it('unit assignments SURVIVE a structural change — the whole point', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    await request(buildApp()).post(`/api/utility/meters/${id}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitId: f.unitAId }).expect(201)
+    await request(buildApp())
+      .patch(`/api/utility/meters/${id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ utilityType: 'gas', billingMethod: 'submeter', rubsAllocationMethod: null })
+      .expect(200)
+    const rows = await db.query(
+      `SELECT 1 FROM utility_meter_units WHERE meter_id=$1 AND unit_id=$2`, [id, f.unitAId])
+    expect(rows.rowCount).toBe(1)
+  })
+
+  it('the meters list reports whether each meter has history', async () => {
+    const f = await seed()
+    const fresh = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    const used  = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    await readingOn(used, f)
+    const res = await request(buildApp())
+      .get(`/api/utility/meters?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    // The live API camelizes every response globally; this harness mounts the
+    // router alone, so the suite does it explicitly (same as the hasBaseline
+    // tests above).
+    const byId = Object.fromEntries(
+      (camelCaseKeys(res.body.data) as any[]).map(m => [m.id, m.hasHistory]))
+    expect(byId[fresh]).toBe(false)
+    expect(byId[used]).toBe(true)
+  })
+})
+
+/**
+ * S609 (Nic): assigning many units at once.
+ *
+ * "I want to have it where it opens a little window, and I just can checkbox all
+ * the units that get applied to that master meter."
+ *
+ * Oak Park's water master serves 27 units and the old control was one-at-a-time,
+ * with the button jumping to the end of the list after every save.
+ */
+describe('S609 POST /meters/:id/units — many at once', () => {
+  async function extraUnits(f: Fixture, n: number): Promise<string[]> {
+    const c = await db.connect()
+    const ids: string[] = []
+    try {
+      await c.query('BEGIN')
+      for (let i = 0; i < n; i++) {
+        ids.push(await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId }))
+      }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    return ids
+  }
+
+  it('assigns a whole selection in one call', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const ids = await extraUnits(f, 5)
+    const res = await request(buildApp())
+      .post(`/api/utility/meters/${id}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitIds: ids })
+    expect(res.status).toBe(201)
+    expect(res.body.data.added).toHaveLength(5)
+    expect(res.body.data.skipped).toEqual([])
+    const rows = await db.query(`SELECT 1 FROM utility_meter_units WHERE meter_id=$1`, [id])
+    expect(rows.rowCount).toBe(5)
+  })
+
+  it('ONE bad unit does not discard the rest of the selection', async () => {
+    const f = await seed()
+    const master  = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const other   = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const ids = await extraUnits(f, 4)
+    // Park one unit on a different water master — it would be billed twice.
+    await request(buildApp()).post(`/api/utility/meters/${other}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitId: ids[2] }).expect(201)
+
+    const res = await request(buildApp())
+      .post(`/api/utility/meters/${master}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitIds: ids })
+    expect(res.status).toBe(201)
+    expect(res.body.data.added).toHaveLength(3)
+    expect(res.body.data.skipped).toHaveLength(1)
+    expect(res.body.data.skipped[0].unitId).toBe(ids[2])
+    expect(res.body.data.skipped[0].reason).toMatch(/billed twice/i)
+  })
+
+  it('a submeter refuses a multi-select outright', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    const ids = await extraUnits(f, 2)
+    const res = await request(buildApp())
+      .post(`/api/utility/meters/${id}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitIds: ids })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/single unit/i)
+  })
+
+  it('the old single-unit call still errors rather than silently skipping', async () => {
+    const f = await seed()
+    const master = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const other  = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const [u] = await extraUnits(f, 1)
+    await request(buildApp()).post(`/api/utility/meters/${other}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ unitId: u }).expect(201)
+    const res = await request(buildApp())
+      .post(`/api/utility/meters/${master}/units`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitId: u })
+    expect(res.status).toBe(400)
+  })
+
+  it('another landlord cannot assign units to this meter', async () => {
+    const f = await seed()
+    const id = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const ids = await extraUnits(f, 2)
+    const res = await request(buildApp())
+      .post(`/api/utility/meters/${id}/units`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ unitIds: ids })
+    expect(res.status).toBe(403)
   })
 })

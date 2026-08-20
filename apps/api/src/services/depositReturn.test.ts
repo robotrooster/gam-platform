@@ -28,6 +28,7 @@ import { db, getClient } from '../db'
 import {
   calculateDepositReturn,
   finalizeDepositReturn,
+  createOrFetchDraft,
 } from './depositReturn'
 import {
   cleanupAllSchema,
@@ -500,5 +501,74 @@ describe('S550 — conditional lease fees in the sweep', () => {
     await addConditionalFee(stack.leaseId, 75, 'failed')
     calc = await calculateDepositReturn(stack.leaseId)
     expect(calc!.cleaning_fee_amount).toBe(175) // + only the FAILED one
+  })
+})
+
+/**
+ * S609 (Nic): "We need to set it where any future installments preset for
+ * propane become due in full on a final bill at a move out. That's the only
+ * place where acceleration would still be needed."
+ *
+ * The opposite case from the acceleration that was REMOVED. Accelerating on a
+ * new fill punished a tenant still living there and paying on schedule;
+ * accelerating at move-out collects propane already delivered and burned, from
+ * the person who used it. There is no future invoice left to put it on.
+ */
+describe('S609 remaining propane comes due at move-out', () => {
+  async function fillWithSchedule(f: LeaseStack, gallons: number, installments: number) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const fill = await c.query<{ id: string }>(
+        `INSERT INTO propane_fills
+           (property_id, landlord_id, unit_id, lease_id, tenant_id, gallons,
+            price_per_gallon, total_amount, installment_count, created_by_user_id)
+         VALUES ($1,$2,$3,$4,$5,$6,3,$7,$8,$9) RETURNING id`,
+        [f.propertyId, f.landlordId, f.unitId, f.leaseId, f.tenantId,
+         gallons, gallons * 3, installments, f.ownerUserId])
+      const per = Math.round((gallons * 3 / installments) * 100) / 100
+      for (let i = 0; i < installments; i++) {
+        await c.query(
+          `INSERT INTO propane_fill_installments
+             (fill_id, installment_number, amount, gallons, billing_cycle_month, payment_id)
+           VALUES ($1,$2,$3,$4, (date_trunc('month', CURRENT_DATE) + make_interval(months => $5::int))::date, NULL)`,
+          [fill.rows[0].id, i + 1, per, gallons / installments, i + 1])
+      }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('turns every unbilled installment into a charge on the final bill', async () => {
+    const f = await buildLeaseStack()
+    await fillWithSchedule(f, 120, 4)          // $360 over four months, none billed
+
+    // Before: nothing payable — they are future charges, like next month's rent.
+    const before = await db.query(
+      `SELECT id FROM payments WHERE lease_id=$1 AND entry_description='PROPANE'`, [f.leaseId])
+    expect(before.rows).toHaveLength(0)
+
+    await createOrFetchDraft(f.leaseId)
+
+    const after = await db.query<any>(
+      `SELECT amount FROM payments WHERE lease_id=$1 AND entry_description='PROPANE'`, [f.leaseId])
+    expect(after.rows).toHaveLength(4)
+    expect(after.rows.reduce((s: number, r: any) => s + Number(r.amount), 0)).toBeCloseTo(360, 2)
+
+    // And every installment now points at its charge — none left unbilled.
+    const unbilled = await db.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM propane_fill_installments i
+         JOIN propane_fills fl ON fl.id = i.fill_id
+        WHERE fl.lease_id = $1 AND i.payment_id IS NULL`, [f.leaseId])
+    expect(unbilled.rows[0].n).toBe(0)
+  })
+
+  it('re-opening the draft does not charge twice', async () => {
+    const f = await buildLeaseStack()
+    await fillWithSchedule(f, 120, 4)
+    await createOrFetchDraft(f.leaseId)
+    await createOrFetchDraft(f.leaseId)
+    const after = await db.query(
+      `SELECT id FROM payments WHERE lease_id=$1 AND entry_description='PROPANE'`, [f.leaseId])
+    expect(after.rows).toHaveLength(4)
   })
 })

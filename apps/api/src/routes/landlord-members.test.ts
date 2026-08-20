@@ -114,15 +114,21 @@ describe('landlord members CRUD', () => {
     expect(a.rows[0].referred_by_user_id).toBe(priorUpline.userId)
   })
 
-  it('rejects unknown emails and duplicate adds', async () => {
+  it('invites unknown emails and rejects duplicate adds', async () => {
     const oakPark = await seedEntity('Oak Park LLC')
     const friend = await seedEntity('Friend WY Holdings')
     const app = buildApp()
     const t = tokenFor(oakPark)
 
+    // S609: an unknown email is no longer a dead end. The route now SENDS AN
+    // INVITE (202) instead of 404 — deliberate: requiring a co-owner to go and
+    // register themselves first, with no invitation in hand, is how the
+    // invitation quietly dies. The test name's "rejects unknown emails" no
+    // longer describes the product; the duplicate-add half below still does.
     const missing = await request(app).post('/api/landlords/members')
       .set('Authorization', `Bearer ${t}`).send({ email: 'nobody@nowhere.dev' })
-    expect(missing.status).toBe(404)
+    expect(missing.status).toBe(202)
+    expect(missing.body.data.invited).toBe(true)
 
     await request(app).post('/api/landlords/members')
       .set('Authorization', `Bearer ${t}`).send({ email: friend.email })

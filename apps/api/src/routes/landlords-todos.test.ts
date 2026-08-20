@@ -93,10 +93,16 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.leases).toEqual([])
     // No tenant ACH because no v_unit_occupancy primary tenant link yet
     // (seedTenant alone doesn't link to a unit via lease_tenants)
-    expect(res.body.data.ach.length).toBe(1)
-    expect(res.body.data.ach[0].id).toBe('landlord-bank')
+    //
+    // S609: a second todo joined this list — 'landlord-bank-feed', connecting
+    // the operating bank. That is deliberate (the bank feed belongs in
+    // onboarding), so the test is updated rather than the code. Asserted by ID
+    // rather than by count, so the next addition names itself instead of just
+    // moving a number.
+    expect(res.body.data.ach.map((t: any) => t.id).sort())
+      .toEqual(['landlord-bank', 'landlord-bank-feed'])
     expect(res.body.data.maintenance).toEqual([])
-    expect(res.body.data.counts.total).toBe(1)
+    expect(res.body.data.counts.total).toBe(2)
   })
 
   it('bank account active → no landlord-bank todo', async () => {

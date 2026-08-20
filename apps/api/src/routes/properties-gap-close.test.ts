@@ -547,7 +547,12 @@ describe('unit-subtypes CRUD (S527)', () => {
     expect(after.body.data).toHaveLength(0)
   })
 
-  it('upsert: same (type, name) updates in place, no duplicate', async () => {
+  // S613 (Nic, data loss): this used to assert the OPPOSITE — a create with an
+  // existing name silently overwrote that subtype in place and returned 200.
+  // Nic built "Back In / 50 amp" then "Back In / 30 amp" at Oak Park and the
+  // second ate the first, with a successful save on screen and one row in the
+  // list. A name collision is now refused out loud.
+  it('duplicate name → 409, and the existing subtype is untouched', async () => {
     const f = await seed()
     const app = buildApp()
     await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
@@ -555,11 +560,60 @@ describe('unit-subtypes CRUD (S527)', () => {
       .send({ unitType: 'apartment', name: 'Studio', bedrooms: 0, rentAmount: 600 })
     const res = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ unitType: 'apartment', name: 'Studio', bedrooms: 0, rentAmount: 650 })
-    expect(res.status).toBe(200)
+      .send({ unitType: 'apartment', name: 'studio', bedrooms: 0, rentAmount: 650 })
+    expect(res.status).toBe(409)
     const list = await request(app).get(`/api/properties/${f.propertyAId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(list.body.data).toHaveLength(1)
-    expect(Number(list.body.data[0].rent_amount)).toBe(650)
+    expect(Number(list.body.data[0].rent_amount)).toBe(600)
+  })
+
+  // The case Nic actually wanted: two variations of the same kind of space,
+  // living side by side.
+  it('two RV subtypes differing only by amp service both survive', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const a = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'rv_spot', name: 'Back-in 50 amp', rvSiteLayout: 'back_in', rvAmpService: '50', rentAmount: 480 })
+    const b = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'rv_spot', name: 'Back-in 30 amp', rvSiteLayout: 'back_in', rvAmpService: '30', rentAmount: 440 })
+    expect(a.status).toBe(200)
+    expect(b.status).toBe(200)
+    const list = await request(app).get(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    const amps = list.body.data.filter((r: any) => r.unit_type === 'rv_spot').map((r: any) => r.rv_amp_service).sort()
+    expect(amps).toEqual(['30', '50'])
+  })
+
+  it('renaming a subtype onto another subtype\'s name → 409', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'apartment', name: 'Studio' })
+    const two = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'apartment', name: 'One bedroom' })
+    const res = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ id: two.body.data.id, unitType: 'apartment', name: 'Studio' })
+    expect(res.status).toBe(409)
+  })
+
+  // The editor reads this back to prefill its dropdown; when it was missing the
+  // dropdown defaulted to 'tenant' and any later edit silently flipped a
+  // park-owned rental to tenant-owned.
+  it('list returns dwelling_ownership and a unit count', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'mobile_home', name: 'Park Model Rental', dwellingOwnership: 'landlord' })
+    const list = await request(app).get(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(list.body.data[0].dwelling_ownership).toBe('landlord')
+    expect(list.body.data[0].unit_count).toBe(0)
   })
 })

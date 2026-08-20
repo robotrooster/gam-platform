@@ -200,3 +200,68 @@ describe('generateInvoices — work-trade credit', () => {
     expect(invoice.total_amount).toBe('1000.00')
   })
 })
+
+/**
+ * S609 (Nic): PROPANE IS WORK-TRADE CREDITABLE.
+ *
+ * "We need to find a way to include propane in there too, because at a different
+ * property I own we do dispense propane, and we give our seasonal help free
+ * propane in the winter. We don't actually invoice them anything. I just need a
+ * way to track it — what's being given out, the total value of what's been
+ * given, for what work has been done."
+ *
+ * It was excluded as a "fixed contractual split amount", so a full trade month
+ * still left a propane bill. Running it through the credit records the value
+ * given AND the work done on the same invoice, instead of the arrangement living
+ * in someone's head.
+ */
+describe('S609 propane in the work-trade credit', () => {
+  it('a full month covers propane along with everything else', () => {
+    // $500 rent + $80 utilities + $20 fee + $300 propane = $900 owed.
+    const credit = workTradeFraction(80, 80) * 900   // full target month
+    const d = distributeWorkTradeCredit(500, [80], [20], credit, [300])
+    expect(d.rentNet).toBe(0)
+    expect(d.utilityNets).toEqual([0])
+    expect(d.feeNets).toEqual([0])
+    expect(d.propaneNets).toEqual([0])
+    expect(d.creditApplied).toBeCloseTo(900, 2)
+  })
+
+  it('propane is taken LAST — a half month covers living costs first', () => {
+    // Half of $900 is $450: rent takes it all, nothing reaches propane.
+    const credit = workTradeFraction(40, 80) * 900
+    const d = distributeWorkTradeCredit(500, [80], [20], credit, [300])
+    expect(d.rentNet).toBeCloseTo(50, 2)     // 500 − 450
+    expect(d.utilityNets).toEqual([80])
+    expect(d.propaneNets).toEqual([300])     // untouched
+  })
+
+  it('the credit spills into propane once everything else is covered', () => {
+    // $700 of credit clears rent+utilities+fees ($600) with $100 left.
+    const d = distributeWorkTradeCredit(500, [80], [20], 700, [300])
+    expect(d.rentNet).toBe(0)
+    expect(d.utilityNets).toEqual([0])
+    expect(d.feeNets).toEqual([0])
+    expect(d.propaneNets).toEqual([200])     // 300 − 100
+    expect(d.creditApplied).toBeCloseTo(700, 2)
+  })
+
+  it('several fills are covered in order', () => {
+    const d = distributeWorkTradeCredit(0, [], [], 250, [100, 100, 100])
+    expect(d.propaneNets).toEqual([0, 0, 50])
+  })
+
+  it('no propane behaves exactly as before', () => {
+    const d = distributeWorkTradeCredit(500, [80], [20], 600)
+    expect(d.propaneNets).toEqual([])
+    expect(d.rentNet).toBe(0)
+    expect(d.creditApplied).toBeCloseTo(600, 2)
+  })
+
+  it('credit never exceeds what is owed', () => {
+    const d = distributeWorkTradeCredit(100, [], [], 999, [50])
+    expect(d.creditApplied).toBeCloseTo(150, 2)
+    expect(d.rentNet).toBe(0)
+    expect(d.propaneNets).toEqual([0])
+  })
+})

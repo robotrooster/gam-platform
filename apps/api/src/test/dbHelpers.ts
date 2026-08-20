@@ -152,6 +152,9 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_charge_accounts`)
   await db.query(`DELETE FROM remittance_applications`)
   await db.query(`DELETE FROM lease_prepaid_credits`)
+  // S609: tenant autopay schedules (one per lease, cascades from leases anyway,
+  // but leases are deleted later in this chain).
+  await db.query(`DELETE FROM tenant_autopay`)
   await db.query(`DELETE FROM tenant_remittances`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —
@@ -770,15 +773,24 @@ export async function seedUtilityMeter(
     propertyId: string
     utilityType?: 'water' | 'gas' | 'electric' | 'sewer' | 'trash'
     billingMethod?: 'submeter' | 'rubs' | 'master_bill_to_landlord'
+    /** Required by the schema for a RUBS master; ignored for anything else. */
+    rubsAllocationMethod?: string
   }
 ): Promise<string> {
+  // S609: `billingMethod: 'rubs'` was accepted here but could never succeed —
+  // utility_meters_check requires a RUBS master to carry an allocation method
+  // and this helper never set one, so every attempt violated the constraint.
+  // The option looked available and wasn't.
+  const method = params.billingMethod ?? 'submeter'
+  const alloc = method === 'rubs' ? (params.rubsAllocationMethod ?? 'occupant_count') : null
   const res = await client.query<{ id: string }>(
     `INSERT INTO utility_meters
-       (property_id, utility_type, label, billing_method)
-     VALUES ($1, $2, 'Test Meter', $3) RETURNING id`,
+       (property_id, utility_type, label, billing_method, rubs_allocation_method)
+     VALUES ($1, $2, 'Test Meter', $3, $4) RETURNING id`,
     [params.propertyId,
      params.utilityType ?? 'water',
-     params.billingMethod ?? 'submeter']
+     method,
+     alloc]
   )
   return res.rows[0].id
 }

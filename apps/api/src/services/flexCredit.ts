@@ -108,9 +108,10 @@ export async function processFlexCreditFee(now: Date = new Date()): Promise<Flex
            landlord_id, tenant_id, lease_id, unit_id,
            type, amount, status, entry_description,
            due_date, stripe_payment_intent_id, notes,
-           gam_supersedence_amount
+           gam_supersedence_amount, revenue_owner
+         -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share. A tenant opt-in product.
          ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'SUBSCRIP',
-                   $6, $7, $8, $9)
+                   $6, $7, $8, $9, 'gam')
          RETURNING id`,
         [
           r.landlord_id, r.tenant_id, r.lease_id, r.unit_id,

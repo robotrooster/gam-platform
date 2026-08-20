@@ -239,6 +239,10 @@ describe('fetchAccountStatus', () => {
       requirements_currently_due: ['individual.dob'],
       requirements_past_due:      ['external_account'],
       requirements_disabled_reason: 'requirements.past_due',
+      // S609: payout_bank was added in S605 — the account rent actually pays
+      // out to, so a landlord isn't asked for bank details they already gave
+      // Stripe. These mocks supply no external_accounts, so it resolves to null.
+      payout_bank: null,
     })
   })
 
@@ -252,6 +256,7 @@ describe('fetchAccountStatus', () => {
       requirements_currently_due: [],
       requirements_past_due:      [],
       requirements_disabled_reason: null,
+      payout_bank: null,
     })
   })
 })

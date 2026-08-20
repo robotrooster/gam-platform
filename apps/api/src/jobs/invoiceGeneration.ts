@@ -7,6 +7,9 @@ import {
   loadWorkTradeCreditContext, workTradeFraction, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
+import { applyCreditsToOpenCharges } from '../services/creditApplication'
+import { consumePrepaidCreditForInvoice } from '../services/prepaidRelease'
+import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
@@ -438,6 +441,7 @@ async function runGeneration(
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
                 ub.utility_type, ub.usage_amount, ub.reading_start, ub.reading_end,
+                ub.reading_start_date, ub.reading_end_date,
                 m.digits
            FROM utility_bills ub
            JOIN utility_meters m ON m.id = ub.meter_id
@@ -497,11 +501,16 @@ async function runGeneration(
         const rentAmountNum = Number(effectiveRentAmount)
         const feesTotalNum = fees.reduce((s, f) => s + Number(f.amount), 0)
         const utilitiesTotalNum = utilityBills.reduce((s, b) => s + Number(b.charge_amount), 0)
-        // Propane installments ride the invoice at face value (fixed
-        // contractual split amounts — exempt from work-trade credit and
-        // late fees) but count into the utilities subtotal + total.
+        // Propane installments count into the utilities subtotal + total.
+        // S609 (Nic): they are ALSO work-trade creditable now. They used to be
+        // exempt as "fixed contractual split amounts", which meant someone
+        // working a full trade month still got a propane bill — and Nic gives
+        // seasonal help their winter propane outright. Running it through the
+        // credit bills the fill at its real value and cancels it, so the value
+        // given and the work done are recorded on one document. Late-fee
+        // treatment is unchanged.
         const propaneTotalNum = propaneInstallments.reduce((s, p) => s + Number(p.amount), 0)
-        const billableTotalNum = round2(rentAmountNum + feesTotalNum + utilitiesTotalNum)
+        const billableTotalNum = round2(rentAmountNum + feesTotalNum + utilitiesTotalNum + propaneTotalNum)
         const subtotalFeesStr      = feesTotalNum.toFixed(2)
         const subtotalUtilitiesStr = round2(utilitiesTotalNum + propaneTotalNum).toFixed(2)
 
@@ -522,12 +531,13 @@ async function runGeneration(
           utilityBills.map(b => Number(b.charge_amount)),
           fees.map(f => Number(f.amount)),
           wtCreditTarget,
+          propaneInstallments.map(p => Number(p.amount)),
         )
         const netTotalNum = round2(
           dist.rentNet
           + dist.utilityNets.reduce((s, u) => s + u, 0)
           + dist.feeNets.reduce((s, f) => s + f, 0)
-          + propaneTotalNum
+          + dist.propaneNets.reduce((s, p) => s + p, 0)
         )
         // A row fully covered by the trade is charged $0 and recorded as
         // already-settled (covered by labor, not cash) only when work-trade
@@ -619,8 +629,20 @@ async function runGeneration(
           // only ever applied to the READER's entry flow).
           const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms' }
           const pad = (v: any) => v == null ? null : String(Math.trunc(Number(v))).padStart(Number((ub as any).digits) || 6, '0')
+          // S607: the READ DATES ride the line too. A utility bill that shows
+          // the opening and closing readings but not when they were taken is
+          // incomplete under the bill-format rules several states impose on a
+          // landlord reselling a utility — and it is the first thing a tenant
+          // disputing a charge asks for. Rendered as a plain date range, only
+          // when both dates are present, so older bills degrade to what they
+          // always showed rather than printing a half-empty range.
+          const d = (v: any) => v == null ? null
+            : new Date(v).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+          const dateNote = (ub as any).reading_start_date && (ub as any).reading_end_date
+            ? ` (${d((ub as any).reading_start_date)} → ${d((ub as any).reading_end_date)})`
+            : ''
           const readNote = (ub as any).reading_start != null && (ub as any).reading_end != null
-            ? `${((ub as any).utility_type || 'utility')[0].toUpperCase() + ((ub as any).utility_type || 'utility').slice(1)} meter ${pad((ub as any).reading_start)} → ${pad((ub as any).reading_end)} · ${Number((ub as any).usage_amount || 0).toLocaleString()} ${UNIT_LABEL[(ub as any).utility_type] || 'units'}`
+            ? `${((ub as any).utility_type || 'utility')[0].toUpperCase() + ((ub as any).utility_type || 'utility').slice(1)} meter ${pad((ub as any).reading_start)} → ${pad((ub as any).reading_end)}${dateNote} · ${Number((ub as any).usage_amount || 0).toLocaleString()} ${UNIT_LABEL[(ub as any).utility_type] || 'units'}`
             : null
           const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
           const utilityPayment = await client.query<{ id: string }>(
@@ -651,7 +673,10 @@ async function runGeneration(
         // S533: propane installment children at face value (fixed split
         // amounts). Once on the invoice they ride its NORMAL late-fee
         // rules (Nic). payment_id stamped so the next run doesn't re-bill.
-        for (const pi of propaneInstallments) {
+        for (const [piIdx, pi] of propaneInstallments.entries()) {
+          // S609: charged at the work-trade NET. Same order the credit was
+          // distributed in, so index piIdx is this installment's net.
+          const propaneNet = dist.propaneNets[piIdx] ?? Number(pi.amount)
           const propanePayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
@@ -660,8 +685,11 @@ async function runGeneration(
              RETURNING id`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              Number(pi.amount).toFixed(2), dueDate,
-              `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`,
+              propaneNet.toFixed(2), dueDate,
+              propaneNet < Number(pi.amount)
+                ? `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count} (${
+                    propaneNet === 0 ? 'covered in full by work trade' : `$${round2(Number(pi.amount) - propaneNet).toFixed(2)} covered by work trade`})`
+                : `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`,
             ]
           )
           await client.query(
@@ -671,127 +699,54 @@ async function runGeneration(
           utilitiesInserted++
         }
 
-        // S537 (Nic): consume prepaid credit (pay-ahead remainder from a
-        // FIFO remittance) against this invoice's fresh charge rows,
-        // oldest credit first. Rows fully covered settle out-of-band (no
-        // Stripe money moves — it already moved when the tenant paid
-        // ahead); a partially covered row splits per the standard
-        // remainder pattern so late-fee mechanics stay truthful.
-        {
-          const credits = await client.query<{ id: string; amount_remaining: string }>(
-            `SELECT id, amount_remaining::text FROM lease_prepaid_credits
-              WHERE lease_id = $1 AND amount_remaining > 0
-              ORDER BY created_at ASC
-              FOR UPDATE`,
-            [lease.id])
-          let available = credits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
-          if (available > 0) {
-            const fresh = await client.query<{ id: string; amount: string; type: string }>(
-              `SELECT id, amount::text, type FROM payments
-                WHERE invoice_id = $1 AND status = 'pending'
-                ORDER BY due_date ASC, created_at ASC`,
-              [invoiceId])
-            let consumed = 0
-            for (const row of fresh.rows) {
-              if (available <= 0.005) break
-              const rowAmt = Number(row.amount)
-              const apply = Math.min(rowAmt, available)
-              if (apply >= rowAmt - 0.005) {
-                await client.query(
-                  `UPDATE payments SET status='settled', settled_at=NOW(),
-                          notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
-                    WHERE id = $1`, [row.id])
-              } else {
-                const remainder = Math.round((rowAmt - apply) * 100) / 100
-                await client.query(
-                  `UPDATE payments SET amount = $2::numeric, status='settled', settled_at=NOW(),
-                          notes = COALESCE(notes || ' — ', '') || 'partially covered by prepaid credit'
-                    WHERE id = $1`, [row.id, apply.toFixed(2)])
-                await client.query(
-                  `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                                         type, amount, status, due_date, entry_description, notes, is_remainder)
-                   SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                          type, $2::numeric, 'pending', due_date, entry_description,
-                          'Remainder after prepaid credit application', TRUE
-                     FROM payments WHERE id = $1`,
-                  [row.id, remainder.toFixed(2)])
-              }
-              available -= apply
-              consumed += apply
-            }
-            // Draw down the credits oldest-first by what was consumed.
-            let toDraw = consumed
-            for (const c of credits.rows) {
-              if (toDraw <= 0.005) break
-              const draw = Math.min(Number(c.amount_remaining), toDraw)
-              await client.query(
-                `UPDATE lease_prepaid_credits
-                    SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
-                  WHERE id = $1`, [c.id, draw.toFixed(2)])
-              toDraw -= draw
-            }
-          }
-        }
+        // S537 (Nic): consume prepaid credit — money the tenant paid ahead —
+        // against this invoice's fresh charge rows, oldest credit first.
+        //
+        // S609: the release now also HANDS THE LANDLORD their share of what the
+        // credit covered. Before, the tenant's bill was marked paid and the
+        // money stayed on GAM's books permanently; see services/prepaidRelease
+        // for the full note. Runs BEFORE landlord-issued credits so real money
+        // the tenant already paid is spent before a landlord's write-off is.
+        await consumePrepaidCreditForInvoice(client, { leaseId: lease.id, invoiceId })
 
-        // S577: landlord-issued account credits (tenant_credits) — applied to
-        // whatever pending rows REMAIN after prepaid credits, oldest-first. Same
-        // application mechanism, SEPARATE source. Funded by the landlord (the
-        // tenant simply owes less → less rent received). INDEPENDENT of
-        // work-trade (which is hours-logging only; a landlord adjusts approved
-        // hours there, never a credit).
-        {
-          const lcredits = await client.query<{ id: string; amount_remaining: string }>(
-            `SELECT id, amount_remaining::text FROM tenant_credits
-              WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0
-              ORDER BY created_at ASC
-              FOR UPDATE`,
-            [lease.id])
-          let available = lcredits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
-          if (available > 0) {
-            const fresh = await client.query<{ id: string; amount: string }>(
-              `SELECT id, amount::text FROM payments
-                WHERE invoice_id = $1 AND status = 'pending'
-                ORDER BY due_date ASC, created_at ASC`,
-              [invoiceId])
-            let consumed = 0
-            for (const row of fresh.rows) {
-              if (available <= 0.005) break
-              const rowAmt = Number(row.amount)
-              const apply = Math.min(rowAmt, available)
-              if (apply >= rowAmt - 0.005) {
-                await client.query(
-                  `UPDATE payments SET status='settled', settled_at=NOW(),
-                          notes = COALESCE(notes || ' — ', '') || 'covered by account credit'
-                    WHERE id = $1`, [row.id])
-              } else {
-                const remainder = Math.round((rowAmt - apply) * 100) / 100
-                await client.query(
-                  `UPDATE payments SET amount = $2::numeric, status='settled', settled_at=NOW(),
-                          notes = COALESCE(notes || ' — ', '') || 'partially covered by account credit'
-                    WHERE id = $1`, [row.id, apply.toFixed(2)])
-                await client.query(
-                  `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                                         type, amount, status, due_date, entry_description, notes, is_remainder)
-                   SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                          type, $2::numeric, 'pending', due_date, entry_description,
-                          'Remainder after account credit application', TRUE
-                     FROM payments WHERE id = $1`,
-                  [row.id, remainder.toFixed(2)])
-              }
-              available -= apply
-              consumed += apply
-            }
-            let toDraw = consumed
-            for (const c of lcredits.rows) {
-              if (toDraw <= 0.005) break
-              const draw = Math.min(Number(c.amount_remaining), toDraw)
-              await client.query(
-                `UPDATE tenant_credits
-                    SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
-                  WHERE id = $1`, [c.id, draw.toFixed(2)])
-              toDraw -= draw
-            }
-          }
+        // S577/S607: landlord-issued account credits (tenant_credits), applied to
+        // whatever pending rows remain after prepaid credits, oldest-first.
+        // Funded by the landlord (the tenant simply owes less → less rent
+        // received). INDEPENDENT of work-trade.
+        //
+        // S607: the application logic now lives in services/creditApplication so
+        // this path and the issue-a-credit path behave identically. They had to
+        // agree anyway, and two copies of "how a credit lands" is how a tenant
+        // ends up with a different balance depending on which code touched them
+        // last. Scoped to this invoice's rows, as it always was — the landlord
+        // route uses lease scope to reach older open charges.
+        //
+        // S609: savepoint-guarded for the same reason the prepaid release is —
+        // THE BILL ALWAYS GOES OUT. This runs inside the per-lease invoice
+        // transaction, so anything thrown here would roll the invoice back and
+        // the tenant would get no bill at all. A credit that fails to apply
+        // leaves the tenant owing money they were going to be forgiven, which is
+        // fixable next cycle; a tenant who never receives a bill is not.
+        // (The landlord's own issue-a-credit route calls the same service
+        // WITHOUT a savepoint, and should — a person pressing a button needs to
+        // see the error.)
+        await client.query('SAVEPOINT lease_credits')
+        try {
+          await applyCreditsToOpenCharges(client, {
+            leaseId: lease.id, scope: 'invoice', invoiceId,
+          })
+          await client.query('RELEASE SAVEPOINT lease_credits')
+        } catch (e) {
+          await client.query('ROLLBACK TO SAVEPOINT lease_credits')
+          logger.error({ err: e, leaseId: lease.id, invoiceId },
+            '[InvoiceGen] account credits could not be applied — invoice still issued')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'invoice_credit_apply_failed',
+            title: `Account credit could not be applied to invoice ${invoiceId}`,
+            body: `The tenant's landlord-issued credit was not applied, so their bill is higher than intended. The invoice was issued rather than held. The credit is untouched and applies on the next cycle.`,
+            context: { lease_id: lease.id, invoice_id: invoiceId },
+          }).catch(() => {})
         }
 
         await client.query('COMMIT')

@@ -619,7 +619,13 @@ stripeRouter.post('/tenant/microdeposits/verify', async (req, res, next) => {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
     const body = z.object({
       amounts:        z.array(z.number().int().min(1).max(99)).length(2).optional(),
-      descriptorCode: z.string().trim().min(4).max(12).optional(),
+      // S607 (Nic): UPPERCASE server-side, not just in the field. Stripe issues
+      // the descriptor code uppercase (SM + 4 characters) and a bank statement
+      // may render it either way; a tenant retyping what they see in lowercase
+      // must not fail a verification that Stripe counts as a wrong guess and
+      // locks after a few. Normalising here covers every client, including any
+      // future one that forgets to.
+      descriptorCode: z.string().trim().toUpperCase().min(4).max(12).optional(),
     }).parse(req.body ?? {})
     if (!body.amounts && !body.descriptorCode) {
       throw new AppError(400, 'Enter the deposit amounts or the code from your statement')

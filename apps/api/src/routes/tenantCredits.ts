@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
+import { applyCreditsToOpenCharges } from '../services/creditApplication'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -53,13 +54,36 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
 
     const lease = await leaseForLandlord(body.leaseId, req.user)
     const amt = Math.round(body.amount * 100) / 100
-    const row = await queryOne<any>(
-      `INSERT INTO tenant_credits
-         (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_by)
-       VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
-       RETURNING id, amount_original, amount_remaining, category, reason, status, created_at`,
-      [lease.landlord_id, lease.tenant_id, lease.id, amt.toFixed(2), body.category, body.reason ?? null, req.user!.userId])
-    res.status(201).json({ success: true, data: row })
+
+    // S607 (Nic): the credit lands on the OPEN BALANCE NOW, not at the next
+    // invoice. "The credit needs to go to the balance and kind of zero it out so
+    // that the landlord's not thinking that the tenant still owes money, the
+    // books look good, everything's zeroed out."
+    //
+    // Before this, forgiving a $35 late fee left $35 showing as owed until the
+    // next invoice ran — and because rent is pay-in-full, that forgiven charge
+    // also blocked the tenant from paying anything at all. Anything not consumed
+    // by open charges stays on the credit for the next invoice.
+    const client = await getClient()
+    let row: any, applied = 0
+    try {
+      await client.query('BEGIN')
+      row = (await client.query<any>(
+        `INSERT INTO tenant_credits
+           (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_by)
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+         RETURNING id, amount_original, amount_remaining, category, reason, status, created_at`,
+        [lease.landlord_id, lease.tenant_id, lease.id, amt.toFixed(2), body.category, body.reason ?? null, req.user!.userId])).rows[0]
+      const r = await applyCreditsToOpenCharges(client, { leaseId: lease.id, scope: 'lease' })
+      applied = r.applied
+      const fresh = await client.query<{ amount_remaining: string }>(
+        `SELECT amount_remaining::text FROM tenant_credits WHERE id = $1`, [row.id])
+      row.amount_remaining = fresh.rows[0].amount_remaining
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
+    finally { client.release() }
+
+    res.status(201).json({ success: true, data: { ...row, appliedToBalance: applied } })
   } catch (e) { next(e) }
 })
 

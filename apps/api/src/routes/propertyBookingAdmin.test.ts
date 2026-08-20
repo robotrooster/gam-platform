@@ -42,13 +42,25 @@ describe('PATCH /properties/:id/booking-config', () => {
   it('sets slug + enables; GET reflects it', async () => {
     const f = await seed()
     const res = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
-      .set('Authorization', `Bearer ${f.tokenA}`).send({ slug: 'my-rv-park', enabled: true, depositPct: 30 })
+      // S609: the booking deposit is now a fixed menu — 5, 10, 15 or 20 percent.
+      // This test used 30, which is no longer offerable, so it 400'd before ever
+      // checking the slug it was actually about.
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ slug: 'my-rv-park', enabled: true, depositPct: 20 })
     expect(res.status).toBe(200)
     expect(res.body.data.slug).toBe('my-rv-park')
     expect(res.body.data.enabled).toBe(true)
-    expect(res.body.data.depositPct).toBe(30)
+    expect(res.body.data.depositPct).toBe(20)
     const get = await request(buildApp()).get(`/api/properties/${f.propertyId}/booking-config`).set('Authorization', `Bearer ${f.tokenA}`)
     expect(get.body.data.slug).toBe('my-rv-park')
+  })
+
+  // S609: pin the menu itself, so the rule the test above tripped over is
+  // guarded rather than merely worked around.
+  it('refuses a deposit percentage outside the 5/10/15/20 menu', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).patch(`/api/properties/${f.propertyId}/booking-config`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ depositPct: 30 })
+    expect(res.status).toBe(400)
   })
 
   it('sets stay rates + short-term tax; preserves unmentioned rates', async () => {

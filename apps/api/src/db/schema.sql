@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict KfIgOuZ9f9g5XdDS9mQ4NRjIBmDbuN04uiegMwmXtNfgkEHQ9ElJkcEpKVqqk2C
+\restrict 2iI6W1RzV4c0O2NcbDEOwdzT6oZbXaY1lbosMSkRVOp3Ju2U1kJ2ibd5QaLfa5Y
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4961,10 +4961,12 @@ CREATE TABLE public.payments (
     manual_method text,
     sublease_markup_amount numeric DEFAULT 0 NOT NULL,
     home_sale_installment_id uuid,
+    revenue_owner text DEFAULT 'landlord'::text NOT NULL,
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
+    CONSTRAINT payments_revenue_owner_check CHECK ((revenue_owner = ANY (ARRAY['landlord'::text, 'gam'::text]))),
     CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
     CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text, 'home_payment'::text, 'carried_balance'::text])))
 );
@@ -5010,6 +5012,13 @@ COMMENT ON COLUMN public.payments.imported_at IS 'Phase B: timestamp the import 
 --
 
 COMMENT ON COLUMN public.payments.home_sale_installment_id IS 'S594: the home_sale_installments row this home_payment charge bills. Partial-unique so an installment is billed at most once even across concurrent cron runs / multiple API instances.';
+
+
+--
+-- Name: COLUMN payments.revenue_owner; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.revenue_owner IS 'S609: whose money this charge is. ''landlord'' (the default) = the tenant owes it because of their LEASE — rent, utilities, late fees, any fee a landlord billed. ''gam'' = the tenant owes it for using a GAM service — a returned bank payment, a declined card, a manual-payment recording, or an opt-in product. Stamped at creation because entry_description cannot distinguish a landlord''s hand-billed fee from a GAM subscription (both write ''SUBSCRIP''). Read by services/allocation.ts to decide whether an owner share is booked.';
 
 
 --
@@ -6035,8 +6044,24 @@ CREATE TABLE public.propane_fill_installments (
     billing_cycle_month date NOT NULL,
     payment_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    accelerated boolean DEFAULT false NOT NULL
+    accelerated boolean DEFAULT false NOT NULL,
+    gallons numeric(10,2),
+    CONSTRAINT propane_fill_installments_gallons_check CHECK (((gallons IS NULL) OR (gallons > (0)::numeric)))
 );
+
+
+--
+-- Name: COLUMN propane_fill_installments.billing_cycle_month; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fill_installments.billing_cycle_month IS 'S609: the invoice month this installment rides. Fixed when the fill is recorded — the whole schedule is decided before any money moves, so the tenant can see what is coming.';
+
+
+--
+-- Name: COLUMN propane_fill_installments.gallons; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fill_installments.gallons IS 'S609: the gallons this installment covers. The split is by GALLONS — a tenant can check a quantity against their tank in a way they cannot check a quarter of a dollar figure. The last installment takes the remainder so the gallons sum to the fill exactly.';
 
 
 --
@@ -6252,12 +6277,28 @@ CREATE TABLE public.property_allocation_rules (
     ach_fee_payer text NOT NULL,
     card_fee_payer text NOT NULL,
     platform_fee_payer text DEFAULT 'landlord'::text NOT NULL,
+    manual_fee_payer text DEFAULT 'tenant'::text NOT NULL,
     CONSTRAINT property_allocation_rules_ach_fee_payer_check CHECK ((ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT property_allocation_rules_card_fee_payer_check CHECK ((card_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
+    CONSTRAINT property_allocation_rules_manual_fee_payer_check CHECK ((manual_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT property_allocation_rules_placement_fee_paired CHECK (((placement_fee_type IS NULL) = (placement_fee_value IS NULL))),
     CONSTRAINT property_allocation_rules_placement_fee_type_check CHECK (((placement_fee_type IS NULL) OR (placement_fee_type = ANY (ARRAY['flat'::text, 'percent_of_first_month'::text])))),
-    CONSTRAINT property_allocation_rules_platform_fee_payer_check CHECK ((platform_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
+    CONSTRAINT property_allocation_rules_platform_fee_payer_check CHECK ((platform_fee_payer = 'landlord'::text))
 );
+
+
+--
+-- Name: COLUMN property_allocation_rules.platform_fee_payer; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_allocation_rules.platform_fee_payer IS 'S607: LOCKED to landlord. The platform fee is GAM''s commercial relationship with the landlord and must never reach a tenant''s bill — otherwise a volume discount GAM grants a landlord would change what that landlord''s tenants pay. Column retained (rather than dropped) because platform_fee_accruals.payer snapshots it per accrual.';
+
+
+--
+-- Name: COLUMN property_allocation_rules.manual_fee_payer; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_allocation_rules.manual_fee_payer IS 'S607: who reimburses the $10 cash/check/money-order fee. tenant (default) = the tenant is invoiced for it. landlord = the landlord absorbs it and no tenant charge is raised. GAM recovers the fee from the landlord''s collections either way; this only decides whether the tenant is billed to make them whole.';
 
 
 --
@@ -6564,7 +6605,8 @@ CREATE TABLE public.property_utility_rates (
     base_fee numeric(12,2) DEFAULT 0 NOT NULL,
     sewer_rate_per_unit numeric(12,5),
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    prevailing_residential_rate numeric(12,5)
 );
 
 
@@ -6573,6 +6615,13 @@ CREATE TABLE public.property_utility_rates (
 --
 
 COMMENT ON TABLE public.property_utility_rates IS 'S605: utility pricing is PROPERTY policy, not per-unit. Every tenant at a property pays the same rate for the same utility. Overrides utility_meters rate columns for new bills.';
+
+
+--
+-- Name: COLUMN property_utility_rates.prevailing_residential_rate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_utility_rates.prevailing_residential_rate IS 'S607: the serving utility''s prevailing basic-service single-family residential rate, per unit of usage. Statutory CEILING on what a submetered tenant may be charged (A.R.S. § 33-1413.01(B), § 33-2107(B)(3)). NULL = not looked up yet, no cap applied. The landlord absorbs any capped shortfall; it is never reallocated to the RUBS spaces.';
 
 
 --
@@ -7816,6 +7865,64 @@ CREATE TABLE public.system_features (
 
 
 --
+-- Name: tenant_autopay; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_autopay (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    pull_day integer,
+    payment_method_id text,
+    last_run_cycle date,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    consecutive_failures integer DEFAULT 0 NOT NULL,
+    disarmed_at timestamp with time zone,
+    disarmed_reason text,
+    last_success_cycle date,
+    CONSTRAINT tenant_autopay_pull_day_check CHECK (((pull_day IS NULL) OR ((pull_day >= 1) AND (pull_day <= 28))))
+);
+
+
+--
+-- Name: TABLE tenant_autopay; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_autopay IS 'S607: tenant-scheduled rent autopay. The pull day is the TENANT''S choice and no landlord route may write to this table — a landlord able to move the date could manufacture late fees. Charges the full outstanding balance read live at run time; nothing is forecast.';
+
+
+--
+-- Name: COLUMN tenant_autopay.pull_day; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.pull_day IS 'S607: day of month (1-28) the tenant chose, or NULL for the due date. Capped at 28 because 29-31 do not exist every month and a schedule that skips February is worse than none.';
+
+
+--
+-- Name: COLUMN tenant_autopay.last_run_cycle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.last_run_cycle IS 'S609: the cycle the runner last ATTEMPTED (success or failure). The idempotency guard — one attempt per lease per cycle, so a restarted job or a second server cannot double-charge a tenant.';
+
+
+--
+-- Name: COLUMN tenant_autopay.consecutive_failures; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.consecutive_failures IS 'S609: failed pulls in a row. Reset to 0 by any success. At 2 the arrangement disarms itself — a closed account would otherwise cost the tenant a bank fee every month forever.';
+
+
+--
+-- Name: COLUMN tenant_autopay.disarmed_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.disarmed_reason IS 'S609: why autopay stopped, in the tenant''s words on their screen. Set only when the system disarmed it; a tenant switching it off themselves just sets enabled=FALSE.';
+
+
+--
 -- Name: tenant_credits; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8350,10 +8457,13 @@ CREATE TABLE public.units (
     retired_at timestamp with time zone,
     superseded_by_unit_id uuid,
     replaces_unit_id uuid,
+    water_fixture_count integer,
+    owner_household_size integer DEFAULT 1 NOT NULL,
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
     CONSTRAINT units_lot_rent_amount_check CHECK ((lot_rent_amount >= (0)::numeric)),
     CONSTRAINT units_occupancy_mode_check CHECK ((occupancy_mode = ANY (ARRAY['whole_unit'::text, 'by_room'::text]))),
+    CONSTRAINT units_owner_household_size_check CHECK (((owner_household_size >= 1) AND (owner_household_size <= 30))),
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text, 'owner_use'::text]))),
@@ -8394,6 +8504,20 @@ COMMENT ON COLUMN public.units.superseded_by_unit_id IS 'S605: the replacement u
 --
 
 COMMENT ON COLUMN public.units.replaces_unit_id IS 'S605: the retired unit this one replaced. Inverse of superseded_by_unit_id.';
+
+
+--
+-- Name: COLUMN units.water_fixture_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.water_fixture_count IS 'S607: plumbing fixture count, for the fixture_count RUBS allocation basis. NULL = not recorded; such a unit contributes 0 to a fixture split and is reported as skipped.';
+
+
+--
+-- Name: COLUMN units.owner_household_size; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.owner_household_size IS 'S609: how many people live in an OWNER-OCCUPIED unit. Read only when units.status = ''owner_use'' — such a unit has no lease, so there are no lease_tenants rows to count, and a zero basis would push the owner''s own utility usage onto the paying tenants. Ignored for every other status.';
 
 
 --
@@ -8585,7 +8709,7 @@ CREATE TABLE public.utility_bills (
     usage_amount numeric(12,4),
     allocation_method text,
     allocation_basis numeric(12,4),
-    rate_per_unit numeric(10,4),
+    rate_per_unit numeric(14,6),
     base_fee_share numeric(10,2) DEFAULT 0 NOT NULL,
     charge_amount numeric(10,2) NOT NULL,
     status text DEFAULT 'unbilled'::text NOT NULL,
@@ -8601,9 +8725,25 @@ CREATE TABLE public.utility_bills (
     sewer_rate_per_unit numeric,
     reading_start numeric,
     reading_end numeric,
+    reading_start_date date,
+    reading_end_date date,
     CONSTRAINT utility_bills_status_check CHECK ((status = ANY (ARRAY['unbilled'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'void'::text]))),
     CONSTRAINT utility_bills_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
 );
+
+
+--
+-- Name: COLUMN utility_bills.rate_per_unit; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_bills.rate_per_unit IS 'S607: the rate this bill was charged at, snapshotted so policy changes never rewrite an issued bill. 6dp because a blended rate (provider bill ÷ usage) is derived, not typed. charge_amount is authoritative.';
+
+
+--
+-- Name: COLUMN utility_bills.reading_end_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_bills.reading_end_date IS 'S607: the date of the closing read. Both A.R.S. § 33-1413.01(A) and § 33-1314.01(E)(1) require each bill to show the opening and closing readings AND their dates.';
 
 
 --
@@ -8623,6 +8763,7 @@ CREATE TABLE public.utility_meter_readings (
     is_rollover boolean DEFAULT false NOT NULL,
     reason text DEFAULT 'monthly_cycle'::text NOT NULL,
     reason_note text,
+    bill_amount numeric(12,2),
     CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'baseline'::text, 'other'::text])))
 );
 
@@ -8632,6 +8773,13 @@ CREATE TABLE public.utility_meter_readings (
 --
 
 COMMENT ON COLUMN public.utility_meter_readings.reason IS 'S605: monthly_cycle = the billed read; baseline = opening odometer captured at meter setup (never occupies the one-cycle-read-per-month slot); others are event reads.';
+
+
+--
+-- Name: COLUMN utility_meter_readings.bill_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meter_readings.bill_amount IS 'S607: RUBS master only — the utility provider''s total dollar charge for this cycle (A.R.S. § 33-2107(C)(1) "actual expense of obtaining the utility, including the taxes and fees"). With reading_value (total gallons) it gives the blended rate the whole line bills at. NULL on submeters, and on a master means the dollar bill was not entered.';
 
 
 --
@@ -8664,12 +8812,76 @@ CREATE TABLE public.utility_meters (
     sewer_rate_per_unit numeric,
     out_of_service boolean DEFAULT false NOT NULL,
     out_of_service_since date,
+    rubs_basis text DEFAULT 'usage_rate'::text NOT NULL,
+    rubs_submeter_rate text DEFAULT 'property_rate'::text NOT NULL,
+    rubs_exclusion_mode text DEFAULT 'usage'::text NOT NULL,
+    rubs_weights jsonb,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
     CONSTRAINT utility_meters_digits_check CHECK ((digits = ANY (ARRAY[4, 5, 6, 7, 8]))),
-    CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'equal_split'::text]))),
+    CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'rented_spaces'::text, 'fixture_count'::text, 'unit_type_weight'::text, 'hybrid'::text]))),
+    CONSTRAINT utility_meters_rubs_basis_check CHECK ((rubs_basis = ANY (ARRAY['usage_rate'::text, 'bill_amount'::text]))),
+    CONSTRAINT utility_meters_rubs_exclusion_mode_check CHECK ((rubs_exclusion_mode = ANY (ARRAY['usage'::text, 'dollars'::text]))),
+    CONSTRAINT utility_meters_rubs_submeter_rate_check CHECK ((rubs_submeter_rate = ANY (ARRAY['property_rate'::text, 'blended'::text]))),
     CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
 );
+
+
+--
+-- Name: COLUMN utility_meters.rubs_basis; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.rubs_basis IS 'S607: how a RUBS master prices its pool. usage_rate = usage × the property rate + base fee (default, unchanged behaviour, valid wherever a landlord may bill a published rate). bill_amount = divide the provider''s actual dollar bill for the cycle, blended into a single per-usage rate (required where the statute limits recovery to actual charges, e.g. A.R.S. § 33-2107(C)(1)). Ignored on non-RUBS meters.';
+
+
+--
+-- Name: COLUMN utility_meters.rubs_submeter_rate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.rubs_submeter_rate IS 'S607: what rate a SUBMETERED unit on this master''s line is billed at. property_rate (default) = the property''s configured rate, unchanged from the usage_rate basis. blended = the master''s dollars ÷ usage. Either way the pool subtracts the dollars those units were actually billed, so the bill always closes.';
+
+
+--
+-- Name: COLUMN utility_meters.rubs_exclusion_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.rubs_exclusion_mode IS 'S607: how a RUBS master removes its submetered units from the pool. usage (default) = subtract their measured usage, then price the remainder. dollars = subtract the dollars they were actually invoiced, so the bill closes at any submeter rate. Only meaningful when rubs_basis = bill_amount.';
+
+
+--
+-- Name: COLUMN utility_meters.rubs_weights; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.rubs_weights IS 'S607: configuration for the allocation bases that need one. unit_type_weight: {unit_type: weight}. weighted_occupancy: {first, additional}. hybrid: {primary, secondary, primaryPct}. NULL elsewhere.';
+
+
+--
+-- Name: utility_owner_use_absorptions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_owner_use_absorptions (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    utility_type text NOT NULL,
+    billing_cycle_month date NOT NULL,
+    allocation_method text,
+    allocation_basis numeric(12,4),
+    charge_amount numeric(12,2) NOT NULL,
+    base_fee_share numeric(12,2) DEFAULT 0 NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT utility_owner_use_absorptions_amount_check CHECK ((charge_amount >= (0)::numeric))
+);
+
+
+--
+-- Name: TABLE utility_owner_use_absorptions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.utility_owner_use_absorptions IS 'S609: utility cost a landlord absorbed on their OWN occupied units. An owner-occupied unit takes a real share of a RUBS pool — so the tenants stop paying for the owner''s usage — and that share is then billed to nobody. This is the provable record that it was held back rather than passed through, which is the question a RUBS audit asks.';
 
 
 --
@@ -11615,6 +11827,22 @@ ALTER TABLE ONLY public.system_features
 
 
 --
+-- Name: tenant_autopay tenant_autopay_one_per_lease; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_autopay
+    ADD CONSTRAINT tenant_autopay_one_per_lease UNIQUE (lease_id);
+
+
+--
+-- Name: tenant_autopay tenant_autopay_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_autopay
+    ADD CONSTRAINT tenant_autopay_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_credits tenant_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11900,6 +12128,14 @@ ALTER TABLE ONLY public.utility_meter_units
 
 ALTER TABLE ONLY public.utility_meters
     ADD CONSTRAINT utility_meters_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_owner_use_absorptions utility_owner_use_absorptions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_owner_use_absorptions
+    ADD CONSTRAINT utility_owner_use_absorptions_pkey PRIMARY KEY (id);
 
 
 --
@@ -14073,6 +14309,13 @@ CREATE INDEX idx_otp_advances_tenant ON public.otp_advances USING btree (tenant_
 
 
 --
+-- Name: idx_owner_use_absorption_landlord_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_owner_use_absorption_landlord_cycle ON public.utility_owner_use_absorptions USING btree (landlord_id, billing_cycle_month);
+
+
+--
 -- Name: idx_parts_inventory_landlord_name; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -14161,6 +14404,13 @@ CREATE INDEX idx_payments_lease_fee_id ON public.payments USING btree (lease_fee
 --
 
 CREATE INDEX idx_payments_platform_held_landlord ON public.payments USING btree (landlord_id) WHERE (platform_held = true);
+
+
+--
+-- Name: idx_payments_revenue_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_revenue_owner ON public.payments USING btree (revenue_owner) WHERE (revenue_owner = 'gam'::text);
 
 
 --
@@ -15155,6 +15405,20 @@ CREATE INDEX idx_surveys_landlord ON public.surveys USING btree (landlord_id) WH
 --
 
 CREATE INDEX idx_surveys_property ON public.surveys USING btree (property_id) WHERE is_active;
+
+
+--
+-- Name: idx_tenant_autopay_enabled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_autopay_enabled ON public.tenant_autopay USING btree (enabled, pull_day) WHERE enabled;
+
+
+--
+-- Name: idx_tenant_autopay_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_autopay_tenant ON public.tenant_autopay USING btree (tenant_id);
 
 
 --
@@ -16173,6 +16437,20 @@ CREATE UNIQUE INDEX ux_invoices_lease_due_date ON public.invoices USING btree (l
 
 
 --
+-- Name: ux_invoices_one_opening_balance_per_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_invoices_one_opening_balance_per_lease ON public.invoices USING btree (lease_id) WHERE is_opening_balance;
+
+
+--
+-- Name: INDEX ux_invoices_one_opening_balance_per_lease; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON INDEX public.ux_invoices_one_opening_balance_per_lease IS 'S609: a lease may carry exactly one opening balance. The route checks first for a friendly error; this makes the rule impossible to race past.';
+
+
+--
 -- Name: ux_monthly_fee_accruals_property_month; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16184,6 +16462,13 @@ CREATE UNIQUE INDEX ux_monthly_fee_accruals_property_month ON public.monthly_fee
 --
 
 CREATE UNIQUE INDEX ux_notification_preferences_user_type ON public.notification_preferences USING btree (user_id, type);
+
+
+--
+-- Name: ux_owner_use_absorption_per_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_owner_use_absorption_per_cycle ON public.utility_owner_use_absorptions USING btree (meter_id, unit_id, billing_cycle_month);
 
 
 --
@@ -22231,6 +22516,22 @@ ALTER TABLE ONLY public.system_features
 
 
 --
+-- Name: tenant_autopay tenant_autopay_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_autopay
+    ADD CONSTRAINT tenant_autopay_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_autopay tenant_autopay_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_autopay
+    ADD CONSTRAINT tenant_autopay_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
 -- Name: tenant_credits tenant_credits_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22887,6 +23188,30 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
+-- Name: utility_owner_use_absorptions utility_owner_use_absorptions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_owner_use_absorptions
+    ADD CONSTRAINT utility_owner_use_absorptions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_owner_use_absorptions utility_owner_use_absorptions_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_owner_use_absorptions
+    ADD CONSTRAINT utility_owner_use_absorptions_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_owner_use_absorptions utility_owner_use_absorptions_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_owner_use_absorptions
+    ADD CONSTRAINT utility_owner_use_absorptions_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: utility_reading_double_checks utility_reading_double_checks_entered_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23010,5 +23335,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict KfIgOuZ9f9g5XdDS9mQ4NRjIBmDbuN04uiegMwmXtNfgkEHQ9ElJkcEpKVqqk2C
+\unrestrict 2iI6W1RzV4c0O2NcbDEOwdzT6oZbXaY1lbosMSkRVOp3Ju2U1kJ2ibd5QaLfa5Y
 

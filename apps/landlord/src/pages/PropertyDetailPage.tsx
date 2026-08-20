@@ -26,6 +26,32 @@ const STATUS_COLORS: Record<string,string> = {
   vacant:'badge-muted', delinquent:'badge-amber', suspended:'badge-red'
 }
 
+// S605 (Nic, DIRECTIVE): property-scoped screens live INSIDE the property.
+// "Some of these tabs probably need to be sub tabs within a specific property
+// where different properties would be allowed to have different rates... maybe
+// other stuff could be hidden within a specific property as well."
+//
+// Utilities and Amenities were top-level nav items that each had to re-ask
+// WHICH property — and the Utilities picker only appeared for landlords with
+// more than one, so a single-property landlord got no scoping cue at all and
+// the page read as global. Inside the property there is nothing to ask.
+//
+// Inventory and Documents deliberately stay top-level: inventory is
+// portfolio-wide stock and documents are scoped to a UNIT, not a property.
+// Moving them here would be tidiness at the cost of being wrong.
+//
+// S609: hoisted out of the component — it never depended on props or state, and
+// living inside made it easy to write a hook below it (see the note there).
+const TABS = [
+  { key: 'overview',  label: 'Overview' },
+  { key: 'utilities', label: 'Utilities' },
+  { key: 'amenities', label: 'Amenities' },
+  { key: 'inventory', label: 'Equipment' },
+  { key: 'maintenance', label: 'Maintenance' },
+  { key: 'ownership', label: 'Ownership' },
+] as const
+type TabKey = typeof TABS[number]['key']
+
 export function PropertyDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -39,36 +65,21 @@ export function PropertyDetailPage() {
     ['property-units', id], () => apiGet(`/units?propertyId=${id}`)
   )
 
-  if (propLoading) return <div style={{ color:'var(--text-3)', padding:32 }}>Loading…</div>
-  if (!property) return <div className="empty-state"><h3>Property not found</h3></div>
-
-  const occupied  = (units as any[]).filter(u => u.tenantId).length
-  const revenue   = (units as any[]).filter(u => u.tenantId).reduce((s,u) => s + parseFloat(u.rentAmount||0), 0)
-  const occupancy = units.length > 0 ? Math.round((occupied / units.length) * 100) : 0
-  const maxRevenue  = (units as any[]).reduce((s, u) => s + parseFloat(u.rentAmount||0), 0)
-
-  // S605 (Nic, DIRECTIVE): property-scoped screens live INSIDE the property.
-  // "Some of these tabs probably need to be sub tabs within a specific property
-  // where different properties would be allowed to have different rates... maybe
-  // other stuff could be hidden within a specific property as well."
+  // S609 — THE CAUSE OF THE INTERMITTENT WHITE-SCREEN (React #310, "rendered
+  // more hooks than during the previous render").
   //
-  // Utilities and Amenities were top-level nav items that each had to re-ask
-  // WHICH property — and the Utilities picker only appeared for landlords with
-  // more than one, so a single-property landlord got no scoping cue at all and
-  // the page read as global. Inside the property there is nothing to ask.
+  // This useState used to sit BELOW the two early returns. On a cold load the
+  // first render bailed at "Loading…" having run three hooks; the moment the
+  // property arrived the component fell through and ran a fourth. React counts
+  // hooks per render and refuses when the count grows — so the page crashed.
   //
-  // Inventory and Documents deliberately stay top-level: inventory is
-  // portfolio-wide stock and documents are scoped to a UNIT, not a property.
-  // Moving them here would be tidiness at the cost of being wrong.
-  const TABS = [
-    { key: 'overview',  label: 'Overview' },
-    { key: 'utilities', label: 'Utilities' },
-    { key: 'amenities', label: 'Amenities' },
-    { key: 'inventory', label: 'Equipment' },
-    { key: 'maintenance', label: 'Maintenance' },
-    { key: 'ownership', label: 'Ownership' },
-  ] as const
-  type TabKey = typeof TABS[number]['key']
+  // Why it looked random: with the query cache already warm there is no loading
+  // render at all, the counts match, and everything works. It only bit on a
+  // hard reload or a first visit — reproducible, but only from cold, which is
+  // exactly when a landlord opens the app for the day.
+  //
+  // EVERY hook must run before any early return. Guarded now by
+  // `npm run lint:hooks` at the repo root.
   const [tab, setTab] = useState<TabKey>(() =>
     (new URLSearchParams(window.location.search).get('tab') as TabKey) || 'overview')
   const goTab = (k: TabKey) => {
@@ -79,6 +90,14 @@ export function PropertyDetailPage() {
     u.searchParams.set('tab', k)
     window.history.replaceState({}, '', u)
   }
+
+  if (propLoading) return <div style={{ color:'var(--text-3)', padding:32 }}>Loading…</div>
+  if (!property) return <div className="empty-state"><h3>Property not found</h3></div>
+
+  const occupied  = (units as any[]).filter(u => u.tenantId).length
+  const revenue   = (units as any[]).filter(u => u.tenantId).reduce((s,u) => s + parseFloat(u.rentAmount||0), 0)
+  const occupancy = units.length > 0 ? Math.round((occupied / units.length) * 100) : 0
+  const maxRevenue  = (units as any[]).reduce((s, u) => s + parseFloat(u.rentAmount||0), 0)
 
   return (
     <div>

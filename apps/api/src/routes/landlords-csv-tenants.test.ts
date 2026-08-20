@@ -193,7 +193,13 @@ describe('POST /api/landlords/me/onboard-tenants-csv/validate', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.summary).toMatchObject({ total: 1, blockers: 0, ready: 1 })
     expect(res.body.data.rows[0].resolvedUnitId).toBe(f.unitId)
-    expect(res.body.data.rows[0].issues).toEqual([])
+    // S609: the importer now WARNS on a bare unit number ("101" with no prefix)
+    // under the unit numbering standard. Deliberate and non-blocking — an
+    // imported number is kept as-is, and blockers is still 0 above, which is
+    // what "happy" means here. The row must carry no ERRORS; a warning about
+    // legacy numbering is information, not a problem to fix.
+    const issues = res.body.data.rows[0].issues as any[]
+    expect(issues.filter((i) => i.severity !== 'warn')).toEqual([])
   })
 
   it('invalid email format → blocker on email field', async () => {

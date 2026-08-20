@@ -30,6 +30,7 @@ import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
+import { RentVolumeMonitor } from './components/RentVolumeMonitor'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
@@ -1014,7 +1015,15 @@ function Overview(){
   const reserveTarget=floatBankroll*DEFAULT_RESERVE_RATE
   const reservePct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(reserveTarget,1))*100,100):0
 
-  const trendData=[{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},{m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:stats?.monthlyRentVolume||0}]
+  // S609: this WAS a hardcoded array — five invented months plus one real value
+  // labelled with a month it wasn't, drawing a tidy rising line whatever the
+  // platform actually did. Now the real thing, from the settled ledger.
+  const [trendMonths, setTrendMonths] = useState(6)
+  const { data: trendData = [] } = useQuery<any[]>(
+    ['rent-volume-trend', trendMonths],
+    () => get(`/admin/rent-volume-trend?months=${trendMonths}`),
+    { enabled: isSuperAdmin },
+  )
 
   if(isLoading&&!stats)return<div style={{padding:32,color:'var(--t3)'}}>Loading platform data…</div>
 
@@ -1075,18 +1084,7 @@ function Overview(){
 
 
       {isSuperAdmin&&<div className="grid2">
-        <div className="card">
-          <div className="ct">Monthly Rent Volume Trend</div>
-          <ResponsiveContainer width="100%" height={180}>
-            <AreaChart data={trendData} margin={{top:0,right:0,left:-20,bottom:0}}>
-              <defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#c9a227" stopOpacity={.3}/><stop offset="95%" stopColor="#c9a227" stopOpacity={0}/></linearGradient></defs>
-              <XAxis dataKey="m" tick={{fill:'var(--t3)',fontSize:10}} axisLine={false} tickLine={false}/>
-              <YAxis tick={{fill:'var(--t3)',fontSize:10}} axisLine={false} tickLine={false} tickFormatter={v=>`$${(v/1000).toFixed(0)}k`}/>
-              <Tooltip contentStyle={{background:'var(--bg3)',border:'1px solid var(--b2)',borderRadius:8,color:'var(--t0)'}} formatter={(v:any)=>[formatCurrency(v),'Volume']}/>
-              <Area type="monotone" dataKey="r" stroke="#c9a227" strokeWidth={2} fill="url(#grad)"/>
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
+        <RentVolumeMonitor months={trendData} windowMonths={trendMonths} onWindowChange={setTrendMonths} />
         <div className="card">
           <div className="ct">FlexPay Reserve &amp; Float</div>
           <div className="dr"><span className="dk">Default reserve balance</span><span className="dv mono">{formatCurrency(stats?.reserveBalance||0)}</span></div>

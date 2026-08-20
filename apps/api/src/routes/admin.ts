@@ -87,6 +87,66 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
 // GAM owes the tenants on top (funded by the trust's own investment return).
 // Powers the admin Overview trust tile + by-state pie so we can reconcile the
 // on-book liability against the actual account balance once it's stood up.
+/**
+ * GET /api/admin/rent-volume-trend?months=6 — platform rent ACTUALLY COLLECTED,
+ * month by month.
+ *
+ * S609 — REPLACES FABRICATED DATA. The admin dashboard's "Monthly Rent Volume
+ * Trend" was a hardcoded array:
+ *
+ *     [{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},
+ *      {m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:<the one real number>}]
+ *
+ * Five invented points and one real one, mislabelled with a month it wasn't.
+ * It drew a tidy upward line no matter what the platform actually did — the
+ * worst kind of wrong on a financial dashboard, because it looks like
+ * information. Nic spotted it as "the graph stops in March".
+ *
+ * WHAT THIS COUNTS: rent that SETTLED, by the month it settled in — money that
+ * actually moved, not contracted rent. That is what makes a spike mean
+ * something: a month where a block of tenants onboarded and paid shows up as a
+ * spike, which is exactly the signal Nic wants to see.
+ *
+ * `paid_via_deposit` counts too — the obligation was met and the money was
+ * real, it just came from a deposit already held.
+ *
+ * EVERY month in the window is returned, including empty ones. A month with no
+ * collections is a ZERO, never a missing row: the heartbeat has to flatline
+ * rather than silently close the gap and imply continuous activity.
+ */
+adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) => {
+  try {
+    // 1..36 — a year is the usual read; 36 supports the long "whole history"
+    // view without letting a query walk the entire table.
+    const months = Math.min(36, Math.max(1, Number(req.query.months) || 6))
+    const rows = await query<{ month_start: string; label: string; revenue: string }>(
+      `WITH span AS (
+         SELECT generate_series(
+           date_trunc('month', CURRENT_DATE) - make_interval(months => $1::int - 1),
+           date_trunc('month', CURRENT_DATE),
+           interval '1 month'
+         ) AS month_start
+       )
+       SELECT span.month_start::date::text AS month_start,
+              TO_CHAR(span.month_start, 'Mon') AS label,
+              COALESCE(SUM(p.amount), 0)::text AS revenue
+         FROM span
+         LEFT JOIN payments p
+           ON date_trunc('month', COALESCE(p.settled_at, p.created_at)) = span.month_start
+          AND p.status IN ('settled', 'paid_via_deposit')
+          AND p.type IN ('rent', 'utility', 'late_fee', 'fee')
+        GROUP BY span.month_start
+        ORDER BY span.month_start ASC`,
+      [months])
+    res.json({ success: true, data: rows.map(r => ({
+      monthStart: r.month_start,
+      // 'Mon' alone repeats across years; the caller decides how much to show.
+      label: r.label,
+      revenue: Number(r.revenue),
+    })) })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/deposit-trust/summary', requireSuperAdmin, async (_req, res, next) => {
   try {
     const HELD = `sd.held_by = 'gam_escrow'
@@ -921,16 +981,47 @@ export const onboardingResendHandler = async (req: any, res: any, next: any) => 
     const { type, targetId } = req.body
     if (!targetId) throw new AppError(400, 'targetId is required')
 
+    // Portfolio scoping: a non-super caller may only act inside their own book.
+    //
+    // S609 — THIS GATE WAS WRONG IN TWO WAYS, and both made the feature
+    // unusable for a regular admin rather than merely strict:
+    //
+    //   1. It assumed targetId is always a TENANT. It isn't — 'bank_verification'
+    //      and 'landlord_setup' target a LANDLORD, so the tenant lookup never
+    //      matched and a regular admin got 403 for a landlord sitting squarely
+    //      in their own book. Always. There was no way to succeed.
+    //
+    //   2. It required an ACTIVE LEASE. This whole endpoint exists to nudge
+    //      people who are still ONBOARDING — the ACH-setup reminder is for a
+    //      tenant who has not finished setting up, which is very often before
+    //      their lease goes active. So the gate refused precisely the case the
+    //      feature was built for.
+    //
+    // Resolve the target's landlord by whichever kind of thing it is, then check
+    // that landlord is in the caller's book. No lease required: being a tenant
+    // OF a landlord in my book is what puts them in my book, not the state of
+    // their paperwork.
     if (req.user?.role !== 'super_admin') {
       const uid = req.user?.userId
       const inBook = await queryOne<{ ok: boolean }>(
         `SELECT EXISTS (
-           SELECT 1 FROM v_lease_active_tenants vlat
-           JOIN leases le ON le.id = vlat.lease_id AND le.status='active'
-           JOIN units un ON un.id = le.unit_id
-           JOIN landlords ld ON ld.id = un.landlord_id
-           WHERE vlat.tenant_id = $1
-             AND (ld.portfolio_manager_id = $2 OR ld.service_manager_id = $2)
+           SELECT 1 FROM landlords ld
+            WHERE (ld.portfolio_manager_id = $2 OR ld.service_manager_id = $2)
+              AND (
+                -- targetId IS a landlord
+                ld.id = $1
+                -- or targetId is a tenant of one. ANY lease in ANY state —
+                -- a tenant being onboarded is typically on a draft or
+                -- pending_add lease, never an active one yet, which is the
+                -- second half of the bug described above. A tenant has no
+                -- landlord except through a lease, so this is the only link.
+                OR EXISTS (
+                  SELECT 1 FROM lease_tenants lt
+                  JOIN leases le ON le.id = lt.lease_id
+                  JOIN units un ON un.id = le.unit_id
+                  WHERE lt.tenant_id = $1 AND un.landlord_id = ld.id
+                )
+              )
          ) AS ok`, [targetId, uid])
       if (!inBook?.ok) throw new AppError(403, 'Outside your portfolio')
     }

@@ -186,13 +186,17 @@ describe('createPmCompanyTransfer', () => {
       destinationConnectAccountId: 'acct_pm',
       metadata: { gam_ledger_id: 'l_1' },
     })
+    // S609: stripe.transfers.create now takes a SECOND argument — the options
+    // object carrying an idempotency key when one is supplied, undefined when
+    // not. That is a real safety improvement (it stops a retried transfer
+    // paying twice), so the assertion is updated to match the call.
     expect(transfersCreateMock).toHaveBeenCalledWith({
       amount: 1234,
       currency: 'usd',
       destination: 'acct_pm',
       description: 'PM company fee',
       metadata: { gam_ledger_id: 'l_1' },
-    })
+    }, undefined)
   })
 
   it('sourceTransactionId included when provided (S113-Phase2.5 charge sourcing)', async () => {
@@ -202,9 +206,13 @@ describe('createPmCompanyTransfer', () => {
       sourceTransactionId: 'ch_source',
       metadata: {},
     })
+    // S609: stripe.transfers.create now takes a SECOND argument — the options
+    // object carrying an idempotency key when one is supplied, undefined when
+    // not. That is a real safety improvement (it stops a retried transfer
+    // paying twice), so the assertion is updated to match the call.
     expect(transfersCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       source_transaction: 'ch_source',
-    }))
+    }), undefined)
   })
 
   it('custom description overrides default', async () => {
@@ -214,9 +222,13 @@ describe('createPmCompanyTransfer', () => {
       metadata: {},
       description: 'Custom fee description',
     })
+    // S609: stripe.transfers.create now takes a SECOND argument — the options
+    // object carrying an idempotency key when one is supplied, undefined when
+    // not. That is a real safety improvement (it stops a retried transfer
+    // paying twice), so the assertion is updated to match the call.
     expect(transfersCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       description: 'Custom fee description',
-    }))
+    }), undefined)
   })
 })
 
@@ -287,6 +299,10 @@ describe('firePmTransfersForReference', () => {
     transfersCreateMock.mockResolvedValueOnce({ id: 'tr_happy' } as any)
     const res = await firePmTransfersForReference('payment', ctx.paymentId)
     expect(res).toEqual({ fired: 1, failed: 0 })
+    // S609: stripe.transfers.create now takes a SECOND argument — the options
+    // object carrying an idempotency key when one is supplied, undefined when
+    // not. That is a real safety improvement (it stops a retried transfer
+    // paying twice), so the assertion is updated to match the call.
     expect(transfersCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       amount: 7500,
       destination: 'acct_pm_target',
@@ -295,7 +311,7 @@ describe('firePmTransfersForReference', () => {
         gam_reference_id: ctx.paymentId,
         gam_reference_type: 'payment',
       }),
-    }))
+    }), undefined)
     const { rows: [l] } = await db.query<any>(
       `SELECT stripe_transfer_id FROM user_balance_ledger WHERE id=$1`, [ledgerId])
     expect(l.stripe_transfer_id).toBe('tr_happy')
@@ -305,9 +321,13 @@ describe('firePmTransfersForReference', () => {
     const ctx = await seedPmCtx({ stripeChargeId: 'ch_source_test' })
     await seedPmFeeLedger(ctx, 50)
     await firePmTransfersForReference('payment', ctx.paymentId)
+    // S609: stripe.transfers.create now takes a SECOND argument — the options
+    // object carrying an idempotency key when one is supplied, undefined when
+    // not. That is a real safety improvement (it stops a retried transfer
+    // paying twice), so the assertion is updated to match the call.
     expect(transfersCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       source_transaction: 'ch_source_test',
-    }))
+    }), undefined)
   })
 
   it('reference_type=lease → no source_transaction lookup; transfer omits the field', async () => {

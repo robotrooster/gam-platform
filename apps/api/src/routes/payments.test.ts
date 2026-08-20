@@ -713,18 +713,51 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(fee.entry_description).toBe('MANUALPAY')
   })
 
-  it('S570 21-day window: first payment on a property onboarded >21 days ago → fee NOT waived', async () => {
+  // S607 (Nic) — the S570 21-day property-creation gate is GONE. It counted from
+  // properties.created_at, so it burned down while the landlord was still setting
+  // the park up and tenants inherited the remainder (four days, at Oak Park).
+  // The free pass belongs to each TENANT'S first payment, on any property, at any
+  // age. Nic: "the anchor is wrong."
+  it('first manual payment is free however old the property is', async () => {
     const f = await seed()
-    // Push the property's onboarding date outside the 21-day migration window.
-    await db.query(`UPDATE properties SET created_at = NOW() - INTERVAL '30 days' WHERE id=$1`, [f.aPropId])
+    await db.query(`UPDATE properties SET created_at = NOW() - INTERVAL '400 days' WHERE id=$1`, [f.aPropId])
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'check' })
     expect(res.status).toBe(200)
-    expect(res.body.data.feeWaived).toBe(false)   // outside window → no free pass even on first payment
+    expect(res.body.data.feeWaived).toBe(true)
+    expect(res.body.data.feePaymentId).toBeFalsy()
+  })
+
+  // Nic: "I like not gating it because I specifically have people at Oak Park
+  // that come in on the fifth because of the grace period." Paying late does not
+  // forfeit the free manual payment — late FEES are a separate charge on a
+  // separate clock, and this fee is not one of them.
+  it('paying well past the due date still gets the free first manual payment', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET due_date = CURRENT_DATE - INTERVAL '10 days' WHERE id=$1`, [pid])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'money_order' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeWaived).toBe(true)
+  })
+
+  // "If they pay card the first time, they lose that freebie." The waiver is the
+  // first PAYMENT being manual, not the first MANUAL payment.
+  it('a card payment first burns the freebie — a later manual payment is charged', async () => {
+    const f = await seed()
+    const paidByCard = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [paidByCard])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeWaived).toBe(false)
     expect(res.body.data.feeAmount).toBe(10)
-    expect(res.body.data.feePaymentId).toBeTruthy()
   })
 
   it('non-rent charge → 409', async () => {
@@ -847,5 +880,359 @@ describe('POST /api/payments/:id/record-prior-arrangement', () => {
     // the response is camelized → priorArrangementEligible, which the UI reads.
     const row = res.body.data.find((r: any) => r.id === pid)
     expect(row.prior_arrangement_eligible).toBe(true)
+  })
+})
+
+// S607 (Nic): the landlord may elect to absorb the manual-payment fee at the
+// property. "If they aren't covering it, it's still charged out of their collect
+// account, but the tenant gets invoiced. So the landlord isn't out any money."
+describe('POST /payments/:id/record-manual — landlord covers the manual fee', () => {
+  it('raises no tenant charge when the property has the landlord covering', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+       VALUES ($1,'tenant','tenant','landlord')
+       ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [f.aPropId])
+    // Burn the free first payment so the waiver cannot be what we are observing.
+    const first = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [first])
+
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.coveredByLandlord).toBe(true)
+    expect(res.body.data.firstPayment).toBe(false)   // NOT the free-first reason
+    expect(res.body.data.feeBilledTo).toBe('landlord')
+    expect(res.body.data.feePaymentId).toBeFalsy()
+
+    // No TENANT charge...
+    const fees = await db.query(
+      `SELECT id FROM payments WHERE entry_description='MANUALPAY' AND tenant_id=$1`, [f.tenant1Id])
+    expect(fees.rows).toHaveLength(0)
+
+    // ...but GAM is still paid. Nic: "if they use cash the second month and the
+    // landlord covers, that means the LANDLORD gets charged."
+    const rev = await db.query<{ amount: string }>(
+      `SELECT amount::text FROM platform_revenue_ledger
+        WHERE reference_type='manual_payment_fee'`)
+    expect(rev.rows).toHaveLength(1)
+    expect(Number(rev.rows[0].amount)).toBeCloseTo(10, 2)
+  })
+
+  it('defaults to billing the tenant when the property says nothing', async () => {
+    const f = await seed()
+    const first = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [first])
+
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.coveredByLandlord).toBe(false)
+    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feePaymentId).toBeTruthy()
+  })
+
+  // The two reasons must stay distinguishable: one expires, the other does not.
+  it('reports first-payment and landlord-covered as separate reasons', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.body.data.firstPayment).toBe(true)
+    expect(res.body.data.coveredByLandlord).toBe(false)
+  })
+})
+
+// S607 (Nic): the invoice shows every avenue and its price. "Here's your $450
+// rent. ACH makes that $456. $450 with a debit card is $466.30. $450 with cash
+// is $460. That way they see all the avenues and the price at the point the
+// invoice comes out."
+describe('GET /payments/balance-context — per-method price breakdown', () => {
+  it('prices bank, card and cash for the outstanding balance', async () => {
+    const f = await seed()
+    // Burn the free first payment so the cash row reflects the real $10.
+    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+    const lease = res.body.data.leases[0]
+    const by = Object.fromEntries(lease.methodCosts.map((m: any) => [m.method, m]))
+    expect(by.ach.total).toBeCloseTo(456, 2)
+    expect(by.card.total).toBeCloseTo(466.30, 2)
+    expect(by.manual.total).toBeCloseTo(460, 2)
+  })
+
+  it('shows cash at no extra cost while the first payment is still free', async () => {
+    const f = await seed()
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const lease = res.body.data.leases[0]
+    const manual = lease.methodCosts.find((m: any) => m.method === 'manual')
+    expect(lease.manualFeeFirstFree).toBe(true)
+    expect(manual.fee).toBe(0)
+    expect(manual.total).toBeCloseTo(450, 2)
+  })
+
+  // Nic: the tenant must see the landlord is ACTIVELY covering it, "and that
+  // they may choose to stop covering that at any time" — so a later $10 on their
+  // bill is recognisable as a change of policy, not a new surprise charge.
+  it('reports the landlord covering it, with the amount being absorbed', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+       VALUES ($1,'tenant','tenant','landlord')
+       ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [f.aPropId])
+    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const lease = res.body.data.leases[0]
+    expect(lease.manualFeeCoveredByLandlord).toBe(true)
+    expect(lease.manualFeeAbsorbed).toBeCloseTo(10, 2)
+    const manual = lease.methodCosts.find((m: any) => m.method === 'manual')
+    expect(manual.total).toBeCloseTo(450, 2)   // $450, not $460
+  })
+})
+
+// S607 (Nic): "it's free for the landlord the first time, and that first time is
+// used up. The tenant doesn't get to assume a first time freebie if the landlord
+// stops covering it. That's used up on the first cash payment no matter who's
+// covering."
+describe('POST /payments/:id/record-manual — the free first payment is spent once', () => {
+  it('a landlord-covered first payment consumes the freebie for good', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+       VALUES ($1,'tenant','tenant','landlord')
+       ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [f.aPropId])
+
+    // 1st manual payment — landlord covering, and it is also the tenant's first.
+    // Nobody is charged, and the rent settles, which is what spends the freebie.
+    const p1 = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const r1 = await request(buildApp()).post(`/api/payments/${p1}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(r1.body.data.firstPayment).toBe(true)
+    expect(r1.body.data.feePaymentId).toBeFalsy()
+
+    // The landlord stops covering.
+    await db.query(`UPDATE property_allocation_rules SET manual_fee_payer='tenant' WHERE property_id=$1`, [f.aPropId])
+
+    // 2nd manual payment — the tenant cannot claim an unused freebie.
+    const p2 = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const r2 = await request(buildApp()).post(`/api/payments/${p2}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(r2.body.data.firstPayment).toBe(false)
+    expect(r2.body.data.coveredByLandlord).toBe(false)
+    expect(r2.body.data.feeAmount).toBe(10)
+    expect(r2.body.data.feePaymentId).toBeTruthy()
+  })
+
+  it('the tenant quote agrees — no free-first once it has been spent', async () => {
+    const f = await seed()
+    const p1 = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await request(buildApp()).post(`/api/payments/${p1}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    const res = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const lease = res.body.data.leases[0]
+    expect(lease.manualFeeFirstFree).toBe(false)
+    expect(lease.methodCosts.find((m: any) => m.method === 'manual').total).toBeCloseTo(460, 2)
+  })
+})
+
+// S607 (Nic): "it's only free the first payment and only if they do cash."
+// The landlord's toggle MOVES the fee, it does not erase it.
+describe('POST /payments/:id/record-manual — landlord-covered fee still reaches GAM', () => {
+  const coverProperty = (propId: string) => db.query(
+    `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+     VALUES ($1,'tenant','tenant','landlord')
+     ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [propId])
+
+  it('a covered FIRST cash payment charges nobody — that one really is free', async () => {
+    const f = await seed()
+    await coverProperty(f.aPropId)
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(res.body.data.feeBilledTo).toBe('none')
+    const rev = await db.query(`SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
+    expect(rev.rows).toHaveLength(0)
+  })
+
+  it('a card first payment leaves nothing to cover, and burns the freebie', async () => {
+    const f = await seed()
+    await coverProperty(f.aPropId)
+    // First rent settled by card — no manual fee arises at all.
+    const byCard = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [byCard])
+    // Second month, cash, landlord covering → the LANDLORD is charged.
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(res.body.data.feeBilledTo).toBe('landlord')
+    const rev = await db.query<{ amount: string }>(
+      `SELECT amount::text FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
+    expect(rev.rows).toHaveLength(1)
+    expect(Number(rev.rows[0].amount)).toBeCloseTo(10, 2)
+  })
+
+  it('re-recording the same payment cannot post the fee twice', async () => {
+    const f = await seed()
+    await coverProperty(f.aPropId)
+    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    // Second attempt 409s (already settled), and must not double-post revenue.
+    await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    const rev = await db.query(`SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
+    expect(rev.rows).toHaveLength(1)
+  })
+})
+
+// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
+// visible to them so they can track it. If the landlord is not covering the ten
+// dollars, it doesn't need to be visible to them."
+describe('GET /payments/absorbed-manual-fees', () => {
+  const coverProperty = (propId: string) => db.query(
+    `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+     VALUES ($1,'tenant','tenant','landlord')
+     ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [propId])
+
+  /** Settle one prior rent (burning the freebie), then record a manual payment. */
+  async function absorbOne(f: any) {
+    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+  }
+
+  it('shows the landlord what they absorbed, with the property and unit', async () => {
+    const f = await seed()
+    await coverProperty(f.aPropId)
+    await absorbOne(f)
+
+    const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.total).toBeCloseTo(10, 2)
+    expect(res.body.data.count).toBe(1)
+    // NOTE: buildApp() mounts the router WITHOUT index.ts's camelize middleware,
+    // so DB-derived columns arrive snake_case here. In production the response is
+    // camelized (unitNumber / propertyName) — which is what the UI reads, and
+    // what wireContract.test.ts enforces.
+    expect(res.body.data.rows[0].unit_number).toBeTruthy()
+    expect(res.body.data.rows[0].property_name).toBeTruthy()
+  })
+
+  it('shows nothing when the tenant is the one reimbursing it', async () => {
+    const f = await seed()
+    // manual_fee_payer defaults to 'tenant' — no allocation rule needed.
+    await absorbOne(f)
+
+    const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.total).toBe(0)
+    expect(res.body.data.rows).toHaveLength(0)
+  })
+
+  it('never leaks another landlord\'s absorbed fees', async () => {
+    const f = await seed()
+    await coverProperty(f.aPropId)
+    await absorbOne(f)
+
+    const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.rows).toHaveLength(0)
+  })
+
+  it('refuses a caller with no landlord scope', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(403)
+  })
+})
+
+// S607 (Nic): "we need to make sure that all the toggles are scoped per property,
+// not actually able to be changed per tenant. You can't have a tenant getting the
+// ten dollar fee covered by a landlord and another tenant not getting the fee
+// covered. It needs to be scoped to prevent discrimination."
+//
+// This is guaranteed by the SHAPE of the data — the fee settings live in a single
+// row per property (property_allocation_rules, primary key property_id) and there
+// is no lease-level or tenant-level column anywhere to override them. These tests
+// hold that guarantee in place, because a future "just this one tenant" column
+// would break them rather than shipping quietly.
+describe('fee settings are per-property and cannot single out a tenant', () => {
+  it('two tenants in the same property are quoted identically', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
+       VALUES ($1,'tenant','tenant','landlord')
+       ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [f.aPropId])
+
+    // A SECOND tenant, in a second unit, at the SAME property.
+    const c = await db.connect()
+    let tenant2Id = '', tenant2UserId = '', unit2Id = ''
+    try {
+      await c.query('BEGIN')
+      unit2Id = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
+      tenant2Id = await seedTenant(c)
+      const r = await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenant2Id])
+      tenant2UserId = r.rows[0].user_id
+      const lease2 = await seedLease(c, { unitId: unit2Id, landlordId: f.aLid })
+      await seedLeaseTenant(c, { leaseId: lease2, tenantId: tenant2Id, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const tokenTenant2 = sign({ userId: tenant2UserId, role: 'tenant', email: 't2@t.dev', profileId: tenant2Id })
+
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
+    await seedPayment({ unitId: unit2Id,   tenantId: tenant2Id,   landlordId: f.aLid, amount: 450 })
+
+    const one = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const two = await request(buildApp()).get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${tokenTenant2}`)
+
+    expect(one.body.data.leases[0].manualFeeCoveredByLandlord)
+      .toBe(two.body.data.leases[0].manualFeeCoveredByLandlord)
+    expect(one.body.data.leases[0].manualFeeCoveredByLandlord).toBe(true)
+  })
+
+  it('there is nowhere to store a per-tenant or per-lease fee setting', async () => {
+    const cols = await db.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.columns
+        WHERE column_name IN ('manual_fee_payer','ach_fee_payer','card_fee_payer','platform_fee_payer')`)
+    const tables = [...new Set(cols.rows.map(r => r.table_name))]
+    // Exactly one home, and it is keyed by property.
+    expect(tables).toEqual(['property_allocation_rules'])
+
+    const pk = await db.query<{ column_name: string }>(
+      `SELECT kcu.column_name
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'property_allocation_rules' AND tc.constraint_type = 'PRIMARY KEY'`)
+    expect(pk.rows.map(r => r.column_name)).toEqual(['property_id'])
   })
 })

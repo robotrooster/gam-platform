@@ -85,7 +85,12 @@ describe('S376: admin onboarding checklist label rename', () => {
       tenantId = await seedTenant(c)
       await c.query('COMMIT')
     } finally { c.release() }
-    const adminToken = sign({ userId: randomUUID(), role: 'admin',
+    // S609: this test is about the LABEL, not about who may read the checklist.
+    // The route became portfolio-scoped (S592), so a regular admin with an empty
+    // book is refused before the label is ever rendered. super_admin sees all,
+    // which keeps the assertion pointed at the thing it actually guards.
+    // Scoping itself is tested in admin-arc-closer.test.ts.
+    const adminToken = sign({ userId: randomUUID(), role: 'super_admin',
                                email: 'a@t.dev', profileId: randomUUID() })
     const res = await request(buildAdminApp())
       .get(`/api/admin/onboarding/tenant/${tenantId}`)

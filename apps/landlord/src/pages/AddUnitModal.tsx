@@ -54,6 +54,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     nightlyRate:      '',
     weeklyRate:       '',
     status:           'vacant',
+    ownerHouseholdSize: '1',
   })
   // S533 (Nic): meters are configured HERE, in the unit add area — there
   // is no meters list elsewhere. Each checked utility creates a 1:1
@@ -222,6 +223,12 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       // S568: lot rent the operator pays the external park (homes-only properties).
       ...(form.lotRentAmount !== '' ? { lotRentAmount: Number(form.lotRentAmount) } : {}),
       status:          form.status,
+      // Only meaningful for an owner-occupied unit; the server ignores it
+      // otherwise. It is what a headcount utility split weighs the unit by,
+      // since there is no lease to count people from.
+      ...(form.status === 'owner_use'
+        ? { ownerHouseholdSize: Math.max(1, Number(form.ownerHouseholdSize) || 1) }
+        : {}),
     })
   }
 
@@ -591,6 +598,13 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   // it back — so the copy says so.
                   { value: 'vacant', label: 'Vacant', desc: 'No tenant yet — recommended; a lease flips this to Active', color: 'var(--gold)' },
                   { value: 'active', label: 'Active', desc: 'Already occupied — only if a lease is being added', color: 'var(--green)' },
+                  // S609 (Nic): owner-occupied was only reachable by creating the
+                  // unit and then editing it, so it was being marked Vacant at
+                  // setup — "there's no way to mark them owner occupied". That is
+                  // not cosmetic: a vacant-marked owner unit takes no share of a
+                  // utility split, so the owner's own usage lands on the paying
+                  // tenants.
+                  { value: 'owner_use', label: 'Owner-occupied', desc: 'You or your staff live here — no lease, no rent, and its utility share is never billed to tenants', color: 'var(--blue, #5b8def)' },
                 ].map(s => (
                   <div
                     key={s.value}
@@ -606,6 +620,29 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   </div>
                 ))}
               </div>
+              {/* S609 (Nic): an owner-occupied unit has NO LEASE, so a headcount
+                  utility split has nobody to count. This number is what it
+                  weighs the unit by — and weighing it at all is what stops the
+                  owner's own water landing on the tenants' bills. */}
+              {form.status === 'owner_use' && (
+                <div style={{ marginTop: 10 }}>
+                  <label style={labelStyle}>People living here</label>
+                  <input
+                    type="number" min={1} max={30}
+                    value={form.ownerHouseholdSize}
+                    onChange={e => set('ownerHouseholdSize', e.target.value)}
+                    style={{ width: 90, padding: '7px 10px', borderRadius: 8,
+                             border: '1px solid var(--border-0)', background: 'var(--bg-2)',
+                             color: 'var(--text-0)', fontSize: '.85rem' }}
+                  />
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>
+                    Used only if a shared meter splits by occupancy — this unit takes its share
+                    of the bill and you absorb it, so your tenants aren&apos;t billed for your
+                    household&apos;s usage. It&apos;s recorded each cycle so you can show it
+                    wasn&apos;t passed through.
+                  </div>
+                </div>
+              )}
             </div>
 
             <div style={{ marginTop: 4 }}>

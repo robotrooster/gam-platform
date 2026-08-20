@@ -8,6 +8,7 @@ import { query, queryOne } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
+import { registerAutopayEngine } from './autopayRunner'
 import { registerRefreshCron, refreshTimezoneCrons, summary as tzCronSummary } from './timezoneCronManager'
 import { expireStaleInvitations as expireStalePmPropertyInvitations } from '../services/pm'
 import { getPropertyResponsibleParty } from '../services/responsibleParty'
@@ -1998,6 +1999,7 @@ export function schedulerInit() {
 
   registerInvoiceEngine()
   registerLateFeeEngine()
+  registerAutopayEngine()
   registerRefreshCron()
   // initial population — async, will populate per-tz crons on next tick
   refreshTimezoneCrons().then(({ added }) => {

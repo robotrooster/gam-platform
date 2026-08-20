@@ -2,14 +2,16 @@
  * S537: FIFO payment application — ONE tenant "Pay now", oldest-first.
  *
  * Rules under test (Nic-locked):
- *   - PAY-IN-FULL ONLY. There are no partial payments anywhere in the system
- *     (a partial can reset a landlord's eviction clock). /pay-balance requires
- *     the EXACT outstanding balance — under- OR over-payment → 422.
+ *   - NO PARTIAL PAYMENTS, anywhere in the system (a partial can reset a
+ *     landlord's eviction clock). /pay-balance refuses anything under the
+ *     outstanding balance.
+ *   - S609: OVER-payment is now allowed and becomes pay-ahead, held by GAM and
+ *     released to the landlord month by month. The old over-payment rejection
+ *     recorded a missing amount box, not a decision.
  *   - Every dollar applies to the oldest outstanding balance first; the
  *     tenant never picks targets, and the full-balance payment settles all
  *     rows with no split and no remainder.
- *   - (Prepaid credits still exist via invoice generation, but pay-ahead is
- *     gone — the tenant UI has no amount field.)
+ *   - Prepaid credit is consumed at invoice generation, oldest first.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
@@ -73,6 +75,19 @@ async function fixture() {
     await client.query('BEGIN')
     const ll = await seedLandlord(client)
     const propertyId = await seedProperty(client, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+    // S609: a property has to be able to PAY OUT before prepaid credit will be
+    // applied — the release refuses to settle a tenant's bill with money it
+    // cannot hand to the landlord. Tenant-payer matches the previous
+    // no-rule default (null → tenant pays).
+    await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+    // platform_processing_rates survives cleanupAllSchema — guard the insert so
+    // repeated runs don't stack rows.
+    await client.query(
+      `INSERT INTO platform_processing_rates
+         (payment_method, customer_facing_flat, customer_facing_percent,
+          stripe_cost_flat, stripe_cost_percent)
+       SELECT 'ach', 6, 0, 0, 0.5
+        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
     const unitId = await seedUnit(client, { propertyId, landlordId: ll.landlordId, withLateFeeDecision: true })
     const tenantId = await seedTenant(client)
     const tu = await client.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
@@ -183,7 +198,11 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     expect(lines.rows.map((r: any) => r.a)).toEqual([40, 60, 440])
   })
 
-  it('pay-in-full enforced: under-payment AND over-payment both → 422; exact total passes', async () => {
+  // S609 (Nic): the two halves of this rule are NOT symmetrical any more.
+  // Under-payment is still refused — a partial can reset a landlord's eviction
+  // clock. Over-payment is now PAY-AHEAD: the old rejection was there only
+  // because the screen had no amount box, never as a decision.
+  it('under-payment → 422; exact total passes; OVER-payment is pay-ahead', async () => {
     const f = await fixture()
     await seedCharge(f, 'late_fee', 60, '2026-06-06')
     await seedCharge(f, 'rent', 440, '2026-07-01')  // total = 500
@@ -195,14 +214,19 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     expect(under.status).toBe(422)
     expect(under.body.error).toMatch(/paid in full/i)
 
-    // No pay-ahead either — over the balance is rejected too.
     const over = await request(buildApp())
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
       .send({ amount: 600, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
-    expect(over.status).toBe(422)
-    expect(over.body.error).toMatch(/paid in full/i)
+    expect(over.status).toBe(200)
+    expect(over.body.data.appliedTotal).toBeCloseTo(500, 2)
+    expect(over.body.data.payAhead).toBeCloseTo(100, 2)   // held for next month
+  })
 
+  it('exact total passes, unchanged', async () => {
+    const f = await fixture()
+    await seedCharge(f, 'late_fee', 60, '2026-06-06')
+    await seedCharge(f, 'rent', 440, '2026-07-01')
     const full = await request(buildApp())
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
@@ -367,7 +391,7 @@ describe('S539 GET /payments/remittances — per-line application display', () =
       const client = await db.connect()
       try {
         await client.query('BEGIN')
-        await seedAllocationRule(client, { propertyId: f.propertyId })
+        // (allocation rule + ACH rate now come from fixture() — S609)
         // platform_processing_rates survives cleanupAllSchema — guard the
         // insert (suite convention) so repeated runs don't stack rows.
         await client.query(

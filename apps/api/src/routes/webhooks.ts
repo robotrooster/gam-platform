@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { createHash } from 'crypto'
 import Stripe from 'stripe'
 import { query, queryOne, getClient } from '../db'
-import { executeRentAllocation, type PaymentMethod } from '../services/allocation'
+import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES, type PaymentMethod } from '../services/allocation'
 import {
   recordAccountUpdated, recordPayoutEvent, recordDisputeEvent,
   firePmTransfersForReference, fireManagerTransfersForReference,
@@ -111,6 +111,9 @@ webhooksRouter.post('/stripe', async (req, res) => {
           amount: string
           settled_at: string
           reversal_id: string | null
+          // S609: needed to decide whether this row carries an owner share.
+          revenue_owner: string
+          unit_id: string | null
         }>(
           `UPDATE payments
               SET status='settled', settled_at=NOW(),
@@ -118,7 +121,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
                   stripe_charge_id = COALESCE($2, stripe_charge_id)
             WHERE stripe_payment_intent_id=$1
               AND status != 'settled'
-            RETURNING id, type, tenant_id, due_date, lease_id, amount, settled_at, reversal_id`,
+            RETURNING id, type, tenant_id, due_date, lease_id, amount, settled_at, reversal_id,
+                      revenue_owner, unit_id`,
           [pi.id, stripeChargeId]
         )
         // S561: reopened-after-reversal rows are handled in the loop below and
@@ -133,12 +137,25 @@ webhooksRouter.post('/stripe', async (req, res) => {
           settled.rows.filter((r) => !r.reversal_id && r.type === 'rent').map((r) => r.id)
         )
 
-        // Run allocation for every settled rent OR utility payment in this
-        // batch. Utility payments use the same allocation engine as rent
-        // (S122) — same banking_fee math, same owner/PM split, just a
-        // different entry_description on the payment row.
+        // Run allocation for every settled row that carries an owner share.
+        // Utility payments use the same engine as rent (S122).
+        //
+        // S609 (Nic): LATE FEES AND LANDLORD-BILLED FEES NOW TOO. "Late fees
+        // that come from the lease and are on the invoice need to go to the
+        // landlord... those also need to go to the landlord. I don't know why
+        // that would go to GAM." Until now they got no allocation at all, so
+        // the tenant paid them and the money stopped on GAM's books.
+        //
+        // A row only allocates if it is the LANDLORD'S money — a 'fee' row can
+        // be either side's (GAM's ACH-return, decline, manual-payment and
+        // opt-in-product fees are stamped revenue_owner='gam' at creation), and
+        // it needs a unit to resolve a property (FlexCharge rows carry none).
         for (const row of settled.rows) {
-          if (row.type === 'rent' || row.type === 'utility') {
+          const allocatable =
+            (ALLOCATABLE_PAYMENT_TYPES as readonly string[]).includes(row.type) &&
+            row.revenue_owner === 'landlord' &&
+            !!row.unit_id
+          if (allocatable) {
             if (!paymentMethod) {
               throw new Error(
                 `payment_intent ${pi.id} succeeded but payment_method could not be ` +
@@ -160,7 +177,45 @@ webhooksRouter.post('/stripe', async (req, res) => {
               continue
             }
 
-            await executeRentAllocation(client, row.id, paymentMethod)
+            // S609: rent and utilities stay STRICT — allocation failing on them
+            // rolls the settle back so Stripe retries, which is the long-
+            // standing "settle + ledger move together" posture and must not
+            // change. The kinds ADDED in S609 (late fees, landlord-billed fees)
+            // are lenient instead:
+            //
+            //   A LATE FEE MUST NEVER ROLL BACK A TENANT'S PAYMENT. It rides on
+            //   the same charge as the rent, so a property missing its payout
+            //   configuration would have taken the whole settlement down with
+            //   it — the tenant's rent included. That is the same shape of
+            //   defect Nic called out on invoice generation ("if it ever
+            //   becomes broken it still sends the rent bill and doesn't gate
+            //   the invoice"), and the same answer applies: the primary money
+            //   movement completes, the secondary concern raises an alert.
+            //
+            // The money is not lost — the row is settled and platform_held, so
+            // re-running allocation once the configuration is fixed books the
+            // landlord's share.
+            const strict = row.type === 'rent' || row.type === 'utility'
+            if (strict) {
+              await executeRentAllocation(client, row.id, paymentMethod)
+            } else {
+              await client.query('SAVEPOINT fee_alloc')
+              try {
+                await executeRentAllocation(client, row.id, paymentMethod)
+                await client.query('RELEASE SAVEPOINT fee_alloc')
+              } catch (allocErr) {
+                await client.query('ROLLBACK TO SAVEPOINT fee_alloc')
+                logger.error({ err: allocErr, payment_id: row.id, type: row.type },
+                  '[settle] fee allocated to nobody — payment still settled')
+                await createAdminNotification({
+                  severity: 'warn',
+                  category: 'fee_allocation_failed',
+                  title: `A ${row.type} could not be credited to the landlord (payment ${row.id})`,
+                  body: `The tenant's payment settled normally, but this charge could not be split out to the landlord — usually a property missing its payout configuration. The money is held on the platform; fix the configuration and re-run allocation for this payment.`,
+                  context: { payment_id: row.id, type: row.type, stripe_payment_intent_id: pi.id },
+                }).catch(() => {})
+              }
+            }
 
             // Credit ledger: emit payment_received_* event tagged to the
             // tenant subject. Skipped if the payment row has no
@@ -662,9 +717,10 @@ webhooksRouter.post('/stripe', async (req, res) => {
           await query(
             `INSERT INTO payments
                (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-                entry_description, due_date, invoice_id, notes)
+                entry_description, due_date, invoice_id, notes, revenue_owner)
+             -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share.
              SELECT p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, 'fee', $2,
-                    'pending', 'DECLINEFEE', CURRENT_DATE, p.invoice_id, $3
+                    'pending', 'DECLINEFEE', CURRENT_DATE, p.invoice_id, $3, 'gam'
                FROM payments p
               WHERE p.id = $1
                 AND p.tenant_id IS NOT NULL
@@ -1049,6 +1105,39 @@ webhooksRouter.post('/stripe', async (req, res) => {
             VALUES ('first_sender', $1, $2, 'Microdeposits confirmed — bank verified, first-time sender tracking initiated')`,
             [flipped.id, `${routing}_${bankLast4}`],
           )
+
+          // S607 (Nic): PROMOTE the verified bank to the customer's default.
+          //
+          // routes/stripe.ts already refuses to let a saved card take the
+          // default away from a bank ("don't steal from ACH"). Only half of that
+          // preference was implemented: nothing promoted the bank once it
+          // verified. The sequence every tenant hits — rent is due, add a card
+          // to pay now, bank verifies 1–3 days later — therefore left the CARD
+          // as default permanently, and the tenant kept paying card rates on a
+          // bank they waited three days to verify.
+          //
+          // Done here rather than in the verify endpoint because this is already
+          // the single source of truth for "the bank is verified", so a
+          // Stripe-side confirmation promotes it too. A PM can only be made
+          // default once ATTACHED, which is exactly what succeeded means.
+          //
+          // Deliberately only on the FALSE→TRUE transition (we are inside it):
+          // a tenant who later chooses a card as default keeps that choice, and
+          // a re-delivered webhook will not silently undo it.
+          if (pmId && customerId) {
+            try {
+              await getStripe().customers.update(customerId, {
+                invoice_settings: { default_payment_method: pmId },
+              })
+              logger.info({ tenant_id: flipped.id, pm: pmId }, '[webhook] verified bank promoted to default payment method')
+            } catch (e) {
+              // Never fail the verification over the default. The bank IS
+              // verified; the tenant can still pick it at pay time, and the
+              // PATCH /tenant/default-payment-method route remains available.
+              logger.error({ err: e, tenant_id: flipped.id, pm: pmId },
+                '[webhook] could not promote verified bank to default')
+            }
+          }
           logger.info({ tenant_id: flipped.id, setup_intent: setupIntent.id }, '[webhook] ACH microdeposits verified')
         }
       } catch (e) {

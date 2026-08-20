@@ -20,7 +20,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
 
 const { backfillInvoicesMock } = vi.hoisted(() => ({
   backfillInvoicesMock: vi.fn(async (..._args: any[]) => ({
@@ -249,6 +249,116 @@ describe('GET /api/admin/nacha/monitoring', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .get('/api/admin/nacha/monitoring')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(res.status).toBe(403)
+  })
+})
+
+/**
+ * S609 (Nic): "on the monthly rent volume trend KPI card, that's showing a graph
+ * still that stops in March. It's not updated with the rolling last six months."
+ *
+ * It wasn't a stale window — the chart was a HARDCODED array of five invented
+ * months plus one real value labelled with a month it wasn't. It drew a tidy
+ * rising line no matter what the platform did, which on a financial dashboard is
+ * worse than showing nothing.
+ *
+ * These pin the replacement: real settled money, a continuous month series, and
+ * a window that reaches back far enough for the long view.
+ */
+describe('S609 GET /api/admin/rent-volume-trend', () => {
+  async function settledRent(f: AFixture, monthsAgo: number, amount: number) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, settled_at)
+         VALUES ($1,$2,$3,'rent',$4,'settled','RENT', CURRENT_DATE,
+                 date_trunc('month', CURRENT_DATE) - make_interval(months => $5::int))`,
+        [unitId, tenantId, landlordId, amount.toFixed(2), monthsAgo])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('returns one point per month, oldest first', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=6')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(6)
+    const starts = res.body.data.map((d: any) => d.monthStart)
+    expect([...starts].sort()).toEqual(starts)   // already ascending
+  })
+
+  it('reports money that actually settled, in the month it settled', async () => {
+    const f = await seedAFixture()
+    await settledRent(f, 2, 1500)
+    await settledRent(f, 0, 900)
+    const res = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=6')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const pts = res.body.data as any[]
+    expect(pts[pts.length - 1].revenue).toBeCloseTo(900, 2)
+    expect(pts[pts.length - 3].revenue).toBeCloseTo(1500, 2)
+  })
+
+  it('an empty month is a ZERO, not a missing row', async () => {
+    // The heartbeat has to flatline through a dead month. A gap would close up
+    // and imply continuous activity that never happened.
+    const f = await seedAFixture()
+    await settledRent(f, 0, 500)
+    const res = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=6')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const pts = res.body.data as any[]
+    expect(pts).toHaveLength(6)
+    expect(pts.slice(0, 5).every(p => p.revenue === 0)).toBe(true)
+  })
+
+  it('unsettled rent is not counted', async () => {
+    const f = await seedAFixture()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
+         VALUES ($1,$2,$3,'rent',9999,'pending','RENT', CURRENT_DATE)`,
+        [unitId, tenantId, landlordId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const res = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=6')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const total = (res.body.data as any[]).reduce((s, p) => s + p.revenue, 0)
+    expect(total).toBe(0)
+  })
+
+  it('supports the long view and caps it', async () => {
+    const f = await seedAFixture()
+    const three = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=36')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(three.body.data).toHaveLength(36)
+    const absurd = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=500')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(absurd.body.data).toHaveLength(36)
+  })
+
+  it('a regular admin cannot read platform-wide revenue', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/rent-volume-trend?months=6')
       .set('Authorization', `Bearer ${f.adminToken}`)
     expect(res.status).toBe(403)
   })

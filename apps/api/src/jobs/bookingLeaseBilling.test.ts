@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease, seedLeaseTenant,
+  seedLease, seedLeaseTenant, seedAllocationRule,
 } from '../test/dbHelpers'
 import { backfillInvoices } from './invoiceGeneration'
 import { generateMoveInInvoice } from './moveInBundle'
@@ -34,6 +34,16 @@ async function seedStack(opts: { bookingSourced?: boolean } = {}) {
     const { userId, landlordId } = await seedLandlord(client)
     const tenantId = await seedTenant(client)
     const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    // S609: prepaid credit is only consumed if the landlord's share of it can
+    // actually be booked — the release refuses to settle a tenant's bill with
+    // money it cannot hand over. So the property needs a payout configuration.
+    await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+    await client.query(
+      `INSERT INTO platform_processing_rates
+         (payment_method, customer_facing_flat, customer_facing_percent,
+          stripe_cost_flat, stripe_cost_percent)
+       SELECT 'ach', 6, 0, 0, 0.5
+        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
     const unitId = await seedUnit(client, { propertyId, landlordId })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: RENT, startDate: START })
     await seedLeaseTenant(client, { leaseId, tenantId })

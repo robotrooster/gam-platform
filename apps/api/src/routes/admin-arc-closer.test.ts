@@ -25,7 +25,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease,
+  seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import { OWNER_EMAIL } from '../middleware/auth'
 
@@ -69,6 +69,7 @@ beforeEach(async () => {
 interface AFixture {
   landlordUserId: string
   landlordId:     string
+  propertyId:     string
   adminUserId:    string
   adminToken:     string
   // S592: OTP retry-transfer is owner-only (manual money movement); the
@@ -82,6 +83,8 @@ async function seedAFixture(): Promise<AFixture> {
   try {
     await client.query('BEGIN')
     const { userId: landlordUserId, landlordId } = await seedLandlord(client)
+    const propertyId = await seedProperty(client, {
+      landlordId, ownerUserId: landlordUserId, managedByUserId: landlordUserId })
     const adminRes = await client.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'admin', 'A', 'D', TRUE) RETURNING id`,
@@ -94,13 +97,21 @@ async function seedAFixture(): Promise<AFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'super_admin', 'Gam', 'Owner', TRUE) RETURNING id`,
       [OWNER_EMAIL])
+    // S609: admin routes are PORTFOLIO-SCOPED (S592) — a non-super admin may
+    // only act on landlords in their own book. This fixture predates that rule
+    // and left the admin with an empty book, so every call 404'd/403'd on scope
+    // before reaching the behaviour under test. Put the landlord in their book,
+    // which is what the test always meant.
+    await client.query(
+      `UPDATE landlords SET portfolio_manager_id = $2 WHERE id = $1`,
+      [landlordId, adminRes.rows[0].id])
     await client.query('COMMIT')
     const sign = (id: string, role: string, email: string) => jwt.sign(
       { userId: id, role, email, profileId: id, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     return {
-      landlordUserId, landlordId,
+      landlordUserId, landlordId, propertyId,
       adminUserId:     adminRes.rows[0].id,
       adminToken:      sign(adminRes.rows[0].id, 'admin', 'a@test.dev'),
       superAdminToken: sign(superRes.rows[0].id, 'super_admin', 'super@test.dev'),
@@ -280,7 +291,23 @@ describe('GET /api/admin/tenants/:tenantId/flexsuite-acceptances', () => {
     const f = await seedAFixture()
     const client = await db.connect()
     let tenantId = ''
-    try { await client.query('BEGIN'); tenantId = await seedTenant(client); await client.query('COMMIT') }
+    // S609: this tenant must be under a DIFFERENT landlord — one who is not in
+    // this admin's book. The shared fixture's landlord now IS in their book (so
+    // the resend tests can reach the behaviour they test), so an outside tenant
+    // has to be built explicitly. Otherwise this test passes for the wrong
+    // reason: "outside the portfolio" and "has no landlord at all" are not the
+    // same thing, and only the first is what this rule is about.
+    try {
+      await client.query('BEGIN')
+      const other = await seedLandlord(client)
+      const otherProp = await seedProperty(client, {
+        landlordId: other.landlordId, ownerUserId: other.userId, managedByUserId: other.userId })
+      tenantId = await seedTenant(client)
+      const unitId = await seedUnit(client, { propertyId: otherProp, landlordId: other.landlordId })
+      const leaseId = await seedLease(client, { unitId, landlordId: other.landlordId })
+      await seedLeaseTenant(client, { leaseId, tenantId })
+      await client.query('COMMIT')
+    }
     finally { client.release() }
     const res = await request(buildApp())
       .get(`/api/admin/tenants/${tenantId}/flexsuite-acceptances`)
@@ -311,7 +338,17 @@ describe('POST /api/admin/onboarding/resend', () => {
     const f = await seedAFixture()
     const client = await db.connect()
     let tenantId = ''
-    try { await client.query('BEGIN'); tenantId = await seedTenant(client); await client.query('COMMIT') }
+    // S609: a tenant belongs to a landlord only THROUGH a lease, and the
+    // portfolio gate rightly checks that link. Attach them, or this is a tenant
+    // with no landlord at all — which no admin should be able to act on.
+    try {
+      await client.query('BEGIN')
+      tenantId = await seedTenant(client)
+      const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      await seedLeaseTenant(client, { leaseId, tenantId })
+      await client.query('COMMIT')
+    }
     finally { client.release() }
     const res = await request(buildApp())
       .post('/api/admin/onboarding/resend')

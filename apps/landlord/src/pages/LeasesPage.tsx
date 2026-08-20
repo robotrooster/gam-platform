@@ -26,6 +26,13 @@ const STATUS_MAP: Record<LeaseStatus, string> = {
   terminated: 'badge-muted',
 }
 
+/** 1 → "1st". Used by the autopay badge. */
+function ordinalDay(n: number): string {
+  const suffix = ['th', 'st', 'nd', 'rd']
+  const v = n % 100
+  return `${n}${suffix[(v - 20) % 10] ?? suffix[v] ?? suffix[0]}`
+}
+
 export function LeasesPage() {
   const { data: leases = [], isLoading } = useQuery<any[]>('leases', () => apiGet('/leases'))
   const [modalOpen, setModalOpen] = useState(false)
@@ -37,6 +44,12 @@ export function LeasesPage() {
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
+  // S607 (Nic): a genuine one-off charge — amount + description, nothing defined
+  // in advance. "The landlord's always gonna have some random thing... a notice
+  // for parking violation. All that little stuff is not gonna be added into the
+  // lease." Separate state from Bill fee, which bills a fee the lease already
+  // carries.
+  const [chargeLease, setChargeLease] = useState<any | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
@@ -276,6 +289,31 @@ export function LeasesPage() {
                     <td className="mono">{l.unitNumber || '—'}</td>
                     <td>
                       {tenantName}
+                      {/* S609 (Nic): autopay VISIBILITY only. Knowing a payment
+                          is scheduled stops a landlord reading a quiet lease as
+                          a tenant who has stopped paying. The day is the
+                          tenant's own choice and is not editable here — a
+                          landlord able to move it could manufacture late fees. */}
+                      {l.autopayEnabled && (
+                        <span
+                          title={`This tenant has scheduled automatic payment${l.autopayPullDay ? ` on the ${ordinalDay(l.autopayPullDay)} of each month` : ' on the day rent is due'}. They set this themselves — it can't be changed from here.`}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            marginLeft: 8,
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            background: 'rgba(34,197,94,.12)',
+                            color: 'var(--green)',
+                            fontSize: '.65rem',
+                            fontWeight: 600,
+                            textTransform: 'uppercase',
+                            letterSpacing: '.04em',
+                          }}
+                        >
+                          Autopay {l.autopayPullDay ? ordinalDay(l.autopayPullDay) : 'on due date'}
+                        </span>
+                      )}
                       {l.needsReview && (
                         <span
                           title="Needs review"
@@ -368,6 +406,16 @@ export function LeasesPage() {
                             <FileText size={12} /> Bill fee
                           </button>
                         )}
+                        {can('leases.bill_fee') && l.status === 'active' && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="Charge this tenant a one-off amount — parking violation, damage, anything not in the lease"
+                            onClick={() => setChargeLease(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <FileText size={12} /> Charge
+                          </button>
+                        )}
                         {/* S605 (Nic): arrears from the landlord's previous
                             system. Sits beside Bill fee because it is the same
                             act — a landlord adding a charge — but it is entered
@@ -449,6 +497,12 @@ export function LeasesPage() {
         <BillFeeModal
           lease={billFeeLease}
           onClose={() => setBillFeeLease(null)}
+        />
+      )}
+      {chargeLease && (
+        <OneOffChargeModal
+          lease={chargeLease}
+          onClose={() => setChargeLease(null)}
         />
       )}
       {carriedLease && (
@@ -607,6 +661,94 @@ function MoneyAddonModal({ lease, onClose }: { lease: any; onClose: () => void }
 }
 
 // S181 / A2: landlord-triggered one-off fee billing.
+// S607 (Nic): a one-off charge with the landlord's own wording.
+//
+// Distinct from Bill fee, which bills a fee the LEASE already defines. This is
+// for the real world — a parking violation, a replaced gate remote, a rule
+// change nobody is going to sign an addendum for. The description is required
+// and is what the TENANT sees on their bill, so a charge never lands unexplained.
+//
+// It is not a late fee: it stays out of late-fee reporting and does not count
+// against the lease's late-fee cap, so a landlord who keeps late fees switched
+// off can still charge the occasional tenant.
+function OneOffChargeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [amount, setAmount] = useState('')
+  const [description, setDescription] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const post = useMutation(
+    () => apiPost(`/leases/${lease.id}/charge`, {
+      amount: Number(amount),
+      description: description.trim(),
+    }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('leases')
+        qc.invalidateQueries('payments')
+        onClose()
+      },
+      onError: (e: any) =>
+        setError(e?.response?.data?.error || 'Could not post this charge'),
+    },
+  )
+
+  const amt = Number(amount)
+  const ready = amt > 0 && description.trim().length >= 3
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Charge this tenant</div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 14 }}>
+          A one-off amount added to their balance — {lease.tenantName || 'the tenant'} sees the
+          description you write here on their bill. Not a late fee: it stays out of late-fee
+          totals and does not count toward the lease's late-fee cap.
+        </div>
+
+        <label style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)' }}>Amount</label>
+        <input
+          className="form-input"
+          inputMode="decimal"
+          placeholder="45.00"
+          value={amount}
+          onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1'))}
+          style={{ width: '100%', marginBottom: 12 }}
+        />
+
+        <label style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)' }}>
+          What is this for?
+        </label>
+        <input
+          className="form-input"
+          placeholder="Parking violation — blocked the gate arm"
+          maxLength={200}
+          value={description}
+          onChange={e => setDescription(e.target.value)}
+          style={{ width: '100%' }}
+        />
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, lineHeight: 1.45 }}>
+          Write it the way you would explain it at the door — this is the only thing the tenant
+          gets to go on.
+        </div>
+
+        {error && <div style={{ marginTop: 10, fontSize: '.8rem', color: 'var(--red)' }}>{error}</div>}
+
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button
+            className="btn btn-primary"
+            disabled={!ready || post.isLoading}
+            onClick={() => { setError(null); post.mutate() }}
+          >
+            {post.isLoading ? 'Posting…' : `Charge $${(amt || 0).toFixed(2)}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Posts to /api/leases/:id/bill-fee (S180). Per the S177 walkthrough
 // "platform provides capability not execution" — this is just a
 // surface for the existing backend endpoint. The created payments row
