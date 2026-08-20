@@ -38,6 +38,10 @@ const addMonths = (iso: string, n: number) => {
 propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
+    // S613 (Nic): optional unit filter. The unit page asks "does THIS space have
+    // propane, and what does it still owe on it" — property-wide with a LIMIT 50
+    // would answer neither on a park with a busy winter.
+    const unitId = req.query.unitId ? z.string().uuid().parse(req.query.unitId) : null
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
@@ -58,10 +62,10 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
          JOIN units u ON u.id = f.unit_id
          JOIN tenants t ON t.id = f.tenant_id
          JOIN users us ON us.id = t.user_id
-        WHERE f.property_id = $1
+        WHERE f.property_id = $1 AND ($2::uuid IS NULL OR f.unit_id = $2)
         ORDER BY f.fill_date DESC, f.created_at DESC
         LIMIT 50`,
-      [propertyId])
+      [propertyId, unitId])
     res.json({ success: true, data: fills })
   } catch (e) { next(e) }
 })

@@ -478,3 +478,29 @@ describe('S609 propane fills queue behind each other', () => {
     expect(inst.rows[0].cycle).toBe(next.toISOString().slice(0, 10))
   })
 })
+
+// S613 (Nic): the unit page asks a narrower question than the property page —
+// "does THIS space have propane, and what does it still owe" — and it renders
+// nothing at all when the answer is no. A property-wide list capped at 50 could
+// answer neither on a park with a busy winter.
+describe('GET /api/propane/fills?unitId — S613 unit filter', () => {
+  it("returns only that unit's fills, and nothing for a unit with none", async () => {
+    const f = await seed()
+    const app = buildApp()
+    const made = await postFill(app, f, { unitId: f.unitAId, gallons: 100, pricePerGallon: 3, installments: 1 })
+    expect(made.status).toBe(201)
+
+    const mine = await request(app)
+      .get(`/api/propane/fills?propertyId=${f.propertyAId}&unitId=${f.unitAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data).toHaveLength(1)
+    expect(mine.body.data[0].unit_id).toBe(f.unitAId)
+
+    const other = await request(app)
+      .get(`/api/propane/fills?propertyId=${f.propertyAId}&unitId=${f.vacantUnitId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(other.status).toBe(200)
+    expect(other.body.data).toHaveLength(0)
+  })
+})

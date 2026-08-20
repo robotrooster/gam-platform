@@ -1092,44 +1092,33 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
             )
           })}
 
-          {/* S613 (Nic): READ-ONLY, and only the masters this unit is actually
-              on. Which master feeds a space is set on the Utilities page, beside
-              the pool it divides. */}
-          <div style={{ marginTop: 12 }}>
-            <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>
-              Shared meters
-            </div>
-            {sharedMeters.length === 0 ? (
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
-                This unit isn&apos;t on a shared meter. Which master serves a unit is set on the
-                <strong> Utilities</strong> page, on the meter itself.
+          {/* S613 (Nic): READ-ONLY, and shown ONLY when this unit is on a master.
+              "That just needs to show which one it's a part of. It doesn't need
+              to show the other one." A unit on no master gets no section at all
+              rather than a line about nothing — which master feeds a space is a
+              question the Utilities page answers, beside the pool it divides.
+
+              The note that used to sit here explaining that moving a unit
+              re-cuts everyone's share is gone too: it was advice about a screen
+              you aren't on, for a change you can't make here. */}
+          {sharedMeters.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>
+                Shared meters
               </div>
-            ) : (
-              <>
-                {sharedMeters.map((m: any) => (
-                  <div key={m.id}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
-                             borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6, fontSize: '.8rem' }}>
-                    <span style={{ fontWeight: 600 }}>{ICONS[m.utilityType]} {m.label}</span>
-                    <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                      split across the units on it
-                    </span>
-                  </div>
-                ))}
-                <div style={{ fontSize: '.66rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
-                  Change which units a master serves on the <strong>Utilities</strong> page — moving one
-                  re-cuts everybody else&apos;s share of both meters.
+              {sharedMeters.map((m: any) => (
+                <div key={m.id}
+                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                           borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6, fontSize: '.8rem' }}>
+                  <span style={{ fontWeight: 600 }}>{ICONS[m.utilityType]} {m.label}</span>
+                  <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                    split across the units on it
+                  </span>
                 </div>
-              </>
-            )}
-          </div>
-          {/* Propane has no meter anywhere — a fill is an event, not a reading —
-              so it is worth saying rather than leaving someone hunting. */}
-          <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
-            Propane isn&apos;t linked to a unit: there is no propane meter. Set the price per gallon
-            in <strong>Rates</strong>, then use <strong>Record Delivery</strong> and enter the gallons
-            that went into this tank.
-          </div>
+              ))}
+            </div>
+          )}
+          <UnitPropaneRow unitId={unitId} propertyId={propertyId} />
       </div>
       {mine.map((m: any) => (
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6 }}>
@@ -1179,6 +1168,55 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
               onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, sewerRate: v })) }} style={{ width: 170 }} />
           )}
           <button className="btn btn-primary btn-sm" disabled={addMut.isLoading} onClick={() => addMut.mutate()}>Add</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// S613 (Nic): "There's nothing that shows a tank being linked to that unit. And
+// when there isn't propane for that unit, that message shouldn't even be there.
+// You're just having things there that aren't applicable."
+//
+// What stood here was a paragraph of instructions on every unit in the country,
+// propane or not, explaining that propane has no meter and where to record a
+// delivery. Both true and neither any use on a space that has never had a drop.
+//
+// A unit's propane IS its fills — there is no tank record to link, because a
+// fill is an event against the unit, not a device. So this shows what the unit
+// actually has: its last delivery and what it still owes on the schedule. No
+// fills, no section.
+function UnitPropaneRow({ unitId, propertyId }: { unitId: string; propertyId: string }) {
+  const { data: fills = [] } = useQuery<any[]>(
+    ['unit-propane', unitId],
+    () => apiGet(`/propane/fills?propertyId=${propertyId}&unitId=${unitId}`),
+    { enabled: !!propertyId }
+  )
+  const rows = fills as any[]
+  if (rows.length === 0) return null
+
+  const last = rows[0]
+  const owed = rows.reduce((n, f) => n + Number(f.balanceRemaining ?? 0), 0)
+  const money = (v: any) => `$${Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>
+        Propane
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                    borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem', flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 600 }}>🔥 {Number(last.gallons)} gal</span>
+        <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+          filled {String(last.fillDate).slice(0, 10)} at {money(last.pricePerGallon)}/gal
+        </span>
+        <span style={{ marginLeft: 'auto', fontSize: '.72rem', color: owed > 0 ? 'var(--gold)' : 'var(--text-3)' }}>
+          {owed > 0 ? `${money(owed)} still to bill` : 'paid off'}
+        </span>
+      </div>
+      {rows.length > 1 && (
+        <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 4 }}>
+          {rows.length} fills on record.
         </div>
       )}
     </div>
