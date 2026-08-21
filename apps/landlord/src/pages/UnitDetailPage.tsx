@@ -1278,6 +1278,17 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               ⚠ add opening read
             </button>
           )}
+          {/* S613 (Nic, mid-walk): "I just fat fingered an opening meter read. I
+              need a way to edit it." The row said whether a read EXISTED but
+              never what it said, so a typo was invisible and uncorrectable. */}
+          {m.openingRead && (
+            <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.72rem' }}
+              title="Correct this opening read"
+              onClick={() => setBaselineFor(m)}>
+              opened at <span className="mono" style={{ color: 'var(--text-1)' }}>{Number(m.openingRead.value)}</span>
+              <Pencil size={11} style={{ marginLeft: 5, color: 'var(--text-3)' }} />
+            </button>
+          )}
           <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
             onClick={() => { appConfirm(`Remove the ${m.utilityType} meter? Its readings go with it.`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) delMut.mutate(m.id) }) }}>Remove</button>
         </div>
@@ -1522,25 +1533,38 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
 // which is why the date is editable and defaults to the start of the month
 // rather than to now.
 function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: () => void; onSaved: () => void }) {
-  const [value, setValue] = useState('')
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 8) + '01')
+  // S613 (Nic): the same modal CORRECTS an existing opening read. It prefills
+  // what is on record, because a landlord fixing a typo needs to see the wrong
+  // number to know which digit he fat-fingered.
+  const existing = meter.openingRead ?? null
+  const [value, setValue] = useState(existing ? String(Number(existing.value)) : '')
+  const [date, setDate] = useState(() =>
+    existing?.date ? String(existing.date).slice(0, 10) : new Date().toISOString().slice(0, 8) + '01')
   const [err, setErr] = useState('')
   const save = useMutation(
-    () => apiPost(`/utility/meters/${meter.id}/readings`, {
-      readingValue: Number(value), readingDate: date,
-      billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
-    }),
+    () => existing
+      ? apiPatch(`/utility/meters/${meter.id}/readings/${existing.id}`, {
+          readingValue: Number(value), readingDate: date,
+        })
+      : apiPost(`/utility/meters/${meter.id}/readings`, {
+          readingValue: Number(value), readingDate: date,
+          billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
+        }),
     { onSuccess: onSaved,
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save the opening read') },
   )
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Opening read — {meter.label}</div>
+        <div className="modal-title">{existing ? 'Correct the opening read' : 'Opening read'} — {meter.label}</div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.55 }}>
-          Usage is the difference between two reads, so this meter can't bill until it has a
-          starting point. Enter what the meter face read when the tenancy or cycle began —
-          <strong> date it before the reads you want to bill</strong>.
+          {existing
+            ? <>Currently on record as <strong className="mono">{Number(existing.value)}</strong>. Enter
+                what the meter face actually reads. Nothing has billed from it yet, so correcting it
+                is safe — the change is kept on the record either way.</>
+            : <>Usage is the difference between two reads, so this meter can&apos;t bill until it has a
+                starting point. Enter what the meter face read when the tenancy or cycle began —
+                <strong> date it before the reads you want to bill</strong>.</>}
         </div>
         <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
           <input className="input" type="number" value={value} autoFocus
@@ -1556,7 +1580,7 @@ function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: ()
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           <button className="btn btn-primary" disabled={value === '' || save.isLoading}
             onClick={() => { setErr(''); save.mutate() }}>
-            {save.isLoading ? 'Saving…' : 'Save opening read'}
+            {save.isLoading ? 'Saving…' : existing ? 'Save correction' : 'Save opening read'}
           </button>
         </div>
       </div>

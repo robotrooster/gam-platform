@@ -1143,3 +1143,57 @@ describe('S609 POST /meters/:id/units — many at once', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// S613 (Nic, mid-walk): "I just fat fingered an opening meter read. I need a way
+// to edit it." There was no route at all — a read could be entered and never
+// corrected, which is untenable for a number typed off a dial in a field.
+describe('PATCH /api/utility/meters/:id/readings/:readingId (S613)', () => {
+  it('corrects an unbilled opening read and keeps the old value on the record', async () => {
+    const f = await seed()
+    const meterId = await seedMeter(f, f.propertyAId)
+    const app = buildApp()
+    const created = await request(app).post(`/api/utility/meters/${meterId}/readings`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ readingValue: 24520, readingDate: '2026-08-01', billingCycleMonth: '2026-08-01', reason: 'baseline' })
+    expect(created.status).toBe(201)
+    const readingId = created.body.data.id
+
+    const fixed = await request(app).patch(`/api/utility/meters/${meterId}/readings/${readingId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 24250 })
+    expect(fixed.status).toBe(200)
+    expect(Number(fixed.body.data.reading_value)).toBe(24250)
+
+    // The mistyped number survives the correction — a meter read is what a
+    // tenant's bill is computed from, so what it used to say stays on the record.
+    const { rows } = await db.query<any>(
+      `SELECT old_row->>'reading_value' AS was FROM audit_row_changes
+        WHERE table_name = 'utility_meter_readings' AND row_id = $1`, [readingId])
+    expect(rows.length).toBeGreaterThan(0)
+    expect(Number(rows[0].was)).toBe(24520)
+  })
+
+  it('refuses a read wider than the meter face', async () => {
+    const f = await seed()
+    const meterId = await seedMeter(f, f.propertyAId)
+    const app = buildApp()
+    const created = await request(app).post(`/api/utility/meters/${meterId}/readings`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ readingValue: 1234, readingDate: '2026-08-01', billingCycleMonth: '2026-08-01', reason: 'baseline' })
+    const res = await request(app).patch(`/api/utility/meters/${meterId}/readings/${created.body.data.id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 99999999 })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/digit/i)
+  })
+
+  it("another landlord's meter → 403", async () => {
+    const f = await seed()
+    const meterId = await seedMeter(f, f.propertyBId)
+    const app = buildApp()
+    const created = await request(app).post(`/api/utility/meters/${meterId}/readings`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ readingValue: 100, readingDate: '2026-08-01', billingCycleMonth: '2026-08-01', reason: 'baseline' })
+    const res = await request(app).patch(`/api/utility/meters/${meterId}/readings/${created.body.data.id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 200 })
+    expect(res.status).toBe(403)
+  })
+})

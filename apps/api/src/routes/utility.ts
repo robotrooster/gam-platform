@@ -124,6 +124,14 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
         -- allocate from the property invoice and never read an odometer.
         (m.billing_method <> 'submeter'
          OR EXISTS (SELECT 1 FROM utility_meter_readings WHERE meter_id = m.id)) AS has_baseline,
+        -- S613: the opening read itself, so a landlord who mistyped one can SEE
+        -- the number and correct it rather than only being told whether one
+        -- exists. Null once anything later has been read.
+        (SELECT jsonb_build_object('id', r.id, 'value', r.reading_value,
+                                   'date', r.reading_date)
+           FROM utility_meter_readings r
+          WHERE r.meter_id = m.id AND r.reason = 'baseline'
+          ORDER BY r.reading_date DESC, r.created_at DESC LIMIT 1) AS opening_read,
         -- W-36 (S531): assigned unit ids ride along so the management UI can
         -- render/edit assignments without an N+1 per meter.
         ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids,
@@ -907,6 +915,74 @@ utilityRouter.post('/tax-rates', requirePerm('properties.edit'), async (req, res
 // the tenant's next monthly invoice (S178).
 
 // List runs for a property (open first, then recent history).
+// PATCH /api/utility/meters/:id/readings/:readingId — S613 (Nic): fix a
+// mistyped read.
+//
+//   "I just fat fingered an opening meter read. I need a way to edit it...
+//    clicking to edit the actual thing only lets me choose the billing method
+//    and the name of the spot."
+//
+// A read could be entered and never corrected, which is untenable for a number
+// typed off a dial in a field — and it hit him on the very first walk.
+//
+// WHAT IT REFUSES: a read that something has already BILLED FROM. Usage is the
+// difference between two reads, so moving one silently re-writes what a tenant
+// was charged on an invoice already issued. Those need the reversal path, not a
+// quiet edit. Every correction is audit-logged either way (the trigger added in
+// 20260821140000), because what the number used to say is part of the story of
+// the bill it produced.
+utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      readingValue: z.number().nonnegative().optional(),
+      readingDate:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      note:         z.string().trim().max(300).optional(),
+    }).parse(req.body)
+    if (body.readingValue == null && body.readingDate == null) {
+      throw new AppError(400, 'Nothing to change — send a new value or a new date.')
+    }
+
+    const meter = await queryOne<any>(
+      `SELECT m.*, p.landlord_id FROM utility_meters m
+         JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
+    if (!meter) throw new AppError(404, 'Meter not found')
+    if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const reading = await queryOne<any>(
+      `SELECT * FROM utility_meter_readings WHERE id = $1 AND meter_id = $2`,
+      [req.params.readingId, req.params.id])
+    if (!reading) throw new AppError(404, 'Reading not found on this meter')
+
+    if (body.readingValue != null && meter.digits != null
+        && body.readingValue >= meterReadingModulus(meter.digits)) {
+      throw new AppError(400,
+        `That is more than a ${meter.digits}-digit meter can show. Check the odometer size on the meter if the face is wider.`)
+    }
+
+    // Anything billed from this read, or from the span that starts at it.
+    const billed = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM utility_bills
+        WHERE meter_id = $1 AND billing_cycle_month >= $2::date`,
+      [req.params.id, reading.billing_cycle_month])
+    if (Number(billed?.n ?? 0) > 0) {
+      throw new AppError(409,
+        'A bill has already been issued from this read, so changing it would rewrite a charge a tenant has already seen. ' +
+        'Enter a correcting read instead, or reverse that bill first.')
+    }
+
+    const updated = await queryOne<any>(
+      `UPDATE utility_meter_readings
+          SET reading_value = COALESCE($3, reading_value),
+              reading_date  = COALESCE($4::date, reading_date),
+              review_note   = COALESCE($5, review_note)
+        WHERE id = $1 AND meter_id = $2
+        RETURNING *`,
+      [req.params.readingId, req.params.id,
+       body.readingValue ?? null, body.readingDate ?? null, body.note ?? null])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
 utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)

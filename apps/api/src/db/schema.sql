@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict euomturIgJJ9LNddTeZFlhj6ptUV88jihE2YFAhfO6sFA9PgsAkUosgmzWd2fax
+\restrict d6qnriud2Tg3w2XpZw4GFyTTDvN9zdaCtXLi8kGU9CdEcxxXVwxUDZqRTjVzh9W
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -17335,6 +17335,13 @@ CREATE TRIGGER audit_utility_bills AFTER DELETE OR UPDATE ON public.utility_bill
 
 
 --
+-- Name: utility_meter_readings audit_utility_meter_readings; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_meter_readings AFTER DELETE OR UPDATE ON public.utility_meter_readings FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
 -- Name: utility_meters audit_utility_meters; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -23312,5 +23319,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict euomturIgJJ9LNddTeZFlhj6ptUV88jihE2YFAhfO6sFA9PgsAkUosgmzWd2fax
+\unrestrict d6qnriud2Tg3w2XpZw4GFyTTDvN9zdaCtXLi8kGU9CdEcxxXVwxUDZqRTjVzh9W
 
