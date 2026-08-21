@@ -1331,29 +1331,6 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
       {baselineFor && (
         <OpeningReadModal meter={baselineFor} onClose={() => setBaselineFor(null)} onSaved={() => { invalidate(); setBaselineFor(null) }} />
       )}
-      {adding && availableTypes.length === 0 && (
-        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
-          This unit already has a submeter for every utility GAM meters (electric and water).
-          Remove one above to replace it.
-        </div>
-      )}
-      {adding && availableTypes.length > 0 && (
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
-          <select className="input" value={draft.utilityType} onChange={e => setDraft(d => ({ ...d, utilityType: e.target.value }))} style={{ width: 120 }}>
-            {availableTypes.map(t => <option key={t} value={t}>{ICONS[t]} {t}</option>)}
-          </select>
-          <input className="input" type="text" inputMode="decimal" placeholder="$/unit e.g. 0.14" value={draft.rate}
-            onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, rate: v })) }} style={{ width: 140 }} />
-          <select className="input" value={draft.digits} onChange={e => setDraft(d => ({ ...d, digits: e.target.value }))} style={{ width: 110 }}>
-            {[4, 5, 6, 7, 8].map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
-          </select>
-          {draft.utilityType === 'water' && (
-            <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)" value={draft.sewerRate}
-              onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, sewerRate: v })) }} style={{ width: 170 }} />
-          )}
-          <button className="btn btn-primary btn-sm" disabled={addMut.isLoading} onClick={() => addMut.mutate()}>Add</button>
-        </div>
-      )}
     </div>
   )
 }
