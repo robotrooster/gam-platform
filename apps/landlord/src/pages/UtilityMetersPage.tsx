@@ -1130,6 +1130,40 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
   const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  // S613 (Nic): a meter can be configured perfectly and bill nothing, because a
+  // unit bills a utility only where its LEASE passes it through. Assigning
+  // twenty-seven units to a brand-new trash charge hits that on twenty-seven
+  // leases at once, silently. This records the pass-through for all of them.
+  const billBack = useMutation((id: string) => apiPost(`/utility/meters/${id}/bill-back`, {}), {
+    onSuccess: (r: any) => {
+      onChanged()
+      toast(`${r?.data?.leasesUpdated ?? 0} lease${r?.data?.leasesUpdated === 1 ? '' : 's'} updated — it starts on the next invoice.`)
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record that'),
+  })
+  function BillBackNotice({ m }: { m: any }) {
+    const blocked: string[] = m.unitsNotBilling || []
+    if (blocked.length === 0) return null
+    return (
+      <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 7, fontSize: '.72rem', lineHeight: 1.6,
+                    color: 'var(--amber)', background: 'rgba(245,158,11,.07)', border: '1px solid rgba(245,158,11,.25)' }}>
+        ⚠ {blocked.length} unit{blocked.length === 1 ? '' : 's'} on this
+        ({blocked.map(unitLabel).join(', ')}) {blocked.length === 1 ? 'has a lease that' : 'have leases that'}
+        &nbsp;don&apos;t mention {m.utilityType}, so {blocked.length === 1 ? 'it bills' : 'they bill'} nothing.
+        <button className="btn btn-secondary btn-sm" style={{ marginLeft: 8, padding: '1px 8px', fontSize: '.68rem' }}
+          disabled={billBack.isLoading}
+          onClick={() => appConfirm(
+            `Bill ${m.utilityType} back to ${blocked.length} tenant${blocked.length === 1 ? '' : 's'}?\n\n` +
+            `Their leases don't cover it, so this is an addendum — you should have their written ` +
+            `agreement, the same as adding it on paper. GAM records that you turned it on and when.\n\n` +
+            `It starts on the next invoice. Nothing already sent changes.`,
+            { confirmLabel: 'Bill it back' },
+          ).then(ok => { if (ok) billBack.mutate(m.id) })}>
+          Bill it back
+        </button>
+      </div>
+    )
+  }
 
   function UnitAssigner({ m }: { m: any }) {
     const assigned: string[] = m.assignedUnitIds || []
@@ -1208,6 +1242,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
           <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete master "${m.label}"? Its submeters stay.`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
         </div>
         <UnitAssigner m={m} />
+        <BillBackNotice m={m} />
         {served.length > 0 && (
           <div style={{ marginTop: 8, fontSize: '.68rem', color: 'var(--text-3)' }}>
             {submeteredCount > 0
@@ -1302,7 +1337,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
           </button>
           <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete meter "${m.label}"?`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
         </div>
-        {m.billingMethod !== 'master_bill_to_landlord' && <UnitAssigner m={m} />}
+        {m.billingMethod !== 'master_bill_to_landlord' && <><UnitAssigner m={m} /><BillBackNotice m={m} /></>}
       </div>
     )
   }

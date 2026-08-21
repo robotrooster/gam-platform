@@ -5,7 +5,7 @@ import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assert
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -1140,6 +1140,70 @@ unitsRouter.patch('/:id/subtype', requirePerm('schedule.configure_unit'), async 
     } catch (e: any) {
       throw new AppError(400, e?.message || 'Could not set that subtype')
     }
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/utility-responsibility — S613 (Nic, DIRECTIVE).
+//
+// "Trash or other stuff may be an ADDENDUM when billed back separately, as
+//  things change. There needs to be able to be other charges that are not on the
+//  lease. The accuracy we're going for is that the things that are IN the lease
+//  cannot be ALTERED on the charge, not that no other charges happen."
+//
+// Until now this row had exactly one writer — e-sign, parsing the lease's own
+// tags — which made a utility the lease never mentioned unbillable forever. A
+// landlord who added trash service in year two configured everything correctly
+// and the run reported unitsSkipped, silently, every month.
+//
+// What this does NOT open: rent, deposits, or any amount the lease fixes. Those
+// come off the lease row and still have no editor. This says only WHETHER a
+// utility is billed back, which is what an addendum ordinarily says on paper —
+// and it records who asserted it and when, because GAM cannot see the paper.
+unitsRouter.patch('/:id/utility-responsibility', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      utilityType:       z.enum(UTILITY_TYPES as unknown as [string, ...string[]]),
+      tenantResponsible: z.boolean(),
+      note:              z.string().trim().max(300).optional(),
+    }).parse(req.body)
+
+    const unit = await queryOne<any>(
+      `SELECT id, landlord_id, unit_number FROM units WHERE id = $1`, [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const lease = await queryOne<any>(
+      `SELECT id FROM leases WHERE unit_id = $1 AND status = 'active' LIMIT 1`, [req.params.id])
+    if (!lease) {
+      throw new AppError(409,
+        `Unit ${unit.unit_number} has no active lease, so there is nobody to bill it back to. ` +
+        `The next lease decides this on its own terms.`)
+    }
+
+    // A responsibility that CAME FROM the signed lease is not overwritten into
+    // silence here: switching one off would be altering what the tenant signed,
+    // which is the thing this whole rule protects.
+    const existing = await queryOne<any>(
+      `SELECT source, tenant_responsible FROM lease_utility_responsibilities
+        WHERE lease_id = $1 AND utility_type = $2`, [lease.id, body.utilityType])
+    if (existing && existing.source === 'lease' && existing.tenant_responsible && !body.tenantResponsible) {
+      throw new AppError(409,
+        `The signed lease makes this tenant responsible for ${body.utilityType}. That is a term of ` +
+        `the lease, so it can't be switched off here — it changes on the next lease, or by an ` +
+        `agreement you both sign.`)
+    }
+
+    const row = await queryOne<any>(
+      `INSERT INTO lease_utility_responsibilities
+         (lease_id, utility_type, tenant_responsible, source, set_by_user_id, set_at, note)
+       VALUES ($1, $2, $3, 'addendum', $4, NOW(), $5)
+       ON CONFLICT (lease_id, utility_type) DO UPDATE
+         SET tenant_responsible = EXCLUDED.tenant_responsible,
+             source = 'addendum', set_by_user_id = EXCLUDED.set_by_user_id,
+             set_at = NOW(), note = EXCLUDED.note
+       RETURNING *`,
+      [lease.id, body.utilityType, body.tenantResponsible, req.user!.userId, body.note ?? null])
+    res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
 

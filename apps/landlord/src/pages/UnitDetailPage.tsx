@@ -917,6 +917,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
   embedded?: boolean
 }) {
   const qc = useQueryClient()
+  const { can } = usePerms()
   const { data: meters = [] } = useQuery<any[]>(
     ['utility-meters', propertyId],
     () => apiGet(`/utility/meters?propertyId=${propertyId}`),
@@ -1090,6 +1091,19 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
       },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not add that') }
   )
+  // S613 (Nic): a utility the signed lease never mentioned CAN be billed back —
+  // "there needs to be able to be other charges that are not on the lease" —
+  // recorded as an addendum with who turned it on. What the lease FIXES (rent,
+  // deposits) still has no editor anywhere; this only says whether a utility is
+  // passed through.
+  const respMut = useMutation(
+    (b: { utilityType: string; tenantResponsible: boolean }) =>
+      apiPatch(`/units/${unitId}/utility-responsibility`, b),
+    {
+      onSuccess: () => { qc.invalidateQueries(['unit', unitId]); toast('Recorded — it starts on the next invoice.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change that'),
+    },
+  )
   const delMut = useMutation((id: string) => apiDelete(`/utility/meters/${id}`), {
     onSuccess: invalidate,
     onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not remove meter'),
@@ -1103,9 +1117,23 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
   // rather than offering a switch that would override the lease.
   const notBilled = (t: string) => hasLease && !tenantBilled.includes(t)
   const LeaseGateWarning = ({ t }: { t: string }) => notBilled(t) ? (
-    <div style={{ fontSize: '.66rem', color: 'var(--amber)', margin: '2px 0 6px 10px', lineHeight: 1.5 }}>
-      ⚠ This tenant&apos;s lease doesn&apos;t make them responsible for {t}, so this will bill nothing.
-      It comes from the signed lease — fix it there, or on the next lease.
+    <div style={{ fontSize: '.66rem', color: 'var(--amber)', margin: '2px 0 6px 10px', lineHeight: 1.6,
+                  display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <span>⚠ This tenant&apos;s signed lease doesn&apos;t mention {t}, so nothing bills for it.</span>
+      {can('schedule.configure_unit') && (
+        <button className="btn btn-secondary btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }}
+          disabled={respMut.isLoading}
+          onClick={() => appConfirm(
+            `Bill ${t} back to this tenant?\n\n` +
+            `Their lease doesn't cover it, so this is an addendum — you should have their written ` +
+            `agreement for it, the same as adding it on paper. GAM records that you turned it on ` +
+            `and when.\n\n` +
+            `It starts on the next invoice. Nothing already sent changes.`,
+            { confirmLabel: `Bill ${t} back` },
+          ).then(ok => { if (ok) respMut.mutate({ utilityType: t, tenantResponsible: true }) })}>
+          Bill it back
+        </button>
+      )}
     </div>
   ) : null
   const HOW_LABEL: Record<string, string> = {

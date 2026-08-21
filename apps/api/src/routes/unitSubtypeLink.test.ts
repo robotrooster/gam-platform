@@ -308,3 +308,84 @@ describe('every utility arrangement can be made from the unit (S613)', () => {
     expect(billed).not.toContain('trash')
   })
 })
+
+// S613 (Nic, DIRECTIVE): "The accuracy we're going for is that the things that
+// are IN the lease cannot be ALTERED on the charge, not that no other charges
+// happen. Trash or other stuff may be an addendum when billed back separately."
+describe('charges outside the lease (S613)', () => {
+  async function activeLease(unitId: string, landlordId: string) {
+    const c = await db.connect()
+    try { return await seedLease(c, { unitId, landlordId, status: 'active' }) } finally { c.release() }
+  }
+
+  it('a utility the lease never mentioned can be billed back, recorded as an addendum', async () => {
+    const app = buildApp(); const f = await seed()
+    const leaseId = await activeLease(f.rvA, f.landlordId)
+    const res = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ utilityType: 'trash', tenantResponsible: true, note: 'signed addendum 2026-08' })
+    expect(res.status).toBe(200)
+    const row = (await db.query(
+      `SELECT tenant_responsible, source, set_by_user_id, note FROM lease_utility_responsibilities
+        WHERE lease_id = $1 AND utility_type = 'trash'`, [leaseId])).rows[0]
+    expect(row.tenant_responsible).toBe(true)
+    expect(row.source).toBe('addendum')
+    expect(row.set_by_user_id).toBe(f.userId)
+    expect(row.note).toMatch(/addendum/)
+  })
+
+  // The half of the rule that stays: what the signed lease FIXES cannot move.
+  it('a responsibility that came from the signed lease cannot be switched off', async () => {
+    const app = buildApp(); const f = await seed()
+    const leaseId = await activeLease(f.rvA, f.landlordId)
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible, source)
+       VALUES ($1, 'water', true, 'lease')`, [leaseId])
+    const res = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ utilityType: 'water', tenantResponsible: false })
+    expect(res.status).toBe(409)
+    const row = (await db.query(
+      `SELECT tenant_responsible FROM lease_utility_responsibilities
+        WHERE lease_id = $1 AND utility_type = 'water'`, [leaseId])).rows[0]
+    expect(row.tenant_responsible).toBe(true)
+  })
+
+  it('no active lease → says there is nobody to bill', async () => {
+    const app = buildApp(); const f = await seed()
+    const res = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ utilityType: 'trash', tenantResponsible: true })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/no active lease/i)
+  })
+
+  // The bulk door — a park that starts charging for trash hits this on every
+  // lease at once, and one unit at a time is how half of them get missed.
+  it('bill-back covers every unit on the meter in one go', async () => {
+    const app = buildApp(); const f = await seed()
+    await activeLease(f.rvA, f.landlordId)
+    await activeLease(f.rvB, f.landlordId)
+    const meter = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', baseFee: 0, assignUnitId: f.rvA })
+    await request(app).post(`/api/utility/meters/${meter.body.data.id}/units`)
+      .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.rvB })
+
+    const before = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m = before.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m.units_not_billing ?? m.unitsNotBilling).length).toBe(2)
+
+    const res = await request(app).post(`/api/utility/meters/${meter.body.data.id}/bill-back`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.status).toBe(200)
+    expect(res.body.data.leasesUpdated).toBe(2)
+
+    const after = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m2 = after.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m2.units_not_billing ?? m2.unitsNotBilling).length).toBe(0)
+  })
+})

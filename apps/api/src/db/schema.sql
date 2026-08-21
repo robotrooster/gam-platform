@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict e0FfDpNfoGBDcHqvLON1L9GigQQ0D5z5bABJF7erm8MUSxcaHRQHnZL7wGcMGtz
+\restrict o3C1AXsry8GDuukWQ7xp94W3eT19WoAfPsZZsj9lgZA4xli5bG8YHDGGZhETNga
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4509,8 +4509,20 @@ CREATE TABLE public.lease_utility_responsibilities (
     utility_type text NOT NULL,
     tenant_responsible boolean NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
+    source text DEFAULT 'lease'::text NOT NULL,
+    set_by_user_id uuid,
+    set_at timestamp with time zone,
+    note text,
+    CONSTRAINT lease_utility_responsibilities_source_check CHECK ((source = ANY (ARRAY['lease'::text, 'addendum'::text]))),
     CONSTRAINT lease_utility_responsibilities_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
+
+
+--
+-- Name: COLUMN lease_utility_responsibilities.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_utility_responsibilities.source IS 'S613: ''lease'' = parsed from the signed document at e-sign. ''addendum'' = added later by the landlord, who is asserting there is paper for it.';
 
 
 --
@@ -20468,6 +20480,14 @@ ALTER TABLE ONLY public.lease_utility_responsibilities
 
 
 --
+-- Name: lease_utility_responsibilities lease_utility_responsibilities_set_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_responsibilities
+    ADD CONSTRAINT lease_utility_responsibilities_set_by_user_id_fkey FOREIGN KEY (set_by_user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: lease_vehicles lease_vehicles_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23415,5 +23435,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict e0FfDpNfoGBDcHqvLON1L9GigQQ0D5z5bABJF7erm8MUSxcaHRQHnZL7wGcMGtz
+\unrestrict o3C1AXsry8GDuukWQ7xp94W3eT19WoAfPsZZsj9lgZA4xli5bG8YHDGGZhETNga
 

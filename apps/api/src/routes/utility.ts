@@ -127,6 +127,20 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
         -- W-36 (S531): assigned unit ids ride along so the management UI can
         -- render/edit assignments without an N+1 per meter.
         ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids,
+        -- S613 (Nic): units on this meter whose ACTIVE lease doesn't bill this
+        -- utility back. They are configured perfectly and bill nothing, and the
+        -- run says so only as a count of unitsSkipped. Surfaced so a landlord
+        -- who has just ticked twenty-seven units onto a new trash charge is told
+        -- how many of them will actually produce a charge.
+        ARRAY(
+          SELECT mu.unit_id FROM utility_meter_units mu
+            JOIN leases lz ON lz.unit_id = mu.unit_id AND lz.status = 'active'
+           WHERE mu.meter_id = m.id
+             AND NOT EXISTS (
+               SELECT 1 FROM lease_utility_responsibilities lur
+                WHERE lur.lease_id = lz.id AND lur.utility_type = m.utility_type
+                  AND lur.tenant_responsible)
+        ) AS units_not_billing,
         -- S609 (Nic): has this meter actually MEASURED or BILLED anything yet?
         -- Until it has, every setting on it can still be corrected — including
         -- the utility and billing method. The edit form reads this to decide
@@ -577,6 +591,44 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
       success: true,
       data: { added, skipped: skipped.map(({ unitId, reason }) => ({ unitId, reason })) },
     })
+  } catch (e) { next(e) }
+})
+
+// POST /api/utility/meters/:id/bill-back — S613 (Nic, DIRECTIVE): record, for
+// every unit on this meter whose active lease is silent about this utility,
+// that it is billed back to the tenant.
+//
+// "Trash or other stuff may be an addendum when billed back separately, as
+//  things change. There needs to be able to be other charges that are not on
+//  the lease."
+//
+// The per-unit door exists too; this is the one that matters when a park starts
+// charging for something it never charged for, because doing it a unit at a time
+// across twenty-seven spaces is how half of them get missed. A responsibility
+// that came FROM a signed lease is never touched — this only fills silences.
+utilityRouter.post('/meters/:id/bill-back', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { note } = z.object({ note: z.string().trim().max(300).optional() }).parse(req.body ?? {})
+    const meter = await queryOne<any>(
+      `SELECT m.*, p.landlord_id FROM utility_meters m
+         JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
+    if (!meter) throw new AppError(404, 'Meter not found')
+    if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const rows = await query<{ lease_id: string }>(
+      `INSERT INTO lease_utility_responsibilities
+         (lease_id, utility_type, tenant_responsible, source, set_by_user_id, set_at, note)
+       SELECT lz.id, $2, true, 'addendum', $3, NOW(), $4
+         FROM utility_meter_units mu
+         JOIN leases lz ON lz.unit_id = mu.unit_id AND lz.status = 'active'
+        WHERE mu.meter_id = $1
+       ON CONFLICT (lease_id, utility_type) DO UPDATE
+         SET tenant_responsible = true, source = 'addendum',
+             set_by_user_id = EXCLUDED.set_by_user_id, set_at = NOW(), note = EXCLUDED.note
+         WHERE lease_utility_responsibilities.tenant_responsible = false
+       RETURNING lease_id`,
+      [req.params.id, meter.utility_type, req.user!.userId, note ?? null])
+    res.json({ success: true, data: { leasesUpdated: rows.length } })
   } catch (e) { next(e) }
 })
 
