@@ -1148,13 +1148,20 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
           setting them in the first place... Every time I click it on and off,
           that could be interrupting some sort of code to bill."
 
-          He is right, and the consequence is sharper than a stray click. A flat
-          charge is NOT prorated — billing reads the assignment when the monthly
-          run happens and writes the whole property amount. Off on the 3rd and
-          forgotten means the tenant is never billed for that month at all; on
-          the 28th means they pay the full month. A checkbox is far too casual an
-          instrument for that, so this lists only what the unit HAS, and taking
-          one off is a deliberate act that says what it costs.
+          WHAT ACTUALLY HAPPENS, because the first version of this comment got it
+          backwards and Nic corrected it: a flat charge is created BY THE INVOICE
+          RUN (invoiceGeneration → ensureBillsForUnit), off the assignment as it
+          stands at that moment, dated to the invoice's own month. So nothing is
+          ever billed mid-month and nothing is ever prorated — switch it off on
+          the 3rd and the 1st's invoice already carries the charge, switch it on
+          on the 28th and it simply appears on the next invoice as a whole month.
+          Nic: "they're not being invoiced at the time separate from when the rent
+          goes out."
+
+          The toggle therefore decides which INVOICE the charge lands on, and a
+          checkbox is still too casual for that — an idle click near the turn of
+          the month silently moves a charge by a whole month. So this lists only
+          what the unit HAS, and taking one off is deliberate.
 
           Adding is the "Add utility" picker above — the one door. */}
       {flatCharges.some((m: any) => onMeter(m)) && (
@@ -1179,8 +1186,8 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
                 disabled={toggleMut.isLoading}
                 onClick={() => appConfirm(
                   `Take unit ${unitNumber} off ${m.utilityType}?\n\n` +
-                  `Flat charges are NOT prorated. If this month's bill has already been generated it stays, ` +
-                  `and if it hasn't, this unit isn't billed for ${m.utilityType} at all this month — not a part month.`,
+                  `Invoices already sent keep the charge. From the next invoice on, this unit isn't ` +
+                  `billed for ${m.utilityType} — flat charges are whole months, never part of one.`,
                   { danger: true, confirmLabel: 'Take it off' },
                 ).then(ok => { if (ok) toggleMut.mutate({ meter: m, on: true }) })}>
                 Remove
