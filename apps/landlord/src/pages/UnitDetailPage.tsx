@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink, Lock, Pencil } from 'lucide-react'
-import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, listingMinPhotos, unitSubtypeFactsLabel, type PropertyUnitSubtype, type UnitType, type FloorLevel } from '@gam/shared'
+import { UTILITY_TYPE_LABEL, UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, listingMinPhotos, unitSubtypeFactsLabel, type PropertyUnitSubtype, type UnitType, type FloorLevel } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -1202,7 +1202,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
                        borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6, fontSize: '.8rem' }}>
               <span style={{ fontWeight: 600 }}>
-                {ICONS[m.utilityType]} {m.utilityType[0].toUpperCase() + m.utilityType.slice(1)}
+                {ICONS[m.utilityType]} {(UTILITY_TYPE_LABEL as Record<string, string>)[m.utilityType] ?? m.utilityType}
               </span>
               {/* The price lives on the property rate, not the row — see the
                   anti-discrimination note in services/utilityBilling. */}
@@ -1301,7 +1301,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 3 }}>Utility</div>
               <select className="input" value={t} style={{ width: 130 }}
                 onChange={e => setDraft(d => ({ ...d, utilityType: e.target.value, how: howsFor(e.target.value)[0] }))}>
-                {availableTypes.map(x => <option key={x} value={x}>{ICONS[x]} {x[0].toUpperCase() + x.slice(1)}</option>)}
+                {availableTypes.map(x => <option key={x} value={x}>{ICONS[x]} {(UTILITY_TYPE_LABEL as Record<string, string>)[x] ?? x}</option>)}
               </select>
             </div>
             <div>

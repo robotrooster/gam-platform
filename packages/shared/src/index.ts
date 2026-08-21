@@ -3271,6 +3271,36 @@ export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {
 export type UtilityType = 'water' | 'gas' | 'electric' | 'sewer' | 'trash' | 'propane'
 export const UTILITY_TYPES: readonly UtilityType[] = ['water', 'gas', 'electric', 'sewer', 'trash', 'propane'] as const
 
+// S613 (Nic asked whether gas and propane should stay separate): they stay
+// separate because they are not measured the same way and are not delivered the
+// same way. Natural gas arrives on a pipe and is read in THERMS; propane arrives
+// on a truck and is measured in GALLONS in a tank. The per-tank fill model has
+// no meaning for natural gas, and a merged type would put the wrong unit on
+// somebody's bill — which is exactly the defect fixed this session, where a
+// propane line printed "therms".
+//
+// The risk of two similar names is a landlord picking the wrong one, and that is
+// a LABEL problem, not a modelling one. Hence these, which also retire the raw
+// enum being capitalised straight into the UI.
+export const UTILITY_TYPE_LABEL: Record<UtilityType, string> = {
+  water:    'Water',
+  sewer:    'Sewer',
+  electric: 'Electric',
+  gas:      'Natural gas',
+  trash:    'Trash',
+  propane:  'Propane',
+}
+
+/** What a unit of this utility IS, on a meter face or a delivery ticket. */
+export const UTILITY_UNIT_LABEL: Record<UtilityType, string> = {
+  water:    'gal',
+  sewer:    'gal',
+  electric: 'kWh',
+  gas:      'therms',
+  trash:    '',
+  propane:  'gal',
+}
+
 export type UtilityRowTag =
   | 'utility_water_responsibility'
   | 'utility_gas_responsibility'

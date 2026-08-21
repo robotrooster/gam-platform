@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
-import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
+import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
@@ -1164,8 +1164,9 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
           <tbody>
             {lines.map((l: any) => (
               <tr key={l.utilityType} style={{ borderTop: '1px solid var(--border-0)' }}>
-                <td style={{ padding: '5px 0', textTransform: 'capitalize' }}>
-                  {UTILITY_ICONS[l.utilityType] || ''} {l.utilityType === 'unspecified' ? 'Unspecified' : l.utilityType}
+                <td style={{ padding: '5px 0' }}>
+                  {UTILITY_ICONS[l.utilityType] || ''}{' '}
+                  {l.utilityType === 'unspecified' ? 'Unspecified' : (UTILITY_TYPE_LABEL[l.utilityType as UtilityType] ?? l.utilityType)}
                 </td>
                 <td className="mono" style={{ textAlign: 'right' }}>{l.spent ? fmt(l.spent) : '—'}</td>
                 <td className="mono" style={{ textAlign: 'right', color: 'var(--green)' }}>{l.recovered ? fmt(l.recovered) : '—'}</td>
@@ -1636,7 +1637,9 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
               onClick={() => setOpenType(c.type)}>
               <span style={{ fontSize: '1.3rem', filter: c.configured ? undefined : 'grayscale(1)' }}>{UTILITY_ICONS[c.type]}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 700, color: c.configured ? 'var(--text-0)' : 'var(--text-2)', textTransform: 'capitalize' }}>{c.type}</div>
+                <div style={{ fontWeight: 700, color: c.configured ? 'var(--text-0)' : 'var(--text-2)' }}>
+                  {UTILITY_TYPE_LABEL[c.type as UtilityType] ?? c.type}
+                </div>
                 <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{c.summary}</div>
               </div>
               {c.problems.map((p, i) => (
@@ -1660,7 +1663,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
                 {openType === 'propane' && <PropaneTanksCard propertyId={propertyId} units={units} onChanged={onChanged} />}
                 {forType.length === 0 && openType !== 'propane' && (
                   <div className="card" style={{ padding: 16, fontSize: '.8rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
-                    Nothing set up for {openType} yet.
+                    Nothing set up for {(UTILITY_TYPE_LABEL[openType as UtilityType] ?? openType).toLowerCase()} yet.
                     {openType === 'trash'
                       ? <> Trash is usually a flat monthly charge — set its price under <strong>Utility rates</strong> below,
                           then add a flat-rate meter here and tick the spaces that have a can. It can also be split from
@@ -1669,7 +1672,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
                           across several.</>}
                     <div style={{ marginTop: 10 }}>
                       <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
-                        <Plus size={13} /> Set up {openType}
+                        <Plus size={13} /> Set up {(UTILITY_TYPE_LABEL[openType as UtilityType] ?? openType).toLowerCase()}
                       </button>
                     </div>
                   </div>
