@@ -70,7 +70,14 @@ unitsRouter.get('/', async (req, res, next) => {
         -- S554 (button-sweep bug #10): the admin-ops Units panel reads
         -- achVerified for the primary tenant's ACH badge; without this the
         -- field was always undefined and the badge stuck on "Pending".
-        pt.ach_verified
+        pt.ach_verified,
+        -- S613 (Nic): how many people have ALREADY been invited to this unit and
+        -- have not finished a lease yet. v_unit_occupancy only knows about an
+        -- ACTIVE tenancy, so a unit with an invite out still looked free — and
+        -- inviting thirty households in one sitting, that is how the same space
+        -- gets offered to two of them.
+        (SELECT COUNT(*)::int FROM pending_lease_drafts pld
+          WHERE pld.unit_id = u.id AND pld.resolved_at IS NULL) AS pending_invite_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id

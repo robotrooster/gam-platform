@@ -860,3 +860,31 @@ describe('DELETE /api/units/:id', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// S613 (Nic): "Do the occupied units disappear from this list the same way our
+// submeter units disappear after they're selected?" The invite picker filters on
+// this field, so it has to count an invite that has gone out but not landed.
+describe('GET /api/units — pending invite count (S613)', () => {
+  it('counts unresolved invites on a unit, and stops counting once resolved', async () => {
+    const f = await seed()
+    const app = buildApp()
+
+    const before = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const row0 = before.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(row0.pending_invite_count ?? row0.pendingInviteCount)).toBe(0)
+
+    await db.query(
+      `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
+       VALUES ($1, $2, $3, 0)`, [f.aLid, f.aUnitId, f.pmUserId])
+
+    const during = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const row1 = during.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(row1.pending_invite_count ?? row1.pendingInviteCount)).toBe(1)
+
+    // Once the lease is drafted, the unit is no longer "waiting on an invite".
+    await db.query(`UPDATE pending_lease_drafts SET resolved_at = NOW() WHERE unit_id = $1`, [f.aUnitId])
+    const after = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const row2 = after.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(row2.pending_invite_count ?? row2.pendingInviteCount)).toBe(0)
+  })
+})

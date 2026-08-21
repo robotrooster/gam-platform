@@ -43,9 +43,34 @@ export function InviteTenantModal({ onClose }: Props) {
   // (property-level invite). Uncheck only for someone who doesn't need screening.
   const [requireScreening, setRequireScreening] = useState(true)
 
-  const { data: units = [] } = useQuery<any[]>('vacant-units', () =>
-    apiGet('/units').then((all: any[]) => all.filter(u => !u.tenantId))
-  )
+  // S613 (Nic): "Do the occupied units disappear from this list the same way
+  // our submeter units disappear after they're selected?"
+  //
+  // They did — but only for a fully ACTIVE tenancy, which is a narrower test
+  // than it looks. Three kinds of unit stayed on the list that should not have:
+  //
+  //   · a unit someone was ALREADY INVITED to, with no lease finished yet.
+  //     Inviting thirty households in a sitting, that is how the same space gets
+  //     offered to two of them — and nothing on screen would have said so.
+  //   · an OWNER-OCCUPIED unit, which has no lease at all, so it read as free.
+  //   · a unit already holding a signed-but-not-active lease.
+  //
+  // Hidden rather than greyed, per the rule Nic set for the meter pickers ("I
+  // don't want them grayed out because then I still have to scroll around
+  // looking for just the odd one or two"), with a count of what was hidden
+  // underneath so nothing vanishes unexplained.
+  const { data: allUnits = [] } = useQuery<any[]>('vacant-units', () => apiGet('/units'))
+  const hidden = (allUnits as any[]).filter(u =>
+    u.tenantId || u.status === 'owner_use' || Number(u.pendingInviteCount || 0) > 0)
+  const hiddenReasons = [
+    hidden.filter(u => u.tenantId).length && `${hidden.filter(u => u.tenantId).length} occupied`,
+    hidden.filter(u => !u.tenantId && Number(u.pendingInviteCount || 0) > 0).length
+      && `${hidden.filter(u => !u.tenantId && Number(u.pendingInviteCount || 0) > 0).length} already invited`,
+    hidden.filter(u => !u.tenantId && u.status === 'owner_use').length
+      && `${hidden.filter(u => !u.tenantId && u.status === 'owner_use').length} owner-occupied`,
+  ].filter(Boolean) as string[]
+  const units = (allUnits as any[]).filter(u =>
+    !u.tenantId && u.status !== 'owner_use' && !(Number(u.pendingInviteCount || 0) > 0))
 
   const inviteMut = useMutation(
     async (payloads: any[]) => {
@@ -299,8 +324,12 @@ export function InviteTenantModal({ onClose }: Props) {
             {(units as any[]).length === 0 ? (
               <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-3)' }}>
                 <DoorOpen size={32} style={{ margin: '0 auto 8px', display: 'block', opacity: .4 }} />
-                <div style={{ fontSize: '.82rem' }}>No vacant units available.</div>
-                <div style={{ fontSize: '.75rem', marginTop: 4 }}>Add units first or check existing unit assignments.</div>
+                  <div style={{ fontSize: '.82rem' }}>No vacant units available.</div>
+                <div style={{ fontSize: '.75rem', marginTop: 4 }}>
+                  {hiddenReasons.length
+                    ? <>Every unit is spoken for — {hiddenReasons.join(', ')}.</>
+                    : <>Add units first or check existing unit assignments.</>}
+                </div>
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 320, overflowY: 'auto' }}>
@@ -338,6 +367,14 @@ export function InviteTenantModal({ onClose }: Props) {
                     {form.unitId === u.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
                   </div>
                 ))}
+              </div>
+            )}
+            {/* S613: nothing vanishes unexplained — the count of what was left
+                out sits under the list, the same way the meter unit picker
+                reports what it hid. */}
+            {units.length > 0 && hiddenReasons.length > 0 && (
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 8 }}>
+                Not shown: {hiddenReasons.join(', ')}.
               </div>
             )}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
