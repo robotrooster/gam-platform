@@ -8,6 +8,24 @@ import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+
+// S613 (Nic): "We have twenty five point zero zero zero zero zero. We have five
+// decimal places for something that can never be charged more than down to the
+// penny."
+//
+// Right about the display — the column is numeric(12,5) and its raw value was
+// going straight into the input, so a $25 trash charge read back as 25.00000.
+// Number() drops the dead zeros: 25.00000 → "25", 0.21000 → "0.21".
+//
+// The STORED precision stays, and this is the reason: a per-usage rate genuinely
+// lives below a cent. Water is commonly sold per THOUSAND gallons — $3.50/1,000
+// is $0.0035 a gallon, which rounds to $0.00 at two decimals and would bill
+// nothing at all. Precision in the RATE is not precision in the CHARGE; every
+// bill is still rounded to the penny when it is written. A FLAT charge is
+// different — it IS the charge — so that one is held to two decimals.
+const trimRate = (v: any) => v == null || v === '' ? '' : String(Number(v))
+/** A flat charge is the amount itself, so it can't be finer than a penny. */
+const FLAT_RATE_UTILITIES = ['trash']
 // Meter reads are odometer values — display with leading zeros at the
 // meter's own digit width (a cycled-over 6-digit meter reads 000133).
 // S613: `digits` is NULL on anything with no dial (trash, any flat rate). Those
@@ -991,20 +1009,25 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
         {TYPES.map(t => {
           const cur = row(t)
           const d = draft[t] ?? {
-            rate: cur?.ratePerUnit != null ? String(cur.ratePerUnit) : '',
-            sewer: cur?.sewerRatePerUnit != null ? String(cur.sewerRatePerUnit) : '',
+            rate: trimRate(cur?.ratePerUnit),
+            sewer: trimRate(cur?.sewerRatePerUnit),
           }
+          const pennyOnly = FLAT_RATE_UTILITIES.includes(t)
           const set = (k: 'rate' | 'sewer', v: string) =>
             setDraft(p => ({ ...p, [t]: { ...d, [k]: v } }))
           return (
             <div key={t} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '8px 0',
               borderBottom: '1px solid var(--border-0)', flexWrap: 'wrap' }}>
-              <span style={{ minWidth: 92, fontSize: '.82rem', fontWeight: 600, textTransform: 'capitalize' }}>
-                {UTILITY_ICONS[t]} {t}
+              <span style={{ minWidth: 92, fontSize: '.82rem', fontWeight: 600 }}>
+                {UTILITY_ICONS[t]} {UTILITY_TYPE_LABEL[t as UtilityType] ?? t}
               </span>
-              <input className="input input-sm" type="number" step="0.00001" value={d.rate}
+              {/* S613: a flat charge steps by the penny, because it IS the
+                  charge. A usage rate steps finer — water sold per thousand
+                  gallons lands at $0.0035, which two decimals would round to
+                  nothing. */}
+              <input className="input input-sm" type="number" step={pennyOnly ? '0.01' : '0.00001'} value={d.rate}
                 onChange={e => set('rate', e.target.value)}
-                placeholder={t === 'trash' ? '$ per unit / cycle' : `$ per ${UTILITY_UNITS[t] || 'unit'}`}
+                placeholder={pennyOnly ? '$ per unit / cycle' : `$ per ${UTILITY_UNITS[t] || 'unit'}`}
                 style={{ width: 150 }} />
               {t === 'propane' && (
                 <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>
@@ -1030,7 +1053,7 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
                 })}>Save</button>
               {cur?.ratePerUnit != null && (
                 <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                  currently {fmt(cur.ratePerUnit)}/{UTILITY_UNITS[t] || 'unit'}
+                  currently {pennyOnly ? fmt(cur.ratePerUnit) : `$${trimRate(cur.ratePerUnit)}`}{pennyOnly ? '' : `/${UTILITY_UNITS[t] || 'unit'}`}
                 </span>
               )}
             </div>
