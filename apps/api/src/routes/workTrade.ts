@@ -88,6 +88,10 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       renewalTerms: z.string().optional(),
       // W-56: per-person target; the property value is only the default.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      // S613 (Nic): what this agreement trades for. Omitted = everything, which
+      // is what every agreement written before this did.
+      coveredCharges: z.array(z.enum(
+        ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
     }).parse(req.body)
 
     const landlordId = resolveLandlordIdForUser(req.user!)
@@ -117,12 +121,14 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     const agreement = await queryOne<any>(`
       INSERT INTO work_trade_agreements
         (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms,
-         monthly_hours_target)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         monthly_hours_target, covered_charges)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+              COALESCE($9::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))
       RETURNING *`,
       [body.unitId, body.tenantId, landlordId, body.duties || null,
        body.startDate, body.endDate || null, body.renewalTerms || null,
-       body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80]
+       body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80,
+       body.coveredCharges ?? null]
     )
 
     res.json({ success: true, data: agreement })
@@ -341,7 +347,9 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate, monthlyHoursTarget } = z.object({
+    const { status, endDate, monthlyHoursTarget, coveredCharges } = z.object({
+      coveredCharges: z.array(z.enum(
+        ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
       // W-56: per-person target is editable on the agreement.
@@ -355,9 +363,11 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         status=COALESCE($1,status),
         end_date=COALESCE($2,end_date),
         monthly_hours_target=COALESCE($4,monthly_hours_target),
+        covered_charges=COALESCE($5::text[], covered_charges),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
-      [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null]
+      [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
+       coveredCharges ?? null]
     )
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

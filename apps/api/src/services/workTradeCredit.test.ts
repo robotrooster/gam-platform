@@ -265,3 +265,57 @@ describe('S609 propane in the work-trade credit', () => {
     expect(d.propaneNets).toEqual([0])
   })
 })
+
+// S613 (Nic): an agreement covers only what it says it covers.
+//
+//   "It would be like they did fifty percent of the work for the rent and the
+//    electric, and it bills them fifty percent of the electric, but propane is
+//    excluded — so they get a hundred percent of the propane bill."
+describe('covered charges (S613)', () => {
+  it('an excluded row is billed in FULL and takes no credit', () => {
+    // 50% of a $1,000 rent + $200 electric basis = $600 of credit.
+    const dist = distributeWorkTradeCredit(
+      1000, [200], [], 600, [300],
+      { rent: true, utilities: [true], fees: [], propane: false },
+    )
+    expect(dist.rentNet).toBe(400)        // $600 credit lands on rent first
+    expect(dist.utilityNets[0]).toBe(200) // nothing left over for electric here
+    expect(dist.propaneNets[0]).toBe(300) // propane untouched — the whole bill
+    expect(dist.creditApplied).toBe(600)
+  })
+
+  it('credit spills into a covered utility but never into an excluded one', () => {
+    // A near-full month: $1,150 of credit against rent $1,000 + electric $200.
+    const dist = distributeWorkTradeCredit(
+      1000, [200, 150], [], 1150, [300],
+      // electric covered, water NOT
+      { rent: true, utilities: [true, false], fees: [], propane: false },
+    )
+    expect(dist.rentNet).toBe(0)
+    expect(dist.utilityNets[0]).toBe(50)   // electric took the remaining $150
+    expect(dist.utilityNets[1]).toBe(150)  // water untouched
+    expect(dist.propaneNets[0]).toBe(300)  // propane untouched
+  })
+
+  it('omitting the map covers everything — the pre-S613 deal is unchanged', () => {
+    const withMap = distributeWorkTradeCredit(1000, [200], [50], 1250, [100],
+      { rent: true, utilities: [true], fees: [true], propane: true })
+    const without = distributeWorkTradeCredit(1000, [200], [50], 1250, [100])
+    expect(without).toEqual(withMap)
+    expect(without.rentNet).toBe(0)
+    expect(without.utilityNets[0]).toBe(0)
+    expect(without.feeNets[0]).toBe(0)
+    expect(without.propaneNets[0]).toBe(100)  // credit ran out before propane
+  })
+
+  it('a fully-excluded agreement credits nothing at all', () => {
+    const dist = distributeWorkTradeCredit(
+      1000, [200], [], 0, [300],
+      { rent: false, utilities: [false], fees: [], propane: false },
+    )
+    expect(dist.rentNet).toBe(1000)
+    expect(dist.utilityNets[0]).toBe(200)
+    expect(dist.propaneNets[0]).toBe(300)
+    expect(dist.creditApplied).toBe(0)
+  })
+})

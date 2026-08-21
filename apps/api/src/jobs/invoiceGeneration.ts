@@ -438,6 +438,10 @@ async function runGeneration(
       const utilityBills = await query<{
         id: string
         charge_amount: string
+        // S613: which utility this row is, so a work-trade agreement can cover
+        // electric and exclude propane. Already SELECTed below; it just was not
+        // in the type.
+        utility_type: string
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
                 ub.utility_type, ub.usage_amount, ub.reading_start, ub.reading_end,
@@ -525,13 +529,41 @@ async function runGeneration(
           ? await loadWorkTradeCreditContext(client, { unitId: lease.unit_id, tenantId: lease.tenant_id, dueDate })
           : null
         const wtFraction = wt ? workTradeFraction(wt.verifiedHours, wt.target) : 0
-        const wtCreditTarget = round2(wtFraction * billableTotalNum)
+
+        // S613 (Nic): an agreement covers only what it says it covers — "fifty
+        // percent of the work for the rent and the electric... but propane is
+        // excluded, so they get a hundred percent of the propane bill."
+        //
+        // The credit is a PERCENTAGE OF A BASIS, so an excluded charge has to
+        // leave the basis as well as the distribution. Leave propane in the
+        // basis and the tenant's labour buys dollars off a bill they are meant
+        // to pay whole — the excluded charge silently discounts everything else,
+        // which is invisible on the invoice and wrong in the landlord's favour
+        // nowhere and the tenant's favour everywhere.
+        //
+        // No agreement at all → everything is covered, which is what the credit
+        // did before this existed.
+        const covers = (kind: string) => !wt || wt.coveredCharges.length === 0
+          || wt.coveredCharges.includes(kind)
+        const utilityCovered = utilityBills.map(b => covers(String(b.utility_type)))
+        const feeCovered     = fees.map(() => covers('fees'))
+        const rentCovered    = covers('rent')
+        const propaneCovered = covers('propane')
+
+        const creditBasis = round2(
+          (rentCovered ? rentAmountNum : 0)
+          + utilityBills.reduce((s, b, i) => s + (utilityCovered[i] ? Number(b.charge_amount) : 0), 0)
+          + fees.reduce((s, f, i) => s + (feeCovered[i] ? Number(f.amount) : 0), 0)
+          + (propaneCovered ? propaneTotalNum : 0)
+        )
+        const wtCreditTarget = round2(wtFraction * creditBasis)
         const dist = distributeWorkTradeCredit(
           rentAmountNum,
           utilityBills.map(b => Number(b.charge_amount)),
           fees.map(f => Number(f.amount)),
           wtCreditTarget,
           propaneInstallments.map(p => Number(p.amount)),
+          { rent: rentCovered, utilities: utilityCovered, fees: feeCovered, propane: propaneCovered },
         )
         const netTotalNum = round2(
           dist.rentNet

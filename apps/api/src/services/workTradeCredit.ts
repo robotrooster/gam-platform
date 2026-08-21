@@ -73,6 +73,19 @@ export function distributeWorkTradeCredit(
   fees: number[],
   creditAmount: number,
   propane: number[] = [],
+  /**
+   * S613 (Nic): which rows this agreement actually covers. A row that is NOT
+   * covered is billed in FULL — it never takes credit here, and the caller must
+   * also leave it out of the basis the credit was computed from, or the tenant's
+   * labour would buy dollars off a bill they are supposed to pay whole.
+   * Omitted = everything covered, which is what every agreement did before this.
+   */
+  covered: {
+    rent?: boolean
+    utilities?: boolean[]
+    fees?: boolean[]
+    propane?: boolean
+  } = {},
 ): CreditDistribution {
   let remaining = round2(Math.max(0, creditAmount))
   const take = (gross: number): number => {
@@ -80,14 +93,18 @@ export function distributeWorkTradeCredit(
     remaining = round2(remaining - used)
     return round2(gross - used)
   }
-  const rentNet = take(rent)
-  const utilityNets = utilities.map(take)
-  const feeNets = fees.map(take)
+  /** A row outside the agreement passes through untouched. */
+  const takeIf = (gross: number, isCovered: boolean): number =>
+    isCovered ? take(gross) : round2(gross)
+
+  const rentNet = takeIf(rent, covered.rent !== false)
+  const utilityNets = utilities.map((u, i) => takeIf(u, covered.utilities?.[i] !== false))
+  const feeNets = fees.map((f, i) => takeIf(f, covered.fees?.[i] !== false))
   // S609: propane is taken LAST, so a partial month covers the recurring cost of
   // living here before it touches a one-off fill. Only a near-full month reaches
   // it — which matches how it is actually used (Nic gives seasonal help their
   // winter propane outright, and they are working a full trade).
-  const propaneNets = propane.map(take)
+  const propaneNets = propane.map(p => takeIf(p, covered.propane !== false))
   const sum = (xs: number[]) => xs.reduce((s, x) => s + x, 0)
   const grossSum = round2(rent + sum(utilities) + sum(fees) + sum(propane))
   const netSum = round2(rentNet + sum(utilityNets) + sum(feeNets) + sum(propaneNets))
@@ -98,6 +115,14 @@ export interface WorkTradeCreditContext {
   agreementId: string
   target: number
   verifiedHours: number
+  /** S613: what this agreement trades for. See the migration. */
+  coveredCharges: string[]
+}
+
+/** S613: is this charge inside the agreement? Utilities match on their own
+ *  type, so "electric included, propane excluded" is expressible per row. */
+export function isCovered(coveredCharges: string[], kind: string): boolean {
+  return coveredCharges.includes(kind)
 }
 
 /**
@@ -121,6 +146,7 @@ export async function loadWorkTradeCreditContext(
   const r = await client.query<{ agreement_id: string; target: number; verified_hours: string }>(
     `SELECT wta.id AS agreement_id,
             wta.monthly_hours_target AS target,
+            wta.covered_charges,
             COALESCE((
               SELECT SUM(l.hours)
                 FROM work_trade_logs l
@@ -145,5 +171,6 @@ export async function loadWorkTradeCreditContext(
     agreementId: r.rows[0].agreement_id,
     target: Number(r.rows[0].target),
     verifiedHours: Number(r.rows[0].verified_hours),
+    coveredCharges: (r.rows[0] as any).covered_charges ?? [],
   }
 }

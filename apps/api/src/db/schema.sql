@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict iJDw5RMculR2UcZRxpcgXdNgy9TnFt18jIr6sWgzL2wOMBWyFKK9lKAdOGXlDMG
+\restrict BejdC4NktCnJM0ZyJbBLlLcb7p6cNeps21grbGHXShVmamW9NVnHSVgC08sW7Sj
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9094,8 +9094,10 @@ CREATE TABLE public.work_trade_agreements (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     monthly_hours_target integer DEFAULT 80 NOT NULL,
     paused_by_hibernation boolean DEFAULT false NOT NULL,
+    covered_charges text[] DEFAULT ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text] NOT NULL,
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
-    CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0))
+    CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
+    CONSTRAINT work_trade_covered_charges_check CHECK ((covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text]))
 );
 
 
@@ -9104,6 +9106,13 @@ CREATE TABLE public.work_trade_agreements (
 --
 
 COMMENT ON COLUMN public.work_trade_agreements.paused_by_hibernation IS 'S594: TRUE when lease hibernation paused this agreement. lease /resume reactivates only these, never a hand-paused one.';
+
+
+--
+-- Name: COLUMN work_trade_agreements.covered_charges; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.covered_charges IS 'S613: what this agreement trades for. A charge NOT listed is billed in full and takes no part in the credit basis. Default is everything, which is the behaviour every pre-S613 agreement had.';
 
 
 --
@@ -23294,5 +23303,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict iJDw5RMculR2UcZRxpcgXdNgy9TnFt18jIr6sWgzL2wOMBWyFKK9lKAdOGXlDMG
+\unrestrict BejdC4NktCnJM0ZyJbBLlLcb7p6cNeps21grbGHXShVmamW9NVnHSVgC08sW7Sj
 

@@ -73,7 +73,7 @@ export function WorkTradePage() {
       <div className="card" style={{ padding: 0 }}>
         {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
           <table className="data-table">
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Covers</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
             <tbody>
               {agreements.length ? agreements.map((a: any) => (
                 // W-56: the row pulls up the tenant's LEASE; the target cell
@@ -86,6 +86,7 @@ export function WorkTradePage() {
                   <td>{a.propertyName || '—'}</td>
                   <td className="mono">{Number(a.hoursThisMonth || 0).toFixed(1)} / {a.target} hrs</td>
                   <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)} /></td>
+                  <td onClick={e => e.stopPropagation()}><AgreementCoversCell agreement={a} /></td>
                   <td className="mono">{Number(a.pendingCount) > 0
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
                     : <span style={{ color: 'var(--text-3)' }}>0</span>}</td>
@@ -94,7 +95,7 @@ export function WorkTradePage() {
                   <td onClick={e => e.stopPropagation()}><AddendumCell agreement={a} templates={addendumTemplates as any[]} /></td>
                 </tr>
               )) : (
-                <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No work trade agreements yet.</td></tr>
+                <tr><td colSpan={10} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>No work trade agreements yet.</td></tr>
               )}
             </tbody>
           </table>
@@ -182,6 +183,78 @@ function AddendumCell({ agreement, templates }: { agreement: any; templates: any
       onClick={() => { if (templates.length === 1) send.mutate(templates[0].id); else setPicking(true) }}>
       {send.isLoading ? 'Sending…' : 'Send addendum'}
     </button>
+  )
+}
+
+// S613 (Nic): what this agreement actually trades for.
+//
+//   "If people are on a work trade agreement, those things might not be included
+//    at some properties... they did fifty percent of the work for the rent and
+//    the electric, and it bills them fifty percent of the electric, but propane
+//    is excluded, so they get a hundred percent of the propane bill."
+//
+// PER AGREEMENT, beside the hours target, for the reason Nic gave for the target
+// itself: "I have different agreements with different people here... some people
+// do less work than others, and we need to make it fairly distributed." A
+// property-wide setting would force one bargain onto everybody.
+//
+// An unticked charge is billed in FULL and takes no part in the credit at all —
+// it does not even help earn it, or the excluded bill would quietly discount
+// everything else.
+const COVERABLE: { key: string; label: string }[] = [
+  { key: 'rent',     label: 'Rent' },
+  { key: 'electric', label: 'Electric' },
+  { key: 'water',    label: 'Water' },
+  { key: 'sewer',    label: 'Sewer' },
+  { key: 'gas',      label: 'Natural gas' },
+  { key: 'trash',    label: 'Trash' },
+  { key: 'propane',  label: 'Propane' },
+  { key: 'fees',     label: 'Fees' },
+]
+
+function AgreementCoversCell({ agreement }: { agreement: any }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const covered: string[] = agreement.coveredCharges ?? []
+  const save = useMutation(
+    (next: string[]) => apiPatch(`/work-trade/${agreement.id}`, { coveredCharges: next }),
+    { onSuccess: () => { qc.invalidateQueries('work-trade'); toast('Saved — it applies from the next invoice.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that') },
+  )
+  const toggle = (key: string) => {
+    const next = covered.includes(key) ? covered.filter(k => k !== key) : [...covered, key]
+    save.mutate(next)
+  }
+  const excluded = COVERABLE.filter(c => !covered.includes(c.key))
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem', padding: '2px 8px' }}
+        onClick={() => setOpen(o => !o)}>
+        {excluded.length === 0
+          ? 'Everything'
+          : `All but ${excluded.map(c => c.label.toLowerCase()).join(', ')}`}
+      </button>
+      {open && (
+        <div style={{ position: 'absolute', zIndex: 30, top: '100%', left: 0, marginTop: 4, minWidth: 190,
+                      background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 8,
+                      padding: 8, boxShadow: '0 8px 24px rgba(0,0,0,.35)' }}>
+          <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 6, lineHeight: 1.5 }}>
+            What the hours trade for. Anything unticked is billed in full.
+          </div>
+          {COVERABLE.map(c => (
+            <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '3px 2px',
+                                        fontSize: '.76rem', cursor: 'pointer' }}>
+              <input type="checkbox" checked={covered.includes(c.key)}
+                disabled={save.isLoading} onChange={() => toggle(c.key)} />
+              {c.label}
+            </label>
+          ))}
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: 6, width: '100%', fontSize: '.7rem' }}
+            onClick={() => setOpen(false)}>Done</button>
+        </div>
+      )}
+    </div>
   )
 }
 
