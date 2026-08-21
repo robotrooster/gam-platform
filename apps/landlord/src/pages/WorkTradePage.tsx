@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { ChevronDown } from 'lucide-react'
 import { toast } from '../components/dialogs'
 
 const STATUS_MAP: Record<string, string> = { active: 'badge-green', paused: 'badge-amber', ended: 'badge-muted' }
@@ -225,22 +226,36 @@ function AgreementCoversCell({ agreement }: { agreement: any }) {
     const next = covered.includes(key) ? covered.filter(k => k !== key) : [...covered, key]
     save.mutate(next)
   }
-  const excluded = COVERABLE.filter(c => !covered.includes(c.key))
+  // S613 (Nic): the label states what IS covered, and never editorialises.
+  //
+  //   "Why would a selectable list be titled 'all but propane' if other things
+  //    could be selected or unselected?"
+  //
+  // Right — that phrasing implied propane was the special one, when every line
+  // in the list is equally selectable, and it described the control by what is
+  // MISSING from it. A picker should say what it holds and invite the choice.
+  const chosen = COVERABLE.filter(c => covered.includes(c.key))
+  const label = chosen.length === 0 ? 'Choose…'
+    : chosen.length === COVERABLE.length ? 'Everything'
+    : chosen.length <= 3 ? chosen.map(c => c.label).join(', ')
+    : `${chosen.slice(0, 2).map(c => c.label).join(', ')} +${chosen.length - 2}`
 
   return (
     <div style={{ position: 'relative' }}>
-      <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem', padding: '2px 8px' }}
+      <button className="btn btn-ghost btn-sm"
+        style={{ fontSize: '.72rem', padding: '2px 8px', display: 'flex', alignItems: 'center', gap: 5,
+                 color: chosen.length === 0 ? 'var(--text-3)' : undefined }}
+        title={chosen.length ? `Covers ${chosen.map(c => c.label.toLowerCase()).join(', ')}` : 'Nothing selected yet'}
         onClick={() => setOpen(o => !o)}>
-        {excluded.length === 0
-          ? 'Everything'
-          : `All but ${excluded.map(c => c.label.toLowerCase()).join(', ')}`}
+        {label}
+        <ChevronDown size={12} style={{ color: 'var(--text-3)' }} />
       </button>
       {open && (
         <div style={{ position: 'absolute', zIndex: 30, top: '100%', left: 0, marginTop: 4, minWidth: 190,
                       background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 8,
                       padding: 8, boxShadow: '0 8px 24px rgba(0,0,0,.35)' }}>
           <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 6, lineHeight: 1.5 }}>
-            What the hours trade for. Anything unticked is billed in full.
+            Choose what the hours trade for. Anything unticked is billed in full.
           </div>
           {COVERABLE.map(c => (
             <label key={c.key} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '3px 2px',
