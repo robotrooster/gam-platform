@@ -29,7 +29,11 @@ async function seed() {
     const { userId: llUser, landlordId } = await seedLandlord(c)
     const tenantId = await seedTenant(c)
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
-    const unitId = await seedUnit(c, { propertyId, landlordId })       // dwelling_ownership defaults 'landlord'
+    // S613 (Nic, DIRECTIVE): a financed sale converts a park-owned HOME to
+    // tenant-owned, so it is offered on mobile homes only — never an RV, which
+    // is towed away rather than converted. The fixture is a park-owned home.
+    const unitId = await seedUnit(c, { propertyId, landlordId, unitType: 'mobile_home' })
+    await c.query(`UPDATE units SET dwelling_ownership = 'landlord' WHERE id = $1`, [unitId])
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 400 })
     await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })   // the buyer occupies the space
     await c.query('COMMIT')

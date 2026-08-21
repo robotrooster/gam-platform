@@ -517,12 +517,13 @@ export function UnitDetailPage() {
           <HomeOwnerSection unitId={id!} />
         )}
 
-        {(unit.unitType === 'mobile_home' || unit.unitType === 'rv_spot') && (
+        {/* S613 (Nic, DIRECTIVE): "Financed sales scope needs to be limited to
+            converting park owned homes to tenant owned homes. We don't want it
+            to be anything to do with RVs." A financed sale is the park selling
+            a home it owns to the household living in it — an RV is towed away,
+            not converted. */}
+        {unit.unitType === 'mobile_home' && unit.dwellingOwnership === 'landlord' && (
           <FinancedSaleSection unitId={id!} />
-        )}
-
-        {(unit.unitType === 'mobile_home' || unit.unitType === 'rv_spot') && (
-          <ResidentSaleSection unitId={id!} />
         )}
 
         <div className="card" style={{ gridColumn: "1 / -1" }}>
@@ -1656,148 +1657,6 @@ function FinancedSaleSection({ unitId }: { unitId: string }) {
             </div>
           </div>
         )
-      )}
-    </div>
-  )
-}
-
-// S594 (Nic): resident-to-resident home sale. A resident who OWNS their home
-// sells it to another resident on payments. GAM keeps the schedule + a copy of
-// the contract on file — it processes NO money between them (the absolute
-// distinction from the landlord→tenant financed sale above, which GAM bills).
-function ResidentSaleSection({ unitId }: { unitId: string }) {
-  const qc = useQueryClient()
-  const navigate = useNavigate()
-  const { data } = useQuery(['resident-sale', unitId], () => apiGet<any>(`/resident-home-sales/unit/${unitId}`))
-  const [open, setOpen] = useState(false)
-  const [form, setForm] = useState({ planType: 'flat', buyerName: '', buyerEmail: '', salePrice: '', downPayment: '0', annualInterestRate: '', termMonths: '', monthlyAmount: '', numberOfPayments: '', notes: '', startMonth: new Date().toISOString().slice(0, 7) + '-01' })
-  const [err, setErr] = useState<string | null>(null)
-  const [file, setFile] = useState<File | null>(null)
-
-  const sale = data?.sale
-  const schedule: any[] = data?.schedule || []
-  const owner = data?.currentOwner
-  const dwelling = data?.dwellingOwnership
-  const canSetUp = !sale || sale.status !== 'active'
-
-  const create = useMutation(
-    () => apiPost('/resident-home-sales', form.planType === 'flat'
-      ? { unitId, planType: 'flat', buyerName: form.buyerName.trim(), buyerEmail: form.buyerEmail.trim(),
-          monthlyAmount: Number(form.monthlyAmount), numberOfPayments: Number(form.numberOfPayments),
-          notes: form.notes.trim() || null, startMonth: form.startMonth }
-      : { unitId, planType: 'amortized', buyerName: form.buyerName.trim(), buyerEmail: form.buyerEmail.trim(),
-          salePrice: Number(form.salePrice), downPayment: Number(form.downPayment || 0),
-          annualInterestRate: Number(form.annualInterestRate || 0), termMonths: Number(form.termMonths),
-          notes: form.notes.trim() || null, startMonth: form.startMonth }),
-    { onSuccess: () => { qc.invalidateQueries(['resident-sale', unitId]); setOpen(false); toast('Resident sale recorded.') },
-      onError: (e: any) => setErr(e?.response?.data?.message || e?.message || 'Could not record the sale.') })
-
-  const markPaid = useMutation(
-    ({ n, paid }: { n: number; paid: boolean }) => apiPost(`/resident-home-sales/${sale.id}/installments/${n}/mark-paid`, { paid }),
-    { onSuccess: () => { qc.invalidateQueries(['resident-sale', unitId]); qc.invalidateQueries(['home-owner', unitId]); qc.invalidateQueries(['unit', unitId]) } })
-
-  const cancel = useMutation(
-    () => apiPost(`/resident-home-sales/${sale.id}/cancel`, {}),
-    { onSuccess: () => { qc.invalidateQueries(['resident-sale', unitId]); toast('Resident sale cancelled.') } })
-
-  const uploadContract = useMutation(
-    async () => {
-      const fd = new FormData(); fd.append('file', file!)
-      const res = await fetch(`${(import.meta as any).env?.VITE_API_URL}/api/resident-home-sales/${sale.id}/contract`, {
-        method: 'POST', headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') }, body: fd })
-      const j = await res.json(); if (!res.ok) throw new Error(j?.error || 'Upload failed'); return j
-    },
-    { onSuccess: () => { setFile(null); qc.invalidateQueries(['resident-sale', unitId]); toast('Contract uploaded.') },
-      onError: (e: any) => setErr(e?.message || 'Upload failed') })
-
-  return (
-    <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title" style={{ marginBottom: 8 }}>Resident-to-resident sale</div>
-      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14 }}>
-        For a resident selling their own home to another resident on payments. GAM keeps the schedule and a copy of the contract on file — it does not process the money between them.
-      </div>
-
-      {dwelling !== 'tenant' ? (
-        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>This home is park-owned — use the financed sale above. Resident-to-resident sales apply once a home is tenant-owned.</div>
-      ) : !owner ? (
-        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>Record the home’s current owner (the seller) above first, then set up the sale.</div>
-      ) : (
-        <>
-          {sale && sale.status === 'active' && (
-            <>
-              <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
-                {sale.sellerFirst} {sale.sellerLast} → {sale.buyerFirst} {sale.buyerLast} · {sale.installmentsPaid}/{sale.installmentsTotal} paid · {sale.planType === 'flat' ? `${sale.installmentsTotal} × ${fmt(sale.monthlyPayment)}` : `${fmt(sale.salePrice)} @ ${Number(sale.annualInterestRate)}%`}
-              </div>
-              {schedule.length > 0 && (
-                <div style={{ maxHeight: 200, overflowY: 'auto', border: '1px solid var(--border-0)', borderRadius: 8 }}>
-                  <table style={{ width: '100%', fontSize: '.72rem', borderCollapse: 'collapse' }}>
-                    <thead><tr style={{ color: 'var(--text-3)', textAlign: 'left' }}><th style={{ padding: '6px 10px' }}>#</th><th>Month</th><th>Amount</th><th>Paid</th><th></th></tr></thead>
-                    <tbody>
-                      {schedule.map((s: any) => (
-                        <tr key={s.installmentNumber} style={{ borderTop: '1px solid var(--border-0)' }}>
-                          <td style={{ padding: '5px 10px' }}>{s.installmentNumber}</td>
-                          <td>{String(s.dueMonth).slice(0, 7)}</td>
-                          <td>{fmt(s.amount)}</td>
-                          <td>{s.paid ? '✓' : '—'}</td>
-                          <td><button className="btn btn-ghost btn-sm" disabled={markPaid.isLoading} onClick={() => markPaid.mutate({ n: s.installmentNumber, paid: !s.paid })}>{s.paid ? 'Unmark' : 'Mark paid'}</button></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              <div style={{ marginTop: 12, fontSize: '.75rem' }}>
-                {sale.contractName
-                  ? <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/view?src=${encodeURIComponent(`/resident-home-sales/${sale.id}/contract`)}&title=${encodeURIComponent(sale.contractName)}`)}>View contract on file</button>
-                  : <span style={{ color: 'var(--text-3)' }}>No contract uploaded yet.</span>}
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
-                  <input type="file" onChange={e => setFile(e.target.files?.[0] || null)} />
-                  <button className="btn btn-ghost btn-sm" disabled={!file || uploadContract.isLoading} onClick={() => uploadContract.mutate()}>{uploadContract.isLoading ? 'Uploading…' : 'Upload contract'}</button>
-                </div>
-              </div>
-              <button className="btn btn-ghost btn-sm" style={{ marginTop: 12 }} disabled={cancel.isLoading} onClick={() => cancel.mutate()}>Cancel sale</button>
-            </>
-          )}
-
-          {sale && sale.status === 'paid_off' && (
-            <div style={{ color: 'var(--green)', fontSize: '.85rem' }}>Paid off — {sale.buyerFirst} {sale.buyerLast} now owns the home.</div>
-          )}
-
-          {canSetUp && (!sale || sale.status === 'cancelled') && (
-            !open ? (
-              <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>Record resident sale</button>
-            ) : (
-              <div>
-                <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>Seller: {owner.firstName} {owner.lastName}. Enter the buyer and the terms the residents agreed on.</div>
-                <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-                  {[['flat', 'Flat monthly'], ['amortized', 'Amortized (interest)']].map(([v, label]) => (
-                    <button key={v} type="button" className={`btn btn-sm ${form.planType === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setForm({ ...form, planType: v })}>{label}</button>
-                  ))}
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 8, maxWidth: 460 }}>
-                  <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Buyer name<input className="form-input" value={form.buyerName} onChange={e => setForm({ ...form, buyerName: e.target.value })} /></label>
-                  <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Buyer email<input className="form-input" value={form.buyerEmail} onChange={e => setForm({ ...form, buyerEmail: e.target.value })} /></label>
-                  {(form.planType === 'flat'
-                    ? [['monthlyAmount', 'Monthly payment ($)'], ['numberOfPayments', 'Number of payments']]
-                    : [['salePrice', 'Sale price'], ['downPayment', 'Down payment'], ['annualInterestRate', 'Interest rate (%/yr)'], ['termMonths', 'Term (months)']]
-                  ).map(([k, label]) => (
-                    <label key={k} style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{label}
-                      <input className="form-input" inputMode="decimal" value={(form as any)[k]} onChange={e => setForm({ ...form, [k]: e.target.value })} /></label>
-                  ))}
-                  <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>First payment month
-                    <input className="form-input" type="month" value={String(form.startMonth).slice(0, 7)} onChange={e => setForm({ ...form, startMonth: e.target.value + '-01' })} /></label>
-                </div>
-                {err && <div style={{ fontSize: '.72rem', color: 'var(--red)', marginTop: 8 }}>{err}</div>}
-                <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                  <button className="btn btn-primary btn-sm"
-                    disabled={create.isLoading || !form.buyerName || !/.+@.+\..+/.test(form.buyerEmail) || (form.planType === 'flat' ? (!form.monthlyAmount || !form.numberOfPayments) : (!form.salePrice || !form.termMonths))}
-                    onClick={() => { setErr(null); create.mutate() }}>{create.isLoading ? 'Recording…' : 'Record sale'}</button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
-                </div>
-              </div>
-            )
-          )}
-        </>
       )}
     </div>
   )

@@ -195,9 +195,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // delete, but explicit order keeps the chain obvious.
   await db.query(`DELETE FROM unit_entry_request_responses`)
   await db.query(`DELETE FROM unit_entry_requests`)
-  // S594: resident_home_sales FKs units + users + documents (RESTRICT);
-  // installments CASCADE. Clear before documents/units/users below.
-  await db.query(`DELETE FROM resident_home_sales`)
+  // S613: resident_home_sales is GONE — the resident-to-resident sale record
+  // was retired (Nic: "scrap the person to person sale monitoring"), so there is
+  // nothing to clear here any more.
   // documents FKs leases/units/tenants/landlords (NO cascade). S573: a
   // finalized inspection now writes a summary-report documents row referencing
   // its lease — clear documents BEFORE leases/units, not just before landlords.

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 7XMHuixwfLCw4dEcTInshnelRqisfWOM0WBtZDxBAbB3D9TXYFN8t2Vgq3jmKhf
+\restrict iJDw5RMculR2UcZRxpcgXdNgy9TnFt18jIr6sWgzL2wOMBWyFKK9lKAdOGXlDMG
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6123,7 +6123,6 @@ CREATE TABLE public.propane_fill_installments (
     billing_cycle_month date NOT NULL,
     payment_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    accelerated boolean DEFAULT false NOT NULL,
     gallons numeric(10,2),
     CONSTRAINT propane_fill_installments_gallons_check CHECK (((gallons IS NULL) OR (gallons > (0)::numeric)))
 );
@@ -6164,6 +6163,8 @@ CREATE TABLE public.propane_fills (
     tax_rate_pct numeric(6,4) DEFAULT 0 NOT NULL,
     tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
     client_key uuid,
+    delivery_fee_share numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT propane_fills_delivery_fee_share_check CHECK ((delivery_fee_share >= (0)::numeric)),
     CONSTRAINT propane_fills_gallons_check CHECK ((gallons > (0)::numeric)),
     CONSTRAINT propane_fills_installment_count_check CHECK ((installment_count = ANY (ARRAY[1, 2, 4]))),
     CONSTRAINT propane_fills_price_per_gallon_check CHECK ((price_per_gallon >= (0)::numeric))
@@ -6175,6 +6176,13 @@ CREATE TABLE public.propane_fills (
 --
 
 COMMENT ON COLUMN public.propane_fills.client_key IS 'S594: client-supplied idempotency key (one per Record-Fill intent). Partial-unique so a repeated submission is a no-op instead of a double-charge.';
+
+
+--
+-- Name: COLUMN propane_fills.delivery_fee_share; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.delivery_fee_share IS 'S613: this tank''s share of the delivery charge on the supplier ticket (hazmat / fuel surcharge / per-stop fee). Included in total_amount and in the instalment schedule. Untaxed — the propane tax applies to the fuel.';
 
 
 --
@@ -6814,76 +6822,6 @@ CREATE TABLE public.reserve_fund_state (
     updated_at timestamp with time zone DEFAULT now(),
     CONSTRAINT reserve_fund_state_phase_check CHECK ((phase = ANY (ARRAY[1, 2, 3])))
 );
-
-
---
--- Name: resident_home_sale_installments; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.resident_home_sale_installments (
-    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    sale_id uuid NOT NULL,
-    installment_number integer NOT NULL,
-    due_month date NOT NULL,
-    amount numeric(12,2) NOT NULL,
-    principal_portion numeric(12,2) NOT NULL,
-    interest_portion numeric(12,2) NOT NULL,
-    remaining_balance numeric(12,2) NOT NULL,
-    paid boolean DEFAULT false NOT NULL,
-    paid_at timestamp with time zone,
-    paid_recorded_by_user_id uuid,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: COLUMN resident_home_sale_installments.paid; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.resident_home_sale_installments.paid IS 'S594: manual paid flag — the landlord records that the resident buyer paid the resident seller off-platform. GAM moves no money; there is no payment_id.';
-
-
---
--- Name: resident_home_sales; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.resident_home_sales (
-    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    unit_id uuid NOT NULL,
-    property_id uuid NOT NULL,
-    landlord_id uuid NOT NULL,
-    seller_user_id uuid NOT NULL,
-    buyer_user_id uuid NOT NULL,
-    plan_type text DEFAULT 'flat'::text NOT NULL,
-    sale_price numeric(12,2) NOT NULL,
-    down_payment numeric(12,2) DEFAULT 0 NOT NULL,
-    annual_interest_rate numeric(6,3) DEFAULT 0 NOT NULL,
-    term_months integer NOT NULL,
-    monthly_payment numeric(12,2) NOT NULL,
-    start_month date NOT NULL,
-    installments_total integer NOT NULL,
-    installments_paid integer DEFAULT 0 NOT NULL,
-    status text DEFAULT 'active'::text NOT NULL,
-    contract_document_id uuid,
-    notes text,
-    created_by_user_id uuid,
-    paid_off_at timestamp with time zone,
-    cancelled_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT resident_home_sales_parties_distinct CHECK ((seller_user_id <> buyer_user_id)),
-    CONSTRAINT resident_home_sales_plan_type_check CHECK ((plan_type = ANY (ARRAY['amortized'::text, 'flat'::text]))),
-    CONSTRAINT resident_home_sales_sale_price_check CHECK ((sale_price > (0)::numeric)),
-    CONSTRAINT resident_home_sales_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paid_off'::text, 'cancelled'::text]))),
-    CONSTRAINT resident_home_sales_term_check CHECK (((term_months > 0) AND (term_months <= 600)))
-);
-
-
---
--- Name: TABLE resident_home_sales; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.resident_home_sales IS 'S594: resident-to-resident financed home sale. GAM records the schedule + holds the contract; it moves NO money (that is strictly between the two residents). Separate from home_sale_contracts on purpose so billing can never touch it.';
 
 
 --
@@ -11525,30 +11463,6 @@ ALTER TABLE ONLY public.reserve_fund_state
 
 
 --
--- Name: resident_home_sale_installments resident_home_sale_installments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sale_installments
-    ADD CONSTRAINT resident_home_sale_installments_pkey PRIMARY KEY (id);
-
-
---
--- Name: resident_home_sale_installments resident_home_sale_installments_uq; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sale_installments
-    ADD CONSTRAINT resident_home_sale_installments_uq UNIQUE (sale_id, installment_number);
-
-
---
--- Name: resident_home_sales resident_home_sales_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sales
-    ADD CONSTRAINT resident_home_sales_pkey PRIMARY KEY (id);
-
-
---
 -- Name: route_stops route_stops_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15226,27 +15140,6 @@ CREATE INDEX idx_remittance_applications_remittance ON public.remittance_applica
 
 
 --
--- Name: idx_resident_home_sale_installments_sale; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_resident_home_sale_installments_sale ON public.resident_home_sale_installments USING btree (sale_id);
-
-
---
--- Name: idx_resident_home_sales_buyer; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_resident_home_sales_buyer ON public.resident_home_sales USING btree (buyer_user_id) WHERE (status = 'active'::text);
-
-
---
--- Name: idx_resident_home_sales_unit; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_resident_home_sales_unit ON public.resident_home_sales USING btree (unit_id);
-
-
---
 -- Name: idx_route_stops_appointment; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16633,13 +16526,6 @@ CREATE UNIQUE INDEX ux_properties_booking_slug ON public.properties USING btree 
 
 
 --
--- Name: ux_resident_home_sale_active_per_unit; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX ux_resident_home_sale_active_per_unit ON public.resident_home_sales USING btree (unit_id) WHERE (status = 'active'::text);
-
-
---
 -- Name: ux_unit_booking_waitlists_claim_token; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17750,13 +17636,6 @@ CREATE TRIGGER trg_reject_booking_on_retired_unit BEFORE INSERT OR UPDATE OF uni
 --
 
 CREATE TRIGGER trg_reject_lease_on_unavailable_unit BEFORE INSERT OR UPDATE OF unit_id, status ON public.leases FOR EACH ROW EXECUTE FUNCTION public.reject_lease_on_unavailable_unit();
-
-
---
--- Name: resident_home_sales trg_resident_home_sales_updated_at; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_resident_home_sales_updated_at BEFORE UPDATE ON public.resident_home_sales FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -22188,46 +22067,6 @@ ALTER TABLE ONLY public.remittance_applications
 
 
 --
--- Name: resident_home_sale_installments resident_home_sale_installments_sale_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sale_installments
-    ADD CONSTRAINT resident_home_sale_installments_sale_fkey FOREIGN KEY (sale_id) REFERENCES public.resident_home_sales(id) ON DELETE CASCADE;
-
-
---
--- Name: resident_home_sales resident_home_sales_buyer_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sales
-    ADD CONSTRAINT resident_home_sales_buyer_fkey FOREIGN KEY (buyer_user_id) REFERENCES public.users(id);
-
-
---
--- Name: resident_home_sales resident_home_sales_contract_doc_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sales
-    ADD CONSTRAINT resident_home_sales_contract_doc_fkey FOREIGN KEY (contract_document_id) REFERENCES public.documents(id);
-
-
---
--- Name: resident_home_sales resident_home_sales_seller_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sales
-    ADD CONSTRAINT resident_home_sales_seller_fkey FOREIGN KEY (seller_user_id) REFERENCES public.users(id);
-
-
---
--- Name: resident_home_sales resident_home_sales_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.resident_home_sales
-    ADD CONSTRAINT resident_home_sales_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
-
-
---
 -- Name: route_stops route_stops_appointment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23455,5 +23294,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 7XMHuixwfLCw4dEcTInshnelRqisfWOM0WBtZDxBAbB3D9TXYFN8t2Vgq3jmKhf
+\unrestrict iJDw5RMculR2UcZRxpcgXdNgy9TnFt18jIr6sWgzL2wOMBWyFKK9lKAdOGXlDMG
 

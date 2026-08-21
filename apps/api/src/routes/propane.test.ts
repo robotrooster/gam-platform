@@ -23,7 +23,6 @@ import { utilityRouter } from './utility'
 import { paymentsRouter } from './payments'
 import { errorHandler } from '../middleware/errorHandler'
 import { generateBillsForMeter } from '../services/utilityBilling'
-import { applyAcceleratedPropane } from '../services/propaneRedistribution'
 
 function buildApp() {
   const app = express()
@@ -432,9 +431,12 @@ describe('S609 POST /propane/deliveries', () => {
   // accelerated propane FIRST — the exact rent-supersession Nic ruled out:
   // "it's gonna apply the payment to the oldest charge, which would supersede
   // the rent, which would still end up letting the tenant acquire late fees."
-  // Acceleration is removed, so nothing marks an installment `accelerated` and
-  // the path is unreachable. services/propaneRedistribution is dead code kept
-  // only until it can be deleted deliberately — see the note in that file.
+  //
+  // S613: the service, its call in the settle webhook, its tenant notification
+  // and the `accelerated` column are all DELETED. Verified dead before cutting —
+  // nothing anywhere set the flag, so the query could never match. (The word
+  // also appears as a flex_deposit_plan_status value in flexsuiteAcceptance;
+  // that is a different column and was left alone.)
 
 })
 
@@ -593,5 +595,69 @@ describe('bulk propane tanks (S613)', () => {
       .set('Authorization', `Bearer ${f.tokenB}`)
       .send({ propertyId: f.propertyAId, unitIds: [] })
     expect(res.status).toBe(403)
+  })
+})
+
+// S613 (Nic): the delivery charge on a supplier's ticket. A fill priced purely
+// at gallons × price left the landlord absorbing the hazmat / fuel / per-stop
+// fee on every delivery.
+describe('propane delivery charge (S613)', () => {
+  it('splits the ticket fee across tanks by gallons, remainder on the last', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const u2 = await (async () => {
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const unitId = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
+        const tenantId = await seedTenant(c)
+        const leaseId = await seedLease(c, { unitId, landlordId: f.landlordAId, status: 'active' })
+        await seedLeaseTenant(c, { leaseId, tenantId })
+        await c.query(`UPDATE units SET has_propane_tank = true WHERE id = $1`, [unitId])
+        await c.query('COMMIT')
+        return unitId
+      } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    })()
+
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, pricePerGallon: 3, installments: 1,
+              deliveryCharge: 30, deliveryChargeSplit: 'gallons',
+              lines: [{ unitId: f.unitAId, gallons: 75 }, { unitId: u2, gallons: 25 }] })
+    expect(res.status).toBe(201)
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, gallons, delivery_fee_share, total_amount
+         FROM propane_fills ORDER BY gallons DESC`)
+    expect(rows).toHaveLength(2)
+    // 75 of 100 gallons carries 75% of the $30.
+    expect(Number(rows[0].delivery_fee_share)).toBe(22.50)
+    expect(Number(rows[1].delivery_fee_share)).toBe(7.50)
+    // The shares sum to the ticket exactly — the landlord passes on what he paid.
+    expect(Number(rows[0].delivery_fee_share) + Number(rows[1].delivery_fee_share)).toBe(30)
+    // And the fee is IN the tenant's total: 75 × $3 + $22.50.
+    expect(Number(rows[0].total_amount)).toBe(247.50)
+  })
+
+  it('splits evenly per tank when asked', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, pricePerGallon: 3, installments: 1,
+              deliveryCharge: 25, deliveryChargeSplit: 'even',
+              lines: [{ unitId: f.unitAId, gallons: 80 }] })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query<any>(`SELECT delivery_fee_share FROM propane_fills`)
+    expect(Number(rows[0].delivery_fee_share)).toBe(25)
+  })
+
+  it('no delivery charge → nothing added, as before', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await postFill(app, f, { unitId: f.unitAId, gallons: 50, pricePerGallon: 3, installments: 1 })
+    const { rows } = await db.query<any>(`SELECT delivery_fee_share, total_amount FROM propane_fills`)
+    expect(Number(rows[0].delivery_fee_share)).toBe(0)
+    expect(Number(rows[0].total_amount)).toBe(150)
   })
 })

@@ -1,0 +1,24 @@
+-- S613 (Nic, DIRECTIVE): "I think we actually need to scrap the person to
+-- person sale monitoring. We don't care. As long as the spot rent is paid, and
+-- as long as the person moving in signs a lease... thinking as a platform, I
+-- don't see any reason to track the sale unless eventually the platform does the
+-- financing and makes the interest."
+--
+-- S594 built resident-to-resident home sales as a RECORD-ONLY feature: GAM held
+-- the instalment schedule and a copy of the contract, moved no money, and
+-- flipped home ownership when the landlord marked the last payment. It earned
+-- GAM nothing and asked a landlord to keep a second set of books about a deal he
+-- is not party to. What the park actually needs from a resident-to-resident sale
+-- is already covered elsewhere: the new occupant signs a lease, the space rent
+-- is billed, and home_ownerships records who owns the home.
+--
+-- The condition that would bring it back, in Nic's words: "if we sell the home
+-- on behalf of tenant A to tenant B on payments, and then we hold title to the
+-- trailer while it's being paid" — i.e. when GAM is the lender and earns the
+-- interest. That is a different feature (a real loan book), not this one.
+--
+-- Both tables are EMPTY — checked before dropping, no landlord ever used it.
+-- The landlord→tenant financed sale (home_sale_contracts) is untouched: GAM
+-- bills those, and they are now limited to mobile homes.
+DROP TABLE IF EXISTS resident_home_sale_installments;
+DROP TABLE IF EXISTS resident_home_sales;

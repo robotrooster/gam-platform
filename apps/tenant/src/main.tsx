@@ -265,6 +265,9 @@ input,select,textarea{font-family:var(--font-b)}
 .card{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:20px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media(max-width:1100px){.grid4{grid-template-columns:1fr 1fr}}
+@media(max-width:600px){.grid4{grid-template-columns:1fr}}
 @media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
 .ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--b0)}
 .pt{font-family:var(--font-d);font-size:1.5rem;font-weight:800;color:var(--t0)}
@@ -636,6 +639,89 @@ const Q_INCOME_OPTIONS: { v: 'ssi'|'ssdi'|'other_fixed'|'none'; label: string }[
   { v: 'other_fixed', label: 'Other fixed day' }, { v: 'none', label: 'No / Neither' },
 ]
 
+/**
+ * S613 (Nic): the tenant's propane detail — "the price per gallon they're
+ * charged, the delivery date, the amount total of the fill, and how it was split
+ * into two or four payments... and then also have in that window the settings
+ * that the landlord has set for the property about the split, so they know what
+ * to be expecting if they get another fill."
+ *
+ * The split rules are the part a tenant could never work out on their own. Why
+ * 190 gallons became four payments and 60 became two is a property setting they
+ * have no other window onto, and not showing it is how a fill feels arbitrary.
+ */
+function PropaneLedgerModal({ data, onClose }: { data: any; onClose: () => void }) {
+  const r = data.splitRules
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 620, maxHeight: '85vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-t">Your propane</div>
+        <div style={{ fontSize: '.85rem', color: 'var(--t2)', marginBottom: 16, lineHeight: 1.6 }}>
+          {data.balance > 0
+            ? <>You still owe <strong style={{ color: 'var(--gold)' }}>{formatCurrency(data.balance)}</strong> across
+                {' '}{data.totalCount - data.paidCount} remaining payment{data.totalCount - data.paidCount === 1 ? '' : 's'}.
+                They ride your monthly invoice — nothing is charged at the time of a delivery.</>
+            : <>Nothing outstanding. Propane is billed on your monthly invoice after a delivery, never at the time of the fill.</>}
+        </div>
+
+        {data.fills.map((f: any) => (
+          <div key={f.id} style={{ border: '1px solid var(--b1)', borderRadius: 10, padding: 12, marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
+              <strong style={{ fontSize: '.92rem' }}>{Number(f.gallons)} gallons</strong>
+              <span style={{ fontSize: '.78rem', color: 'var(--t3)' }}>
+                delivered {String(f.fillDate).slice(0, 10)}
+              </span>
+            </div>
+            <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginTop: 4, lineHeight: 1.7 }}>
+              {Number(f.gallons)} gal × {formatCurrency(f.pricePerGallon)}/gal
+              {Number(f.taxAmount) > 0 && <> · tax {formatCurrency(f.taxAmount)}</>}
+              {Number(f.deliveryFeeShare) > 0 && <> · delivery charge {formatCurrency(f.deliveryFeeShare)}</>}
+              {' '}= <strong style={{ color: 'var(--t1)' }}>{formatCurrency(f.totalAmount)}</strong>
+              {f.installmentCount > 1 && <>, split into {f.installmentCount} payments</>}
+            </div>
+            <div style={{ marginTop: 8 }}>
+              {f.installments.map((i: any) => (
+                <div key={i.installmentNumber} style={{ display: 'flex', justifyContent: 'space-between',
+                                                          fontSize: '.78rem', padding: '3px 0' }}>
+                  <span style={{ color: 'var(--t3)' }}>
+                    {i.paid ? '✓' : '○'} Payment {i.installmentNumber} of {f.installmentCount}
+                    {i.gallons != null && <> · {Number(i.gallons)} gal</>}
+                    {' '}· {String(i.billingCycleMonth).slice(0, 7)}
+                  </span>
+                  <span className="mono" style={{ color: i.paid ? 'var(--t3)' : 'var(--t0)' }}>
+                    {formatCurrency(i.amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        {r && (
+          <div style={{ fontSize: '.78rem', color: 'var(--t3)', lineHeight: 1.7, borderTop: '1px solid var(--b1)', paddingTop: 12 }}>
+            <strong style={{ color: 'var(--t2)' }}>How your park splits a fill</strong><br />
+            {r.allowInstallments ? (
+              <>A fill of at least {r.twoPaymentMinGallons} gallons can be split into 2 payments, and
+                {' '}{r.fourPaymentMinGallons} gallons or more into 4. Smaller fills are billed on one invoice.
+                {' '}Each payment is a share of the GALLONS, so you can check it against your own tank.</>
+            ) : (
+              <>Your park bills a fill on the next invoice in one payment.</>
+            )}
+            {r.propertyPricePerGallon != null && (
+              <><br />Current price per gallon here: {formatCurrency(r.propertyPricePerGallon)} — a delivery is
+                priced at what the supplier charged that day, so it can differ.</>
+            )}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+          <button className="btn" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function QuestionnairePrompt() {
   const qc = useQueryClient()
   const { data: pending = [] } = useQuery<any[]>('tenant-questionnaires',
@@ -782,6 +868,10 @@ function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const { data: health } = useQuery<any>('tenant-payment-health', () => get<any>('/tenants/me/payment-health'))
+  // S613: this tenant's own propane — empty for almost everyone, which is why
+  // the card only appears when there is something to show.
+  const { data: propane } = useQuery<any>('tenant-propane', () => get<any>('/propane/mine'))
+  const [propaneOpen, setPropaneOpen] = useState(false)
   const flexVis = useFlexVisibility()
 
   return (
@@ -799,7 +889,12 @@ function HomePage() {
       {/* S542: private platform questionnaire — landlord never sees it. */}
       <QuestionnairePrompt />
 
-      <div className="grid3" style={{marginBottom:24}}>
+      {/* S613 (Nic): "I'd like it on the home page, but only visible if a unit
+          has the utility." A tenant with no propane sees the same three cards
+          they always saw; a tenant with a tank gets a fourth and the row tightens
+          to fit, rather than the page growing a section that is empty for most
+          people. */}
+      <div className={propane && propane.totalCount > 0 ? 'grid4' : 'grid3'} style={{marginBottom:24}}>
         <a href="/payments" style={{textDecoration:'none'}} className="kpi"
           onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
           onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
@@ -831,7 +926,23 @@ function HomePage() {
             <div className="kpi-s">{me?.flexDepositEnrolled ? 'FlexDeposit installments' : 'Paid in full'} →</div>
           </a>
         )}
+        {propane && propane.totalCount > 0 && (
+          <div className="kpi" style={{cursor:'pointer'}} onClick={()=>setPropaneOpen(true)}
+            onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+            onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
+            <div className="kpi-l">Propane</div>
+            <div className="kpi-v" style={{color: propane.balance > 0 ? 'var(--gold)' : undefined}}>
+              {formatCurrency(propane.balance)}
+            </div>
+            <div className="kpi-s">
+              {propane.paidCount} of {propane.totalCount} payments paid · tap for details →
+            </div>
+          </div>
+        )}
       </div>
+      {propaneOpen && propane && (
+        <PropaneLedgerModal data={propane} onClose={()=>setPropaneOpen(false)} />
+      )}
 
       {/* S595 (Nic): Payment Health heartbeat — the tenant's ON-TIME payment
           health as an animated ECG (mirrors the landlord dashboard monitor).

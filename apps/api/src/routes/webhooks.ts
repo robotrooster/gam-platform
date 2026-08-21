@@ -94,7 +94,6 @@ webhooksRouter.post('/stripe', async (req, res) => {
       const client = await getClient()
       let settledRows: { id: string; type: string }[] = []
       const supersedenceTransfers: { paymentId: string; transfers: PostCommitTransfer[]; residual: number; tenantId: string | null }[] = []
-      const propaneRedistributions: { tenantId: string; applied: number; rentRemainder: number; paymentAmount: number; propanePaymentIds: string[] }[] = []
       try {
         await client.query('BEGIN')
 
@@ -351,24 +350,12 @@ webhooksRouter.post('/stripe', async (req, res) => {
             })
           }
 
-          // S533: accelerated-propane priority — redirect this rent
-          // payment's funds to unpaid accelerated propane rows first
-          // (whole rows, oldest first) and split the rent row into a
-          // settled portion + pending remainder. LEDGER-ONLY: the funds
-          // sit on the platform rails (Connect balance) and reach the
-          // landlord solely via the Friday batch payout — this changes
-          // which obligations the money satisfies, never where it goes.
-          // Sits BEHIND supersedence (GAM-first) by running after it.
-          if (row.type === 'rent') {
-            try {
-              const { applyAcceleratedPropane } = await import('../services/propaneRedistribution')
-              const redis = await applyAcceleratedPropane(client, row as any)
-              if (redis) propaneRedistributions.push({ tenantId: row.tenant_id!, ...redis, paymentAmount: Number(row.amount) })
-            } catch (e) {
-              logger.error({ err: e, payment_id: row.id }, 'propane redistribution failed')
-              throw e // same posture as allocation: settle + ledger move together
-            }
-          }
+          // S613: the accelerated-propane priority that ran here is GONE, with
+          // the service and the column behind it. It applied a tenant's rent
+          // money to propane FIRST, which Nic ruled out when the propane model
+          // was rebuilt (S610): a refill never accelerates anything, it just
+          // adds future instalments. Nothing had set `accelerated` since, so the
+          // query could never match and this was a call into a no-op.
         }
 
         // S537: FIFO remittance settle — the covered rows were settled by
@@ -461,35 +448,6 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // never the borrower's). Lands on the landlord's Connect account,
       // funded from GAM platform balance (where the supersedence boost
       // landed). Residual amounts (boost > FIFO total) get an admin notification.
-      // S533 post-commit: tell the tenant exactly how their payment was
-      // applied when accelerated propane took priority over rent.
-      for (const r of propaneRedistributions) {
-        try {
-          const tenantUser = await query<{ user_id: string; email: string; landlord_id: string }>(
-            `SELECT t.user_id, u.email, p.landlord_id
-               FROM tenants t
-               JOIN users u ON u.id = t.user_id
-               JOIN payments p ON p.tenant_id = t.id
-              WHERE t.id = $1 LIMIT 1`, [r.tenantId])
-          if (tenantUser.length) {
-            const { createNotification } = await import('../services/notifications')
-            await createNotification({
-              userId: tenantUser[0].user_id,
-              landlordId: tenantUser[0].landlord_id,
-              type: 'propane_priority_applied',
-              title: 'How your payment was applied',
-              body: `Of your $${r.paymentAmount.toFixed(2)} payment, $${r.applied.toFixed(2)} was applied to your outstanding propane balance first; $${(r.paymentAmount - r.applied).toFixed(2)} went to rent. Remaining rent due: $${r.rentRemainder.toFixed(2)}.`,
-              actionUrl: '/payments',
-              sendEmail: true, emailTo: tenantUser[0].email,
-              emailSubject: 'How your payment was applied',
-              emailHtml: `Of your $${r.paymentAmount.toFixed(2)} payment, <b>$${r.applied.toFixed(2)}</b> was applied to your outstanding propane balance first; $${(r.paymentAmount - r.applied).toFixed(2)} went to rent. Remaining rent due: <b>$${r.rentRemainder.toFixed(2)}</b>.`,
-            })
-          }
-        } catch (e) {
-          logger.error({ err: e, tenant_id: r.tenantId }, 'propane redistribution notification failed')
-        }
-      }
-
       for (const entry of supersedenceTransfers) {
         for (const t of entry.transfers) {
           if (t.source !== 'flexcharge_statement') continue

@@ -47,6 +47,19 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     if (unit.dwelling_ownership !== 'landlord') {
       throw new AppError(409, 'This unit is already tenant-owned — there is no park-owned home to finance.')
     }
+    // S613 (Nic, DIRECTIVE): "Financed sales scope needs to be limited to
+    // converting park owned homes to tenant owned homes. We don't want it to be
+    // anything to do with RVs."
+    //
+    // The shape only makes sense for a HOME: the park owns a house sitting on
+    // its own lot, the household living in it buys it over time, and on payoff
+    // the dwelling flips to tenant-owned and the lot becomes space rent. An RV
+    // is towed away — there is nothing to convert, and financing one would make
+    // GAM the lender on a vehicle that can leave the property.
+    if (unit.unit_type !== 'mobile_home') {
+      throw new AppError(400,
+        'A financed sale converts a park-owned HOME to tenant-owned. It is only offered on mobile homes.')
+    }
     const lease = await queryOne<any>(`SELECT id, landlord_id, unit_id FROM leases WHERE id=$1`, [body.leaseId])
     if (!lease || lease.unit_id !== body.unitId) throw new AppError(400, 'Lease does not belong to this unit')
     // The buyer must be an active tenant on this lease — never trust an arbitrary

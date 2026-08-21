@@ -1,0 +1,20 @@
+-- S613 (Nic): "Delete all of the dead code everywhere. Make sure that it's
+-- actually dead, though, because I don't trust handoffs with information."
+--
+-- Verified before cutting rather than taken on the handoff's word:
+--   · nothing in the codebase ever SET propane_fill_installments.accelerated —
+--     the only reads were inside the dead service itself;
+--   · no row in the database has it true;
+--   · the one other appearance of the word is a flex_deposit_plan_status value
+--     in flexsuiteAcceptance, a different column entirely, left alone.
+--
+-- The behaviour it served — applying a tenant's rent money to propane FIRST —
+-- was ruled out when the propane model was rebuilt: a refill never accelerates
+-- anything, it adds future instalments that queue behind. With nothing setting
+-- the flag, services/propaneRedistribution was a call into a no-op on every
+-- settled rent payment.
+--
+-- Deleted together, as the S610 handoff said they had to be: the service, its
+-- call in the settle webhook, the tenant notification that explained a
+-- redistribution that can no longer happen, and this column.
+ALTER TABLE propane_fill_installments DROP COLUMN IF EXISTS accelerated;

@@ -91,6 +91,90 @@ const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
 // Removing a tank never touches money already owed — instalments on propane
 // already delivered keep billing. It only stops the space being offered on
 // Record Delivery.
+// GET /api/propane/mine — S613 (Nic): the TENANT's own propane ledger.
+//
+// "Just have a tenant facing propane ledger... showing a balance there and
+//  showing two of four payments paid... make it clickable to open a little
+//  window with all the details — the price per gallon they're charged, the
+//  delivery date, the amount total of the fill, and how it was split into two or
+//  four payments — and then also have in that window the settings that the
+//  landlord has set for the property about the split, so they know what to be
+//  expecting if they get another fill."
+//
+// Everything the tenant is owed an explanation for, in the order they'd ask:
+// what do I still owe, how many payments are left, what was each delivery, and
+// what will happen next time. The landlord's split rules are included precisely
+// because the tenant cannot otherwise know why 190 gallons became four payments
+// and 60 became two.
+propaneRouter.get('/mine', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const tenantId = req.user!.profileId
+
+    const fills = await query<any>(
+      `SELECT f.id, f.fill_date, f.gallons, f.price_per_gallon, f.total_amount,
+              f.installment_count, f.tax_amount, f.tax_rate_pct, f.delivery_fee_share,
+              u.unit_number,
+              p.propane_allow_installments, p.propane_split_min_gallons,
+              p.propane_split_four_min_gallons,
+              (SELECT rate_per_unit FROM property_utility_rates r
+                WHERE r.property_id = p.id AND r.utility_type = 'propane') AS property_price_per_gallon
+         FROM propane_fills f
+         JOIN units u ON u.id = f.unit_id
+         JOIN properties p ON p.id = f.property_id
+        WHERE f.tenant_id = $1
+        ORDER BY f.fill_date DESC, f.created_at DESC
+        LIMIT 24`,
+      [tenantId])
+
+    const ids = fills.map((f: any) => f.id)
+    const installments = ids.length ? await query<any>(
+      `SELECT i.fill_id, i.installment_number, i.amount, i.gallons, i.billing_cycle_month,
+              (i.payment_id IS NOT NULL AND pm.status IN ('settled','paid_via_deposit')) AS paid
+         FROM propane_fill_installments i
+         LEFT JOIN payments pm ON pm.id = i.payment_id
+        WHERE i.fill_id = ANY($1::uuid[])
+        ORDER BY i.fill_id, i.installment_number`,
+      [ids]) : []
+
+    const byFill = new Map<string, any[]>()
+    for (const i of installments) {
+      if (!byFill.has(i.fill_id)) byFill.set(i.fill_id, [])
+      byFill.get(i.fill_id)!.push(i)
+    }
+
+    const detailed = fills.map((f: any) => {
+      const list = byFill.get(f.id) ?? []
+      return {
+        ...f,
+        installments: list,
+        paid_count: list.filter((i: any) => i.paid).length,
+        balance_remaining: Math.round(
+          list.filter((i: any) => !i.paid).reduce((n: number, i: any) => n + Number(i.amount), 0) * 100) / 100,
+      }
+    })
+
+    // The headline the KPI card shows: everything still to pay across every
+    // fill, and progress across them all — "3 of 8" reads right whether that is
+    // one fill or a second delivery stacked behind the first.
+    const allInst = detailed.flatMap((f: any) => f.installments)
+    const settings = fills[0] ?? null
+    res.json({ success: true, data: {
+      balance: Math.round(
+        allInst.filter((i: any) => !i.paid).reduce((n: number, i: any) => n + Number(i.amount), 0) * 100) / 100,
+      paidCount: allInst.filter((i: any) => i.paid).length,
+      totalCount: allInst.length,
+      fills: detailed,
+      splitRules: settings ? {
+        allowInstallments:  settings.propane_allow_installments,
+        twoPaymentMinGallons:  Number(settings.propane_split_min_gallons),
+        fourPaymentMinGallons: Number(settings.propane_split_four_min_gallons),
+        propertyPricePerGallon: settings.property_price_per_gallon,
+      } : null,
+    } })
+  } catch (e) { next(e) }
+})
+
 propaneRouter.put('/tanks', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const body = z.object({
@@ -196,6 +280,12 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       propertyId:     z.string().uuid(),
       // One price for the whole delivery — it is what the invoice charged.
       pricePerGallon: z.number().nonnegative().max(999),
+      // S613: the ticket's delivery charge (hazmat / fuel surcharge / per stop),
+      // passed through to the tanks on this run. Suppliers bill it per STOP, so
+      // pro-rata by gallons is the normal split; even-per-tank is the other
+      // common treatment and some parks prefer it. Omitted = nothing to pass on.
+      deliveryCharge: z.number().nonnegative().max(100000).optional(),
+      deliveryChargeSplit: z.enum(['gallons', 'even']).default('gallons'),
       installments:   z.number().int().refine(n => [1, 2, 4].includes(n), 'installments must be 1, 2, or 4').default(1),
       lines: z.array(z.object({
         unitId:  z.string().uuid(),
@@ -249,11 +339,30 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
         prepared.push({ unit: unit.rows[0], leaseId, tenantId, gallons: line.gallons })
       }
 
+      // S613: split the ticket's delivery charge across the tanks on this run.
+      // The LAST tank carries the rounding remainder, the same posture the
+      // gallons split uses, so the shares sum to the ticket exactly and the
+      // landlord passes on what he was charged — no more, no less.
+      const fee = body.deliveryCharge ?? 0
+      const totalGal = prepared.reduce((n, p) => n + p.gallons, 0)
+      const feeShares = prepared.map((p, i) => {
+        if (fee <= 0 || prepared.length === 0) return 0
+        if (i === prepared.length - 1) return 0   // filled in below
+        return body.deliveryChargeSplit === 'even'
+          ? Math.round((fee / prepared.length) * 100) / 100
+          : Math.round((totalGal > 0 ? fee * (p.gallons / totalGal) : 0) * 100) / 100
+      })
+      if (fee > 0 && prepared.length > 0) {
+        feeShares[prepared.length - 1] =
+          Math.round((fee - feeShares.slice(0, -1).reduce((n, v) => n + v, 0)) * 100) / 100
+      }
+
       const fills = []
       for (const [i, p] of prepared.entries()) {
         fills.push(await recordFill(client, {
           unit: p.unit, leaseId: p.leaseId, tenantId: p.tenantId,
           gallons: p.gallons, pricePerGallon: body.pricePerGallon,
+          deliveryFeeShare: feeShares[i],
           installments: body.installments, createdByUserId: req.user!.userId,
           // The key marks the delivery; only the first line carries it, which is
           // enough for the repeat-submit check above.
@@ -266,6 +375,7 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
         fills,
         tanks: fills.length,
         totalGallons: Math.round(totalGallons * 100) / 100,
+        deliveryCharge: Math.round((body.deliveryCharge ?? 0) * 100) / 100,
         totalAmount: Math.round(fills.reduce((s, f) => s + Number(f.total_amount), 0) * 100) / 100,
       } })
     } catch (e) {

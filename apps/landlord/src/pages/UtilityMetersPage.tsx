@@ -832,6 +832,9 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
     .filter((f: any) => f.unitId === unitId)
     .reduce((sum: number, f: any) => sum + Number(f.balanceRemaining || 0), 0)
   const [installments, setInstallments] = useState(1)
+  // S613: the ticket's delivery charge — hazmat, fuel surcharge, per-stop fee.
+  const [deliveryCharge, setDeliveryCharge] = useState('')
+  const [feeSplit, setFeeSplit] = useState<'gallons' | 'even'>('gallons')
   const [clientKey] = useState(() => crypto.randomUUID())
   const { data: taxRates = [] } = useQuery<any[]>(
     ['utility-tax-rates', propertyId], () => apiGet(`/utility/tax-rates?propertyId=${propertyId}`))
@@ -846,7 +849,10 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
   const totalGallons = lines.reduce((s, l) => s + l.gallons, 0)
   const subtotal = Math.round(totalGallons * (Number(ppg) || 0) * 100) / 100
   const tax = Math.round(subtotal * taxPct) / 100
-  const total = Math.round((subtotal + tax) * 100) / 100
+  // The delivery charge rides on top of the taxed fuel — the propane tax is a
+  // fuel tax on the gallons, not on a per-stop fee.
+  const fee = Math.round((Number(deliveryCharge) || 0) * 100) / 100
+  const total = Math.round((subtotal + tax + fee) * 100) / 100
 
   // Splits are gated by the SMALLEST tank on the delivery — every fill on it is
   // recorded with the same installment count, so the tightest line governs.
@@ -856,6 +862,7 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
 
   const mut = useMutation(
     () => apiPost('/propane/deliveries', {
+      ...(fee > 0 ? { deliveryCharge: fee, deliveryChargeSplit: feeSplit } : {}),
       propertyId, pricePerGallon: Number(ppg), installments, lines, clientKey,
     }),
     { onSuccess: onClose,
@@ -918,6 +925,37 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
         </div>
         )}
 
+        {/* S613 (Nic left the call to me): a supplier's ticket carries a
+            hazmat / fuel / per-stop charge, and a fill priced purely at
+            gallons × price left the landlord absorbing it on every delivery.
+            Suppliers bill it per STOP, so pro-rata by gallons is the normal
+            pass-through; even-per-tank is the other common treatment. Which is
+            fair is the landlord's call and his state's — so both, not one. */}
+        <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+          <div>
+            <label style={lbl}>Delivery charge on the ticket (optional)</label>
+            <input className="input" type="text" inputMode="decimal" placeholder="e.g. 35.00"
+              value={deliveryCharge} style={{ width: 150 }}
+              onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d{0,2}$/.test(v)) setDeliveryCharge(v) }} />
+          </div>
+          {fee > 0 && lines.length > 1 && (
+            <div>
+              <label style={lbl}>Split it</label>
+              <select className="input" value={feeSplit} style={{ width: 190 }}
+                onChange={e => setFeeSplit(e.target.value as 'gallons' | 'even')}>
+                <option value="gallons">by gallons delivered</option>
+                <option value="even">evenly per tank</option>
+              </select>
+            </div>
+          )}
+          {fee > 0 && (
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', flexBasis: '100%', lineHeight: 1.5 }}>
+              Passed on to the {lines.length === 1 ? 'tank' : `${lines.length} tanks`} on this delivery, and
+              included in the payments below. Untaxed — the propane tax applies to the fuel.
+            </div>
+          )}
+        </div>
+
         {allowSplits && splitOpts.length > 1 && (
           <div style={{ marginTop: 12 }}>
             <label style={lbl}>Split each tank&apos;s charge into</label>
@@ -941,6 +979,11 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
           {taxPct > 0 && (
             <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-3)', marginTop: 3, fontSize: '.74rem' }}>
               <span>Tax ({taxPct}%)</span><span className="mono">{fmt(tax)}</span>
+            </div>
+          )}
+          {fee > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-3)', marginTop: 3, fontSize: '.74rem' }}>
+              <span>Delivery charge</span><span className="mono">{fmt(fee)}</span>
             </div>
           )}
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, color: 'var(--text-0)', marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border-1)' }}>

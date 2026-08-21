@@ -106,6 +106,8 @@ export async function recordFill(
     installments: number
     createdByUserId: string
     clientKey?: string | null
+    /** S613: this tank's share of the ticket's delivery charge. Untaxed. */
+    deliveryFeeShare?: number
   },
 ): Promise<any> {
   const { unit } = args
@@ -118,7 +120,11 @@ export async function recordFill(
   const taxRatePct = Number(taxRow.rows[0]?.tax_rate_pct || 0)
   const subtotal = Math.round(args.gallons * args.pricePerGallon * 100) / 100
   const taxAmount = Math.round(subtotal * taxRatePct) / 100
-  const total = Math.round((subtotal + taxAmount) * 100) / 100
+  // S613: the delivery charge rides on TOP of the taxed fuel. The propane tax
+  // rate is a fuel tax on the gallons — applying it to a hazmat or per-stop fee
+  // would invent a tax the landlord never configured.
+  const deliveryFee = Math.round((args.deliveryFeeShare ?? 0) * 100) / 100
+  const total = Math.round((subtotal + taxAmount + deliveryFee) * 100) / 100
 
   // S609 (Nic): THE SPLIT IS IN GALLONS. "If it's a hundred and ninety gallons,
   // you do three forty-eights and then a forty-six." Even gallons to the nearest
@@ -146,11 +152,11 @@ export async function recordFill(
     `INSERT INTO propane_fills
        (property_id, landlord_id, unit_id, lease_id, tenant_id, gallons,
         price_per_gallon, total_amount, installment_count, created_by_user_id,
-        tax_rate_pct, tax_amount, client_key)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        tax_rate_pct, tax_amount, client_key, delivery_fee_share)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
     [unit.property_id, unit.landlord_id, unit.id, args.leaseId, args.tenantId,
      args.gallons, args.pricePerGallon, total, args.installments, args.createdByUserId,
-     taxRatePct, taxAmount, args.clientKey ?? null])
+     taxRatePct, taxAmount, args.clientKey ?? null, deliveryFee])
   const fillId = fill.rows[0].id
 
   // S609 (Nic): NOTHING BILLS IMMEDIATELY. "All decided before any money moves."
