@@ -1532,7 +1532,17 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '.74rem', background: 'var(--bg-2)', border: `1px solid ${excluded ? 'var(--gold)' : 'var(--border-0)'}`, borderRadius: 6, padding: '2px 6px' }}>
                 {unitLabel(uid)}
                 {isMaster && <span style={{ fontSize: '.6rem', color: excluded ? 'var(--gold)' : 'var(--text-3)' }}>{excluded ? '🔌 submetered' : 'splits'}</span>}
-                <X size={11} style={{ cursor: 'pointer', color: 'var(--text-3)' }} onClick={() => unassign.mutate({ id: m.id, unitId: uid })} />
+                {/* S613 (Nic): "There's a little spot to x out what unit it's
+                    linked to. If I click that out, I can reassign it to a
+                    different spot. That button shouldn't be there at all."
+                    Right — a SUBMETER is one meter on one space, physically. Its
+                    readings ARE that space's usage, so re-pointing it would hand
+                    one household's consumption to another's bill, and a stray
+                    click could do it. A master's or a flat charge's unit list is
+                    a real membership question and keeps its X. */}
+                {!isSubmeter && (
+                  <X size={11} style={{ cursor: 'pointer', color: 'var(--text-3)' }} onClick={() => unassign.mutate({ id: m.id, unitId: uid })} />
+                )}
               </span>
             )
           })}
@@ -1595,27 +1605,46 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   // lose the cycle anyway. Backdating matters — the opening read must predate
   // the reads it enables, so the date is editable and defaults to the 1st of
   // the current month rather than today.
+  // S613 (Nic): the same control ADDS an opening read and CORRECTS one.
+  //
+  //   "I just fat fingered an opening meter read. I need a way to edit it."
+  //
+  // The first pass put the correction on the unit page only — but the reading
+  // walk happens HERE, meter by meter, which is where the typo gets made and
+  // where it has to be fixable. It prefills the number on record, because you
+  // have to see the wrong one to know which digit you hit.
   function BaselineFixer({ m }: { m: any }) {
+    const existing = m.openingRead ?? null
     const [open, setOpen] = useState(false)
-    const [value, setValue] = useState('')
-    const [date, setDate] = useState(() => new Date().toISOString().slice(0, 8) + '01')
+    const [value, setValue] = useState(existing ? String(Number(existing.value)) : '')
+    const [date, setDate] = useState(() =>
+      existing?.date ? String(existing.date).slice(0, 10) : new Date().toISOString().slice(0, 8) + '01')
     const [err, setErr] = useState('')
     const save = useMutation(
-      () => apiPost(`/utility/meters/${m.id}/readings`, {
-        readingValue: Number(value), readingDate: date,
-        billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
-      }),
+      () => existing
+        ? apiPatch(`/utility/meters/${m.id}/readings/${existing.id}`, {
+            readingValue: Number(value), readingDate: date,
+          })
+        : apiPost(`/utility/meters/${m.id}/readings`, {
+            readingValue: Number(value), readingDate: date,
+            billingCycleMonth: date.slice(0, 7) + '-01', reason: 'baseline',
+          }),
       { onSuccess: () => { setOpen(false); onChanged() },
         onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save the opening read') },
     )
     return (
       <div style={{ marginTop: 6 }}>
-        <div style={{ fontSize: '.72rem', color: 'var(--red)', lineHeight: 1.5 }}>
-          Will not bill — usage is the difference between two reads and this meter has none yet.
-        </div>
+        {!existing && (
+          <div style={{ fontSize: '.72rem', color: 'var(--red)', lineHeight: 1.5 }}>
+            Will not bill — usage is the difference between two reads and this meter has none yet.
+          </div>
+        )}
         {!open ? (
-          <button className="btn btn-primary btn-sm" style={{ marginTop: 6 }} onClick={() => setOpen(true)}>
-            <Plus size={13} /> Add opening read
+          <button className={`btn btn-sm ${existing ? 'btn-ghost' : 'btn-primary'}`} style={{ marginTop: 6 }}
+            onClick={() => setOpen(true)}>
+            {existing
+              ? <>Opened at <span className="mono" style={{ color: 'var(--text-1)' }}>{Number(existing.value)}</span> <Pencil size={11} /></>
+              : <><Plus size={13} /> Add opening read</>}
           </button>
         ) : (
           <div style={{ marginTop: 6 }}>
@@ -1660,7 +1689,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
               {methodLabel(m)}
               {m.outOfService && <> · billed from the lowest comparable spot until repaired</>}
             </div>
-            {m.hasBaseline === false && <BaselineFixer m={m} />}
+            {(m.hasBaseline === false || m.openingRead) && <BaselineFixer m={m} />}
           </div>
           {m.billingMethod === 'submeter' && (
             <button className="btn btn-ghost btn-sm" title={m.outOfService ? 'Mark repaired' : 'Mark broken — bills from comparable spots'}
