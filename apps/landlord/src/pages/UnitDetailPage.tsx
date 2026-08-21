@@ -406,7 +406,7 @@ export function UnitDetailPage() {
                       about that unit is in one place, in the order you set it up:
                       details, then meters, then features. */}
                   <div style={{ marginTop: 8, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
-                    <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} embedded />
+                    <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} embedded />
                   </div>
                   {/* S609 (Nic): the per-unit inspection features are hidden on RV
                       SPOTS — "those should just go away, it's just extra clutter",
@@ -493,7 +493,7 @@ export function UnitDetailPage() {
                   settings are locked, but its meters still need adding and
                   reading. Same section, same place on the card either way. */}
               <div style={{ marginTop: 10, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
-                <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} embedded />
+                <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} embedded />
               </div>
             </>
           )}
@@ -907,8 +907,8 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
 // submeter is (one unit, one utility, an opening read). They share the same
 // endpoint, which is what keeps them honest — if that ever forks, consolidate
 // on one screen rather than maintaining two.
-function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
-  unitId: string; propertyId: string; unitNumber: string
+function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedded }: {
+  unitId: string; propertyId: string; unitNumber: string; hasPropaneTank: boolean
   /** S609: rendered INSIDE the Unit Details card — drop the card chrome so it
    *  reads as a section of that form rather than a card nested in a card. */
   embedded?: boolean
@@ -1024,12 +1024,23 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
 
   return (
     <div className={embedded ? '' : 'card'} style={embedded ? undefined : { marginTop: 16 }}>
+      {/* S613 (Nic, DIRECTIVE): "All those things should be selectable in the
+          same spot even though it's not always a meter, but it could be a RUBS
+          thing. Propane could be RUBS, trash could be RUBS. So all of those
+          things need to all be in the utilities workflow."
+
+          One section, one question per utility: what does this space have? The
+          answer happens to be a submeter for electric, a flat charge for trash
+          and a tank for propane, but that is the mechanism, not the question. It
+          used to be three separate blocks organised by mechanism, so "does this
+          unit have propane" had no home at all. */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         {embedded
-          ? <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Sub-meters</div>
-          : <h3 style={{ fontSize: '.9rem', margin: 0 }}>Sub-meters</h3>}
+          ? <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Utilities on this unit</div>
+          : <h3 style={{ fontSize: '.9rem', margin: 0 }}>Utilities on this unit</h3>}
         <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add Meter'}</button>
       </div>
+      <PropaneTankRow unitId={unitId} propertyId={propertyId} hasTank={hasPropaneTank} />
       {mine.length === 0 && !adding && (
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
           No sub-meters on this unit. Metered utilities bill the tenant through the monthly reading run; sewer bills off the water reading as part of the same line item.
@@ -1118,7 +1129,6 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
               ))}
             </div>
           )}
-          <UnitPropaneRow unitId={unitId} propertyId={propertyId} />
       </div>
       {mine.map((m: any) => (
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6 }}>
@@ -1174,49 +1184,87 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, embedded }: {
   )
 }
 
-// S613 (Nic): "There's nothing that shows a tank being linked to that unit. And
-// when there isn't propane for that unit, that message shouldn't even be there.
-// You're just having things there that aren't applicable."
+// S613 (Nic): "Filling the tank for propane is an event, but you need to link
+// which units even HAVE tanks to be filled so that you can record the event in
+// the first place."
 //
-// What stood here was a paragraph of instructions on every unit in the country,
-// propane or not, explaining that propane has no meter and where to record a
-// delivery. Both true and neither any use on a space that has never had a drop.
+// This is that link, and it sits with the submeters and flat charges on purpose:
+// "all those things should be selectable in the same spot even though it's not
+// always a meter." A tank is not a meter — nobody reads it, and propane bills
+// off deliveries rather than the monthly reading run — but the QUESTION is the
+// same question, so it belongs in the same list.
 //
-// A unit's propane IS its fills — there is no tank record to link, because a
-// fill is an event against the unit, not a device. So this shows what the unit
-// actually has: its last delivery and what it still owes on the schedule. No
-// fills, no section.
-function UnitPropaneRow({ unitId, propertyId }: { unitId: string; propertyId: string }) {
+// Marking a tank is what puts the space on the Record Delivery form. Before
+// this, that form listed every unit at the property and asked for gallons on
+// each: thirty rows at Oak Park for the few that actually have one.
+//
+// A unit with a tank also shows what it has: last delivery, and what is still to
+// bill on the schedule. A unit without one, on a property that does no propane
+// at all, shows nothing.
+function PropaneTankRow({ unitId, propertyId, hasTank }: {
+  unitId: string; propertyId: string; hasTank: boolean
+}) {
+  const qc = useQueryClient()
+  const { can } = usePerms()
   const { data: fills = [] } = useQuery<any[]>(
     ['unit-propane', unitId],
     () => apiGet(`/propane/fills?propertyId=${propertyId}&unitId=${unitId}`),
-    { enabled: !!propertyId }
+    { enabled: !!propertyId },
   )
-  const rows = fills as any[]
-  if (rows.length === 0) return null
+  // Does this PROPERTY do propane at all? A rate, a delivery, or a propane meter
+  // are each a yes. On a downtown apartment building all three are no and the
+  // row never appears — the complaint that started this was a propane paragraph
+  // printed on units that will never see a tank.
+  const { data: rates = [] } = useQuery<any[]>(
+    ['utility-property-rates', propertyId],
+    () => apiGet(`/utility/property-rates?propertyId=${propertyId}`),
+    { enabled: !!propertyId },
+  )
+  const doesPropane = hasTank
+    || (fills as any[]).length > 0
+    || (rates as any[]).some((r: any) => r.utilityType === 'propane')
 
+  const setTank = useMutation(
+    (on: boolean) => apiPatch(`/units/${unitId}/details`, { hasPropaneTank: on }),
+    {
+      onSuccess: () => qc.invalidateQueries(['unit', unitId]),
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change that'),
+    },
+  )
+
+  if (!doesPropane) return null
+
+  const rows = fills as any[]
   const last = rows[0]
   const owed = rows.reduce((n, f) => n + Number(f.balanceRemaining ?? 0), 0)
   const money = (v: any) => `$${Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
   return (
-    <div style={{ marginTop: 12 }}>
-      <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>
-        Propane
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
-                    borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem', flexWrap: 'wrap' }}>
-        <span style={{ fontWeight: 600 }}>🔥 {Number(last.gallons)} gal</span>
+    <div style={{ marginBottom: 10 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                      borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem',
+                      cursor: can('schedule.configure_unit') && !setTank.isLoading ? 'pointer' : 'default' }}>
+        <input type="checkbox" checked={hasTank}
+          disabled={!can('schedule.configure_unit') || setTank.isLoading}
+          onChange={e => setTank.mutate(e.target.checked)} />
+        <span style={{ fontWeight: 600 }}>🛢️ Propane tank</span>
         <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-          filled {String(last.fillDate).slice(0, 10)} at {money(last.pricePerGallon)}/gal
+          {hasTank ? 'this space has a tank — it appears on Record Delivery'
+                   : 'no tank here — not offered on Record Delivery'}
         </span>
-        <span style={{ marginLeft: 'auto', fontSize: '.72rem', color: owed > 0 ? 'var(--gold)' : 'var(--text-3)' }}>
-          {owed > 0 ? `${money(owed)} still to bill` : 'paid off'}
-        </span>
-      </div>
-      {rows.length > 1 && (
-        <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 4 }}>
-          {rows.length} fills on record.
+      </label>
+      {hasTank && last && (
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '5px 0 0 10px', lineHeight: 1.6 }}>
+          Last filled {String(last.fillDate).slice(0, 10)} — {Number(last.gallons)} gal at {money(last.pricePerGallon)}/gal
+          {owed > 0
+            ? <span style={{ color: 'var(--gold)' }}> · {money(owed)} still to bill</span>
+            : <span> · nothing outstanding</span>}
+          {rows.length > 1 && ` · ${rows.length} fills on record`}
+        </div>
+      )}
+      {hasTank && !last && (
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '5px 0 0 10px' }}>
+          No deliveries recorded yet.
         </div>
       )}
     </div>

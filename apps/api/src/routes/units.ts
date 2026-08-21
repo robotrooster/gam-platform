@@ -559,6 +559,11 @@ export const UNIT_CLONE_COPIED = [
   // tenants. (Status itself still resets to vacant; this is a fact about the
   // household preserved, not an occupancy state carried over.)
   'owner_household_size',
+  // S613: the propane tank is bolted to the space, and retire-and-replace is
+  // that same space under a new number. Left uncopied, the replacement would
+  // drop off the Record Delivery form and the next fill would have nowhere to
+  // go — the renumbering would silently un-plumb the site.
+  'has_propane_tank',
 ] as const
 
 /**
@@ -966,6 +971,10 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
       lotRentAmount:   z.number().min(0).optional(),
       // S609: household size for an OWNER-OCCUPIED unit — see the migration.
       ownerHouseholdSize: z.number().int().min(1).max(30).optional(),
+      // S613 (Nic): does this space have a propane tank to fill. Set in the same
+      // place as its submeters and flat charges — "all those things should be
+      // selectable in the same spot even though it's not always a meter."
+      hasPropaneTank:  z.boolean().optional(),
       nightlyRate:     z.number().min(0).nullable().optional(),
       weeklyRate:      z.number().min(0).nullable().optional(),
       monthlyRate:     z.number().min(0).nullable().optional(),
@@ -1072,13 +1081,14 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
         lot_rent_amount=$14, nightly_rate=$15, weekly_rate=$16, monthly_rate=$17,
         is_bookable=$18, lease_types_allowed=$19::text[], floor_level=$21,
         living_areas=$22, features=$23::jsonb,
-        owner_household_size=COALESCE($24, owner_household_size), updated_at=NOW()
+        owner_household_size=COALESCE($24, owner_household_size),
+        has_propane_tank=COALESCE($25, has_propane_tank), updated_at=NOW()
       WHERE id=$20 RETURNING *`,
       [unitType, bedrooms, bathrooms, sqft, rentAmount, securityDeposit, dwellingOwnership,
        isMultiLevel, isAdaAccessible, occupancyMode, rvLayout, rvAmp, storageSize,
        lotRentAmount, nightlyRate, weeklyRate, monthlyRate, isBookable, leaseTypesAllowed,
        req.params.id, floorLevel, livingAreas, JSON.stringify(features),
-       body.ownerHouseholdSize ?? null])
+       body.ownerHouseholdSize ?? null, body.hasPropaneTank ?? null])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

@@ -711,6 +711,17 @@ export async function generateBillsForMeter(
       reason: 'master usage total awaiting double-check — no bills until resolved' }
   }
 
+  // S613: everything below is the RUBS path, and it used to be reached by
+  // FALLING OFF the end of the submeter branch — "not master, not flat, not
+  // submeter" was treated as RUBS. That is fine for the four methods that exist
+  // and a trap for the fifth: any method added to the enum without its own
+  // branch would silently start splitting a pool across units. Say it out loud
+  // instead, so an unhandled method reports itself rather than billing.
+  if (meter.billing_method !== 'rubs') {
+    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+      reason: `unsupported billing method "${meter.billing_method}" — nothing billed` }
+  }
+
   const masterUsage = Number(cycleReading.reading_value)
   // S607 (Nic, DIRECTIVE): `bill_amount` masters divide the provider's ACTUAL
   // dollar charge instead of pricing usage at a rate we chose. Nic: "you're

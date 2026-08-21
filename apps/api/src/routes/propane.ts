@@ -71,6 +71,7 @@ propaneRouter.get('/fills', requirePerm('units.edit', 'units.view_status', 'prop
 })
 
 const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
+              u.has_propane_tank,
               p.propane_allow_installments,
               p.propane_split_min_gallons, p.propane_split_four_min_gallons`
 

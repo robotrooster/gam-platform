@@ -64,6 +64,10 @@ async function seed(): Promise<Fixture> {
     const tenantA = await seedTenant(c)
     const leaseA = await seedLease(c, { unitId: unitA, landlordId: aId, status: 'active' })
     await seedLeaseTenant(c, { leaseId: leaseA, tenantId: tenantA })
+    // S613: a fill presupposes a tank — the space has to be marked as having one
+    // before the delivery form will offer it, so the tenanted unit carries one.
+    // `vacant` deliberately does NOT, which is what the no-tank cases exercise.
+    await c.query(`UPDATE units SET has_propane_tank = true WHERE id = $1`, [unitA])
     await c.query('COMMIT')
     const sign = (p: object) => jwt.sign(p, process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
@@ -300,6 +304,8 @@ describe('S609 POST /propane/deliveries', () => {
       const tenantId = await seedTenant(c)
       const leaseId = await seedLease(c, { unitId, landlordId: f.landlordAId, status: 'active' })
       await seedLeaseTenant(c, { leaseId, tenantId })
+      // S613: a space only takes a delivery once it is marked as having a tank.
+      await c.query(`UPDATE units SET has_propane_tank = true WHERE id = $1`, [unitId])
       await c.query('COMMIT')
       return unitId
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
@@ -350,6 +356,10 @@ describe('S609 POST /propane/deliveries', () => {
   it('ALL OR NOTHING — one bad line records nothing', async () => {
     // Transcribing one invoice must not leave some tanks in and some out.
     const f = await seed()
+    // S613: give the vacant space a tank so this still fails for the reason it
+    // was written to test — the missing LEASE, not the missing tank (which the
+    // S613 block below covers on its own).
+    await db.query(`UPDATE units SET has_propane_tank = true WHERE id = $1`, [f.vacantUnitId])
     const res = await postDelivery(buildApp(), f, {
       propertyId: f.propertyAId, pricePerGallon: 3,
       lines: [
@@ -502,5 +512,39 @@ describe('GET /api/propane/fills?unitId — S613 unit filter', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(other.status).toBe(200)
     expect(other.body.data).toHaveLength(0)
+  })
+})
+
+// S613 (Nic): "You need to link which units even HAVE tanks to be filled so that
+// you can record the event in the first place." A fill against a space with no
+// tank on record is refused, and says where to mark it.
+describe('propane tanks are declared on the unit (S613)', () => {
+  it('refuses a fill on a unit with no tank, and names the fix', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await db.query(`UPDATE units SET has_propane_tank = false WHERE id = $1`, [f.unitAId])
+    const res = await postFill(app, f, { unitId: f.unitAId, gallons: 50, pricePerGallon: 3, installments: 1 })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no propane tank on record/i)
+    expect(res.body.error).toMatch(/unit/i)
+  })
+
+  it('a delivery is refused whole when one line has no tank — nothing is written', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, pricePerGallon: 3, installments: 1,
+              lines: [{ unitId: f.unitAId, gallons: 40 }, { unitId: f.vacantUnitId, gallons: 40 }] })
+    expect(res.status).toBe(400)
+    const fills = await db.query(`SELECT id FROM propane_fills WHERE unit_id = $1`, [f.unitAId])
+    expect(fills.rows).toHaveLength(0)
+  })
+
+  it('a marked tank takes a fill normally', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const ok = await postFill(app, f, { unitId: f.unitAId, gallons: 60, pricePerGallon: 3, installments: 1 })
+    expect(ok.status).toBe(201)
   })
 })

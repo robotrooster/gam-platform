@@ -813,6 +813,9 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
     ['utility-tax-rates', propertyId], () => apiGet(`/utility/tax-rates?propertyId=${propertyId}`))
   const taxPct = Number((taxRates as any[]).find((r: any) => r.utilityType === 'propane')?.taxRatePct || 0)
 
+  // S613: a tank is a fact about the space, recorded on the unit alongside its
+  // submeters. Only those spaces can take a delivery.
+  const tankUnits = (units as any[]).filter((u: any) => u.hasPropaneTank)
   const lines = Object.entries(gallonsBy)
     .map(([unitId, g]) => ({ unitId, gallons: Number(g) || 0 }))
     .filter(l => l.gallons > 0)
@@ -857,9 +860,21 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
           )}
         </div>
 
+        {/* S613 (Nic): ONLY the spaces that actually have a tank. "You need to
+            link which units even have tanks to be filled so that you can record
+            the event in the first place." This listed every unit at the property
+            and asked for gallons on each — thirty rows at Oak Park for the few
+            with a tank, and no way to tell which were which. */}
         <label style={lbl}>Gallons per tank</label>
+        {tankUnits.length === 0 ? (
+          <div style={{ marginTop: 4, padding: '12px 14px', borderRadius: 8, background: 'var(--bg-2)',
+                        fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+            No spaces are marked as having a propane tank yet. Open a unit and tick
+            <strong> Propane tank</strong> under Utilities — that is what puts it on this form.
+          </div>
+        ) : (
         <div style={{ maxHeight: 280, overflowY: 'auto', border: '1px solid var(--border-1)', borderRadius: 8, marginTop: 4 }}>
-          {units.map((u: any) => (
+          {tankUnits.map((u: any) => (
             <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 10px',
                                      borderBottom: '1px solid var(--border-1)' }}>
               <span style={{ fontSize: '.82rem', color: 'var(--text-1)', flex: 1 }}>Unit {u.unitNumber}</span>
@@ -877,6 +892,7 @@ function PropaneDeliveryModal({ propertyId, units, allowSplits, splitMin, splitF
             </div>
           ))}
         </div>
+        )}
 
         {allowSplits && splitOpts.length > 1 && (
           <div style={{ marginTop: 12 }}>

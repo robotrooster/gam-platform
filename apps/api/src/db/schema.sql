@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict w6dT4OD0F4LzJ9vSwF2jh92b1TgxuVNabjFl9RIvi6HXigCVuF9Fbsh1PFWRLv7
+\restrict RFDhlzlBgWOG1JDgpQqVnSHy1Py5sxZyQxMKoK3NZWfgNWu4WeJTHjROfiff3GI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8517,6 +8517,7 @@ CREATE TABLE public.units (
     replaces_unit_id uuid,
     water_fixture_count integer,
     owner_household_size integer DEFAULT 1 NOT NULL,
+    has_propane_tank boolean DEFAULT false NOT NULL,
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
     CONSTRAINT units_lot_rent_amount_check CHECK ((lot_rent_amount >= (0)::numeric)),
@@ -8576,6 +8577,13 @@ COMMENT ON COLUMN public.units.water_fixture_count IS 'S607: plumbing fixture co
 --
 
 COMMENT ON COLUMN public.units.owner_household_size IS 'S609: how many people live in an OWNER-OCCUPIED unit. Read only when units.status = ''owner_use'' — such a unit has no lease, so there are no lease_tenants rows to count, and a zero basis would push the owner''s own utility usage onto the paying tenants. Ignored for every other status.';
+
+
+--
+-- Name: COLUMN units.has_propane_tank; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.has_propane_tank IS 'S613: this space has a propane tank that gets filled. Drives which units the delivery form offers; propane still bills through propane_fills, not a meter.';
 
 
 --
@@ -23407,5 +23415,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict w6dT4OD0F4LzJ9vSwF2jh92b1TgxuVNabjFl9RIvi6HXigCVuF9Fbsh1PFWRLv7
+\unrestrict RFDhlzlBgWOG1JDgpQqVnSHy1Py5sxZyQxMKoK3NZWfgNWu4WeJTHjROfiff3GI
 

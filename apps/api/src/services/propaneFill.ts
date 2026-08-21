@@ -38,6 +38,8 @@ export interface UnitFillContext {
   landlord_id: string
   property_id: string
   unit_number: string
+  /** S613: this space has a tank to fill. No tank, no fill. */
+  has_propane_tank: boolean
   propane_allow_installments: boolean
   propane_split_min_gallons: string
   propane_split_four_min_gallons: string
@@ -54,6 +56,15 @@ export async function validateFillLine(
   unit: UnitFillContext,
   args: { gallons: number; installments: number },
 ): Promise<{ leaseId: string; tenantId: string }> {
+  // S613 (Nic): "You need to link which units even HAVE tanks to be filled so
+  // that you can record the event in the first place." A fill against a space
+  // with no tank on record is a transcription slip — the delivery form no longer
+  // offers those units, so reaching here means the wrong line got typed.
+  if (!unit.has_propane_tank) {
+    throw new AppError(400,
+      `Unit ${unit.unit_number} has no propane tank on record. Mark it under Utilities on the ` +
+      `unit's page — that is what tells the delivery form which spaces to offer.`)
+  }
   const lt = await client.query<{ lease_id: string; tenant_id: string }>(
     `SELECT vlat.lease_id, vlat.tenant_id
        FROM v_lease_active_tenants vlat
