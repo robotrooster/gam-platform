@@ -1133,70 +1133,65 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
         <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add utility'}</button>
       </div>
       <PropaneTankRow unitId={unitId} propertyId={propertyId} hasTank={hasPropaneTank} />
-      {mine.length === 0 && !adding && (
-        <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-          No sub-meters on this unit. Metered utilities bill the tenant through the monthly reading run; sewer bills off the water reading as part of the same line item.
+      {/* S613: ONE empty state, and only when the unit truly has nothing. This
+          said "no sub-meters on this unit" on a space that had a propane tank
+          and a trash charge — true, and noise. */}
+      {mine.length === 0 && sharedMeters.length === 0 && !hasPropaneTank
+        && !flatCharges.some((m: any) => onMeter(m)) && !adding && (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+          Nothing set up on this unit yet. <strong>Add utility</strong> covers all of it — a sub-meter
+          read each month, a flat monthly charge, or a propane tank that gets filled.
         </div>
       )}
-      {/* S609 (Nic): shared property charges, switchable per unit — see the note
-          where propertyMeters is built. */}
-      {/* S609 (Nic): shown even with NOTHING to list. A landlord with no trash
-          meter yet saw an empty space and reasonably concluded there was nowhere
-          to link trash — "I still don't see where to add trash into any sort of
-          unit linkage." The answer is that the meter has to exist first, so the
-          empty state says so instead of showing nothing. */}
+      {/* S613 (Nic, DIRECTIVE): "Once it's on, we need to make sure it's not just
+          toggleable to turn off immediately. That kinda defeats the purpose of
+          setting them in the first place... Every time I click it on and off,
+          that could be interrupting some sort of code to bill."
+
+          He is right, and the consequence is sharper than a stray click. A flat
+          charge is NOT prorated — billing reads the assignment when the monthly
+          run happens and writes the whole property amount. Off on the 3rd and
+          forgotten means the tenant is never billed for that month at all; on
+          the 28th means they pay the full month. A checkbox is far too casual an
+          instrument for that, so this lists only what the unit HAS, and taking
+          one off is a deliberate act that says what it costs.
+
+          Adding is the "Add utility" picker above — the one door. */}
+      {flatCharges.some((m: any) => onMeter(m)) && (
       <div style={{ marginTop: mine.length || adding ? 12 : 10, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
-          <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>
             Flat charges
           </div>
-          <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.5 }}>
-            Switch one off and this unit isn&apos;t billed for it — a resident hauling their own
-            trash, for instance.
-          </div>
-          {/* S613: the nudge to "set a trash price in Rates" is WRONG for a
-              landlord who bills trash by RUBS — following it creates a second
-              trash meter and the double-billing guard then blocks his units.
-              Only offered when the property has no trash setup at all. */}
-          {flatCharges.length === 0 && ((meters as any[]).some((m: any) => m.utilityType === 'trash') ? (
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 4 }}>
-              Nothing to switch here — this property bills trash on a shared meter, not as a flat
-              charge. It&apos;s below.
-            </div>
-          ) : (
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 4 }}>
-              Nothing to switch yet. A flat charge like <strong>trash</strong> appears here as soon as
-              you set its price in <strong>Rates</strong> on the Utilities page — every unit starts
-              off it, and you switch on the ones that have it.
+          {flatCharges.filter((m: any) => onMeter(m)).map((m: any) => (
+            <div key={m.id}
+              style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                       borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6, fontSize: '.8rem' }}>
+              <span style={{ fontWeight: 600 }}>
+                {ICONS[m.utilityType]} {m.utilityType[0].toUpperCase() + m.utilityType.slice(1)}
+              </span>
+              {/* The price lives on the property rate, not the row — see the
+                  anti-discrimination note in services/utilityBilling. */}
+              <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                {rateFor(m.utilityType) ? `${fmt(rateFor(m.utilityType).ratePerUnit)}/mo — ` : ''}
+                the property rate, same for everyone on it
+              </span>
+              <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
+                disabled={toggleMut.isLoading}
+                onClick={() => appConfirm(
+                  `Take unit ${unitNumber} off ${m.utilityType}?\n\n` +
+                  `Flat charges are NOT prorated. If this month's bill has already been generated it stays, ` +
+                  `and if it hasn't, this unit isn't billed for ${m.utilityType} at all this month — not a part month.`,
+                  { danger: true, confirmLabel: 'Take it off' },
+                ).then(ok => { if (ok) toggleMut.mutate({ meter: m, on: true }) })}>
+                Remove
+              </button>
             </div>
           ))}
-          {flatCharges.map((m: any) => {
-            const on = onMeter(m)
-            return (
-              <label key={m.id}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
-                         borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6,
-                         cursor: toggleMut.isLoading ? 'wait' : 'pointer', fontSize: '.8rem' }}>
-                <input type="checkbox" checked={on} disabled={toggleMut.isLoading}
-                  onChange={() => toggleMut.mutate({ meter: m, on: !on })} />
-                <span style={{ fontWeight: 600 }}>
-                  {ICONS[m.utilityType]} {m.utilityType[0].toUpperCase() + m.utilityType.slice(1)}
-                </span>
-                {/* The price lives on the property rate, not the row — see the
-                    anti-discrimination note in services/utilityBilling. */}
-                <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                  flat charge — the property rate, same for everyone on it
-                </span>
-                {!on && (
-                  <span style={{ marginLeft: 'auto', fontSize: '.68rem', color: 'var(--text-3)' }}>
-                    not billed here
-                  </span>
-                )}
-              </label>
-            )
-          })}
           {flatCharges.filter((m: any) => onMeter(m)).map((m: any) => (
             <LeaseGateWarning key={`gate-${m.id}`} t={m.utilityType} />
           ))}
+      </div>
+      )}
 
           {/* S613 (Nic): READ-ONLY, and shown ONLY when this unit is on a master.
               "That just needs to show which one it's a part of. It doesn't need
@@ -1224,7 +1219,6 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               ))}
             </div>
           )}
-      </div>
       {mine.map((m: any) => (
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6 }}>
           <span style={{ fontSize: '.82rem', fontWeight: 600, minWidth: 110, textTransform: 'capitalize' }}>{ICONS[m.utilityType]} {m.utilityType}</span>
@@ -1385,18 +1379,33 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
 
   return (
     <div style={{ marginBottom: 10 }}>
-      <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
-                      borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem',
-                      cursor: can('schedule.configure_unit') && !setTank.isLoading ? 'pointer' : 'default' }}>
-        <input type="checkbox" checked={hasTank}
-          disabled={!can('schedule.configure_unit') || setTank.isLoading}
-          onChange={e => setTank.mutate(e.target.checked)} />
+      {/* S613 (Nic): no checkbox here either. A tick that removes a tank is a
+          tick that quietly drops the space off Record Delivery — and the next
+          delivery would be recorded without it, so a tenant who took gallons is
+          never charged for them. Taking it off is deliberate and says so. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                    borderRadius: 8, background: 'var(--bg-2)', fontSize: '.8rem' }}>
         <span style={{ fontWeight: 600 }}>🛢️ Propane tank</span>
         <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-          {hasTank ? 'this space has a tank — it appears on Record Delivery'
-                   : 'no tank here — not offered on Record Delivery'}
+          on this space — it appears on Record Delivery
         </span>
-      </label>
+        {can('schedule.configure_unit') && (
+          <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
+            disabled={setTank.isLoading}
+            onClick={() => appConfirm(
+              owed > 0
+                ? `This space still owes ${money(owed)} on propane already delivered. Taking the tank off ` +
+                  `does not cancel that — the scheduled instalments keep billing. It only stops this space ` +
+                  `being offered on Record Delivery. Remove it?`
+                : `Take the propane tank off this space? It stops appearing on Record Delivery, so a ` +
+                  `future delivery here couldn't be recorded until it's added back. Fills already ` +
+                  `recorded are kept.`,
+              { danger: true, confirmLabel: 'Remove tank' },
+            ).then(ok => { if (ok) setTank.mutate(false) })}>
+            Remove
+          </button>
+        )}
+      </div>
       {hasTank && last && (
         <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '5px 0 0 10px', lineHeight: 1.6 }}>
           Last filled {String(last.fillDate).slice(0, 10)} — {Number(last.gallons)} gal at {money(last.pricePerGallon)}/gal
