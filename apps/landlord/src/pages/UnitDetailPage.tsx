@@ -1316,8 +1316,17 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               <>
                 <input className="input" type="text" inputMode="decimal" placeholder="$/unit e.g. 0.14" value={draft.rate}
                   onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, rate: v })) }} style={{ width: 130 }} />
-                <select className="input" value={draft.digits} onChange={e => setDraft(d => ({ ...d, digits: e.target.value }))} style={{ width: 105 }}>
-                  {[4, 5, 6, 7, 8].map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
+                {/* S613 (Nic hit this): he set a meter to 6-digit and then
+                    entered five-digit opening reads, and reasonably wondered
+                    whether he had broken something. Nothing — the width has no
+                    bearing on a reading or on usage (end − start is arithmetic);
+                    it is used ONLY to compute a wrap when a meter passes its
+                    ceiling. The number to enter is the one on the meter FACE,
+                    not the one you happened to read, so the label says so. */}
+                <select className="input" value={draft.digits} onChange={e => setDraft(d => ({ ...d, digits: e.target.value }))}
+                  title="Count the digit windows on the meter face — not the length of today's reading. Only used to work out usage when the meter rolls over."
+                  style={{ width: 150 }}>
+                  {[4, 5, 6, 7, 8].map(d => <option key={d} value={String(d)}>{d} digits on the face</option>)}
                 </select>
                 {t === 'water' && (
                   <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)" value={draft.sewerRate}
