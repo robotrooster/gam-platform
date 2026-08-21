@@ -1098,9 +1098,59 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   // S609: the meter whose units are being picked (null = picker closed).
   const [pickFor, setPickFor] = useState<any>(null)
   const unitLabel = (id: string) => { const u = units.find(x => x.id === id); return u ? `Unit ${u.unitNumber}` : id.slice(0, 8) }
-  const masters = meters.filter(m => m.billingMethod === 'rubs')
-  const submeters = meters.filter(m => m.billingMethod === 'submeter')
-  const others = meters.filter(m => m.billingMethod === 'flat_rate' || m.billingMethod === 'master_bill_to_landlord')
+  // S613: the flat-charge amount lives on the PROPERTY rate, so a card that says
+  // "flat $25/mo" has to read it from there — the meter row deliberately has no
+  // amount (anti-discrimination, S609).
+  const { data: propertyRates = [] } = useQuery<any[]>(
+    ['utility-property-rates', propertyId], () => apiGet(`/utility/property-rates?propertyId=${propertyId}`))
+
+  // S613: which utility panel is open. Null = the summary of all of them.
+  const [openType, setOpenType] = useState<string | null>(null)
+
+  // A propane TANK is not a meter (units.has_propane_tank), so propane can be
+  // fully set up at a property with no propane meter at all. Counted here so the
+  // utility still gets a card rather than looking like it doesn't exist.
+  const tankUnitCount = (units as any[]).filter((u: any) => u.hasPropaneTank).length
+
+  const typeCards = (() => {
+    const types = Array.from(new Set([
+      ...meters.map(m => m.utilityType),
+      ...(tankUnitCount > 0 ? ['propane'] : []),
+    ]))
+    const order = ['electric', 'water', 'sewer', 'gas', 'trash', 'propane']
+    types.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+    return types.map(type => {
+      const mine = meters.filter(m => m.utilityType === type)
+      const subs = mine.filter(m => m.billingMethod === 'submeter')
+      const rubs = mine.filter(m => m.billingMethod === 'rubs')
+      const flat = mine.filter(m => m.billingMethod === 'flat_rate')
+      const landlord = mine.filter(m => m.billingMethod === 'master_bill_to_landlord')
+      const rate = (propertyRates as any[]).find((r: any) => r.utilityType === type)
+
+      const bits: string[] = []
+      if (subs.length) bits.push(`${subs.length} space${subs.length === 1 ? '' : 's'} submetered`)
+      for (const m of rubs) {
+        const n = (m.assignedUnitIds || []).length
+        bits.push(`master → ${n} space${n === 1 ? '' : 's'}`)
+      }
+      for (const m of flat) {
+        const n = (m.assignedUnitIds || []).length
+        bits.push(`flat ${rate ? fmt(rate.ratePerUnit) : '—'}/mo · ${n} space${n === 1 ? '' : 's'}`)
+      }
+      if (landlord.length) bits.push('landlord pays — not billed back')
+      if (type === 'propane' && tankUnitCount) bits.push(`tanks on ${tankUnitCount} space${tankUnitCount === 1 ? '' : 's'}`)
+      if (rate?.ratePerUnit != null && subs.length) bits.push(`${fmt(rate.ratePerUnit)}/unit`)
+
+      const problems: string[] = []
+      const noRead = mine.filter(m => m.hasBaseline === false).length
+      if (noRead) problems.push(`${noRead} need${noRead === 1 ? 's' : ''} an opening read`)
+      const blocked = new Set<string>()
+      for (const m of mine) for (const u of (m.unitsNotBilling || [])) blocked.add(u)
+      if (blocked.size) problems.push(`${blocked.size} lease${blocked.size === 1 ? '' : 's'} won't bill it`)
+
+      return { type, summary: bits.join(' · ') || 'nothing set up yet', problems }
+    })
+  })()
   // S558: a unit is auto-excluded from a RUBS master's split when it has its OWN
   // same-utility submeter — derived from shared unit membership, no manual link.
   const unitHasSubmeter = (unitId: string, utilityType: string) =>
@@ -1348,14 +1398,72 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
         <h2 style={{ fontSize: '.95rem', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}><Gauge size={16} /> Meter Setup</h2>
         <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}><Plus size={14} /> Add meter</button>
       </div>
-      {meters.length === 0 && (
+      {meters.length === 0 && typeCards.length === 0 && (
         <div className="card" style={{ padding: 20, fontSize: '.82rem', color: 'var(--text-3)' }}>
           No meters yet. Add a RUBS master for a shared meter, submeters for individually-metered units, or a flat-rate meter (e.g. trash).
         </div>
       )}
-      {masters.map(m => <MasterCard key={m.id} m={m} />)}
-      {submeters.map(m => <PlainCard key={m.id} m={m} />)}
-      {others.map(m => <PlainCard key={m.id} m={m} />)}
+
+      {/* S613 (Nic, DIRECTIVE): "We have all these submetered spots in a long
+          line list... It's freaking a hundred meters long already with just
+          nothing, and bigger parks would have even longer menus. That's not the
+          way it needs to be. Consolidate. Have each meter setup have each type
+          of thing, and then click into those to set all the units and the rates."
+
+          One card per UTILITY, not per meter. Oak Park's 28 meters become four
+          lines; a 200-space park becomes the same four. Each line answers what
+          you would otherwise scroll to find — how this utility is billed here,
+          how many spaces are on it, and whether anything about it is broken.
+
+          The problem counts are the real gain. A submeter with no opening read
+          bills nothing SILENTLY, and finding those meant reading every row. */}
+      {openType === null ? (
+        <div style={{ display: 'grid', gap: 10 }}>
+          {typeCards.map(c => (
+            <div key={c.type} className="card"
+              style={{ padding: '12px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12 }}
+              onClick={() => setOpenType(c.type)}>
+              <span style={{ fontSize: '1.3rem' }}>{UTILITY_ICONS[c.type]}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, color: 'var(--text-0)', textTransform: 'capitalize' }}>{c.type}</div>
+                <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{c.summary}</div>
+              </div>
+              {c.problems.map((p, i) => (
+                <span key={i} className="badge badge-amber" style={{ fontSize: '.62rem', whiteSpace: 'nowrap' }}>⚠ {p}</span>
+              ))}
+              <ChevronRight size={16} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div>
+          <button className="btn btn-ghost btn-sm" style={{ marginBottom: 10 }} onClick={() => setOpenType(null)}>
+            ← All utilities
+          </button>
+          {(() => {
+            const forType = meters.filter(m => m.utilityType === openType)
+            return (
+              <>
+                {forType.filter(m => m.billingMethod === 'rubs').map(m => <MasterCard key={m.id} m={m} />)}
+                {forType.filter(m => m.billingMethod !== 'rubs').map(m => <PlainCard key={m.id} m={m} />)}
+                {openType === 'propane' && (
+                  <div className="card" style={{ padding: 14, fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+                    <strong>{tankUnitCount} space{tankUnitCount === 1 ? '' : 's'}</strong> have a propane tank.
+                    A tank is not a meter — nobody reads it — so it is marked on the unit, under Utilities,
+                    and it bills off the gallons entered on <strong>Record Delivery</strong>.
+                    {forType.length === 0 && <> This property has no propane meter, which is normal for per-space tanks.</>}
+                  </div>
+                )}
+                {forType.length === 0 && openType !== 'propane' && (
+                  <div className="card" style={{ padding: 16, fontSize: '.8rem', color: 'var(--text-3)' }}>
+                    Nothing set up for {openType} yet.
+                  </div>
+                )}
+              </>
+            )
+          })()}
+        </div>
+      )}
       {showAdd && <MeterModal propertyId={propertyId} onClose={() => setShowAdd(false)} onSaved={onChanged} />}
       {editMeter && <MeterModal propertyId={propertyId} meter={editMeter}
         onClose={() => setEditMeter(null)} onSaved={onChanged} />}
