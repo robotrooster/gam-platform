@@ -13,6 +13,7 @@
  */
 
 import { randomUUID } from 'crypto'
+import { formatUnitNumber } from '../lib/format'
 import type { PoolClient } from 'pg'
 import { db, getClient } from '../db'
 
@@ -479,11 +480,27 @@ export async function seedUnit(
   if (params.withLateFeeDecision) {
     await seedLateFeeDecision(client, { propertyId: params.propertyId, unitType })
   }
+  // S613: the seeded number is CANONICALISED, the way every production unit
+  // number is (POST /units runs canonicalUnitNumber; retire runs
+  // formatUnitNumber). Without this the fixture could store a number no real
+  // unit could have, and unitRetire's "refuses a number already taken" test
+  // failed roughly 6% of runs because of it:
+  //
+  //   randomUUID().slice(0,6) is HEX, so ~6% of the time it is all digits.
+  //   'U-3f9a2b' formats to 'U-3F9A2B' — only case changes, and the clash check
+  //   is case-insensitive, so it matched and the retire was refused.
+  //   'U-123456' formats to 'U 123456' — the hyphen becomes a SPACE, which no
+  //   longer matches the raw 'U-123456' the fixture stored, so no clash was
+  //   found and the retire succeeded.
+  //
+  // A test-only defect, not a production one: real numbers are canonical on both
+  // sides, so they always compare. Fixed by making the fixture behave like
+  // production rather than by loosening the assertion.
   const res = await client.query<{ id: string }>(
     `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, unit_type)
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [params.propertyId, params.landlordId,
-     `U-${randomUUID().slice(0, 6)}`, params.rentAmount ?? 1000, unitType]
+     formatUnitNumber(`U-${randomUUID().slice(0, 6)}`), params.rentAmount ?? 1000, unitType]
   )
   return res.rows[0].id
 }
