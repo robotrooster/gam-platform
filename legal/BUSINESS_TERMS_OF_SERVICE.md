@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 10, 2026
+Last Updated: August 19, 2026
 
 ---
 
@@ -112,7 +112,11 @@ GAM reserves the right to change its fees prospectively with thirty (30) days' n
 
 ### 6.3 Electronic Payments and Recorded Manual Payments
 
-The Platform's built-in rent collection processes electronic payments (ACH and card) through the Payment Rail. A Landlord or authorized staff member may also **record a payment the Tenant made off-platform** — cash, check, or money order — so that the Tenant's balance reflects it. Recording a manual payment marks the corresponding rent as settled but moves no money through the Payment Rail; the Landlord is responsible for having actually received the off-platform funds and for their accuracy. Each recorded manual payment is subject to a **$10.00 manual-payment fee** payable to GAM. This fee is waived only for a Tenant's first recorded rent payment during a property's initial onboarding window — the first few weeks after the property is brought onto the Platform, while existing tenancies are being migrated over. Tenants added after that onboarding window are charged the fee even on a first recorded payment.
+The Platform's built-in rent collection processes electronic payments (ACH and card) through the Payment Rail. A Landlord or authorized staff member may also **record a payment the Tenant made off-platform** — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — so that the Tenant's balance reflects it. Recording a manual payment marks the corresponding rent as settled but moves no money through the Payment Rail; the Landlord is responsible for having actually received the off-platform funds and for their accuracy. Each recorded manual payment is subject to a **$10.00 manual-payment fee** payable to GAM, **charged per recorded payment** (ten such payments in a month is $100).
+
+**When the fee is waived.** The fee is waived on a Tenant's **first rent payment on their lease, and only if that first payment is an off-platform payment.** If the Tenant's first rent payment is made electronically, the waiver is used up and does not carry forward. The waiver does not depend on when the Tenant or the property joined the Platform, and a late payment does not forfeit it.
+
+**Who pays it, and how GAM collects it.** By default the fee is charged to the Tenant, and you are made whole. You may elect, **per property**, to cover it instead. That election applies to every Tenant at that property alike and cannot be made tenant by tenant. Where you elect to cover it, GAM collects the fee from your collected balance before disbursement — it appears as a reduction in your payout rather than as an invoice — and the Platform shows you an itemised record of the fees you have absorbed. Where you do not cover it, the Tenant is charged and your payout is unaffected. You may change this election at any time, prospectively.
 
 ### 6.4 Chargebacks, ACH Returns, and Disputes
 

@@ -10,10 +10,14 @@
     "build": "npm run build --workspaces",
     "db:migrate": "npm run migrate --workspace=apps/api",
     "db:seed": "npm run seed --workspace=apps/api",
-    "schema:dump": "bash apps/api/scripts/dump-schema.sh"
+    "schema:dump": "bash apps/api/scripts/dump-schema.sh",
+    "lint:hooks": "eslint --no-eslintrc -c ./.hooks-eslint.json --ext .tsx,.ts apps/landlord/src apps/tenant/src apps/admin/src apps/pm-company/src apps/business/src apps/marketing/src apps/customer/src apps/listings/src apps/property-intel/src apps/admin-ops/src apps/storefront/src apps/fitness/src"
   },
   "devDependencies": {
+    "@typescript-eslint/parser": "^6.21.0",
     "concurrently": "^8.2.2",
+    "eslint": "^8.57.1",
+    "eslint-plugin-react-hooks": "^4.6.2",
     "vite": "^8.0.0"
   },
   "overrides": {

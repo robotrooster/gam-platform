@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 10, 2026
+Last Updated: August 19, 2026
 
 ---
 
@@ -74,7 +74,7 @@ Subject to Section 5.5 below (Payment Routing) and Section 5.6 (Unpaid Rent), ea
 
 ### 5.2 Fees You May Pay
 
-You pay the Platform's payment-processing fees on your payments by default, and the fee is disclosed at the checkout step before you confirm. Your Landlord may have elected at onboarding to cover your **ACH** processing fee — where your Landlord has done so, no ACH fee is shown to you. **Card processing fees are always paid by you and are never covered by your Landlord.** You can see whether a given charge carries a fee at the point you authorize payment.
+You pay the Platform's payment-processing fees on your payments by default, and the fee is disclosed at the checkout step before you confirm. Your Landlord may have elected at onboarding to cover your **ACH** processing fee, and separately may elect to cover the **manual-payment fee** on off-platform payments described in Section 5.3 — where your Landlord has done so, no such fee is shown to you. Any such election is made **for an entire property and applies to every Tenant at that property alike**; it is not made tenant by tenant, and your Landlord may change it at any time going forward. **Card processing fees are always paid by you and are never covered by your Landlord.** GAM's own platform subscription fee is charged to your Landlord and is never passed through to you. You can see whether a given charge carries a fee at the point you authorize payment, and the Platform shows you what your balance would cost by each available payment method before you choose one.
 
 When fees are passed through, the rates are:
 
@@ -88,7 +88,13 @@ If you enroll in FlexDeposit, the FlexDeposit terms (Section 9.1) govern the ins
 
 ### 5.3 Electronic Payments and Recorded Off-Platform Payments
 
-The Platform processes electronic payments (ACH and card). If you pay your Landlord off-platform — by cash, check, or money order — your Landlord or their staff can **record that payment** on the Platform so your balance reflects it. Recording an off-platform payment carries a **$10.00 manual-payment fee, charged to you.** This fee is waived only for your first recorded rent payment during a property's initial onboarding window — the first few weeks after the property is brought onto the Platform, while existing tenancies are being migrated over. Tenants who join after that onboarding window are charged the fee even on a first recorded payment. Until an off-platform payment is recorded, your Platform account will continue to reflect the unpaid balance.
+The Platform processes electronic payments (ACH and card). If you pay your Landlord off-platform — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — your Landlord or their staff can **record that payment** on the Platform so your balance reflects it. Recording an off-platform payment carries a **$10.00 manual-payment fee.**
+
+**When the fee is waived.** The fee is waived on **your first rent payment on your lease, and only if that first payment is an off-platform payment.** If your first rent payment is made electronically (ACH or card), the waiver is used up and does not carry forward — later off-platform payments are charged the fee. The waiver does not depend on when you joined or how long the property has been on the Platform, and paying after your rent due date does not forfeit it (late fees under your lease are separate and still apply).
+
+**Who pays it.** The fee is charged to you by default. Your Landlord may elect, for an entire property, to cover it instead — see Section 5.2. That election applies to every Tenant at that property alike; it is not made tenant by tenant. Where your Landlord covers the fee, no charge is shown to you, and the amount your Landlord is covering is disclosed to you before you choose a payment method. **Your Landlord may stop covering it at any time**, after which the fee appears on your balance.
+
+Before you choose how to pay, the Platform shows you what your balance would cost by each available method, so the fee is disclosed to you at the point you decide. Until an off-platform payment is recorded, your Platform account will continue to reflect the unpaid balance.
 
 ### 5.4 Failed ACH Pulls, Retries, Chargebacks, and Pass-Through Fees
 
