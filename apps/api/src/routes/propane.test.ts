@@ -548,3 +548,50 @@ describe('propane tanks are declared on the unit (S613)', () => {
     expect(ok.status).toBe(201)
   })
 })
+
+// S613 (Nic): "It needs to be toggled the same way as trash. If I just click on
+// the propane — ten, eleven, twelve, fifteen, sixteen, eighteen — they're all
+// toggled on, and so they all can get delivery amounts individually."
+describe('bulk propane tanks (S613)', () => {
+  it('sets membership: ticked spaces get a tank, unticked ones lose it', async () => {
+    const f = await seed()
+    const app = buildApp()
+    // Fixture starts with a tank on unitA only.
+    const on = await request(app).put('/api/propane/tanks')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, unitIds: [f.unitAId, f.vacantUnitId] })
+    expect(on.status).toBe(200)
+    expect(on.body.data.withTank).toBe(2)
+    let rows = (await db.query(
+      `SELECT id, has_propane_tank FROM units WHERE id = ANY($1::uuid[])`,
+      [[f.unitAId, f.vacantUnitId]])).rows
+    expect(rows.every((r: any) => r.has_propane_tank)).toBe(true)
+
+    const off = await request(app).put('/api/propane/tanks')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, unitIds: [f.unitAId] })
+    expect(off.status).toBe(200)
+    rows = (await db.query(
+      `SELECT id, has_propane_tank FROM units WHERE id = ANY($1::uuid[])`,
+      [[f.unitAId, f.vacantUnitId]])).rows
+    expect(rows.find((r: any) => r.id === f.unitAId).has_propane_tank).toBe(true)
+    expect(rows.find((r: any) => r.id === f.vacantUnitId).has_propane_tank).toBe(false)
+  })
+
+  it('refuses a unit that is not at this property', async () => {
+    const f = await seed()
+    const other = await seed()
+    const res = await request(buildApp()).put('/api/propane/tanks')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, unitIds: [other.unitAId] })
+    expect(res.status).toBe(400)
+  })
+
+  it('cross-landlord property → 403', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).put('/api/propane/tanks')
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ propertyId: f.propertyAId, unitIds: [] })
+    expect(res.status).toBe(403)
+  })
+})

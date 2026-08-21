@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
-import { apiGet, apiPost, apiDelete, apiPatch } from '../lib/api'
+import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
 import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
@@ -233,7 +233,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
           {/* Meter setup is LANDLORD-only (broken toggle, rates, links). */}
           {canReview && (
-            <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
+            <>
+              <RecoveryCard propertyId={propertyId} />
+              <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
+            </>
           )}
 
           {/* ── BILLS (read-only status; runs create these) ── */}
@@ -1089,6 +1092,198 @@ function methodLabel(m: any): string {
   return m.billingMethod
 }
 
+/**
+ * S613 (Nic): "Over a whole year when there's fifty thousand dollars in
+ * utilities and there's twelve thousand maybe not billed back to people, we
+ * wanna see that... that way we can measure how much utility wasn't billed back."
+ *
+ * Spent is what the property recorded paying for utilities; recovered is what it
+ * billed out. The gap is the number. The owner-occupied slice is called out
+ * because it is recorded as it happens — the rest of the gap (common areas, a
+ * nightly stay with power in the rate, a vacancy, a lease that never passed it
+ * through) is left unattributed rather than guessed at.
+ *
+ * A utility with no expense recorded shows a dash, not a shortfall: with nothing
+ * on the spent side there is nothing to subtract from, and printing the whole
+ * recovery as "not recovered" would be a lie in the landlord's own report.
+ */
+function RecoveryCard({ propertyId }: { propertyId: string }) {
+  const thisYear = new Date().getFullYear()
+  const [year, setYear] = useState(thisYear)
+  const { data } = useQuery<any>(
+    ['utility-recovery', propertyId, year],
+    () => apiGet(`/utility/recovery?propertyId=${propertyId}&from=${year}-01-01&to=${year}-12-31`),
+    { enabled: !!propertyId },
+  )
+  const lines: any[] = data?.lines ?? []
+  const t = data?.totals
+  if (!t || (t.spent === 0 && t.recovered === 0)) return null
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <h2 style={{ fontSize: '.95rem', margin: 0 }}>What the utilities cost, and what came back</h2>
+        <select className="form-select" style={{ width: 'auto', fontSize: '.78rem', padding: '2px 8px' }}
+          value={year} onChange={e => setYear(Number(e.target.value))}>
+          {[thisYear, thisYear - 1, thisYear - 2].map(y => <option key={y} value={y}>{y}</option>)}
+        </select>
+      </div>
+      <div className="card" style={{ padding: 14 }}>
+        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Spent</div>
+            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.spent)}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Billed back</div>
+            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--green)' }}>{fmt(t.recovered)}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Not recovered</div>
+            <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700, color: t.notRecovered > 0 ? 'var(--gold)' : 'var(--text-1)' }}>
+              {fmt(t.notRecovered)}
+            </div>
+          </div>
+          {t.ownerOccupied > 0 && (
+            <div>
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Of that, your own units</div>
+              <div className="mono" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{fmt(t.ownerOccupied)}</div>
+            </div>
+          )}
+        </div>
+        <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              <th style={{ textAlign: 'left', padding: '4px 0' }}>Utility</th>
+              <th style={{ textAlign: 'right' }}>Spent</th>
+              <th style={{ textAlign: 'right' }}>Billed back</th>
+              <th style={{ textAlign: 'right' }}>Not recovered</th>
+              <th style={{ textAlign: 'right' }}>Your units</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((l: any) => (
+              <tr key={l.utilityType} style={{ borderTop: '1px solid var(--border-0)' }}>
+                <td style={{ padding: '5px 0', textTransform: 'capitalize' }}>
+                  {UTILITY_ICONS[l.utilityType] || ''} {l.utilityType === 'unspecified' ? 'Unspecified' : l.utilityType}
+                </td>
+                <td className="mono" style={{ textAlign: 'right' }}>{l.spent ? fmt(l.spent) : '—'}</td>
+                <td className="mono" style={{ textAlign: 'right', color: 'var(--green)' }}>{l.recovered ? fmt(l.recovered) : '—'}</td>
+                <td className="mono" style={{ textAlign: 'right', color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
+                  {l.notRecovered == null ? '—' : fmt(l.notRecovered)}
+                </td>
+                <td className="mono" style={{ textAlign: 'right' }}>{l.ownerOccupied ? fmt(l.ownerOccupied) : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
+          &ldquo;Spent&rdquo; is what you recorded under <strong>Expenses → Utilities</strong> for this property; tag each
+          bill with its utility and these lines split out. A dash means no bill was recorded, so there
+          is nothing to compare against. What isn&apos;t your own units is common areas, stays with
+          utilities in the rate, vacancies, and anything a lease doesn&apos;t pass through.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * S613 (Nic): "It needs to be toggled the same way as trash plus the fill
+ * amount. If I just click on the propane — ten, eleven, twelve, fifteen,
+ * sixteen, eighteen, all on propane — they're all toggled on, and so they all
+ * can get delivery amounts individually. You just skipped the step of adding
+ * them to this card."
+ *
+ * He is right and it was a plain omission. A tank could be marked on the unit
+ * page one space at a time and nowhere else, so standing propane up across a
+ * park meant opening every space in turn — while trash, which is the same
+ * question, got a checklist. That a tank isn't a meter is an implementation
+ * detail; it is no reason to make the landlord do it the slow way.
+ *
+ * Ticking is free — nothing saves until Save — and the ticked spaces are exactly
+ * the ones Record Delivery then offers, each with its own gallons.
+ */
+function PropaneTanksCard({ propertyId, units, onChanged }: {
+  propertyId: string; units: any[]; onChanged: () => void
+}) {
+  const live = (units as any[]).filter((u: any) => u.propertyId === propertyId && !u.retiredAt)
+  const [picked, setPicked] = useState<Set<string> | null>(null)
+  const current = picked ?? new Set(live.filter((u: any) => u.hasPropaneTank).map((u: any) => u.id))
+  const dirty = picked !== null
+  const toggle = (id: string) => {
+    const next = new Set(current)
+    next.has(id) ? next.delete(id) : next.add(id)
+    setPicked(next)
+  }
+  const save = useMutation(
+    () => apiPut('/propane/tanks', { propertyId, unitIds: Array.from(current) }),
+    {
+      onSuccess: (r: any) => {
+        setPicked(null)
+        onChanged()
+        toast(`${r?.changed ?? 0} space${r?.changed === 1 ? '' : 's'} changed — ${r?.withTank ?? 0} now on Record Delivery.`)
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that'),
+    },
+  )
+  const removing = live.filter((u: any) => u.hasPropaneTank && !current.has(u.id))
+
+  return (
+    <div className="card" style={{ padding: 14 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 2 }}>Spaces with a propane tank</div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
+        Tick every space that has a tank. Those are the ones <strong>Record Delivery</strong> offers, each
+        with its own gallons. A tank isn&apos;t a meter — nobody reads it — so propane bills off the
+        gallons delivered, not a monthly reading.
+      </div>
+      {live.length === 0 ? (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>No units at this property yet.</div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 4,
+                      maxHeight: 300, overflowY: 'auto' }}>
+          {live.map((u: any) => {
+            const on = current.has(u.id)
+            return (
+              <label key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '4px 6px',
+                                          borderRadius: 6, background: on ? 'rgba(201,162,39,.08)' : 'transparent',
+                                          cursor: 'pointer', fontSize: '.78rem' }}>
+                <input type="checkbox" checked={on} onChange={() => toggle(u.id)} />
+                {u.unitNumber}
+              </label>
+            )
+          })}
+        </div>
+      )}
+      {dirty && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+          <button className="btn btn-primary btn-sm" disabled={save.isLoading}
+            onClick={() => {
+              // Unticking a space that HAS a tank is a removal, and removals are
+              // never casual here — money already owed on delivered propane keeps
+              // billing either way, which is worth saying before it looks like a
+              // way to cancel a charge.
+              if (removing.length === 0) return save.mutate()
+              appConfirm(
+                `Take the tank off ${removing.length} space${removing.length === 1 ? '' : 's'} ` +
+                `(${removing.map((u: any) => u.unitNumber).join(', ')})?\n\n` +
+                `They stop appearing on Record Delivery. Anything still owed on propane already ` +
+                `delivered keeps billing — this doesn't cancel that.`,
+                { danger: true, confirmLabel: 'Save' },
+              ).then(ok => { if (ok) save.mutate() })
+            }}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setPicked(null)}>Cancel</button>
+          <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            {current.size} space{current.size === 1 ? '' : 's'} with a tank
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   propertyId: string; meters: any[]; units: any[]; onChanged: () => void
 }) {
@@ -1446,14 +1641,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
               <>
                 {forType.filter(m => m.billingMethod === 'rubs').map(m => <MasterCard key={m.id} m={m} />)}
                 {forType.filter(m => m.billingMethod !== 'rubs').map(m => <PlainCard key={m.id} m={m} />)}
-                {openType === 'propane' && (
-                  <div className="card" style={{ padding: 14, fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
-                    <strong>{tankUnitCount} space{tankUnitCount === 1 ? '' : 's'}</strong> have a propane tank.
-                    A tank is not a meter — nobody reads it — so it is marked on the unit, under Utilities,
-                    and it bills off the gallons entered on <strong>Record Delivery</strong>.
-                    {forType.length === 0 && <> This property has no propane meter, which is normal for per-space tanks.</>}
-                  </div>
-                )}
+                {openType === 'propane' && <PropaneTanksCard propertyId={propertyId} units={units} onChanged={onChanged} />}
                 {forType.length === 0 && openType !== 'propane' && (
                   <div className="card" style={{ padding: 16, fontSize: '.8rem', color: 'var(--text-3)' }}>
                     Nothing set up for {openType} yet.

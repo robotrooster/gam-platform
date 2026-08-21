@@ -16,6 +16,9 @@ export interface CreateExpenseInput {
   vendor?: string | null
   expenseDate: string          // YYYY-MM-DD
   isCommon?: boolean
+  /** S613: which utility, when category = 'utilities'. Optional — an untyped
+   *  utility bill still counts toward what the property spent. */
+  utilityType?: string | null
 }
 
 export async function createLandlordExpense(input: CreateExpenseInput) {
@@ -45,11 +48,12 @@ export async function createLandlordExpense(input: CreateExpenseInput) {
   const row = await queryOne<any>(
     `INSERT INTO landlord_expenses
        (landlord_id, created_by, property_id, unit_id, category, amount, description, vendor,
-        expense_date, is_common, allocate_per_unit)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+        expense_date, is_common, allocate_per_unit, utility_type)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
     [input.landlordId, input.createdBy ?? null, propertyId, unitId, input.category,
      input.amount.toFixed(2), input.description ?? null, input.vendor ?? null,
-     input.expenseDate, isCommon, allocate])
+     input.expenseDate, isCommon, allocate,
+     input.category === 'utilities' ? (input.utilityType ?? null) : null])
   return row
 }
 

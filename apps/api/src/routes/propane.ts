@@ -17,7 +17,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { propaneSplitOptions } from '@gam/shared'
-import { query, queryOne, getClient } from '../db'
+import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canAccessLandlordResource } from '../middleware/scope'
@@ -74,6 +74,48 @@ const UNIT_FILL_COLS = `u.id, u.landlord_id, u.property_id, u.unit_number,
               u.has_propane_tank,
               p.propane_allow_installments,
               p.propane_split_min_gallons, p.propane_split_four_min_gallons`
+
+// PUT /api/propane/tanks — S613 (Nic): set which spaces have a tank, all at once.
+//
+// "It needs to be toggled the same way as trash plus the fill amount. If I just
+//  click on the propane, ten, eleven, twelve, fifteen, sixteen, eighteen, all on
+//  propane, they're all toggled on, and so they all can get delivery amounts
+//  individually. You just skipped the step of adding them to this card."
+//
+// Right — the tank was settable one unit at a time on the unit page and nowhere
+// else, so standing up propane across a park meant opening every space in turn.
+// Trash got its checklist and propane didn't, for no reason other than a tank
+// not being a meter. MEMBERSHIP semantics, like the trash picker: ticked spaces
+// have a tank, unticked ones don't.
+//
+// Removing a tank never touches money already owed — instalments on propane
+// already delivered keep billing. It only stops the space being offered on
+// Record Delivery.
+propaneRouter.put('/tanks', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      propertyId: z.string().uuid(),
+      unitIds:    z.array(z.string().uuid()).max(2000),
+    }).parse(req.body)
+    const property = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const stray = body.unitIds.length ? await queryOne<any>(
+      `SELECT unit_number FROM units
+        WHERE id = ANY($1::uuid[]) AND (property_id <> $2 OR retired_at IS NOT NULL) LIMIT 1`,
+      [body.unitIds, body.propertyId]) : null
+    if (stray) throw new AppError(400, `Unit ${stray.unit_number} isn't a live unit at this property.`)
+
+    const { rowCount } = await db.query(
+      `UPDATE units SET has_propane_tank = (id = ANY($2::uuid[])), updated_at = NOW()
+        WHERE property_id = $1 AND retired_at IS NULL
+          AND has_propane_tank IS DISTINCT FROM (id = ANY($2::uuid[]))`,
+      [body.propertyId, body.unitIds])
+    res.json({ success: true, data: { changed: rowCount ?? 0, withTank: body.unitIds.length } })
+  } catch (e) { next(e) }
+})
 
 propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, next) => {
   try {

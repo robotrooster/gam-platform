@@ -648,6 +648,96 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
+// GET /api/utility/recovery?propertyId=&from=&to= — S613 (Nic).
+//
+// "Unbilled utility tracking would just be the difference between an owner
+//  importing their total charges coming into the property and subtracting the
+//  outgoing charges, and knowing the difference in dollar amounts... over a
+//  whole year when there's fifty thousand dollars in utilities and there's
+//  twelve thousand maybe not billed back to people, we wanna see that."
+//
+// Exactly that, and no new ledger for it: what the property SPENT is its utility
+// expenses, what it RECOVERED is the bills it sent, and the gap is the answer.
+// The one slice that can be named without guessing is the owner-occupied share,
+// because that is recorded as it happens. Everything else in the gap — common
+// areas, a nightly stay with power in the rate, a vacant space, a lease that
+// doesn't pass it through — is reported together as "not recovered", because
+// attributing it would mean inventing a number rather than reading one.
+utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const from = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).parse(req.query.from)
+    const to   = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).parse(req.query.to)
+    const property = await queryOne<any>(
+      `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const rows = await query<any>(`
+      WITH spent AS (
+        SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
+               SUM(e.amount)::numeric AS amount
+          FROM landlord_expenses e
+         WHERE e.property_id = $1 AND e.category = 'utilities'
+           AND e.status = 'active'
+           AND e.expense_date BETWEEN $2::date AND $3::date
+         GROUP BY 1
+      ),
+      recovered AS (
+        SELECT ub.utility_type, SUM(ub.charge_amount)::numeric AS amount
+          FROM utility_bills ub
+          JOIN units u ON u.id = ub.unit_id
+         WHERE u.property_id = $1
+           AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                          AND date_trunc('month', $3::date)::date
+         GROUP BY 1
+      ),
+      owner_use AS (
+        SELECT a.utility_type, SUM(a.charge_amount)::numeric AS amount
+          FROM utility_owner_use_absorptions a
+          JOIN units u ON u.id = a.unit_id
+         WHERE u.property_id = $1
+           AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
+         GROUP BY 1
+      )
+      SELECT t.utility_type,
+             COALESCE(s.amount, 0)::float  AS spent,
+             COALESCE(r.amount, 0)::float  AS recovered,
+             COALESCE(o.amount, 0)::float  AS owner_occupied
+        FROM (SELECT utility_type FROM spent
+              UNION SELECT utility_type FROM recovered
+              UNION SELECT utility_type FROM owner_use) t
+        LEFT JOIN spent s     ON s.utility_type = t.utility_type
+        LEFT JOIN recovered r ON r.utility_type = t.utility_type
+        LEFT JOIN owner_use o ON o.utility_type = t.utility_type
+       ORDER BY 2 DESC
+    `, [propertyId, from, to])
+
+    const lines = rows.map((r: any) => ({
+      utilityType: r.utility_type,
+      spent: Number(r.spent),
+      recovered: Number(r.recovered),
+      ownerOccupied: Number(r.owner_occupied),
+      // Only meaningful where the landlord recorded what he SPENT. Without the
+      // bill on the expense side there is nothing to subtract from, so this
+      // reports null rather than implying the whole recovery was a shortfall.
+      notRecovered: Number(r.spent) > 0
+        ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
+        : null,
+    }))
+    const sum = (k: 'spent' | 'recovered' | 'ownerOccupied') =>
+      Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
+    res.json({ success: true, data: {
+      from, to, lines,
+      totals: {
+        spent: sum('spent'), recovered: sum('recovered'), ownerOccupied: sum('ownerOccupied'),
+        notRecovered: Math.round((sum('spent') - sum('recovered')) * 100) / 100,
+      },
+    } })
+  } catch (e) { next(e) }
+})
+
 // ── METER READINGS ───────────────────────────────────────────
 // S560: LANDLORD-ONLY. Returns raw historical reading VALUES, so it must NOT
 // be reachable by the blind front-desk reader (utility.read_meters) — same

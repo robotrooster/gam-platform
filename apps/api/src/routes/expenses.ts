@@ -63,13 +63,16 @@ expensesRouter.post('/', requireLandlord, async (req: any, res, next) => {
       vendor:          z.string().max(160).nullable().optional(),
       expenseDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       isCommon:        z.boolean().optional(),
+      // S613: which utility this bill was for. Drives the recovery report —
+      // what came in for water vs what was billed back out for water.
+      utilityType:     z.enum(['water','gas','electric','sewer','trash','propane']).nullable().optional(),
     }).parse(req.body)
     const row = await createLandlordExpense({
       landlordId: scope(req), createdBy: req.user.userId,
       propertyId: body.propertyId ?? null, unitId: body.unitId ?? null,
       category: body.category, amount: body.amount, description: body.description ?? null,
       vendor: body.vendor ?? null, expenseDate: body.expenseDate,
-      isCommon: body.isCommon,
+      isCommon: body.isCommon, utilityType: body.utilityType ?? null,
     })
     res.json({ success: true, data: row })
   } catch (e) { next(e) }

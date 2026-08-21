@@ -34,6 +34,8 @@ export function ExpensesPage() {
   const [form, setForm] = useState({
     propertyId: '', unitId: '', scope: 'unit' as 'unit' | 'common',
     category: 'repairs', amount: '', description: '', vendor: '', expenseDate: today(),
+    // S613: which utility, when category = utilities. Feeds the recovery report.
+    utilityType: null as string | null,
   })
   const [err, setErr] = useState<string | null>(null)
   const [receipt, setReceipt] = useState<File | null>(null)
@@ -45,6 +47,7 @@ export function ExpensesPage() {
     async () => {
       const res = await apiPost<any>('/expenses', {
         category: form.category, amount: Number(form.amount), expenseDate: form.expenseDate,
+        utilityType: form.category === 'utilities' ? form.utilityType : null,
         description: form.description.trim() || null, vendor: form.vendor.trim() || null,
         ...(form.scope === 'unit'
           ? { unitId: form.unitId }
@@ -124,6 +127,20 @@ export function ExpensesPage() {
               <select className="form-input" value={form.category} onChange={e => set({ category: e.target.value })}>
                 {EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{EXPENSE_CATEGORY_LABEL[c]}</option>)}
               </select>
+              {/* S613 (Nic): "They can put it as a utility bill electric or
+                  whatever, utility bill water, and add the dollar amount."
+                  Tagging which utility is what lets the Utilities page compare
+                  what was spent against what was billed back, per utility. */}
+              {form.category === 'utilities' && (
+                <select className="form-select" style={{ marginTop: 6 }}
+                  value={form.utilityType || ''}
+                  onChange={e => set({ utilityType: e.target.value || null })}>
+                  <option value="">Which utility? (optional)</option>
+                  {['electric', 'water', 'sewer', 'gas', 'trash', 'propane'].map(u => (
+                    <option key={u} value={u}>{u[0].toUpperCase() + u.slice(1)}</option>
+                  ))}
+                </select>
+              )}
             </label>
             <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Amount
               <input className="form-input" type="number" inputMode="decimal" placeholder="0.00" value={form.amount} onChange={e => set({ amount: e.target.value })} />

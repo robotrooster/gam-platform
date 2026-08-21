@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict o3C1AXsry8GDuukWQ7xp94W3eT19WoAfPsZZsj9lgZA4xli5bG8YHDGGZhETNga
+\restrict tj8f6Jg7fhKc0Eu8VHddkQX6dlQO1yWAaRWDymCBLlyfrLZTGnb6nAx6PtuwhnI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3788,9 +3788,11 @@ CREATE TABLE public.landlord_expenses (
     receipt_name text,
     receipt_mime text,
     receipt_size integer,
+    utility_type text,
     CONSTRAINT landlord_expenses_amount_check CHECK ((amount >= (0)::numeric)),
     CONSTRAINT landlord_expenses_check CHECK ((((unit_id IS NOT NULL) AND (is_common = false)) OR (unit_id IS NULL))),
-    CONSTRAINT landlord_expenses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'voided'::text])))
+    CONSTRAINT landlord_expenses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'voided'::text]))),
+    CONSTRAINT landlord_expenses_utility_type_check CHECK (((utility_type IS NULL) OR (utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text]))))
 );
 
 
@@ -3799,6 +3801,13 @@ CREATE TABLE public.landlord_expenses (
 --
 
 COMMENT ON TABLE public.landlord_expenses IS 'S568: landlord-entered expenses (unit-linked or common; common can allocate per unit). Feeds the landlord P&L expense side. Soft-void, never hard-delete.';
+
+
+--
+-- Name: COLUMN landlord_expenses.utility_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_expenses.utility_type IS 'S613: which utility this expense was for, when category = utilities. NULL is fine and means "utilities, unspecified" — it still counts in the total spent.';
 
 
 --
@@ -23435,5 +23444,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict o3C1AXsry8GDuukWQ7xp94W3eT19WoAfPsZZsj9lgZA4xli5bG8YHDGGZhETNga
+\unrestrict tj8f6Jg7fhKc0Eu8VHddkQX6dlQO1yWAaRWDymCBLlyfrLZTGnb6nAx6PtuwhnI
 
