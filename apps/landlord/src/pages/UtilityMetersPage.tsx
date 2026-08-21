@@ -1307,11 +1307,25 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   // utility still gets a card rather than looking like it doesn't exist.
   const tankUnitCount = (units as any[]).filter((u: any) => u.hasPropaneTank).length
 
+  // S613 (Nic): "I don't see propane in the meter setup area. It should be right
+  // there with electric, water and trash the same... Propane isn't necessarily
+  // metered, it's filled — but the principle is the same, and we select which
+  // units have that meter even though it's not an actual meter. We metered the
+  // usage in a different way for that utility."
+  //
+  // The cards were built from what EXISTS, so propane only appeared once a space
+  // already had a tank — and the card is the place you go to mark the tanks. The
+  // same chicken-and-egg I had already been caught on twice: gating the only
+  // door behind the thing it opens.
+  //
+  // This page's job is SETUP, so it lists every utility you can set up, whether
+  // or not you have yet. (That is the opposite of the unit page, which shows only
+  // what a unit HAS — there, an unused utility really is clutter.) Sewer is not
+  // offered on its own because it has no independent setup: it rides the water
+  // meter and bills on the water line. It still gets a card if one exists.
   const typeCards = (() => {
-    const types = Array.from(new Set([
-      ...meters.map(m => m.utilityType),
-      ...(tankUnitCount > 0 ? ['propane'] : []),
-    ]))
+    const OFFERED = ['electric', 'water', 'gas', 'trash', 'propane']
+    const types = Array.from(new Set([...OFFERED, ...meters.map(m => m.utilityType)]))
     const order = ['electric', 'water', 'sewer', 'gas', 'trash', 'propane']
     types.sort((a, b) => order.indexOf(a) - order.indexOf(b))
     return types.map(type => {
@@ -1343,8 +1357,15 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
       for (const m of mine) for (const u of (m.unitsNotBilling || [])) blocked.add(u)
       if (blocked.size) problems.push(`${blocked.size} lease${blocked.size === 1 ? '' : 's'} won't bill it`)
 
-      return { type, summary: bits.join(' · ') || 'nothing set up yet', problems }
-    })
+      const configured = mine.length > 0 || (type === 'propane' && tankUnitCount > 0)
+      return {
+        type, configured, problems: configured ? problems : [],
+        summary: bits.join(' · ') || (
+          type === 'propane' ? 'not set up — tick the spaces that have a tank'
+          : type === 'trash' ? 'not set up — a flat monthly charge, or split from the hauler’s bill'
+          : 'not set up'),
+      }
+    }).sort((a, b) => Number(b.configured) - Number(a.configured))
   })()
   // S558: a unit is auto-excluded from a RUBS master's split when it has its OWN
   // same-utility submeter — derived from shared unit membership, no manual link.
@@ -1593,12 +1614,6 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
         <h2 style={{ fontSize: '.95rem', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}><Gauge size={16} /> Meter Setup</h2>
         <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}><Plus size={14} /> Add meter</button>
       </div>
-      {meters.length === 0 && typeCards.length === 0 && (
-        <div className="card" style={{ padding: 20, fontSize: '.82rem', color: 'var(--text-3)' }}>
-          No meters yet. Add a RUBS master for a shared meter, submeters for individually-metered units, or a flat-rate meter (e.g. trash).
-        </div>
-      )}
-
       {/* S613 (Nic, DIRECTIVE): "We have all these submetered spots in a long
           line list... It's freaking a hundred meters long already with just
           nothing, and bigger parks would have even longer menus. That's not the
@@ -1616,11 +1631,12 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
         <div style={{ display: 'grid', gap: 10 }}>
           {typeCards.map(c => (
             <div key={c.type} className="card"
-              style={{ padding: '12px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12 }}
+              style={{ padding: '12px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12,
+                       opacity: c.configured ? 1 : .72 }}
               onClick={() => setOpenType(c.type)}>
-              <span style={{ fontSize: '1.3rem' }}>{UTILITY_ICONS[c.type]}</span>
+              <span style={{ fontSize: '1.3rem', filter: c.configured ? undefined : 'grayscale(1)' }}>{UTILITY_ICONS[c.type]}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 700, color: 'var(--text-0)', textTransform: 'capitalize' }}>{c.type}</div>
+                <div style={{ fontWeight: 700, color: c.configured ? 'var(--text-0)' : 'var(--text-2)', textTransform: 'capitalize' }}>{c.type}</div>
                 <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{c.summary}</div>
               </div>
               {c.problems.map((p, i) => (
@@ -1643,8 +1659,19 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
                 {forType.filter(m => m.billingMethod !== 'rubs').map(m => <PlainCard key={m.id} m={m} />)}
                 {openType === 'propane' && <PropaneTanksCard propertyId={propertyId} units={units} onChanged={onChanged} />}
                 {forType.length === 0 && openType !== 'propane' && (
-                  <div className="card" style={{ padding: 16, fontSize: '.8rem', color: 'var(--text-3)' }}>
+                  <div className="card" style={{ padding: 16, fontSize: '.8rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
                     Nothing set up for {openType} yet.
+                    {openType === 'trash'
+                      ? <> Trash is usually a flat monthly charge — set its price under <strong>Utility rates</strong> below,
+                          then add a flat-rate meter here and tick the spaces that have a can. It can also be split from
+                          the hauler&apos;s bill as a shared master.</>
+                      : <> Add a sub-meter for individually-metered spaces, or a shared master to split one bill
+                          across several.</>}
+                    <div style={{ marginTop: 10 }}>
+                      <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
+                        <Plus size={13} /> Set up {openType}
+                      </button>
+                    </div>
                   </div>
                 )}
               </>
