@@ -887,4 +887,47 @@ describe('GET /api/units — pending invite count (S613)', () => {
     const row2 = after.body.data.find((u: any) => u.id === f.aUnitId)
     expect(Number(row2.pending_invite_count ?? row2.pendingInviteCount)).toBe(0)
   })
+
+  // S613 (Nic): "It would only show up back on this list if there's a timeout at
+  // the end of the acceptance flow — if somebody never accepts the invite, then
+  // it would show back as available after a timeout." Seven days.
+  it('an invite that lapsed unaccepted releases the unit again', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await db.query(
+      `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
+       VALUES ($1, $2, $3, 0)`, [f.aLid, f.aUnitId, f.pmUserId])
+
+    // A live invite holds the unit.
+    await db.query(
+      `UPDATE users SET tenant_invite_token='t', tenant_invite_expires_at = NOW() + INTERVAL '7 days'
+        WHERE id = $1`, [f.pmUserId])
+    const live = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowLive = live.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowLive.pending_invite_count ?? rowLive.pendingInviteCount)).toBe(1)
+
+    // Seven days later with no acceptance, the unit is free to offer again.
+    await db.query(
+      `UPDATE users SET tenant_invite_expires_at = NOW() - INTERVAL '1 day' WHERE id = $1`,
+      [f.pmUserId])
+    const lapsed = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const rowLapsed = lapsed.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(rowLapsed.pending_invite_count ?? rowLapsed.pendingInviteCount)).toBe(0)
+  })
+
+  // Accepting CLEARS the token, so "no expiry" means they are in and working
+  // through the lease — the unit must stay held, not spring back to the list.
+  it('an ACCEPTED invite keeps holding the unit while the lease is unfinished', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await db.query(
+      `INSERT INTO pending_lease_drafts (landlord_id, unit_id, tenant_user_id, household_order)
+       VALUES ($1, $2, $3, 0)`, [f.aLid, f.aUnitId, f.pmUserId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_expires_at = NULL WHERE id = $1`,
+      [f.pmUserId])
+    const res = await request(app).get('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+    const row = res.body.data.find((u: any) => u.id === f.aUnitId)
+    expect(Number(row.pending_invite_count ?? row.pendingInviteCount)).toBe(1)
+  })
 })

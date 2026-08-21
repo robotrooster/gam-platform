@@ -52,6 +52,9 @@ export function InviteTenantModal({ onClose }: Props) {
   //   · a unit someone was ALREADY INVITED to, with no lease finished yet.
   //     Inviting thirty households in a sitting, that is how the same space gets
   //     offered to two of them — and nothing on screen would have said so.
+  //     An invite that LAPSES unaccepted (7 days) releases the unit again, so a
+  //     silent invite can never hold a space out of the list forever; one that
+  //     was accepted keeps holding it while the lease is finished.
   //   · an OWNER-OCCUPIED unit, which has no lease at all, so it read as free.
   //   · a unit already holding a signed-but-not-active lease.
   //

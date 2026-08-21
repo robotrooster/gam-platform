@@ -76,8 +76,28 @@ unitsRouter.get('/', async (req, res, next) => {
         -- ACTIVE tenancy, so a unit with an invite out still looked free — and
         -- inviting thirty households in one sitting, that is how the same space
         -- gets offered to two of them.
+        --
+        -- S613 (Nic): "Any pending invites should block things from showing up
+        -- on this list. It would only show up back on this list if there's a
+        -- timeout at the end of the acceptance flow — if somebody never accepts
+        -- the invite, then it would show back as available after a timeout."
+        --
+        -- A tenant invite lives SEVEN days (tenants.ts sets
+        -- tenant_invite_expires_at = NOW() + 7 days). Accepting CLEARS the token
+        -- and the expiry, so the three states are distinguishable and only one
+        -- of them releases the unit:
+        --
+        --   expiry in the future  → invite is live, someone is considering it → BLOCK
+        --   expiry NULL           → they accepted; mid-flow, lease not finished → BLOCK
+        --   expiry in the past    → sent, never accepted, lapsed → RELEASE
+        --
+        -- Without the last case an unaccepted invite would hold a space out of
+        -- the list forever, which is worse than the double-invite it prevents.
         (SELECT COUNT(*)::int FROM pending_lease_drafts pld
-          WHERE pld.unit_id = u.id AND pld.resolved_at IS NULL) AS pending_invite_count
+           JOIN users pu ON pu.id = pld.tenant_user_id
+          WHERE pld.unit_id = u.id AND pld.resolved_at IS NULL
+            AND (pu.tenant_invite_expires_at IS NULL
+                 OR pu.tenant_invite_expires_at > NOW())) AS pending_invite_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
