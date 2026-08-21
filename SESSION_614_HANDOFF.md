@@ -9,8 +9,12 @@ Supersedes SESSION_612_HANDOFF.md.
 
 ## 0. NIC'S IMMEDIATE PATH
 
-1. **Finish the opening reads.** 20 of 20 electric done, 7 of 9 water done —
-   **MH master water meters remain** (Master 22658 Main, Master 22720 Back Row).
+1. **Opening reads are DONE.** All 20 electric submeters and all 7 water
+   submeters are read. The two water MASTERS need no opening read — both are RUBS
+   on the `bill_amount` basis, which divides the provider's invoice total rather
+   than reading an odometer, so `has_baseline` deliberately exempts them. What
+   they need is the **water bill's dollar total entered each cycle**, at billing
+   time, not now.
 2. **Import lease templates**, then invite tenants. Templates first: an invite
    with a unit attached drafts that household's lease from the unit type's
    default template. Without one the invite still sends and drafting catches up
@@ -273,7 +277,7 @@ possible — formatting an already-formatted number leaves it alone.
 | Leases / tenants | **none** |
 | Electric | 20 submeters, all assigned, **all 20 read** |
 | Electric widths | **4-digit:** RV 01, 26, 27, 31, 32, 33, 34, 35, 36, 37 · **5-digit:** RV 02, 03, 20, 22, 23, 24, 25, 28, 29, 30 |
-| Water | 7 submeters (**all read**) + 2 RUBS masters (**not read**), 7-digit |
+| Water | 7 submeters, **all read** · 2 RUBS masters on `bill_amount` — no opening read needed, they take the invoice total each cycle |
 | Water reads | full GALLONS, not face turns — multiplier stays 1 |
 | Trash | flat $25/mo, **1 unit assigned** — worth checking, self-haulers aside |
 | Propane | no rate, no tanks marked |
