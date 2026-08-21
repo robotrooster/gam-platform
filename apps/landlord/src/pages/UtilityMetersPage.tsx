@@ -10,6 +10,9 @@ import { usePerms } from '../lib/permissions'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 // Meter reads are odometer values — display with leading zeros at the
 // meter's own digit width (a cycled-over 6-digit meter reads 000133).
+// S613: `digits` is NULL on anything with no dial (trash, any flat rate). Those
+// have no readings to print, but the fallback keeps a null from becoming NaN
+// padding if one ever reaches here.
 const fmtRead = (v: any, digits: any) => String(Math.trunc(Number(v))).padStart(Number(digits) || METER_READING_DEFAULT_DIGITS, '0')
 const lbl: CSSProperties = { fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }
 

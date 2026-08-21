@@ -772,7 +772,7 @@ export async function seedUtilityMeter(
   params: {
     propertyId: string
     utilityType?: 'water' | 'gas' | 'electric' | 'sewer' | 'trash'
-    billingMethod?: 'submeter' | 'rubs' | 'master_bill_to_landlord'
+    billingMethod?: 'submeter' | 'rubs' | 'master_bill_to_landlord' | 'flat_rate'
     /** Required by the schema for a RUBS master; ignored for anything else. */
     rubsAllocationMethod?: string
   }
@@ -783,14 +783,17 @@ export async function seedUtilityMeter(
   // The option looked available and wasn't.
   const method = params.billingMethod ?? 'submeter'
   const alloc = method === 'rubs' ? (params.rubsAllocationMethod ?? 'occupant_count') : null
+  // S613: nothing is read on trash or on a flat rate, so those carry NO odometer
+  // width — the column is NULL there and the CHECK enforces it. The seed sets it
+  // explicitly for everything else rather than leaning on a default that no
+  // longer exists.
+  const utilityType = params.utilityType ?? 'water'
+  const dialless = utilityType === 'trash' || method === 'flat_rate'
   const res = await client.query<{ id: string }>(
     `INSERT INTO utility_meters
-       (property_id, utility_type, label, billing_method, rubs_allocation_method)
-     VALUES ($1, $2, 'Test Meter', $3, $4) RETURNING id`,
-    [params.propertyId,
-     params.utilityType ?? 'water',
-     method,
-     alloc]
+       (property_id, utility_type, label, billing_method, rubs_allocation_method, digits)
+     VALUES ($1, $2, 'Test Meter', $3, $4, $5) RETURNING id`,
+    [params.propertyId, utilityType, method, alloc, dialless ? null : 6]
   )
   return res.rows[0].id
 }

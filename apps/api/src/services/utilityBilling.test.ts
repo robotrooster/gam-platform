@@ -705,7 +705,9 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
       meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
       await c.query('COMMIT')
     } finally { c.release() }
-    await db.query(`UPDATE utility_meters SET billing_method='flat_rate' WHERE id=$1`, [meterId])
+    // S613: a flat rate has no reading, so it carries no odometer width — the
+    // CHECK enforces NULL there. Flipping a submeter to flat_rate has to drop it.
+    await db.query(`UPDATE utility_meters SET billing_method='flat_rate', digits=NULL WHERE id=$1`, [meterId])
     const { rows: [m] } = await db.query<any>(`SELECT utility_type FROM utility_meters WHERE id=$1`, [meterId])
     await db.query(
       `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
@@ -1187,8 +1189,9 @@ describe('S607: flat-rate meters bill on the per-unit path', () => {
         `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
          VALUES ($1,'trash',28,0)`, [propertyId])
       const r = await c.query(
-        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
-         VALUES ($1,'trash','Trash','flat_rate',6,0) RETURNING id`, [propertyId])
+        // S613: trash has no odometer — the width is NULL and the CHECK says so.
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee)
+         VALUES ($1,'trash','Trash','flat_rate',0) RETURNING id`, [propertyId])
       meterId = r.rows[0].id
       await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [meterId, unitId])
       await c.query('COMMIT')

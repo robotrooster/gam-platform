@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict tj8f6Jg7fhKc0Eu8VHddkQX6dlQO1yWAaRWDymCBLlyfrLZTGnb6nAx6PtuwhnI
+\restrict 7XMHuixwfLCw4dEcTInshnelRqisfWOM0WBtZDxBAbB3D9TXYFN8t2Vgq3jmKhf
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8895,7 +8895,7 @@ CREATE TABLE public.utility_meters (
     rubs_allocation_method text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    digits integer DEFAULT 6 NOT NULL,
+    digits integer,
     sewer_rate_per_unit numeric,
     out_of_service boolean DEFAULT false NOT NULL,
     out_of_service_since date,
@@ -8905,13 +8905,24 @@ CREATE TABLE public.utility_meters (
     rubs_weights jsonb,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
-    CONSTRAINT utility_meters_digits_check CHECK ((digits = ANY (ARRAY[4, 5, 6, 7, 8]))),
+    CONSTRAINT utility_meters_digits_check CHECK (
+CASE
+    WHEN ((utility_type = 'trash'::text) OR (billing_method = 'flat_rate'::text)) THEN (digits IS NULL)
+    ELSE (digits = ANY (ARRAY[4, 5, 6, 7, 8]))
+END),
     CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'rented_spaces'::text, 'fixture_count'::text, 'unit_type_weight'::text, 'hybrid'::text]))),
     CONSTRAINT utility_meters_rubs_basis_check CHECK ((rubs_basis = ANY (ARRAY['usage_rate'::text, 'bill_amount'::text]))),
     CONSTRAINT utility_meters_rubs_exclusion_mode_check CHECK ((rubs_exclusion_mode = ANY (ARRAY['usage'::text, 'dollars'::text]))),
     CONSTRAINT utility_meters_rubs_submeter_rate_check CHECK ((rubs_submeter_rate = ANY (ARRAY['property_rate'::text, 'blended'::text]))),
     CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
+
+
+--
+-- Name: COLUMN utility_meters.digits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.digits IS 'S613: how many windows are on the METER FACE — not how long a reading is. Used only to work out the wrap when a meter passes its ceiling, and to bound what can be entered. NULL where nothing is read: trash, and any flat rate.';
 
 
 --
@@ -23444,5 +23455,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict tj8f6Jg7fhKc0Eu8VHddkQX6dlQO1yWAaRWDymCBLlyfrLZTGnb6nAx6PtuwhnI
+\unrestrict 7XMHuixwfLCw4dEcTInshnelRqisfWOM0WBtZDxBAbB3D9TXYFN8t2Vgq3jmKhf
 

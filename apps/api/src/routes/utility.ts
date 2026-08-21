@@ -260,7 +260,12 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
         [body.propertyId, body.utilityType, body.label, body.billingMethod,
          body.ratePerUnit ?? null, body.baseFee,
-         body.rubsAllocationMethod ?? null, body.digits, body.sewerRatePerUnit ?? null,
+         body.rubsAllocationMethod ?? null,
+         // S613 (Nic): "There needs to be no digits at all ever selectable on
+         // trash, because that's not a thing." Nothing is read on trash or on a
+         // flat rate, so the width is NULL rather than a default nobody meant.
+         (body.utilityType === 'trash' || body.billingMethod === 'flat_rate') ? null : body.digits,
+         body.sewerRatePerUnit ?? null,
          body.rubsBasis ?? 'usage_rate',
          body.rubsSubmeterRate ?? 'property_rate',
          body.rubsExclusionMode ?? 'usage',
@@ -390,6 +395,15 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
 
     // Shrinking the width below an existing reading would corrupt the
     // rollover math (a stored 45210 can't live on a 4-digit meter).
+    // S613: a width can't be set on something with no dial. Refused out loud —
+    // an ignored setting is how a landlord ends up believing a number that
+    // isn't true of his property.
+    if (body.digits != null && (nextUtility === 'trash' || nextMethod === 'flat_rate')) {
+      throw new AppError(400,
+        nextUtility === 'trash'
+          ? 'Trash has no meter to read — it is a flat charge per household, or the hauler’s bill split across the units on it. There is no odometer size to set.'
+          : 'A flat charge has no reading, so it has no odometer size.')
+    }
     if (body.digits != null) {
       const maxRead = await queryOne<{ max: string | null }>(
         `SELECT MAX(reading_value) AS max FROM utility_meter_readings WHERE meter_id = $1`,
@@ -407,7 +421,14 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         rate_per_unit = COALESCE($2, rate_per_unit),
         base_fee = COALESCE($3, base_fee),
         rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
-        digits = COALESCE($6, digits),
+        -- S613: a meter that BECOMES trash or a flat rate loses its width (the
+        -- constraint requires NULL there); one that stops being either needs a
+        -- width again, so it falls back to the default rather than failing the
+        -- save with a constraint error the landlord can do nothing about.
+        digits = CASE
+          WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
+          ELSE COALESCE($6, digits, 6)
+        END,
         sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
         rubs_basis = COALESCE($11, rubs_basis),
         rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
@@ -438,6 +459,9 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
         body.utilityType ?? null,
         body.billingMethod ?? null,
+        // $18/$19: what the meter is BECOMING, for the digits rule above.
+        nextUtility,
+        nextMethod,
       ])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
