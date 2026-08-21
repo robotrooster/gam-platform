@@ -1207,10 +1207,13 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
               </span>
               {/* The price lives on the property rate, not the row — see the
                   anti-discrimination note in services/utilityBilling. */}
-              <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-                {rateFor(m.utilityType) ? `${fmt(rateFor(m.utilityType).ratePerUnit)}/mo — ` : ''}
-                the property rate, same for everyone on it
-              </span>
+              {/* S613 (Nic): "Say one household uses a lot of trash and they
+                  actually have a second can — is there a way to toggle can count
+                  times the property rate?" Quantity, never price: the amount is
+                  the property's and identical for everyone, and what differs is
+                  how many of the service this unit takes. */}
+              <QuantityStepper meter={m} unitId={unitId} propertyId={propertyId}
+                rate={rateFor(m.utilityType)?.ratePerUnit} />
               <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
                 disabled={toggleMut.isLoading}
                 onClick={() => appConfirm(
@@ -1371,6 +1374,44 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
         <OpeningReadModal meter={baselineFor} onClose={() => setBaselineFor(null)} onSaved={() => { invalidate(); setBaselineFor(null) }} />
       )}
     </div>
+  )
+}
+
+// S613 (Nic): how many of a flat-rate service this unit receives — two trash
+// cans, two parking spaces. It multiplies the PROPERTY rate, so everybody still
+// pays the same price per can and nobody can be charged a different amount for
+// the same thing (the S609 anti-discrimination rule the flat amount exists to
+// enforce). The invoice line says "2 × $25.00" so the tenant is never left
+// working out why their trash doubled.
+function QuantityStepper({ meter, unitId, propertyId, rate }: {
+  meter: any; unitId: string; propertyId: string; rate?: any
+}) {
+  const qc = useQueryClient()
+  const { can } = usePerms()
+  const qty = Number(meter.unitQuantities?.[unitId] ?? 1)
+  const save = useMutation(
+    (n: number) => apiPatch(`/utility/meters/${meter.id}/units/${unitId}`, { quantity: n }),
+    {
+      onSuccess: () => qc.invalidateQueries(['utility-meters', propertyId]),
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change that'),
+    },
+  )
+  const each = rate != null ? Number(rate) : null
+  const editable = can('schedule.configure_unit')
+
+  return (
+    <span style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+      {editable && (
+        <select className="input" value={qty} disabled={save.isLoading}
+          style={{ width: 56, padding: '1px 4px', fontSize: '.7rem' }}
+          onChange={e => save.mutate(Number(e.target.value))}>
+          {Array.from({ length: 10 }, (_, i) => i + 1).map(n => <option key={n} value={n}>×{n}</option>)}
+        </select>
+      )}
+      {each != null
+        ? <>{qty > 1 ? <>{qty} × {fmt(each)} = <strong style={{ color: 'var(--text-1)' }}>{fmt(each * qty)}</strong>/mo</> : <>{fmt(each)}/mo</>} — the property rate, same for everyone on it</>
+        : <>the property rate, same for everyone on it</>}
+    </span>
   )
 }
 

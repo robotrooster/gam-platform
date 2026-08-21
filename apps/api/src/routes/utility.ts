@@ -127,6 +127,10 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
         -- W-36 (S531): assigned unit ids ride along so the management UI can
         -- render/edit assignments without an N+1 per meter.
         ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids,
+        -- S613: {unitId: count} for a flat charge, so the unit page can show
+        -- "2 cans × $25" without a second round trip.
+        COALESCE((SELECT jsonb_object_agg(mu.unit_id::text, mu.quantity)
+                    FROM utility_meter_units mu WHERE mu.meter_id = m.id), '{}'::jsonb) AS unit_quantities,
         -- S613 (Nic): units on this meter whose ACTIVE lease doesn't bill this
         -- utility back. They are configured perfectly and bill nothing, and the
         -- run says so only as a count of unitsSkipped. Surfaced so a landlord
@@ -653,6 +657,36 @@ utilityRouter.post('/meters/:id/bill-back', requirePerm('properties.edit'), asyn
        RETURNING lease_id`,
       [req.params.id, meter.utility_type, req.user!.userId, note ?? null])
     res.json({ success: true, data: { leasesUpdated: rows.length } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/utility/meters/:id/units/:unitId — S613 (Nic): how many of this
+// service the unit takes. "Say one household uses a lot of trash and they
+// actually have a second can — is there a way to toggle can count times the
+// property rate for their bill?"
+//
+// Quantity only, never price. The amount stays the property's, identical for
+// everyone (S609 anti-discrimination); what differs is how many cans get
+// emptied. Flat charges only: on a submeter or a RUBS master the usage already
+// carries how much the unit used, and multiplying it would double-count.
+utilityRouter.patch('/meters/:id/units/:unitId', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { quantity } = z.object({ quantity: z.number().int().min(1).max(99) }).parse(req.body)
+    const meter = await queryOne<any>(
+      `SELECT m.*, p.landlord_id FROM utility_meters m
+         JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
+    if (!meter) throw new AppError(404, 'Meter not found')
+    if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (meter.billing_method !== 'flat_rate') {
+      throw new AppError(400,
+        'A count only applies to a flat charge. On a meter, usage already reflects how much this unit used.')
+    }
+    const row = await queryOne<any>(
+      `UPDATE utility_meter_units SET quantity = $3
+        WHERE meter_id = $1 AND unit_id = $2 RETURNING *`,
+      [req.params.id, req.params.unitId, quantity])
+    if (!row) throw new AppError(404, 'That unit is not on this charge')
+    res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
 

@@ -438,12 +438,16 @@ async function runGeneration(
       const utilityBills = await query<{
         id: string
         charge_amount: string
+        allocation_method: string
+        allocation_basis: string | null
+        rate_per_unit: string | null
         // S613: which utility this row is, so a work-trade agreement can cover
         // electric and exclude propane. Already SELECTed below; it just was not
         // in the type.
         utility_type: string
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
+                ub.allocation_method, ub.allocation_basis, ub.rate_per_unit,
                 ub.utility_type, ub.usage_amount, ub.reading_start, ub.reading_end,
                 ub.reading_start_date, ub.reading_end_date,
                 m.digits
@@ -677,7 +681,12 @@ async function runGeneration(
             : ''
           const readNote = (ub as any).reading_start != null && (ub as any).reading_end != null
             ? `${((ub as any).utility_type || 'utility')[0].toUpperCase() + ((ub as any).utility_type || 'utility').slice(1)} meter ${pad((ub as any).reading_start)} → ${pad((ub as any).reading_end)}${dateNote} · ${Number((ub as any).usage_amount || 0).toLocaleString()} ${UNIT_LABEL[(ub as any).utility_type] || 'units'}`
-            : null
+            // S613: a flat charge billed more than once says so on the line. A
+            // household with a second trash can sees "2 × $25.00", not a $50
+            // charge they have to phone up about.
+            : (ub as any).allocation_method === 'flat_rate' && Number((ub as any).allocation_basis || 1) > 1
+              ? `${Number((ub as any).allocation_basis)} × $${Number((ub as any).rate_per_unit || 0).toFixed(2)}`
+              : null
           const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
           const utilityPayment = await client.query<{ id: string }>(
             `INSERT INTO payments (

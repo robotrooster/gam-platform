@@ -450,6 +450,9 @@ export async function generateBillsForMeter(
   const units = await query<any>(`
     SELECT u.id AS unit_id, u.unit_number, u.sqft, u.bedrooms,
            u.unit_type, u.rv_amp_service, u.water_fixture_count,
+           -- S613: how many of this service the unit takes (2 trash cans).
+           -- Multiplies a FLAT charge only; usage already carries it elsewhere.
+           mu.quantity,
            -- S609: an owner-occupied unit takes a real share of the pool that
            -- the LANDLORD absorbs, so the basis needs to know which units those
            -- are and how many people live in them.
@@ -529,11 +532,17 @@ export async function generateBillsForMeter(
       // S613: an owner-occupied unit on a flat charge — the landlord's own
       // household still has the trash can, and the service is still paid for.
       // Recorded, billed to nobody.
+      // S613: everyone pays the same price per can; a unit with two cans pays
+      // for two. The quantity rides the bill as its allocation basis so the
+      // invoice line, and anyone auditing it later, can see WHY the amount is a
+      // multiple of the property rate.
+      const qty = Math.max(1, Number(unit.quantity ?? 1))
+      const unitCharge = round2(flatAmount * qty)
       if (unit.status === 'owner_use') {
         await recordOwnerUseAbsorption({
           unitId: unit.unit_id, utilityType: meter.utility_type,
-          chargeAmount: flatAmount, allocationMethod: 'flat_rate', allocationBasis: null,
-          baseFeeShare: flatAmount,
+          chargeAmount: unitCharge, allocationMethod: 'flat_rate', allocationBasis: qty,
+          baseFeeShare: unitCharge,
           notes: 'Owner-occupied unit — the flat charge for this service, absorbed by the landlord and billed to nobody.',
         })
         skipped++
@@ -545,10 +554,10 @@ export async function generateBillsForMeter(
         cycleMonth: cycleIso,
         usageAmount: null,
         allocationMethod: 'flat_rate',
-        allocationBasis: null,
-        ratePerUnit: 0,
-        baseFeeShare: flatAmount,
-        chargeAmount: flatAmount,
+        allocationBasis: qty,
+        ratePerUnit: flatAmount,
+        baseFeeShare: unitCharge,
+        chargeAmount: unitCharge,
         taxRatePct,
       })
       if (inserted) created++; else skipped++

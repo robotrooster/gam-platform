@@ -781,6 +781,52 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
     expect(rows[0].n).toBe(1)
   })
 
+  // S613 (Nic): "Say one household uses a lot of trash and they actually have a
+  // second can. Is there a way to toggle can count times the property rate?"
+  it('a unit with 2 cans is billed twice the property rate, once', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)   // $25 a can, property-wide
+    const one = await seedUnitWithActiveTenant(base)
+    const two = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(meterId, one.unitId)
+    await attachMeterToUnit(meterId, two.unitId)
+    await db.query(
+      `UPDATE utility_meter_units SET quantity = 2 WHERE meter_id = $1 AND unit_id = $2`,
+      [meterId, two.unitId])
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(2)
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount, allocation_basis, rate_per_unit
+         FROM utility_bills WHERE meter_id = $1`, [meterId])
+    const oneCan = rows.find((r: any) => r.unit_id === one.unitId)
+    const twoCan = rows.find((r: any) => r.unit_id === two.unitId)
+    expect(Number(oneCan.charge_amount)).toBe(25)
+    expect(Number(twoCan.charge_amount)).toBe(50)
+    // The multiple is ON the bill, so the invoice line can say "2 × $25.00"
+    // and an audit can see why one unit paid double.
+    expect(Number(twoCan.allocation_basis)).toBe(2)
+    expect(Number(twoCan.rate_per_unit)).toBe(25)
+    // Same PRICE per can for both — the anti-discrimination rule is intact.
+    expect(Number(oneCan.rate_per_unit)).toBe(25)
+  })
+
+  it('an owner-occupied unit with 2 cans absorbs both', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)
+    const owner = await seedUnitWithActiveTenant(base)
+    await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
+    await attachMeterToUnit(meterId, owner.unitId)
+    await db.query(
+      `UPDATE utility_meter_units SET quantity = 2 WHERE meter_id = $1 AND unit_id = $2`,
+      [meterId, owner.unitId])
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount FROM utility_owner_use_absorptions WHERE meter_id=$1`, [meterId])
+    expect(Number(rows[0].charge_amount)).toBe(50)
+  })
+
   it('tenant_responsible=FALSE → that unit is skipped', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedFlatMeter(base, 20)

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict BejdC4NktCnJM0ZyJbBLlLcb7p6cNeps21grbGHXShVmamW9NVnHSVgC08sW7Sj
+\restrict euomturIgJJ9LNddTeZFlhj6ptUV88jihE2YFAhfO6sFA9PgsAkUosgmzWd2fax
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8814,8 +8814,17 @@ COMMENT ON COLUMN public.utility_meter_readings.bill_amount IS 'S607: RUBS maste
 CREATE TABLE public.utility_meter_units (
     meter_id uuid NOT NULL,
     unit_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    quantity integer DEFAULT 1 NOT NULL,
+    CONSTRAINT utility_meter_units_quantity_check CHECK (((quantity >= 1) AND (quantity <= 99)))
 );
+
+
+--
+-- Name: COLUMN utility_meter_units.quantity; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meter_units.quantity IS 'S613: how many of this service the unit receives (e.g. 2 trash cans). Multiplies a FLAT-RATE charge only — metered and RUBS meters ignore it, since usage already reflects how much a unit used.';
 
 
 --
@@ -23303,5 +23312,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict BejdC4NktCnJM0ZyJbBLlLcb7p6cNeps21grbGHXShVmamW9NVnHSVgC08sW7Sj
+\unrestrict euomturIgJJ9LNddTeZFlhj6ptUV88jihE2YFAhfO6sFA9PgsAkUosgmzWd2fax
 
