@@ -194,6 +194,10 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
         d => (METER_READING_DIGIT_OPTIONS as readonly number[]).includes(d),
         `digits must be one of ${METER_READING_DIGIT_OPTIONS.join(', ')}`,
       ).default(METER_READING_DEFAULT_DIGITS),
+      // S613 (Nic): what ONE turn of the last digit on the FACE is worth. A
+      // water register that counts per hundred gallons is 100 — 413 on the dial
+      // is 41,300 gallons. Reads stay the face; only usage multiplies.
+      readingMultiplier: z.number().positive().max(100000).optional(),
       // Sewer rides the water meter (S533) — same reading bills sewer
       // at this rate. Water meters only; there is no sewer meter.
       sewerRatePerUnit: z.number().nonnegative().nullable().optional(),
@@ -268,8 +272,8 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
         INSERT INTO utility_meters
           (property_id, utility_type, label, billing_method, rate_per_unit,
            base_fee, rubs_allocation_method, digits, sewer_rate_per_unit, rubs_basis,
-           rubs_submeter_rate, rubs_exclusion_mode, rubs_weights)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+           rubs_submeter_rate, rubs_exclusion_mode, rubs_weights, reading_multiplier)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
         [body.propertyId, body.utilityType, body.label, body.billingMethod,
          body.ratePerUnit ?? null, body.baseFee,
          body.rubsAllocationMethod ?? null,
@@ -281,7 +285,10 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
          body.rubsBasis ?? 'usage_rate',
          body.rubsSubmeterRate ?? 'property_rate',
          body.rubsExclusionMode ?? 'usage',
-         body.rubsWeights ? JSON.stringify(body.rubsWeights) : null])
+         body.rubsWeights ? JSON.stringify(body.rubsWeights) : null,
+         // S613: what one turn of the last digit is worth. 1 unless the face
+         // counts in hundreds (a per-hundred-gallon water register).
+         body.readingMultiplier ?? 1])
       meter = created.rows[0]
 
       // Stamped as reason 'baseline' rather than 'monthly_cycle': it is the
@@ -346,6 +353,9 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         d => (METER_READING_DIGIT_OPTIONS as readonly number[]).includes(d),
         `digits must be one of ${METER_READING_DIGIT_OPTIONS.join(', ')}`,
       ).optional(),
+      // S613 (Nic): what ONE turn of the last digit is worth. A water face that
+      // counts per hundred gallons is 100. Reads stay the face; usage multiplies.
+      readingMultiplier: z.number().positive().max(100000).optional(),
       sewerRatePerUnit: z.number().nonnegative().nullable().optional(),
       // S559: mark a meter broken/repaired. Broken meters bill the lowest
       // comparable usage and are never flagged for reread. Stamps the "since"
@@ -437,6 +447,7 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         -- constraint requires NULL there); one that stops being either needs a
         -- width again, so it falls back to the default rather than failing the
         -- save with a constraint error the landlord can do nothing about.
+        reading_multiplier = COALESCE($20, reading_multiplier),
         digits = CASE
           WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
           ELSE COALESCE($6, digits, 6)
@@ -474,6 +485,7 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         // $18/$19: what the meter is BECOMING, for the digits rule above.
         nextUtility,
         nextMethod,
+        body.readingMultiplier ?? null,
       ])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

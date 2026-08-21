@@ -47,11 +47,20 @@ export interface GenerateBillsResult {
 }
 
 /** Pure usage math shared by the submeter branch and the S558 RUBS exclusion:
- *  cycle − prior, with odometer-rollover handling when the wrap was stamped. */
-function cycleUsageFromReadings(cycleVal: number, priorVal: number, isRollover: boolean, digits: number): number {
+ *  cycle − prior, with odometer-rollover handling when the wrap was stamped.
+ *
+ *  S613 (Nic): the difference is in FACE TURNS; the multiplier converts it to
+ *  billing units. A water face that counts per hundred gallons reads 413 → 415
+ *  for 200 gallons, and billing at a penny a gallon has to see 200, not 2.
+ *  Rollover uses the FACE modulus, so the wrap is computed before the multiply —
+ *  a 7-digit face wraps at 10^7 turns whatever each turn is worth. */
+function cycleUsageFromReadings(
+  cycleVal: number, priorVal: number, isRollover: boolean, digits: number,
+  multiplier = 1,
+): number {
   let usage = cycleVal - priorVal
   if (usage < 0 && isRollover) usage = (meterReadingModulus(digits) - priorVal) + cycleVal
-  return usage
+  return usage * (multiplier > 0 ? multiplier : 1)
 }
 
 /** S558/S605: a linked submeter's usage for the cycle, for RUBS pool exclusion.
@@ -74,8 +83,9 @@ function cycleUsageFromReadings(cycleVal: number, priorVal: number, isRollover: 
 async function submeterCycleUsageForExclusion(
   meterId: string, cycleIso: string,
 ): Promise<{ usage: number; estimated?: string }> {
-  const m = await queryOne<{ digits: number; label: string; out_of_service: boolean; utility_type: string; property_id: string }>(
-    `SELECT digits, label, out_of_service, utility_type, property_id FROM utility_meters WHERE id = $1`, [meterId])
+  const m = await queryOne<{ digits: number; label: string; out_of_service: boolean; utility_type: string; property_id: string; reading_multiplier: string }>(
+    `SELECT digits, label, out_of_service, utility_type, property_id, reading_multiplier
+       FROM utility_meters WHERE id = $1`, [meterId])
   if (!m) return { usage: 0, estimated: 'linked submeter not found' }
   // Broken submeter (S559): no real read, but it must NOT block the RUBS
   // pool. Its excluded amount is what it actually bills — the lowest
@@ -100,7 +110,8 @@ async function submeterCycleUsageForExclusion(
       ORDER BY reading_date DESC, created_at DESC LIMIT 1`, [meterId, cur.reading_date, cur.created_at])
   if (!prior) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" has no opening read`)
   const usage = cycleUsageFromReadings(
-    Number(cur.reading_value), Number(prior.reading_value), !!cur.is_rollover, m.digits)
+    Number(cur.reading_value), Number(prior.reading_value), !!cur.is_rollover, m.digits,
+    Number(m.reading_multiplier ?? 1))
   if (usage < 0) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" read lower than the previous read`)
   return { usage }
 }
@@ -138,7 +149,11 @@ async function lowestComparableUsage(args: {
   unitType: string | null; rvAmpService: string | null; cycleIso: string;
 }): Promise<number | null> {
   const run = (matchType: boolean) => query<{ usage: string }>(`
-    SELECT (cyc.reading_value - pri.reading_value) AS usage
+    -- S613: comparable usage is in BILLING UNITS, not face turns. Each meter
+    -- carries its own multiplier, so a park mixing per-gallon and per-hundred
+    -- faces still compares like with like — without this, a broken meter on a
+    -- per-hundred face would be estimated at a hundredth of the real usage.
+    SELECT (cyc.reading_value - pri.reading_value) * cm.reading_multiplier AS usage
       FROM utility_meters cm
       JOIN utility_meter_units cmu ON cmu.meter_id = cm.id
       JOIN units cu ON cu.id = cmu.unit_id
@@ -666,7 +681,7 @@ export async function generateBillsForMeter(
     // the meter's range) or by the landlord's double-check confirmation.
     const usage = cycleUsageFromReadings(
       Number(cycleReading.reading_value), Number(priorReading.reading_value),
-      !!cycleReading.is_rollover, meter.digits)
+      !!cycleReading.is_rollover, meter.digits, Number(meter.reading_multiplier ?? 1))
     if (usage < 0) {
       return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
         reason: `negative usage (${usage}) — awaiting reading double-check` }
@@ -1083,7 +1098,8 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
   if (isRollover && priorVal < meterReadingModulus(digits) * 0.9) {
     return { billed: false, reason: 'move-out read is below the previous read but the meter was not near its ceiling — likely a mis-entered reading, not a rollover; please re-check the number' }
   }
-  const usage = cycleUsageFromReadings(cur, priorVal, isRollover, digits)
+  const usage = cycleUsageFromReadings(cur, priorVal, isRollover, digits,
+    Number(meter.reading_multiplier ?? 1))
 
   const units = await query<any>(`SELECT u.id AS unit_id FROM utility_meter_units mu JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = $1`, [meterId])
   const cycleIso = String(read.billing_cycle_month).slice(0, 10)

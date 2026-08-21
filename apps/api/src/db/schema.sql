@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict d6qnriud2Tg3w2XpZw4GFyTTDvN9zdaCtXLi8kGU9CdEcxxXVwxUDZqRTjVzh9W
+\restrict 2tjpw2BnoecgdRuGRhJECI3PgBiyGDKqqNpgbuiE6TlauqGrQrl9G5ZxEEA9qXU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8850,6 +8850,7 @@ CREATE TABLE public.utility_meters (
     rubs_submeter_rate text DEFAULT 'property_rate'::text NOT NULL,
     rubs_exclusion_mode text DEFAULT 'usage'::text NOT NULL,
     rubs_weights jsonb,
+    reading_multiplier numeric(10,4) DEFAULT 1 NOT NULL,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
     CONSTRAINT utility_meters_digits_check CHECK (
@@ -8857,6 +8858,7 @@ CASE
     WHEN ((utility_type = 'trash'::text) OR (billing_method = 'flat_rate'::text)) THEN (digits IS NULL)
     ELSE (digits = ANY (ARRAY[4, 5, 6, 7, 8]))
 END),
+    CONSTRAINT utility_meters_reading_multiplier_check CHECK ((reading_multiplier > (0)::numeric)),
     CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'rented_spaces'::text, 'fixture_count'::text, 'unit_type_weight'::text, 'hybrid'::text]))),
     CONSTRAINT utility_meters_rubs_basis_check CHECK ((rubs_basis = ANY (ARRAY['usage_rate'::text, 'bill_amount'::text]))),
     CONSTRAINT utility_meters_rubs_exclusion_mode_check CHECK ((rubs_exclusion_mode = ANY (ARRAY['usage'::text, 'dollars'::text]))),
@@ -8898,6 +8900,13 @@ COMMENT ON COLUMN public.utility_meters.rubs_exclusion_mode IS 'S607: how a RUBS
 --
 
 COMMENT ON COLUMN public.utility_meters.rubs_weights IS 'S607: configuration for the allocation bases that need one. unit_type_weight: {unit_type: weight}. weighted_occupancy: {first, additional}. hybrid: {primary, secondary, primaryPct}. NULL elsewhere.';
+
+
+--
+-- Name: COLUMN utility_meters.reading_multiplier; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.reading_multiplier IS 'S613: what ONE turn of the last digit on the FACE is worth in billing units. 1 = the face is already gallons/kWh. 100 = a face that counts per hundred gallons (413 on the dial = 41,300 gallons). Reads are entered and shown as the face; only usage is multiplied.';
 
 
 --
@@ -23319,5 +23328,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict d6qnriud2Tg3w2XpZw4GFyTTDvN9zdaCtXLi8kGU9CdEcxxXVwxUDZqRTjVzh9W
+\unrestrict 2tjpw2BnoecgdRuGRhJECI3PgBiyGDKqqNpgbuiE6TlauqGrQrl9G5ZxEEA9qXU
 

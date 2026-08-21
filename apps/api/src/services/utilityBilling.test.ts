@@ -1460,3 +1460,57 @@ describe('S609 trash billed as RUBS, not only flat rate', () => {
     }
   })
 })
+
+// S613 (Nic): a water face that counts in HUNDREDS of gallons.
+//
+//   "The four thirteen — the meter only counts over every hundred gallons, so
+//    the four thirteen is really forty one thousand three hundred."
+//
+// He reads and records the FACE. Billing has to see gallons, or a penny-a-gallon
+// charge comes out 100x light — $0.26 where the tenant owes $26.
+describe('reading multiplier (S613)', () => {
+  async function meterWithMultiplier(base: BaseCtx, multiplier: number): Promise<string> {
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(
+      `UPDATE utility_meters SET rate_per_unit = 0.01, reading_multiplier = $2, digits = 7 WHERE id = $1`,
+      [meterId, multiplier])
+    return meterId
+  }
+
+  it('bills the FACE difference times the multiplier', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterWithMultiplier(base, 100)
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(meterId, u.unitId)
+
+    // Face 413 -> 415 is two turns = 200 gallons at a penny = $2.00.
+    await seedReading(meterId, '2026-03-01', 413, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 415, base.landlordUserId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(
+      `SELECT usage_amount, charge_amount FROM utility_bills WHERE meter_id = $1`, [meterId])
+    expect(Number(rows[0].usage_amount)).toBe(200)
+    expect(Number(rows[0].charge_amount)).toBe(2)
+  })
+
+  it('a multiplier of 1 is unchanged — every meter that exists today', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterWithMultiplier(base, 1)
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(meterId, u.unitId)
+    await seedReading(meterId, '2026-03-01', 1000, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 1200, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    const { rows } = await db.query<any>(
+      `SELECT usage_amount FROM utility_bills WHERE meter_id = $1`, [meterId])
+    expect(Number(rows[0].usage_amount)).toBe(200)
+  })
+})
