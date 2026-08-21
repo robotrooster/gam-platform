@@ -1285,7 +1285,9 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
             <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.72rem' }}
               title="Correct this opening read"
               onClick={() => setBaselineFor(m)}>
-              opened at <span className="mono" style={{ color: 'var(--text-1)' }}>{Number(m.openingRead.value)}</span>
+              opened at <span className="mono" style={{ color: 'var(--text-1)' }}>
+                {String(Math.trunc(Number(m.openingRead.value))).padStart(Number(m.digits) || 6, '0')}
+              </span>
               <Pencil size={11} style={{ marginLeft: 5, color: 'var(--text-3)' }} />
             </button>
           )}
@@ -1537,7 +1539,9 @@ function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: ()
   // what is on record, because a landlord fixing a typo needs to see the wrong
   // number to know which digit he fat-fingered.
   const existing = meter.openingRead ?? null
-  const [value, setValue] = useState(existing ? String(Number(existing.value)) : '')
+  // S613 (Nic): padded to the meter face — he is comparing this to the dial.
+  const [value, setValue] = useState(existing
+    ? String(Math.trunc(Number(existing.value))).padStart(Number(meter.digits) || 6, '0') : '')
   const [date, setDate] = useState(() =>
     existing?.date ? String(existing.date).slice(0, 10) : new Date().toISOString().slice(0, 8) + '01')
   const [err, setErr] = useState('')
@@ -1559,7 +1563,7 @@ function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: ()
         <div className="modal-title">{existing ? 'Correct the opening read' : 'Opening read'} — {meter.label}</div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.55 }}>
           {existing
-            ? <>Currently on record as <strong className="mono">{Number(existing.value)}</strong>. Enter
+            ? <>Currently on record as <strong className="mono">{String(Math.trunc(Number(existing.value))).padStart(Number(meter.digits) || 6, '0')}</strong>. Enter
                 what the meter face actually reads. Nothing has billed from it yet, so correcting it
                 is safe — the change is kept on the record either way.</>
             : <>Usage is the difference between two reads, so this meter can&apos;t bill until it has a
@@ -1567,9 +1571,12 @@ function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: ()
                 <strong> date it before the reads you want to bill</strong>.</>}
         </div>
         <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-          <input className="input" type="number" value={value} autoFocus
-            onChange={e => setValue(e.target.value)}
-            placeholder={`${meter.digits}-digit read`} style={{ flex: 2 }} />
+          {/* S613: TEXT, so a padded 0000400 survives being edited — a number
+              input drops the leading zeros as soon as you touch it. */}
+          <input className="input mono" type="text" inputMode="numeric" value={value} autoFocus
+            maxLength={Number(meter.digits) || 8}
+            onChange={e => setValue(e.target.value.replace(/\D/g, '').slice(0, Number(meter.digits) || 8))}
+            placeholder={`${meter.digits}-digit read`} style={{ flex: 2, letterSpacing: '.08em' }} />
           <input className="input" type="date" value={date}
             onChange={e => setDate(e.target.value)} style={{ flex: 1 }} />
         </div>

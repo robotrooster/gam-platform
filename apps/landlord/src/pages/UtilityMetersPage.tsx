@@ -1616,7 +1616,7 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   function BaselineFixer({ m }: { m: any }) {
     const existing = m.openingRead ?? null
     const [open, setOpen] = useState(false)
-    const [value, setValue] = useState(existing ? String(Number(existing.value)) : '')
+    const [value, setValue] = useState(existing ? fmtRead(existing.value, m.digits) : '')
     const [date, setDate] = useState(() =>
       existing?.date ? String(existing.date).slice(0, 10) : new Date().toISOString().slice(0, 8) + '01')
     const [err, setErr] = useState('')
@@ -1643,14 +1643,28 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
           <button className={`btn btn-sm ${existing ? 'btn-ghost' : 'btn-primary'}`} style={{ marginTop: 6 }}
             onClick={() => setOpen(true)}>
             {existing
-              ? <>Opened at <span className="mono" style={{ color: 'var(--text-1)' }}>{Number(existing.value)}</span> <Pencil size={11} /></>
+              // S613 (Nic): PADDED to the meter face. "It's saying opened at
+              // four hundred, opened at four thirteen. It's not showing all the
+              // zeros before it, which is gonna mess up the next read." The
+              // stored number is right and the arithmetic never cared about
+              // leading zeros — but a landlord checking 27 reads against 27
+              // dials is comparing what he sees here to what is painted on the
+              // meter, and 400 does not look like 0000400. fmtRead has padded
+              // every other read on this page since S533; this one skipped it.
+              ? <>Opened at <span className="mono" style={{ color: 'var(--text-1)' }}>{fmtRead(existing.value, m.digits)}</span> <Pencil size={11} /></>
               : <><Plus size={13} /> Add opening read</>}
           </button>
         ) : (
           <div style={{ marginTop: 6 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <input className="input input-sm" type="number" value={value} autoFocus
-                onChange={e => setValue(e.target.value)} placeholder={`${m.digits}-digit read`} style={{ width: 150 }} />
+              {/* S613: TEXT, not number — a number input normalises away the
+                  leading zeros as you type, so a padded 0000400 would collapse
+                  to 400 the moment you touched it. Digits only, capped at the
+                  meter face, matching how the reading-run walk takes a read. */}
+              <input className="input input-sm mono" type="text" inputMode="numeric" value={value} autoFocus
+                maxLength={Number(m.digits) || 8}
+                onChange={e => setValue(e.target.value.replace(/\D/g, '').slice(0, Number(m.digits) || 8))}
+                placeholder={`${m.digits}-digit read`} style={{ width: 150, letterSpacing: '.08em' }} />
               <input className="input input-sm" type="date" value={date}
                 onChange={e => setDate(e.target.value)} style={{ width: 150 }} />
               <button className="btn btn-primary btn-sm" disabled={value === '' || save.isLoading}
