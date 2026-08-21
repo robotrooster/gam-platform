@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict RFDhlzlBgWOG1JDgpQqVnSHy1Py5sxZyQxMKoK3NZWfgNWu4WeJTHjROfiff3GI
+\restrict e0FfDpNfoGBDcHqvLON1L9GigQQ0D5z5bABJF7erm8MUSxcaHRQHnZL7wGcMGtz
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4509,7 +4509,7 @@ CREATE TABLE public.lease_utility_responsibilities (
     utility_type text NOT NULL,
     tenant_responsible boolean NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT lease_utility_responsibilities_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
+    CONSTRAINT lease_utility_responsibilities_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
 
 
@@ -8889,7 +8889,7 @@ CREATE TABLE public.utility_meters (
     CONSTRAINT utility_meters_rubs_basis_check CHECK ((rubs_basis = ANY (ARRAY['usage_rate'::text, 'bill_amount'::text]))),
     CONSTRAINT utility_meters_rubs_exclusion_mode_check CHECK ((rubs_exclusion_mode = ANY (ARRAY['usage'::text, 'dollars'::text]))),
     CONSTRAINT utility_meters_rubs_submeter_rate_check CHECK ((rubs_submeter_rate = ANY (ARRAY['property_rate'::text, 'blended'::text]))),
-    CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
+    CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
 
 
@@ -23415,5 +23415,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict RFDhlzlBgWOG1JDgpQqVnSHy1Py5sxZyQxMKoK3NZWfgNWu4WeJTHjROfiff3GI
+\unrestrict e0FfDpNfoGBDcHqvLON1L9GigQQ0D5z5bABJF7erm8MUSxcaHRQHnZL7wGcMGtz
 

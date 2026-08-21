@@ -62,13 +62,17 @@ utilityRouter.get('/bills', async (req, res, next) => {
 // Listing is gated on units.edit / units.view_status — same audience as
 // the unit-config view, since meter config sits alongside unit setup.
 
-const utilityTypeEnum = ['water','gas','electric','sewer','trash'] as const
+// S613 (Nic): propane joins the list — a central tank split across spaces is a
+// RUBS master like any other, and a flat monthly propane charge is a flat
+// charge like any other. A per-space TANK is the third shape and is not a meter
+// at all (units.has_propane_tank); it bills off deliveries, not readings.
+const utilityTypeEnum = ['water','gas','electric','sewer','trash','propane'] as const
 // S609 (Nic): PROPANE has a property-level price per gallon too — "we need a way
 // to also set the rate for the propane at the property level, that way when
 // we're putting in gallons it can calculate the bill for that tenant correctly."
 // It is NOT a meterable utility (there is no propane meter — fills are events),
 // so it belongs in the RATES list without joining the meter list.
-const rateUtilityTypeEnum = [...utilityTypeEnum, 'propane'] as const
+const rateUtilityTypeEnum = utilityTypeEnum
 const billingMethodEnum = ['submeter','rubs','master_bill_to_landlord','flat_rate'] as const
 // Single source of truth lives in @gam/shared — never re-declare here.
 const rubsMethodEnum = RUBS_ALLOCATION_METHODS

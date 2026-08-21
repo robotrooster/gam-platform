@@ -139,7 +139,18 @@ unitsRouter.get('/:id', async (req, res, next) => {
                   AND le.status IN ('active','pending')) AS has_active_lease,
         -- S613: the unit's subtype, so the page can SHOW what class this space
         -- is. subtype_id has been stored since S527 and displayed nowhere.
-        st.name AS subtype_name
+        st.name AS subtype_name,
+        -- S613: which utilities THIS unit's active lease actually makes the
+        -- tenant responsible for. Nothing bills without it and it fails
+        -- SILENTLY — the run just reports unitsSkipped — so the unit page has to
+        -- be able to say "you configured this and it will still bill nobody".
+        -- Written at e-sign from the lease's own tags; there is no other writer,
+        -- because the lease is what a tenant agreed to pay.
+        (SELECT COALESCE(array_agg(lur.utility_type), '{}')
+           FROM lease_utility_responsibilities lur
+           JOIN leases lz ON lz.id = lur.lease_id
+          WHERE lz.unit_id = u.id AND lz.status = 'active'
+            AND lur.tenant_responsible) AS tenant_billed_utilities
       FROM units u
       LEFT JOIN property_unit_subtypes st ON st.id = u.subtype_id
       JOIN properties p ON p.id = u.property_id

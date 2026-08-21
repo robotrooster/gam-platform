@@ -3265,8 +3265,11 @@ export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {
 // this assignment ties to (resolved out-of-band from tag).
 // ============================================================================
 
-export type UtilityType = 'water' | 'gas' | 'electric' | 'sewer' | 'trash'
-export const UTILITY_TYPES: readonly UtilityType[] = ['water', 'gas', 'electric', 'sewer', 'trash'] as const
+// S613 (Nic): propane is a utility like the rest — it can be a shared master
+// split across spaces, a flat monthly charge, or a per-space tank that bills off
+// deliveries. Only the third is not a meter.
+export type UtilityType = 'water' | 'gas' | 'electric' | 'sewer' | 'trash' | 'propane'
+export const UTILITY_TYPES: readonly UtilityType[] = ['water', 'gas', 'electric', 'sewer', 'trash', 'propane'] as const
 
 export type UtilityRowTag =
   | 'utility_water_responsibility'

@@ -406,7 +406,7 @@ export function UnitDetailPage() {
                       about that unit is in one place, in the order you set it up:
                       details, then meters, then features. */}
                   <div style={{ marginTop: 8, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
-                    <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} embedded />
+                    <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} tenantBilled={unit.tenantBilledUtilities || []} hasLease={!!unit.hasActiveLease} embedded />
                   </div>
                   {/* S609 (Nic): the per-unit inspection features are hidden on RV
                       SPOTS — "those should just go away, it's just extra clutter",
@@ -493,7 +493,7 @@ export function UnitDetailPage() {
                   settings are locked, but its meters still need adding and
                   reading. Same section, same place on the card either way. */}
               <div style={{ marginTop: 10, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
-                <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} embedded />
+                <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} hasPropaneTank={!!unit.hasPropaneTank} tenantBilled={unit.tenantBilledUtilities || []} hasLease={!!unit.hasActiveLease} embedded />
               </div>
             </>
           )}
@@ -907,8 +907,11 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
 // submeter is (one unit, one utility, an opening read). They share the same
 // endpoint, which is what keeps them honest — if that ever forks, consolidate
 // on one screen rather than maintaining two.
-function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedded }: {
+function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenantBilled, hasLease, embedded }: {
   unitId: string; propertyId: string; unitNumber: string; hasPropaneTank: boolean
+  /** Utilities this unit's ACTIVE lease makes the tenant responsible for. */
+  tenantBilled: string[]
+  hasLease: boolean
   /** S609: rendered INSIDE the Unit Details card — drop the card chrome so it
    *  reads as a section of that form rather than a card nested in a card. */
   embedded?: boolean
@@ -973,54 +976,143 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedd
       // rather than a silent no-op.
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not change that') })
   const [adding, setAdding] = useState(false)
-  const [draft, setDraft] = useState({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' })
+  // S613 (Nic, DIRECTIVE): "It all needs to be in one spot." This picker used to
+  // offer electric and water and nothing else, so a trash charge or a propane
+  // tank could only be created from another screen — and the propane row was
+  // hidden until a property propane rate existed, which was a setting with no
+  // way in. Now every arrangement this unit can have is added from here.
+  const [draft, setDraft] = useState({
+    utilityType: 'electric', how: 'submeter', rate: '', digits: '6', sewerRate: '', flatAmount: '',
+  })
 
-  // S605 (Nic hit this): the picker hides utilities the unit already has, so on
-  // a unit with an electric submeter the only option is Water — but the draft
-  // still held 'electric' from its initial state. A <select> whose value matches
-  // no option DISPLAYS the first one while keeping the old value, so the form
-  // showed "water" and submitted "electric". That then failed the
-  // double-billing guard (the unit already has an electric submeter) with an
-  // error that made no sense against what was on screen.
-  //
-  // Derive the options once and force the draft onto a valid one whenever the
-  // list changes, so what's displayed is always what gets sent.
-  // Only electric and water have an odometer a walker can read. Trash is a flat
-  // property charge and propane is a delivered fill — neither is a submeter, and
-  // both are explained under Property charges below.
-  const availableTypes = (['electric', 'water'] as const)
-    .filter(t => !mine.some((m: any) => m.utilityType === t))
+  const { data: propertyRates = [] } = useQuery<any[]>(
+    ['utility-property-rates', propertyId],
+    () => apiGet(`/utility/property-rates?propertyId=${propertyId}`),
+    { enabled: !!propertyId },
+  )
+  const rateFor = (t: string) => (propertyRates as any[]).find((r: any) => r.utilityType === t)
+
+  // What this unit could still be given. A utility already arranged here is not
+  // offered again — that is the double-billing guard's job, and offering it
+  // would just produce a refusal.
+  const ARRANGEABLE = [
+    { type: 'electric', hows: ['submeter', 'flat_rate'] },
+    { type: 'water',    hows: ['submeter', 'flat_rate'] },
+    { type: 'gas',      hows: ['submeter', 'flat_rate'] },
+    { type: 'trash',    hows: ['flat_rate'] },
+    { type: 'propane',  hows: ['tank', 'flat_rate'] },
+  ] as const
+  const hasSubmeter = (t: string) => mine.some((m: any) => m.utilityType === t)
+  const hasFlat = (t: string) => flatCharges.some((m: any) => m.utilityType === t && onMeter(m))
+  const howsFor = (t: string) => {
+    const row = ARRANGEABLE.find(a => a.type === t)
+    if (!row) return [] as string[]
+    return row.hows.filter(h =>
+      h === 'submeter' ? !hasSubmeter(t)
+      : h === 'flat_rate' ? !hasFlat(t)
+      : h === 'tank' ? !hasPropaneTank
+      : false)
+  }
+  const availableTypes = ARRANGEABLE.map(a => a.type).filter(t => howsFor(t).length > 0)
+
+  // S605 (Nic hit this): a <select> whose value matches no option DISPLAYS the
+  // first one while keeping the old value, so the form showed one utility and
+  // submitted another. Force the draft onto a valid pair whenever the list moves.
   useEffect(() => {
     if (availableTypes.length && !availableTypes.includes(draft.utilityType as any)) {
-      setDraft(d => ({ ...d, utilityType: availableTypes[0] }))
+      setDraft(d => ({ ...d, utilityType: availableTypes[0], how: howsFor(availableTypes[0])[0] }))
+    } else if (availableTypes.length && !howsFor(draft.utilityType).includes(draft.how)) {
+      setDraft(d => ({ ...d, how: howsFor(d.utilityType)[0] }))
     }
-  }, [availableTypes.join(','), draft.utilityType])
+  }, [availableTypes.join(','), draft.utilityType, draft.how])
 
   const [baselineFor, setBaselineFor] = useState<any | null>(null)
   const invalidate = () => qc.invalidateQueries(['utility-meters', propertyId])
   const addMut = useMutation(
     async () => {
+      const t = draft.utilityType
+
+      // A TANK is not a meter — it is a fact about the space. Same picker,
+      // because "does this unit have propane" is the same question as "does it
+      // have its own electric meter", whatever the machinery underneath.
+      if (draft.how === 'tank') {
+        await apiPatch(`/units/${unitId}/details`, { hasPropaneTank: true })
+        return
+      }
+
+      if (draft.how === 'flat_rate') {
+        // The AMOUNT is a property fact, never a per-unit one (S609,
+        // anti-discrimination): "if you're billing a flat rate per unit, it
+        // needs to not be editable, it needs to be set at the property level."
+        // So the first unit to take it sets the price for the property, and
+        // every later unit just joins at that price — the field is read-only
+        // from then on, and nobody reprices the whole park from a unit page.
+        const existingRate = rateFor(t)
+        if (!existingRate) {
+          await apiPost('/utility/property-rates', {
+            propertyId, utilityType: t, ratePerUnit: Number(draft.flatAmount), baseFee: 0,
+          })
+        }
+        const master = (meters as any[]).find(
+          (m: any) => m.utilityType === t && m.billingMethod === 'flat_rate')
+        if (master) {
+          await apiPost(`/utility/meters/${master.id}/units`, { unitId })
+        } else {
+          // S605: ONE call — create-and-assign together, so a refused assignment
+          // can't leave an orphan meter behind.
+          await apiPost('/utility/meters', {
+            propertyId, utilityType: t, label: `${t[0].toUpperCase()}${t.slice(1)}`,
+            billingMethod: 'flat_rate', baseFee: 0, assignUnitId: unitId,
+          })
+        }
+        return
+      }
+
       // S605: ONE call. This was create-then-assign, and when the assign was
       // refused the meter had already been created and stayed behind as an
       // orphan — Oak Park collected three before anyone noticed.
       await apiPost('/utility/meters', {
-        propertyId, utilityType: draft.utilityType,
-        label: `${unitNumber} ${draft.utilityType}`,
+        propertyId, utilityType: t,
+        label: `${unitNumber} ${t}`,
         billingMethod: 'submeter',
         ratePerUnit: draft.rate === '' ? null : Number(draft.rate),
         baseFee: 0, digits: Number(draft.digits) || 6,
-        ...(draft.utilityType === 'water' && draft.sewerRate !== '' ? { sewerRatePerUnit: Number(draft.sewerRate) } : {}),
+        ...(t === 'water' && draft.sewerRate !== '' ? { sewerRatePerUnit: Number(draft.sewerRate) } : {}),
         assignUnitId: unitId,
       })
     },
-    { onSuccess: () => { invalidate(); setAdding(false); setDraft({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' }) },
-      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not add meter') }
+    { onSuccess: () => {
+        invalidate()
+        qc.invalidateQueries(['unit', unitId])
+        qc.invalidateQueries(['utility-property-rates', propertyId])
+        setAdding(false)
+        setDraft({ utilityType: 'electric', how: 'submeter', rate: '', digits: '6', sewerRate: '', flatAmount: '' })
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not add that') }
   )
   const delMut = useMutation((id: string) => apiDelete(`/utility/meters/${id}`), {
     onSuccess: invalidate,
     onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not remove meter'),
   })
-  const ICONS: Record<string, string> = { water: '💧', electric: '⚡', sewer: '🚰', trash: '🗑️' }
+  const ICONS: Record<string, string> = { water: '💧', electric: '⚡', sewer: '🚰', trash: '🗑️', gas: '🔥', propane: '🛢️' }
+  // S613 (Nic's silent-gate problem, handoff §1a): a unit bills for a utility
+  // ONLY where its LEASE marks the tenant responsible. Meter, assignment and
+  // rate are all irrelevant without it, and it fails by billing nothing and
+  // saying nothing. It is written from the signed lease's own tags and nowhere
+  // else — deliberately, because a tenant pays what they signed — so this warns
+  // rather than offering a switch that would override the lease.
+  const notBilled = (t: string) => hasLease && !tenantBilled.includes(t)
+  const LeaseGateWarning = ({ t }: { t: string }) => notBilled(t) ? (
+    <div style={{ fontSize: '.66rem', color: 'var(--amber)', margin: '2px 0 6px 10px', lineHeight: 1.5 }}>
+      ⚠ This tenant&apos;s lease doesn&apos;t make them responsible for {t}, so this will bill nothing.
+      It comes from the signed lease — fix it there, or on the next lease.
+    </div>
+  ) : null
+  const HOW_LABEL: Record<string, string> = {
+    submeter:  'Its own sub-meter (read monthly)',
+    flat_rate: 'Flat monthly charge',
+    tank:      'A propane tank that gets filled',
+  }
 
   return (
     <div className={embedded ? '' : 'card'} style={embedded ? undefined : { marginTop: 16 }}>
@@ -1038,7 +1130,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedd
         {embedded
           ? <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Utilities on this unit</div>
           : <h3 style={{ fontSize: '.9rem', margin: 0 }}>Utilities on this unit</h3>}
-        <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add Meter'}</button>
+        <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add utility'}</button>
       </div>
       <PropaneTankRow unitId={unitId} propertyId={propertyId} hasTank={hasPropaneTank} />
       {mine.length === 0 && !adding && (
@@ -1102,6 +1194,9 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedd
               </label>
             )
           })}
+          {flatCharges.filter((m: any) => onMeter(m)).map((m: any) => (
+            <LeaseGateWarning key={`gate-${m.id}`} t={m.utilityType} />
+          ))}
 
           {/* S613 (Nic): READ-ONLY, and shown ONLY when this unit is on a master.
               "That just needs to show which one it's a part of. It doesn't need
@@ -1154,6 +1249,85 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, embedd
             onClick={() => { appConfirm(`Remove the ${m.utilityType} meter? Its readings go with it.`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) delMut.mutate(m.id) }) }}>Remove</button>
         </div>
       ))}
+      {mine.map((m: any) => <LeaseGateWarning key={`gate-sub-${m.id}`} t={m.utilityType} />)}
+      {sharedMeters.map((m: any) => <LeaseGateWarning key={`gate-shared-${m.id}`} t={m.utilityType} />)}
+      {baselineFor && (
+        <OpeningReadModal meter={baselineFor} onClose={() => setBaselineFor(null)} onSaved={() => { invalidate(); setBaselineFor(null) }} />
+      )}
+      {adding && availableTypes.length === 0 && (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
+          This unit already has every utility arrangement GAM offers. Remove one above to change it.
+        </div>
+      )}
+      {adding && availableTypes.length > 0 && (() => {
+        const t = draft.utilityType
+        const hows = howsFor(t)
+        const existingRate = rateFor(t)
+        const isFlat = draft.how === 'flat_rate'
+        const canSave = draft.how !== 'flat_rate' || existingRate != null || draft.flatAmount !== ''
+        return (
+          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap',
+                        padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
+            <div>
+              <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 3 }}>Utility</div>
+              <select className="input" value={t} style={{ width: 130 }}
+                onChange={e => setDraft(d => ({ ...d, utilityType: e.target.value, how: howsFor(e.target.value)[0] }))}>
+                {availableTypes.map(x => <option key={x} value={x}>{ICONS[x]} {x[0].toUpperCase() + x.slice(1)}</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 3 }}>How it&apos;s billed here</div>
+              <select className="input" value={draft.how} style={{ width: 230 }}
+                onChange={e => setDraft(d => ({ ...d, how: e.target.value }))}>
+                {hows.map(h => <option key={h} value={h}>{HOW_LABEL[h]}</option>)}
+              </select>
+            </div>
+
+            {draft.how === 'submeter' && (
+              <>
+                <input className="input" type="text" inputMode="decimal" placeholder="$/unit e.g. 0.14" value={draft.rate}
+                  onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, rate: v })) }} style={{ width: 130 }} />
+                <select className="input" value={draft.digits} onChange={e => setDraft(d => ({ ...d, digits: e.target.value }))} style={{ width: 105 }}>
+                  {[4, 5, 6, 7, 8].map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
+                </select>
+                {t === 'water' && (
+                  <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)" value={draft.sewerRate}
+                    onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, sewerRate: v })) }} style={{ width: 160 }} />
+                )}
+              </>
+            )}
+
+            {isFlat && (existingRate ? (
+              <div style={{ fontSize: '.74rem', color: 'var(--text-2)', maxWidth: 260, lineHeight: 1.5 }}>
+                {fmt(existingRate.ratePerUnit)}/mo — this property&apos;s rate, the same for every unit on it.
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 3 }}>Amount / month</div>
+                <input className="input" type="text" inputMode="decimal" placeholder="e.g. 25" value={draft.flatAmount}
+                  onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, flatAmount: v })) }} style={{ width: 130 }} />
+              </div>
+            ))}
+
+            <button className="btn btn-primary btn-sm" disabled={addMut.isLoading || !canSave}
+              onClick={() => addMut.mutate()}>Add</button>
+
+            {isFlat && !existingRate && (
+              <div style={{ fontSize: '.66rem', color: 'var(--text-3)', flexBasis: '100%', lineHeight: 1.5 }}>
+                This sets the price for the whole property — every unit you switch on afterwards is
+                billed the same. Charging two identical units different amounts for the same service
+                is what that prevents.
+              </div>
+            )}
+            {draft.how === 'tank' && (
+              <div style={{ fontSize: '.66rem', color: 'var(--text-3)', flexBasis: '100%', lineHeight: 1.5 }}>
+                Marks this space as having a tank, which is what puts it on <strong>Record Delivery</strong>.
+                Propane bills off the gallons delivered, not a monthly reading.
+              </div>
+            )}
+          </div>
+        )
+      })()}
       {baselineFor && (
         <OpeningReadModal meter={baselineFor} onClose={() => setBaselineFor(null)} onSaved={() => { invalidate(); setBaselineFor(null) }} />
       )}
@@ -1211,19 +1385,6 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
     () => apiGet(`/propane/fills?propertyId=${propertyId}&unitId=${unitId}`),
     { enabled: !!propertyId },
   )
-  // Does this PROPERTY do propane at all? A rate, a delivery, or a propane meter
-  // are each a yes. On a downtown apartment building all three are no and the
-  // row never appears — the complaint that started this was a propane paragraph
-  // printed on units that will never see a tank.
-  const { data: rates = [] } = useQuery<any[]>(
-    ['utility-property-rates', propertyId],
-    () => apiGet(`/utility/property-rates?propertyId=${propertyId}`),
-    { enabled: !!propertyId },
-  )
-  const doesPropane = hasTank
-    || (fills as any[]).length > 0
-    || (rates as any[]).some((r: any) => r.utilityType === 'propane')
-
   const setTank = useMutation(
     (on: boolean) => apiPatch(`/units/${unitId}/details`, { hasPropaneTank: on }),
     {
@@ -1232,7 +1393,13 @@ function PropaneTankRow({ unitId, propertyId, hasTank }: {
     },
   )
 
-  if (!doesPropane) return null
+  // S613 (Nic): shown when the space HAS a tank, and added from the Add utility
+  // picker when it doesn't. The first cut gated this on the property having a
+  // propane rate, which meant a landlord with no rate saw no propane row and no
+  // way to create one — a setting reachable only from a screen he'd have to know
+  // to visit first. That is the same "wired to nothing" trap, and it is why this
+  // now has exactly one entry point, on the unit, in the list.
+  if (!hasTank) return null
 
   const rows = fills as any[]
   const last = rows[0]

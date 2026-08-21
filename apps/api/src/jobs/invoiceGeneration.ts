@@ -627,7 +627,9 @@ async function runGeneration(
           // S533: the invoice line carries begin/end reads + usage — the
           // tenant sees exactly what produced the charge (the blind rule
           // only ever applied to the READER's entry flow).
-          const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms' }
+          // S613: propane is sold and read in GALLONS. A propane line labelled
+          // "therms" on a billable document is a wrong unit in front of a tenant.
+          const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms', propane: 'gal' }
           const pad = (v: any) => v == null ? null : String(Math.trunc(Number(v))).padStart(Number((ub as any).digits) || 6, '0')
           // S607: the READ DATES ride the line too. A utility bill that shows
           // the opening and closing readings but not when they were taken is

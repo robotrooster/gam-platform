@@ -18,6 +18,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
 import { unitsRouter } from './units'
+import { utilityRouter } from './utility'
 import { propertiesRouter } from './properties'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -26,6 +27,7 @@ function buildApp() {
   app.use(express.json({ limit: '2mb' }))
   app.use('/api/units', unitsRouter)
   app.use('/api/properties', propertiesRouter)
+  app.use('/api/utility', utilityRouter)
   app.use(errorHandler)
   return app
 }
@@ -239,5 +241,70 @@ describe('unit ↔ subtype linking (S613)', () => {
     expect(res.status).toBe(400)
     const rows = (await db.query(`SELECT rent_amount FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
     expect(rows.every((r: any) => Number(r.rent_amount) === 440)).toBe(true)
+  })
+})
+
+// S613 (Nic, DIRECTIVE): "All those things should be selectable in the same
+// spot even though it's not always a meter... Propane could be RUBS, trash
+// could be RUBS. So all of those things need to all be in the utilities
+// workflow." These cover the arrangements the unit page can now create, since
+// the picker offered electric and water submeters and nothing else.
+describe('every utility arrangement can be made from the unit (S613)', () => {
+  it('a flat trash charge: sets the property price once, then joins units to it', async () => {
+    const app = buildApp(); const f = await seed()
+    const rate = await request(app).post('/api/utility/property-rates')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'trash', ratePerUnit: 25, baseFee: 0 })
+    expect([200, 201]).toContain(rate.status)
+    const meter = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', baseFee: 0, assignUnitId: f.rvA })
+    expect(meter.status).toBe(201)
+    const join = await request(app).post(`/api/utility/meters/${meter.body.data.id}/units`)
+      .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.rvB })
+    expect(join.status).toBe(201)
+  })
+
+  // Propane could not be a meter at all — the CHECK constraint listed
+  // water/gas/electric/sewer/trash — so a central tank split across spaces was
+  // impossible to configure.
+  it('propane can be a shared master, a flat charge, or a per-space tank', async () => {
+    const app = buildApp(); const f = await seed()
+    const master = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'propane', label: 'Park tank',
+              billingMethod: 'rubs', rubsAllocationMethod: 'occupant_count', baseFee: 0,
+              assignUnitId: f.rvA })
+    expect(master.status).toBe(201)
+
+    const flat = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'propane', label: 'Propane flat',
+              billingMethod: 'flat_rate', baseFee: 0, assignUnitId: f.rvB })
+    expect(flat.status).toBe(201)
+
+    const tank = await request(app).patch(`/api/units/${f.apt}/details`)
+      .set('Authorization', `Bearer ${f.token}`).send({ hasPropaneTank: true })
+    expect(tank.status).toBe(200)
+    expect(tank.body.data.has_propane_tank).toBe(true)
+  })
+
+  // The gate that silently stops any utility billing (handoff §1a) is now
+  // visible on the unit rather than only discoverable by nothing happening.
+  it('the unit reports which utilities its lease actually bills', async () => {
+    const app = buildApp(); const f = await seed()
+    const c = await db.connect()
+    let leaseId = ''
+    try { leaseId = await seedLease(c, { unitId: f.rvA, landlordId: f.landlordId, status: 'active' }) }
+    finally { c.release() }
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'water', true), ($1, 'trash', false)`, [leaseId])
+    const res = await request(app).get(`/api/units/${f.rvA}`).set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(200)
+    const billed = res.body.data.tenant_billed_utilities ?? res.body.data.tenantBilledUtilities
+    expect(billed).toContain('water')
+    expect(billed).not.toContain('trash')
   })
 })
