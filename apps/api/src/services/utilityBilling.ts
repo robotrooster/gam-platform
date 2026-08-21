@@ -464,6 +464,34 @@ export async function generateBillsForMeter(
       reason: 'meter not assigned to any units' }
   }
 
+  /** S613 (Nic): "Say owner occupied has a trash can. Are we logging that?"
+   *
+   *  The owner-use absorption ledger existed only inside the RUBS split, so an
+   *  owner-occupied unit on a FLAT charge or with its own SUBMETER produced
+   *  nothing at all: tryInsertBill needs a tenant and a lease, an owner-occupied
+   *  unit has neither, so the charge was dropped and counted as skipped. The
+   *  landlord is still paying for that service — the can is still emptied, the
+   *  meter still turns — and the audit answer ("billed out plus kept back equals
+   *  what the property consumed") only reconciles if every method records it. */
+  const recordOwnerUseAbsorption = async (args: {
+    unitId: string; utilityType: string; chargeAmount: number
+    allocationMethod: string; allocationBasis: number | null; baseFeeShare?: number; notes: string
+  }) => {
+    await query(`
+      INSERT INTO utility_owner_use_absorptions
+        (meter_id, unit_id, landlord_id, utility_type, billing_cycle_month,
+         allocation_method, allocation_basis, charge_amount, base_fee_share, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (meter_id, unit_id, billing_cycle_month) DO UPDATE
+        SET charge_amount = EXCLUDED.charge_amount,
+            allocation_basis = EXCLUDED.allocation_basis,
+            base_fee_share = EXCLUDED.base_fee_share,
+            updated_at = NOW()
+    `, [meterId, args.unitId, landlordId, args.utilityType, cycleIso,
+        args.allocationMethod, args.allocationBasis,
+        args.chargeAmount.toFixed(2), (args.baseFeeShare ?? 0).toFixed(2), args.notes])
+  }
+
   if (meter.billing_method === 'flat_rate') {
     // S558 (Nic): fixed per-unit charge with NO meter reading (e.g. a flat trash
     // buildback). Each served unit bills the flat amount as its own line item so
@@ -498,6 +526,19 @@ export async function generateBillsForMeter(
     }
     let created = 0, skipped = 0
     for (const unit of units) {
+      // S613: an owner-occupied unit on a flat charge — the landlord's own
+      // household still has the trash can, and the service is still paid for.
+      // Recorded, billed to nobody.
+      if (unit.status === 'owner_use') {
+        await recordOwnerUseAbsorption({
+          unitId: unit.unit_id, utilityType: meter.utility_type,
+          chargeAmount: flatAmount, allocationMethod: 'flat_rate', allocationBasis: null,
+          baseFeeShare: flatAmount,
+          notes: 'Owner-occupied unit — the flat charge for this service, absorbed by the landlord and billed to nobody.',
+        })
+        skipped++
+        continue
+      }
       const inserted = await tryInsertBill({
         meterId, unitId: unit.unit_id, landlordId,
         utilityType: meter.utility_type,

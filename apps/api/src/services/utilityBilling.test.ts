@@ -735,6 +735,50 @@ describe('generateBillsForMeter — flat_rate (S558)', () => {
     }
   })
 
+  // S613 (Nic): "Say owner occupied has a trash can. Are we logging that... in
+  // terms of categorization on operational cost? Because that's still service
+  // we're paying for." The absorption ledger existed only inside the RUBS split,
+  // so a flat charge on an owner-occupied unit recorded nothing at all — the
+  // can is still emptied and the landlord still pays for it.
+  it('owner-occupied unit on a flat charge is RECORDED, not silently dropped', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25) // $25/unit trash
+    const tenanted = await seedUnitWithActiveTenant(base)
+    const owner = await seedUnitWithActiveTenant(base)
+    await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
+    await attachMeterToUnit(meterId, tenanted.unitId)
+    await attachMeterToUnit(meterId, owner.unitId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)                    // only the tenant is billed
+
+    const { rows: bills } = await db.query<any>(
+      `SELECT unit_id FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(bills).toHaveLength(1)
+    expect(bills[0].unit_id).toBe(tenanted.unitId)
+
+    const { rows: abs } = await db.query<any>(
+      `SELECT unit_id, charge_amount, allocation_method FROM utility_owner_use_absorptions
+        WHERE meter_id=$1`, [meterId])
+    expect(abs).toHaveLength(1)
+    expect(abs[0].unit_id).toBe(owner.unitId)
+    expect(Number(abs[0].charge_amount)).toBe(25)       // the landlord's own can
+    expect(abs[0].allocation_method).toBe('flat_rate')
+  })
+
+  it('re-running the cycle does not duplicate the owner-use record', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedFlatMeter(base, 25)
+    const owner = await seedUnitWithActiveTenant(base)
+    await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
+    await attachMeterToUnit(meterId, owner.unitId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM utility_owner_use_absorptions WHERE meter_id=$1`, [meterId])
+    expect(rows[0].n).toBe(1)
+  })
+
   it('tenant_responsible=FALSE → that unit is skipped', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedFlatMeter(base, 20)
