@@ -443,6 +443,10 @@ tenantsRouter.get('/me', async (req, res, next) => {
         sa.id                AS utility_service_agreement_id,
         sa.service_address   AS utility_service_address,
         sa.billing_due_day   AS utility_service_due_day,
+        -- S616: so the portal shows "final bill requested" instead of offering
+        -- the button again to somebody who already pressed it.
+        sa.moveout_notice_at,
+        to_char(sa.moveout_expected_on, 'YYYY-MM-DD') AS moveout_expected_on,
         sau.unit_number      AS utility_service_space,
         sap.name             AS utility_service_property_name
       FROM tenants t
@@ -466,7 +470,8 @@ tenantsRouter.get('/me', async (req, res, next) => {
         LIMIT 1
       ) pti ON TRUE
       LEFT JOIN LATERAL (
-        SELECT sa2.id, sa2.service_address, sa2.billing_due_day, sa2.unit_id
+        SELECT sa2.id, sa2.service_address, sa2.billing_due_day, sa2.unit_id,
+               sa2.moveout_notice_at, sa2.moveout_expected_on
           FROM utility_service_agreements sa2
          WHERE sa2.tenant_id = t.id AND sa2.status = 'active'
          ORDER BY sa2.start_date DESC

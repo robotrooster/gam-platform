@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict yPqAW9LFokaZBkmLaTcUtvr9EGz1S5Ti3PdXY0X7beGCvr4g56r8tlxMF1cPjDD
+\restrict 1kpLWZMwITUoNL2BE8vbJbRj0NnrZi6wsBnczdjCKQDAV2YjNyxj0KTZL1vsw1i
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9202,6 +9202,10 @@ CREATE TABLE public.utility_service_agreements (
     payer_attested_at timestamp with time zone,
     payer_attested_by uuid,
     payer_attestation_note text,
+    moveout_notice_at timestamp with time zone,
+    moveout_expected_on date,
+    moveout_note text,
+    final_bill_issued_at timestamp with time zone,
     CONSTRAINT usa_billing_due_day_check CHECK (((billing_due_day >= 1) AND (billing_due_day <= 31))),
     CONSTRAINT usa_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
     CONSTRAINT usa_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
@@ -9238,6 +9242,20 @@ COMMENT ON COLUMN public.utility_service_agreements.payer_accepted_at IS 'S616: 
 --
 
 COMMENT ON COLUMN public.utility_service_agreements.payer_attested_at IS 'S616: when the LANDLORD attested that this person already agreed to the arrangement off-platform. For the arrangements that predate GAM — cash collected by hand for years. Recorded with who attested, because it is a claim someone made rather than something the platform verified.';
+
+
+--
+-- Name: COLUMN utility_service_agreements.moveout_notice_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.moveout_notice_at IS 'S616: when the payer told GAM they are leaving, from the button in their portal. A notice, not a termination — the landlord still confirms the final reading and who takes over.';
+
+
+--
+-- Name: COLUMN utility_service_agreements.moveout_expected_on; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.moveout_expected_on IS 'S616: the date the payer expects to be gone. Drives the final billing period and tells the landlord when to read the meter.';
 
 
 --
@@ -23924,5 +23942,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict yPqAW9LFokaZBkmLaTcUtvr9EGz1S5Ti3PdXY0X7beGCvr4g56r8tlxMF1cPjDD
+\unrestrict 1kpLWZMwITUoNL2BE8vbJbRj0NnrZi6wsBnczdjCKQDAV2YjNyxj0KTZL1vsw1i
 

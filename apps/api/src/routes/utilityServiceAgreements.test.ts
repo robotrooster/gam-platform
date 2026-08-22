@@ -236,3 +236,73 @@ describe('GET + PATCH /api/utility/service-agreements (S615)', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// S616 (Nic): "maybe that tenant portal profile that only has the utilities
+// gets a big button that says 'hey, I need my final bill because I'm moving
+// out'." Nobody is watching the neighbour's front door — the one person who
+// reliably knows is the person leaving.
+describe('the payer gives notice (S616)', () => {
+  async function payerToken(f: any, tenantId: string) {
+    const { rows: [t] } = await db.query<any>(
+      `SELECT user_id FROM tenants WHERE id = $1`, [tenantId])
+    return jwt.sign({ userId: t.user_id, role: 'tenant', profileId: tenantId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+  }
+
+  it('records the notice and the date they expect to be gone', async () => {
+    const f = await seed()
+    const made = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Neighbor A', payer })
+    const token = await payerToken(f, made.body.data.tenantId)
+
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements/mine/moveout-notice')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ expectedOn: '2026-09-30', note: 'My brother is taking over' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.moveoutExpectedOn).toBe('2026-09-30')
+
+    const { rows } = await db.query<any>(
+      `SELECT moveout_notice_at, moveout_note, status
+         FROM utility_service_agreements WHERE id = $1`, [made.body.data.id])
+    expect(rows[0].moveout_notice_at).not.toBeNull()
+    expect(rows[0].moveout_note).toBe('My brother is taking over')
+    // A NOTICE, not a termination — letting a payer close their own account
+    // would let somebody walk away from a balance by pressing a button.
+    expect(rows[0].status).toBe('active')
+  })
+
+  it('a landlord cannot give notice on the payer’s behalf', async () => {
+    const f = await seed()
+    await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Neighbor A', payer })
+
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements/mine/moveout-notice')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ expectedOn: '2026-09-30' })
+    expect(res.status).toBe(403)
+  })
+
+  it('refuses when the payer has no live service', async () => {
+    const f = await seed()
+    const made = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Neighbor A', payer })
+    await db.query(
+      `UPDATE utility_service_agreements SET status='ended' WHERE id=$1`,
+      [made.body.data.id])
+    const token = await payerToken(f, made.body.data.tenantId)
+
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements/mine/moveout-notice')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ expectedOn: '2026-09-30' })
+    expect(res.status).toBe(404)
+  })
+})

@@ -301,3 +301,79 @@ utilityServiceAgreementsRouter.patch('/:id', requirePerm('properties.edit'),
       res.json({ success: true, data: updated })
     } catch (e) { next(e) }
   })
+
+/**
+ * S616 (Nic) — the payer says they are moving out.
+ *
+ *   "Maybe that tenant portal profile that only has the utilities gets a big
+ *    button that says 'hey, I need my final bill because I'm moving out', and
+ *    then it's gonna look for more utilities to go onto a new person after that
+ *    final billing period."
+ *
+ * Nobody is watching the neighbour's front door. The one person who reliably
+ * knows they are leaving is the person leaving, so this is their button.
+ *
+ * It records a NOTICE, not a termination. The landlord confirms the final
+ * reading and the handover — letting a payer end their own billing outright
+ * would let somebody walk away from a balance by pressing a button.
+ */
+utilityServiceAgreementsRouter.post('/mine/moveout-notice', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') {
+      throw new AppError(403, 'Only the payer can give notice on their own service.')
+    }
+    const body = z.object({
+      expectedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      note:       z.string().trim().max(500).optional(),
+    }).parse(req.body)
+
+    // Their OWN live agreement. Scoped by the authenticated tenant rather than
+    // an id from the body — a body-supplied agreement id would let one payer
+    // give notice on another's service.
+    const sa = await queryOne<any>(
+      `SELECT sa.id, sa.landlord_id, sa.service_address, u.unit_number,
+              usr.first_name, usr.last_name
+         FROM utility_service_agreements sa
+         JOIN units u    ON u.id = sa.unit_id
+         JOIN tenants t  ON t.id = sa.tenant_id
+         JOIN users usr  ON usr.id = t.user_id
+        WHERE sa.tenant_id = $1 AND sa.status = 'active'
+        LIMIT 1`, [req.user!.profileId])
+    if (!sa) throw new AppError(404, 'You have no active utility service to give notice on.')
+
+    const updated = await queryOne<any>(
+      `UPDATE utility_service_agreements
+          SET moveout_notice_at   = COALESCE(moveout_notice_at, NOW()),
+              moveout_expected_on = $2::date,
+              moveout_note        = COALESCE($3, moveout_note),
+              updated_at          = NOW()
+        WHERE id = $1
+        RETURNING id, to_char(moveout_expected_on, 'YYYY-MM-DD') AS moveout_expected_on`,
+      [sa.id, body.expectedOn, body.note ?? null])
+
+    // The landlord is the one who has to act: read the meter, close the final
+    // period, and find out who is taking over. Telling them is the entire point
+    // — nobody else is watching that front door.
+    try {
+      const { createNotification } = await import('../services/notifications')
+      const owner = await queryOne<{ user_id: string }>(
+        `SELECT user_id FROM landlords WHERE id = $1`, [sa.landlord_id])
+      if (owner) {
+        await createNotification({
+          userId: owner.user_id,
+          landlordId: sa.landlord_id,
+          type: 'service_moveout_notice',
+          title: `${sa.first_name} ${sa.last_name} is leaving ${sa.service_address || sa.unit_number}`,
+          body: `They have asked for a final utility bill, expecting to be gone by ${body.expectedOn}. Take a closing read around then, and set up whoever takes over so the meter does not keep billing the person who left.`,
+          data: { serviceAgreementId: sa.id, expectedOn: body.expectedOn },
+          actionUrl: '/utilities',
+        })
+      }
+    } catch (err) {
+      logger.error({ err, serviceAgreementId: sa.id },
+        '[service-moveout] landlord notification failed — notice still recorded')
+    }
+
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})

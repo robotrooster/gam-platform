@@ -894,6 +894,90 @@ function HomeAlerts() {
  * than render that page full of dashes, this shows the balance and the bills
  * behind it, and says plainly what the arrangement is.
  */
+/**
+ * S616 (Nic) — the neighbour tells us they are leaving.
+ *
+ *   "Maybe that tenant portal profile that only has the utilities gets a big
+ *    button that says 'hey, I need my final bill because I'm moving out', and
+ *    then it's gonna look for more utilities to go onto a new person after that
+ *    final billing period."
+ *
+ * Nobody is watching the neighbour's front door. This person is the only one
+ * who reliably knows, so it is their button. It gives NOTICE — the landlord
+ * still takes the closing read and sets up whoever moves in. Letting a payer
+ * close their own account would let somebody walk away from a balance.
+ */
+function MoveOutNotice({ me }: { me: any }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [expectedOn, setExpectedOn] = useState('')
+  const [note, setNote] = useState('')
+  const [error, setError] = useState('')
+
+  const give = useMutation(
+    () => post('/utility/service-agreements/mine/moveout-notice', { expectedOn, note: note.trim() || undefined }),
+    {
+      onSuccess: () => { setOpen(false); qc.invalidateQueries('tenant-me') },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not send that'),
+    },
+  )
+
+  if (me.moveoutNoticeAt) {
+    return (
+      <div className="card" style={{marginBottom:16, borderLeft:'3px solid var(--gold)'}}>
+        <div style={{fontWeight:700, color:'var(--t0)', marginBottom:4}}>Final bill requested</div>
+        <div style={{fontSize:'.84rem', color:'var(--t2)', lineHeight:1.6}}>
+          We&apos;ve told {me.utilityServicePropertyName || 'your provider'} you expect to be out by{' '}
+          <strong>{me.moveoutExpectedOn}</strong>. They&apos;ll take a final meter reading around then and
+          send your last bill. Keep paying as normal until it arrives.
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="card" style={{marginBottom:16}}>
+      {!open ? (
+        <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, flexWrap:'wrap'}}>
+          <div style={{fontSize:'.84rem', color:'var(--t2)', lineHeight:1.6}}>
+            Moving out? Ask for your final bill so the meter stops billing you after you go.
+          </div>
+          <button className="btn btn-p" onClick={() => setOpen(true)}>
+            I&apos;m moving out
+          </button>
+        </div>
+      ) : (
+        <div>
+          <div style={{fontWeight:700, color:'var(--t0)', marginBottom:6}}>Request your final bill</div>
+          <div style={{fontSize:'.82rem', color:'var(--t3)', marginBottom:12, lineHeight:1.6}}>
+            Tell us when you expect to be out. Your provider takes a final reading around that date and
+            sends your last bill — you&apos;re billed for what you used, nothing after.
+          </div>
+          <label style={{fontSize:'.75rem', color:'var(--t3)', display:'block', marginBottom:4}}>
+            When do you expect to be out?
+          </label>
+          <input className="inp" type="date" value={expectedOn}
+            onChange={e => setExpectedOn(e.target.value)} />
+          <label style={{fontSize:'.75rem', color:'var(--t3)', display:'block', margin:'10px 0 4px'}}>
+            Anything they should know? <span style={{color:'var(--t3)'}}>(optional)</span>
+          </label>
+          <textarea className="inp" rows={2} value={note} maxLength={500}
+            placeholder="Who's taking over, where to reach you…"
+            onChange={e => setNote(e.target.value)} />
+          {error && <div style={{marginTop:10, fontSize:'.8rem', color:'var(--red)'}}>{error}</div>}
+          <div style={{display:'flex', gap:8, marginTop:14}}>
+            <button className="btn btn-p" disabled={!expectedOn || give.isLoading}
+              onClick={() => { setError(''); give.mutate() }}>
+              {give.isLoading ? 'Sending…' : 'Send request'}
+            </button>
+            <button className="btn btn-sm" onClick={() => setOpen(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
   const { data: balanceCtx } = useQuery<any>('balance-context',
     () => get<any>('/payments/balance-context'))
@@ -938,6 +1022,8 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
           <div className="kpi-s">each month</div>
         </div>
       </div>
+
+      <MoveOutNotice me={me} />
 
       <div className="card" style={{padding:16}}>
         <div style={{fontWeight:700,marginBottom:6}}>What you&apos;re billed for</div>

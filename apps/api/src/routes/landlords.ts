@@ -89,8 +89,22 @@ export const adminLandlordsListHandler = async (req: any, res: any, next: any) =
         smu.first_name AS sm_first_name, smu.last_name AS sm_last_name,
         rbu.first_name AS referrer_first_name, rbu.last_name AS referrer_last_name,
         COUNT(DISTINCT p.id)::int AS property_count,
-        COUNT(DISTINCT u2.id)::int AS unit_count,
-        COUNT(DISTINCT u2.id) FILTER (WHERE u2.status <> 'vacant')::int AS occupied_count,
+        -- S616 (Nic): a neighbour's serviced space is NEITHER. "It doesn't
+        -- count as a vacancy. It doesn't count as an occupied unit. It doesn't
+        -- count as anything in terms of that — just utilities coming in."
+        --
+        -- It is somebody else's building that this landlord happens to supply
+        -- power or trash to. Counting it as a unit inflates the portfolio;
+        -- counting it as occupied inflates the occupancy rate with a space that
+        -- was never rentable. It was landing in BOTH, because the occupancy
+        -- filter only asked "is it vacant" and a serviced space is not.
+        --
+        -- Its utility income still reaches the books — that is separate, and
+        -- correct: the money is real, the $2 fee is charged on it, and it shows
+        -- as collected. What it is not is rent, occupancy, or inventory.
+        COUNT(DISTINCT u2.id) FILTER (WHERE u2.status <> 'utility_service')::int AS unit_count,
+        COUNT(DISTINCT u2.id) FILTER (
+          WHERE u2.status <> 'vacant' AND u2.status <> 'utility_service')::int AS occupied_count,
         EXISTS (
           SELECT 1 FROM user_bank_accounts ba
            WHERE ba.user_id = l.user_id AND ba.status = 'active'
@@ -573,7 +587,11 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
         COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
         COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
-        COUNT(u.id)::int AS total_units,
+        -- S616 (Nic): a neighbour's serviced space is not inventory. Every
+        -- status count above already excludes it by naming a status explicitly;
+        -- this one counted everything, so the portfolio total was the one place
+        -- it still inflated.
+        COUNT(u.id) FILTER (WHERE u.status <> 'utility_service')::int AS total_units,
         -- Expected Monthly Rent = full rent roll across ALL occupied units
         -- (active + delinquent + suspended), NOT active-only.
         -- Delinquent/suspended units are occupied and still owe rent, and their
