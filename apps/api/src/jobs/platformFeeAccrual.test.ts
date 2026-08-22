@@ -490,7 +490,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   /** A property with ONE leased unit plus one space next door the landlord
    *  only supplies utilities to. Two billable units, not one. */
   async function stackWithServicedSpace(
-    opts: { superseded?: boolean; endDate?: string } = {},
+    opts: { superseded?: boolean; endDate?: string; meters?: number } = {},
   ): Promise<{ propertyId: string }> {
     const stack = await buildPlatformStack({ unitCount: 1 })
     const client = await getClient()
@@ -511,10 +511,28 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
       await client.query(
         `INSERT INTO utility_service_agreements
            (landlord_id, unit_id, tenant_id, start_date, end_date,
-            superseded_by_lease_id)
-         VALUES ($1,$2,$3,'2026-01-01',$4,$5)`,
+            superseded_by_lease_id, payer_attested_at)
+         VALUES ($1,$2,$3,'2026-01-01',$4,$5,NOW())`,
         [stack.landlordId, unitId, payerId, opts.endDate ?? null,
          supersedingLeaseId])
+      // S616: the $2 is for a space that is ON a utility charge, so the space
+      // has to actually be wired to a meter.
+      if (opts.meters !== 0) {
+        const { rows: [m] } = await client.query(
+          `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee)
+           VALUES ($1,'trash','Trash','flat_rate',0) RETURNING id`, [stack.propertyId])
+        await client.query(
+          `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+          [m.id, unitId])
+        if (opts.meters === 2) {
+          const { rows: [m2] } = await client.query(
+            `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, rate_per_unit)
+             VALUES ($1,'electric','Elec','submeter',0,0.21) RETURNING id`, [stack.propertyId])
+          await client.query(
+            `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+            [m2.id, unitId])
+        }
+      }
     } finally { client.release() }
     return { propertyId: stack.propertyId }
   }
@@ -558,5 +576,43 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
          FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
     expect(rows[0].utility_service_unit_count).toBe(0)
     expect(rows[0].total_billable).toBe(1)
+  })
+
+  // S616 (Nic): "the two dollars is getting charged per residence... if my lot
+  // next door, they're paying electricity to me and rent to my neighbor, Oak
+  // Park is paying the two dollars on that until the other landlord onboards."
+  it('two utilities on one space is still $2, not $4', async () => {
+    const { propertyId } = await stackWithServicedSpace({ meters: 2 })
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT utility_service_unit_count, total_billable
+         FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
+    // Trash AND electric on the one neighbour space.
+    expect(rows[0].utility_service_unit_count).toBe(1)
+  })
+
+  // Nic: "we're not assigning the spaces to a meter. Trash is a flat rate.
+  // Water is a RUBS system. There is not always going to be a meter." The
+  // agreement existing IS the statement that this space is on a utility charge.
+  it('is charged even with no meter attached — trash is a flat rate', async () => {
+    const { propertyId } = await stackWithServicedSpace({ meters: 0 })
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT utility_service_unit_count FROM platform_fee_accruals
+        WHERE property_id = $1`, [propertyId])
+    expect(rows[0].utility_service_unit_count).toBe(1)
+  })
+
+  // Without consent no invoice is issued at all, so GAM would be charging for
+  // a bill it never delivered.
+  it('a payer who has not agreed is not charged for', async () => {
+    const { propertyId } = await stackWithServicedSpace()
+    await db.query(
+      `UPDATE utility_service_agreements SET payer_attested_at = NULL, payer_accepted_at = NULL`)
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT utility_service_unit_count FROM platform_fee_accruals
+        WHERE property_id = $1`, [propertyId])
+    expect(rows[0].utility_service_unit_count).toBe(0)
   })
 })

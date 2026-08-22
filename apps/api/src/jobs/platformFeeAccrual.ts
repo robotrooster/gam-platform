@@ -200,11 +200,35 @@ async function accrueOneProperty(
     // number GAM showed the landlord was one higher than the bill GAM then
     // sent, and GAM under-collected its own revenue every month.
     //
+    // S616 (Nic): "$2 per occupied unit next door THAT IS ON SOME SORT OF
+    // UTILITY CHARGE — trash or electric or whatever."
+    //
+    // Counted per SPACE, never per utility: a neighbour on both trash and
+    // electric is $2, not $4. That is what COUNT(DISTINCT sa.unit_id) buys.
+    //
+    // Two conditions decide whether GAM has earned it, and neither is an event
+    // test — deliberately. This job runs 1:30am on the 1st and invoices
+    // generate at 7am, so any "was something billed this month" check would
+    // find nothing and silently zero the fee forever. Both of these are STATE:
+    //
+    //   · the payer has agreed — accepted their invite, or the landlord
+    //     attested to an arrangement that predates GAM. Without that no invoice
+    //     is issued at all (see serviceAgreementInvoices), so GAM would be
+    //     charging for a bill it never delivered.
+    //
+    // NOT gated on a meter assignment, which an earlier version tried. Nic:
+    // "we're not assigning the spaces to a meter. Trash is a flat rate. Water
+    // is a RUBS system. There is not always going to be a meter, and there
+    // probably won't ever be a meter when we're in this particular type of
+    // situation." The agreement existing IS the statement that this space is on
+    // a utility charge; requiring a meter row would have silently zeroed the
+    // fee for the exact arrangement it exists to bill.
+    //
     // superseded_by_lease_id drops it the moment the space's real owner
-    // onboards and puts a tenancy on it: the $2 follows the unit to them and is
-    // never charged twice for one space. There is no mid-month conflict, because
-    // the incoming landlord sits inside the no-double-bill grace until their
-    // second cycle, and that cycle is wholly theirs.
+    // onboards: the $2 follows the unit to them and is never charged twice for
+    // one space. No mid-month conflict — the incoming landlord sits inside the
+    // no-double-bill grace until their second cycle, and that cycle is wholly
+    // theirs.
     const usRes = await client.query<{ c: number }>(`
       SELECT COUNT(DISTINCT sa.unit_id)::int AS c
         FROM utility_service_agreements sa
@@ -214,6 +238,7 @@ async function accrueOneProperty(
          AND sa.superseded_by_lease_id IS NULL
          AND sa.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
          AND (sa.end_date IS NULL OR sa.end_date >= $2::date)
+         AND (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL)
     `, [propertyId, monthIso])
     const utilityServiceUnitCount = usRes.rows[0].c
 

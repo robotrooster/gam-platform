@@ -460,7 +460,9 @@ adminRouter.get('/onboarding-metrics', requireAdmin, async (_req, res, next) => 
              ELSE NULL END AS duration_days,
         (lu.first_name || ' ' || lu.last_name) AS landlord_name,
         CASE WHEN pmu.id IS NOT NULL THEN (pmu.first_name || ' ' || pmu.last_name) ELSE NULL END AS closer_name,
-        (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count,
+        -- S616: service points are not inventory.
+        (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id
+          AND u.status <> 'utility_service') AS unit_count,
         (SELECT COUNT(*)::int FROM lease_documents ld JOIN units u2 ON u2.id = ld.unit_id
            WHERE u2.property_id = p.id AND ld.document_type = 'original_lease') AS esign_lease_count,
         (SELECT COUNT(*)::int FROM pending_tenant_intents pti LEFT JOIN units u3 ON u3.id = pti.unit_id

@@ -568,7 +568,11 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
     // drill-in reconcile with this row).
     const properties = await query<any>(`
       SELECT p.*,
-        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id) AS total_units,
+        -- S616: a service point carries a neighbour's utility bill and is not
+        -- this landlord's inventory. Every other count here names a status,
+        -- which is why this bare one was the place it still leaked in.
+        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id
+          AND u.status <> 'utility_service') AS total_units,
         (SELECT COUNT(*) FROM units u
            JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units,
@@ -630,7 +634,11 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
 
     const property = await queryOne<any>(`
       SELECT p.id, p.name, p.city, p.state, p.type,
-        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id) AS total_units,
+        -- S616: a service point carries a neighbour's utility bill and is not
+        -- this landlord's inventory. Every other count here names a status,
+        -- which is why this bare one was the place it still leaked in.
+        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id
+          AND u.status <> 'utility_service') AS total_units,
         (SELECT COUNT(*) FROM units u
            JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units

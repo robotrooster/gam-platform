@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 1kpLWZMwITUoNL2BE8vbJbRj0NnrZi6wsBnczdjCKQDAV2YjNyxj0KTZL1vsw1i
+\restrict SFoaSAYxk86IDVT1oYL0q72NdAxk0fhYnsar9LcMGafdby2v60uwgICpMf6efgt
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9348,7 +9348,15 @@ CREATE VIEW public.v_unit_occupancy AS
      LEFT JOIN LATERAL ( SELECT (count(*))::integer AS tenant_count
            FROM (public.leases l
              JOIN public.lease_tenants lt ON ((lt.lease_id = l.id)))
-          WHERE ((l.unit_id = u.id) AND (l.status = 'active'::text) AND (lt.status = 'active'::text))) counts ON (true));
+          WHERE ((l.unit_id = u.id) AND (l.status = 'active'::text) AND (lt.status = 'active'::text))) counts ON (true))
+  WHERE (u.status <> 'utility_service'::text);
+
+
+--
+-- Name: VIEW v_unit_occupancy; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_unit_occupancy IS 'Occupancy per RENTABLE unit. S616: service points (status=''utility_service'') are excluded — they exist only to carry a neighbour''s utility bill under a payer''s name, are never rentable or bookable, and are neither occupied nor vacant.';
 
 
 --
@@ -23942,5 +23950,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 1kpLWZMwITUoNL2BE8vbJbRj0NnrZi6wsBnczdjCKQDAV2YjNyxj0KTZL1vsw1i
+\unrestrict SFoaSAYxk86IDVT1oYL0q72NdAxk0fhYnsar9LcMGafdby2v60uwgICpMf6efgt
 
