@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict sENeercOaWR2wAMI1eTktixRGuflNPPT50buE30ZHbCbTR4rchQlWX719bwDlj8
+\restrict rol4pQNTRhp7o1ehSd1NzqQwlXJCgDouocEX0DB1vXAJ8aJOiwe8uJE2ejqwqXi
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2675,12 +2675,6 @@ CREATE TABLE public.cross_property_service_links (
     status text DEFAULT 'proposed'::text NOT NULL,
     proposed_via text NOT NULL,
     proposed_by_user_id uuid,
-    service_landlord_approved_at timestamp with time zone,
-    service_landlord_approved_by uuid,
-    unit_landlord_approved_at timestamp with time zone,
-    unit_landlord_approved_by uuid,
-    tenant_confirmed_at timestamp with time zone,
-    tenant_confirmed_by uuid,
     activated_at timestamp with time zone,
     declined_at timestamp with time zone,
     declined_by_user_id uuid,
@@ -2691,11 +2685,10 @@ CREATE TABLE public.cross_property_service_links (
     address_match_basis text,
     address_match_evidence text,
     address_checked_at timestamp with time zone,
-    CONSTRAINT cpsl_active_needs_all_three CHECK (((status <> 'active'::text) OR ((service_landlord_approved_at IS NOT NULL) AND (unit_landlord_approved_at IS NOT NULL) AND (tenant_confirmed_at IS NOT NULL)))),
     CONSTRAINT cpsl_two_landlords CHECK ((service_landlord_id <> unit_landlord_id)),
     CONSTRAINT cross_property_service_links_address_match_basis_check CHECK ((address_match_basis = ANY (ARRAY['same_address'::text, 'same_street'::text, 'none'::text]))),
     CONSTRAINT cross_property_service_links_proposed_via_check CHECK ((proposed_via = ANY (ARRAY['tenant_account'::text, 'proximity'::text, 'admin'::text]))),
-    CONSTRAINT cross_property_service_links_status_check CHECK ((status = ANY (ARRAY['proposed'::text, 'active'::text, 'declined'::text, 'ended'::text])))
+    CONSTRAINT cross_property_service_links_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
 );
 
 
@@ -2703,7 +2696,7 @@ CREATE TABLE public.cross_property_service_links (
 -- Name: TABLE cross_property_service_links; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.cross_property_service_links IS 'S616: a space one landlord SERVICES and a unit another landlord LEASES are the same physical place. While active, the serviced space stops cutting its own invoice and its utility charges ride the leased unit''s tenant invoice, each row still stamped with the SERVICE landlord''s id so the payout sweep routes that money to the landlord whose meter turned.';
+COMMENT ON TABLE public.cross_property_service_links IS 'S616: a space one landlord SERVICES and a unit another landlord LEASES are the same physical place, matched by GAM on their addresses. Neither landlord approves it and the unit''s landlord is never told: no landlord has standing to refuse another a payment rail, and neither party''s revenue changes. While active the serviced space stops cutting its own invoice and its charges ride the leased unit''s tenant invoice, each row still stamped with the SERVICE landlord''s id so the money reaches the landlord whose meter turned.';
 
 
 --
@@ -16743,14 +16736,14 @@ CREATE UNIQUE INDEX utility_meter_readings_one_cycle_read_per_month ON public.ut
 -- Name: ux_cpsl_live_agreement; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_cpsl_live_agreement ON public.cross_property_service_links USING btree (service_agreement_id) WHERE (status = ANY (ARRAY['proposed'::text, 'active'::text]));
+CREATE UNIQUE INDEX ux_cpsl_live_agreement ON public.cross_property_service_links USING btree (service_agreement_id) WHERE (status = 'active'::text);
 
 
 --
 -- Name: ux_cpsl_live_unit; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_cpsl_live_unit ON public.cross_property_service_links USING btree (unit_id) WHERE (status = ANY (ARRAY['proposed'::text, 'active'::text]));
+CREATE UNIQUE INDEX ux_cpsl_live_unit ON public.cross_property_service_links USING btree (unit_id) WHERE (status = 'active'::text);
 
 
 --
@@ -19414,14 +19407,6 @@ ALTER TABLE ONLY public.cross_property_service_links
 
 
 --
--- Name: cross_property_service_links cross_property_service_links_service_landlord_approved_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.cross_property_service_links
-    ADD CONSTRAINT cross_property_service_links_service_landlord_approved_by_fkey FOREIGN KEY (service_landlord_approved_by) REFERENCES public.users(id);
-
-
---
 -- Name: cross_property_service_links cross_property_service_links_service_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19430,27 +19415,11 @@ ALTER TABLE ONLY public.cross_property_service_links
 
 
 --
--- Name: cross_property_service_links cross_property_service_links_tenant_confirmed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.cross_property_service_links
-    ADD CONSTRAINT cross_property_service_links_tenant_confirmed_by_fkey FOREIGN KEY (tenant_confirmed_by) REFERENCES public.users(id);
-
-
---
 -- Name: cross_property_service_links cross_property_service_links_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.cross_property_service_links
     ADD CONSTRAINT cross_property_service_links_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
-
-
---
--- Name: cross_property_service_links cross_property_service_links_unit_landlord_approved_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.cross_property_service_links
-    ADD CONSTRAINT cross_property_service_links_unit_landlord_approved_by_fkey FOREIGN KEY (unit_landlord_approved_by) REFERENCES public.users(id);
 
 
 --
@@ -23889,5 +23858,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict sENeercOaWR2wAMI1eTktixRGuflNPPT50buE30ZHbCbTR4rchQlWX719bwDlj8
+\unrestrict rol4pQNTRhp7o1ehSd1NzqQwlXJCgDouocEX0DB1vXAJ8aJOiwe8uJE2ejqwqXi
 

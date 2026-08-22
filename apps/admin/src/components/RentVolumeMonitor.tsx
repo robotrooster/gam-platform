@@ -122,7 +122,7 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
   return (
     <div className="card">
       <div className="ct" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        <span>Rent Collected</span>
+        <span>Tenant Payments Collected</span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.72rem', fontWeight: 700, color: status.color }}>
           <Activity size={15} /> {status.label}
         </span>

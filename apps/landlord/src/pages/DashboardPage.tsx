@@ -1,8 +1,7 @@
 import React, { useState, useRef } from 'react'
-import { useQuery, useMutation } from 'react-query'
+import { useQuery } from 'react-query'
 import { humanize } from '@gam/shared'
-import { apiGet, apiPost } from '../lib/api'
-import { toast, appConfirm } from '../components/dialogs'
+import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
@@ -98,11 +97,6 @@ export function DashboardPage() {
 
   return (
     <div>
-      {/* S616: a link request from the landlord next door lands ABOVE the
-          alerts. It is somebody else asking to put charges on your tenant's
-          invoice — it should never be something you find by browsing. */}
-      <CrossPropertyLinkRequests />
-
       {/* Alerts */}
       {/* S605 (Nic): FIRST alert, above everything else — until Stripe
           verification is done NO RENT CAN MOVE, and nothing used to say so. A
@@ -640,79 +634,5 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
         }
       `}</style>
     </div>
-  )
-}
-
-/**
- * S616 (Nic) — "I'm not sure when that would show up to people."
- *
- * On your dashboard, the moment someone asks. The utility landlord proposes it
- * from the space he supplies; this is the other end of that request, and it
- * carries the evidence — which two addresses GAM compared and why it thinks
- * they are one place — because agreeing means another landlord's charges appear
- * on your tenant's invoice.
- *
- * Renders nothing at all when there is nothing pending, which is almost always.
- */
-function CrossPropertyLinkRequests() {
-  const { data: links = [], refetch } = useQuery<any[]>(
-    ['cross-property-links'], () => apiGet('/cross-property-links'))
-  const pending = links.filter((l: any) => l.awaitingYou)
-
-  const approve = useMutation((id: string) => apiPost(`/cross-property-links/${id}/approve`, {}), {
-    onSuccess: () => { refetch(); toast('Approved. It goes live once everyone has agreed.') },
-    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not approve that'),
-  })
-  const decline = useMutation((id: string) => apiPost(`/cross-property-links/${id}/decline`, {}), {
-    onSuccess: () => { refetch(); toast('Declined.') },
-    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not decline that'),
-  })
-
-  if (pending.length === 0) return null
-
-  return (
-    <>
-      {pending.map((l: any) => (
-        <div key={l.id} className="card" style={{ marginBottom: 16, borderColor: 'var(--gold)' }}>
-          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
-            {l.yourRole === 'unit_landlord'
-              ? `${l.serviceLandlordFirst} ${l.serviceLandlordLast} supplies utilities to one of your units`
-              : `${l.unitLandlordFirst} ${l.unitLandlordLast} leases the space you supply`}
-          </div>
-          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 8 }}>
-            {l.yourRole === 'unit_landlord' ? (
-              <>They bill <strong>{l.firstName} {l.lastName}</strong> for utilities at{' '}
-              {l.serviceAddress || l.unitStreet1}. If you agree, those charges join your tenant&apos;s
-              invoice for <strong>{l.unitPropertyName} · Unit {l.unitNumber}</strong> — one bill instead
-              of two. Their utility money still goes to them; your rent still comes to you.</>
-            ) : (
-              <>Their unit <strong>{l.unitPropertyName} · Unit {l.unitNumber}</strong> is the place you
-              supply. Agreeing merges the paperwork onto their invoice.</>
-            )}
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5,
-                        padding: '8px 10px', borderRadius: 8, background: 'var(--bg-2)' }}>
-            {l.addressMatchEvidence}
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '10px 0 0', lineHeight: 1.5 }}>
-            Late fees follow <strong>your lease</strong> from then on, and the utility landlord gives
-            up theirs — so your tenant never sees two kinds of late fee.
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-            <button className="btn btn-primary btn-sm" disabled={approve.isLoading}
-              onClick={() => approve.mutate(l.id)}>
-              Agree
-            </button>
-            <button className="btn btn-ghost btn-sm" disabled={decline.isLoading}
-              onClick={() => appConfirm(
-                'Decline this link?\n\nBoth of you keep billing separately, exactly as you do now.',
-                { confirmLabel: 'Decline' },
-              ).then(ok => { if (ok) decline.mutate(l.id) })}>
-              No thanks
-            </button>
-          </div>
-        </div>
-      ))}
-    </>
   )
 }

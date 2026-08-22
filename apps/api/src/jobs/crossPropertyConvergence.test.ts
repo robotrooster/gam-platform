@@ -18,7 +18,7 @@ import {
 } from '../test/dbHelpers'
 import { generateInvoices } from './invoiceGeneration'
 import { generateServiceAgreementInvoices } from './serviceAgreementInvoices'
-import { proposeLink, recordConsent } from '../services/crossPropertyLink'
+import { proposeLink } from '../services/crossPropertyLink'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -103,42 +103,36 @@ async function twoLandlordsOnePlace() {
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
+// S616: matching IS linking. Nic: "The other landlord shouldn't even see
+// anything about it. We are matching it up on the back end without anybody
+// knowing."
 async function linkAndActivate(f: any) {
-  const link = await proposeLink({
+  return proposeLink({
     serviceAgreementId: f.agreementId, unitId: f.leasedUnitId, via: 'tenant_account',
   })
-  await recordConsent(link.id, 'service_landlord', f.A.userId)
-  await recordConsent(link.id, 'unit_landlord', f.B.userId)
-  const { rows: [t] } = await db.query<any>(
-    `SELECT user_id FROM tenants WHERE id=$1`, [f.tenantId])
-  return recordConsent(link.id, 'tenant', t.user_id)
 }
 
 describe('cross-property convergence (S616)', () => {
-  it('proposes on the address the utility landlord typed', async () => {
+  it('links on the address the utility landlord typed, with no approvals', async () => {
     const f = await twoLandlordsOnePlace()
     const link = await proposeLink({
       serviceAgreementId: f.agreementId, unitId: f.leasedUnitId, via: 'tenant_account',
     })
-    expect(link.status).toBe('proposed')
+    // Live immediately. Nobody is asked: neither landlord's revenue changes,
+    // and a landlord has no standing to refuse another a payment rail.
+    expect(link.status).toBe('active')
+    expect(link.activated_at).not.toBeNull()
     expect(link.address_match_basis).toBe('same_address')
     expect(link.address_match_evidence).toContain('22660 Highway 89')
   })
 
-  it('stays inert until all three approve', async () => {
+  it('moves the $2 platform fee to the leasing landlord when it links', async () => {
     const f = await twoLandlordsOnePlace()
-    const link = await proposeLink({
-      serviceAgreementId: f.agreementId, unitId: f.leasedUnitId, via: 'tenant_account',
-    })
-    await recordConsent(link.id, 'service_landlord', f.A.userId)
-    let after = await recordConsent(link.id, 'unit_landlord', f.B.userId)
-    expect(after.status).toBe('proposed')      // two is not enough
-
-    const { rows: [t] } = await db.query<any>(
-      `SELECT user_id FROM tenants WHERE id=$1`, [f.tenantId])
-    after = await recordConsent(link.id, 'tenant', t.user_id)
-    expect(after.status).toBe('active')
-    expect(after.activated_at).not.toBeNull()
+    await linkAndActivate(f)
+    const { rows: [sa] } = await db.query<any>(
+      `SELECT superseded_by_lease_id FROM utility_service_agreements WHERE id=$1`,
+      [f.agreementId])
+    expect(sa.superseded_by_lease_id).toBe(f.leaseId)
   })
 
   // THE POINT OF THE WHOLE BUILD.
@@ -227,8 +221,7 @@ describe('cross-property convergence (S616)', () => {
       serviceAgreementId: f.agreementId, unitId: f.leasedUnitId,
       via: 'admin', force: true,
     })
-    expect(link.status).toBe('proposed')
-    // Forced past the GATE, never past the CONSENTS.
-    expect(link.service_landlord_approved_at).toBeNull()
+    expect(link.status).toBe('active')
+    expect(link.address_match_basis).toBe('none')
   })
 })

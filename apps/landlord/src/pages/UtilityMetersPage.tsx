@@ -1521,14 +1521,6 @@ function LinkToNeighbourButton({ agreementId, onChanged }: {
       </span>
     )
   }
-  if (mine?.status === 'proposed') {
-    return (
-      <span className="badge badge-amber" style={{ marginRight: 6 }}
-        title="Waiting on the other landlord and the tenant to approve">
-        awaiting approval
-      </span>
-    )
-  }
   return (
     <>
       <button className="btn btn-ghost btn-sm" style={{ marginRight: 6 }}
@@ -1556,7 +1548,7 @@ function LinkToNeighbourModal({ agreementId, onClose, onSaved }: {
     (unitId: string) => apiPost('/cross-property-links', { serviceAgreementId: agreementId, unitId }),
     {
       onSuccess: () => {
-        toast('Sent. It goes live once the other landlord and the tenant both agree.')
+        toast('Linked. Their next invoice carries your utilities; the money still comes to you.')
         onSaved()
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Could not propose that link'),
@@ -1597,7 +1589,7 @@ function LinkToNeighbourModal({ agreementId, onClose, onSaved }: {
                 <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }}
                   disabled={propose.isLoading}
                   onClick={() => { setError(''); propose.mutate(c.id) }}>
-                  Ask to link
+                  Bill through them
                 </button>
               </div>
             ))}
@@ -1607,8 +1599,9 @@ function LinkToNeighbourModal({ agreementId, onClose, onSaved }: {
         {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
 
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 14, lineHeight: 1.5 }}>
-          Nothing changes until <strong>all three</strong> of you agree — you, their landlord, and the
-          person paying. Late fees move to their lease at that point; yours stop.
+          Your charges and their rent both stay exactly what they are — only the paperwork merges.
+          Late fees follow their lease from then on, and yours stop, so the tenant never sees two
+          kinds of late fee. You can undo this at any time.
         </div>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>

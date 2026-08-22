@@ -894,71 +894,6 @@ function HomeAlerts() {
  * than render that page full of dashes, this shows the balance and the bills
  * behind it, and says plainly what the arrangement is.
  */
-/**
- * S616 (Nic) — the tenant is the third consent.
- *
- * Two landlords have agreed that the space one supplies and the other leases
- * are the same place. The tenant is the only party physically standing in it,
- * and the only one who eats a wrong bill, so nothing converges until they say
- * yes. Nic's three consents: "the other landlord approves, I approve, and then
- * the tenant confirms."
- *
- * The ask is deliberately about the ADDRESS and not about the billing
- * mechanics. A tenant knows where they live; they should not be asked to
- * approve a payout arrangement between two landlords.
- */
-function CrossPropertyLinkConfirm() {
-  const qc = useQueryClient()
-  const { data: links = [] } = useQuery<any[]>('cross-property-links',
-    () => get<any[]>('/cross-property-links'))
-  const pending = links.filter((l: any) => l.awaitingYou)
-
-  const approve = useMutation((id: string) => post(`/cross-property-links/${id}/approve`, {}), {
-    onSuccess: () => qc.invalidateQueries('cross-property-links'),
-  })
-  const decline = useMutation((id: string) => post(`/cross-property-links/${id}/decline`, {}), {
-    onSuccess: () => qc.invalidateQueries('cross-property-links'),
-  })
-
-  if (pending.length === 0) return null
-
-  return (
-    <>
-      {pending.map((l: any) => (
-        <div key={l.id} className="card" style={{ marginBottom: 16, borderLeft: '3px solid var(--gold)' }}>
-          <div style={{ fontWeight: 700, color: 'var(--t0)', marginBottom: 6 }}>
-            One bill instead of two?
-          </div>
-          <div style={{ fontSize: '.85rem', color: 'var(--t2)', lineHeight: 1.6, marginBottom: 10 }}>
-            You pay <strong>{l.serviceLandlordFirst} {l.serviceLandlordLast}</strong> for utilities at{' '}
-            {l.serviceAddress || 'your address'}, and you rent{' '}
-            <strong>{l.unitPropertyName} · Unit {l.unitNumber}</strong> from{' '}
-            <strong>{l.unitLandlordFirst} {l.unitLandlordLast}</strong>.
-            {' '}Is that the same place — the utilities you pay for are the ones at the home you rent?
-          </div>
-          <div style={{ fontSize: '.8rem', color: 'var(--t2)', lineHeight: 1.6, marginBottom: 12 }}>
-            If it is, your utilities move onto your rent invoice: one bill, one due date, one
-            payment. The amounts do not change.
-          </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button className="btn btn-p btn-sm" disabled={approve.isLoading}
-              onClick={() => approve.mutate(l.id)}>
-              Yes, same place
-            </button>
-            <button className="btn btn-sm" disabled={decline.isLoading}
-              onClick={() => decline.mutate(l.id)}>
-              No, they&apos;re different
-            </button>
-          </div>
-          <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 10, lineHeight: 1.5 }}>
-            Saying no changes nothing — you keep paying both bills the way you do today.
-          </div>
-        </div>
-      ))}
-    </>
-  )
-}
-
 function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
   const { data: balanceCtx } = useQuery<any>('balance-context',
     () => get<any>('/payments/balance-context'))
@@ -1071,7 +1006,6 @@ function HomePage() {
       </div>
 
       <ServiceOutageBanner />
-      <CrossPropertyLinkConfirm />
       <HomeAlerts />
 
       {/* S542: private platform questionnaire — landlord never sees it. */}

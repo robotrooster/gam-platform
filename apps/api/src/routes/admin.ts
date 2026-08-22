@@ -102,8 +102,17 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  * worst kind of wrong on a financial dashboard, because it looks like
  * information. Nic spotted it as "the graph stops in March".
  *
- * WHAT THIS COUNTS: rent that SETTLED, by the month it settled in — money that
- * actually moved, not contracted rent. That is what makes a spike mean
+ * WHAT THIS COUNTS (S616 — the name and the query disagreed): every TENANT
+ * payment that settled — rent, utilities, late fees and one-off charges — by
+ * the month it settled in. Money that actually moved, not contracted rent.
+ *
+ * The card said "Rent Collected" while the query has always summed four types.
+ * They coincided only because rent was the sole kind of row that existed. The
+ * moment Oak Park bills a trash can or a parking violation, a card labelled
+ * "rent" would quietly start including them. Renamed rather than narrowed: for
+ * a platform-health heartbeat, what matters is money crossing the rails, and
+ * narrowing it to rent would have hidden the utility billing this session
+ * exists to enable. Deposits stay out — they are held, not earned. That is what makes a spike mean
  * something: a month where a block of tenants onboarded and paid shows up as a
  * spike, which is exactly the signal Nic wants to see.
  *
@@ -135,6 +144,21 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
            ON date_trunc('month', COALESCE(p.settled_at, p.created_at)) = span.month_start
           AND p.status IN ('settled', 'paid_via_deposit')
           AND p.type IN ('rent', 'utility', 'late_fee', 'fee')
+          -- S616 (Nic, tracing a $2 figure he could not account for): DEMO AND
+          -- SYSTEM LANDLORDS ARE NOT PLATFORM REVENUE.
+          --
+          -- The $2 was real — a live Stripe test payment on a $2/month lease —
+          -- but the landlord behind it is james@demo.dev, flagged is_demo. Two
+          -- other metrics on this same dashboard already exclude demo and
+          -- system landlords (the onboarding table above, growthSnapshots);
+          -- this one did not, so one chart counted demo money as revenue while
+          -- the chart beside it did not. At launch that becomes real numbers
+          -- mixed with rehearsal numbers on the figure the platform is judged
+          -- by.
+          AND EXISTS (
+            SELECT 1 FROM landlords ll
+             WHERE ll.id = p.landlord_id
+               AND ll.is_demo = FALSE AND ll.is_system = FALSE)
         GROUP BY span.month_start
         ORDER BY span.month_start ASC`,
       [months])
