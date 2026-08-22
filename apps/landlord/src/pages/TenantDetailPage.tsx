@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery } from 'react-query'
+import { useQuery, useMutation } from 'react-query'
 import { humanize } from '@gam/shared'
-import { apiGet } from '../lib/api'
-import { ArrowLeft } from 'lucide-react'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { ArrowLeft, Plus } from 'lucide-react'
+import { toast, appConfirm } from '../components/dialogs'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S252: legacy per-tenant FlexChargePanel removed. The new schema
@@ -133,6 +134,8 @@ export function TenantDetailPage() {
             </div>
           </div>
 
+          <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
+
           <div className="card" style={{ marginBottom: 16 }}>
             <div className="card-title" style={{ marginBottom: 14 }}>Payment History</div>
             {payments?.length === 0 ? (
@@ -257,6 +260,185 @@ function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: a
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * S616 (Nic) — charging for something that happened.
+ *
+ * "You are saying a landlord charging a parking violation would get the charge
+ *  ignored?"
+ *
+ * It would not have been ignored — there was nowhere to enter it. Every charge
+ * on the platform came from a system flow or from the lease document itself, so
+ * a fire-lane violation, a broken window or a replaced key had no door at all.
+ *
+ * This is the door. The charge rides the tenant's next invoice as an ordinary
+ * line with the reason and the date printed on it, so they recognise it instead
+ * of phoning up about an amount.
+ */
+const CHARGE_TYPES = [
+  { value: 'violation',   label: 'Violation' },
+  { value: 'damage',      label: 'Damage' },
+  { value: 'replacement', label: 'Replacement (key, remote, fob)' },
+  { value: 'service',     label: 'Service or callout' },
+  { value: 'other',       label: 'Something else' },
+] as const
+
+function OneOffChargesCard({ tenantId, hasUnit }: { tenantId: string; hasUnit: boolean }) {
+  const [adding, setAdding] = useState(false)
+  const { data: charges = [], refetch } = useQuery<any[]>(
+    ['one-off-charges', tenantId],
+    () => apiGet(`/one-off-charges?tenantId=${tenantId}`),
+  )
+
+  const cancel = useMutation(
+    (row: any) => apiPatch(`/one-off-charges/${row.id}/cancel`, {}),
+    {
+      onSuccess: () => { refetch(); toast('Charge withdrawn.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not withdraw that'),
+    },
+  )
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+        <div className="card-title" style={{ marginBottom: 0 }}>Charges</div>
+        {hasUnit && (
+          <button className="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
+            <Plus size={13}/> Add a charge
+          </button>
+        )}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.6 }}>
+        Something that happened rather than something in the lease — a violation, damage, a
+        replacement key. It goes on their next invoice with the reason and the date on it.
+      </div>
+
+      {charges.length === 0 ? (
+        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>
+          {hasUnit ? 'Nothing charged.' : 'No active lease to charge.'}
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {charges.map((c: any) => (
+            <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 12,
+                                     padding: '10px 12px', borderRadius: 10,
+                                     background: 'var(--bg-2)', border: '1px solid var(--border-0)',
+                                     opacity: c.status === 'cancelled' ? 0.55 : 1 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
+                  {c.reason}
+                </div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
+                  {humanize(c.chargeType)} · {c.incidentDate}
+                  {c.status === 'billed' && ' · on their invoice'}
+                  {c.status === 'cancelled' && ` · withdrawn${c.cancelReason ? ` — ${c.cancelReason}` : ''}`}
+                  {c.status === 'pending' && ` · bills on or after ${c.billOnOrAfter}`}
+                </div>
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', fontWeight: 600,
+                            color: c.status === 'cancelled' ? 'var(--text-3)' : 'var(--gold)' }}>
+                {fmt(c.amount)}
+              </div>
+              {c.status === 'pending' && (
+                <button className="btn btn-ghost btn-sm" disabled={cancel.isLoading}
+                  onClick={() => appConfirm(
+                    `Withdraw the ${fmt(c.amount)} charge for "${c.reason}"?\n\n` +
+                    `It stays on the record as withdrawn — nothing is erased.`,
+                    { confirmLabel: 'Withdraw' },
+                  ).then(ok => { if (ok) cancel.mutate(c) })}>
+                  Withdraw
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {adding && (
+        <AddChargeModal tenantId={tenantId}
+          onClose={() => setAdding(false)}
+          onSaved={() => { setAdding(false); refetch() }} />
+      )}
+    </div>
+  )
+}
+
+function AddChargeModal({ tenantId, onClose, onSaved }: {
+  tenantId: string; onClose: () => void; onSaved: () => void
+}) {
+  const today = new Date().toISOString().slice(0, 10)
+  const [chargeType, setChargeType] = useState('violation')
+  const [amount, setAmount] = useState('')
+  const [reason, setReason] = useState('')
+  const [incidentDate, setIncidentDate] = useState(today)
+  const [internalNote, setInternalNote] = useState('')
+  const [error, setError] = useState('')
+
+  const save = useMutation(
+    () => apiPost('/one-off-charges', {
+      tenantId, chargeType,
+      amount: Number(amount),
+      reason: reason.trim(),
+      incidentDate,
+      internalNote: internalNote.trim() || undefined,
+    }),
+    {
+      onSuccess: () => { toast('Charge added — it goes on their next invoice.'); onSaved() },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not add that charge'),
+    },
+  )
+
+  const ready = Number(amount) > 0 && reason.trim().length >= 3
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add a charge</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
+          For something that happened — not a term of the lease. The tenant sees the reason and
+          the date on their invoice.
+        </div>
+
+        <label style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }}>What kind</label>
+        <select className="form-select" value={chargeType} onChange={e => setChargeType(e.target.value)}>
+          {CHARGE_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+        </select>
+
+        <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>Amount</label>
+        <input className="form-input" type="number" min="0.01" step="0.01" value={amount}
+          placeholder="50.00" onChange={e => setAmount(e.target.value)} />
+
+        <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>
+          Reason <span style={{ color:'var(--text-3)' }}>(the tenant reads this)</span>
+        </label>
+        <input className="form-input" value={reason} maxLength={200}
+          placeholder="Parking in the fire lane"
+          onChange={e => setReason(e.target.value)} />
+
+        <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>When it happened</label>
+        <input className="form-input" type="date" value={incidentDate} max={today}
+          onChange={e => setIncidentDate(e.target.value)} />
+
+        <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>
+          Your own note <span style={{ color:'var(--text-3)' }}>(never shown to them)</span>
+        </label>
+        <textarea className="form-input" rows={2} value={internalNote} maxLength={1000}
+          onChange={e => setInternalNote(e.target.value)} />
+
+        {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+          <button className="btn btn-primary" disabled={!ready || save.isLoading}
+            onClick={() => { setError(''); save.mutate() }}>
+            {save.isLoading ? 'Adding…' : 'Add charge'}
+          </button>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>

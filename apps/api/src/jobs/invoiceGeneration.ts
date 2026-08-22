@@ -494,6 +494,31 @@ async function runGeneration(
         [lease.id, dueDate, crossLink?.service_agreement_id ?? null]
       )
 
+      // S616 (Nic) — ONE-OFF CHARGES. A parking violation, damage, a
+      // replacement key: things that happened rather than terms that were
+      // agreed. Until now there was no way to bill any of them, so a landlord
+      // with a $50 fire-lane violation had nowhere to put it.
+      //
+      // Same straggler semantics as a utility bill — anything due on or before
+      // this cycle rides it, so a charge entered on the 20th is not lost
+      // because the invoice for that month had already gone out.
+      const oneOffCharges = await query<{
+        id: string
+        amount: string
+        reason: string
+        charge_type: string
+        incident_date: string
+      }>(
+        `SELECT id, amount::text, reason, charge_type,
+                to_char(incident_date, 'YYYY-MM-DD') AS incident_date
+           FROM tenant_one_off_charges
+          WHERE lease_id = $1
+            AND status = 'pending'
+            AND bill_on_or_after <= $2::date
+          ORDER BY incident_date ASC, created_at ASC`,
+        [lease.id, dueDate]
+      )
+
       // S533: propane fill installments not yet billed whose cycle has
       // arrived. #1 billed immediately at the fill (payment_id set), so
       // this only picks up the split remainder. Same straggler semantics
@@ -526,7 +551,7 @@ async function runGeneration(
         if (existing.length > 0) continue
         invoicesInserted++
         rentsInserted++
-        feesInserted += fees.length
+        feesInserted += fees.length + oneOffCharges.length
         utilitiesInserted += utilityBills.length + propaneInstallments.length
         continue
       }
@@ -541,6 +566,9 @@ async function runGeneration(
         // Compute GROSS totals (the invoice subtotals stay gross for the record).
         const rentAmountNum = Number(effectiveRentAmount)
         const feesTotalNum = fees.reduce((s, f) => s + Number(f.amount), 0)
+        // S616: one-off charges sit in the FEES subtotal — they are fees, just
+        // not ones the lease named in advance.
+        const oneOffTotalNum = oneOffCharges.reduce((s, c) => s + Number(c.amount), 0)
         const utilitiesTotalNum = utilityBills.reduce((s, b) => s + Number(b.charge_amount), 0)
         // Propane installments count into the utilities subtotal + total.
         // S609 (Nic): they are ALSO work-trade creditable now. They used to be
@@ -551,8 +579,8 @@ async function runGeneration(
         // given and the work done are recorded on one document. Late-fee
         // treatment is unchanged.
         const propaneTotalNum = propaneInstallments.reduce((s, p) => s + Number(p.amount), 0)
-        const billableTotalNum = round2(rentAmountNum + feesTotalNum + utilitiesTotalNum + propaneTotalNum)
-        const subtotalFeesStr      = feesTotalNum.toFixed(2)
+        const billableTotalNum = round2(rentAmountNum + feesTotalNum + oneOffTotalNum + utilitiesTotalNum + propaneTotalNum)
+        const subtotalFeesStr      = round2(feesTotalNum + oneOffTotalNum).toFixed(2)
         const subtotalUtilitiesStr = round2(utilitiesTotalNum + propaneTotalNum).toFixed(2)
 
         // S517 — work-trade credit (Landlord #29). When the master tenant on
@@ -619,6 +647,12 @@ async function runGeneration(
           + dist.utilityNets.reduce((s, u) => s + u, 0)
           + dist.feeNets.reduce((s, f) => s + f, 0)
           + dist.propaneNets.reduce((s, p) => s + p, 0)
+          // S616: one-off charges at FACE VALUE. They are outside the work-trade
+          // distribution entirely (a fine is not a cost of living there), so
+          // they add here rather than arriving through `dist` — and they must
+          // add, or the invoice's subtotal would show the charge while its
+          // total quietly left it out.
+          + oneOffTotalNum
         )
         // A row fully covered by the trade is charged $0 and recorded as
         // already-settled (covered by labor, not cash) only when work-trade
@@ -693,6 +727,39 @@ async function runGeneration(
               net.toFixed(2), dueDate, fee.id, rowStatus(net), rowNote(net),
             ]
           )
+          feesInserted++
+        }
+
+        // S616: one-off charge rows. Charged at FACE VALUE — deliberately not
+        // work-trade creditable. A work-trade agreement covers rent, fees and
+        // utilities: the recurring cost of living there. A violation is not a
+        // cost of living there, it is a consequence, and letting hours worked
+        // discount a fine turns the fine into a rate card. It leaves the credit
+        // BASIS as well, for the S613 reason — a charge that cannot be
+        // discounted must not inflate the pot that discounts everything else.
+        for (const oc of oneOffCharges) {
+          const ocPayment = await client.query<{ id: string }>(
+            `INSERT INTO payments (
+               invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+               type, amount, status, due_date, entry_description, notes
+             ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, 'pending', $7, 'OTHERFEE', $8)
+             RETURNING id`,
+            [
+              invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
+              Number(oc.amount).toFixed(2), dueDate,
+              // The tenant reads the reason and the day it happened, so the
+              // line is recognisable instead of a bare amount they have to
+              // phone up about.
+              `${oc.reason} (${new Date(oc.incident_date + 'T00:00:00Z')
+                .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })})`,
+            ]
+          )
+          await client.query(
+            `UPDATE tenant_one_off_charges
+                SET status = 'billed', payment_id = $1, billed_at = NOW(),
+                    updated_at = NOW()
+              WHERE id = $2`,
+            [ocPayment.rows[0].id, oc.id])
           feesInserted++
         }
 

@@ -170,6 +170,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // but leases are deleted later in this chain).
   await db.query(`DELETE FROM tenant_autopay`)
   await db.query(`DELETE FROM tenant_remittances`)
+  // S616: a one-off charge FKs a payments row, plus the lease, unit and tenant
+  // — all NO ACTION, so it clears before the earliest of them.
+  await db.query(`DELETE FROM tenant_one_off_charges`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —
   // clear it too or gam_test grows without bound across runs.

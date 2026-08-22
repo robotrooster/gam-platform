@@ -82,6 +82,7 @@ import { maintenanceRouter }  from './routes/maintenance'
 import { documentsRouter }    from './routes/documents'
 import { utilityRouter }      from './routes/utility'
 import { utilityServiceAgreementsRouter } from './routes/utilityServiceAgreements'
+import { oneOffChargesRouter } from './routes/oneOffCharges'
 import { propaneRouter }      from './routes/propane'
 import { adminRouter }        from './routes/admin'
 import { portfolioRouter }    from './routes/portfolio'
@@ -346,6 +347,7 @@ app.use('/api/documents',     documentsRouter)
 // S615: mounted BEFORE the utility router so '/service-agreements' is matched
 // here rather than falling into utilityRouter's own route table.
 app.use('/api/utility/service-agreements', utilityServiceAgreementsRouter)
+app.use('/api/one-off-charges', oneOffChargesRouter)
 app.use('/api/utility',       utilityRouter)
 app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)

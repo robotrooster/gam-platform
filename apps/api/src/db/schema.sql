@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SkJhGMbjHwObixcv655r1E6AuHhLQnPYoJ7yIKfiGRAxMTTJHPGWbbnwWYDRGd7
+\restrict LxWY64rrhRsXh4ndZeQhO9ClLRFOsCaN60K1mgXcyGO7TIzZibaoQD1VUxPrvN4
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5139,7 +5139,7 @@ CREATE TABLE public.payments (
     sublease_markup_amount numeric DEFAULT 0 NOT NULL,
     home_sale_installment_id uuid,
     revenue_owner text DEFAULT 'landlord'::text NOT NULL,
-    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text]))),
+    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
@@ -8107,6 +8107,46 @@ CREATE TABLE public.tenant_notifications (
     read boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+
+--
+-- Name: tenant_one_off_charges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_one_off_charges (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid,
+    unit_id uuid NOT NULL,
+    charge_type text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    reason text NOT NULL,
+    incident_date date NOT NULL,
+    internal_note text,
+    bill_on_or_after date DEFAULT CURRENT_DATE NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    payment_id uuid,
+    billed_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    cancelled_by uuid,
+    cancel_reason text,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_one_off_charges_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT tenant_one_off_charges_charge_type_check CHECK ((charge_type = ANY (ARRAY['violation'::text, 'damage'::text, 'replacement'::text, 'service'::text, 'other'::text]))),
+    CONSTRAINT tenant_one_off_charges_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'billed'::text, 'cancelled'::text]))),
+    CONSTRAINT tooc_billed_has_payment CHECK (((status = 'billed'::text) = (payment_id IS NOT NULL))),
+    CONSTRAINT tooc_cancelled_has_reason CHECK (((status <> 'cancelled'::text) OR (cancelled_at IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE tenant_one_off_charges; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_one_off_charges IS 'S616: a charge that happened rather than a term that was agreed — a parking violation, damage, a replacement key. Rides the tenant''s next invoice as an ordinary fee row. Kept OUT of lease_fees on purpose: lease_fees is what the signed lease says, and the lease is the only thing that holds up in court.';
 
 
 --
@@ -12082,6 +12122,14 @@ ALTER TABLE ONLY public.tenant_notifications
 
 
 --
+-- Name: tenant_one_off_charges tenant_one_off_charges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_questionnaires tenant_questionnaires_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15736,6 +15784,27 @@ CREATE INDEX idx_tnotif_user ON public.tenant_notifications USING btree (user_id
 
 
 --
+-- Name: idx_tooc_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tooc_landlord ON public.tenant_one_off_charges USING btree (landlord_id, status);
+
+
+--
+-- Name: idx_tooc_lease_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tooc_lease_pending ON public.tenant_one_off_charges USING btree (lease_id, bill_on_or_after) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_tooc_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tooc_tenant ON public.tenant_one_off_charges USING btree (tenant_id, created_at DESC);
+
+
+--
 -- Name: idx_transfer_approvals_open; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17525,6 +17594,13 @@ CREATE TRIGGER audit_subleases AFTER DELETE OR UPDATE ON public.subleases FOR EA
 --
 
 CREATE TRIGGER audit_tenant_identifications AFTER DELETE OR UPDATE ON public.tenant_identifications FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_one_off_charges audit_tenant_one_off_charges; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_one_off_charges AFTER DELETE OR UPDATE ON public.tenant_one_off_charges FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -22936,6 +23012,62 @@ ALTER TABLE ONLY public.tenant_notifications
 
 
 --
+-- Name: tenant_one_off_charges tenant_one_off_charges_cancelled_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_cancelled_by_fkey FOREIGN KEY (cancelled_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: tenant_one_off_charges tenant_one_off_charges_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_one_off_charges
+    ADD CONSTRAINT tenant_one_off_charges_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
 -- Name: tenant_questionnaires tenant_questionnaires_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23731,5 +23863,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SkJhGMbjHwObixcv655r1E6AuHhLQnPYoJ7yIKfiGRAxMTTJHPGWbbnwWYDRGd7
+\unrestrict LxWY64rrhRsXh4ndZeQhO9ClLRFOsCaN60K1mgXcyGO7TIzZibaoQD1VUxPrvN4
 
