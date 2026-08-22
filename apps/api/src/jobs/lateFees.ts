@@ -29,7 +29,8 @@ import { logger } from '../lib/logger'
 
 interface QualifyingInvoice {
   invoice_id: number
-  lease_id: number
+  // S615: NULL on a utility-service invoice — it has an agreement, not a lease.
+  lease_id: number | null
   landlord_id: string
   unit_id: string | null
   resolved_unit_id: string
@@ -73,17 +74,24 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         i.tenant_id,
         i.due_date::text AS due_date,
         (NOW() AT TIME ZONE p.timezone)::date::text AS today_local,
-        COALESCE(l.late_fee_grace_days, 5) AS late_fee_grace_days,
-        l.late_fee_initial_type,
-        l.late_fee_initial_amount::text AS late_fee_initial_amount,
-        l.late_fee_accrual_type,
-        l.late_fee_accrual_amount::text AS late_fee_accrual_amount,
-        l.late_fee_accrual_period,
-        COALESCE(l.late_fee_accrual_from, 'grace_end') AS late_fee_accrual_from,
-        l.late_fee_cap_type,
-        l.late_fee_cap_amount::text AS late_fee_cap_amount
+        COALESCE(l.late_fee_grace_days, sa.late_fee_grace_days, 5) AS late_fee_grace_days,
+        COALESCE(l.late_fee_initial_type, sa.late_fee_initial_type) AS late_fee_initial_type,
+        COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount)::text AS late_fee_initial_amount,
+        COALESCE(l.late_fee_accrual_type, sa.late_fee_accrual_type) AS late_fee_accrual_type,
+        COALESCE(l.late_fee_accrual_amount, sa.late_fee_accrual_amount)::text AS late_fee_accrual_amount,
+        COALESCE(l.late_fee_accrual_period, sa.late_fee_accrual_period) AS late_fee_accrual_period,
+        COALESCE(l.late_fee_accrual_from, sa.late_fee_accrual_from, 'grace_end') AS late_fee_accrual_from,
+        COALESCE(l.late_fee_cap_type, sa.late_fee_cap_type) AS late_fee_cap_type,
+        COALESCE(l.late_fee_cap_amount, sa.late_fee_cap_amount)::text AS late_fee_cap_amount
       FROM invoices i
-      JOIN leases l ON l.id = i.lease_id
+      -- S615: an invoice belongs to EITHER a lease or a utility service
+      -- agreement, so the lease join can no longer be an inner one — it was
+      -- silently excluding every next-door utility invoice from the late-fee
+      -- engine entirely. Both instruments carry the same stamped parameters,
+      -- and exactly one of them is present per the invoices CHECK, so the
+      -- COALESCE pairs above are unambiguous rather than a precedence rule.
+      LEFT JOIN leases l ON l.id = i.lease_id
+      LEFT JOIN utility_service_agreements sa ON sa.id = i.service_agreement_id
       JOIN units u ON u.id = COALESCE(i.unit_id, l.unit_id)
       JOIN properties p ON p.id = u.property_id
       WHERE ${rowFilter}
@@ -93,10 +101,10 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         -- catch-up plan shouldn't be fined for arrears from the old system."
         -- Set per invoice, so a landlord CAN opt a specific debt back in.
         AND i.late_fee_exempt = false
-        AND l.late_fee_enabled = true
-        AND l.late_fee_initial_amount IS NOT NULL
+        AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled) = true
+        AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount) IS NOT NULL
         AND (NOW() AT TIME ZONE p.timezone)::date
-            >= (i.due_date + (COALESCE(l.late_fee_grace_days, 5) || ' days')::interval)::date
+            >= (i.due_date + (COALESCE(l.late_fee_grace_days, sa.late_fee_grace_days, 5) || ' days')::interval)::date
         -- S537 (Nic): late fees track UNPAID BASE CHARGES, never themselves.
         -- (a) Stop accruing once every non-late-fee child is settled — a
         --     partial invoice whose only open child is the late fee itself
@@ -225,12 +233,26 @@ async function processInvoice(
   // reopen (double-count) and 'failed'/'paid_via_deposit' artifacts. The old
   // `LIMIT 1` picked ONE piece arbitrarily (even the already-paid slice),
   // under-basing the fee whenever the rent had been split.
-  const { rows: rentRows } = await client.query<{ total: string }>(`
-    SELECT COALESCE(SUM(amount), 0)::text AS total
-    FROM payments
-    WHERE invoice_id = $1 AND type = 'rent'
-      AND status IN ('pending', 'processing', 'settled')
-  `, [inv.invoice_id])
+  //
+  // S615: a UTILITY-SERVICE invoice (no lease, no rent row anywhere) bases the
+  // percentage on its own billable charges instead — the utilities, which are
+  // the entire obligation. Without this a percent-of-rent property would
+  // compute every such fee as exactly $0 and a percent CAP would return 0
+  // remaining, which blocks even a FLAT fee: the bill would look configured,
+  // qualify, and then quietly never charge anything. Scoped to lease_id IS
+  // NULL so a leased invoice's basis is byte-identical to what it was.
+  const isServiceInvoice = inv.lease_id == null
+  const { rows: rentRows } = await client.query<{ total: string }>(
+    isServiceInvoice
+      ? `SELECT COALESCE(SUM(amount), 0)::text AS total
+           FROM payments
+          WHERE invoice_id = $1 AND type <> 'late_fee'
+            AND status IN ('pending', 'processing', 'settled')`
+      : `SELECT COALESCE(SUM(amount), 0)::text AS total
+           FROM payments
+          WHERE invoice_id = $1 AND type = 'rent'
+            AND status IN ('pending', 'processing', 'settled')`
+  , [inv.invoice_id])
   const rentAmount = Number(rentRows[0].total)
 
   // S558 (Nic): billing = PURE lease-stamp. Every parameter comes from the

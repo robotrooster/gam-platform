@@ -8,6 +8,7 @@ import { query, queryOne } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
+import { registerServiceAgreementInvoiceEngine } from './serviceAgreementInvoices'
 import { registerAutopayEngine } from './autopayRunner'
 import { registerRefreshCron, refreshTimezoneCrons, summary as tzCronSummary } from './timezoneCronManager'
 import { expireStaleInvitations as expireStalePmPropertyInvitations } from '../services/pm'
@@ -1998,6 +1999,9 @@ export function schedulerInit() {
   })
 
   registerInvoiceEngine()
+  // S615: the same 7am-local slot, so a landlord's next-door utility bills go
+  // out the same morning their tenants' invoices do.
+  registerServiceAgreementInvoiceEngine()
   registerLateFeeEngine()
   registerAutopayEngine()
   registerRefreshCron()

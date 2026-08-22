@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict wvfXDaL5c3WA8CkvNp92a3gA1LUV5rZf9oqTbFh8zSyV8TdBkSarLbXdYzGD1a3
+\restrict R9ud3cv8EoLG62T7R5p7pbCLsfdjCtlXi80ZKxd2Ahg4ecsJmo2AVEzLOYY8DNY
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3625,7 +3625,7 @@ CREATE TABLE public.invoices (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     landlord_id uuid NOT NULL,
     tenant_id uuid,
-    lease_id uuid NOT NULL,
+    lease_id uuid,
     unit_id uuid NOT NULL,
     invoice_number text NOT NULL,
     due_date date NOT NULL,
@@ -3647,6 +3647,8 @@ CREATE TABLE public.invoices (
     work_trade_agreement_id uuid,
     is_opening_balance boolean DEFAULT false NOT NULL,
     late_fee_exempt boolean DEFAULT false NOT NULL,
+    service_agreement_id uuid,
+    CONSTRAINT invoices_payer_source_check CHECK (((lease_id IS NOT NULL) <> (service_agreement_id IS NOT NULL))),
     CONSTRAINT invoices_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'partial'::text, 'settled'::text, 'void'::text]))),
     CONSTRAINT invoices_subtotal_deposits_check CHECK ((subtotal_deposits >= (0)::numeric)),
     CONSTRAINT invoices_subtotal_fees_check CHECK ((subtotal_fees >= (0)::numeric)),
@@ -3670,6 +3672,13 @@ COMMENT ON COLUMN public.invoices.is_opening_balance IS 'S605: a balance carried
 --
 
 COMMENT ON COLUMN public.invoices.late_fee_exempt IS 'S605: the nightly late-fee engine skips this invoice. Defaults TRUE on carried balances so migrated arrears do not start compounding; landlord may override per balance.';
+
+
+--
+-- Name: COLUMN invoices.service_agreement_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.invoices.service_agreement_id IS 'S615: set when this invoice bills a space the landlord SERVICES but does not lease (cross-property utilities). Mutually exclusive with lease_id. Such an invoice carries utility rows only — there is no rent to charge.';
 
 
 --
@@ -9004,8 +9013,39 @@ CREATE TABLE public.utility_service_agreements (
     created_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    billing_due_day integer DEFAULT 1 NOT NULL,
+    late_fee_enabled boolean DEFAULT true NOT NULL,
+    late_fee_grace_days integer,
+    late_fee_initial_amount numeric(10,2),
+    late_fee_initial_type text DEFAULT 'flat'::text NOT NULL,
+    late_fee_accrual_amount numeric,
+    late_fee_accrual_type text,
+    late_fee_accrual_period text,
+    late_fee_accrual_from text DEFAULT 'grace_end'::text NOT NULL,
+    late_fee_cap_amount numeric,
+    late_fee_cap_type text,
+    CONSTRAINT usa_billing_due_day_check CHECK (((billing_due_day >= 1) AND (billing_due_day <= 31))),
+    CONSTRAINT usa_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
+    CONSTRAINT usa_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
+    CONSTRAINT usa_late_fee_accrual_type_check CHECK (((late_fee_accrual_type IS NULL) OR (late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
+    CONSTRAINT usa_late_fee_cap_type_check CHECK (((late_fee_cap_type IS NULL) OR (late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
+    CONSTRAINT usa_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT utility_service_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
 );
+
+
+--
+-- Name: COLUMN utility_service_agreements.billing_due_day; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.billing_due_day IS 'S615: day of month this agreement''s utility invoice is due. Clamped to the last day in shorter months, same as a lease''s rent_due_day.';
+
+
+--
+-- Name: COLUMN utility_service_agreements.late_fee_initial_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.late_fee_initial_amount IS 'S615: stamped from property policy when the agreement is created. NULL means no late fee was configured at the property, and none accrues.';
 
 
 --
@@ -13883,6 +13923,13 @@ CREATE INDEX idx_invoices_lease ON public.invoices USING btree (lease_id);
 
 
 --
+-- Name: idx_invoices_service_agreement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_service_agreement ON public.invoices USING btree (service_agreement_id) WHERE (service_agreement_id IS NOT NULL);
+
+
+--
 -- Name: idx_invoices_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16526,6 +16573,13 @@ CREATE UNIQUE INDEX ux_invoices_one_opening_balance_per_lease ON public.invoices
 --
 
 COMMENT ON INDEX public.ux_invoices_one_opening_balance_per_lease IS 'S609: a lease may carry exactly one opening balance. The route checks first for a friendly error; this makes the rule impossible to race past.';
+
+
+--
+-- Name: ux_invoices_service_agreement_due_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_invoices_service_agreement_due_date ON public.invoices USING btree (service_agreement_id, due_date) WHERE (service_agreement_id IS NOT NULL);
 
 
 --
@@ -19804,6 +19858,14 @@ ALTER TABLE ONLY public.invoices
 
 ALTER TABLE ONLY public.invoices
     ADD CONSTRAINT invoices_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: invoices invoices_service_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_service_agreement_id_fkey FOREIGN KEY (service_agreement_id) REFERENCES public.utility_service_agreements(id) ON DELETE RESTRICT;
 
 
 --
@@ -23450,5 +23512,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict wvfXDaL5c3WA8CkvNp92a3gA1LUV5rZf9oqTbFh8zSyV8TdBkSarLbXdYzGD1a3
+\unrestrict R9ud3cv8EoLG62T7R5p7pbCLsfdjCtlXi80ZKxd2Ahg4ecsJmo2AVEzLOYY8DNY
 

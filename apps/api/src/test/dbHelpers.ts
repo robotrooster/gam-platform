@@ -104,6 +104,13 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM utility_bills`)
   // S614: a service agreement holds units + tenants with RESTRICT, and its bills
   // reference it, so it clears after the bills and before units/tenants below.
+  // S615: its INVOICES reference it too (RESTRICT), and invoices are cleared
+  // much further down — so they go first, together with the payment rows that
+  // hang off them, or this delete trips invoices_service_agreement_id_fkey.
+  await db.query(
+    `DELETE FROM payments WHERE invoice_id IN
+       (SELECT id FROM invoices WHERE service_agreement_id IS NOT NULL)`)
+  await db.query(`DELETE FROM invoices WHERE service_agreement_id IS NOT NULL`)
   await db.query(`DELETE FROM utility_service_agreements`)
   // S533: propane installments FK payments (NO ACTION) — clear the
   // child before payments get wiped; fills cascade from installments'
