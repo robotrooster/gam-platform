@@ -1488,15 +1488,31 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
       userId = u.rows[0].id
     }
 
-    // 2. Invite token on user
+    // 2. Invite token on user — ONLY for someone who needs one.
+    //
+    // S616 (Nic): "it needs to be intercepted in the server that that person
+    // already is on the platform. And instead of giving them the tenant portal
+    // invite, it just drafts up the lease." Same interception as
+    // /me/onboard-new-lease-tenant; this is the second door onto the same
+    // problem, and leaving it would still mail "set a password" to a neighbour
+    // who has been signing in for months to pay their trash bill.
+    //
     // S410 (S377): store on tenant_invite_token with 7-day expiry. Pre-S410
     // wrote to email_verify_token (overloaded column).
-    const inviteToken = require('crypto').randomBytes(32).toString('hex')
-    await client.query(
-      `UPDATE users SET tenant_invite_token=$1,
-                        tenant_invite_expires_at=NOW() + INTERVAL '7 days'
-        WHERE id=$2`,
-      [inviteToken, userId])
+    const activatedRow2 = await client.query<{ activated: boolean }>(
+      `SELECT password_hash <> '$2b$10$placeholder_invite_pending' AS activated
+         FROM users WHERE id = $1`, [userId])
+    const alreadyOnPlatform = activatedRow2.rows[0]?.activated === true
+
+    let inviteToken: string | null = null
+    if (!alreadyOnPlatform) {
+      inviteToken = require('crypto').randomBytes(32).toString('hex')
+      await client.query(
+        `UPDATE users SET tenant_invite_token=$1,
+                          tenant_invite_expires_at=NOW() + INTERVAL '7 days'
+          WHERE id=$2`,
+        [inviteToken, userId])
+    }
 
     // 3. Tenant row (create or reuse, stamp onboarding_source)
     let tenantId: string
@@ -1559,7 +1575,7 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
 
     // --- Send activation email (post-commit; failure here doesn't roll back tenant) ---
     const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
 
     const landlord = await queryOne<any>(
       `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
@@ -1570,15 +1586,30 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
 
     try {
-      await emailTenantOnboarded(
-        emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl,
-        { landlordId, tenantId }
-      )
+      if (alreadyOnPlatform) {
+        // S616: they already sign in here. Point them at the lease, in the
+        // account they have — never at "set a password".
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId,
+          landlordId,
+          type: 'lease_drafted',
+          title: `${landlordName} added a lease for ${unitLabel}`,
+          body: `A lease for ${propertyAddress} is ready for you to review. Sign in as usual — you already have an account.`,
+          data: { unitId, tenantId, leaseId },
+          actionUrl: '/lease',
+        })
+      } else {
+        await emailTenantOnboarded(
+          emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!,
+          { landlordId, tenantId }
+        )
+      }
     } catch (emailErr) {
       // Failure also lands in email_send_log via send()'s internal logging;
       // landlord can surface it via GET /api/landlords/me/email-failures.
-      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD] Email send failed for')
-      logger.info(`[ONBOARD] Manual activation URL: ${activationUrl}`)
+      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD] notify failed for')
+      if (activationUrl) logger.info(`[ONBOARD] Manual activation URL: ${activationUrl}`)
     }
 
     res.json({
@@ -1589,6 +1620,9 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
         leaseId,
         email: emailNorm,
         activationUrl,
+        // S616: so the screen never says "invite sent" when what happened was
+        // a lease drafted for someone who already has a login.
+        alreadyOnPlatform,
       },
     })
   } catch (e) {
@@ -1687,11 +1721,40 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
         [emailNorm, firstName, lastName, phone])
       userId = u.rows[0].id
     }
-    // Invite token (7-day), reset acceptance state so a re-invite works.
-    const inviteToken = require('crypto').randomBytes(32).toString('hex')
-    await client.query(
-      `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=NOW()+INTERVAL '7 days', updated_at=NOW() WHERE id=$2`,
-      [inviteToken, userId])
+
+    // S616 (Nic): ALREADY ON THE PLATFORM — skip the invite entirely.
+    //
+    //   "When a landlord is onboarding a property and goes to send an invite and
+    //    lease to that person, it needs to be intercepted in the server that
+    //    that person already is on the platform. And instead of giving them the
+    //    tenant portal invite, it just drafts up the lease."
+    //
+    // The neighbour who has been paying for trash and electric for months
+    // already has a GAM login. This route reused their user row and then
+    // unconditionally issued a fresh invite token and mailed them "activate
+    // your account and set a password" — for an account they already use. If
+    // they followed it they would overwrite their working password, and the
+    // landlord would be told an invite was sent when what was needed was a
+    // lease.
+    //
+    // "Already on the platform" means they have finished setting up: a real
+    // password rather than the placeholder this route writes for a brand-new
+    // row. An invite that was sent but never accepted still needs re-sending.
+    const activatedRow = await client.query<{ activated: boolean }>(
+      `SELECT password_hash <> '$2b$10$placeholder_invite_pending' AS activated
+         FROM users WHERE id = $1`, [userId])
+    const alreadyOnPlatform = activatedRow.rows[0]?.activated === true
+
+    // Only mint an invite for someone who actually needs one. Issuing a token
+    // to an established account is what makes the "set a password" mail
+    // possible in the first place.
+    let inviteToken: string | null = null
+    if (!alreadyOnPlatform) {
+      inviteToken = require('crypto').randomBytes(32).toString('hex')
+      await client.query(
+        `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=NOW()+INTERVAL '7 days', updated_at=NOW() WHERE id=$2`,
+        [inviteToken, userId])
+    }
 
     // Tenant (create or reuse).
     let tenantId: string
@@ -1718,19 +1781,34 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
 
     await client.query('COMMIT')
 
-    // Invite email (post-commit; failure doesn't roll back).
+    // Post-commit; a mail failure never rolls back the onboarding.
     const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
     const landlord = await queryOne<any>(
       `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
     const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
     const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
     const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
     try {
-      await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl, { landlordId, tenantId })
+      if (alreadyOnPlatform) {
+        // S616: they have a login. Tell them a lease is waiting, in the account
+        // they already use — never "set a password".
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId,
+          landlordId,
+          type: 'lease_drafted',
+          title: `${landlordName} added a lease for ${unitLabel}`,
+          body: `A lease for ${propertyAddress} is ready for you to review and sign. Sign in as usual — you already have an account.`,
+          data: { unitId, tenantId },
+          actionUrl: '/lease',
+        })
+      } else {
+        await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!, { landlordId, tenantId })
+      }
     } catch (emailErr) {
-      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] Email send failed for')
-      logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
+      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] notify failed for')
+      if (activationUrl) logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
     }
 
     // S579: this flow onboards a SITTING tenant (the page is explicitly "tenants
@@ -1751,7 +1829,12 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       }
     }
 
-    res.json({ success: true, data: { userId, tenantId, email: emailNorm, unitId, activationUrl, screeningWaived } })
+    // S616: the landlord is told which of the two actually happened, so the
+    // screen never claims an invite was sent when a lease was drafted instead.
+    res.json({ success: true, data: {
+      userId, tenantId, email: emailNorm, unitId, activationUrl, screeningWaived,
+      alreadyOnPlatform,
+    } })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     next(e)

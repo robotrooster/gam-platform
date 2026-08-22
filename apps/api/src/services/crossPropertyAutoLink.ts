@@ -16,6 +16,9 @@ import { checkUnitAgainstAgreement } from './addressAdjacency'
 // neither landlord's revenue changes and no landlord has standing to refuse
 // another a payment rail.
 //
+// TWO SIGNALS, BOTH REQUIRED: the addresses describe one place, AND the person
+// paying the utilities is the person on the lease. See the note in the loop.
+//
 // Runs daily rather than on a trigger because either side can arrive first.
 // Nic: "we don't always know which order... it could be the lease side of
 // things, or it could be the utility side." A sweep does not care which.
@@ -32,8 +35,8 @@ export async function autoLinkNeighborServices(): Promise<AutoLinkResult> {
   // Live agreements that are not already linked. An agreement whose space has
   // no address recorded cannot be matched to anything, and is skipped rather
   // than guessed at.
-  const agreements = await query<{ id: string; landlord_id: string }>(
-    `SELECT sa.id, sa.landlord_id
+  const agreements = await query<{ id: string; landlord_id: string; tenant_id: string }>(
+    `SELECT sa.id, sa.landlord_id, sa.tenant_id
        FROM utility_service_agreements sa
       WHERE sa.status = 'active'
         AND NOT EXISTS (
@@ -44,18 +47,39 @@ export async function autoLinkNeighborServices(): Promise<AutoLinkResult> {
 
   for (const sa of agreements) {
     try {
-      // Units belonging to a DIFFERENT landlord, not already linked, that could
-      // be the same place. The address comparison is what narrows this — not a
-      // pre-filter that might quietly exclude the right answer.
+      // Units belonging to a DIFFERENT landlord, not already linked, WHOSE
+      // ACTIVE TENANT IS THE SAME PERSON who pays this agreement.
+      //
+      // S616 (Nic): "it also matches face, not just on the property address. It
+      // needs to match on the customer name too."
+      //
+      // Two signals, and neither is sufficient alone. An address alone cannot
+      // tell a duplex apart, and the person alone proves nothing — Nic raised
+      // the case himself: "one of the roommates had the utilities in their name
+      // with landlord A, and the lease is signed by tenant B." Requiring both
+      // means the roommate case simply does not link, which is the safe
+      // outcome: two separate bills, exactly as today.
+      //
+      // Matched on the tenant ID rather than a name string. The payer already
+      // holds a GAM account, and the whole point of reusing it when their
+      // landlord onboards is that it IS the same person — a name comparison
+      // would be a worse test of a fact we can check exactly.
       const candidates = await query<{ id: string }>(
         `SELECT u.id
            FROM units u
           WHERE u.landlord_id <> $1
             AND u.status <> 'utility_service'
+            AND EXISTS (
+              SELECT 1
+                FROM v_lease_active_tenants vt
+                JOIN leases l2 ON l2.id = vt.lease_id
+               WHERE l2.unit_id = u.id
+                 AND l2.status = 'active'
+                 AND vt.tenant_id = $2)
             AND NOT EXISTS (
               SELECT 1 FROM cross_property_service_links l
                WHERE l.unit_id = u.id AND l.status = 'active')
-          LIMIT 2000`, [sa.landlord_id])
+          LIMIT 2000`, [sa.landlord_id, sa.tenant_id])
 
       // Only an UNAMBIGUOUS match links. Two units that both look like the same
       // place means GAM cannot tell which, and linking the wrong one puts a

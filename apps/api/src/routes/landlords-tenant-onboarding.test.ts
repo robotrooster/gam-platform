@@ -446,3 +446,106 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
     expect(u.rows.length).toBe(1)
   })
 })
+
+// S616 (Nic): "When a landlord is onboarding a property and goes to send an
+// invite and lease to that person, it needs to be intercepted in the server
+// that that person already is on the platform. And instead of giving them the
+// tenant portal invite, it just drafts up the lease."
+//
+// The neighbour who has been paying for trash and electric for months already
+// has a GAM login. Both onboarding routes reused their user row and then
+// mailed them "activate your account and set a password" for an account they
+// already use — and following it would overwrite their working password.
+describe('onboarding somebody who is already on the platform (S616)', () => {
+  async function existingAccount(email: string) {
+    // A real password, not the placeholder the invite flow writes.
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { rows: [u] } = await c.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+         VALUES ($1, '$2b$10$a.real.bcrypt.hash.for.an.active.account', 'tenant',
+                 'Dale', 'Ruiz', '555-0143')
+         RETURNING id`, [email])
+      await c.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+      await c.query('COMMIT')
+      return u.id
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('drafts the lease instead of sending a portal invite', async () => {
+    const f = await seedTOFixture()
+    const email = `existing-${randomUUID().slice(0,6)}@test.dev`
+    const userId = await existingAccount(email)
+
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        firstName: 'Dale', lastName: 'Ruiz', email, phone: '555-0143',
+        unitId: f.unitId,
+        leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
+        monthlyRent: 1500, securityDeposit: 1000,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.data.alreadyOnPlatform).toBe(true)
+    // No activation link, because there is nothing to activate.
+    expect(res.body.data.activationUrl).toBeNull()
+
+    // And no invite token was minted against their live account — that token is
+    // what makes the "set a password" mail possible in the first place.
+    const { rows } = await db.query<any>(
+      `SELECT tenant_invite_token, password_hash FROM users WHERE id = $1`, [userId])
+    expect(rows[0].tenant_invite_token).toBeNull()
+    expect(rows[0].password_hash).toBe('$2b$10$a.real.bcrypt.hash.for.an.active.account')
+
+    // The lease still gets made — that is the whole point.
+    expect(res.body.data.leaseId).toBeTruthy()
+  })
+
+  it('a brand-new person still gets the invite, unchanged', async () => {
+    const f = await seedTOFixture()
+    const email = `brand-new-${randomUUID().slice(0,6)}@test.dev`
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        firstName: 'New', lastName: 'Person', email, phone: '555-0100',
+        unitId: f.unitId,
+        leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
+        monthlyRent: 1500, securityDeposit: 1000,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.data.alreadyOnPlatform).toBe(false)
+    expect(res.body.data.activationUrl).toMatch(/\/accept-invite\?token=[0-9a-f]{64}$/)
+  })
+
+  // An invite that was SENT but never accepted still needs re-sending — that
+  // account is not "on the platform", it is waiting.
+  it('re-invites someone who never accepted', async () => {
+    const f = await seedTOFixture()
+    const email = `pending-${randomUUID().slice(0,6)}@test.dev`
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await c.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+         VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', 'Wait', 'Ing', '555-0111')`,
+        [email])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        firstName: 'Wait', lastName: 'Ing', email, phone: '555-0111',
+        unitId: f.unitId,
+        leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
+        monthlyRent: 1500, securityDeposit: 1000,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.data.alreadyOnPlatform).toBe(false)
+    expect(res.body.data.activationUrl).toBeTruthy()
+  })
+})

@@ -316,8 +316,36 @@ describe('automatic linking (S616)', () => {
     const c = await db.connect()
     try {
       await c.query('BEGIN')
-      // A second unit at B's property — same address, so equally plausible.
-      await seedUnit(c, { propertyId: f.propB, landlordId: f.B.landlordId })
+      // A second unit at B's property leased to the SAME person — same address,
+      // same tenant, so both signals point at both units and neither is more
+      // plausible than the other.
+      const unit2 = await seedUnit(c, { propertyId: f.propB, landlordId: f.B.landlordId })
+      const lease2 = await seedLease(c, {
+        unitId: unit2, landlordId: f.B.landlordId, status: 'active',
+        rentAmount: 500, startDate: '2026-01-01',
+      })
+      await seedLeaseTenant(c, { leaseId: lease2, tenantId: f.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(0)
+  })
+
+  // S616 (Nic): "it also matches face, not just on the property address. It
+  // needs to match on the customer name too." The roommate case he raised
+  // himself — utilities in one person's name, the lease signed by another —
+  // must NOT link, and both keep their own bills.
+  it('does not link when the address matches but the person does not', async () => {
+    const f = await twoLandlordsOnePlace()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      // The lease at B's unit is signed by a DIFFERENT person.
+      const roommate = await seedTenant(c)
+      await c.query(
+        `UPDATE lease_tenants SET tenant_id = $1 WHERE lease_id = $2`,
+        [roommate, f.leaseId])
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
