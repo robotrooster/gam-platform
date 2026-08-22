@@ -4553,6 +4553,7 @@ export function formatInvoiceNumber(year: number, sequence: number): string {
 }
 
 export * from './lateFees';
+export * from './autopaySchedule';
 
 // ============================================================================
 // Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)

@@ -96,6 +96,23 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       await query('UPDATE tenants SET ssi_ssdi=$1 WHERE user_id=$2', [!!ssiSsdi, user.id])
     }
 
+    // S616 (Nic): a UTILITY-SERVICE payer agreeing to be billed.
+    //
+    // A serviced space's payer has no lease, no application and no prior
+    // relationship with GAM — accepting this invite is the only moment they
+    // ever consent to anything. Until it happens (or the landlord attests they
+    // agreed off-platform) their charges accrue but no invoice is issued, so
+    // this stamp is what actually releases the billing.
+    await query(
+      `UPDATE utility_service_agreements sa
+          SET payer_accepted_at = NOW(), updated_at = NOW()
+         FROM tenants t
+        WHERE t.user_id = $1
+          AND sa.tenant_id = t.id
+          AND sa.status = 'active'
+          AND sa.payer_accepted_at IS NULL`,
+      [user.id])
+
     // S568: role-aware — activate the account under the user's ACTUAL role.
     // Real tenants keep role='tenant' (unchanged); an e-sign 'contact' (customer
     // pool, no tenant profile) activates as 'contact' with a null profileId so

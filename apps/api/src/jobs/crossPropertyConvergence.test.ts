@@ -57,8 +57,12 @@ async function twoLandlordsOnePlace() {
       `INSERT INTO utility_service_agreements
          (landlord_id, unit_id, tenant_id, start_date, service_address,
           late_fee_enabled, late_fee_grace_days, late_fee_initial_type,
-          late_fee_initial_amount)
-       VALUES ($1,$2,$3,'2026-01-01','22660 Highway 89', true, 5, 'flat', 25)
+          late_fee_initial_amount,
+          -- S616: the payer has agreed — attested by the landlord, which is
+          -- Nic's own case (cash collected by hand for years). Without this
+          -- nothing is invoiced at all.
+          payer_attested_at)
+       VALUES ($1,$2,$3,'2026-01-01','22660 Highway 89', true, 5, 'flat', 25, NOW())
        RETURNING id`,
       [A.landlordId, servicedUnitId, tenantId])
 

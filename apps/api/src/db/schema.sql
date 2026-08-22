@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict LxWY64rrhRsXh4ndZeQhO9ClLRFOsCaN60K1mgXcyGO7TIzZibaoQD1VUxPrvN4
+\restrict sENeercOaWR2wAMI1eTktixRGuflNPPT50buE30ZHbCbTR4rchQlWX719bwDlj8
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9161,6 +9161,10 @@ CREATE TABLE public.utility_service_agreements (
     late_fee_accrual_from text DEFAULT 'grace_end'::text NOT NULL,
     late_fee_cap_amount numeric,
     late_fee_cap_type text,
+    payer_accepted_at timestamp with time zone,
+    payer_attested_at timestamp with time zone,
+    payer_attested_by uuid,
+    payer_attestation_note text,
     CONSTRAINT usa_billing_due_day_check CHECK (((billing_due_day >= 1) AND (billing_due_day <= 31))),
     CONSTRAINT usa_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
     CONSTRAINT usa_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
@@ -9183,6 +9187,20 @@ COMMENT ON COLUMN public.utility_service_agreements.billing_due_day IS 'S615: da
 --
 
 COMMENT ON COLUMN public.utility_service_agreements.late_fee_initial_amount IS 'S615: stamped from property policy when the agreement is created. NULL means no late fee was configured at the property, and none accrues.';
+
+
+--
+-- Name: COLUMN utility_service_agreements.payer_accepted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.payer_accepted_at IS 'S616: when the payer accepted their portal invite. Either this or payer_attested_at must be set before any invoice is issued — nobody is billed by GAM without having agreed to be.';
+
+
+--
+-- Name: COLUMN utility_service_agreements.payer_attested_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_service_agreements.payer_attested_at IS 'S616: when the LANDLORD attested that this person already agreed to the arrangement off-platform. For the arrangements that predate GAM — cash collected by hand for years. Recorded with who attested, because it is a claim someone made rather than something the platform verified.';
 
 
 --
@@ -23764,6 +23782,14 @@ ALTER TABLE ONLY public.utility_service_agreements
 
 
 --
+-- Name: utility_service_agreements utility_service_agreements_payer_attested_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_payer_attested_by_fkey FOREIGN KEY (payer_attested_by) REFERENCES public.users(id);
+
+
+--
 -- Name: utility_service_agreements utility_service_agreements_superseded_by_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23863,5 +23889,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict LxWY64rrhRsXh4ndZeQhO9ClLRFOsCaN60K1mgXcyGO7TIzZibaoQD1VUxPrvN4
+\unrestrict sENeercOaWR2wAMI1eTktixRGuflNPPT50buE30ZHbCbTR4rchQlWX719bwDlj8
 

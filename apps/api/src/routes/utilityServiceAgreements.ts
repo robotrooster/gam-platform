@@ -48,6 +48,11 @@ utilityServiceAgreementsRouter.get('/',
                -- outstanding invite is the difference between "they can pay
                -- online" and "you are still collecting cash".
                (usr.tenant_invite_token IS NOT NULL) AS invite_pending,
+               -- S616: has this person agreed to be billed at all? Until they
+               -- have, charges accrue but nothing is issued — and the landlord
+               -- needs to see that rather than wonder why no bill went out.
+               (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL) AS payer_consented,
+               sa.payer_accepted_at, sa.payer_attested_at,
                -- What they owe right now, across every invoice on this
                -- agreement. The reason the landlord opens this screen.
                COALESCE((
@@ -79,6 +84,11 @@ const createBody = z.object({
   startDate:    z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   /** How many people live there — a RUBS pool split by headcount needs it. */
   householdSize: z.number().int().min(1).max(30).default(1),
+  /** S616: the landlord states this person has already agreed to the
+   *  arrangement — the cash-in-hand deal that predates GAM. Without it (or the
+   *  payer accepting their invite) charges accrue but no invoice is issued. */
+  payerAlreadyAgreed: z.boolean().optional(),
+  payerAgreementNote: z.string().trim().max(300).optional(),
   payer: z.object({
     firstName: z.string().trim().min(1).max(60),
     lastName:  z.string().trim().min(1).max(60),
@@ -180,9 +190,13 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
            late_fee_enabled, late_fee_grace_days,
            late_fee_initial_amount, late_fee_initial_type,
            late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period,
-           late_fee_cap_amount, late_fee_cap_type
+           late_fee_cap_amount, late_fee_cap_type,
+           payer_attested_at, payer_attested_by, payer_attestation_note
          ) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::date, CURRENT_DATE),$8,
-                   $9,$10,$11,$12,$13,$14,$15,$16,$17)
+                   $9,$10,$11,$12,$13,$14,$15,$16,$17,
+                   CASE WHEN $18::boolean THEN NOW() ELSE NULL END,
+                   CASE WHEN $18::boolean THEN $8::uuid ELSE NULL END,
+                   $19)
          RETURNING id`,
         [landlordId, unitId, tenantId, body.serviceAddress ?? null,
          body.note ?? null, body.billingDueDay, body.startDate ?? null,
@@ -191,7 +205,8 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
          property.late_fee_initial_amount, property.late_fee_initial_type,
          property.late_fee_accrual_amount, property.late_fee_accrual_type,
          property.late_fee_accrual_period,
-         property.late_fee_cap_amount, property.late_fee_cap_type])
+         property.late_fee_cap_amount, property.late_fee_cap_type,
+         body.payerAlreadyAgreed ?? false, body.payerAgreementNote ?? null])
 
       await client.query('COMMIT')
 
@@ -224,6 +239,10 @@ utilityServiceAgreementsRouter.post('/', requirePerm('properties.edit'),
   })
 
 const patchBody = z.object({
+  /** S616: attest after the fact — the neighbour never clicks emails, but the
+   *  arrangement is real and the landlord is willing to say so on the record. */
+  payerAlreadyAgreed: z.boolean().optional(),
+  payerAgreementNote: z.string().trim().max(300).optional(),
   serviceAddress: z.string().trim().max(200).nullable().optional(),
   note:           z.string().trim().max(500).nullable().optional(),
   billingDueDay:  z.number().int().min(1).max(31).optional(),
@@ -252,7 +271,14 @@ utilityServiceAgreementsRouter.patch('/:id', requirePerm('properties.edit'),
 
       const updated = await queryOne<any>(
         `UPDATE utility_service_agreements
-            SET service_address = COALESCE($2, service_address),
+            SET payer_attested_at = CASE
+                  WHEN $8::boolean AND payer_attested_at IS NULL THEN NOW()
+                  ELSE payer_attested_at END,
+                payer_attested_by = CASE
+                  WHEN $8::boolean AND payer_attested_by IS NULL THEN $9::uuid
+                  ELSE payer_attested_by END,
+                payer_attestation_note = COALESCE($10, payer_attestation_note),
+                service_address = COALESCE($2, service_address),
                 note            = COALESCE($3, note),
                 billing_due_day = COALESCE($4, billing_due_day),
                 status          = COALESCE($5, status),
@@ -264,10 +290,13 @@ utilityServiceAgreementsRouter.patch('/:id', requirePerm('properties.edit'),
                 updated_at      = NOW()
           WHERE id = $1
           RETURNING id, status, billing_due_day, service_address, note,
-                    to_char(end_date, 'YYYY-MM-DD') AS end_date`,
+                    to_char(end_date, 'YYYY-MM-DD') AS end_date,
+                    (payer_accepted_at IS NOT NULL OR payer_attested_at IS NOT NULL) AS payer_consented`,
         [req.params.id, body.serviceAddress ?? null, body.note ?? null,
          body.billingDueDay ?? null, body.status ?? null,
-         body.endDate ?? null, endingNow])
+         body.endDate ?? null, endingNow,
+         body.payerAlreadyAgreed ?? false, req.user!.userId,
+         body.payerAgreementNote ?? null])
 
       res.json({ success: true, data: updated })
     } catch (e) { next(e) }

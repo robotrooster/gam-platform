@@ -264,6 +264,13 @@ const AGREEMENT_SELECT = `
     JOIN units u ON u.id = sa.unit_id
     JOIN properties p ON p.id = u.property_id
    WHERE sa.status = 'active'
+     -- S616 (Nic): nobody is invoiced by GAM without having agreed to be.
+     -- Either the payer accepted their portal invite, or the landlord attested
+     -- that they agreed off-platform (the arrangements that predate GAM).
+     -- Charges still ACCRUE while neither is true — the meter turned — they
+     -- simply are not issued, and they ride the first invoice after consent
+     -- lands via the ordinary straggler lookback.
+     AND (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL)
      AND NOT EXISTS (
        SELECT 1 FROM cross_property_service_links l
         WHERE l.service_agreement_id = sa.id AND l.status = 'active')`

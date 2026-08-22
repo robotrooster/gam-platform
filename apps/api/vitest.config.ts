@@ -2,7 +2,12 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   test: {
-    include: ['src/**/*.test.ts'],
+    // S616: the shared package's own tests were never run by anything. There
+    // is no test script in packages/shared and this include covered only
+    // apps/api, so paymentAllocation.test.ts — the FIFO math every rent
+    // payment goes through — had sat unexecuted. Shared code is the code most
+    // worth testing: it is the part two apps depend on at once.
+    include: ['src/**/*.test.ts', '../../packages/shared/src/**/*.test.ts'],
     exclude: ['node_modules/**', 'dist/**'],
     globalSetup: ['./src/test/globalSetup.ts'],
     pool: 'forks',

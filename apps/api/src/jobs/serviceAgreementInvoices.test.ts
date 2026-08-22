@@ -54,9 +54,12 @@ async function servicedSpaceWithTrash(
       `INSERT INTO utility_service_agreements
          (landlord_id, unit_id, tenant_id, start_date, billing_due_day,
           service_address, late_fee_enabled, late_fee_grace_days,
-          late_fee_initial_type, late_fee_initial_amount)
+          late_fee_initial_type, late_fee_initial_amount,
+          -- S616: the landlord attests the arrangement predates GAM, which is
+          -- Nic's own case — cash collected by hand for years.
+          payer_attested_at)
        VALUES ($1, $2, $3, '2026-01-01', $4, '2 Next Door Ln',
-               true, 5, 'flat', 25)
+               true, 5, 'flat', 25, NOW())
        RETURNING id`,
       [landlordId, unitId, tenantId, opts.dueDay ?? 1])
     ctx = { landlordUserId, landlordId, propertyId, unitId, tenantId, agreementId: sa.id }
@@ -383,5 +386,93 @@ describe('the payer sees their bill in the portal (S615)', () => {
     expect(res.body.data.utilityServiceAgreementId).toBe(ctx.agreementId)
     expect(res.body.data.utilityServiceAddress).toBe('2 Next Door Ln')
     expect(res.body.data.unitId).toBeNull()
+  })
+})
+
+// S616 (Nic): "how am I as a landlord going to set up the initial 'hey, let's
+// bill utilities to this random address' and email [them]... without any sort
+// of [check], what else are we missing?"
+//
+// This was missing. S615 let a landlord type any name, email and address, open
+// a portal account for that person, and start invoicing them — with nothing
+// anywhere checking that they had ever agreed to be billed.
+describe('nobody is invoiced without having agreed (S616)', () => {
+  async function unconsented() {
+    const c = await db.connect()
+    let ctx: any
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, {
+        landlordId, ownerUserId: userId, managedByUserId: userId,
+      })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(`UPDATE units SET status='utility_service' WHERE id=$1`, [unitId])
+      const { rows: [sa] } = await c.query(
+        `INSERT INTO utility_service_agreements
+           (landlord_id, unit_id, tenant_id, start_date, billing_due_day)
+         VALUES ($1,$2,$3,'2026-01-01',1) RETURNING id`,
+        [landlordId, unitId, tenantId])
+      ctx = { landlordId, propertyId, unitId, tenantId, agreementId: sa.id }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const c2 = await db.connect()
+    let meterId = ''
+    try {
+      await c2.query('BEGIN')
+      meterId = await seedUtilityMeter(c2, { propertyId: ctx.propertyId })
+      await c2.query('COMMIT')
+    } finally { c2.release() }
+    await db.query(
+      `UPDATE utility_meters SET billing_method='flat_rate', utility_type='trash',
+              digits=NULL WHERE id=$1`, [meterId])
+    await db.query(
+      `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
+       VALUES ($1,'trash',25,0) ON CONFLICT (property_id, utility_type)
+       DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit`, [ctx.propertyId])
+    await db.query(
+      `INSERT INTO utility_meter_units (meter_id, unit_id, quantity) VALUES ($1,$2,1)`,
+      [meterId, ctx.unitId])
+    return ctx
+  }
+
+  it('issues no invoice to someone who never agreed to be billed', async () => {
+    const ctx = await unconsented()
+    const res = await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
+    expect(res.invoicesInserted).toBe(0)
+  })
+
+  // The charge is NOT lost. The meter turned and the service happened; a bill
+  // nobody sent is not a bill nobody owes.
+  it('still accrues the charge, and bills it the cycle after they agree', async () => {
+    const ctx = await unconsented()
+    await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
+
+    await db.query(
+      `UPDATE utility_service_agreements SET payer_accepted_at = NOW() WHERE id = $1`,
+      [ctx.agreementId])
+
+    const res = await generateServiceAgreementInvoices(new Date('2026-04-05T14:00:00Z'))
+    expect(res.invoicesInserted).toBeGreaterThan(0)
+    const { rows } = await db.query<any>(
+      `SELECT total_amount::text AS total FROM invoices WHERE service_agreement_id = $1`,
+      [ctx.agreementId])
+    // Both cycles' cans — the March charge rode the first invoice it could.
+    expect(Number(rows[0].total)).toBeGreaterThanOrEqual(25)
+  })
+
+  // Nic's own case: the arrangement predates GAM and the neighbour is never
+  // going to click an email.
+  it('a landlord can attest to an arrangement that predates GAM', async () => {
+    const ctx = await unconsented()
+    await db.query(
+      `UPDATE utility_service_agreements
+          SET payer_attested_at = NOW(), payer_attestation_note = 'Paid cash for years'
+        WHERE id = $1`, [ctx.agreementId])
+
+    const res = await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
+    expect(res.invoicesInserted).toBe(1)
   })
 })

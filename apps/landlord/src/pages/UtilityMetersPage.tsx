@@ -1439,8 +1439,13 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
                   <div>{r.firstName} {r.lastName}</div>
                   <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
                     {r.email}
-                    {r.invitePending && (
-                      <span className="badge badge-amber" style={{ marginLeft: 6 }}>invite not accepted</span>
+                    {!r.payerConsented ? (
+                      <span className="badge badge-amber" style={{ marginLeft: 6 }}
+                        title="Charges are adding up, but no bill goes out until they accept — or until you confirm they already agreed.">
+                        not billing yet
+                      </span>
+                    ) : r.invitePending && (
+                      <span className="badge badge-muted" style={{ marginLeft: 6 }}>invite not accepted</span>
                     )}
                   </div>
                 </td>
@@ -1451,7 +1456,8 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
                                               color: Number(r.balanceDue) > 0 ? 'var(--gold)' : undefined }}>
                   {Number(r.balanceDue) > 0 ? fmt(r.balanceDue) : '—'}
                 </td>
-                <td style={{ textAlign: 'right' }}>
+                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  <LinkToNeighbourButton agreementId={r.id} onChanged={refetch} />
                   <button className="btn btn-ghost btn-sm" disabled={end.isLoading}
                     onClick={() => appConfirm(
                       `End utility service for ${r.unitNumber}?\n\n` +
@@ -1485,6 +1491,134 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
   )
 }
 
+/**
+ * S616 (Nic) — "I'm not sure when that would show up to people."
+ *
+ * Here, on the row of the space it concerns, and nowhere else. There is no
+ * screen called "links" to go and find: the utility landlord sees this button
+ * beside the space he supplies, the other landlord sees the request on his own
+ * unit, and the tenant sees it in their portal. Each party is asked where they
+ * already were.
+ *
+ * It only offers units belonging to OTHER landlords whose address looks like
+ * the same place. Until the neighbour onboards there is nothing to show, and
+ * the panel says that plainly rather than presenting an empty list that reads
+ * as broken.
+ */
+function LinkToNeighbourButton({ agreementId, onChanged }: {
+  agreementId: string; onChanged: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const { data: links = [] } = useQuery<any[]>(
+    ['cross-property-links'], () => apiGet('/cross-property-links'))
+  const mine = links.find((l: any) => l.serviceAgreementId === agreementId)
+
+  if (mine?.status === 'active') {
+    return (
+      <span className="badge badge-green" style={{ marginRight: 6 }}
+        title={`Their utilities are billed on ${mine.unitPropertyName} Unit ${mine.unitNumber}'s invoice`}>
+        linked
+      </span>
+    )
+  }
+  if (mine?.status === 'proposed') {
+    return (
+      <span className="badge badge-amber" style={{ marginRight: 6 }}
+        title="Waiting on the other landlord and the tenant to approve">
+        awaiting approval
+      </span>
+    )
+  }
+  return (
+    <>
+      <button className="btn btn-ghost btn-sm" style={{ marginRight: 6 }}
+        onClick={() => setOpen(true)}>
+        Link
+      </button>
+      {open && (
+        <LinkToNeighbourModal agreementId={agreementId}
+          onClose={() => setOpen(false)}
+          onSaved={() => { setOpen(false); onChanged() }} />
+      )}
+    </>
+  )
+}
+
+function LinkToNeighbourModal({ agreementId, onClose, onSaved }: {
+  agreementId: string; onClose: () => void; onSaved: () => void
+}) {
+  const { data: candidates = [], isLoading } = useQuery<any[]>(
+    ['link-candidates', agreementId],
+    () => apiGet(`/cross-property-links/candidates?serviceAgreementId=${agreementId}`),
+  )
+  const [error, setError] = useState('')
+  const propose = useMutation(
+    (unitId: string) => apiPost('/cross-property-links', { serviceAgreementId: agreementId, unitId }),
+    {
+      onSuccess: () => {
+        toast('Sent. It goes live once the other landlord and the tenant both agree.')
+        onSaved()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not propose that link'),
+    },
+  )
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Bill this through their landlord</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
+          If the landlord who owns this place is on GAM, their tenant can get <strong>one bill</strong> —
+          their rent and your utilities on the same invoice, paid once. Your utility money still
+          comes to you; only the paperwork merges.
+        </div>
+
+        {isLoading ? (
+          <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>Looking…</div>
+        ) : candidates.length === 0 ? (
+          <div style={{ fontSize: '.8rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+            No other landlord on GAM has a unit at this address yet. Nothing to do — keep billing
+            them directly, and this becomes available the day their landlord signs up.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {candidates.map((c: any) => (
+              <div key={c.id} style={{ padding: '10px 12px', borderRadius: 10,
+                                       background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
+                <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
+                  {c.propertyName} · Unit {c.unitNumber}
+                </div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
+                  {c.street1}, {c.city} · {c.firstName} {c.lastName}
+                </div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+                  {c.evidence}
+                </div>
+                <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }}
+                  disabled={propose.isLoading}
+                  onClick={() => { setError(''); propose.mutate(c.id) }}>
+                  Ask to link
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 14, lineHeight: 1.5 }}>
+          Nothing changes until <strong>all three</strong> of you agree — you, their landlord, and the
+          person paying. Late fees move to their lease at that point; yours stop.
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
   propertyId: string; onClose: () => void; onSaved: () => void
 }) {
@@ -1496,6 +1630,10 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
   const [phone, setPhone] = useState('')
   const [billingDueDay, setBillingDueDay] = useState('1')
   const [householdSize, setHouseholdSize] = useState('1')
+  // S616: nobody is invoiced by GAM without having agreed to be. Either the
+  // payer accepts their invite, or the landlord says here that they already
+  // agreed — which is the ordinary case for an arrangement that predates GAM.
+  const [alreadyAgreed, setAlreadyAgreed] = useState(false)
   const [error, setError] = useState('')
 
   const save = useMutation(
@@ -1505,6 +1643,7 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
       serviceAddress: serviceAddress.trim() || undefined,
       billingDueDay: Number(billingDueDay) || 1,
       householdSize: Number(householdSize) || 1,
+      payerAlreadyAgreed: alreadyAgreed,
       payer: {
         firstName: firstName.trim(), lastName: lastName.trim(),
         email: email.trim(), phone: phone.trim(),
@@ -1581,6 +1720,22 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
           Headcount only matters if you split a shared meter by how many people are on it — otherwise
           leave it at 1.
         </div>
+
+        <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginTop: 16,
+                        padding: '10px 12px', borderRadius: 8, cursor: 'pointer',
+                        background: alreadyAgreed ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                        border: '1px solid var(--border-0)' }}>
+          <input type="checkbox" checked={alreadyAgreed} style={{ marginTop: 3 }}
+            onChange={e => setAlreadyAgreed(e.target.checked)} />
+          <span style={{ fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
+            <strong>They&apos;ve already agreed to pay for this.</strong>
+            <span style={{ display: 'block', color: 'var(--text-3)', fontSize: '.72rem', marginTop: 2 }}>
+              Tick this if you already have an arrangement with them — you&apos;ve been collecting
+              for it. Without it, their charges still add up but no bill goes out until they
+              accept the email and see what they&apos;re being billed for.
+            </span>
+          </span>
+        </label>
 
         {error && (
           <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red, #dc2626)' }}>{error}</div>

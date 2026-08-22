@@ -16,6 +16,7 @@
 
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
+import { autopayLateness } from '@gam/shared'
 import { apiGet, apiPut } from '../lib/api'
 import { useTenantPaymentMethods, type SavedPaymentMethod } from './payShared'
 
@@ -87,9 +88,21 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
   // Matches the late-fee engine's own fallback, so the screen and the charge
   // never disagree about which day is safe.
   const graceDays = row.lateFeeGraceDays ?? 5
-  // The engine fires when today >= due + grace, so the last free day is one
-  // before that. With late fees switched off entirely there is no unsafe day.
-  const lastFreeDay = row.lateFeeEnabled === false ? 28 : dueDay + graceDays - 1
+  // S616: asked of the SAME function the runner schedules by, against a real
+  // cycle date rather than by comparing two day-of-month numbers.
+  //
+  // `pullDay > dueDay` was wrong in a way that mattered: a day EARLIER in the
+  // month than the due day rolls to the NEXT month, so rent due the 5th with
+  // autopay on the 1st is not four days early — it is twenty-six days late,
+  // every cycle, and the card said nothing because 1 is not greater than 5.
+  const nextDue = (() => {
+    const now = new Date()
+    const y = now.getUTCFullYear(), m = now.getUTCMonth() + 1
+    return `${y}-${String(m).padStart(2, '0')}-${String(Math.min(dueDay, 28)).padStart(2, '0')}`
+  })()
+  const lateness = autopayLateness(nextDue, pullDay, graceDays, row.lateFeeEnabled !== false)
+  const prettyPayDate = new Date(`${lateness.payDate}T00:00:00Z`)
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', timeZone: 'UTC' })
   const afterDue = chargeDay > dueDay
   // A bank still verifying cannot be charged, so it must not be offered as the
   // method a monthly schedule depends on.
@@ -177,30 +190,28 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
           {/* S616 (Nic): "if people get their Social Security on the third or
               the fifth... and it's still within the grace period, they should be
               able to choose to have auto payment set up."
-              They always could. What was wrong was this message: ANY day after
-              the due day was called late, so a tenant paid on the 3rd with a
-              five-day grace was warned about fees they would never be charged.
-              Telling someone their rent will be penalised when it will not is
-              how you talk them out of the arrangement that would have kept them
-              current.
-              The engine charges a fee when today >= due + grace, so the last
-              free day is (due + grace − 1). Autopay initiating on that day is
-              genuinely safe: an in-flight ACH counts as paid from the day it
-              starts, so the fee never accrues while it clears. */}
-          {pullDay != null && pullDay > dueDay && (
-            pullDay <= lastFreeDay ? (
+              They always could. What was wrong was this message — and then,
+              after the first fix, still wrong for any day EARLIER in the month
+              than the due day, which rolls to the next month rather than paying
+              early. Both cases now come from autopayLateness, the same
+              arithmetic the runner schedules by. */}
+          {pullDay != null && lateness.daysAfterDue > 0 && (
+            !lateness.isLate ? (
               <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
                 Rent is due on the {ordinal(dueDay)}, and your lease allows {graceDays} day
-                {graceDays === 1 ? '' : 's'} past that before a late fee. Paying on the{' '}
-                {ordinal(pullDay)} is inside that window — <strong>no late fee</strong>. Pick the day your
-                money actually arrives.
+                {graceDays === 1 ? '' : 's'} past that before a late fee. This pays on{' '}
+                <strong>{prettyPayDate}</strong> — inside that window, so <strong>no late fee</strong>.
+                Pick the day your money actually arrives.
               </div>
             ) : (
               <div style={{ fontSize: '.74rem', color: 'var(--warn)', marginTop: 8, lineHeight: 1.5 }}>
                 Rent is due on the {ordinal(dueDay)}, and your lease allows {graceDays} day
-                {graceDays === 1 ? '' : 's'} past that. Paying on the {ordinal(pullDay)} is beyond it, so
-                late fees under your lease will apply — we can&apos;t waive those. The {ordinal(lastFreeDay)} is
-                the last day without one.
+                {graceDays === 1 ? '' : 's'} past that. Choosing the {ordinal(pullDay)} pays on{' '}
+                <strong>{prettyPayDate}</strong>
+                {pullDay < dueDay && <> — the {ordinal(pullDay)} of the <strong>following</strong> month,
+                  because a day before the {ordinal(dueDay)} can&apos;t mean paying before it&apos;s owed</>}
+                , which is {lateness.daysAfterDue} day{lateness.daysAfterDue === 1 ? '' : 's'} late.
+                Late fees under your lease will apply — we can&apos;t waive those.
               </div>
             )
           )}
