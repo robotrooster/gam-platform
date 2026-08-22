@@ -63,6 +63,9 @@ export interface PayTarget {
   // S537: pay-balance sends the tenant-chosen amount in the body (FIFO
   // application server-side). Per-row endpoints ignore it.
   sendAmountInBody?: boolean
+  /** S616: a payer with no lease settling their utility bill — every utility on
+   *  the agreement, in one charge. */
+  serviceAgreementId?: string
   // S581: pay-balance scopes the charge to one lease (each lease is its own
   // ACH/card charge + receipt). Sent when paying a specific lease's balance.
   leaseId?: string
@@ -289,6 +292,7 @@ export function PayNowModal({
         paymentMethodType: selectedMethod.type,
         ...(target.sendAmountInBody ? { amount } : {}),
         ...(target.leaseId ? { leaseId: target.leaseId } : {}),
+        ...(target.serviceAgreementId ? { serviceAgreementId: target.serviceAgreementId } : {}),
       })
       const status = (res as any)?.data?.status
       // S534 (Nic): no propane-priority disclosure here — warning the

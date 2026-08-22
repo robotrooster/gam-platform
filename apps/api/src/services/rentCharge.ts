@@ -62,8 +62,14 @@ export type ChargeSource = typeof CHARGE_SOURCES[number]
 
 export interface ChargeLeaseBalanceInput {
   tenantId:          string
-  /** The ONE lease this charge settles. Resolve it before calling. */
-  leaseId:           string
+  /** The ONE lease this charge settles. Resolve it before calling.
+   *  S616: omit it and pass serviceAgreementId instead for a payer who has no
+   *  lease — the neighbour buying trash and electric. */
+  leaseId?:          string
+  /** S616 (Nic): "their trash and electric needs to be on one bill if they have
+   *  more than one utility through this subsystem." One agreement is one bill
+   *  and one charge, however many utilities are on it. */
+  serviceAgreementId?: string
   /** What the tenant chose to pay. >= the outstanding balance; the excess is banked. */
   amount:            number
   paymentMethodId:   string
@@ -87,7 +93,23 @@ export interface ChargeLeaseBalanceResult {
 /** The rows a lease balance is made of, oldest first, with the context every
  *  charge decision needs. Shared by the charge path and the balance preview so
  *  the number the tenant is shown is the number the server enforces. */
-export async function fetchOutstandingRows(tenantId: string, leaseId: string) {
+export type BalanceScope =
+  | { kind: 'lease'; leaseId: string }
+  /** S616 (Nic): a payer with no lease at all — the neighbour buying trash and
+   *  electric. "Their trash and electric needs to be on one bill if they have
+   *  more than one utility through this subsystem." One agreement is one bill,
+   *  however many utilities are on it. */
+  | { kind: 'service'; serviceAgreementId: string }
+
+export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope | string) {
+  // Back-compat: every existing caller passes a lease id string.
+  const sc: BalanceScope = typeof scope === 'string'
+    ? { kind: 'lease', leaseId: scope } : scope
+  const scopeSql = sc.kind === 'lease'
+    ? `(p.lease_id = $2
+        OR p.invoice_id IN (SELECT id FROM invoices WHERE lease_id = $2))`
+    : `p.invoice_id IN (SELECT id FROM invoices WHERE service_agreement_id = $2)`
+  const scopeId = sc.kind === 'lease' ? sc.leaseId : sc.serviceAgreementId
   return query<any>(
     `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
             -- S609: the allocator pays PROPANE last whatever its date, so a fill
@@ -114,18 +136,17 @@ export async function fetchOutstandingRows(tenantId: string, leaseId: string) {
         -- once, not just pay in full locked to what the lease says."
         --
         -- A converged invoice carries rent owed to this landlord and utilities
-        -- owed to the landlord next door. Those utility rows are deliberately
+        -- owed to the neighbouring landlord. Those utility rows are deliberately
         -- NOT tied to this lease — they are not part of it — so scoping by
         -- lease_id alone made them invisible here: the pay-in-full guard would
         -- not have covered them and FIFO would never have allocated to them,
         -- leaving the tenant paying rent in full and the other landlord unpaid.
         -- That is the two-operator partial Nic ruled out as unallocatable.
-        AND (p.lease_id = $2
-             OR p.invoice_id IN (SELECT id FROM invoices WHERE lease_id = $2))
+        AND ${scopeSql}
         AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
              OR p.status = 'failed')
       ORDER BY p.due_date ASC, p.created_at ASC`,
-    [tenantId, leaseId])
+    [tenantId, scopeId])
 }
 
 /**
@@ -198,6 +219,9 @@ export const chargeLeaseBalanceSchema = z.object({
   amount:            z.number().positive(),
   paymentMethodId:   z.string().min(1),
   paymentMethodType: z.enum(['ach', 'card']),
+  /** S616: a payer with no lease settles their service agreement's bill —
+   *  every utility on it, in one charge. */
+  serviceAgreementId: z.string().uuid().optional(),
   // S581 (Nic): ONE lease per charge. A tenant with two leases (an overlap
   // while moving to a bigger place, or two different landlords) pays each
   // lease as its OWN ACH/card charge with its OWN receipt. Separate charges
@@ -214,13 +238,19 @@ export const chargeLeaseBalanceSchema = z.object({
 export async function chargeLeaseBalance(
   input: ChargeLeaseBalanceInput,
 ): Promise<ChargeLeaseBalanceResult> {
-  const { tenantId, leaseId, amount, paymentMethodId, paymentMethodType } = input
+  const { tenantId, leaseId, serviceAgreementId, amount, paymentMethodId, paymentMethodType } = input
+  if (!leaseId && !serviceAgreementId) {
+    throw new AppError(400, 'A balance needs either a lease or a service agreement to settle.')
+  }
+  const scope: BalanceScope = leaseId
+    ? { kind: 'lease', leaseId }
+    : { kind: 'service', serviceAgreementId: serviceAgreementId! }
   const client = await getClient()
   try {
     // The tenant's outstanding ledger FOR THIS LEASE, oldest first. Every row
     // shares one lease → one unit → one landlord → one property, so ctx (row 0)
     // is representative of the whole charge (incl. the eviction-hold check).
-    const rows = await fetchOutstandingRows(tenantId, leaseId)
+    const rows = await fetchOutstandingRows(tenantId, scope)
     if (rows.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
     const ctx = rows[0]
     if (ctx.payment_block) {

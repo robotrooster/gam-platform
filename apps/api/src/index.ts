@@ -83,7 +83,6 @@ import { documentsRouter }    from './routes/documents'
 import { utilityRouter }      from './routes/utility'
 import { utilityServiceAgreementsRouter } from './routes/utilityServiceAgreements'
 import { oneOffChargesRouter } from './routes/oneOffCharges'
-import { crossPropertyLinksRouter } from './routes/crossPropertyLinks'
 import { propaneRouter }      from './routes/propane'
 import { adminRouter }        from './routes/admin'
 import { portfolioRouter }    from './routes/portfolio'
@@ -349,7 +348,6 @@ app.use('/api/documents',     documentsRouter)
 // here rather than falling into utilityRouter's own route table.
 app.use('/api/utility/service-agreements', utilityServiceAgreementsRouter)
 app.use('/api/one-off-charges', oneOffChargesRouter)
-app.use('/api/cross-property-links', crossPropertyLinksRouter)
 app.use('/api/utility',       utilityRouter)
 app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)

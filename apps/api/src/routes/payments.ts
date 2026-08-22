@@ -731,16 +731,47 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // that path is lease-keyed end to end (FIFO scope, pay-in-full guard,
     // eviction hold, sublease markup), and widening the engine that moves every
     // tenant's rent is a bigger change than billing the neighbour needs.
-    const serviceCharges = serviceRows.map((r: any) => ({
-      id: r.id,
-      amount: r.amount,
-      dueDate: r.due_date,
-      type: r.type,
-      entryDescription: r.entry_description,
-      notes: r.notes,
-      unitNumber: r.unit_number,
-      propertyName: r.property_name,
-      methodCosts: paymentMethodCosts(r.amount, { manualFee: 0 }),
+    // S616 (Nic): the payer's outstanding balance, grouped PER AGREEMENT —
+    // exactly the way `leases` above groups a tenant's balance per lease.
+    //
+    // "Their trash and electric needs to be on one bill if they have more than
+    // one utility through this subsystem." The invoice already carries every
+    // utility for the cycle; what was wrong was handing the portal a flat list
+    // of ROWS, which rendered a Pay button per utility — two charges and two
+    // processing fees for one month at one address.
+    //
+    // Named for the agreement, not "bills": an invoice IS the bill (Nic), and a
+    // second name for it alongside `invoices` in the same payload would invent
+    // a distinction that does not exist.
+    const byAgreement = new Map<string, {
+      serviceAgreementId: string; outstanding: number
+      unitNumber: string; propertyName: string; dueDate: string
+      rows: any[]; methodCosts?: any
+    }>()
+    for (const r of serviceRows) {
+      let g = byAgreement.get(r.service_agreement_id)
+      if (!g) {
+        g = {
+          serviceAgreementId: r.service_agreement_id,
+          outstanding: 0,
+          unitNumber: r.unit_number,
+          propertyName: r.property_name,
+          dueDate: r.due_date,
+          rows: [],
+        }
+        byAgreement.set(r.service_agreement_id, g)
+      }
+      g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
+      // The oldest date on the bill is the one that matters for lateness.
+      if (r.due_date < g.dueDate) g.dueDate = r.due_date
+      g.rows.push({
+        id: r.id, amount: r.amount, dueDate: r.due_date,
+        type: r.type, notes: r.notes,
+      })
+    }
+    const serviceAgreements = [...byAgreement.values()].map(a => ({
+      ...a,
+      methodCosts: paymentMethodCosts(a.outstanding, { manualFee: 0 }),
     }))
 
     res.json({ success: true, data: {
@@ -749,7 +780,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       // is blocked (a per-lease `leases[].paymentBlocked` is the real signal).
       paymentBlocked: leases.length ? leases.every(l => l.paymentBlocked) : false,
       leases,
-      serviceCharges,
+      serviceAgreements,
       rows,
     } })
   } catch (e) { next(e) }
@@ -819,6 +850,29 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       throw new AppError(403, 'Only tenants can call this endpoint')
     }
     const tenantId = req.user!.profileId
+
+    // S616 (Nic): a payer with no lease — the neighbour buying trash and
+    // electric — settles their agreement's whole bill in one charge. "Their
+    // trash and electric needs to be on one bill if they have more than one
+    // utility through this subsystem." Ownership is checked against the
+    // agreement rather than a lease, which they do not have.
+    if (body.serviceAgreementId) {
+      const owns = await queryOne<{ id: string }>(
+        `SELECT id FROM utility_service_agreements
+          WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+        [body.serviceAgreementId, tenantId])
+      if (!owns) throw new AppError(404, 'Service agreement not found')
+      const result = await chargeLeaseBalance({
+        tenantId,
+        serviceAgreementId: body.serviceAgreementId,
+        amount:            body.amount,
+        paymentMethodId:   body.paymentMethodId,
+        paymentMethodType: body.paymentMethodType,
+        source:            'portal',
+      })
+      return res.json({ success: true, data: result })
+    }
+
     const leaseId = await resolveTargetLease(tenantId, body.leaseId ?? null)
 
     // S609: the charge itself lives in services/rentCharge so the autopay

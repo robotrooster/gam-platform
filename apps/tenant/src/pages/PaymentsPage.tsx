@@ -159,13 +159,14 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       suggestedPayAhead?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
-    // S615: open charges for a UTILITY-SERVICE payer — someone the landlord
-    // supplies power or trash to but does not rent to. No lease, so these are
-    // not in `leases` above and are paid one at a time.
-    serviceCharges?: {
-      id: string; amount: number; dueDate: string; type: string
-      entryDescription: string; notes: string | null
-      unitNumber: string; propertyName: string
+    // S616: what the payer owes on each utility service agreement — the same
+    // shape as `leases` above. However many utilities are on it, it is one
+    // invoice and one payment. Nic: "their trash and electric needs to be on
+    // one bill if they have more than one utility through this subsystem."
+    serviceAgreements?: {
+      serviceAgreementId: string; outstanding: number
+      unitNumber: string; propertyName: string; dueDate: string
+      rows: { id: string; amount: number; dueDate: string; type: string; notes: string | null }[]
       methodCosts?: any
     }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
@@ -213,17 +214,22 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // per-charge route. There is no lease behind it and therefore no eviction
   // clock, so the pay-in-full rule that governs rent has nothing to protect
   // here — each bill is simply its own payable document.
-  const serviceCharges = balanceCtx?.serviceCharges ?? []
-  // Someone with utility charges and no lease groups at all is a service-only
+  const serviceAgreements = balanceCtx?.serviceAgreements ?? []
+  // Someone with utility bills and no lease groups at all is a service-only
   // payer. A tenant who somehow had both would keep the rent-shaped page.
-  const serviceOnlyPayer = serviceCharges.length > 0 && (balanceCtx?.leases ?? []).length === 0
-  const openPayServiceCharge = (c: any) => {
+  const serviceOnlyPayer = serviceAgreements.length > 0 && (balanceCtx?.leases ?? []).length === 0
+  // S616: everything outstanding on the agreement in ONE charge — one Stripe
+  // transaction, one processing fee. Paying each utility separately would
+  // charge the fee twice for one month at one address.
+  const openPayServiceAgreement = (b: any) => {
     setPayTarget({
       target: {
-        amount:    Math.round(Number(c.amount) * 100) / 100,
-        endpoint:  `/payments/${c.id}/pay`,
-        subheader: c.type === 'late_fee' ? 'late fee' : 'utility charge',
+        amount:    Math.round(Number(b.outstanding) * 100) / 100,
+        endpoint:  '/payments/pay-balance',
+        subheader: 'your utility bill, paid in full',
         kind:      'utility',
+        sendAmountInBody: true,
+        serviceAgreementId: b.serviceAgreementId,
       },
     })
   }
@@ -393,28 +399,34 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         ) : null
       ))}
 
-      {/* S615: the utility-service payer's bills. Each is its own card with its
-          own Pay button — one bill, one charge, one receipt. */}
-      {serviceCharges.map((c: any) => (
-        <div key={c.id} className="card" style={{ padding: 16, marginTop: 16 }}>
+      {/* S616: one card per AGREEMENT — every utility on it, one Pay. */}
+      {serviceAgreements.map((b: any) => (
+        <div key={b.serviceAgreementId} className="card" style={{ padding: 16, marginTop: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
-            <div>
+            <div style={{ flex: 1, minWidth: 240 }}>
               <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
-                {c.type === 'late_fee' ? 'Late fee' : 'Utility bill'} — {c.propertyName}
+                Utility bill — {b.propertyName}
               </div>
               <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
-                {formatCurrency(c.amount)}
+                {formatCurrency(b.outstanding)}
               </div>
-              {c.notes && (
-                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>{c.notes}</div>
-              )}
-              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
-                Due {c.dueDate}
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>Due {b.dueDate}</div>
+              {/* Every utility itemised, so the total is never a number they
+                  have to phone up about. */}
+              <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {b.rows.map((l: any) => (
+                  <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: '.78rem' }}>
+                    <span style={{ color: 'var(--t2)' }}>
+                      {l.type === 'late_fee' ? 'Late fee' : (l.notes || 'Utilities')}
+                    </span>
+                    <span className="mono" style={{ color: 'var(--t1)' }}>{formatCurrency(l.amount)}</span>
+                  </div>
+                ))}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-              <button className="btn btn-p" onClick={() => openPayServiceCharge(c)}>
-                Pay {formatCurrency(c.amount)}
+              <button className="btn btn-p" onClick={() => openPayServiceAgreement(b)}>
+                Pay {formatCurrency(b.outstanding)}
               </button>
             </div>
           </div>

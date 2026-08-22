@@ -345,9 +345,9 @@ describe('the payer sees their bill in the portal (S615)', () => {
     // resolves to a lease filter matching nothing and 409s on a bill the
     // person is looking at.
     expect(res.body.data.leases).toHaveLength(0)
-    expect(res.body.data.serviceCharges).toHaveLength(1)
-    expect(Number(res.body.data.serviceCharges[0].amount)).toBe(75)
-    expect(res.body.data.serviceCharges[0].notes).toBe('3 × $25.00')
+    expect(res.body.data.serviceAgreements).toHaveLength(1)
+    expect(Number(res.body.data.serviceAgreements[0].outstanding)).toBe(75)
+    expect(res.body.data.serviceAgreements[0].rows[0].notes).toBe('3 × $25.00')
     expect(Number(res.body.data.totalOutstanding)).toBe(75)
   })
 
@@ -474,5 +474,50 @@ describe('nobody is invoiced without having agreed (S616)', () => {
 
     const res = await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
     expect(res.invoicesInserted).toBe(1)
+  })
+})
+
+// S616 (Nic): "their trash and electric needs to be on one bill if they have
+// more than one utility through this subsystem." Two utilities is one bill,
+// one Pay, one Stripe charge — paying them separately would charge the
+// processing fee twice for one month at one address.
+describe('one bill however many utilities (S616)', () => {
+  it('trash and electric arrive as ONE bill with both lines', async () => {
+    const ctx = await servicedSpaceWithTrash()
+
+    // A second utility on the same serviced space: a submetered electric.
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: ctx.propertyId })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(
+      `UPDATE utility_meters SET billing_method='submeter', utility_type='electric',
+              rate_per_unit=0.21 WHERE id=$1`, [meterId])
+    await db.query(
+      `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+      [meterId, ctx.unitId])
+    for (const [cycle, val] of [['2026-02-01', 1000], ['2026-03-01', 1100]] as const) {
+      await db.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [meterId, cycle, val, cycle, ctx.landlordUserId])
+    }
+
+    await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
+
+    // ONE invoice carrying both.
+    const { rows: invs } = await db.query<any>(
+      `SELECT id, total_amount::text AS total FROM invoices
+        WHERE service_agreement_id = $1`, [ctx.agreementId])
+    expect(invs).toHaveLength(1)
+    expect(Number(invs[0].total)).toBe(96)      // $75 trash + $21 electric
+
+    const { rows: pays } = await db.query<any>(
+      `SELECT amount::text AS amt FROM payments WHERE invoice_id = $1`, [invs[0].id])
+    expect(pays).toHaveLength(2)
   })
 })

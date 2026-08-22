@@ -257,7 +257,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             <>
               <RecoveryCard propertyId={propertyId} />
               <div style={{ marginBottom: 28 }}>
-                <h2 style={{ fontSize:'.95rem', margin:'0 0 12px' }}>Next door</h2>
+                <h2 style={{ fontSize:'.95rem', margin:'0 0 12px' }}>Neighbor utilities</h2>
                 <ServicedSpacesCard propertyId={propertyId} onChanged={invalidate} />
               </div>
               <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
@@ -1400,20 +1400,22 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
     <div className="card" style={{ padding: 14, marginBottom: 10 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                     gap: 10, flexWrap: 'wrap', marginBottom: 2 }}>
-        <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Spaces you supply but don&apos;t rent</div>
+        <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Neighbor spaces you supply but don&apos;t rent</div>
         <button className="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
           <Plus size={13}/> Add a space
         </button>
       </div>
       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
-        A space next door on your trash or your power that isn&apos;t one of your units — different
-        owner, no lease. Add it here and it takes meters and a can count like any other space, and
-        the person who pays gets their own login and bill instead of handing you cash.
+        A space at a <strong>neighboring property</strong> on your trash or your power — different
+        owner, different property, no lease. Add it here and it takes meters and a can count like
+        any other space, and the person who pays gets their own login and bill instead of handing
+        you cash.
       </div>
 
       {live.length === 0 ? (
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-          None set up. If you&apos;re collecting for utilities off the books, this is where it goes.
+          None set up. If you&apos;re collecting from a neighboring property off the books, this is
+          where it goes.
         </div>
       ) : (
         <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
@@ -1457,7 +1459,6 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
                   {Number(r.balanceDue) > 0 ? fmt(r.balanceDue) : '—'}
                 </td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                  <LinkToNeighbourButton agreementId={r.id} onChanged={refetch} />
                   <button className="btn btn-ghost btn-sm" disabled={end.isLoading}
                     onClick={() => appConfirm(
                       `End utility service for ${r.unitNumber}?\n\n` +
@@ -1491,126 +1492,14 @@ function ServicedSpacesCard({ propertyId, onChanged }: {
   )
 }
 
-/**
- * S616 (Nic) — "I'm not sure when that would show up to people."
- *
- * Here, on the row of the space it concerns, and nowhere else. There is no
- * screen called "links" to go and find: the utility landlord sees this button
- * beside the space he supplies, the other landlord sees the request on his own
- * unit, and the tenant sees it in their portal. Each party is asked where they
- * already were.
- *
- * It only offers units belonging to OTHER landlords whose address looks like
- * the same place. Until the neighbour onboards there is nothing to show, and
- * the panel says that plainly rather than presenting an empty list that reads
- * as broken.
+/*
+ * S616: the "Link to a neighbour's landlord" button and its candidate picker
+ * lived here and are gone. Nic: "We are gonna be linking the units on the back
+ * end automatically, so you can remove the link user interface." GAM matches
+ * the service address against other landlords' property addresses on a daily
+ * sweep (services/crossPropertyAutoLink) — nobody presses anything, and the
+ * other landlord is never shown a request.
  */
-function LinkToNeighbourButton({ agreementId, onChanged }: {
-  agreementId: string; onChanged: () => void
-}) {
-  const [open, setOpen] = useState(false)
-  const { data: links = [] } = useQuery<any[]>(
-    ['cross-property-links'], () => apiGet('/cross-property-links'))
-  const mine = links.find((l: any) => l.serviceAgreementId === agreementId)
-
-  if (mine?.status === 'active') {
-    return (
-      <span className="badge badge-green" style={{ marginRight: 6 }}
-        title={`Their utilities are billed on ${mine.unitPropertyName} Unit ${mine.unitNumber}'s invoice`}>
-        linked
-      </span>
-    )
-  }
-  return (
-    <>
-      <button className="btn btn-ghost btn-sm" style={{ marginRight: 6 }}
-        onClick={() => setOpen(true)}>
-        Link
-      </button>
-      {open && (
-        <LinkToNeighbourModal agreementId={agreementId}
-          onClose={() => setOpen(false)}
-          onSaved={() => { setOpen(false); onChanged() }} />
-      )}
-    </>
-  )
-}
-
-function LinkToNeighbourModal({ agreementId, onClose, onSaved }: {
-  agreementId: string; onClose: () => void; onSaved: () => void
-}) {
-  const { data: candidates = [], isLoading } = useQuery<any[]>(
-    ['link-candidates', agreementId],
-    () => apiGet(`/cross-property-links/candidates?serviceAgreementId=${agreementId}`),
-  )
-  const [error, setError] = useState('')
-  const propose = useMutation(
-    (unitId: string) => apiPost('/cross-property-links', { serviceAgreementId: agreementId, unitId }),
-    {
-      onSuccess: () => {
-        toast('Linked. Their next invoice carries your utilities; the money still comes to you.')
-        onSaved()
-      },
-      onError: (e: any) => setError(e?.response?.data?.error || 'Could not propose that link'),
-    },
-  )
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Bill this through their landlord</div>
-        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
-          If the landlord who owns this place is on GAM, their tenant can get <strong>one bill</strong> —
-          their rent and your utilities on the same invoice, paid once. Your utility money still
-          comes to you; only the paperwork merges.
-        </div>
-
-        {isLoading ? (
-          <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>Looking…</div>
-        ) : candidates.length === 0 ? (
-          <div style={{ fontSize: '.8rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
-            No other landlord on GAM has a unit at this address yet. Nothing to do — keep billing
-            them directly, and this becomes available the day their landlord signs up.
-          </div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {candidates.map((c: any) => (
-              <div key={c.id} style={{ padding: '10px 12px', borderRadius: 10,
-                                       background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
-                <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
-                  {c.propertyName} · Unit {c.unitNumber}
-                </div>
-                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
-                  {c.street1}, {c.city} · {c.firstName} {c.lastName}
-                </div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
-                  {c.evidence}
-                </div>
-                <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }}
-                  disabled={propose.isLoading}
-                  onClick={() => { setError(''); propose.mutate(c.id) }}>
-                  Bill through them
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
-
-        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 14, lineHeight: 1.5 }}>
-          Your charges and their rent both stay exactly what they are — only the paperwork merges.
-          Late fees follow their lease from then on, and yours stop, so the tenant never sees two
-          kinds of late fee. You can undo this at any time.
-        </div>
-
-        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
-          <button className="btn btn-ghost" onClick={onClose}>Close</button>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
   propertyId: string; onClose: () => void; onSaved: () => void
@@ -1659,14 +1548,14 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
       <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
         <div className="modal-title">Add a space you supply</div>
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
-          For a space on your utilities that you don&apos;t rent out — the apartment next door on your
-          meter, or cans you put out for a neighbour. There&apos;s no lease and no rent; you&apos;re
-          billing them for what they use.
+          For a space at a <strong>neighboring property</strong> that&apos;s on your utilities — the
+          apartment on your meter, or cans you put out for a neighbor. There&apos;s no lease and no
+          rent; you&apos;re billing them for what they use.
         </div>
 
         <label style={lbl}>What you call the space</label>
         <input className="form-input" value={label} maxLength={40}
-          placeholder="Next door — upstairs apt"
+          placeholder="Neighbor — upstairs apt"
           onChange={e => setLabel(e.target.value)} />
 
         <label style={{ ...lbl, marginTop: 10 }}>Service address <span style={{ color:'var(--text-3)' }}>(optional)</span></label>

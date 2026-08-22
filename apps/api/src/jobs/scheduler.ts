@@ -979,6 +979,19 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S616 (Nic): link a neighbour's serviced space to the unit its own landlord
+  // leases, automatically. "We are gonna be linking the units on the back end
+  // automatically." Daily, because either side can onboard first.
+  cron.schedule('30 6 * * *', async () => {
+    try {
+      const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+      const r = await autoLinkNeighborServices()
+      if (r.linked > 0) logger.info(r, '[auto-link] neighbour services linked')
+    } catch (e) {
+      logger.error({ err: e }, '[auto-link] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S561: reversal recovery. The handler decides net-vs-pull immediately when a
   // reversal opens; this daily pass is the backstop — it decides any that
   // slipped through and flips scheduled nettings past the 2-week cap to ACH

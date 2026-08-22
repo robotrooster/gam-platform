@@ -270,3 +270,58 @@ describe('cross-property convergence (S616)', () => {
     expect(link.address_match_basis).toBe('none')
   })
 })
+
+// S616 (Nic): "We are gonna be linking the units on the back end
+// automatically, so you can remove the link user interface."
+describe('automatic linking (S616)', () => {
+  it('links the two spaces with nobody pressing anything', async () => {
+    const f = await twoLandlordsOnePlace()
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+
+    const r = await autoLinkNeighborServices()
+    expect(r.linked).toBe(1)
+
+    const { rows } = await db.query<any>(
+      `SELECT status, unit_id, address_match_basis FROM cross_property_service_links
+        WHERE service_agreement_id = $1`, [f.agreementId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].status).toBe('active')
+    expect(rows[0].unit_id).toBe(f.leasedUnitId)
+  })
+
+  it('is idempotent — a second sweep does not link again', async () => {
+    const f = await twoLandlordsOnePlace()
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    await autoLinkNeighborServices()
+    expect((await autoLinkNeighborServices()).linked).toBe(0)
+  })
+
+  it('leaves it alone when the addresses do not match', async () => {
+    const f = await twoLandlordsOnePlace()
+    await db.query(
+      `UPDATE properties SET street1='9 Elsewhere Rd', city='Toledo',
+                             state='OH', zip='43606' WHERE id=$1`, [f.propB])
+    await db.query(
+      `UPDATE utility_service_agreements SET service_address=NULL WHERE id=$1`,
+      [f.agreementId])
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(0)
+  })
+
+  // Linking the WRONG unit puts a stranger's electricity on somebody's rent
+  // invoice and sends the money to the wrong landlord. Ambiguity is a reason to
+  // do nothing, not to guess.
+  it('refuses to guess when two units both match', async () => {
+    const f = await twoLandlordsOnePlace()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      // A second unit at B's property — same address, so equally plausible.
+      await seedUnit(c, { propertyId: f.propB, landlordId: f.B.landlordId })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(0)
+  })
+})

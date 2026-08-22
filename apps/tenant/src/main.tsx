@@ -897,7 +897,7 @@ function HomeAlerts() {
 function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
   const { data: balanceCtx } = useQuery<any>('balance-context',
     () => get<any>('/payments/balance-context'))
-  const charges: any[] = balanceCtx?.serviceCharges ?? []
+  const charges: any[] = (balanceCtx?.serviceAgreements ?? []).flatMap((a: any) => a.rows ?? [])
   const owed = charges.reduce((s: number, c: any) => s + Number(c.amount || 0), 0)
   const where = me.utilityServiceAddress || me.utilityServiceSpace || 'your address'
 
