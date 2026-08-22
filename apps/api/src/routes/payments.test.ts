@@ -29,7 +29,7 @@ vi.mock('../services/adminNotifications', () => ({
 }))
 
 vi.mock('../services/stripeConnect', async () => {
-  const computeApplicationFee = vi.fn(() => 5.00)
+  const computePlatformCut = vi.fn(() => 5.00)
   const createRentDestinationCharge = vi.fn(async () => ({
     id: 'pi_dest_mock', status: 'processing',
   }))
@@ -37,7 +37,7 @@ vi.mock('../services/stripeConnect', async () => {
     id: 'pi_plat_mock', status: 'processing',
   }))
   return {
-    computeApplicationFee,
+    computePlatformCut,
     createRentDestinationCharge,
     createRentPlatformCharge,
   }
@@ -78,7 +78,7 @@ function buildApp() {
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_payments'
-  ;(stripeConnect.computeApplicationFee as ReturnType<typeof vi.fn>).mockClear()
+  ;(stripeConnect.computePlatformCut as ReturnType<typeof vi.fn>).mockClear()
   ;(stripeConnect.createRentDestinationCharge as ReturnType<typeof vi.fn>).mockClear()
   ;(stripeConnect.createRentPlatformCharge as ReturnType<typeof vi.fn>).mockClear()
 })
@@ -463,7 +463,7 @@ describe('POST /api/payments/:id/pay', () => {
       [propId, ach, card])
   }
 
-  // S562: the processing fee (mock computeApplicationFee → $5) must be ADDED to
+  // S562: the processing fee (mock computePlatformCut → $5) must be ADDED to
   // the charge when the tenant is the fee payer, so GAM doesn't eat Stripe's
   // cost. When the landlord pays it, the charge stays pure rent and the
   // landlord absorbs the fee via the settle-time allocation split.

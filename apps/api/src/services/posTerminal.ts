@@ -391,7 +391,7 @@ export async function createBusinessCardPresentPaymentIntent(opts: {
   businessConnectAccountId: string
   businessId:               string
   amountCents:              number
-  applicationFeeCents:      number
+  platformCutCents:      number
   currency?:                string
   description?:             string
 }): Promise<Stripe.PaymentIntent> {
@@ -408,7 +408,7 @@ export async function createBusinessCardPresentPaymentIntent(opts: {
       currency:               opts.currency ?? 'usd',
       payment_method_types:   ['card_present'],
       capture_method:         'manual',
-      application_fee_amount: Math.max(0, Math.round(opts.applicationFeeCents)),
+      application_fee_amount: Math.max(0, Math.round(opts.platformCutCents)),
       transfer_data:          { destination: opts.businessConnectAccountId },
       on_behalf_of:           opts.businessConnectAccountId,
       description:            opts.description ?? 'POS sale',

@@ -11,7 +11,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import { paymentMethodCosts, processingFeeFor, PROCESSING_FEES } from '@gam/shared'
-import { computeApplicationFee } from './stripeConnect'
+import { computePlatformCut } from './stripeConnect'
 
 describe('paymentMethodCosts', () => {
   // Oak Park's actual rent, the number Nic used.
@@ -59,9 +59,9 @@ describe('paymentMethodCosts', () => {
     for (const amount of [450, 440, 1000, 12.34, 0.01, 7500]) {
       const rows = paymentMethodCosts(amount)
       expect(rows[0].fee).toBeCloseTo(
-        computeApplicationFee({ amount, paymentMethod: 'ach' }), 2)
+        computePlatformCut({ amount, paymentMethod: 'ach' }), 2)
       expect(rows[1].fee).toBeCloseTo(
-        computeApplicationFee({ amount, paymentMethod: 'card' }), 2)
+        computePlatformCut({ amount, paymentMethod: 'card' }), 2)
       expect(rows[1].fee).toBeCloseTo(
         processingFeeFor({ amount, paymentMethod: 'card' }), 2)
     }
@@ -70,6 +70,6 @@ describe('paymentMethodCosts', () => {
   it('still matches for a non-US card, where the add-on could diverge', () => {
     const amount = 450
     expect(paymentMethodCosts(amount, { cardCountry: 'CA' })[1].fee).toBeCloseTo(
-      computeApplicationFee({ amount, paymentMethod: 'card', cardCountry: 'CA' }), 2)
+      computePlatformCut({ amount, paymentMethod: 'card', cardCountry: 'CA' }), 2)
   })
 })

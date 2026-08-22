@@ -63,7 +63,7 @@ vi.mock('./stripeConnect', async () => ({
     id: 'pi_flexcharge_mock', status: 'processing',
   })),
   createRentDestinationCharge: vi.fn(),
-  computeApplicationFee:       vi.fn(() => 0),
+  computePlatformCut:       vi.fn(() => 0),
 }))
 
 import Stripe from 'stripe'

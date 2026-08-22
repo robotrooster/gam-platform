@@ -64,7 +64,7 @@ describe('createRentDestinationCharge', () => {
     stripeCustomerId: 'cus_test',
     paymentMethodId: 'pm_test',
     destinationConnectAccountId: 'acct_landlord',
-    applicationFeeAmount: 10.50,
+    platformCutAmount: 10.50,
     entryDescription: 'RENT',
   }
 
@@ -124,7 +124,7 @@ describe('createRentDestinationCharge', () => {
     await createRentDestinationCharge({
       ...baseOpts,
       amount: 33.33,
-      applicationFeeAmount: 1.234,
+      platformCutAmount: 1.234,
       paymentMethodTypes: ['card'],
     })
     expect(paymentIntentsCreateMock).toHaveBeenCalledWith(expect.objectContaining({

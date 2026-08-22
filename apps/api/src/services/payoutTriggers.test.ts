@@ -31,7 +31,7 @@ const CYCLE = '2026-03-01'
 const TODAY = '2026-03-02'
 
 /** A landlord with `units` occupied units, each owing rent this cycle. */
-async function landlordWithRoll(units: number) {
+async function landlordWithRoll(units: number, cycle: string = CYCLE) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -51,7 +51,7 @@ async function landlordWithRoll(units: number) {
         `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type,
                                entry_description, amount, status, due_date)
          VALUES ($1,$2,$3,$4,'rent','RENT',500,'pending',$5)`,
-        [landlordId, tenantId, leaseId, unitId, CYCLE])
+        [landlordId, tenantId, leaseId, unitId, cycle])
       unitIds.push(unitId)
     }
     await c.query('COMMIT')
@@ -102,9 +102,45 @@ describe('threshold claiming (S616)', () => {
     const c = await claimThresholdIfReached('user', f.userId, CYCLE, TODAY, p)
     expect(c.claimed).toBe(true)
     expect(c.triggerKind).toBe('threshold_50')
-    // Trigger on PAID, fire when it will have settled.
+    // Trigger on PAID, fire when it will have settled. Mon Mar 2 + 4 business
+    // days = Fri Mar 6 — this window happens to contain no weekend, so it is
+    // the one case where the old calendar count agreed.
     expect(c.scheduledFor).toBe('2026-03-06')
     expect(SETTLE_LEAD_DAYS).toBe(4)
+  })
+
+  // S617 (Nic): "threshold trigger plus four business days." The lead time was
+  // four CALENDAR days while Stripe releases an ACH four BUSINESS days out. A
+  // payout scheduled short fires before the money exists, reads an empty
+  // balance, and autoPayouts retires the trigger anyway — burning one of the
+  // landlord's three monthly payouts on nothing.
+  it('steps the lead time over a weekend rather than counting calendar days', async () => {
+    const f = await landlordWithRoll(10)
+    await markPaid(f.unitIds, 5)
+    const p = await rollProgressForLandlordUser(f.userId, CYCLE)
+
+    // March rent, half of it in by Thu 2026-03-05. Four business days is
+    // Wed 2026-03-11; the calendar count said Mon 2026-03-09.
+    const c = await claimThresholdIfReached('user', f.userId, CYCLE, '2026-03-05', p)
+    expect(c.claimed).toBe(true)
+    expect(c.scheduledFor).toBe('2026-03-11')
+  })
+
+  it('steps the lead time over a federal holiday', async () => {
+    // September rent, paid in September — Labor Day falls inside the window.
+    const SEPT = '2026-09-01'
+    const f = await landlordWithRoll(10, SEPT)
+    await markPaid(f.unitIds, 5)
+    const p = await rollProgressForLandlordUser(f.userId, SEPT)
+    expect(p.percentPaid).toBe(50)
+
+    // Half the roll is in on Wed Sep 2. Labor Day is Mon Sep 7, so four
+    // business days is Wed Sep 9. The calendar count said Sun Sep 6 — a day
+    // the payout cron does not even run, and two days before Stripe would
+    // have released the money.
+    const c = await claimThresholdIfReached('user', f.userId, SEPT, '2026-09-02', p)
+    expect(c.claimed).toBe(true)
+    expect(c.scheduledFor).toBe('2026-09-09')
   })
 
   it('does not claim below 50%', async () => {

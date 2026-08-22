@@ -280,7 +280,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
       guestEmail: opts.guestEmail,
       successUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`),
       cancelUrl:  storefrontUrl(prop.booking_slug),
-      applicationFeeCents: 0,
+      platformCutCents: 0,
       metadata: { gam_booking_id: bookingId },
     })
     await query(`UPDATE unit_bookings SET stripe_checkout_session_id=$1, updated_at=now() WHERE id=$2`,

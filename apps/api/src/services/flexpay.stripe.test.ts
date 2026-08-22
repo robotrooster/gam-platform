@@ -61,7 +61,7 @@ vi.mock('./stripeConnect', async () => {
     // No other helpers from this module are touched by flexpay.ts, but
     // include common ones as no-op stubs in case future code adds calls.
     createRentDestinationCharge: vi.fn(),
-    computeApplicationFee:       vi.fn(() => 0),
+    computePlatformCut:       vi.fn(() => 0),
   }
 })
 

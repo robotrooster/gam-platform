@@ -578,7 +578,7 @@ businessPosRouter.post('/terminal/charge', requireAuth, async (req, res, next) =
       businessConnectAccountId: connectId,
       businessId,
       amountCents: chargeCents,
-      applicationFeeCents: fee,
+      platformCutCents: fee,
       description: 'POS sale',
     })
     await processBusinessPIOnReader({ stripeReaderId, paymentIntentId: intent.id })

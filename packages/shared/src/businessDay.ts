@@ -67,3 +67,41 @@ export function lastBusinessDay(year: number, month: number, timezone: string): 
 export function daysInMonth(year: number, month: number): number {
   return DateTime.fromObject({ year, month, day: 1 }, { zone: 'utc' }).daysInMonth!
 }
+
+/**
+ * The ISO date `n` business days after `from`, skipping weekends and US
+ * federal holidays.
+ *
+ * S617 (Nic): "threshold trigger plus four business days. That's the simpler
+ * way to do it." This exists because the payout scheduler was adding four
+ * CALENDAR days to the day a rent-roll threshold tripped, while Stripe releases
+ * an ACH debit four BUSINESS days out. Those only agree in a week with no
+ * weekend in it, so a payout scheduled off the calendar count fired before the
+ * money existed, found an empty balance, and retired the trigger anyway —
+ * spending one of the landlord's three monthly payouts on nothing.
+ *
+ * Verified against a real charge: an ACH created Wed 2026-08-19 came back from
+ * Stripe with available_on Tue 2026-08-25, which is what this returns for
+ * (2026-08-19, 4). The calendar count returned 2026-08-23, two days early.
+ *
+ * Holidays are looked up per year as the walk crosses one, so a window that
+ * straddles New Year is correct in both years.
+ */
+export function addBusinessDays(from: string, n: number): string {
+  let dt = DateTime.fromISO(from, { zone: 'utc' })
+  const holidaysByYear = new Map<number, Set<string>>()
+  const holidaysFor = (year: number): Set<string> => {
+    let s = holidaysByYear.get(year)
+    if (!s) { s = new Set(usFederalHolidays(year)); holidaysByYear.set(year, s) }
+    return s
+  }
+  let moved = 0
+  while (moved < n) {
+    dt = dt.plus({ days: 1 })
+    const iso = dt.toISODate()!
+    if (dt.weekday >= 6) continue                 // Sat/Sun
+    if (holidaysFor(dt.year).has(iso)) continue   // federal holiday
+    moved++
+  }
+  return dt.toISODate()!
+}

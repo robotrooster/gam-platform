@@ -167,7 +167,7 @@ interface CreateRentDestinationChargeOpts {
   paymentMethodId: string                 // tenant's saved ACH or card pm
   paymentMethodTypes: ('us_bank_account' | 'card')[]
   destinationConnectAccountId: string     // landlord's stripe_connect_account_id
-  applicationFeeAmount: number            // GAM's cut in dollars (will be cents-rounded)
+  platformCutAmount: number            // GAM's cut in dollars (will be cents-rounded)
   entryDescription: string                // NACHA-shaped (RENT/SUBSCRIP/etc)
   metadata?: Record<string, string>
 }
@@ -195,7 +195,7 @@ export async function createRentDestinationCharge(opts: CreateRentDestinationCha
     transfer_data: {
       destination: opts.destinationConnectAccountId,
     },
-    application_fee_amount: Math.round(opts.applicationFeeAmount * 100),
+    application_fee_amount: Math.round(opts.platformCutAmount * 100),
     description: `${opts.entryDescription} - Gold Asset Management`,
     metadata: { entry_description: opts.entryDescription, ...(opts.metadata ?? {}) },
     // Required for ACH per S64 (mandate-data + financial_connections)
@@ -285,11 +285,25 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
 }
 
 /**
- * Compute GAM's `application_fee_amount` for a rent payment.
+ * Compute GAM's PLATFORM CUT for a rent payment.
+ *
+ * ── NAMING, because two unrelated things are called an "application fee" ──
+ * Stripe's wire field for a platform's cut of a Connect charge is
+ * `application_fee_amount`. It has nothing to do with a rental application.
+ * GAM has a real rental application fee too — a lease_fees / property fee
+ * schedule type paid by an APPLICANT, capped by state law
+ * (state_application_fee_caps), and unrelated to this.
+ *
+ * S617 (Nic): "that's fucking retarded. It's confusing as shit." So the name
+ * `application fee` belongs to the RENTAL one everywhere in this codebase.
+ * GAM's cut is the PLATFORM CUT, and the string `application_fee_amount`
+ * appears in exactly four places — the lines that hand a number to Stripe.
+ * Do not reintroduce it as one of our own names.
+ *
  * Reads the per-property fee toggle: when 'tenant', the tenant pays the
  * processing fee on top of rent (so GAM's cut = the full processing fee
  * GAM charges). When 'landlord', the landlord absorbs the fee (so the
- * application_fee_amount equals what GAM charges them, deducted from gross).
+ * platform cut equals what GAM charges them, deducted from gross).
  *
  * Rates — single source: PROCESSING_FEES in @gam/shared, mirrored into the
  * platform_processing_rates DB rows (latest: 20260812150000):
@@ -299,9 +313,9 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
  *         fixed leg + amortized authorizations that earn nothing)
  *   Non-US-issued card: +1.5% surcharge passed through to tenant
  *
- * @returns dollar amount (not cents) GAM keeps as application fee
+ * @returns dollar amount (not cents) GAM keeps as its platform cut
  */
-export function computeApplicationFee(opts: {
+export function computePlatformCut(opts: {
   amount: number
   paymentMethod: 'ach' | 'card'
   cardCountry?: string | null  // Stripe payment_method.card.country
@@ -849,7 +863,7 @@ interface CreateInvoiceCheckoutOpts {
   customerEmail?:               string | null
   successUrl:                   string
   cancelUrl:                    string
-  applicationFeeCents?:         number
+  platformCutCents?:         number
   metadata?:                    Record<string, string>
   // S508: when set, ask Stripe to create a Customer + save the card
   // for off-session charges (recurring cycles). The webhook persists
@@ -896,7 +910,7 @@ export async function createInvoiceCheckoutSession(
       transfer_data: {
         destination: opts.businessConnectAccountId,
       },
-      application_fee_amount: opts.applicationFeeCents ?? 0,
+      application_fee_amount: opts.platformCutCents ?? 0,
       metadata: {
         gam_purpose: 'business_invoice',
         ...(opts.metadata ?? {}),
@@ -941,7 +955,7 @@ export interface CreateBookingDepositCheckoutOpts {
   guestEmail?:                 string | null
   successUrl:                  string
   cancelUrl:                   string
-  applicationFeeCents?:        number
+  platformCutCents?:        number
   metadata?:                   Record<string, string>
 }
 
@@ -962,7 +976,7 @@ export async function createBookingDepositCheckoutSession(
     }],
     payment_intent_data: {
       transfer_data: { destination: opts.landlordConnectAccountId },
-      application_fee_amount: opts.applicationFeeCents ?? 0,
+      application_fee_amount: opts.platformCutCents ?? 0,
       metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
     },
     metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },

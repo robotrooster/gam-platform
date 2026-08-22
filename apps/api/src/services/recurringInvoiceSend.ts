@@ -109,7 +109,7 @@ export async function sendGeneratedInvoice(
         // covers Stripe's processing cost with margin (see shared
         // PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_*). Pre-fix this was 0
         // and GAM ate the processing cost on every hosted payment.
-        applicationFeeCents: Math.round((Math.round(Number(inv.total_amount) * 100)) * BIZ_FEES.BUSINESS_INVOICE_APP_FEE_PCT) + BIZ_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS,
+        platformCutCents: Math.round((Math.round(Number(inv.total_amount) * 100)) * BIZ_FEES.BUSINESS_INVOICE_APP_FEE_PCT) + BIZ_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS,
         businessConnectAccountId: biz.stripe_connect_account_id,
         invoiceNumber:            inv.invoice_number,
         customerEmail:            customer?.email ?? null,

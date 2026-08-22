@@ -15,7 +15,7 @@
  *   - <SavedMethodsCard methods={...} /> — read-only summary surface
  *   - Types: SavedPaymentMethod / SavedAch / SavedCard / PayTarget
  *
- * Backend pricing math lives in services/stripeConnect.computeApplicationFee.
+ * Backend pricing math lives in services/stripeConnect.computePlatformCut.
  * Frontend never computes a fee and never types one: any price shown here comes
  * from achFeeLabel() / cardFeeLabel(), which derive from PROCESSING_FEES.
  * (This header used to quote "flat $6 ACH; 3.25% + $0.26/txn card" — already two

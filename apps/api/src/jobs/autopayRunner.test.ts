@@ -20,7 +20,7 @@ import {
 
 const chargeMock = vi.fn(async (_input?: any) => ({
   remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
-  appliedTotal: 0, payAhead: 0, applicationFeeAmount: 0, lines: [],
+  appliedTotal: 0, payAhead: 0, platformCutAmount: 0, lines: [],
 }))
 vi.mock('../services/rentCharge', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
@@ -110,7 +110,7 @@ describe('S609 autopay runner', () => {
     chargeMock.mockClear()
     chargeMock.mockImplementation(async (_input?: any) => ({
       remittanceId: 'rem_x', paymentIntentId: 'pi_x', status: 'processing',
-      appliedTotal: 0, payAhead: 0, applicationFeeAmount: 0, lines: [],
+      appliedTotal: 0, payAhead: 0, platformCutAmount: 0, lines: [],
     }))
     f = await fixture()
   })

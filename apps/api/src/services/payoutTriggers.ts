@@ -1,3 +1,4 @@
+import { addBusinessDays } from '@gam/shared'
 import { query, queryOne } from '../db'
 
 // ============================================================
@@ -18,13 +19,25 @@ export const THRESHOLD_50 = 50
 export const THRESHOLD_90 = 90
 
 /**
- * Days between a threshold tripping and the payout firing.
+ * BUSINESS days between a threshold tripping and the payout firing.
  *
- * Nic: trigger on PAID, not settled. Stripe holds an ACH debit roughly four
- * business days, so scheduling out four days front-runs that wait rather than
- * discovering it — by the time this fires, the money the tenants sent has
- * cleared. Stripe only ever releases settled funds, so the firing takes
- * whatever is genuinely available and an empty one is skipped for free.
+ * Nic: trigger on PAID, not settled. A tenant counts the moment their bank is
+ * debited, because an ACH sits in 'processing' for days afterwards and counting
+ * only settled money would make every roll look empty during the exact week
+ * rent arrives. The lead time is what covers that wait.
+ *
+ * S617 (Nic): "threshold trigger plus four business days. That's the simpler
+ * way to do it." These were CALENDAR days, and Stripe releases an ACH four
+ * BUSINESS days out — the two only agree in a week with no weekend in it.
+ * Measured on a real charge: an ACH created Wed 2026-08-19 had available_on
+ * Tue 2026-08-25. Four calendar days said the 23rd, so the payout fired two
+ * days before the money existed, read an empty balance, and the trigger was
+ * retired anyway (see the comment in autoPayouts) — one of the landlord's
+ * three monthly payouts spent on nothing, and his rent pushed to the 90%
+ * trigger or the late-month sweep.
+ *
+ * Deliberately NOT Stripe's per-payment available_on. Nic: "we're not gonna
+ * read every payment." One roll-wide count, not a lookup per tenant.
  */
 export const SETTLE_LEAD_DAYS = 4
 
@@ -71,13 +84,6 @@ export async function rollProgressForLandlordUser(
   }
 }
 
-/** ISO date N days after `from`. */
-function addDaysIso(from: string, n: number): string {
-  const d = new Date(`${from}T00:00:00Z`)
-  d.setUTCDate(d.getUTCDate() + n)
-  return d.toISOString().slice(0, 10)
-}
-
 export interface ClaimResult {
   claimed: boolean
   triggerKind?: string
@@ -102,7 +108,7 @@ export async function claimThresholdIfReached(
     : null
   if (!kind) return { claimed: false }
 
-  const scheduledFor = addDaysIso(today, SETTLE_LEAD_DAYS)
+  const scheduledFor = addBusinessDays(today, SETTLE_LEAD_DAYS)
   const res = await query<{ id: string }>(
     `INSERT INTO payout_triggers
        (entity_kind, entity_id, cycle_month, trigger_kind,

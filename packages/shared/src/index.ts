@@ -3941,7 +3941,7 @@ export const STRIPE_CONFIG = {
 // S551 (Nic): the platform-wide CUSTOMER-FACING processing fee schedule —
 // THE single source for every card/ACH processing fee on any service
 // (rent, background checks, deposits, POS, everything). Consumers:
-// services/stripeConnect.ts computeApplicationFee (destination charges) and
+// services/stripeConnect.ts computePlatformCut (destination charges) and
 // the platform_processing_rates DB rows (allocation engine) — the
 // 20260721 migration seeds those rows from these same numbers; if these
 // change, cut a new migration to match.
@@ -3994,7 +3994,7 @@ export function achFeeLabel(): string {
 
 /**
  * S607 — THE processing-fee formula. One definition, used by the code that
- * CHARGES (services/stripeConnect.computeApplicationFee delegates here) and by
+ * CHARGES (services/stripeConnect.computePlatformCut delegates here) and by
  * the code that QUOTES a price to a tenant before they choose a method.
  *
  * Nic asked the invoice to show what each payment method would cost. A display

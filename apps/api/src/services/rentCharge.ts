@@ -53,7 +53,7 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { allocateOldestFirst } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
-import { computeApplicationFee, createRentPlatformCharge } from './stripeConnect'
+import { computePlatformCut, createRentPlatformCharge } from './stripeConnect'
 import { createAdminNotification } from './adminNotifications'
 import { computeTenantGamOutstandingTotal } from './supersedence'
 
@@ -86,7 +86,7 @@ export interface ChargeLeaseBalanceResult {
   appliedTotal:        number
   /** Dollars banked as prepaid credit for future months. */
   payAhead:            number
-  applicationFeeAmount: number
+  platformCutAmount: number
   lines:               { payment_id: string; amount_applied: number }[]
 }
 
@@ -299,7 +299,7 @@ export async function chargeLeaseBalance(
     // pay-ahead surplus included — Stripe charges us on every dollar it
     // processes and GAM never absorbs a banking fee. allocation.ts reads the
     // same total back off the remittance so its books match this exactly.
-    const baseApplicationFee = computeApplicationFee({
+    const basePlatformCut = computePlatformCut({
       amount,
       paymentMethod: paymentMethodType,
       cardCountry,
@@ -343,8 +343,8 @@ export async function chargeLeaseBalance(
     // pay-ahead surplus is the tenant's money held for future rent, not
     // available cash to sweep.
     const gamSupersedenceAmount = Math.min(appliedTotal, await computeTenantGamOutstandingTotal(tenantId))
-    const applicationFeeAmount = Math.round(
-      (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100) / 100
+    const platformCutAmount = Math.round(
+      (basePlatformCut + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100) / 100
 
     // S562: tenant-borne processing fee rides on top of the lump charge.
     // Fee-payer resolved from the first row's property (ctx) — a single
@@ -352,7 +352,7 @@ export async function chargeLeaseBalance(
     // lump, matching Stripe's single-transaction cost.
     const feePayer = paymentMethodType === 'ach' ? ctx.ach_fee_payer : ctx.card_fee_payer
     const tenantPaysProcessingFee = feePayer !== 'landlord'
-    const tenantBorneOnTop = (tenantPaysProcessingFee ? baseApplicationFee : 0) + passthroughAmount
+    const tenantBorneOnTop = (tenantPaysProcessingFee ? basePlatformCut : 0) + passthroughAmount
     const chargeAmount = Math.round((amount + tenantBorneOnTop) * 100) / 100
 
     // Create the remittance BEFORE the Stripe call so the PI metadata can
@@ -467,7 +467,7 @@ export async function chargeLeaseBalance(
       status: intent.status,
       appliedTotal,
       payAhead: plan.unapplied,
-      applicationFeeAmount,
+      platformCutAmount,
       lines: plan.lines,
     }
   } catch (e) {

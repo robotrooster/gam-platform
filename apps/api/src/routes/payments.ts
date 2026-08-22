@@ -8,7 +8,7 @@ import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
          MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE, paymentMethodCosts,
          PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
-import { computeApplicationFee, createRentPlatformCharge } from '../services/stripeConnect'
+import { computePlatformCut, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
@@ -46,7 +46,7 @@ paymentsRouter.post('/quote', async (req, res, next) => {
     }
     const tenantPaysFee = feePayer !== 'landlord'
     // cardCountry omitted → US base rate; a non-US card adds 1.5% at charge time (flagged in the UI).
-    const fee = tenantPaysFee ? computeApplicationFee({ amount: body.amount, paymentMethod: body.method }) : 0
+    const fee = tenantPaysFee ? computePlatformCut({ amount: body.amount, paymentMethod: body.method }) : 0
     const total = Math.round((body.amount + fee) * 100) / 100
     res.json({ success: true, data: {
       base: body.amount, method: body.method, fee, tenantPaysFee, total,
@@ -297,7 +297,7 @@ paymentsRouter.post('/:id/handle-return', requireAdmin, async (req, res, next) =
 //      payment_method_type ('ach' or 'card')
 //   2. Backend validates the payment row belongs to this tenant
 //   3. Looks up the landlord's stripe_connect_account_id
-//   4. Computes application_fee_amount via computeApplicationFee
+//   4. Computes application_fee_amount via computePlatformCut
 //   5. Creates a destination charge — Stripe routes gross to landlord's
 //      Connect, application_fee_amount to GAM's platform balance
 //   6. Stamps stripe_payment_intent_id on the payment row, status →
@@ -398,7 +398,7 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
     }
 
     const amount = parseFloat(pmt.amount)
-    const baseApplicationFee = computeApplicationFee({
+    const basePlatformCut = computePlatformCut({
       amount,
       paymentMethod: body.paymentMethodType,
       cardCountry,
@@ -463,8 +463,8 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       ? Math.min(amount, await computeTenantGamOutstandingTotal(pmt.tenant_id))
       : 0
 
-    const applicationFeeAmount = Math.round(
-      (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100
+    const platformCutAmount = Math.round(
+      (basePlatformCut + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100
     ) / 100
 
     // S562: the tenant bears the processing fee UNLESS the property routes it to
@@ -482,7 +482,7 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
     // unclaimed accruals, so it's naturally $0 when the landlord pays the
     // platform fee — the launch default). Same leak, same fix: under platform-
     // holds these must be collected in the charge, or GAM eats them.
-    const tenantBorneOnTop = (tenantPaysProcessingFee ? baseApplicationFee : 0) + passthroughAmount
+    const tenantBorneOnTop = (tenantPaysProcessingFee ? basePlatformCut : 0) + passthroughAmount
     const chargeAmount = Math.round((amount + tenantBorneOnTop) * 100) / 100
 
     // S560 money-flow rebuild (Phase 1): ALWAYS charge to the platform balance —
@@ -559,7 +559,7 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       data: {
         paymentIntentId:       intent.id,
         status:                intent.status,
-        applicationFeeAmount,
+        platformCutAmount,
         platformFeePassthrough: passthroughAmount,
         accrualsClaimed:       unpaidAccruals.length,
       },

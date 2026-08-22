@@ -41,6 +41,7 @@
  *     column we haven't added; PM-portal will read from connect_payouts.
  */
 
+import { isUsFederalHoliday } from '@gam/shared'
 import { query } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { createAdminNotification } from '../services/adminNotifications'
@@ -52,34 +53,20 @@ import {
 } from '../services/payoutTriggers'
 import { logger } from '../lib/logger'
 
-// US federal holidays 2026-2027. Refresh annually before each calendar year.
-// "Observed" dates used when the actual holiday falls on a weekend.
-export const US_FEDERAL_HOLIDAYS = new Set<string>([
-  // 2026
-  '2026-01-01', // New Year's Day (Thu)
-  '2026-01-19', // MLK Day
-  '2026-02-16', // Presidents Day
-  '2026-05-25', // Memorial Day
-  '2026-06-19', // Juneteenth (Fri)
-  '2026-07-03', // Independence Day observed (Jul 4 = Sat)
-  '2026-09-07', // Labor Day
-  '2026-10-12', // Columbus Day
-  '2026-11-11', // Veterans Day
-  '2026-11-26', // Thanksgiving
-  '2026-12-25', // Christmas (Fri)
-  // 2027
-  '2027-01-01', // New Year's Day (Fri)
-  '2027-01-18', // MLK Day
-  '2027-02-15', // Presidents Day
-  '2027-05-31', // Memorial Day
-  '2027-06-18', // Juneteenth observed (Jun 19 = Sat)
-  '2027-07-05', // Independence Day observed (Jul 4 = Sun)
-  '2027-09-06', // Labor Day
-  '2027-10-11', // Columbus Day
-  '2027-11-11', // Veterans Day
-  '2027-11-25', // Thanksgiving
-  '2027-12-24', // Christmas observed (Dec 25 = Sat)
-])
+// US federal holidays. Computed, not listed.
+//
+// S617: this was a hand-maintained set for 2026-2027 headed "Refresh annually
+// before each calendar year" — a chore nobody would remember, whose reward for
+// being forgotten is payouts firing on a day the banks are shut. The shared
+// helper derives them from the rules (including the Sat->Fri / Sun->Mon
+// observed shift) for any year, and payoutTriggers now schedules against the
+// same source, so the day the scheduler thinks is a business day and the day
+// this engine agrees to run on cannot drift apart.
+//
+// Verified identical to the list it replaced for 2026 and 2027 before the swap.
+export const US_FEDERAL_HOLIDAYS = {
+  has: (iso: string): boolean => isUsFederalHoliday(iso),
+}
 
 const TZ = 'America/Phoenix'
 

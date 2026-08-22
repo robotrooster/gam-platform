@@ -5,7 +5,7 @@
  * status side, not the money-movement side). Each session in this
  * multi-session arc carves off a coherent subset:
  *   S434 (this): ensureConnectAccount + createOnboardingSession +
- *                fetchAccountStatus + computeApplicationFee +
+ *                fetchAccountStatus + computePlatformCut +
  *                recordAccountUpdated
  *   S435+: charges (rent destination + platform), transfers
  *          (PM company), payout/dispute webhook recorders
@@ -46,7 +46,7 @@ import {
 } from '../test/dbHelpers'
 import {
   ensureConnectAccount, createOnboardingSession, fetchAccountStatus,
-  computeApplicationFee, recordAccountUpdated,
+  computePlatformCut, recordAccountUpdated,
 } from './stripeConnect'
 
 beforeEach(async () => {
@@ -261,47 +261,47 @@ describe('fetchAccountStatus', () => {
   })
 })
 
-// ─── computeApplicationFee ───────────────────────────────────
+// ─── computePlatformCut ───────────────────────────────────
 
-describe('computeApplicationFee — ACH (S601: flat $6 at any rent)', () => {
+describe('computePlatformCut — ACH (S601: flat $6 at any rent)', () => {
   it('$100 → $6', () => {
-    expect(computeApplicationFee({ amount: 100, paymentMethod: 'ach' })).toBe(6)
+    expect(computePlatformCut({ amount: 100, paymentMethod: 'ach' })).toBe(6)
   })
 
   it('$200 → $6', () => {
-    expect(computeApplicationFee({ amount: 200, paymentMethod: 'ach' })).toBe(6)
+    expect(computePlatformCut({ amount: 200, paymentMethod: 'ach' })).toBe(6)
   })
 
   it('$600 → $6', () => {
-    expect(computeApplicationFee({ amount: 600, paymentMethod: 'ach' })).toBe(6)
+    expect(computePlatformCut({ amount: 600, paymentMethod: 'ach' })).toBe(6)
   })
 
   it('$2000 → $6 (flat, no cap surprise)', () => {
-    expect(computeApplicationFee({ amount: 2000, paymentMethod: 'ach' })).toBe(6)
+    expect(computePlatformCut({ amount: 2000, paymentMethod: 'ach' })).toBe(6)
   })
 })
 
-describe('computeApplicationFee — card (S603: 3.5% + $0.55/txn)', () => {
+describe('computePlatformCut — card (S603: 3.5% + $0.55/txn)', () => {
   it('US card 3.5% + 55¢ ($100 → $4.05)', () => {
-    expect(computeApplicationFee({
+    expect(computePlatformCut({
       amount: 100, paymentMethod: 'card', cardCountry: 'US',
     })).toBe(4.05)
   })
 
   it('card with null country defaults to base 3.5% + 55¢', () => {
-    expect(computeApplicationFee({
+    expect(computePlatformCut({
       amount: 100, paymentMethod: 'card', cardCountry: null,
     })).toBe(4.05)
   })
 
   it('non-US card adds 1.5% surcharge (CA $100 → $5.55)', () => {
-    expect(computeApplicationFee({
+    expect(computePlatformCut({
       amount: 100, paymentMethod: 'card', cardCountry: 'CA',
     })).toBe(5.55)
   })
 
   it('card amount rounded to cents (3.5% of $33.33 + 55¢ → $1.72)', () => {
-    expect(computeApplicationFee({
+    expect(computePlatformCut({
       amount: 33.33, paymentMethod: 'card', cardCountry: 'US',
     })).toBe(1.72)
   })
