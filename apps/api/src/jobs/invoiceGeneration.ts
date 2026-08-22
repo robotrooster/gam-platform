@@ -812,21 +812,17 @@ async function runGeneration(
           // meter at that space, and re-pointing it would show the utility
           // landlord a bill against a unit he does not own.
           //
-          // lease_id, however, is the LEASE THIS INVOICE BELONGS TO, and S616
-          // originally set it NULL for the same instinct. That was wrong and it
-          // broke the money. fetchOutstandingRows scopes a tenant's balance by
-          // `p.lease_id = $2`, so a NULL-lease row is invisible to it: the
-          // pay-in-full guard would not cover it, FIFO would never allocate to
-          // it, and the tenant would pay their rent in full while the
-          // neighbouring landlord's utilities stayed unpaid.
+          // lease_id stays NULL, because this charge is NOT part of that lease.
+          // Nic: "the utilities are not tied to the lease from the landlord next
+          // door because they are not part of that. They're getting billed to
+          // the same tenant but for a different landlord."
           //
-          // That is a partial payment across two landlords, which Nic ruled out
-          // precisely because it cannot be allocated: "usually it all goes to
-          // one person, but in the case of it going to two different operators,
-          // how would you allocate that? The charges happened at the exact same
-          // time." Carrying the lease id is also simply TRUE — this charge was
-          // billed on that lease's invoice — and landlord_id still names the
-          // landlord the money belongs to, which is what routes it.
+          // I briefly stamped the lease on it to make the balance work, and that
+          // was solving the right problem the wrong way — it made the utility
+          // landlord's charge look like a term of another landlord's lease. The
+          // balance is scoped by INVOICE instead (see fetchOutstandingRows): the
+          // whole document is paid at once, which is what Nic asked for, without
+          // pretending the charge belongs to a lease it does not.
           const isCrossPropertyRow = (ub as any).service_agreement_id != null
           const rowLandlordId = (ub as any).bill_landlord_id ?? lease.landlord_id
           const utilityPayment = await client.query<{ id: string }>(
@@ -840,7 +836,7 @@ async function runGeneration(
             [
               invoiceId,
               isCrossPropertyRow ? crossLink!.service_unit_id : lease.unit_id,
-              lease.id,
+              isCrossPropertyRow ? null : lease.id,
               effectiveTenantId,
               rowLandlordId,
               net.toFixed(2), dueDate, rowStatus(net), combinedNote,

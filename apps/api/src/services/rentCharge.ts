@@ -108,7 +108,20 @@ export async function fetchOutstandingRows(tenantId: string, leaseId: string) {
        JOIN users lu ON lu.id = l.user_id
        LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
       WHERE p.tenant_id = $1
-        AND p.lease_id = $2
+        -- S616 (Nic): the balance is what is on the DOCUMENT, not what the
+        -- lease says. "When they get their rent bill, they get the utilities
+        -- and the rent on the invoice and the whole thing has to be paid at
+        -- once, not just pay in full locked to what the lease says."
+        --
+        -- A converged invoice carries rent owed to this landlord and utilities
+        -- owed to the landlord next door. Those utility rows are deliberately
+        -- NOT tied to this lease — they are not part of it — so scoping by
+        -- lease_id alone made them invisible here: the pay-in-full guard would
+        -- not have covered them and FIFO would never have allocated to them,
+        -- leaving the tenant paying rent in full and the other landlord unpaid.
+        -- That is the two-operator partial Nic ruled out as unallocatable.
+        AND (p.lease_id = $2
+             OR p.invoice_id IN (SELECT id FROM invoices WHERE lease_id = $2))
         AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
              OR p.status = 'failed')
       ORDER BY p.due_date ASC, p.created_at ASC`,

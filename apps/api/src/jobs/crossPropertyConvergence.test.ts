@@ -166,12 +166,11 @@ describe('cross-property convergence (S616)', () => {
     expect(util.landlord_id).toBe(f.A.landlordId)
     // It stays a fact about HIS space, not a bill against a unit he owns...
     expect(util.unit_id).toBe(f.servicedUnitId)
-    // ...but it carries THIS lease, because that is the balance it belongs to.
-    // With a NULL lease it would be invisible to fetchOutstandingRows, which
-    // scopes by p.lease_id — the tenant would pay rent in full and the
-    // neighbouring landlord's utilities not at all. Nic ruled that out: a
-    // partial split across two operators cannot be allocated.
-    expect(util.lease_id).toBe(f.leaseId)
+    // ...and it is NOT part of the other landlord's lease. Nic: "the utilities
+    // are not tied to the lease from the landlord next door because they are
+    // not part of that." The balance is scoped by INVOICE instead, which is how
+    // the whole document still gets paid at once.
+    expect(util.lease_id).toBeNull()
   })
 
   // The pay-in-full rule has to cover BOTH landlords' rows or it is not a

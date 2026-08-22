@@ -2239,11 +2239,53 @@ export const LEASE_TYPES_BY_UNIT_TYPE: Record<UnitType, string[]> = {
   land_lot:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
 }
 
-/** The allowed stay lengths for a unit type. Unknown types get the
- *  conservative answer — long-term only — rather than the permissive one. */
-export function leaseTypesForUnitType(unitType: string): string[] {
-  return LEASE_TYPES_BY_UNIT_TYPE[unitType as UnitType]
+/**
+ * Unit types that are short-stay by nature — somebody arrives with their own
+ * rig, or the room IS the stay. These carry nightly and weekly without anyone
+ * turning anything on.
+ *
+ * Everything else is somewhere a person LIVES, and Nic is explicit that the
+ * long-term case is the norm: "Short term stays is not gonna be the bulk of the
+ * people using this software. So they have to manually select that. It should
+ * never be on by default."
+ */
+export const SHORT_STAY_BY_NATURE_UNIT_TYPES: readonly UnitType[] = [
+  'rv_spot', 'campsite', 'hotel_room',
+  // S577 (unchanged): parking, boat slips and land lots are rented by the day
+  // as well as the month — a day's parking, a visiting boat, an event lot.
+  'parking', 'boat_slip', 'land_lot',
+] as const
+
+/**
+ * The allowed stay lengths for a unit, given its type and whether the operator
+ * has turned short stays ON for it.
+ *
+ * S616 (Nic): a home-shaped unit — mobile home, apartment, house, commercial —
+ * is long-term only until an operator deliberately opts it in. A landlord CAN
+ * short-stay their single-family house; they just have to say so, which is what
+ * is_bookable has meant since S538 ("is_bookable IS the short-stay gate").
+ *
+ * Storage never gains nightly or weekly whatever the toggle says. Nic: "storage
+ * should not be short term, nightly, whatever. It's by the month lease."
+ *
+ * An unknown type gets the conservative answer, never the permissive one.
+ */
+export function leaseTypesForUnitType(
+  unitType: string, shortTermEnabled = false,
+): string[] {
+  const base = LEASE_TYPES_BY_UNIT_TYPE[unitType as UnitType]
     ?? ['month_to_month', 'long_term']
+  if ((SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unitType)) {
+    return ['month_to_month', 'long_term']
+  }
+  if (base.includes('nightly')) return base          // short-stay by nature
+  if (!shortTermEnabled) return base                 // a home, left as a home
+  return ['nightly', 'weekly', ...base]              // opted in by the operator
+}
+
+/** Does this type get short stays without anyone asking for them? */
+export function isShortStayByNature(unitType: string): boolean {
+  return (SHORT_STAY_BY_NATURE_UNIT_TYPES as readonly string[]).includes(unitType)
 }
 // Whether this unit type conceptually has bedrooms (affects UI rendering).
 export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {

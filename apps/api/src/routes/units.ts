@@ -5,7 +5,7 @@ import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assert
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
-import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -261,6 +261,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // status='owner_use' — such a unit has no lease, so there are no tenants
       // to count for a headcount-based utility split.
       ownerHouseholdSize: z.number().int().min(1).max(30).optional(),
+      // S616 (Nic): the operator opting a home-shaped unit into short stays at
+      // creation. Absent means "follow the type" — open for an RV spot or a
+      // campsite, closed for an apartment or a mobile home.
+      isBookable: z.boolean().optional(),
     }).parse(req.body)
 
     // Verify the calling user can manage units on this property's landlord.
@@ -392,7 +396,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // STORAGE is locked — so every mobile home, apartment, house and
       // commercial space was created bookable by the night. All eight of Oak
       // Park's mobile home spaces came out that way and nobody asked for it.
-      const leaseTypesAllowed = leaseTypesForUnitType(unitType)
+      //
+      // A home-shaped unit is long-term until an operator turns short stays on:
+      // "Short term stays is not gonna be the bulk of the people using this
+      // software. So they have to manually select that."
+      const leaseTypesAllowed = leaseTypesForUnitType(unitType, !!body.isBookable)
       const [unit] = await query<any>(`
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
@@ -407,7 +415,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
          nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
-         isRv, leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features),
+         // S616: bookable by DEFAULT only for the types that are short-stay by
+         // nature. A house or a mobile home starts closed and the operator opens
+         // it; an RV spot or campsite is open the day it is created.
+         body.isBookable ?? isShortStayByNature(unitType), leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features),
          body.ownerHouseholdSize ?? 1]
       )
       created.push(unit)
@@ -891,7 +902,11 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       throw new AppError(400, 'Storage units cannot be made bookable for short-term stays')
     }
 
-    const leaseTypesAllowed = leaseTypesForUnitType(unitType)
+    // S616: the operator's short-stay toggle IS is_bookable (S538), so the
+    // allow-list has to follow it — otherwise a landlord could open their house
+    // to short stays and the booking search would still never return it,
+    // because lease_types_allowed lacked nightly.
+    const leaseTypesAllowed = leaseTypesForUnitType(unitType, !!isBookable)
 
     const updated = await queryOne<any>(`UPDATE units SET
       unit_type=$1, lease_types_allowed=$2, nightly_rate=$3, weekly_rate=$4, monthly_rate=$5,
