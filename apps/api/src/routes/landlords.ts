@@ -21,7 +21,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
@@ -707,10 +707,29 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       FROM leases
       WHERE landlord_id = ANY($1) AND status = 'active' AND end_date IS NOT NULL`, [scopeIds])
 
-    // Occupancy rate — round(100 × active / total). SAME formula as the Reports
-    // page (/reports/summary), so the Dashboard's Occupancy card agrees with it.
+    // S616 (Nic): occupancy counts SHORT STAYS too — "aggregate thirty nights
+    // of bookings as well." Before this, a park running on nightly bookings
+    // read as nearly empty while it was full: a booking is not a lease, so
+    // every booked spot still carries status 'vacant'.
+    //
+    // One shared formula with the Reports page, so the Dashboard's Occupancy
+    // card and /reports/summary cannot drift.
+    const nightsRow = await queryOne<{ nights: number }>(`
+      SELECT COALESCE(SUM(
+               GREATEST(
+                 LEAST(b.check_out, date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date
+                   - GREATEST(b.check_in, date_trunc('month', CURRENT_DATE))::date, 0)), 0)::int AS nights
+        FROM unit_bookings b
+        JOIN units u ON u.id = b.unit_id
+       WHERE u.landlord_id = ANY($1)
+         AND u.status <> 'utility_service'
+         AND b.lease_type IN ('nightly','weekly')
+         AND b.status NOT IN ('cancelled','no_show')
+         AND b.check_in  < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+         AND b.check_out > date_trunc('month', CURRENT_DATE)`, [scopeIds])
     const totalUnits = stats?.total_units || 0
-    const occupancyRate = totalUnits > 0 ? Math.round(100 * (stats?.active_units || 0) / totalUnits) : 0
+    const occupancyRate = occupancyRateFrom(
+      stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
     res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead

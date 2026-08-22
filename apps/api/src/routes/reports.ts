@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { occupancyRateFrom } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -150,22 +151,40 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
         `, [landlordId])
     const outstanding = parseFloat(outstandingRow?.amount ?? '0')
 
+    // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
+    // bookings as well" — and excludes service points, which are a neighbour's
+    // building rather than this landlord's inventory. Shares one formula with
+    // the Dashboard's Occupancy card so the two cannot disagree.
     const occRow = isAdmin
       ? await queryOne<any>(`
           SELECT
-            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE status <> 'utility_service')::int AS total,
             COUNT(*) FILTER (WHERE status='active')::int AS active
           FROM units
         `)
       : await queryOne<any>(`
           SELECT
-            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE status <> 'utility_service')::int AS total,
             COUNT(*) FILTER (WHERE status='active')::int AS active
           FROM units WHERE landlord_id = $1
         `, [landlordId])
+    const nightsRow = await queryOne<{ nights: number }>(`
+      SELECT COALESCE(SUM(
+               GREATEST(
+                 LEAST(b.check_out, date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date
+                   - GREATEST(b.check_in, date_trunc('month', CURRENT_DATE))::date, 0)), 0)::int AS nights
+        FROM unit_bookings b
+        JOIN units u ON u.id = b.unit_id
+       WHERE ($1::uuid IS NULL OR u.landlord_id = $1::uuid)
+         AND u.status <> 'utility_service'
+         AND b.lease_type IN ('nightly','weekly')
+         AND b.status NOT IN ('cancelled','no_show')
+         AND b.check_in  < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+         AND b.check_out > date_trunc('month', CURRENT_DATE)`,
+      [isAdmin ? null : landlordId])
     const total = parseInt(occRow?.total ?? '0', 10)
     const active = parseInt(occRow?.active ?? '0', 10)
-    const occupancyRate = total > 0 ? Math.round(100 * active / total) : 0
+    const occupancyRate = occupancyRateFrom(active, nightsRow?.nights || 0, total)
 
     // 16a owner-vs-manager split for the calling user, this calendar month.
     // Both columns sum to "what hit my ledger this month".

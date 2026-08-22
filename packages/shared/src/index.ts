@@ -6001,3 +6001,40 @@ export const LISTING_MIN_PHOTOS_BY_UNIT_TYPE: Partial<Record<UnitType, number>> 
 }
 export const listingMinPhotos = (unitType: string): number =>
   LISTING_MIN_PHOTOS_BY_UNIT_TYPE[unitType as UnitType] ?? LISTING_MIN_PHOTOS_DEFAULT
+
+/**
+ * S616 (Nic) — occupancy has to see short stays.
+ *
+ *   "Occupancy also needs to track not just active leases, but it needs to
+ *    track on short term stays, aggregate thirty nights of bookings as well."
+ *
+ * Occupancy was active LEASES over total units, so a park running on nightly
+ * bookings read as almost entirely empty while it was full. Sunset Palms has
+ * five live nightly bookings and every one of those spots carries status
+ * 'vacant', because a booking is not a lease — so the landlord's occupancy card
+ * said close to zero on a property that was busy.
+ *
+ * Thirty booked nights is one occupied unit-month, the same arithmetic the
+ * platform fee already uses (CEIL(nights / 30) in platformFeeAccrual), so the
+ * number a landlord SEES and the number GAM BILLS on cannot drift apart.
+ *
+ * Deliberately NOT reusing the fee model's unit-type split. That split exists
+ * because some types bill per night and others bill a percentage of revenue —
+ * a question about money, not about whether somebody is staying there. For
+ * occupancy a booked spot is occupied whatever type it is.
+ *
+ * Service points are excluded, as everywhere else: a neighbour's building is
+ * not this landlord's occupancy either way.
+ */
+export const SHORT_STAY_NIGHTS_PER_UNIT_MONTH = 30
+
+export function occupancyRateFrom(
+  activeUnits: number, shortStayNights: number, totalUnits: number,
+): number {
+  if (totalUnits <= 0) return 0
+  const shortStayEquivalent = Math.ceil(shortStayNights / SHORT_STAY_NIGHTS_PER_UNIT_MONTH)
+  // A property cannot be more than full: a spot turned over many times in one
+  // month is still one spot, and an unbounded ratio would read as 140% occupied.
+  const occupied = Math.min(totalUnits, activeUnits + shortStayEquivalent)
+  return Math.round((100 * occupied) / totalUnits)
+}
