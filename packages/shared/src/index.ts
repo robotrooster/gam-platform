@@ -2192,6 +2192,59 @@ export const NIGHTS_AGGREGATION_UNIT_TYPES = ['rv_spot', 'campsite', 'boat_slip'
 // manual reservation create, and the public bookStay flow. (S577: parking is
 // NOT locked — it's bookable by the day at 5%, or rented monthly at $2/unit.)
 export const SHORT_STAY_LOCKED_UNIT_TYPES = ['storage'] as const
+
+/**
+ * S616 (Nic) — which stay lengths each unit type may be rented for.
+ *
+ * "I don't know where you're getting the twenty nine out of thirty... that's
+ *  completely false. The apartment doesn't allow that, and all eight mobile home
+ *  spaces do not allow that. So we need to check something. If you're thinking
+ *  that it's set up that way, then we need to adjust the onboarding flow."
+ *
+ * He was right and the data proved it: all eight of Oak Park's mobile home
+ * spaces were configured for nightly and weekly stays, which nobody asked for.
+ *
+ * THE CAUSE was two different rules for one question, in one file. Creating a
+ * unit said "nightly/weekly unless the type is short-stay-locked", and only
+ * STORAGE is locked — so a mobile home, an apartment, a single-family house and
+ * a commercial space all came out bookable by the night. Editing a unit's type
+ * said the opposite: consult a matrix, and anything not listed falls back to
+ * long-term only. The two disagreed for every type in neither list, and which
+ * value a unit ended up with depended on which screen last touched it.
+ *
+ * This is the single answer both paths now use. Types are the real UnitType
+ * values — the old matrix was keyed on 'residential' and 'short_term_cabin',
+ * neither of which is a unit type the database accepts, so those keys could
+ * only ever be reached as a fallback.
+ */
+export const LEASE_TYPES_BY_UNIT_TYPE: Record<UnitType, string[]> = {
+  // A home is a home. You do not rent a mobile home space or an apartment by
+  // the night, and the eight spaces that said otherwise were an accident.
+  apartment:     ['month_to_month', 'long_term'],
+  single_family: ['month_to_month', 'long_term'],
+  mobile_home:   ['month_to_month', 'long_term'],
+  commercial:    ['month_to_month', 'long_term'],
+  // Storage is short-stay LOCKED (S538) — its allow-list never carries nightly.
+  storage:       ['month_to_month', 'long_term'],
+  // Sites and spots: rented by the night, the week, or the month.
+  rv_spot:       ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  campsite:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  // S538: weekly-rate motels and long-term room tenants are both real —
+  // Oak Park has the second kind.
+  hotel_room:    ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  // S577: daily bookings bill 5%, a monthly rental bills $2/unit.
+  parking:       ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  boat_slip:     ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  // S577: land short-term = event/vendor space.
+  land_lot:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
+}
+
+/** The allowed stay lengths for a unit type. Unknown types get the
+ *  conservative answer — long-term only — rather than the permissive one. */
+export function leaseTypesForUnitType(unitType: string): string[] {
+  return LEASE_TYPES_BY_UNIT_TYPE[unitType as UnitType]
+    ?? ['month_to_month', 'long_term']
+}
 // Whether this unit type conceptually has bedrooms (affects UI rendering).
 export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   apartment:     true,

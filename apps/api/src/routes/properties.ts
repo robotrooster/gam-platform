@@ -998,8 +998,9 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // S537 (Nic): partial payments reset the eviction clock — a landlord
     // preparing to act can refuse anything under the full outstanding
     // balance. Tenant portal's Pay Now enforces it server-side.
-    const acceptPartialPayments =
-      typeof raw.acceptPartialPayments === 'boolean' ? raw.acceptPartialPayments : undefined
+    // S616 (Nic): partial payments are not a setting — see the migration.
+    // A converged invoice carries two landlords' charges due the same day, and
+    // a partial against it has no defensible allocation.
     // S558: property DEFAULT occupancy mode — seeds new units only (each unit's
     // own occupancy_mode is authoritative). Not a governing property setting.
     const defaultOccupancyMode =
@@ -1022,9 +1023,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         subleasing_allowed      = COALESCE($13, subleasing_allowed),
         flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
         weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
-        accept_partial_payments = COALESCE($17, accept_partial_payments),
-        default_occupancy_mode  = COALESCE($18, default_occupancy_mode),
-        operator_owns_land      = COALESCE($19, operator_owns_land),
+        default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
+        operator_owns_land      = COALESCE($18, operator_owns_land),
         updated_at  = NOW()
       WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
@@ -1038,7 +1038,6 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        flexchargeEnabled === undefined ? null : flexchargeEnabled,
        weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
        req.params.id,
-       acceptPartialPayments === undefined ? null : acceptPartialPayments,
        defaultOccupancyMode ?? null,
        typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null]
     )

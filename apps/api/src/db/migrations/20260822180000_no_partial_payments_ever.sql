@@ -1,0 +1,23 @@
+-- S616 (Nic) — partial payments are not a setting.
+--
+--   "We need to not allow partial payments at all. I know we talked about it
+--    being off by default, but it needs to be off in the system permanently...
+--    a partial payment creates a problem because usually it all goes to one
+--    person, but in the case of it going to two different operators, how would
+--    you allocate that? Like, the charges happened at the exact same time. So
+--    how do you do that split? We just need to avoid that altogether. Property
+--    wise, partial payments, not an option."
+--
+-- The split-utility case is what makes this structural rather than a
+-- preference. A converged invoice carries rent owed to one landlord and
+-- utilities owed to another, both due the same day. A partial payment against
+-- it has no defensible allocation — any rule for who gets paid first is GAM
+-- picking a winner between two landlords, and picking wrong is taking one
+-- landlord's money and handing it to the other.
+--
+-- THE COLUMN WAS ALREADY DEAD. Enforcement lives in chargeLeaseBalance and is
+-- unconditional — under-payment throws 422 regardless of this flag, and nothing
+-- has read it since. It survived as a settable property setting defaulting to
+-- TRUE, which is worse than useless: a landlord could turn it on, nothing would
+-- happen, and the next reader would assume it governed something.
+ALTER TABLE properties DROP COLUMN IF EXISTS accept_partial_payments;

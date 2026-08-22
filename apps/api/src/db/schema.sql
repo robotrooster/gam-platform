@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict w7bl8dqecGqYv69Z3dUZsr7GAEsEvBlCWjqTZVSvhfS2HS0eM1u6qXFZIjlO8DZ
+\restrict AC6P6VuJCbJO2o8ttI5HkhTwooALngoWQBSGJyQncLsARyiSvJlgSHe3QaizabP
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5192,6 +5192,35 @@ COMMENT ON COLUMN public.payments.revenue_owner IS 'S609: whose money this charg
 
 
 --
+-- Name: payout_triggers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payout_triggers (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    entity_kind text NOT NULL,
+    entity_id uuid NOT NULL,
+    cycle_month date NOT NULL,
+    trigger_kind text NOT NULL,
+    units_total integer,
+    units_paid integer,
+    scheduled_for date NOT NULL,
+    fired_at timestamp with time zone,
+    skipped_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT payout_triggers_entity_kind_check CHECK ((entity_kind = ANY (ARRAY['user'::text, 'pm_company'::text, 'business'::text]))),
+    CONSTRAINT payout_triggers_trigger_kind_check CHECK ((trigger_kind = ANY (ARRAY['threshold_50'::text, 'threshold_90'::text, 'monthly_sweep'::text])))
+);
+
+
+--
+-- Name: TABLE payout_triggers; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.payout_triggers IS 'S616: what earned a landlord payout and when it is scheduled. At most three rows per Connect account per rent cycle — 50% of units paid, 90%, and a guaranteed late-month sweep — so the per-initiation cost is capped at $0.75 a month and known in advance.';
+
+
+--
 -- Name: payroll_run_lines; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6338,7 +6367,6 @@ CREATE TABLE public.properties (
     propane_allow_installments boolean DEFAULT false NOT NULL,
     propane_split_min_gallons integer DEFAULT 40 NOT NULL,
     propane_split_four_min_gallons integer DEFAULT 100 NOT NULL,
-    accept_partial_payments boolean DEFAULT true NOT NULL,
     booking_monthly_deposit numeric(10,2),
     booking_utilities_billed boolean DEFAULT true NOT NULL,
     office_phone text,
@@ -11029,6 +11057,14 @@ ALTER TABLE ONLY public.payments
 
 
 --
+-- Name: payout_triggers payout_triggers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payout_triggers
+    ADD CONSTRAINT payout_triggers_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: payroll_run_lines payroll_run_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14761,6 +14797,13 @@ CREATE INDEX idx_payments_unit ON public.payments USING btree (unit_id);
 
 
 --
+-- Name: idx_payout_triggers_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payout_triggers_due ON public.payout_triggers USING btree (scheduled_for) WHERE (fired_at IS NULL);
+
+
+--
 -- Name: idx_payroll_runs_business; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16865,6 +16908,13 @@ CREATE UNIQUE INDEX ux_payments_rent_idempotent ON public.payments USING btree (
 --
 
 CREATE UNIQUE INDEX ux_payments_unit_rent_due_date_active ON public.payments USING btree (unit_id, due_date) WHERE ((type = 'rent'::text) AND (status <> ALL (ARRAY['failed'::text, 'returned'::text])) AND (NOT is_remainder));
+
+
+--
+-- Name: ux_payout_triggers_one_per_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payout_triggers_one_per_cycle ON public.payout_triggers USING btree (entity_kind, entity_id, cycle_month, trigger_kind);
 
 
 --
@@ -23874,5 +23924,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict w7bl8dqecGqYv69Z3dUZsr7GAEsEvBlCWjqTZVSvhfS2HS0eM1u6qXFZIjlO8DZ
+\unrestrict AC6P6VuJCbJO2o8ttI5HkhTwooALngoWQBSGJyQncLsARyiSvJlgSHe3QaizabP
 

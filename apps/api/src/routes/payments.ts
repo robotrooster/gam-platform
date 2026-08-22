@@ -569,10 +569,17 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
 
 // ── S537 (Nic): ONE "Pay now" — FIFO oldest-first application ─────────
 // The tenant portal shows a READ-ONLY oldest-first ledger and a single
-// Pay Now. The tenant may pay ANY amount (partial, full, or ahead) —
-// unless the property has accept_partial_payments=FALSE (accepting a
-// partial resets the eviction clock; the landlord may refuse less than
-// the full outstanding balance).
+// Pay Now. The tenant may pay the full balance or MORE (paying ahead) —
+// never less.
+//
+// S616 (Nic): this comment used to describe a per-property
+// accept_partial_payments setting. That column was dead — enforcement in
+// chargeLeaseBalance has always been unconditional — and it has been dropped,
+// because partial payments are not a setting: "in the case of it going to two
+// different operators, how would you allocate that? The charges happened at the
+// exact same time." A converged invoice carries one landlord's rent and
+// another's utilities, both due the same day; any rule for who gets paid first
+// is GAM picking a winner between two landlords.
 //
 // Mechanics: allocateOldestFirst plans the application. Rows covered in
 // FULL get this charge's PI stamped (status 'processing') — the standard

@@ -5,7 +5,7 @@ import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assert
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
-import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -387,13 +387,12 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // W-16: the units_property_unit_number_uniq index rejects duplicate
       // numbers at a property — surface it as a friendly 409, not a 500.
       try {
-      // S538 (Nic): storage units are LOCKED out of short-term rental —
-      // their allow-list never contains nightly/weekly.
-      const leaseTypesAllowed = (SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unitType)
-        ? ['month_to_month', 'long_term']
-        : isRv
-          ? ['nightly', 'weekly', 'month_to_month', 'long_term']
-          : ['nightly', 'weekly', 'month_to_month']
+      // S616 (Nic): ONE source of truth, shared with PATCH /:id/type below.
+      // This used to read "nightly/weekly unless short-stay-locked", and only
+      // STORAGE is locked — so every mobile home, apartment, house and
+      // commercial space was created bookable by the night. All eight of Oak
+      // Park's mobile home spaces came out that way and nobody asked for it.
+      const leaseTypesAllowed = leaseTypesForUnitType(unitType)
       const [unit] = await query<any>(`
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
@@ -853,24 +852,11 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
 
 // ── UNIT TYPE + SHORT-TERM CONFIG ─────────────────────────────
 
-const LEASE_TYPE_MATRIX: Record<string, string[]> = {
-  residential:     ['month_to_month', 'long_term'],
-  rv_spot:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
-  storage:         ['month_to_month', 'long_term'],
-  // S577: parking is bookable at every stay length — daily bookings bill 5%,
-  // a monthly rental bills $2/unit. (Not short-stay-locked; that's storage only.)
-  parking:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
-  short_term_cabin:['nightly', 'weekly', 'month_to_month'],
-  // S538: hotel/motel rooms — every stay length (weekly-rate motels and
-  // long-term room tenants like Oak Park's are both real).
-  hotel_room:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
-  // S577: boat slip + land/lot bookable at every stay length. Short-term = 5%;
-  // monthly = $2/unit. (Land short-term = event/vendor space.)
-  boat_slip:       ['nightly', 'weekly', 'month_to_month', 'long_term'],
-  land_lot:        ['nightly', 'weekly', 'month_to_month', 'long_term'],
-  // S577: campsite = tent/primitive site, bookable like an RV spot.
-  campsite:        ['nightly', 'weekly', 'month_to_month', 'long_term'],
-}
+// S616: LEASE_TYPE_MATRIX lived here and disagreed with the create path above.
+// Both now call leaseTypesForUnitType from @gam/shared. The old matrix was also
+// keyed on 'residential' and 'short_term_cabin' — neither of which is a
+// unit_type the database accepts, so those entries were only ever reachable as
+// a fallback.
 
 // PATCH /api/units/:id/type — set unit type and rates
 unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (req, res, next) => {
@@ -905,7 +891,7 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       throw new AppError(400, 'Storage units cannot be made bookable for short-term stays')
     }
 
-    const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
+    const leaseTypesAllowed = leaseTypesForUnitType(unitType)
 
     const updated = await queryOne<any>(`UPDATE units SET
       unit_type=$1, lease_types_allowed=$2, nightly_rate=$3, weekly_rate=$4, monthly_rate=$5,
@@ -1083,7 +1069,7 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
     const floorLevel = FLOOR_LEVEL_TYPES.includes(unitType)
       ? (body.floorLevel === undefined ? unit.floor_level : body.floorLevel)
       : null
-    const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
+    const leaseTypesAllowed = leaseTypesForUnitType(unitType)
 
     const bedrooms   = body.bedrooms ?? unit.bedrooms
     const bathrooms  = body.bathrooms ?? unit.bathrooms

@@ -46,6 +46,10 @@ import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services
 import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
 import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
+import {
+  rollProgressForLandlordUser, claimThresholdIfReached, claimMonthlySweep,
+  dueTriggers, markTriggerFired, hasShortTermActivity,
+} from '../services/payoutTriggers'
 import { logger } from '../lib/logger'
 
 // US federal holidays 2026-2027. Refresh annually before each calendar year.
@@ -141,6 +145,19 @@ function thisWeeksAutoPayoutDate(now: Date, tz: string): Date {
   return d
 }
 
+/**
+ * S616: the ONE guaranteed sweep a month. Reuses the Tuesday machinery — and
+ * its holiday and business-day handling — rather than inventing a second
+ * calendar, but fires only on the late-month occurrence (day 20-26). That is
+ * far enough past the rent surge to collect stragglers who paid after the 90%
+ * firing, and it is the backstop for a month where neither threshold tripped.
+ */
+export function isMonthlySweepDay(now: Date = new Date(), tz: string = TZ): boolean {
+  if (!shouldRunToday(now, tz)) return false
+  const dom = Number(localDateString(now, tz).slice(8, 10))
+  return dom >= 20 && dom <= 26
+}
+
 export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean {
   const dow = localDayOfWeek(now, tz)
   if (dow < 1 || dow > 5) return false
@@ -188,11 +205,20 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     errors: [],
   }
 
-  if (!shouldRunToday(now, TZ)) {
-    return result
-  }
-
   const today = localDateString(now, TZ)
+  const cycleMonth = `${today.slice(0, 7)}-01`
+
+  // S616 (Nic): landlords no longer wait on a weekly calendar. Their payout is
+  // earned by how much of the rent roll has actually come in — 50% of occupied
+  // units paid, then 90%, then one guaranteed late-month sweep. Three firings
+  // per Connect account per cycle, capped by a unique index rather than by this
+  // code, so the per-initiation cost is $0.75 a month and cannot run away.
+  //
+  // This part runs EVERY weekday, because a threshold can be crossed on any of
+  // them. It only ever CLAIMS a trigger and schedules it four days out; the
+  // firing loop below is what moves money.
+  const sweepDay = isMonthlySweepDay(now, TZ)
+  const weeklyDay = shouldRunToday(now, TZ)
 
   // S580: retry any platform→Connect passthrough intent stuck in `pending` (its
   // RESERVE committed but the Transfer never confirmed — e.g. Stripe was down).
@@ -260,10 +286,77 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
         AND connect_details_submitted  = TRUE
         AND status = 'active'`
   )
+  // ── S616: decide who is actually due today ───────────────────────────────
+  //
+  // Landlords earn a payout by how much of their rent roll has come in, so
+  // every weekday each one is measured and may CLAIM a trigger — scheduled four
+  // days out, because Stripe holds an ACH that long and scheduling ahead
+  // front-runs the wait rather than discovering it. The claim is capped at
+  // three per cycle by a unique index, not by this loop.
+  //
+  // PM companies and businesses have no rent roll to measure, so they keep the
+  // weekly Tuesday batch exactly as it was.
+  //
+  // A user with NO RENT ROLL this cycle stays on the weekly batch. There is no
+  // roll to measure, so the thresholds can never trip, and putting them through
+  // this path would strand deposits, fees and POS money on a Connect balance
+  // until the late-month sweep. The percentage rule replaces the calendar only
+  // where there is something to take a percentage OF.
+  //
+  // S616 (Nic): "leases follow 3 batch plan we made. short term stays follow
+  // weekly plan." A landlord can be both — Oak Park is, with 29 of its 30 units
+  // allowing nightly stays alongside long-term leases — so the two run
+  // independently and coalesce on the shared balance.
+  const rollDrivenUserIds = new Set<string>()
+  const weeklyUserIds = new Set<string>()
+  for (const r of userRows) {
+    try {
+      const progress = await rollProgressForLandlordUser(r.entity_id, cycleMonth)
+
+      // Nightly and weekly stays have no denominator to take a percentage of —
+      // money arrives whenever someone books, all month — so that stream keeps
+      // the weekly Tuesday. A landlord with NO rent roll at all also stays
+      // weekly: there is nothing to measure, and putting them on thresholds
+      // would strand deposits and fees until the late-month sweep.
+      if (progress.unitsTotal === 0 || await hasShortTermActivity(r.entity_id, cycleMonth)) {
+        weeklyUserIds.add(r.entity_id)
+      }
+      if (progress.unitsTotal === 0) continue
+      rollDrivenUserIds.add(r.entity_id)
+
+      const claimed = await claimThresholdIfReached(
+        'user', r.entity_id, cycleMonth, today, progress)
+      if (claimed.claimed) {
+        logger.info({
+          user_id: r.entity_id, trigger: claimed.triggerKind,
+          units_paid: progress.unitsPaid, units_total: progress.unitsTotal,
+          scheduled_for: claimed.scheduledFor,
+        }, '[auto_payouts] rent-roll threshold reached — payout scheduled')
+      }
+      if (sweepDay) await claimMonthlySweep('user', r.entity_id, cycleMonth, today)
+    } catch (e) {
+      logger.error({ err: e, user_id: r.entity_id },
+        '[auto_payouts] trigger evaluation failed — landlord skipped this pass')
+    }
+  }
+
+  // Everything with a trigger due on or before today. A landlord appears here
+  // once per due trigger; the same-day idempotency key at Stripe means two due
+  // on one day still move the balance once.
+  const due = await dueTriggers(today)
+  const dueUserIds = new Set(due.filter(t => t.entity_kind === 'user').map(t => t.entity_id))
+
   const candidates: Candidate[] = [
-    ...userRows.map((r): UserCandidate => ({ kind: 'user', ...r })),
-    ...pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })),
-    ...bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })),
+    // A landlord is included if EITHER stream says so: a rent threshold is due
+    // today, or it is the weekly Tuesday and they have short-term stays (or no
+    // rent roll at all). Both streams sweep the same balance, so an overlap
+    // costs nothing — the second finds it empty and skips.
+    ...userRows.filter(r =>
+        (dueUserIds.has(r.entity_id))
+        || (weeklyDay && weeklyUserIds.has(r.entity_id)))
+               .map((r): UserCandidate => ({ kind: 'user', ...r })),
+    ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
+    ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
   result.candidatesScanned = candidates.length
 
@@ -274,6 +367,17 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
       else if (fired === 'already_paid_this_week')result.skippedAlreadyPaidThisWeek++
       else if (fired === 'failed')                result.payoutsFailed++
+
+      // S616: retire this candidate's due triggers whatever the outcome. A
+      // firing that found nothing is NOT a failure — the tenants paid but
+      // Stripe has not released it yet — and it must still be marked, or it
+      // would re-fire every day and spend the cycle's whole budget on empty
+      // payouts. The money it was waiting for rides the next trigger.
+      if (cand.kind === 'user') {
+        for (const t of due.filter(x => x.entity_kind === 'user' && x.entity_id === cand.entity_id)) {
+          await markTriggerFired(t.id, fired === 'fired' ? undefined : fired)
+        }
+      }
     } catch (e: any) {
       result.payoutsFailed++
       result.errors.push({
@@ -291,20 +395,24 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 type OneCandidateOutcome = 'fired' | 'zero_balance' | 'already_paid_this_week' | 'failed'
 
 async function processOneCandidate(cand: Candidate, today: string): Promise<OneCandidateOutcome> {
-  // 1. Pre-skip: did this candidate already get an auto_friday payout
-  //    inside the last 6 days? Stripe's idempotency_key is the authoritative
-  //    guard, but pre-skipping avoids a wasted balance.retrieve round-trip.
-  //    We only audit user-side payouts in `disbursements`, so the pre-skip
-  //    only applies there. PM payouts skip this check and always rely on
-  //    Stripe-side idempotency_key.
+  // 1. Pre-skip: already paid TODAY? Stripe's idempotency_key is the
+  //    authoritative guard; this avoids a wasted balance.retrieve round-trip.
+  //
+  //    S616: this was a SIX-DAY window, which is correct for a weekly batch and
+  //    wrong for this one. The 50% and 90% firings are days apart by design —
+  //    that is the entire point of measuring the rent roll instead of the
+  //    calendar — and a six-day pre-skip would have silently swallowed the
+  //    second one, leaving the landlord waiting on the very money the change
+  //    exists to release. Narrowed to the same day, which is what the Stripe
+  //    idempotency key already dedupes on.
   if (cand.kind === 'user') {
     const recent = await query(
       `SELECT 1 FROM disbursements
         WHERE user_id = $1
           AND trigger_type = 'auto_friday'
-          AND created_at > NOW() - INTERVAL '6 days'
+          AND created_at >= $2::date
         LIMIT 1`,
-      [cand.entity_id]
+      [cand.entity_id, today]
     )
     if (recent.length > 0) return 'already_paid_this_week'
   }

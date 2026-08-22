@@ -173,6 +173,10 @@ export async function cleanupAllSchema(): Promise<void> {
   // S616: a one-off charge FKs a payments row, plus the lease, unit and tenant
   // — all NO ACTION, so it clears before the earliest of them.
   await db.query(`DELETE FROM tenant_one_off_charges`)
+  // S616: payout triggers carry no FKs (entity_id is polymorphic), so nothing
+  // forces an order — but they MUST be cleared, or one test file's triggers
+  // are still due in the next one's and every dueTriggers() assertion drifts.
+  await db.query(`DELETE FROM payout_triggers`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —
   // clear it too or gam_test grows without bound across runs.

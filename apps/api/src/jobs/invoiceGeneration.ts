@@ -808,10 +808,25 @@ async function runGeneration(
           // owns the bricks. The payout sweep scopes by payments.landlord_id and
           // not by invoice, so no other code has to know this happened.
           //
-          // unit_id and lease_id likewise stay with the SERVICED SPACE rather
-          // than being rewritten to the leased unit: the charge is a fact about
-          // that meter at that space, and re-pointing it would make the utility
-          // landlord's own records show a bill against a unit he does not own.
+          // unit_id stays the SERVICED SPACE — the charge is a fact about that
+          // meter at that space, and re-pointing it would show the utility
+          // landlord a bill against a unit he does not own.
+          //
+          // lease_id, however, is the LEASE THIS INVOICE BELONGS TO, and S616
+          // originally set it NULL for the same instinct. That was wrong and it
+          // broke the money. fetchOutstandingRows scopes a tenant's balance by
+          // `p.lease_id = $2`, so a NULL-lease row is invisible to it: the
+          // pay-in-full guard would not cover it, FIFO would never allocate to
+          // it, and the tenant would pay their rent in full while the
+          // neighbouring landlord's utilities stayed unpaid.
+          //
+          // That is a partial payment across two landlords, which Nic ruled out
+          // precisely because it cannot be allocated: "usually it all goes to
+          // one person, but in the case of it going to two different operators,
+          // how would you allocate that? The charges happened at the exact same
+          // time." Carrying the lease id is also simply TRUE — this charge was
+          // billed on that lease's invoice — and landlord_id still names the
+          // landlord the money belongs to, which is what routes it.
           const isCrossPropertyRow = (ub as any).service_agreement_id != null
           const rowLandlordId = (ub as any).bill_landlord_id ?? lease.landlord_id
           const utilityPayment = await client.query<{ id: string }>(
@@ -825,7 +840,7 @@ async function runGeneration(
             [
               invoiceId,
               isCrossPropertyRow ? crossLink!.service_unit_id : lease.unit_id,
-              isCrossPropertyRow ? null : lease.id,
+              lease.id,
               effectiveTenantId,
               rowLandlordId,
               net.toFixed(2), dueDate, rowStatus(net), combinedNote,

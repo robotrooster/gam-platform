@@ -164,10 +164,56 @@ describe('cross-property convergence (S616)', () => {
     expect(Number(util.amt)).toBe(25)
     // The diversion: this row's money is the UTILITY landlord's.
     expect(util.landlord_id).toBe(f.A.landlordId)
-    // And it stays a fact about HIS space, not a bill against a unit he
-    // does not own.
+    // It stays a fact about HIS space, not a bill against a unit he owns...
     expect(util.unit_id).toBe(f.servicedUnitId)
-    expect(util.lease_id).toBeNull()
+    // ...but it carries THIS lease, because that is the balance it belongs to.
+    // With a NULL lease it would be invisible to fetchOutstandingRows, which
+    // scopes by p.lease_id — the tenant would pay rent in full and the
+    // neighbouring landlord's utilities not at all. Nic ruled that out: a
+    // partial split across two operators cannot be allocated.
+    expect(util.lease_id).toBe(f.leaseId)
+  })
+
+  // The pay-in-full rule has to cover BOTH landlords' rows or it is not a
+  // pay-in-full rule — it is a rule about one landlord that silently shorts
+  // the other.
+  it('the tenant balance is rent AND the neighbour utilities, together', async () => {
+    const f = await twoLandlordsOnePlace()
+    await linkAndActivate(f)
+    await generateInvoices(new Date('2026-03-05T14:00:00Z'))
+
+    const { fetchOutstandingRows } = await import('../services/rentCharge')
+    const rows = await fetchOutstandingRows(f.tenantId, f.leaseId)
+    const total = rows.reduce((s: number, r: any) => s + Number(r.amount), 0)
+
+    expect(rows).toHaveLength(2)
+    expect(total).toBe(975)            // $950 rent + $25 trash — one balance
+    // Two landlords on one balance; paying it settles both.
+    const landlords = new Set(rows.map((r: any) => r.landlord_id))
+    expect(landlords.size).toBe(2)
+    expect(landlords.has(f.A.landlordId)).toBe(true)
+    expect(landlords.has(f.B.landlordId)).toBe(true)
+  })
+
+  // Nic: "we need to not allow partial payments at all... in the case of it
+  // going to two different operators, how would you allocate that?" There is no
+  // defensible answer, so the guard has to cover the WHOLE converged balance.
+  it('a partial payment against a two-landlord balance is refused', async () => {
+    const f = await twoLandlordsOnePlace()
+    await linkAndActivate(f)
+    await generateInvoices(new Date('2026-03-05T14:00:00Z'))
+
+    // chargeLeaseBalance checks for a Stripe customer before it checks the
+    // amount, so the fixture needs one to reach the pay-in-full guard.
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_test' WHERE id = $1`,
+      [f.tenantId])
+
+    const { chargeLeaseBalance } = await import('../services/rentCharge')
+    await expect(chargeLeaseBalance({
+      tenantId: f.tenantId, leaseId: f.leaseId,
+      amount: 950,                       // the rent, but not the neighbour's $25
+      paymentMethodId: 'pm_test', paymentMethodType: 'ach', source: 'portal',
+    })).rejects.toThrow(/paid in full/i)
   })
 
   it('the serviced space stops cutting its own invoice once linked', async () => {
