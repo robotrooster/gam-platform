@@ -616,3 +616,153 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
     expect(rows[0].utility_service_unit_count).toBe(0)
   })
 })
+
+// S616 (Nic): "any portion of thirty — like thirty two nights booked on a
+// property is gonna be thirty nights as two dollars, and the other two nights
+// are gonna be booked as two dollars. There's no proration. Any rollover past
+// thirty nights is another two dollar charge."
+describe('short-stay nights bill in whole $2 blocks (S616)', () => {
+  /**
+   * A park whose bookings total `nights` WITHIN the accrual month.
+   *
+   * Spread across separate spots on purpose: the accrual clamps each stay to
+   * the month, so a single 32-night booking from May 1st only contributes 31
+   * nights — May has 31 days. It is also closer to what Nic described, "thirty
+   * nights as two dollars and the other two nights as two dollars", which is
+   * two stays rather than one long one.
+   */
+  async function parkWithNights(nights: number) {
+    const stack = await buildPlatformStack({ unitCount: 1 })
+    const client = await getClient()
+    try {
+      let remaining = nights
+      while (remaining > 0) {
+        const stay = Math.min(remaining, 28)     // comfortably inside any month
+        const unitId = await seedUnit(client, {
+          propertyId: stack.propertyId, landlordId: stack.landlordId, unitType: 'rv_spot',
+        })
+        await client.query(`UPDATE units SET status='vacant' WHERE id=$1`, [unitId])
+        await client.query(
+          `INSERT INTO unit_bookings (landlord_id, unit_id, lease_type, status,
+                                      check_in, check_out, total_amount, guest_name, guest_email)
+           VALUES ($1,$2,'nightly','confirmed', DATE '2026-05-02',
+                   DATE '2026-05-02' + ($3::int || ' days')::interval, 100, 'G', 'g@t.dev')`,
+          [stack.landlordId, unitId, stay])
+        remaining -= stay
+      }
+    } finally { client.release() }
+    return stack
+  }
+
+  it('30 nights is one $2 block', async () => {
+    const stack = await parkWithNights(30)
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT short_stay_nights, short_stay_equivalent FROM platform_fee_accruals
+        WHERE property_id = $1`, [stack.propertyId])
+    expect(rows[0].short_stay_nights).toBe(30)
+    expect(rows[0].short_stay_equivalent).toBe(1)
+  })
+
+  // THE RULE. Not 32/30 of a block — two blocks.
+  it('32 nights is TWO $2 blocks, not one and a fraction', async () => {
+    const stack = await parkWithNights(32)
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT short_stay_nights, short_stay_equivalent FROM platform_fee_accruals
+        WHERE property_id = $1`, [stack.propertyId])
+    expect(rows[0].short_stay_nights).toBe(32)
+    expect(rows[0].short_stay_equivalent).toBe(2)
+  })
+
+  it('a single night is a whole block — there is no proration downward either', async () => {
+    const stack = await parkWithNights(1)
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT short_stay_equivalent FROM platform_fee_accruals WHERE property_id = $1`,
+      [stack.propertyId])
+    expect(rows[0].short_stay_equivalent).toBe(1)
+  })
+
+  it('61 nights is three blocks', async () => {
+    const stack = await parkWithNights(61)
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows } = await db.query<any>(
+      `SELECT short_stay_equivalent FROM platform_fee_accruals WHERE property_id = $1`,
+      [stack.propertyId])
+    expect(rows[0].short_stay_equivalent).toBe(3)
+  })
+})
+
+// S616 (Nic): "we just need a solution where the utilities only option gets
+// billed to that landlord, and then as soon as the actual unit is physically
+// onboarded to the other property, then the two dollars swaps and gets billed
+// to the new landlord. The platform has to get its two dollar revenue either
+// way."
+describe('the $2 swaps between landlords and is never lost (S616)', () => {
+  it('billed to the utility landlord first, the unit landlord after', async () => {
+    // A supplies utilities to a space; nobody has onboarded the real unit yet.
+    const A = await buildPlatformStack({ unitCount: 0 })
+    const client = await getClient()
+    let servicedUnitId = '', payerId = '', agreementId = ''
+    try {
+      servicedUnitId = await seedUnit(client, {
+        propertyId: A.propertyId, landlordId: A.landlordId,
+      })
+      await client.query(
+        `UPDATE units SET status='utility_service' WHERE id=$1`, [servicedUnitId])
+      payerId = await seedTenant(client)
+      const { rows: [sa] } = await client.query(
+        `INSERT INTO utility_service_agreements
+           (landlord_id, unit_id, tenant_id, start_date, payer_attested_at)
+         VALUES ($1,$2,$3,'2026-01-01',NOW()) RETURNING id`,
+        [A.landlordId, servicedUnitId, payerId])
+      agreementId = sa.id
+    } finally { client.release() }
+
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const { rows: before } = await db.query<any>(
+      `SELECT utility_service_unit_count, total_billable
+         FROM platform_fee_accruals WHERE property_id = $1`, [A.propertyId])
+    expect(before[0].utility_service_unit_count).toBe(1)
+    expect(before[0].total_billable).toBe(1)          // A pays the $2
+
+    // B onboards the real unit and leases it. The link stamps supersedence.
+    const B = await buildPlatformStack({ unitCount: 0 })
+    const c2 = await getClient()
+    let bLeaseId = ''
+    try {
+      const bUnitId = await seedUnit(c2, {
+        propertyId: B.propertyId, landlordId: B.landlordId, rentAmount: 900,
+      })
+      await c2.query(`UPDATE units SET status='active' WHERE id=$1`, [bUnitId])
+      bLeaseId = await seedLease(c2, {
+        unitId: bUnitId, landlordId: B.landlordId, status: 'active',
+        rentAmount: 900, startDate: '2026-01-01',
+      })
+      await seedLeaseTenant(c2, { leaseId: bLeaseId, tenantId: payerId, role: 'primary' })
+      await c2.query(
+        `UPDATE utility_service_agreements SET superseded_by_lease_id = $2 WHERE id = $1`,
+        [agreementId, bLeaseId])
+    } finally { c2.release() }
+
+    // A fresh cycle, so both properties accrue again.
+    await processPlatformFeeAccrual(new Date('2026-06-01T08:00:00Z'))
+
+    const { rows: aAfter } = await db.query<any>(
+      `SELECT utility_service_unit_count, total_billable
+         FROM platform_fee_accruals
+        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [A.propertyId])
+    const { rows: bAfter } = await db.query<any>(
+      `SELECT long_term_unit_count, total_billable
+         FROM platform_fee_accruals
+        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [B.propertyId])
+
+    // It left A…
+    if (aAfter.length > 0) expect(aAfter[0].utility_service_unit_count).toBe(0)
+    // …and landed on B. The platform gets its $2 either way, which is the
+    // whole point — it moves, it never evaporates.
+    expect(bAfter[0].long_term_unit_count).toBe(1)
+    expect(bAfter[0].total_billable).toBe(1)
+  })
+})
