@@ -130,7 +130,7 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
     const months = Math.min(36, Math.max(1, Number(req.query.months) || 6))
     const rows = await query<{
       month_start: string; label: string; revenue: string
-      gross: string; fees: string
+      gross: string; fees: string; in_flight: string
     }>(
       `WITH span AS (
          SELECT generate_series(
@@ -156,11 +156,29 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
               COALESCE((
                 SELECT SUM(r.processing_fee_amount) FROM tenant_remittances r
                  WHERE date_trunc('month', COALESCE(r.settled_at, r.created_at)) = span.month_start
-                   AND r.status IN ('settled','processing')), 0)::text AS fees
+                   AND r.status IN ('settled','processing')), 0)::text AS fees,
+              -- S616: of the total above, how much has not cleared yet. Named
+              -- rather than netted — a landlord waiting on money is a different
+              -- fact from money that has arrived, and both belong on the page.
+              COALESCE(SUM(p.amount) FILTER (WHERE p.status = 'processing'), 0)::text AS in_flight
          FROM span
          LEFT JOIN payments p
            ON date_trunc('month', COALESCE(p.settled_at, p.created_at)) = span.month_start
-          AND p.status IN ('settled', 'paid_via_deposit')
+          -- S616 (Nic): "August revenue should be four dollars. I made two
+          -- different two dollar payments." He is right and excluding
+          -- 'processing' was wrong.
+          --
+          -- ACH is the primary rail for rent, and Stripe holds an ACH debit
+          -- in 'processing' for about four business days AFTER the tenant's bank
+          -- has already been debited — his own money left his account the day
+          -- after he paid. Counting only settled money means that during the
+          -- first week of every month, which is precisely when rent arrives,
+          -- this chart reads near zero. A health monitor that flatlines every
+          -- time the platform is busiest is not measuring health.
+          --
+          -- So it counts money the TENANT HAS SENT. What is still in flight is
+          -- reported separately below rather than hidden inside the total.
+          AND p.status IN ('settled', 'paid_via_deposit', 'processing')
           AND p.type IN ('rent', 'utility', 'late_fee', 'fee')
           -- S616: DEMO LANDLORDS STAY IN, deliberately. I excluded them when
           -- tracing a $2 figure Nic could not place — it was his own live
@@ -188,6 +206,7 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
       // rather than netted so a discrepancy is visible instead of absorbed.
       gross: Number(r.gross),
       fees: Number(r.fees),
+      inFlight: Number(r.in_flight),
     })) })
   } catch (e) { next(e) }
 })

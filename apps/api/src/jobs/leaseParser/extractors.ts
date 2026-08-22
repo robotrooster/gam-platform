@@ -396,13 +396,112 @@ export function detectLateFees(pages: Page[]): {
   //   "5th"      -> "5 th"
   // Anchor on the ordinal-day pattern instead of "remitted by", which is
   // robust to upstream word splits. Form: <digit><opt-ws><ordinal><ws>day.
-  let lateFeeGraceDays: ParserExtractedField<number> | null = null
-  const graceMatch = text.match(/by\s+the\s+(\d{1,2})\s*(?:st|nd|rd|th)\s+day/i)
-  if (graceMatch) {
-    const n = parseInt(graceMatch[1], 10)
-    if (n >= 0 && n <= 31) lateFeeGraceDays = { value: n, confidence: 0.80, rawText: graceMatch[0] }
-  }
+  const lateFeeGraceDays = extractGraceDays(text)
   return { lateFeeAmount, lateFeeGraceDays }
+}
+
+
+/**
+ * S616 (Nic) — find the grace period however the lease phrases it.
+ *
+ *   "We need to add a thing that searches for the word grace in all of those
+ *    phrases, for any lease formats. It should only ignore the word grace when
+ *    it's the name of a person on the lease, which should be rare, but not
+ *    never."
+ *
+ * The old extractor matched exactly one phrasing — "by the 5th day" — and every
+ * other way a lease says this fell through to a silent default of 5. That
+ * default then drove what the tenant was told about their autopay date, so a
+ * lease with a ten-day grace could have had someone warned off a day that was
+ * actually free, or worse, reassured about one that was not.
+ *
+ * WHY "GRACE" IS THE ANCHOR: it is the word that survives reformatting. Leases
+ * are written by a thousand different offices and no two agree on sentence
+ * shape, but the ones that grant a grace period almost always name it.
+ *
+ * THE PERSON PROBLEM. Grace is also a name, and a lease is full of names. A
+ * tenant called Grace Whitfield must not donate her name to the billing engine.
+ * Two guards, because either alone is wrong:
+ *   · a capitalised "Grace" followed by another capitalised word, or preceded
+ *     by one, is a person — "Grace Whitfield", "Mary Grace".
+ *   · no digit anywhere near it means there is no period to read regardless.
+ * A name adjacent to an unrelated number is still refused, because the number
+ * has to sit in a grace-shaped phrase to count.
+ */
+const NUMBER_WORDS: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, fifteen: 15, twenty: 20,
+  thirty: 30,
+}
+
+/** "five (5)" → 5, "5" → 5, "five" → 5. Leases write numbers all three ways,
+ *  often in one sentence. */
+function readCount(raw: string): number | null {
+  const paren = raw.match(/\((\d{1,2})\)/)
+  if (paren) return parseInt(paren[1], 10)
+  const digits = raw.match(/\d{1,2}/)
+  if (digits) return parseInt(digits[0], 10)
+  const word = raw.toLowerCase().match(/[a-z]+/)
+  if (word && NUMBER_WORDS[word[0]] !== undefined) return NUMBER_WORDS[word[0]]
+  return null
+}
+
+/** Is this occurrence of "grace" somebody's name rather than a period? */
+export function graceLooksLikeAName(text: string, index: number): boolean {
+  const before = text.slice(Math.max(0, index - 40), index)
+  const after = text.slice(index + 5, index + 45)
+  // "Grace Whitfield" — capitalised Grace followed by another capitalised word
+  // that is not a word leases use for periods.
+  if (/^\s+[A-Z][a-z]{1,20}/.test(after)
+      && !/^\s+(Period|Days?|Day)\b/i.test(after)
+      && text[index] === 'G') return true
+  // "Mary Grace", "to Grace," — preceded by a capitalised name or an address
+  // of a person.
+  if (/[A-Z][a-z]{1,20}\s+$/.test(before) && text[index] === 'G'
+      && !/(a|the|day|days|of|no|any)\s+$/i.test(before)) return true
+  return false
+}
+
+export function extractGraceDays(text: string): ParserExtractedField<number> | null {
+  // Every phrasing that anchors on the word itself. Ordered strongest first;
+  // the first that yields a plausible count wins.
+  const AROUND_GRACE: RegExp[] = [
+    // "grace period of five (5) days", "grace period: 5 days"
+    /grace\s*period\s*(?:of|is|shall\s+be|=|:)?\s*([a-z]*\s*\(?\d{0,2}\)?)\s*(?:calendar\s+|business\s+)?days?/i,
+    // "five (5) day grace period", "a 10-day grace period"
+    /([a-z]*\s*\(?\d{0,2}\)?)[\s-]*(?:calendar\s+|business\s+)?day[\s-]*grace\s*period/i,
+    // "grace of 5 days"
+    /grace\s+of\s+([a-z]*\s*\(?\d{0,2}\)?)\s*(?:calendar\s+|business\s+)?days?/i,
+  ]
+  for (const re of AROUND_GRACE) {
+    const m = text.match(re)
+    if (!m) continue
+    const at = m.index ?? 0
+    const graceAt = text.toLowerCase().indexOf('grace', at)
+    if (graceAt >= 0 && graceLooksLikeAName(text, graceAt)) continue
+    const n = readCount(m[1] ?? '')
+    if (n !== null && n >= 0 && n <= 31) {
+      return { value: n, confidence: 0.85, rawText: m[0].trim() }
+    }
+  }
+
+  // Leases that describe the same thing without naming it. Lower confidence:
+  // these read a DAY OF MONTH rather than a count of days, which is the same
+  // number only because rent is due on the 1st platform-wide.
+  const IMPLIED: RegExp[] = [
+    /by\s+the\s+(\d{1,2})\s*(?:st|nd|rd|th)\s+day/i,          // "by the 5th day"
+    /(?:on\s+or\s+)?before\s+the\s+(\d{1,2})\s*(?:st|nd|rd|th)/i, // "before the 5th"
+    /within\s+([a-z]*\s*\(?\d{0,2}\)?)\s*(?:calendar\s+|business\s+)?days?\s+(?:of|after|from)\s+the\s+due\s+date/i,
+  ]
+  for (const re of IMPLIED) {
+    const m = text.match(re)
+    if (!m) continue
+    const n = readCount(m[1] ?? '')
+    if (n !== null && n >= 0 && n <= 31) {
+      return { value: n, confidence: 0.80, rawText: m[0].trim() }
+    }
+  }
+  return null
 }
 
 export function detectSubleasingPolicy(pages: Page[]): ParserExtractedField<string> | null {

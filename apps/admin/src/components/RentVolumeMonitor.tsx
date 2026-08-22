@@ -139,6 +139,16 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
               <span>gross <strong style={{ color: 'var(--t0)' }}>${Number(last.gross).toFixed(2)}</strong></span>
               <span>obligations <strong style={{ color: 'var(--t0)' }}>${Number(last.revenue ?? 0).toFixed(2)}</strong></span>
               <span>fees <strong style={{ color: 'var(--t0)' }}>${Number(last.fees ?? 0).toFixed(2)}</strong></span>
+              {Number(last.inFlight ?? 0) > 0 && (
+                /* S616: money the tenant has sent that Stripe has not released
+                   yet — an ACH debit sits here ~4 business days AFTER the
+                   tenant's bank was debited. Counted in the total, and named,
+                   because a landlord waiting on money is a different fact from
+                   money that has landed. */
+                <span title="Tenants have paid this; Stripe has not released it yet (ACH takes ~4 business days to clear)">
+                  in flight <strong style={{ color: 'var(--gold)' }}>${Number(last.inFlight).toFixed(2)}</strong>
+                </span>
+              )}
             </span>
           )
         })()}
