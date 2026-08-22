@@ -2,38 +2,41 @@ import { queryOne } from '../db'
 import { streetNumber, streetTokens } from './addressVerification'
 
 // ============================================================
-// S616 (Nic) — is this unit at the place I already supply?
+// S616 (Nic) — are these two spaces near enough to be the same place?
 //
-// Nic, rejecting the first attempt: "Don't use the Arizona parcel data. We have
-// no way to know if two landlords next to each other in a completely different
-// state are gonna onboard tomorrow. It can't be gated on data that we don't
-// have everywhere else yet. It needs to be address matched, not parcel matched."
+// This started as a street-level test and Nic threw it out for the right
+// reason: it gated on the ONE field nobody is sure of.
 //
-// He is right twice over. The parcel corpus is AZ-only, and the coordinates the
-// first attempt actually used are barely better: HALF the properties in the
-// database have none, because a geocoder that cannot place a rural address
-// leaves them null. A check that silently does nothing for half the platform is
-// not a check.
+//   "Whatever I'm gonna name my next door neighbor's thing as should be
+//    irrelevant to the matchup. We don't necessarily know the exact physical
+//    address of the place next door... a landlord may not want to put that in,
+//    or put it incorrectly. If it's a multiunit building they're not gonna know
+//    which unit it is. So we need to make that not gated on getting it right...
+//    It could be next door but the address could be way different, because it
+//    could be a corner lot facing on the other street.
 //
-// THE SIGNAL WE ALREADY HAVE, AND I WALKED PAST IT. When a landlord sets up a
-// serviced space he types the service address — the address of the place next
-// door that he supplies. When that neighbour's landlord later onboards, HE types
-// the address of the same building. Two people, independently, describing one
-// physical place. That is the match, it is pure text, and it works identically
-// in Yarnell and in Ohio.
+//    So we just need to look at: one, match it to the name; two, match it to
+//    the same town; three, match it to them already having a user profile."
 //
-// The second case is the one where nobody typed a service address, or the
-// utility landlord described it loosely ("the blue house"). Then the fallback is
-// what "next door" literally means: the same street in the same postcode, with
-// street numbers close together.
+// The typed service address describes SOMEBODY ELSE'S BUILDING. Requiring it to
+// line up meant the feature failed exactly where the landlord was least certain,
+// and a corner lot fails it while being literally next door.
 //
-// WHAT THIS IS FOR. It decides whether GAM may RAISE the question on its own.
-// It is never the authority for converging anything — three people still have
-// to approve, and a human can always propose a link this never spots. So a miss
-// costs a suggestion, not the feature.
+// What is reliable is what each landlord entered about THEIR OWN property. So
+// the address test is the TOWN, and the deciding signal is the PERSON — the
+// same human pays one landlord for utilities and the other for rent (enforced
+// by the caller, services/crossPropertyAutoLink). A street-level agreement is
+// still recorded when it happens, because it belongs in the audit trail; it
+// just no longer decides anything.
+//
+// NOT the county parcel corpus, and not coordinates. Nic, on the first attempt:
+// "we have no way to know if two landlords next to each other in a completely
+// different state are gonna onboard tomorrow. It can't be gated on data that we
+// don't have everywhere else yet." Half the properties in the database have no
+// coordinates at all.
 // ============================================================
 
-export type AdjacencyBasis = 'same_address' | 'same_street' | 'none'
+export type AdjacencyBasis = 'same_address' | 'same_street' | 'same_town' | 'none'
 
 export interface AdjacencyResult {
   basis: AdjacencyBasis
@@ -128,71 +131,59 @@ export function compareAddresses(
   serviceProperty: AddressParts,
   unitProperty: AddressParts,
 ): AdjacencyResult {
-  const unitZip = zip5(unitProperty.zip)
-  const unitStreet = unitProperty.street1 ?? ''
-
-  // Two spaces cannot be next door if the properties are not in the same town.
-  // Checked FIRST so no branch below can report a confident match on a street
-  // name that happens to repeat a thousand miles away.
+  // THE GATE: the same town. Both sides of this comparison are what a landlord
+  // entered about their OWN property, so both are as reliable as anything GAM
+  // holds. Same postcode is the ordinary case; city+state is the alternative
+  // because postcode boundaries genuinely run down the middle of some streets.
   if (!sameLocality(serviceProperty, unitProperty)) {
     return {
       basis: 'none',
       matched: false,
-      evidence: 'Those two properties are not in the same town, so GAM will not suggest linking them.',
+      evidence: 'Those two properties are not in the same town, so GAM will not link them.',
     }
   }
 
-  // ── 1. The typed service address vs the other landlord's own address ──
-  // The strongest thing available, because two different people described the
-  // same place without seeing each other's answer.
+  const town = norm(unitProperty.city) || 'the same town'
+  const unitStreet = unitProperty.street1 ?? ''
+  const svcStreet = serviceProperty.street1 ?? ''
+
+  // Everything below only makes the EVIDENCE better. None of it can refuse a
+  // link, because the typed service address is the field Nic explicitly said
+  // must not gate anything.
   if (serviceAddress && unitStreet) {
     const svcNum = streetNumber(serviceAddress)
     const unitNum = streetNumber(unitStreet)
     const streetsAgree = sameStreet(serviceAddress, unitStreet)
-    // A typed service address rarely carries a postcode, so the postcode is
-    // corroboration when present and never a requirement.
-    const svcZip = zipFromFreeText(serviceAddress)
-    const zipOk = !svcZip || !unitZip || svcZip === unitZip
-
-    if (streetsAgree && zipOk && svcNum && unitNum && svcNum === unitNum) {
+    if (streetsAgree && svcNum && unitNum && svcNum === unitNum) {
       return {
-        basis: 'same_address',
-        matched: true,
+        basis: 'same_address', matched: true,
         evidence: `The address recorded for the serviced space (${serviceAddress}) is the same address as this unit's property (${unitStreet}).`,
       }
     }
-    if (streetsAgree && zipOk && svcNum && unitNum
+    if (streetsAgree && svcNum && unitNum
         && Math.abs(Number(svcNum) - Number(unitNum)) <= ADJACENT_NUMBER_SPAN) {
       return {
-        basis: 'same_street',
-        matched: true,
+        basis: 'same_street', matched: true,
         evidence: `The serviced space is recorded at ${serviceAddress}; this unit's property is ${unitStreet} — the same street, a few numbers apart.`,
       }
     }
   }
 
-  // ── 2. No usable service address: fall back to the two PROPERTIES ──
-  // Literally what "next door" means — same street, same postcode, numbers
-  // close together.
-  const svcStreet = serviceProperty.street1 ?? ''
-  const svcPropZip = zip5(serviceProperty.zip)
-  if (svcStreet && unitStreet && svcPropZip && unitZip && svcPropZip === unitZip) {
-    const a = streetNumber(svcStreet)
-    const b = streetNumber(unitStreet)
-    if (sameStreet(svcStreet, unitStreet) && a && b
-        && Math.abs(Number(a) - Number(b)) <= ADJACENT_NUMBER_SPAN) {
+  if (svcStreet && unitStreet && sameStreet(svcStreet, unitStreet)) {
+    const a = streetNumber(svcStreet), b = streetNumber(unitStreet)
+    if (a && b && Math.abs(Number(a) - Number(b)) <= ADJACENT_NUMBER_SPAN) {
       return {
-        basis: 'same_street',
-        matched: true,
-        evidence: `${svcStreet} and ${unitStreet} are on the same street in ${norm(unitProperty.city) || 'the same town'} ${unitZip} — a few numbers apart.`,
+        basis: 'same_street', matched: true,
+        evidence: `${svcStreet} and ${unitStreet} are on the same street in ${town} — a few numbers apart.`,
       }
     }
   }
 
+  // The ordinary answer, and a sufficient one. A corner lot addressed on the
+  // other street lands here, which is the whole point of not gating on streets.
   return {
-    basis: 'none',
-    matched: false,
-    evidence: 'GAM could not tell from the addresses that these are the same place, so it will not suggest the link on its own. Someone who knows they are can still propose it.',
+    basis: 'same_town', matched: true,
+    evidence: `Both properties are in ${town}${unitProperty.zip ? ' ' + (zip5(unitProperty.zip) ?? '') : ''}, and the same person pays utilities at one and rents the other.`,
   }
 }
 

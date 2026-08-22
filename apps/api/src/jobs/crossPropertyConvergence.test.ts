@@ -254,14 +254,19 @@ describe('cross-property convergence (S616)', () => {
     })).rejects.toThrow(/not in the same town/i)
   })
 
-  it('an admin can force a link the addresses could never show', async () => {
+  // With the gate at TOWN level there is little the addresses cannot show, so
+  // force is now for the case a person knows and the data does not: two
+  // properties recorded in different towns that are actually one place — a
+  // mis-entered city, or an address that straddles a town line.
+  it('an admin can force a link across a town line', async () => {
     const f = await twoLandlordsOnePlace()
     await db.query(
-      `UPDATE properties SET street1='the blue house behind the shop' WHERE id=$1`,
-      [f.propA])
-    await db.query(
-      `UPDATE utility_service_agreements SET service_address=NULL WHERE id=$1`,
-      [f.agreementId])
+      `UPDATE properties SET city='Peeples Valley', zip='85332' WHERE id=$1`, [f.propB])
+
+    // The sweep refuses it, correctly — different towns.
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(0)
+
     const link = await proposeLink({
       serviceAgreementId: f.agreementId, unitId: f.leasedUnitId,
       via: 'admin', force: true,
@@ -296,16 +301,43 @@ describe('automatic linking (S616)', () => {
     expect((await autoLinkNeighborServices()).linked).toBe(0)
   })
 
-  it('leaves it alone when the addresses do not match', async () => {
+  it('leaves it alone when the properties are in different towns', async () => {
     const f = await twoLandlordsOnePlace()
     await db.query(
       `UPDATE properties SET street1='9 Elsewhere Rd', city='Toledo',
                              state='OH', zip='43606' WHERE id=$1`, [f.propB])
-    await db.query(
-      `UPDATE utility_service_agreements SET service_address=NULL WHERE id=$1`,
-      [f.agreementId])
     const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
     expect((await autoLinkNeighborServices()).linked).toBe(0)
+  })
+
+  // S616 (Nic): the typed service address must not gate the match. "A landlord
+  // may not want to put that in, or put it incorrectly. If it's a multiunit
+  // building they're not gonna know which unit it is." A corner lot is next
+  // door and carries an address on another street entirely.
+  it('links with no service address typed at all', async () => {
+    const f = await twoLandlordsOnePlace()
+    await db.query(
+      `UPDATE utility_service_agreements SET service_address = NULL WHERE id = $1`,
+      [f.agreementId])
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(1)
+  })
+
+  it('links when the neighbour is on a different street — the corner-lot case', async () => {
+    const f = await twoLandlordsOnePlace()
+    await db.query(
+      `UPDATE utility_service_agreements SET service_address = 'the blue house out back'
+        WHERE id = $1`, [f.agreementId])
+    await db.query(
+      `UPDATE properties SET street1 = '4 Cross St' WHERE id = $1`, [f.propB])
+
+    const { autoLinkNeighborServices } = await import('../services/crossPropertyAutoLink')
+    expect((await autoLinkNeighborServices()).linked).toBe(1)
+
+    const { rows } = await db.query<any>(
+      `SELECT address_match_basis FROM cross_property_service_links
+        WHERE service_agreement_id = $1`, [f.agreementId])
+    expect(rows[0].address_match_basis).toBe('same_town')
   })
 
   // Linking the WRONG unit puts a stranger's electricity on somebody's rent

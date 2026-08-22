@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict AC6P6VuJCbJO2o8ttI5HkhTwooALngoWQBSGJyQncLsARyiSvJlgSHe3QaizabP
+\restrict yPqAW9LFokaZBkmLaTcUtvr9EGz1S5Ti3PdXY0X7beGCvr4g56r8tlxMF1cPjDD
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2686,7 +2686,7 @@ CREATE TABLE public.cross_property_service_links (
     address_match_evidence text,
     address_checked_at timestamp with time zone,
     CONSTRAINT cpsl_two_landlords CHECK ((service_landlord_id <> unit_landlord_id)),
-    CONSTRAINT cross_property_service_links_address_match_basis_check CHECK ((address_match_basis = ANY (ARRAY['same_address'::text, 'same_street'::text, 'none'::text]))),
+    CONSTRAINT cross_property_service_links_address_match_basis_check CHECK ((address_match_basis = ANY (ARRAY['same_address'::text, 'same_street'::text, 'same_town'::text, 'none'::text]))),
     CONSTRAINT cross_property_service_links_proposed_via_check CHECK ((proposed_via = ANY (ARRAY['tenant_account'::text, 'proximity'::text, 'admin'::text]))),
     CONSTRAINT cross_property_service_links_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
 );
@@ -2703,7 +2703,7 @@ COMMENT ON TABLE public.cross_property_service_links IS 'S616: a space one landl
 -- Name: COLUMN cross_property_service_links.address_match_basis; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.cross_property_service_links.address_match_basis IS 'S616: how the two addresses corroborated — ''same_address'' (the service address the utility landlord typed IS the other landlord''s property address), ''same_street'' (same street and postcode, numbers close), or ''none'' (a person proposed it; GAM could not tell).';
+COMMENT ON COLUMN public.cross_property_service_links.address_match_basis IS 'S616: how closely the two addresses agreed — ''same_address'' and ''same_street'' are recorded when the typed service address happens to line up, but ''same_town'' is all that is REQUIRED. The deciding signal is the person: the same tenant pays one landlord for utilities and the other for rent.';
 
 
 --
@@ -23924,5 +23924,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict AC6P6VuJCbJO2o8ttI5HkhTwooALngoWQBSGJyQncLsARyiSvJlgSHe3QaizabP
+\unrestrict yPqAW9LFokaZBkmLaTcUtvr9EGz1S5Ti3PdXY0X7beGCvr4g56r8tlxMF1cPjDD
 

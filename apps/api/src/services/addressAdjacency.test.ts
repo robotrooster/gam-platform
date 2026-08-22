@@ -1,12 +1,19 @@
 /**
- * S616 — deciding, from addresses alone, whether GAM may ask three people
- * about a link.
+ * S616 — are these two spaces near enough to be the same place?
  *
- * Nic threw out the first version: "Don't use the Arizona parcel data... It
- * can't be gated on data that we don't have everywhere else yet. It needs to be
- * address matched." These cases are the shapes real addresses actually take —
- * Oak Park's own highway address, an ordinary numbered street, and the ways two
- * people write the same place differently.
+ * Nic threw out the street-level version for the right reason: it gated on the
+ * ONE field nobody is sure of. "Whatever I'm gonna name my next door neighbor's
+ * thing as should be irrelevant to the matchup... a landlord may not want to
+ * put that in, or put it incorrectly. If it's a multiunit building they're not
+ * gonna know which unit it is... It could be next door but the address could be
+ * way different, because it could be a corner lot facing on the other street.
+ *
+ * So we just need to look at: one, match it to the name; two, match it to the
+ * same town; three, match it to them already having a user profile."
+ *
+ * So the GATE here is the town. The person is enforced by the caller
+ * (crossPropertyAutoLink). A street-level agreement still improves the recorded
+ * evidence — it just cannot refuse anything.
  */
 import { describe, it, expect } from 'vitest'
 import { compareAddresses } from './addressAdjacency'
@@ -41,20 +48,30 @@ describe('address adjacency (S616)', () => {
     expect(r.basis).toBe('same_street')
   })
 
-  it('the far end of the same street is NOT next door', () => {
-    const r = compareAddresses(
-      '1442 W Second St',
-      OAK_PARK,
-      { street1: '2810 W Second St', city: 'Yarnell', state: 'AZ', zip: '85362' })
-    expect(r.matched).toBe(false)
-  })
-
-  it('a different street is not a match, however close the numbers', () => {
+  // THE CASE THAT DROVE THE CHANGE. A corner lot is literally next door and
+  // carries an address on a different street; the old rule refused it.
+  it('a different street in the same town still matches', () => {
     const r = compareAddresses(
       '1442 W Second St',
       OAK_PARK,
       { street1: '1444 W Third St', city: 'Yarnell', state: 'AZ', zip: '85362' })
-    expect(r.matched).toBe(false)
+    expect(r.matched).toBe(true)
+    expect(r.basis).toBe('same_town')
+  })
+
+  it('and so does a landlord who typed nothing at all', () => {
+    const r = compareAddresses(null, OAK_PARK,
+      { street1: '1444 W Third St', city: 'Yarnell', state: 'AZ', zip: '85362' })
+    expect(r.matched).toBe(true)
+    expect(r.basis).toBe('same_town')
+  })
+
+  it('a wrong or vague description no longer blocks anything', () => {
+    const r = compareAddresses(
+      'the blue house behind the shop',
+      OAK_PARK,
+      { street1: '1442 W Second St', city: 'Yarnell', state: 'AZ', zip: '85362' })
+    expect(r.matched).toBe(true)
   })
 
   // The whole point of Nic's objection: this must work where GAM holds no
@@ -69,7 +86,7 @@ describe('address adjacency (S616)', () => {
     expect(r.basis).toBe('same_address')
   })
 
-  it('falls back to the two properties when no service address was typed', () => {
+  it('records the street when the two properties do line up', () => {
     const r = compareAddresses(
       null,
       { street1: '118 Bellefontaine Ave', city: 'Marion', state: 'OH', zip: '43302' },
@@ -78,22 +95,14 @@ describe('address adjacency (S616)', () => {
     expect(r.basis).toBe('same_street')
   })
 
+  // The one thing that still refuses. Two properties in different towns cannot
+  // be one physical place, whatever the streets say.
   it('a different town is a different place', () => {
     const r = compareAddresses(
       null,
       { street1: '118 Bellefontaine Ave', city: 'Marion', state: 'OH', zip: '43302' },
       { street1: '122 Bellefontaine Ave', city: 'Toledo', state: 'OH', zip: '43606' })
     expect(r.matched).toBe(false)
-  })
-
-  // A miss costs a SUGGESTION, never the feature — a person can still propose.
-  it('says plainly that it could not tell, and why that is not the end of it', () => {
-    const r = compareAddresses(
-      'the blue house behind the shop',
-      OAK_PARK,
-      { street1: '1442 W Second St', city: 'Yarnell', state: 'AZ', zip: '85362' })
-    expect(r.matched).toBe(false)
-    expect(r.evidence).toContain('can still propose it')
   })
 
   // Numbered and named streets repeat in every town in the country. Without a
