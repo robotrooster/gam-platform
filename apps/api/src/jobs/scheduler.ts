@@ -959,10 +959,14 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // 16a Step 3: weekly auto-payout batch. Fires Mon-Fri 9am Phoenix; engine
-  // self-gates to only run on the auto-payout day — TUESDAY (S561, D1: lands
-  // the landlord's bank by Friday at standard T+1–T+2), shifted forward over
-  // US federal holidays.
+  // 16a Step 3: auto-payout batch. Fires Mon-Fri 9am Phoenix.
+  //
+  // S616: the engine no longer self-gates to Tuesday. It measures every
+  // landlord's rent roll EVERY weekday, because a threshold can be crossed on
+  // any of them, and schedules the payout four days out. Tuesday still governs
+  // the short-term-stay stream, PM companies, businesses, and any landlord with
+  // no rent roll to measure (S561, D1: lands the bank by Friday at T+1-T+2),
+  // shifted forward over US federal holidays.
   cron.schedule('0 9 * * 1-5', async () => {
     try {
       const { processAutoPayouts } = await import('./autoPayouts')

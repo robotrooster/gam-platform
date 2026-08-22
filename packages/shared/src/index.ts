@@ -3928,7 +3928,14 @@ export const STRIPE_CONFIG = {
   ACH_CAP:         3.00,    // negotiated — mirrors platform_processing_rates.ach stripe_cost_cap
   PAYOUT_RATE:     0.0025,
   PAYOUT_FLAT:     0.25,
-  CONNECT_ACCT_MO: 2.00,
+  // S616 (Nic, confirmed against the Stripe contract): $1.00 per active Connect
+  // account per month, NOT the $2.00 that sat here. Same failure as ACH_RATE
+  // before S603 — a public list price hardcoded where a negotiated rate
+  // belonged, quietly overstating GAM's own cost. Unlike the processing rates
+  // there is no platform_processing_rates row for this one, so nothing
+  // validates it; it is admin-only margin math (calcNetPerUnit, gated to
+  // admin in units.ts /:id/economics) and never reaches a landlord or tenant.
+  CONNECT_ACCT_MO: 1.00,
 } as const
 
 // S551 (Nic): the platform-wide CUSTOMER-FACING processing fee schedule —
