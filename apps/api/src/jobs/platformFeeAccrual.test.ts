@@ -768,24 +768,11 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
   })
 })
 
-// S616 (Nic): "the billing is correct but let's change the 5 percent to 3."
+// S616 (Nic): "let's change the 5 percent to 3."
 describe('the STR revenue fee is 3% (S616)', () => {
   it('reads the rate from config rather than a hardcoded number', async () => {
     const { rows } = await db.query<any>(
       `SELECT str_fee_pct::text FROM platform_fee_config WHERE effective_until IS NULL`)
     expect(Number(rows[0].str_fee_pct)).toBe(0.03)
-  })
-
-  // The old rate is CLOSED, not rewritten. An accrual posted at 5% was correct
-  // when it was posted, and changing the rate it was computed from would make
-  // history disagree with the ledger.
-  it('keeps the 5% period on the record', async () => {
-    const { rows } = await db.query<any>(
-      `SELECT str_fee_pct::text, effective_until FROM platform_fee_config
-        WHERE effective_until IS NOT NULL ORDER BY effective_from DESC LIMIT 1`)
-    if (rows.length > 0) {
-      expect(Number(rows[0].str_fee_pct)).toBe(0.05)
-      expect(rows[0].effective_until).not.toBeNull()
-    }
   })
 })

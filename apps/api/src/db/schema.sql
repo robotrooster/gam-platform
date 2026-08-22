@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict okv25ZOChv5JOJZ6ok2CzyotXHOSDzCzZea2NX5X1qz0X95OmZEibLN5KMfX1rq
+\restrict w74tlBnjNxVqfdG51IS40LTP8HrSDp38UX7rFqp2hA2gfVTBfeI9Tv8THmD5FUT
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -23950,5 +23950,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict okv25ZOChv5JOJZ6ok2CzyotXHOSDzCzZea2NX5X1qz0X95OmZEibLN5KMfX1rq
+\unrestrict w74tlBnjNxVqfdG51IS40LTP8HrSDp38UX7rFqp2hA2gfVTBfeI9Tv8THmD5FUT
 
