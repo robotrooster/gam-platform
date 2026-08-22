@@ -481,3 +481,82 @@ describe('processPlatformFeeAccrual', () => {
     })
   })
 })
+
+// S615 (Nic): "It is technically a unit, so it needs to be billed at two
+// dollars." The live estimate counted serviced spaces from S614; this job —
+// the one that actually charges — did not. So GAM quoted the landlord one
+// number and billed a lower one, under-collecting its own revenue every month.
+describe('utility-service spaces accrue the per-unit fee (S615)', () => {
+  /** A property with ONE leased unit plus one space next door the landlord
+   *  only supplies utilities to. Two billable units, not one. */
+  async function stackWithServicedSpace(
+    opts: { superseded?: boolean; endDate?: string } = {},
+  ): Promise<{ propertyId: string }> {
+    const stack = await buildPlatformStack({ unitCount: 1 })
+    const client = await getClient()
+    try {
+      const unitId = await seedUnit(client, {
+        propertyId: stack.propertyId, landlordId: stack.landlordId,
+      })
+      await client.query(
+        `UPDATE units SET status='utility_service' WHERE id=$1`, [unitId])
+      const payerId = await seedTenant(client)
+      let supersedingLeaseId: string | null = null
+      if (opts.superseded) {
+        supersedingLeaseId = await seedLease(client, {
+          unitId, landlordId: stack.landlordId, status: 'active',
+          startDate: '2026-01-01',
+        })
+      }
+      await client.query(
+        `INSERT INTO utility_service_agreements
+           (landlord_id, unit_id, tenant_id, start_date, end_date,
+            superseded_by_lease_id)
+         VALUES ($1,$2,$3,'2026-01-01',$4,$5)`,
+        [stack.landlordId, unitId, payerId, opts.endDate ?? null,
+         supersedingLeaseId])
+    } finally { client.release() }
+    return { propertyId: stack.propertyId }
+  }
+
+  it('charges $2 for a space the landlord only supplies utilities to', async () => {
+    const { propertyId } = await stackWithServicedSpace()
+
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+
+    const { rows } = await db.query<any>(
+      `SELECT long_term_unit_count, utility_service_unit_count, total_billable
+         FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].utility_service_unit_count).toBe(1)
+    // Counted separately: a serviced space is not a long-term tenancy and
+    // must not be reported to the landlord as one.
+    expect(rows[0].long_term_unit_count).toBe(1)
+    expect(rows[0].total_billable).toBe(2)
+  })
+
+  // The $2 follows the unit to the incoming landlord — never charged twice
+  // for one space.
+  it('stops charging once a lease supersedes the agreement', async () => {
+    const { propertyId } = await stackWithServicedSpace({ superseded: true })
+
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+
+    const { rows } = await db.query<any>(
+      `SELECT utility_service_unit_count FROM platform_fee_accruals
+        WHERE property_id = $1`, [propertyId])
+    expect(rows[0].utility_service_unit_count).toBe(0)
+  })
+
+  it('stops charging once the agreement has ended', async () => {
+    const { propertyId } = await stackWithServicedSpace({ endDate: '2026-02-01' })
+
+    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+
+    const { rows } = await db.query<any>(
+      `SELECT utility_service_unit_count, total_billable
+         FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
+    expect(rows[0].utility_service_unit_count).toBe(0)
+    expect(rows[0].total_billable).toBe(1)
+  })
+})

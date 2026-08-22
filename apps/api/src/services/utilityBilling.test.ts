@@ -1621,3 +1621,95 @@ describe('cross-property utility service (S614)', () => {
     expect(res.billsCreated).toBe(0)
   })
 })
+
+/**
+ * S615: a SERVICED space in a RUBS pool.
+ *
+ * The S614 handoff says a serviced space carries "a share of a RUBS pool like
+ * any other". It did not. rented_spaces measures occupancy with isRented(),
+ * which asks for a LEASE — and a serviced space structurally has none, so it
+ * scored 0 and its consumption was divided among the paying tenants. Exactly
+ * the S609 owner-occupied bug in a new costume, with one difference: this space
+ * has a payer, so its share is BILLED rather than absorbed.
+ */
+describe('S615 serviced spaces take their share of a RUBS pool', () => {
+  async function servicedUnit(base: BaseCtx, householdSize = 1): Promise<string> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(
+        `UPDATE units SET status='utility_service', owner_household_size=$2 WHERE id=$1`,
+        [unitId, householdSize])
+      await c.query(
+        `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date)
+         VALUES ($1,$2,$3,'2020-01-01')`, [base.landlordId, unitId, tenantId])
+      await c.query('COMMIT')
+      return unitId
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  async function rubsMeter(base: BaseCtx, method: 'rented_spaces' | 'occupant_count'): Promise<string> {
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(meterId, method)
+    return meterId
+  }
+
+  it('rented_spaces: a serviced space is a share, and it is billed', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'rented_spaces')
+    await setMeterRateBase(meterId, 1, 0)
+
+    const a = await seedUnitWithActiveTenant(base)
+    const b = await seedUnitWithActiveTenant(base)
+    const svc = await servicedUnit(base)
+    for (const u of [a.unitId, b.unitId, svc]) await attachMeterToUnit(meterId, u)
+
+    await seedReading(meterId, '2026-03-01', 0, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 300, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount::text AS amt, lease_id, service_agreement_id
+         FROM utility_bills WHERE meter_id = $1`, [meterId])
+    // Three shares of $300, not two. The tenants pay $100 each, not $150.
+    expect(rows).toHaveLength(3)
+    for (const r of rows) expect(Number(r.amt)).toBe(100)
+
+    const svcRow = rows.find((r: any) => r.unit_id === svc)
+    expect(svcRow).toBeDefined()
+    // Unlike an owner-occupied share this one is charged to somebody.
+    expect(svcRow.lease_id).toBeNull()
+    expect(svcRow.service_agreement_id).not.toBeNull()
+  })
+
+  it('occupant_count: reads the landlord-stated household size, not zero', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+
+    const a = await seedUnitWithActiveTenant(base)   // 1 tenant
+    const svc = await servicedUnit(base, 3)          // 3 people next door
+    for (const u of [a.unitId, svc]) await attachMeterToUnit(meterId, u)
+
+    await seedReading(meterId, '2026-03-01', 0, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 400, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount::text AS amt FROM utility_bills WHERE meter_id = $1`,
+      [meterId])
+    expect(rows).toHaveLength(2)
+    const byUnit = Object.fromEntries(rows.map((r: any) => [r.unit_id, Number(r.amt)]))
+    // 1 of 4 people, and 3 of 4 — not the whole $400 on the one tenant.
+    expect(byUnit[a.unitId]).toBe(100)
+    expect(byUnit[svc]).toBe(300)
+  })
+})

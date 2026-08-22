@@ -190,6 +190,33 @@ async function accrueOneProperty(
     `, [propertyId, monthIso])
     const longTermUnitCount = ltRes.rows[0].c
 
+    // ── Utility-service spaces (S615) ────────────────────────────────────
+    // Nic: "It is technically a unit, so it needs to be billed at two dollars."
+    // A space next door that this landlord supplies power or trash to is
+    // OCCUPIED BY HIM, because of the utilities — it holds meter assignments
+    // and a payer exactly like a leased unit does.
+    //
+    // The live estimate has counted these since S614; this job did not, so the
+    // number GAM showed the landlord was one higher than the bill GAM then
+    // sent, and GAM under-collected its own revenue every month.
+    //
+    // superseded_by_lease_id drops it the moment the space's real owner
+    // onboards and puts a tenancy on it: the $2 follows the unit to them and is
+    // never charged twice for one space. There is no mid-month conflict, because
+    // the incoming landlord sits inside the no-double-bill grace until their
+    // second cycle, and that cycle is wholly theirs.
+    const usRes = await client.query<{ c: number }>(`
+      SELECT COUNT(DISTINCT sa.unit_id)::int AS c
+        FROM utility_service_agreements sa
+        JOIN units u ON u.id = sa.unit_id
+       WHERE u.property_id = $1
+         AND sa.status = 'active'
+         AND sa.superseded_by_lease_id IS NULL
+         AND sa.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
+         AND (sa.end_date IS NULL OR sa.end_date >= $2::date)
+    `, [propertyId, monthIso])
+    const utilityServiceUnitCount = usRes.rows[0].c
+
     // ── Short-stay nights ────────────────────────────────────────────────
     // SUM of nights in the billing month across all short-stay bookings
     // on this property. Every night counts; bookings on units that ALSO
@@ -214,7 +241,7 @@ async function accrueOneProperty(
     const shortStayNights = ssRes.rows[0].nights ?? 0
     const shortStayEquivalent = Math.ceil(shortStayNights / 30)
 
-    const totalBillable = longTermUnitCount + shortStayEquivalent
+    const totalBillable = longTermUnitCount + shortStayEquivalent + utilityServiceUnitCount
 
     // ── STR revenue (S538) ───────────────────────────────────────────────
     // Bookings on any NON-aggregation unit type (everything but rv_spot)
@@ -289,10 +316,11 @@ async function accrueOneProperty(
       INSERT INTO platform_fee_accruals
         (landlord_id, property_id, accrual_month,
          long_term_unit_count, short_stay_nights, short_stay_equivalent, total_billable,
+         utility_service_unit_count,
          rate_per_unit, min_per_property, total_amount,
          str_revenue, str_fee_amount,
          payer)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13)
       RETURNING id
     `, [
       landlordId, propertyId, monthIso,
@@ -300,6 +328,7 @@ async function accrueOneProperty(
       ratePerUnit, minPerProperty, totalAmount,
       strRevenue, strFeeAmount,
       payer,
+      utilityServiceUnitCount,
     ])
     const accrualId = accrualRes.rows[0].id
 
@@ -330,6 +359,11 @@ async function accrueOneProperty(
         `Platform fee for ${monthIso} (${totalBillable} billable units` +
         (shortStayEquivalent > 0
           ? `, ${longTermUnitCount} long-term + CEIL(${shortStayNights}/30)=${shortStayEquivalent} short-stay`
+          : '') +
+        // S615: name them, so a landlord reading his fee line can see that the
+        // extra $2 is the space next door he supplies and not a miscount.
+        (utilityServiceUnitCount > 0
+          ? `, ${utilityServiceUnitCount} utility-service`
           : '') +
         (strFeeAmount > 0
           ? `, +${(strFeePct * 100).toFixed(1)}% of ${strRevenue.toFixed(2)} STR revenue = ${strFeeAmount.toFixed(2)}`

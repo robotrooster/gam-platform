@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R9ud3cv8EoLG62T7R5p7pbCLsfdjCtlXi80ZKxd2Ahg4ecsJmo2AVEzLOYY8DNY
+\restrict XKMZXXa41BtRJHeMTzskJchko09oB5gg3Fot4UYeZJfoDttUIneluTIMPcgqgwi
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5295,8 +5295,16 @@ CREATE TABLE public.platform_fee_accruals (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     str_revenue numeric(12,2) DEFAULT 0 NOT NULL,
     str_fee_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    utility_service_unit_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT platform_fee_accruals_payer_check CHECK ((payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
 );
+
+
+--
+-- Name: COLUMN platform_fee_accruals.utility_service_unit_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_fee_accruals.utility_service_unit_count IS 'S615: spaces billed under a utility service agreement this month — occupied by this landlord BECAUSE OF the utilities. Drops the moment a lease supersedes the agreement, so the $2 follows the unit and is never charged twice for one space.';
 
 
 --
@@ -23512,5 +23520,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R9ud3cv8EoLG62T7R5p7pbCLsfdjCtlXi80ZKxd2Ahg4ecsJmo2AVEzLOYY8DNY
+\unrestrict XKMZXXa41BtRJHeMTzskJchko09oB5gg3Fot4UYeZJfoDttUIneluTIMPcgqgwi
 

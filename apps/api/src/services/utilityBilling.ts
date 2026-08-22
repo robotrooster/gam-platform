@@ -356,7 +356,15 @@ async function allocationBases(
         // S609: an owner-occupied space has no lease, so isRented() is false —
         // but unlike a VACANT space it is lived in and drawing water. It takes
         // a full share, which the landlord then absorbs rather than bills.
-        basis = (u.status === 'owner_use' || await isRented(u.unit_id)) ? 1 : 0
+        //
+        // S615: a UTILITY-SERVICE space is the same shape and was missed. It
+        // has no lease either, so it scored 0 — and its consumption was then
+        // divided among the paying tenants, who would have quietly covered the
+        // neighbour's water. Unlike an owner-occupied space this one BILLS:
+        // there is a payer on the agreement, so it takes its share and is
+        // charged for it rather than absorbed.
+        basis = (u.status === 'owner_use' || u.status === 'utility_service'
+          || await isRented(u.unit_id)) ? 1 : 0
         break
       case 'sqft':
         basis = Number(u.sqft || 0)
@@ -368,8 +376,13 @@ async function allocationBases(
       // count — it would score 0 and its usage would land on the paying
       // tenants instead. The landlord states the household size; it is a real
       // occupied home and never counts as nobody.
+      // S615: a serviced space has no lease tenants to count either, for the
+      // same structural reason. Both read the landlord-stated household size —
+      // the column is named for the case that introduced it, but what it holds
+      // is "how many people live in a space with no lease to count from",
+      // which is exactly as true next door as it is for an owner.
       case 'occupant_count':
-        basis = u.status === 'owner_use'
+        basis = (u.status === 'owner_use' || u.status === 'utility_service')
           ? Math.max(1, Number(u.owner_household_size || 1))
           : await occupants(u.unit_id)
         break
@@ -383,7 +396,10 @@ async function allocationBases(
       // Landlord-set weight per unit type, so a park can say a mobile home draws
       // 1.5× an RV spot without inventing square footage for either.
       case 'unit_type_weight':
-        basis = (await isRented(u.unit_id)) ? Number(w[u.unit_type] || 0) : 0
+        // S615: same omission as rented_spaces above — a lease-less but
+        // occupied space scored 0 and pushed its draw onto the tenants.
+        basis = (u.status === 'owner_use' || u.status === 'utility_service'
+          || await isRented(u.unit_id)) ? Number(w[u.unit_type] || 0) : 0
         break
       default:
         basis = 0
