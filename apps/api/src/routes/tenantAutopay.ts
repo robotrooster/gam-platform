@@ -50,6 +50,23 @@ tenantAutopayRouter.get('/', async (req: any, res, next) => {
               pr.name             AS property_name,
               u.unit_number,
               l.rent_due_day,
+              -- S616 (Nic): "if people get their Social Security on the third or
+              -- the fifth, if they set autopay and it's still within the grace
+              -- period, they should be able to choose to have auto payment set
+              -- up."
+              --
+              -- They always could — pull_day has existed since S609. What was
+              -- wrong was what the screen TOLD them: any day after the due day
+              -- was called late, so a tenant paid on the 3rd with a five-day
+              -- grace was warned about late fees they would never be charged,
+              -- which is exactly the thing that stops someone using autopay at
+              -- all. The grace has to travel with the row or the screen cannot
+              -- tell the difference.
+              --
+              -- Same default the late-fee engine falls back to (5), so the two
+              -- never disagree about which day is safe.
+              COALESCE(l.late_fee_grace_days, 5) AS late_fee_grace_days,
+              l.late_fee_enabled,
               a.id                AS autopay_id,
               a.enabled,
               a.pull_day,

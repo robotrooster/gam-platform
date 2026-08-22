@@ -1713,3 +1713,119 @@ describe('S615 serviced spaces take their share of a RUBS pool', () => {
     expect(byUnit[svc]).toBe(300)
   })
 })
+
+/**
+ * S616 (Nic): "A service space may or may not take a share of RUBS. It may just
+ * be a submeter or a flat rate as well. It needs to have all options available."
+ *
+ * S615 fixed the RUBS basis and tested that; the other two were tested at S614
+ * but never together, and nothing locked the general rule. This is that lock:
+ * a serviced space is billable by EVERY method the platform offers, because
+ * what the landlord ran to the space next door — its own meter, a share of a
+ * pool, or a flat monthly charge — is a fact about the plumbing, not about
+ * whether a lease exists.
+ */
+describe('S616 a serviced space bills by every method', () => {
+  async function servicedUnit(base: BaseCtx): Promise<{ unitId: string; agreementId: string }> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(`UPDATE units SET status='utility_service' WHERE id=$1`, [unitId])
+      const { rows: [sa] } = await c.query(
+        `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date)
+         VALUES ($1,$2,$3,'2020-01-01') RETURNING id`, [base.landlordId, unitId, tenantId])
+      await c.query('COMMIT')
+      return { unitId, agreementId: sa.id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  async function meterOf(base: BaseCtx, method: string, utility: string): Promise<string> {
+    const c = await db.connect()
+    let id = ''
+    try { await c.query('BEGIN'); id = await seedUtilityMeter(c, { propertyId: base.propertyId }); await c.query('COMMIT') }
+    finally { c.release() }
+    // rubs_allocation_method is required by CHECK whenever the method is
+    // 'rubs', so it has to land in the SAME statement rather than a follow-up.
+    await db.query(
+      `UPDATE utility_meters
+          SET billing_method = $2, utility_type = $3,
+              rubs_allocation_method = CASE WHEN $2 = 'rubs'
+                THEN 'rented_spaces' ELSE rubs_allocation_method END,
+              digits = CASE WHEN $2 = 'flat_rate' THEN NULL ELSE digits END
+        WHERE id=$1`, [id, method, utility])
+    return id
+  }
+
+  it('SUBMETER: its own dial, billed on usage', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterOf(base, 'submeter', 'electric')
+    await setMeterRateBase(meterId, 0.21, 0)
+    const svc = await servicedUnit(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await seedReading(meterId, '2026-03-01', 1000, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 1100, base.landlordUserId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount::text AS amt, service_agreement_id, usage_amount::text AS used
+         FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(Number(rows[0].used)).toBe(100)
+    expect(Number(rows[0].amt)).toBe(21)
+    expect(rows[0].service_agreement_id).toBe(svc.agreementId)
+  })
+
+  it('FLAT RATE: a fixed monthly charge, multiplied by quantity', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterOf(base, 'flat_rate', 'trash')
+    await db.query(
+      `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
+       VALUES ($1,'trash',25,0) ON CONFLICT (property_id, utility_type)
+       DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit`, [base.propertyId])
+    const svc = await servicedUnit(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await db.query(`UPDATE utility_meter_units SET quantity=3 WHERE meter_id=$1 AND unit_id=$2`,
+      [meterId, svc.unitId])
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount::text AS amt, service_agreement_id FROM utility_bills WHERE meter_id=$1`,
+      [meterId])
+    expect(Number(rows[0].amt)).toBe(75)
+    expect(rows[0].service_agreement_id).toBe(svc.agreementId)
+  })
+
+  it('RUBS: a share of a pool alongside leased units', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterOf(base, 'rubs', 'water')
+    await setMeterRateBase(meterId, 1, 0)
+    const leased = await seedUnitWithActiveTenant(base)
+    const svc = await servicedUnit(base)
+    await attachMeterToUnit(meterId, leased.unitId)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await seedReading(meterId, '2026-03-01', 0, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 200, base.landlordUserId)
+
+    await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount::text AS amt FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(rows).toHaveLength(2)
+    for (const r of rows) expect(Number(r.amt)).toBe(100)
+  })
+
+  // A landlord absorbs a master he does not pass through, serviced space or not.
+  it('MASTER BILLED TO LANDLORD: nothing is charged to the serviced space', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await meterOf(base, 'master_bill_to_landlord', 'water')
+    const svc = await servicedUnit(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await seedReading(meterId, '2026-03-01', 0, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 500, base.landlordUserId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    expect(res.billsCreated).toBe(0)
+  })
+})

@@ -24,6 +24,9 @@ interface AutopayRow {
   propertyName:    string
   unitNumber:      string
   rentDueDay:      number | null
+  /** S616: how many days past the due day before a late fee starts. */
+  lateFeeGraceDays: number | null
+  lateFeeEnabled:  boolean | null
   autopayId:       string | null
   enabled:         boolean | null
   pullDay:         number | null
@@ -81,6 +84,12 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
 
   const dueDay = row.rentDueDay ?? 1
   const chargeDay = pullDay ?? dueDay
+  // Matches the late-fee engine's own fallback, so the screen and the charge
+  // never disagree about which day is safe.
+  const graceDays = row.lateFeeGraceDays ?? 5
+  // The engine fires when today >= due + grace, so the last free day is one
+  // before that. With late fees switched off entirely there is no unsafe day.
+  const lastFreeDay = row.lateFeeEnabled === false ? 28 : dueDay + graceDays - 1
   const afterDue = chargeDay > dueDay
   // A bank still verifying cannot be charged, so it must not be offered as the
   // method a monthly schedule depends on.
@@ -165,12 +174,35 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
             )}
           </div>
 
+          {/* S616 (Nic): "if people get their Social Security on the third or
+              the fifth... and it's still within the grace period, they should be
+              able to choose to have auto payment set up."
+              They always could. What was wrong was this message: ANY day after
+              the due day was called late, so a tenant paid on the 3rd with a
+              five-day grace was warned about fees they would never be charged.
+              Telling someone their rent will be penalised when it will not is
+              how you talk them out of the arrangement that would have kept them
+              current.
+              The engine charges a fee when today >= due + grace, so the last
+              free day is (due + grace − 1). Autopay initiating on that day is
+              genuinely safe: an in-flight ACH counts as paid from the day it
+              starts, so the fee never accrues while it clears. */}
           {pullDay != null && pullDay > dueDay && (
-            <div style={{ fontSize: '.74rem', color: 'var(--warn)', marginTop: 8, lineHeight: 1.5 }}>
-              Rent is due on the {ordinal(dueDay)}. Paying on the {ordinal(pullDay)} is late, so late fees
-              under your lease will apply — we can&apos;t waive those. Pick this day only if it&apos;s when
-              your money actually arrives.
-            </div>
+            pullDay <= lastFreeDay ? (
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
+                Rent is due on the {ordinal(dueDay)}, and your lease allows {graceDays} day
+                {graceDays === 1 ? '' : 's'} past that before a late fee. Paying on the{' '}
+                {ordinal(pullDay)} is inside that window — <strong>no late fee</strong>. Pick the day your
+                money actually arrives.
+              </div>
+            ) : (
+              <div style={{ fontSize: '.74rem', color: 'var(--warn)', marginTop: 8, lineHeight: 1.5 }}>
+                Rent is due on the {ordinal(dueDay)}, and your lease allows {graceDays} day
+                {graceDays === 1 ? '' : 's'} past that. Paying on the {ordinal(pullDay)} is beyond it, so
+                late fees under your lease will apply — we can&apos;t waive those. The {ordinal(lastFreeDay)} is
+                the last day without one.
+              </div>
+            )
           )}
 
           <div style={{ fontSize: '.78rem', color: 'var(--t3)', margin: '14px 0 6px' }}>Pay from</div>
