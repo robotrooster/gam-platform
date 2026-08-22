@@ -12,6 +12,7 @@ import { consumePrepaidCreditForInvoice } from '../services/prepaidRelease'
 import { createAdminNotification } from '../services/adminNotifications'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
+import { activeLinkForUnit } from '../services/crossPropertyLink'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -435,6 +436,27 @@ async function runGeneration(
       // bills + any prior-cycle stragglers (late meter readings). Bills
       // for future cycles wait their turn. Read outside the transaction
       // so the dry-run path can use the same query.
+      // S616 (Nic): CONVERGED CROSS-PROPERTY UTILITIES.
+      //
+      //   "We just need to be able to divert the utilities that go to my
+      //    property from the rent that goes to the other property."
+      //
+      // When this unit is linked to a serviced space next door, that space's
+      // utility bills ride THIS invoice — the tenant gets one document with one
+      // due date, and Nic is explicit that they see no distinction: "to them,
+      // it's all going to the same place." What differs is invisible to them
+      // and essential underneath: each of those rows is stamped with the SERVICE
+      // landlord's id, so the payout sweep (which scopes by payments.landlord_id,
+      // not by invoice) sends that money to the landlord whose meter turned.
+      const crossLink = await activeLinkForUnit(lease.unit_id)
+      if (!opts.dryRun && crossLink) {
+        // Generated against the SERVICED SPACE's unit — that is where the
+        // meters and the trash cans are assigned. It is a different unit at a
+        // different property under a different landlord from the one this
+        // lease is on.
+        await ensureBillsForUnit(crossLink.service_unit_id, dueDate)
+      }
+
       const utilityBills = await query<{
         id: string
         charge_amount: string
@@ -450,15 +472,26 @@ async function runGeneration(
                 ub.allocation_method, ub.allocation_basis, ub.rate_per_unit,
                 ub.utility_type, ub.usage_amount, ub.reading_start, ub.reading_end,
                 ub.reading_start_date, ub.reading_end_date,
+                -- S616: whose money this row is. Every utility_bills row has
+                -- always carried its own landlord_id; until now it was always
+                -- the same as the lease's, so nothing read it. On a converged
+                -- invoice it is the landlord next door.
+                ub.landlord_id AS bill_landlord_id,
+                ub.service_agreement_id,
                 m.digits
            FROM utility_bills ub
            JOIN utility_meters m ON m.id = ub.meter_id
-          WHERE ub.lease_id = $1
+          WHERE (ub.lease_id = $1
+                 -- S616: the linked serviced space's bills join this invoice.
+                 -- They carry NO lease_id and never will; the link is what puts
+                 -- them here, and $3 is NULL whenever there is no link, so an
+                 -- ordinary lease's query is unchanged.
+                 OR ub.service_agreement_id = $3)
             AND ub.payment_id IS NULL
             AND ub.status IN ('unbilled','billed')
             AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
           ORDER BY ub.billing_cycle_month ASC, ub.id ASC`,
-        [lease.id, dueDate]
+        [lease.id, dueDate, crossLink?.service_agreement_id ?? null]
       )
 
       // S533: propane fill installments not yet billed whose cycle has

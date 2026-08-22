@@ -37,7 +37,7 @@ export interface VerifyDeps {
 }
 
 /** Leading street number ("22658 Highway 89" → "22658"). */
-function streetNumber(street1: string): string | null {
+export function streetNumber(street1: string): string | null {
   return street1.match(/^\s*(\d{1,6})\b/)?.[1] ?? null
 }
 
@@ -52,7 +52,7 @@ const GENERIC_TOKENS = new Set([
   'blvd', 'boulevard', 'ct', 'court', 'cir', 'circle', 'way', 'pl', 'place',
   'hwy', 'highway', 'route', 'state', 'us', 'az', 'sr', 'trl', 'trail', 'loop',
 ])
-function streetTokens(street1: string): string[] {
+export function streetTokens(street1: string): string[] {
   return street1
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
