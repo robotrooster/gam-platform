@@ -1514,3 +1514,110 @@ describe('reading multiplier (S613)', () => {
     expect(Number(rows[0].usage_amount)).toBe(200)
   })
 })
+
+// S614 (Nic, LAUNCH-CRITICAL): "We already collect from those units next door.
+// That's seventy-five dollars in trash cans and utilities on one electric
+// submeter from next door."
+//
+// A space the landlord SERVICES but does not lease. No lease exists or ever
+// will, so the payer comes from a utility service agreement.
+describe('cross-property utility service (S614)', () => {
+  async function servicedSpace(base: BaseCtx) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(`UPDATE units SET status = 'utility_service' WHERE id = $1`, [unitId])
+      const { rows: [sa] } = await c.query(
+        `INSERT INTO utility_service_agreements (landlord_id, unit_id, tenant_id, start_date)
+         VALUES ($1, $2, $3, '2020-01-01') RETURNING id`,
+        [base.landlordId, unitId, tenantId])
+      await c.query('COMMIT')
+      return { unitId, tenantId, agreementId: sa.id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('bills a flat trash charge to a serviced space with no lease', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await (async () => {
+      const c = await db.connect()
+      let id = ''
+      try {
+        await c.query('BEGIN')
+        id = await seedUtilityMeter(c, { propertyId: base.propertyId })
+        await c.query('COMMIT')
+      } finally { c.release() }
+      await db.query(
+        `UPDATE utility_meters SET billing_method='flat_rate', utility_type='trash', digits=NULL WHERE id=$1`, [id])
+      await db.query(
+        `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit, base_fee)
+         VALUES ($1,'trash',25,0) ON CONFLICT (property_id, utility_type)
+         DO UPDATE SET rate_per_unit = EXCLUDED.rate_per_unit`, [base.propertyId])
+      return id
+    })()
+
+    const svc = await servicedSpace(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    // Three cans next door — the $75 Nic is already collecting.
+    await db.query(
+      `UPDATE utility_meter_units SET quantity = 3 WHERE meter_id = $1 AND unit_id = $2`,
+      [meterId, svc.unitId])
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+
+    const { rows } = await db.query<any>(
+      `SELECT tenant_id, lease_id, service_agreement_id, charge_amount
+         FROM utility_bills WHERE meter_id = $1`, [meterId])
+    expect(Number(rows[0].charge_amount)).toBe(75)
+    expect(rows[0].tenant_id).toBe(svc.tenantId)   // a real payer
+    expect(rows[0].lease_id).toBeNull()            // but no tenancy
+    expect(rows[0].service_agreement_id).toBe(svc.agreementId)
+  })
+
+  // The lease-responsibility gate cannot apply here: it asks whether a signed
+  // lease passes a utility through, and utilities are the ONLY thing owed.
+  it('needs no lease-responsibility row — agreeing to the service IS the responsibility', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await (async () => {
+      const c = await db.connect()
+      let id = ''
+      try { await c.query('BEGIN'); id = await seedUtilityMeter(c, { propertyId: base.propertyId }); await c.query('COMMIT') }
+      finally { c.release() }
+      await db.query(`UPDATE utility_meters SET rate_per_unit = 0.21 WHERE id = $1`, [id])
+      return id
+    })()
+    const svc = await servicedSpace(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await seedReading(meterId, '2026-03-01', 1000, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 1100, base.landlordUserId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount, service_agreement_id FROM utility_bills WHERE meter_id = $1`, [meterId])
+    expect(Number(rows[0].charge_amount)).toBe(21)   // 100 kWh x $0.21
+    expect(rows[0].service_agreement_id).toBe(svc.agreementId)
+  })
+
+  it('an ended agreement stops billing', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await (async () => {
+      const c = await db.connect()
+      let id = ''
+      try { await c.query('BEGIN'); id = await seedUtilityMeter(c, { propertyId: base.propertyId }); await c.query('COMMIT') }
+      finally { c.release() }
+      await db.query(`UPDATE utility_meters SET rate_per_unit = 0.21 WHERE id = $1`, [id])
+      return id
+    })()
+    const svc = await servicedSpace(base)
+    await attachMeterToUnit(meterId, svc.unitId)
+    await db.query(`UPDATE utility_service_agreements SET status='ended', end_date='2020-06-01' WHERE id=$1`,
+      [svc.agreementId])
+    await seedReading(meterId, '2026-03-01', 1000, base.landlordUserId)
+    await seedReading(meterId, '2026-04-01', 1100, base.landlordUserId)
+    const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
+    expect(res.billsCreated).toBe(0)
+  })
+})

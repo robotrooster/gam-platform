@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 2tjpw2BnoecgdRuGRhJECI3PgBiyGDKqqNpgbuiE6TlauqGrQrl9G5ZxEEA9qXU
+\restrict wvfXDaL5c3WA8CkvNp92a3gA1LUV5rZf9oqTbFh8zSyV8TdBkSarLbXdYzGD1a3
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8484,7 +8484,7 @@ CREATE TABLE public.units (
     CONSTRAINT units_owner_household_size_check CHECK (((owner_household_size >= 1) AND (owner_household_size <= 30))),
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
-    CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text, 'owner_use'::text]))),
+    CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text, 'owner_use'::text, 'utility_service'::text]))),
     CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
 );
 
@@ -8493,7 +8493,7 @@ CREATE TABLE public.units (
 -- Name: COLUMN units.status; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.units.status IS 'vacant | available | active | delinquent | suspended | owner_use. S604: owner_use = owner-occupied — no lease, no rent, not bookable, counts as occupied, never billed the per-unit platform fee.';
+COMMENT ON COLUMN public.units.status IS 'S614: adds ''utility_service'' — a space this landlord bills utilities for but does not own or lease (next door, cross-property). Never rentable, never listed, never bookable; it exists to hold meter assignments and a payer.';
 
 
 --
@@ -8728,7 +8728,7 @@ CREATE TABLE public.utility_bills (
     meter_id uuid NOT NULL,
     unit_id uuid NOT NULL,
     tenant_id uuid NOT NULL,
-    lease_id uuid NOT NULL,
+    lease_id uuid,
     landlord_id uuid NOT NULL,
     billing_cycle_month date NOT NULL,
     usage_amount numeric(12,4),
@@ -8752,6 +8752,8 @@ CREATE TABLE public.utility_bills (
     reading_end numeric,
     reading_start_date date,
     reading_end_date date,
+    service_agreement_id uuid,
+    CONSTRAINT utility_bills_payer_source_check CHECK (((lease_id IS NOT NULL) <> (service_agreement_id IS NOT NULL))),
     CONSTRAINT utility_bills_status_check CHECK ((status = ANY (ARRAY['unbilled'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'void'::text]))),
     CONSTRAINT utility_bills_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
 );
@@ -8769,6 +8771,13 @@ COMMENT ON COLUMN public.utility_bills.rate_per_unit IS 'S607: the rate this bil
 --
 
 COMMENT ON COLUMN public.utility_bills.reading_end_date IS 'S607: the date of the closing read. Both A.R.S. § 33-1413.01(A) and § 33-1314.01(E)(1) require each bill to show the opening and closing readings AND their dates.';
+
+
+--
+-- Name: COLUMN utility_bills.service_agreement_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_bills.service_agreement_id IS 'S614: set when this bill is for a space the landlord SERVICES but does not lease (cross-property utilities). Mutually exclusive with lease_id.';
 
 
 --
@@ -8974,6 +8983,28 @@ CREATE TABLE public.utility_reading_runs (
     billed_total numeric(12,2),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT utility_reading_runs_status_check CHECK ((status = ANY (ARRAY['open'::text, 'double_check'::text, 'completed'::text])))
+);
+
+
+--
+-- Name: utility_service_agreements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_service_agreements (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    service_address text,
+    note text,
+    status text DEFAULT 'active'::text NOT NULL,
+    start_date date DEFAULT CURRENT_DATE NOT NULL,
+    end_date date,
+    superseded_by_lease_id uuid,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT utility_service_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
 );
 
 
@@ -12207,6 +12238,14 @@ ALTER TABLE ONLY public.utility_reading_runs
 
 ALTER TABLE ONLY public.utility_reading_runs
     ADD CONSTRAINT utility_reading_runs_property_id_billing_cycle_month_key UNIQUE (property_id, billing_cycle_month);
+
+
+--
+-- Name: utility_service_agreements utility_service_agreements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_pkey PRIMARY KEY (id);
 
 
 --
@@ -15881,6 +15920,13 @@ CREATE INDEX idx_utility_bills_landlord_cycle ON public.utility_bills USING btre
 
 
 --
+-- Name: idx_utility_bills_service_agreement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_bills_service_agreement ON public.utility_bills USING btree (service_agreement_id) WHERE (service_agreement_id IS NOT NULL);
+
+
+--
 -- Name: idx_utility_bills_status_unbilled; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15955,6 +16001,20 @@ CREATE INDEX idx_utility_reading_runs_landlord ON public.utility_reading_runs US
 --
 
 CREATE INDEX idx_utility_reading_runs_open ON public.utility_reading_runs USING btree (property_id) WHERE (status = 'open'::text);
+
+
+--
+-- Name: idx_utility_service_agreements_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_service_agreements_landlord ON public.utility_service_agreements USING btree (landlord_id, status);
+
+
+--
+-- Name: idx_utility_service_agreements_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_service_agreements_tenant ON public.utility_service_agreements USING btree (tenant_id);
 
 
 --
@@ -16585,6 +16645,13 @@ CREATE UNIQUE INDEX ux_users_landlord_invite_token ON public.users USING btree (
 --
 
 CREATE UNIQUE INDEX ux_users_tenant_invite_token ON public.users USING btree (tenant_invite_token) WHERE (tenant_invite_token IS NOT NULL);
+
+
+--
+-- Name: ux_utility_service_agreement_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_utility_service_agreement_live ON public.utility_service_agreements USING btree (unit_id) WHERE (status = 'active'::text);
 
 
 --
@@ -17355,6 +17422,13 @@ CREATE TRIGGER audit_utility_meter_readings AFTER DELETE OR UPDATE ON public.uti
 --
 
 CREATE TRIGGER audit_utility_meters AFTER DELETE OR UPDATE ON public.utility_meters FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: utility_service_agreements audit_utility_service_agreements; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_service_agreements AFTER DELETE OR UPDATE ON public.utility_service_agreements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -23125,6 +23199,14 @@ ALTER TABLE ONLY public.utility_bills
 
 
 --
+-- Name: utility_bills utility_bills_service_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_service_agreement_id_fkey FOREIGN KEY (service_agreement_id) REFERENCES public.utility_service_agreements(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: utility_bills utility_bills_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23253,6 +23335,46 @@ ALTER TABLE ONLY public.utility_reading_runs
 
 
 --
+-- Name: utility_service_agreements utility_service_agreements_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: utility_service_agreements utility_service_agreements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: utility_service_agreements utility_service_agreements_superseded_by_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_superseded_by_lease_id_fkey FOREIGN KEY (superseded_by_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: utility_service_agreements utility_service_agreements_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: utility_service_agreements utility_service_agreements_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_service_agreements
+    ADD CONSTRAINT utility_service_agreements_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: vehicles vehicles_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23328,5 +23450,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 2tjpw2BnoecgdRuGRhJECI3PgBiyGDKqqNpgbuiE6TlauqGrQrl9G5ZxEEA9qXU
+\unrestrict wvfXDaL5c3WA8CkvNp92a3gA1LUV5rZf9oqTbFh8zSyV8TdBkSarLbXdYzGD1a3
 

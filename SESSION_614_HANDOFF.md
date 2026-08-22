@@ -9,6 +9,10 @@ Supersedes SESSION_612_HANDOFF.md.
 
 ## 0. NIC'S IMMEDIATE PATH
 
+0. **Billing next door is LAUNCH-CRITICAL and HALF BUILT — see §1.** The
+   backend can attribute and price a bill for a space with no lease; nothing can
+   create one, invoice it, or collect it yet.
+
 1. **Opening reads are DONE.** All 20 electric submeters and all 7 water
    submeters are read. The two water MASTERS need no opening read — both are RUBS
    on the `bill_amount` basis, which divides the provider's invoice total rather
@@ -27,66 +31,96 @@ Supersedes SESSION_612_HANDOFF.md.
 
 ---
 
-## 1. THE NEXT BUILD — UTILITY CUSTOMERS ACROSS PROPERTY LINES
+## 1. THE NEXT BUILD — BILLING UTILITIES NEXT DOOR (LAUNCH-CRITICAL, HALF DONE)
 
-**Designed with Nic this session, NOT built.** Read this before touching it; the
-fee model is subtle and I got it wrong twice in conversation before he corrected
-me.
+**Nic:** *"We need to fix the billing for utilities next door immediately,
+because we already collect from those units next door. That is an Oak Park launch
+necessity. That's seventy-five dollars in trash cans and utilities on one
+electric submeter from next door."*
+
+**READ THIS FIRST: the backend foundation is BUILT AND GREEN. There is no UI, no
+invoice path and no portal access yet, so nothing bills anybody yet.** Nic asked
+for a handoff before this was started; it was started anyway. The half that
+exists is coherent, migrated and tested — it is not a stub to be thrown away —
+but do not assume any of the missing half exists.
 
 ### The situation
 
-Oak Park's power and trash cross the property line. An apartment next door
-(family-owned) draws Oak Park's electric; three units next door use Oak Park's
-trash. Nic: *"There's a lot of landlords around the country that have pieced
-stuff in over the years. Stuff has been sold, stuff is not necessarily up to code
-or legal, but landlords just operate it how it was when they bought it. We should
-have some smoothness to those potential hiccups."*
+Oak Park's trash and power feed spaces that are NOT Oak Park units and never will
+be — different owner, no lease, no tenancy. Three units next door on Oak Park's
+trash ($25 × 3 = $75/mo) and one apartment on an Oak Park electric submeter. Nic
+already collects this money by hand.
 
-### The model Nic decided
+Nic: *"There's a lot of landlords around the country that have pieced stuff in
+over the years. Stuff has been sold, stuff is not necessarily up to code or
+legal, but landlords just operate it how it was when they bought it."*
 
-**One person, one portal, one balance.** A utility-only customer gets a REAL
-tenant portal account and pays their own bill — *"otherwise the landlord has to
-bother to take cash from the other property."* Not a statement emailed out; the
-portal.
+### The model Nic decided (his words, corrected me twice — get it right)
 
-**The $2 is per OCCUPIED UNIT — never per person, never per billing
-relationship.** Two people in one unit is $2, not $4. A unit is "occupied" by the
-utility-billing landlord BECAUSE OF the utilities; when a lease is later put in
-place by the landlord who owns that space, it becomes physically occupied under
-them. Nic: *"Think of it as being occupied by the first landlord because of
-utilities, and then being occupied physically on the system because of a lease,
-as a SUPERSEDENCE event."*
+**"It is technically a unit."** The space is a REAL unit at Oak Park with
+`status = 'utility_service'`, so it carries meter assignments, a trash-can
+quantity and a share of a RUBS pool like any other. What it has no lease.
 
-**The handoff has no mid-month conflict**, because of the existing no-double-bill
-grace (`gam-no-double-bill-grace`): a newly onboarded landlord is free until
-their SECOND billing cycle — 31 to 59 days. That second period belongs wholly to
-the incoming landlord and comes off the utility-billing landlord. One $2, one
-owner, no proration, no overlap.
+**A SERVICE AGREEMENT names who pays**, because no lease will ever exist.
+
+**They get the full tenant portal.** *"That person should really have access to
+the tenant portal to get on and pay their bill. Otherwise the landlord has to
+bother to take cash from the other property."*
+
+**$2 is per OCCUPIED UNIT — never per person, never per billing relationship.**
+Two people in one unit is $2, not $4. A unit is occupied by the utility-billing
+landlord BECAUSE OF the utilities; when the space's real owner onboards and puts
+a lease on it, it becomes physically occupied under them — *"a SUPERSEDENCE
+event"*. The $2 moves and is never charged twice for one space.
+
+**No mid-month conflict**, because of the existing no-double-bill grace: an
+incoming landlord is free until their SECOND billing cycle (31–59 days), and that
+cycle belongs wholly to them.
 
 **Same person, same login, no duplicate account** when their space is onboarded.
 
-### What already exists in our favour
+### WHAT IS BUILT (migrated, tested, deployed)
 
-- **Every charge row on an invoice carries its own `landlord_id`.** Rent and
-  electric are separate `payments` rows and money routes per row, so "one
-  balance, two destinations" is an unlock rather than a rewrite.
-- `payments.revenue_owner` ('landlord' | 'gam') is a DIFFERENT axis — GAM's cut
-  vs the landlord's. It does not distinguish two landlords. Don't overload it.
+- `utility_service_agreements` — landlord, unit, paying tenant, service address,
+  status, dates, `superseded_by_lease_id`, audit trigger. One live agreement per
+  unit (unique partial index).
+- `units.status` accepts `'utility_service'`.
+- `utility_bills.lease_id` is NULLABLE, with `service_agreement_id` and a CHECK
+  that exactly one of the two is set. `tenant_id` stays NOT NULL — every bill has
+  a payer.
+- **`tryInsertBill` finds a payer from a service agreement** when there is no
+  lease. Deliberately NO lease-responsibility gate on that path: that gate asks
+  whether a signed lease passes a utility through, and here utilities are the
+  ONLY thing owed — agreeing to the service IS the responsibility.
+- **`platformFee` counts serviced spaces** toward the $2, dropped the moment
+  `superseded_by_lease_id` is set.
+- Tests: flat trash at 3 cans billing $75 to a lease-less space, a submetered
+  electric charge, an ended agreement billing nothing.
 
-### What has to be built
+### WHAT IS NOT BUILT
 
-- A meter's served units may only be units at its own property. Cross-property
-  service needs the other landlord's **consent** (accept/decline) — nobody
-  attaches a meter to someone else's tenant unilaterally.
-- Utility rows stamp the **meter owner's** landlord id, not the lease's.
-- A billable party with a portal, a meter and no lease.
-- The $2 follows the unit: utility landlord when no lease exists, the space's
-  landlord once one does, never both.
+1. **No way to create any of it in the UI.** No route, no screen — no POST for a
+   service agreement, no way to mint a `utility_service` unit, nothing on the
+   Utilities or Units pages.
+2. **No invoice path.** `invoiceGeneration` iterates ACTIVE LEASES only, so these
+   bills are written to `utility_bills` and never reach an invoice or a payment.
+   **This is the biggest remaining piece** — it needs a parallel driver that
+   sweeps a service agreement's unbilled utility bills onto an invoice with no
+   rent row.
+3. **No portal access.** The payer needs a `tenants` + `users` row and the tenant
+   invite flow; the tenant portal assumes a lease in places (rent card, lease
+   page) and must tolerate its absence.
+4. **No supersedence trigger.** `superseded_by_lease_id` is never SET by anything
+   — when the neighbour's landlord onboards, something has to notice and stamp it.
+5. **Cross-landlord routing (Scenario A) not started.** A meter serving a unit at
+   ANOTHER landlord's property, with consent, utility rows stamped with the meter
+   owner's landlord id. Every charge row already carries its own `landlord_id`,
+   so this is an unlock rather than a rewrite — but none of it is done.
 
-**Nic has NOT scheduled this.** He dismissed the timing question — do not start
-it without him saying so.
+### Sequence I would follow
 
----
+Invoice path → create/manage routes + UI → portal access → supersedence stamp →
+cross-landlord consent. Nic can bill and collect after the first three.
 
 ## 2. SUBTYPES, PRICING AND THE ANTI-DISCRIMINATION LINE
 
@@ -273,7 +307,7 @@ possible — formatting an already-formatted number leaves it alone.
 
 | | |
 |---|---|
-| Units | 30, **all `vacant`** — owner-occupied ones not yet marked |
+| Units | 30, **all `vacant`** — owner-occupied ones not yet marked. The next-door spaces are NOT created yet (§1) |
 | Leases / tenants | **none** |
 | Electric | 20 submeters, all assigned, **all 20 read** |
 | Electric widths | **4-digit:** RV 01, 26, 27, 31, 32, 33, 34, 35, 36, 37 · **5-digit:** RV 02, 03, 20, 22, 23, 24, 25, 28, 29, 30 |
@@ -321,7 +355,13 @@ Carried forward from S612, all still true, plus what this session taught:
 `..250000_drop_propane_accelerated`, `..260000_retire_resident_home_sales`,
 `..270000_propane_delivery_fee`, `20260821090000_work_trade_covered_charges`,
 `..100000_flat_charge_quantity`, `..140000_audit_meter_readings`,
-`..160000_meter_reading_multiplier`.
+`..160000_meter_reading_multiplier`, `..180000_utility_service_agreements`,
+`..190000_utility_bills_service_agreement`, `..200000_fix_unit_status_check`.
+
+**A caution from S614:** `..180000` rewrote `units_status_check` from memory and
+silently dropped `'available'`, breaking mark-available until `..200000` restored
+it. The authoritative list is `UNIT_STATUSES` in `packages/shared` — read it
+before restating a CHECK, never retype one from memory.
 
 **New services/routes:** `services/unitSubtype.ts`,
 `GET /utility/recovery`, `PATCH /utility/meters/:id/readings/:readingId`,

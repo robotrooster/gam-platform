@@ -119,7 +119,10 @@ describe('GET /work-trade', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('active')
     expect(res.body.data.duties).toBe('groundskeeping')
-    expect(res.body.data.unit_number).toMatch(/^U-/)
+    // S613: seeded unit numbers are CANONICALISED like production ones, and an
+    // all-digit hex suffix canonicalises 'U-123456' → 'U 123456' (hyphen to
+    // space). Either shape is the same seeded unit.
+    expect(res.body.data.unit_number).toMatch(/^U[- ]/)
     expect(res.body.data.property_name).toBe('Test Property')
   })
 

@@ -1225,14 +1225,33 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
        LIMIT 1
     `, [args.unitId, args.cycleMonth])
   }
-  if (!lt) return false  // no attributable tenant — landlord absorbs
-
-  // Tenant responsibility gate.
-  const resp = await queryOne<{ tenant_responsible: boolean }>(`
-    SELECT tenant_responsible FROM lease_utility_responsibilities
-     WHERE lease_id = $1 AND utility_type = $2
-  `, [lt.lease_id, args.utilityType])
-  if (!resp || !resp.tenant_responsible) return false
+  // S614 (Nic, LAUNCH): a space this landlord SERVICES but does not lease — the
+  // apartment and the three trash cans next door. No lease will ever exist for
+  // it, so the payer comes from a utility service agreement instead.
+  //
+  // There is no lease-responsibility gate here, and there cannot be: that gate
+  // asks "does the signed lease pass this utility through", and the whole point
+  // of a service agreement is that utilities are the ONLY thing owed. Agreeing
+  // to the service IS the responsibility.
+  let serviceAgreementId: string | null = null
+  if (!lt) {
+    const sa = await queryOne<{ id: string; tenant_id: string }>(`
+      SELECT id, tenant_id FROM utility_service_agreements
+       WHERE unit_id = $1 AND status = 'active'
+         AND start_date <= ($2::date + interval '1 month' - interval '1 day')
+         AND (end_date IS NULL OR end_date >= $2::date)
+       LIMIT 1`, [args.unitId, args.cycleMonth])
+    if (!sa) return false  // no attributable payer — landlord absorbs
+    serviceAgreementId = sa.id
+    lt = { lease_id: null as any, tenant_id: sa.tenant_id }
+  } else {
+    // Tenant responsibility gate — leases only. See the S610 handoff §1a.
+    const resp = await queryOne<{ tenant_responsible: boolean }>(`
+      SELECT tenant_responsible FROM lease_utility_responsibilities
+       WHERE lease_id = $1 AND utility_type = $2
+    `, [lt.lease_id, args.utilityType])
+    if (!resp || !resp.tenant_responsible) return false
+  }
 
   try {
     await query(`
@@ -1241,8 +1260,9 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
          billing_cycle_month, usage_amount, allocation_method,
          allocation_basis, rate_per_unit, base_fee_share, charge_amount,
          tax_rate_pct, tax_amount, utility_type, sewer_rate_per_unit,
-         reading_start, reading_end, reading_start_date, reading_end_date)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         reading_start, reading_end, reading_start_date, reading_end_date,
+         service_agreement_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
     `, [
       args.meterId, args.unitId, lt.tenant_id, lt.lease_id, args.landlordId,
       args.cycleMonth, args.usageAmount, args.allocationMethod,
@@ -1255,6 +1275,7 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
       args.readingEnd ?? null,
       args.readingStartDate ?? null,
       args.readingEndDate ?? null,
+      serviceAgreementId,
     ])
     return true
   } catch (e: any) {

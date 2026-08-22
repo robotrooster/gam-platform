@@ -102,6 +102,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // cleanupAllSchema on leases/users delete.
   await db.query(`DELETE FROM flexpay_advances`)
   await db.query(`DELETE FROM utility_bills`)
+  // S614: a service agreement holds units + tenants with RESTRICT, and its bills
+  // reference it, so it clears after the bills and before units/tenants below.
+  await db.query(`DELETE FROM utility_service_agreements`)
   // S533: propane installments FK payments (NO ACTION) — clear the
   // child before payments get wiped; fills cascade from installments'
   // parent delete order (fills → installments is CASCADE, but the

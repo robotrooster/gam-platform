@@ -91,6 +91,21 @@ export async function platformFeesByProperty(
         WHERE u.property_id = p.id AND l.status='active'
           AND l.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
           AND (l.end_date IS NULL OR l.end_date >= m.month)) AS long_term,
+      -- S614 (Nic): a space this landlord bills utilities for is an OCCUPIED
+      -- UNIT — "it is technically a unit, so it needs to be billed at two
+      -- dollars." Occupied by THIS landlord because of the utilities.
+      --
+      -- Dropped the moment a LEASE supersedes it: when the space's real owner
+      -- onboards and puts a tenancy on it, the $2 follows the unit to them and
+      -- is never charged twice for the one space. No mid-month conflict —
+      -- the incoming landlord is inside the no-double-bill grace until their
+      -- second cycle, and that cycle is wholly theirs.
+      (SELECT COUNT(DISTINCT sa.unit_id)::int
+         FROM utility_service_agreements sa JOIN units u ON u.id = sa.unit_id
+        WHERE u.property_id = p.id AND sa.status = 'active'
+          AND sa.superseded_by_lease_id IS NULL
+          AND sa.start_date <= (m.month + INTERVAL '1 month' - INTERVAL '1 day')
+          AND (sa.end_date IS NULL OR sa.end_date >= m.month)) AS utility_service,
       COALESCE((SELECT SUM(GREATEST(
             LEAST(b.check_out, m.month + INTERVAL '1 month')::date
               - GREATEST(b.check_in, m.month)::date, 0))
@@ -131,7 +146,10 @@ export async function platformFeesByProperty(
   for (const r of est) {
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
-    const billable = parseInt(r.long_term, 10) + Math.ceil(parseInt(r.nights, 10) / 30)
+    // S614: a serviced space counts exactly once, like any occupied unit.
+    const billable = parseInt(r.long_term, 10)
+      + parseInt(r.utility_service ?? '0', 10)
+      + Math.ceil(parseInt(r.nights, 10) / 30)
     // S538: short-stays on non-rv_spot types bill str_pct of pro-rated
     // revenue instead of nights/30; the fee folds UNDER the property min.
     const strFee = round2(strPct * parseFloat(r.str_revenue ?? '0'))
