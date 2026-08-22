@@ -963,11 +963,17 @@ export function schedulerInit() {
   //
   // S616: the engine no longer self-gates to Tuesday. It measures every
   // landlord's rent roll EVERY weekday, because a threshold can be crossed on
-  // any of them, and schedules the payout four days out. Tuesday still governs
-  // the short-term-stay stream, PM companies, businesses, and any landlord with
-  // no rent roll to measure (S561, D1: lands the bank by Friday at T+1-T+2),
-  // shifted forward over US federal holidays.
-  cron.schedule('0 9 * * 1-5', async () => {
+  // any of them, and schedules the payout four BUSINESS days out (S617 — Stripe
+  // releases an ACH four business days out, and the calendar count this used to
+  // do fired before the money existed). Tuesday still governs the
+  // short-term-stay stream, PM companies, businesses, and any landlord with no
+  // rent roll to measure, shifted forward over US federal holidays.
+  // S617 (Nic): "an hour after the money becomes available." Stripe releases
+  // funds at a hard 00:00:00 UTC boundary on the available_on date, so this
+  // runs at 01:00 UTC — not 9am Phoenix, which was sixteen hours late and cost
+  // the landlord most of a business day at his own bank. UTC, because that is
+  // the frame available_on is expressed in and the engine now counts in it too.
+  cron.schedule('0 1 * * 1-5', async () => {
     try {
       const { processAutoPayouts } = await import('./autoPayouts')
       const result = await processAutoPayouts()
@@ -977,7 +983,7 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[auto-payouts] fatal')
     }
-  }, { timezone: 'America/Phoenix' })
+  }, { timezone: 'UTC' })
 
   // S616 (Nic): link a neighbour's serviced space to the unit its own landlord
   // leases, automatically. "We are gonna be linking the units on the back end

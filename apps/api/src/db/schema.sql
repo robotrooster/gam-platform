@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict w74tlBnjNxVqfdG51IS40LTP8HrSDp38UX7rFqp2hA2gfVTBfeI9Tv8THmD5FUT
+\restrict GWA1t4SaRzPKIdccRfq8KZ1N2OZiucAh8HGg7WgfQThkT8s4705gCcADWXljPeh
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5208,6 +5208,7 @@ CREATE TABLE public.payout_triggers (
     skipped_reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    defer_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT payout_triggers_entity_kind_check CHECK ((entity_kind = ANY (ARRAY['user'::text, 'pm_company'::text, 'business'::text]))),
     CONSTRAINT payout_triggers_trigger_kind_check CHECK ((trigger_kind = ANY (ARRAY['threshold_50'::text, 'threshold_90'::text, 'monthly_sweep'::text])))
 );
@@ -5218,6 +5219,13 @@ CREATE TABLE public.payout_triggers (
 --
 
 COMMENT ON TABLE public.payout_triggers IS 'S616: what earned a landlord payout and when it is scheduled. At most three rows per Connect account per rent cycle — 50% of units paid, 90%, and a guaranteed late-month sweep — so the per-initiation cost is capped at $0.75 a month and known in advance.';
+
+
+--
+-- Name: COLUMN payout_triggers.defer_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payout_triggers.defer_count IS 'S617: times this trigger fired into an empty balance and was pushed to the next business day rather than retired. Capped in code (MAX_DEFERRALS).';
 
 
 --
@@ -23950,5 +23958,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict w74tlBnjNxVqfdG51IS40LTP8HrSDp38UX7rFqp2hA2gfVTBfeI9Tv8THmD5FUT
+\unrestrict GWA1t4SaRzPKIdccRfq8KZ1N2OZiucAh8HGg7WgfQThkT8s4705gCcADWXljPeh
 

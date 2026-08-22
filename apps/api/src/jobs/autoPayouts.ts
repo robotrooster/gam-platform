@@ -49,7 +49,7 @@ import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '
 import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
 import {
   rollProgressForLandlordUser, claimThresholdIfReached, claimMonthlySweep,
-  dueTriggers, markTriggerFired, hasShortTermActivity,
+  dueTriggers, markTriggerFired, deferTrigger, hasShortTermActivity,
 } from '../services/payoutTriggers'
 import { logger } from '../lib/logger'
 
@@ -68,7 +68,23 @@ export const US_FEDERAL_HOLIDAYS = {
   has: (iso: string): boolean => isUsFederalHoliday(iso),
 }
 
-const TZ = 'America/Phoenix'
+// S617 (Nic): "I think we should do that an hour after the money becomes
+// available. The sooner it can get to the landlords, the more they're gonna
+// appreciate it."
+//
+// This engine used to think in Phoenix dates and run at 9am Phoenix — sixteen
+// hours after Stripe releases the money, because available_on is a hard
+// 00:00:00 UTC boundary (verified on both a live card and a live ACH in the
+// account: Thu 2026-08-13 00:00:00 and Tue 2026-08-25 00:00:00, and a payout
+// created at 00:18:00 UTC on the availability date went through).
+//
+// It now runs at 01:00 UTC and counts in UTC. ONE frame, and it is Stripe's
+// own: a trigger's scheduled_for is an available_on date, so comparing it to a
+// Phoenix date would have missed it by a day, and running two frames into the
+// same Stripe idempotency key (auto_payout_<account>_<today>) is how a landlord
+// gets paid twice. The weekly stream's "Tuesday" is now Tuesday UTC, which
+// initiates Monday evening Phoenix and lands at the bank on the same schedule.
+const TZ = 'UTC'
 
 // ============================================================================
 // Date helpers (timezone-aware via Intl)
@@ -160,6 +176,7 @@ export interface PayoutResult {
   candidatesScanned: number
   payoutsFired: number
   skippedZeroBalance: number
+  triggersDeferred: number
   skippedAlreadyPaidThisWeek: number
   payoutsFailed: number
   errors: { entity: string; entity_id: string; account: string; error: string }[]
@@ -187,6 +204,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     candidatesScanned: 0,
     payoutsFired: 0,
     skippedZeroBalance: 0,
+    triggersDeferred: 0,
     skippedAlreadyPaidThisWeek: 0,
     payoutsFailed: 0,
     errors: [],
@@ -355,13 +373,27 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       else if (fired === 'already_paid_this_week')result.skippedAlreadyPaidThisWeek++
       else if (fired === 'failed')                result.payoutsFailed++
 
-      // S616: retire this candidate's due triggers whatever the outcome. A
-      // firing that found nothing is NOT a failure — the tenants paid but
-      // Stripe has not released it yet — and it must still be marked, or it
-      // would re-fire every day and spend the cycle's whole budget on empty
-      // payouts. The money it was waiting for rides the next trigger.
+      // S616/S617: settle up this candidate's due triggers.
+      //
+      // A firing that found nothing is not a failure — the tenants paid and
+      // Stripe has not released it yet, or our own webhook has not landed. S616
+      // retired the trigger anyway so it could not re-fire every day and burn
+      // the cycle's budget on empty payouts. That was right for a 16-hour-late
+      // firing and wrong for a 1-hour-early one: an empty firing never calls
+      // Stripe at all (processOneCandidate returns before creating the payout),
+      // so it costs NOTHING, and retiring it spent one of the landlord's three
+      // payouts on nothing.
+      //
+      // So an empty one is now PUSHED to the next business day, up to
+      // MAX_DEFERRALS. Everything else — a real payout, an already-paid, a
+      // failure — retires as before. The daily-refire worry S616 had is handled
+      // by the deferral cap, not by throwing the trigger away.
       if (cand.kind === 'user') {
         for (const t of due.filter(x => x.entity_kind === 'user' && x.entity_id === cand.entity_id)) {
+          if (fired === 'zero_balance' && await deferTrigger(t.id, today)) {
+            result.triggersDeferred++
+            continue
+          }
           await markTriggerFired(t.id, fired === 'fired' ? undefined : fired)
         }
       }
@@ -397,7 +429,11 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
       `SELECT 1 FROM disbursements
         WHERE user_id = $1
           AND trigger_type = 'auto_friday'
-          AND created_at >= $2::date
+          -- S617: the frame matters now. This database runs in Phoenix, so a
+          -- bare $2::date would mean midnight PHOENIX (07:00 UTC) while the
+          -- engine fires at 01:00 UTC — the guard would stop matching its own
+          -- payouts. Anchored to UTC, the frame today is computed in.
+          AND created_at >= ($2::date AT TIME ZONE 'UTC')
         LIMIT 1`,
       [cand.entity_id, today]
     )

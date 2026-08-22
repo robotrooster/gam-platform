@@ -22,7 +22,8 @@ import {
 } from '../test/dbHelpers'
 import {
   rollProgressForLandlordUser, claimThresholdIfReached, claimMonthlySweep,
-  dueTriggers, markTriggerFired, SETTLE_LEAD_DAYS, hasShortTermActivity,
+  dueTriggers, markTriggerFired, deferTrigger, MAX_DEFERRALS,
+  SETTLE_LEAD_DAYS, hasShortTermActivity,
 } from './payoutTriggers'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -315,5 +316,95 @@ describe('short-term stays keep the weekly cadence (S616)', () => {
     await bookNightly(f.landlordId, f.unitIds[0], '2026-03-10', '2026-03-14')
     const p = await rollProgressForLandlordUser(f.userId, CYCLE)
     expect(p.unitsTotal).toBe(4)
+  })
+})
+
+
+// ============================================================
+// S617 — an empty firing is free, so it must not burn a payout.
+//
+// Nic asked for the payout to fire an hour after Stripe releases the money
+// instead of sixteen. That leaves our own database an hour to have processed
+// the payment_intent.succeeded webhook, so a firing landing on nothing is now
+// a normal event rather than a rare one. A zero-balance firing never calls
+// Stripe (processOneCandidate returns before creating the payout), so pushing
+// it to the next business day costs nothing, while retiring it spent one of
+// the landlord's three payouts for the month.
+// ============================================================
+describe('deferring a trigger instead of retiring it (S617)', () => {
+  async function aTrigger(today = TODAY) {
+    const f = await landlordWithRoll(10)
+    await markPaid(f.unitIds, 5)
+    const p = await rollProgressForLandlordUser(f.userId, CYCLE)
+    await claimThresholdIfReached('user', f.userId, CYCLE, today, p)
+    const [t] = await dueTriggers('2099-01-01')
+    return t
+  }
+
+  it('pushes the trigger to the next business day and leaves it unfired', async () => {
+    const t = await aTrigger()
+    expect(await deferTrigger(t.id, '2026-03-06')).toBe(true)
+
+    const row = await db.query(
+      `SELECT scheduled_for::text, defer_count, fired_at FROM payout_triggers WHERE id = $1`,
+      [t.id])
+    expect(row.rows[0].scheduled_for).toBe('2026-03-09')  // Fri -> Mon
+    expect(row.rows[0].defer_count).toBe(1)
+    expect(row.rows[0].fired_at).toBeNull()
+  })
+
+  it('steps the deferral over a holiday too', async () => {
+    const t = await aTrigger()
+    // Fri 2026-09-04 -> Mon Sep 7 is Labor Day -> Tue Sep 8.
+    expect(await deferTrigger(t.id, '2026-09-04')).toBe(true)
+    const row = await db.query(
+      `SELECT scheduled_for::text FROM payout_triggers WHERE id = $1`, [t.id])
+    expect(row.rows[0].scheduled_for).toBe('2026-09-08')
+  })
+
+  it('gives up after MAX_DEFERRALS so a dry landlord cannot defer forever', async () => {
+    const t = await aTrigger()
+    let day = '2026-03-06'
+    for (let i = 0; i < MAX_DEFERRALS; i++) {
+      expect(await deferTrigger(t.id, day)).toBe(true)
+      day = (await db.query(
+        `SELECT scheduled_for::text AS d FROM payout_triggers WHERE id = $1`, [t.id])).rows[0].d
+    }
+    // The caller retires it normally once this returns false.
+    expect(await deferTrigger(t.id, day)).toBe(false)
+  })
+
+  it('will not resurrect a trigger that already fired', async () => {
+    const t = await aTrigger()
+    await markTriggerFired(t.id)
+    expect(await deferTrigger(t.id, '2026-03-06')).toBe(false)
+  })
+
+  it('a deferred trigger is still due once its new date arrives', async () => {
+    const t = await aTrigger()
+    await deferTrigger(t.id, '2026-03-06')
+    expect((await dueTriggers('2026-03-08')).some(x => x.id === t.id)).toBe(false)
+    expect((await dueTriggers('2026-03-09')).some(x => x.id === t.id)).toBe(true)
+  })
+
+  it('does not consume one of the three triggers a cycle allows', async () => {
+    const f = await landlordWithRoll(10)
+    await markPaid(f.unitIds, 5)
+    const p = await rollProgressForLandlordUser(f.userId, CYCLE)
+    await claimThresholdIfReached('user', f.userId, CYCLE, TODAY, p)
+    const [t] = await dueTriggers('2099-01-01')
+    await deferTrigger(t.id, '2026-03-06')
+
+    // Deferring is not a firing: still exactly one trigger row for the cycle,
+    // and the 90% one is still available to be claimed later.
+    const rows = await db.query(
+      `SELECT trigger_kind FROM payout_triggers WHERE entity_id = $1`, [f.userId])
+    expect(rows.rowCount).toBe(1)
+
+    await markPaid(f.unitIds, 9)
+    const p90 = await rollProgressForLandlordUser(f.userId, CYCLE)
+    const c90 = await claimThresholdIfReached('user', f.userId, CYCLE, TODAY, p90)
+    expect(c90.claimed).toBe(true)
+    expect(c90.triggerKind).toBe('threshold_90')
   })
 })

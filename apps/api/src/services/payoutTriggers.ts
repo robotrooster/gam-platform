@@ -163,6 +163,38 @@ export async function dueTriggers(today: string) {
     [today])
 }
 
+/**
+ * How many times a trigger may fire into an empty balance before it gives up.
+ *
+ * S617: a zero-balance firing never calls Stripe — processOneCandidate returns
+ * before creating the payout — so it costs nothing and must not spend one of
+ * the landlord's three payouts for the month. It is pushed to the next business
+ * day instead. Bounded so a landlord who genuinely has no money to send does
+ * not defer forever; after this many tries the trigger retires and the next
+ * threshold (or the late-month sweep) carries the money.
+ */
+export const MAX_DEFERRALS = 3
+
+/**
+ * Push a trigger to the next business day instead of retiring it.
+ *
+ * Returns false when it has already been deferred MAX_DEFERRALS times, which
+ * tells the caller to retire it normally.
+ */
+export async function deferTrigger(id: string, from: string): Promise<boolean> {
+  const res = await query<{ id: string }>(
+    `UPDATE payout_triggers
+        SET scheduled_for = $2::date,
+            defer_count   = defer_count + 1,
+            updated_at    = NOW()
+      WHERE id = $1
+        AND fired_at IS NULL
+        AND defer_count < $3
+      RETURNING id`,
+    [id, addBusinessDays(from, 1), MAX_DEFERRALS])
+  return res.length > 0
+}
+
 export async function markTriggerFired(id: string, skippedReason?: string): Promise<void> {
   await query(
     `UPDATE payout_triggers
