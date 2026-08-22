@@ -126,6 +126,22 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.72rem', fontWeight: 700, color: status.color }}>
           <Activity size={15} /> {status.label}
         </span>
+        {/* S616 (Nic): "are we just tracking the rent volume and not the stripe
+            charge volume?" We were. Gross is what Stripe charged, obligations
+            is what it settled, fees is the difference the tenant bore — shown
+            side by side so this card ties out to the Stripe dashboard instead
+            of approximating it. */}
+        {(() => {
+          const last: any = data[data.length - 1] || {}
+          if (!last.gross) return null
+          return (
+            <span style={{ display: 'inline-flex', gap: 10, fontSize: '.7rem', color: 'var(--t3)' }}>
+              <span>gross <strong style={{ color: 'var(--t0)' }}>${Number(last.gross).toFixed(2)}</strong></span>
+              <span>obligations <strong style={{ color: 'var(--t0)' }}>${Number(last.revenue ?? 0).toFixed(2)}</strong></span>
+              <span>fees <strong style={{ color: 'var(--t0)' }}>${Number(last.fees ?? 0).toFixed(2)}</strong></span>
+            </span>
+          )
+        })()}
         {/* S609 (Nic): "eventually maybe be able to print it out like a polygraph
             test over time, like a whole history for the last, like, three years."
             The window is a control rather than a constant so the long view is

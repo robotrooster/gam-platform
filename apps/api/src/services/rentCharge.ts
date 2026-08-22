@@ -316,11 +316,19 @@ export async function chargeLeaseBalance(
     // carry its id; stamp the PI after.
     await client.query('BEGIN')
     const rem = await client.query<{ id: string }>(
+      // S616: gross_amount and processing_fee_amount are the two figures that
+      // let GAM tie out to Stripe. They were computed a few lines above, sent
+      // to Stripe, and then thrown away — so nothing on our side could tell a
+      // missing payment from a fee difference. chargeAmount IS what Stripe is
+      // asked for; tenantBorneOnTop is the part of it that is not the
+      // obligation.
       `INSERT INTO tenant_remittances
-         (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, payment_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+         (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount,
+          payment_method, gross_amount, processing_fee_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [tenantId, ctx.lease_id, ctx.landlord_id, amount.toFixed(2),
-       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), paymentMethodType])
+       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), paymentMethodType,
+       chargeAmount.toFixed(2), tenantBorneOnTop.toFixed(2)])
     const remittanceId = rem.rows[0].id
 
     // Apply the plan: split the partial row, record every line.

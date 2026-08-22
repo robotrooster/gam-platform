@@ -128,7 +128,10 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
     // 1..36 — a year is the usual read; 36 supports the long "whole history"
     // view without letting a query walk the entire table.
     const months = Math.min(36, Math.max(1, Number(req.query.months) || 6))
-    const rows = await query<{ month_start: string; label: string; revenue: string }>(
+    const rows = await query<{
+      month_start: string; label: string; revenue: string
+      gross: string; fees: string
+    }>(
       `WITH span AS (
          SELECT generate_series(
            date_trunc('month', CURRENT_DATE) - make_interval(months => $1::int - 1),
@@ -138,27 +141,40 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
        )
        SELECT span.month_start::date::text AS month_start,
               TO_CHAR(span.month_start, 'Mon') AS label,
-              COALESCE(SUM(p.amount), 0)::text AS revenue
+              COALESCE(SUM(p.amount), 0)::text AS revenue,
+              -- S616: what actually moved through Stripe, so the card ties out
+              -- to the Stripe dashboard rather than approximating it. Sourced
+              -- from tenant_remittances (one row per charge) and joined by
+              -- month independently of the payments sum — a remittance and the
+              -- rows it settles can fall either side of a month boundary, and
+              -- forcing them together would make both figures wrong.
+              COALESCE((
+                SELECT SUM(r.gross_amount) FROM tenant_remittances r
+                 WHERE date_trunc('month', COALESCE(r.settled_at, r.created_at)) = span.month_start
+                   AND r.status IN ('settled','processing')
+                   AND r.gross_amount IS NOT NULL), 0)::text AS gross,
+              COALESCE((
+                SELECT SUM(r.processing_fee_amount) FROM tenant_remittances r
+                 WHERE date_trunc('month', COALESCE(r.settled_at, r.created_at)) = span.month_start
+                   AND r.status IN ('settled','processing')), 0)::text AS fees
          FROM span
          LEFT JOIN payments p
            ON date_trunc('month', COALESCE(p.settled_at, p.created_at)) = span.month_start
           AND p.status IN ('settled', 'paid_via_deposit')
           AND p.type IN ('rent', 'utility', 'late_fee', 'fee')
-          -- S616 (Nic, tracing a $2 figure he could not account for): DEMO AND
-          -- SYSTEM LANDLORDS ARE NOT PLATFORM REVENUE.
+          -- S616: DEMO LANDLORDS STAY IN, deliberately. I excluded them when
+          -- tracing a $2 figure Nic could not place — it was his own live
+          -- Stripe test, and the landlord behind it is flagged is_demo, so
+          -- excluding it made the month read $0 and hid real money he had
+          -- actually spent. Nic: "chart only needed to include demo accounts
+          -- for testing. when we launch we can split all demo data out to a
+          -- clone server for showing on sales calls but completely its own
+          -- thing to prevent data bleed."
           --
-          -- The $2 was real — a live Stripe test payment on a $2/month lease —
-          -- but the landlord behind it is james@demo.dev, flagged is_demo. Two
-          -- other metrics on this same dashboard already exclude demo and
-          -- system landlords (the onboarding table above, growthSnapshots);
-          -- this one did not, so one chart counted demo money as revenue while
-          -- the chart beside it did not. At launch that becomes real numbers
-          -- mixed with rehearsal numbers on the figure the platform is judged
-          -- by.
-          AND EXISTS (
-            SELECT 1 FROM landlords ll
-             WHERE ll.id = p.landlord_id
-               AND ll.is_demo = FALSE AND ll.is_system = FALSE)
+          -- That is the right separation and it is not a WHERE clause: demo
+          -- data leaves the production database entirely rather than being
+          -- filtered out of one query and not the next. Until then this counts
+          -- everything, which is what makes it useful for testing.
         GROUP BY span.month_start
         ORDER BY span.month_start ASC`,
       [months])
@@ -167,6 +183,11 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
       // 'Mon' alone repeats across years; the caller decides how much to show.
       label: r.label,
       revenue: Number(r.revenue),
+      // S616: gross is what Stripe charged; revenue is the obligation it
+      // settled; fees is the difference the tenant bore. Reported separately
+      // rather than netted so a discrepancy is visible instead of absorbed.
+      gross: Number(r.gross),
+      fees: Number(r.fees),
     })) })
   } catch (e) { next(e) }
 })

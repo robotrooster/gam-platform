@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict rol4pQNTRhp7o1ehSd1NzqQwlXJCgDouocEX0DB1vXAJ8aJOiwe8uJE2ejqwqXi
+\restrict w7bl8dqecGqYv69Z3dUZsr7GAEsEvBlCWjqTZVSvhfS2HS0eM1u6qXFZIjlO8DZ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8177,12 +8177,28 @@ CREATE TABLE public.tenant_remittances (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     settled_at timestamp with time zone,
+    gross_amount numeric(12,2),
+    processing_fee_amount numeric(12,2) DEFAULT 0 NOT NULL,
     CONSTRAINT tenant_remittances_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_remittances_applied_amount_check CHECK ((applied_amount >= (0)::numeric)),
     CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text]))),
     CONSTRAINT tenant_remittances_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'settled'::text, 'failed'::text]))),
     CONSTRAINT tenant_remittances_unapplied_amount_check CHECK ((unapplied_amount >= (0)::numeric))
 );
+
+
+--
+-- Name: COLUMN tenant_remittances.gross_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.gross_amount IS 'S616: what Stripe actually charged the tenant — the obligation plus any processing fee they bear. NULL on rows written before S616, which is why it is nullable: a backfilled guess would be indistinguishable from a real figure, and the point of this column is being able to tie out.';
+
+
+--
+-- Name: COLUMN tenant_remittances.processing_fee_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.processing_fee_amount IS 'S616: the processing fee the TENANT bore on top, which is zero when the property routes the fee to the landlord. gross_amount − this = the obligation collected.';
 
 
 --
@@ -23858,5 +23874,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict rol4pQNTRhp7o1ehSd1NzqQwlXJCgDouocEX0DB1vXAJ8aJOiwe8uJE2ejqwqXi
+\unrestrict w7bl8dqecGqYv69Z3dUZsr7GAEsEvBlCWjqTZVSvhfS2HS0eM1u6qXFZIjlO8DZ
 
