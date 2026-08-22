@@ -13,7 +13,7 @@
  *   - S538 STR carve-out (Nic-locked): the /30 aggregation is ONLY for
  *     NIGHTS_AGGREGATION_UNIT_TYPES (rv_spot — space-only, landlord
  *     coordinates nothing). Short-stay bookings on ANY other unit type
- *     bill str_fee_pct (default 5%) of booking revenue pro-rated to
+ *     bill str_fee_pct (default 3% — S616, down from 5%) of booking revenue pro-rated to
  *     the month instead. total = MAX(rate × billable + str_fee, min).
  *
  * Long-term unit count: distinct units on the property with an active

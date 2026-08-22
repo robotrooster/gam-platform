@@ -80,7 +80,11 @@ export async function platformFeesByProperty(
      LIMIT 1`, [landlordId])
   const rate   = parseFloat(cfg?.rate ?? '2')
   const min    = parseFloat(cfg?.min ?? '10')
-  const strPct = parseFloat(cfg?.str_pct ?? '0.05')
+  // S616 (Nic): 3%, down from 5%. The live figure comes from
+  // platform_fee_config; this fallback only applies when no config row exists
+  // at all, and it must not disagree with the seeded default or a fresh
+  // install would quote one number and bill another.
+  const strPct = parseFloat(cfg?.str_pct ?? '0.03')
 
   // Per (property, month) billable for the live-estimate fallback. Only months
   // in which the property already existed (created_at) are billed.

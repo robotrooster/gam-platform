@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SFoaSAYxk86IDVT1oYL0q72NdAxk0fhYnsar9LcMGafdby2v60uwgICpMf6efgt
+\restrict okv25ZOChv5JOJZ6ok2CzyotXHOSDzCzZea2NX5X1qz0X95OmZEibLN5KMfX1rq
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5431,7 +5431,7 @@ CREATE TABLE public.platform_fee_config (
     set_by_user_id uuid,
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    str_fee_pct numeric(5,4) DEFAULT 0.05 NOT NULL,
+    str_fee_pct numeric(5,4) DEFAULT 0.03 NOT NULL,
     CONSTRAINT platform_fee_config_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
     CONSTRAINT platform_fee_config_min_nonneg CHECK ((min_per_property >= (0)::numeric)),
     CONSTRAINT platform_fee_config_rate_nonneg CHECK ((rate_per_unit >= (0)::numeric))
@@ -23950,5 +23950,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SFoaSAYxk86IDVT1oYL0q72NdAxk0fhYnsar9LcMGafdby2v60uwgICpMf6efgt
+\unrestrict okv25ZOChv5JOJZ6ok2CzyotXHOSDzCzZea2NX5X1qz0X95OmZEibLN5KMfX1rq
 

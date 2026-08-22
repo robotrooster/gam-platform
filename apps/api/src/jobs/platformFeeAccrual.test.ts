@@ -367,8 +367,9 @@ describe('processPlatformFeeAccrual', () => {
       short_stay_equivalent: 0,
       total_billable:        0,
       str_revenue:           '647.06', // 1000 × 11/17
-      str_fee_amount:        '32.35',  // 5%
-      total_amount:          '32.35',  // clears the $10 min
+      // S616 (Nic): 3%, down from 5%. 647.06 × 0.03 = 19.41.
+      str_fee_amount:        '19.41',
+      total_amount:          '19.41',  // clears the $10 min
     })
   })
 
@@ -400,12 +401,12 @@ describe('processPlatformFeeAccrual', () => {
     )
     expect(accrual.rows[0]).toMatchObject({
       str_revenue:    '100.00',
-      str_fee_amount: '5.00',
-      total_amount:   '10.00',  // MAX(5, min 10)
+      str_fee_amount: '3.00',   // S616: 3% of 100
+      total_amount:   '10.00',  // MAX(3, min 10)
     })
   })
 
-  it('STR: mobile_home short-stay bills 5% too (aggregation is rv_spot-ONLY)', async () => {
+  it('STR: mobile_home short-stay bills the STR percentage too (aggregation is rv_spot-ONLY)', async () => {
     // Nic: mobile homes aren't generally bookable short-term, but if a
     // landlord does it, it's a coordinated stay → 5%, never nights/30.
     // $400 booking fully in May → $20 fee; no nights in the /30 pool.
@@ -436,12 +437,12 @@ describe('processPlatformFeeAccrual', () => {
     expect(accrual.rows[0]).toMatchObject({
       short_stay_nights: 0,
       str_revenue:       '400.00',
-      str_fee_amount:    '20.00',
-      total_amount:      '20.00',
+      str_fee_amount:    '12.00',  // S616: 3% of 400
+      total_amount:      '12.00',
     })
   })
 
-  it('STR + RV mixed property: rv_spot keeps nights/30, apartment adds 5%, both sum', async () => {
+  it('STR + RV mixed property: rv_spot keeps nights/30, apartment adds the STR percentage, both sum', async () => {
     // RV booking: 10 May nights → CEIL(10/30)=1 billable × $2 = $2.
     // Apartment booking: $500 fully in May → 5% = $25.
     // total = MAX(2 + 25, 10) = $27.
@@ -476,8 +477,8 @@ describe('processPlatformFeeAccrual', () => {
       short_stay_equivalent: 1,
       total_billable:        1,
       str_revenue:           '500.00', // apartment booking only
-      str_fee_amount:        '25.00',
-      total_amount:          '27.00',  // 1×$2 + $25, clears the min
+      str_fee_amount:        '15.00',  // S616: 3% of 500
+      total_amount:          '17.00',  // 1×$2 + $15, clears the min
     })
   })
 })
@@ -764,5 +765,27 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
     // whole point — it moves, it never evaporates.
     expect(bAfter[0].long_term_unit_count).toBe(1)
     expect(bAfter[0].total_billable).toBe(1)
+  })
+})
+
+// S616 (Nic): "the billing is correct but let's change the 5 percent to 3."
+describe('the STR revenue fee is 3% (S616)', () => {
+  it('reads the rate from config rather than a hardcoded number', async () => {
+    const { rows } = await db.query<any>(
+      `SELECT str_fee_pct::text FROM platform_fee_config WHERE effective_until IS NULL`)
+    expect(Number(rows[0].str_fee_pct)).toBe(0.03)
+  })
+
+  // The old rate is CLOSED, not rewritten. An accrual posted at 5% was correct
+  // when it was posted, and changing the rate it was computed from would make
+  // history disagree with the ledger.
+  it('keeps the 5% period on the record', async () => {
+    const { rows } = await db.query<any>(
+      `SELECT str_fee_pct::text, effective_until FROM platform_fee_config
+        WHERE effective_until IS NOT NULL ORDER BY effective_from DESC LIMIT 1`)
+    if (rows.length > 0) {
+      expect(Number(rows[0].str_fee_pct)).toBe(0.05)
+      expect(rows[0].effective_until).not.toBeNull()
+    }
   })
 })
