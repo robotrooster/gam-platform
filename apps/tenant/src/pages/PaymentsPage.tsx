@@ -159,6 +159,15 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       suggestedPayAhead?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
+    // S615: open charges for a UTILITY-SERVICE payer — someone the landlord
+    // supplies power or trash to but does not rent to. No lease, so these are
+    // not in `leases` above and are paid one at a time.
+    serviceCharges?: {
+      id: string; amount: number; dueDate: string; type: string
+      entryDescription: string; notes: string | null
+      unitNumber: string; propertyName: string
+      methodCosts?: any
+    }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
   const { data: methods = [], isLoading: methodsLoading } = useTenantPaymentMethods()
   const { data: remitData } = useQuery<{ remittances: Remittance[]; prepaidRemaining: number }>(
@@ -196,6 +205,25 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         leaseId,
         // S609: lets the modal offer an amount box for paying months ahead.
         suggestedPayAhead,
+      },
+    })
+  }
+
+  // S615: a utility-service charge is paid on its own, through the existing
+  // per-charge route. There is no lease behind it and therefore no eviction
+  // clock, so the pay-in-full rule that governs rent has nothing to protect
+  // here — each bill is simply its own payable document.
+  const serviceCharges = balanceCtx?.serviceCharges ?? []
+  // Someone with utility charges and no lease groups at all is a service-only
+  // payer. A tenant who somehow had both would keep the rent-shaped page.
+  const serviceOnlyPayer = serviceCharges.length > 0 && (balanceCtx?.leases ?? []).length === 0
+  const openPayServiceCharge = (c: any) => {
+    setPayTarget({
+      target: {
+        amount:    Math.round(Number(c.amount) * 100) / 100,
+        endpoint:  `/payments/${c.id}/pay`,
+        subheader: c.type === 'late_fee' ? 'late fee' : 'utility charge',
+        kind:      'utility',
       },
     })
   }
@@ -247,8 +275,12 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       <VerifyMicrodepositsCard onVerified={() => qc.invalidateQueries('tenant-payment-methods')} />
       <div className="ph">
         <div>
-          <h1 className="pt">Payments</h1>
-          <p className="ps">Pay rent and view history</p>
+          {/* S615: a utility-service payer pays no rent, so the subtitle would
+              be describing somebody else's account. */}
+          <h1 className="pt">{serviceOnlyPayer ? 'Billing' : 'Payments'}</h1>
+          <p className="ps">
+            {serviceOnlyPayer ? 'Pay your utility bill and view history' : 'Pay rent and view history'}
+          </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-p btn-sm" onClick={() => setAddMethodOpen('ach')}>
@@ -359,6 +391,34 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
             </div>
           </div>
         ) : null
+      ))}
+
+      {/* S615: the utility-service payer's bills. Each is its own card with its
+          own Pay button — one bill, one charge, one receipt. */}
+      {serviceCharges.map((c: any) => (
+        <div key={c.id} className="card" style={{ padding: 16, marginTop: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+            <div>
+              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+                {c.type === 'late_fee' ? 'Late fee' : 'Utility bill'} — {c.propertyName}
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
+                {formatCurrency(c.amount)}
+              </div>
+              {c.notes && (
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>{c.notes}</div>
+              )}
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
+                Due {c.dueDate}
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
+              <button className="btn btn-p" onClick={() => openPayServiceCharge(c)}>
+                Pay {formatCurrency(c.amount)}
+              </button>
+            </div>
+          </div>
+        </div>
       ))}
 
       <SecurityDepositCard />

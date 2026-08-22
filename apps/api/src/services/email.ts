@@ -967,6 +967,51 @@ export async function emailTenantOnboarded(
   )
 }
 
+// S615 — the invite for someone who is NOT a tenant.
+//
+// The space next door is on this landlord's trash and power, and no lease
+// exists or ever will. Nic: "That person should really have access to the
+// tenant portal to get on and pay their bill. Otherwise the landlord has to
+// bother to take cash from the other property."
+//
+// So the copy carefully does not call them a tenant, does not mention a lease,
+// a tenancy, rent, maintenance or a landlord, and does not welcome them to a
+// property they do not live at. What is true is narrow and worth saying
+// plainly: this person buys utilities from this person, and here is where the
+// bill lives.
+export async function emailUtilityServiceInvite(
+  to: string,
+  payerName: string,
+  providerName: string,
+  serviceAddress: string,
+  activationUrl: string,
+  ctx?: { landlordId?: string; tenantId?: string }
+) {
+  await send(to, `Set up online billing for ${serviceAddress}`,
+    base(
+      h('Your utility billing, online') +
+      p(`Hi ${payerName},`) +
+      p(`<strong style="color:#eef1f8">${providerName}</strong> bills you for utility service at the address below, and has set up an account so you can see and pay those bills online instead of arranging it in person.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${serviceAddress}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">Utility service</div>
+      </div>` +
+      p('Click below to activate your account and set a password.') +
+      btn('Activate Your Account', activationUrl) +
+      p('You will see each bill with the meter readings and dates behind it, and can pay it from your account.') +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Questions about a charge? Contact ${providerName} directly.</div>`
+    ),
+    {
+      category: 'utility_service_invite',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { service_address: serviceAddress },
+    },
+    'support',
+  )
+}
+
 // S582 — reminder nudge for a tenant invite that hasn't been accepted and is
 // expiring soon. Sent by the daily invite-nudge job (jobs/inviteNudge.ts).
 export async function emailTenantInviteReminder(

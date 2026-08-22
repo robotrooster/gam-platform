@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedUtilityMeter,
+  seedUtilityMeter, seedLease,
 } from '../test/dbHelpers'
 import { generateServiceAgreementInvoices } from './serviceAgreementInvoices'
 import { generateLateFeesForInvoice } from './lateFees'
@@ -233,5 +233,155 @@ describe('utility-service invoices (S615)', () => {
       `SELECT amount::text FROM payments WHERE invoice_id = $1 AND type = 'late_fee'`, [inv.id])
     expect(fees.length).toBeGreaterThan(0)
     expect(Number(fees[0].amount)).toBe(7.5)   // 10% of $75, not 10% of no rent
+  })
+})
+
+// S615: superseded_by_lease_id was added in S614 and nothing ever set it.
+// Nic: when the space's real owner onboards and puts a lease on it, "the $2
+// moves and is never charged twice for one space."
+describe('supersedence (S615)', () => {
+  it('a lease going active on a serviced space stamps the agreement', async () => {
+    const ctx = await servicedSpaceWithTrash()
+
+    const { rows: [before] } = await db.query<any>(
+      `SELECT superseded_by_lease_id FROM utility_service_agreements WHERE id=$1`,
+      [ctx.agreementId])
+    expect(before.superseded_by_lease_id).toBeNull()
+
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, {
+        unitId: ctx.unitId, landlordId: ctx.landlordId, status: 'active',
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const { rows: [after] } = await db.query<any>(
+      `SELECT superseded_by_lease_id, status FROM utility_service_agreements WHERE id=$1`,
+      [ctx.agreementId])
+    expect(after.superseded_by_lease_id).toBe(leaseId)
+    // The agreement keeps billing — the landlord still supplies that power.
+    // Only the platform fee moved.
+    expect(after.status).toBe('active')
+  })
+
+  it('a lease that is not yet active does not move the fee', async () => {
+    const ctx = await servicedSpaceWithTrash()
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await seedLease(c, {
+        unitId: ctx.unitId, landlordId: ctx.landlordId, status: 'pending',
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const { rows: [after] } = await db.query<any>(
+      `SELECT superseded_by_lease_id FROM utility_service_agreements WHERE id=$1`,
+      [ctx.agreementId])
+    expect(after.superseded_by_lease_id).toBeNull()
+  })
+
+  it('activating an existing lease later stamps it too', async () => {
+    const ctx = await servicedSpaceWithTrash()
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, {
+        unitId: ctx.unitId, landlordId: ctx.landlordId, status: 'pending',
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    await db.query(`UPDATE leases SET status='active' WHERE id=$1`, [leaseId])
+
+    const { rows: [after] } = await db.query<any>(
+      `SELECT superseded_by_lease_id FROM utility_service_agreements WHERE id=$1`,
+      [ctx.agreementId])
+    expect(after.superseded_by_lease_id).toBe(leaseId)
+  })
+})
+
+// S615: the payer must be able to LOG IN and SEE the bill, or the invoice is a
+// document nobody receives and the landlord is still driving over for cash.
+describe('the payer sees their bill in the portal (S615)', () => {
+  it('balance-context returns the charge as a payable service charge, not a lease group', async () => {
+    const { camelCaseKeys } = await import('../lib/caseConversion')
+    const express = (await import('express')).default
+    const request = (await import('supertest')).default
+    const jwt = (await import('jsonwebtoken')).default
+    const { paymentsRouter } = await import('../routes/payments')
+    const { errorHandler } = await import('../middleware/errorHandler')
+
+    process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_svcportal'
+    const ctx = await servicedSpaceWithTrash()
+    await generateServiceAgreementInvoices(new Date('2026-03-05T14:00:00Z'))
+
+    const app = express()
+    app.use(express.json())
+    app.use((_req: any, res: any, next: any) => {
+      const originalJson = res.json.bind(res)
+      res.json = (body: any) => originalJson(camelCaseKeys(body))
+      next()
+    })
+    app.use('/api/payments', paymentsRouter)
+    app.use(errorHandler)
+
+    const token = jwt.sign(
+      { userId: 'x', role: 'tenant', profileId: ctx.tenantId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(app)
+      .get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    // NOT a lease group — a null-keyed group would render a Pay button that
+    // resolves to a lease filter matching nothing and 409s on a bill the
+    // person is looking at.
+    expect(res.body.data.leases).toHaveLength(0)
+    expect(res.body.data.serviceCharges).toHaveLength(1)
+    expect(Number(res.body.data.serviceCharges[0].amount)).toBe(75)
+    expect(res.body.data.serviceCharges[0].notes).toBe('3 × $25.00')
+    expect(Number(res.body.data.totalOutstanding)).toBe(75)
+  })
+
+  it('/tenants/me tells the portal this person has no lease but does have service', async () => {
+    const { camelCaseKeys } = await import('../lib/caseConversion')
+    const express = (await import('express')).default
+    const request = (await import('supertest')).default
+    const jwt = (await import('jsonwebtoken')).default
+    const { tenantsRouter } = await import('../routes/tenants')
+    const { errorHandler } = await import('../middleware/errorHandler')
+
+    process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_svcportal'
+    const ctx = await servicedSpaceWithTrash()
+
+    const app = express()
+    app.use(express.json())
+    app.use((_req: any, res: any, next: any) => {
+      const originalJson = res.json.bind(res)
+      res.json = (body: any) => originalJson(camelCaseKeys(body))
+      next()
+    })
+    app.use('/api/tenants', tenantsRouter)
+    app.use(errorHandler)
+
+    const token = jwt.sign(
+      { userId: 'x', role: 'tenant', profileId: ctx.tenantId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(app)
+      .get('/api/tenants/me')
+      .set('Authorization', `Bearer ${token}`)
+
+    expect(res.status).toBe(200)
+    // Without this the tenant nav computes showFullNav=false and the only
+    // thing they can reach after logging in is a background check they have
+    // no reason to take.
+    expect(res.body.data.utilityServiceAgreementId).toBe(ctx.agreementId)
+    expect(res.body.data.utilityServiceAddress).toBe('2 Next Door Ln')
+    expect(res.body.data.unitId).toBeNull()
   })
 })

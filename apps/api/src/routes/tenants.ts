@@ -412,7 +412,22 @@ tenantsRouter.get('/me', async (req, res, next) => {
         -- has a landlord + property to attribute their background check to. Falls
         -- back to the active lease's landlord/property for a housed tenant.
         COALESCE(pti.landlord_id, pr.landlord_id) AS landlord_id,
-        COALESCE(pti.property_id, pr.id)          AS property_id
+        COALESCE(pti.property_id, pr.id)          AS property_id,
+        -- S615: this person may have NO LEASE and still belong here — a space
+        -- next door on the landlord's trash or power, billed under a utility
+        -- service agreement. Nic: "That person should really have access to the
+        -- tenant portal to get on and pay their bill."
+        --
+        -- Everything above resolves through an ACTIVE LEASE, so for them it is
+        -- all NULL and the portal would greet them with "undefined · Unit
+        -- undefined" over a rent card that can never have a number in it. This
+        -- is the signal that says which kind of person is logged in, so the home
+        -- page can show what is actually true of them.
+        sa.id                AS utility_service_agreement_id,
+        sa.service_address   AS utility_service_address,
+        sa.billing_due_day   AS utility_service_due_day,
+        sau.unit_number      AS utility_service_space,
+        sap.name             AS utility_service_property_name
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN LATERAL (
@@ -433,6 +448,15 @@ tenantsRouter.get('/me', async (req, res, next) => {
         ORDER BY created_at DESC
         LIMIT 1
       ) pti ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT sa2.id, sa2.service_address, sa2.billing_due_day, sa2.unit_id
+          FROM utility_service_agreements sa2
+         WHERE sa2.tenant_id = t.id AND sa2.status = 'active'
+         ORDER BY sa2.start_date DESC
+         LIMIT 1
+      ) sa ON TRUE
+      LEFT JOIN units sau      ON sau.id = sa.unit_id
+      LEFT JOIN properties sap ON sap.id = sau.property_id
       WHERE t.id = $1`, [req.user!.profileId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })

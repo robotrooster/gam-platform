@@ -256,6 +256,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           {canReview && (
             <>
               <RecoveryCard propertyId={propertyId} />
+              <div style={{ marginBottom: 28 }}>
+                <h2 style={{ fontSize:'.95rem', margin:'0 0 12px' }}>Next door</h2>
+                <ServicedSpacesCard propertyId={propertyId} onChanged={invalidate} />
+              </div>
               <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
             </>
           )}
@@ -1350,6 +1354,250 @@ function PropaneTanksCard({ propertyId, units, onChanged }: {
           </span>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * S615 (Nic, LAUNCH-CRITICAL) — the spaces next door.
+ *
+ * "We need to fix the billing for utilities next door immediately, because we
+ *  already collect from those units next door. That is an Oak Park launch
+ *  necessity. That's seventy-five dollars in trash cans and utilities on one
+ *  electric submeter from next door."
+ *
+ * A space on this property's trash or power that is NOT this landlord's unit
+ * and never will be — different owner, no lease, no tenancy. Nic's model: it is
+ * technically a unit, so it carries meters and a trash-can count like any
+ * other; a SERVICE AGREEMENT names who pays, because no lease will ever exist.
+ *
+ * The card is ALWAYS shown, empty or not. Hiding it until one exists would put
+ * the only door to this behind the thing it opens — the same trap the propane
+ * card fell into, where a tank could only be marked from a card that appeared
+ * once a tank existed.
+ */
+function ServicedSpacesCard({ propertyId, onChanged }: {
+  propertyId: string; onChanged: () => void
+}) {
+  const [adding, setAdding] = useState(false)
+  const { data, refetch } = useQuery<any[]>(
+    ['utility-service-agreements'],
+    () => apiGet('/utility/service-agreements'),
+    { enabled: !!propertyId },
+  )
+  const rows = (data ?? []).filter((r: any) => r.propertyId === propertyId)
+  const live = rows.filter((r: any) => r.status === 'active')
+
+  const end = useMutation(
+    (id: string) => apiPatch(`/utility/service-agreements/${id}`, { status: 'ended' }),
+    {
+      onSuccess: () => { refetch(); onChanged(); toast('Service ended. Anything already billed is still owed.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not end that'),
+    },
+  )
+
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    gap: 10, flexWrap: 'wrap', marginBottom: 2 }}>
+        <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Spaces you supply but don&apos;t rent</div>
+        <button className="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
+          <Plus size={13}/> Add a space
+        </button>
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
+        A space next door on your trash or your power that isn&apos;t one of your units — different
+        owner, no lease. Add it here and it takes meters and a can count like any other space, and
+        the person who pays gets their own login and bill instead of handing you cash.
+      </div>
+
+      {live.length === 0 ? (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+          None set up. If you&apos;re collecting for utilities off the books, this is where it goes.
+        </div>
+      ) : (
+        <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              <th style={{ textAlign: 'left', padding: '4px 0' }}>Space</th>
+              <th style={{ textAlign: 'left' }}>Who pays</th>
+              <th style={{ textAlign: 'left' }}>Due</th>
+              <th style={{ textAlign: 'right' }}>Owed now</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {live.map((r: any) => (
+              <tr key={r.id} style={{ borderTop: '1px solid var(--border-0)' }}>
+                <td style={{ padding: '6px 0' }}>
+                  <div style={{ fontWeight: 600 }}>{r.unitNumber}</div>
+                  {r.serviceAddress && (
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{r.serviceAddress}</div>
+                  )}
+                </td>
+                <td>
+                  <div>{r.firstName} {r.lastName}</div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                    {r.email}
+                    {r.invitePending && (
+                      <span className="badge badge-amber" style={{ marginLeft: 6 }}>invite not accepted</span>
+                    )}
+                  </div>
+                </td>
+                <td className="mono" style={{ fontSize: '.75rem' }}>
+                  {r.billingDueDay === 1 ? '1st' : `day ${r.billingDueDay}`}
+                </td>
+                <td className="mono" style={{ textAlign: 'right', fontWeight: 600,
+                                              color: Number(r.balanceDue) > 0 ? 'var(--gold)' : undefined }}>
+                  {Number(r.balanceDue) > 0 ? fmt(r.balanceDue) : '—'}
+                </td>
+                <td style={{ textAlign: 'right' }}>
+                  <button className="btn btn-ghost btn-sm" disabled={end.isLoading}
+                    onClick={() => appConfirm(
+                      `End utility service for ${r.unitNumber}?\n\n` +
+                      `No further bills are created. Anything already billed stays owed — ` +
+                      `this doesn't cancel a charge.`,
+                      { danger: true, confirmLabel: 'End service' },
+                    ).then(ok => { if (ok) end.mutate(r.id) })}>
+                    End
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {live.length > 0 && (
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
+          Assign these spaces to a meter in <strong>Meter Setup</strong> the same way you would any
+          other — a trash can count, a submeter, or a share of a master. Their bill goes out on your
+          normal billing morning and takes the same late fee an unpaid rent invoice does.
+        </div>
+      )}
+
+      {adding && (
+        <AddServicedSpaceModal propertyId={propertyId}
+          onClose={() => setAdding(false)}
+          onSaved={() => { setAdding(false); refetch(); onChanged() }} />
+      )}
+    </div>
+  )
+}
+
+function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
+  propertyId: string; onClose: () => void; onSaved: () => void
+}) {
+  const [label, setLabel] = useState('')
+  const [serviceAddress, setServiceAddress] = useState('')
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
+  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
+  const [billingDueDay, setBillingDueDay] = useState('1')
+  const [householdSize, setHouseholdSize] = useState('1')
+  const [error, setError] = useState('')
+
+  const save = useMutation(
+    () => apiPost('/utility/service-agreements', {
+      propertyId,
+      label: label.trim(),
+      serviceAddress: serviceAddress.trim() || undefined,
+      billingDueDay: Number(billingDueDay) || 1,
+      householdSize: Number(householdSize) || 1,
+      payer: {
+        firstName: firstName.trim(), lastName: lastName.trim(),
+        email: email.trim(), phone: phone.trim(),
+      },
+    }),
+    {
+      onSuccess: () => {
+        toast(`${label.trim()} added — we emailed ${email.trim()} a link to set up their login.`)
+        onSaved()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not add that space'),
+    },
+  )
+
+  const ready = label.trim() && firstName.trim() && lastName.trim()
+    && email.trim() && phone.trim()
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add a space you supply</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
+          For a space on your utilities that you don&apos;t rent out — the apartment next door on your
+          meter, or cans you put out for a neighbour. There&apos;s no lease and no rent; you&apos;re
+          billing them for what they use.
+        </div>
+
+        <label style={lbl}>What you call the space</label>
+        <input className="form-input" value={label} maxLength={40}
+          placeholder="Next door — upstairs apt"
+          onChange={e => setLabel(e.target.value)} />
+
+        <label style={{ ...lbl, marginTop: 10 }}>Service address <span style={{ color:'var(--text-3)' }}>(optional)</span></label>
+        <input className="form-input" value={serviceAddress} maxLength={200}
+          placeholder="1442 W Second St"
+          onChange={e => setServiceAddress(e.target.value)} />
+
+        <div style={{ marginTop: 16, marginBottom: 8, fontWeight: 700, fontSize: '.82rem', color: 'var(--text-0)' }}>
+          Who pays the bill
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <div>
+            <label style={lbl}>First name</label>
+            <input className="form-input" value={firstName} onChange={e => setFirstName(e.target.value)} />
+          </div>
+          <div>
+            <label style={lbl}>Last name</label>
+            <input className="form-input" value={lastName} onChange={e => setLastName(e.target.value)} />
+          </div>
+        </div>
+        <label style={{ ...lbl, marginTop: 10 }}>Email</label>
+        <input className="form-input" type="email" value={email}
+          onChange={e => setEmail(e.target.value)} />
+        <label style={{ ...lbl, marginTop: 10 }}>Phone</label>
+        <input className="form-input" value={phone} onChange={e => setPhone(e.target.value)} />
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 10 }}>
+          <div>
+            <label style={lbl}>Bill due on</label>
+            <select className="form-select" value={billingDueDay}
+              onChange={e => setBillingDueDay(e.target.value)}>
+              {Array.from({ length: 28 }, (_, i) => i + 1).map(d => (
+                <option key={d} value={d}>{d === 1 ? '1st of the month' : `day ${d}`}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={lbl}>People living there</label>
+            <input className="form-input" type="number" min={1} max={30} value={householdSize}
+              onChange={e => setHouseholdSize(e.target.value)} />
+          </div>
+        </div>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+          Headcount only matters if you split a shared meter by how many people are on it — otherwise
+          leave it at 1.
+        </div>
+
+        {error && (
+          <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red, #dc2626)' }}>{error}</div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+          <button className="btn btn-primary" disabled={!ready || save.isLoading}
+            onClick={() => { setError(''); save.mutate() }}>
+            {save.isLoading ? 'Adding…' : 'Add space'}
+          </button>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        </div>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5 }}>
+          They get an email with a link to set a password, then see each bill with the readings
+          behind it and pay it themselves.
+        </div>
+      </div>
     </div>
   )
 }

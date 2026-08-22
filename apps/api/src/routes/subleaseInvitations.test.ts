@@ -146,7 +146,14 @@ describe('GET /api/sublease-invitations/:token', () => {
     const res = await request(buildApp()).get(`/api/sublease-invitations/${f.token}`)
     expect(res.status).toBe(200)
     expect(res.body.data.property_name).toBe('Test Property')
-    expect(res.body.data.unit_number).toMatch(/^U-/)
+    // S615: was toMatch(/^U-/) — a ~6% flake. seedUnit builds the number from
+    // randomUUID().slice(0,6), which is HEX, so roughly one run in sixteen it
+    // is all digits; S614 made the fixture canonicalise like production, where
+    // 'U-123456' becomes 'U 123456'. Asserting the seeded unit's ACTUAL number
+    // is exact and cannot drift with the format.
+    const { rows: [su1] } = await db.query<{ unit_number: string }>(
+      `SELECT unit_number FROM units WHERE id = $1`, [f.unitId])
+    expect(res.body.data.unit_number).toBe(su1.unit_number)
     expect(res.body.data.sublessor_name).toBe('Test Tenant')
     expect(res.body.data.sublessee_email).toBe(f.sublesseeEmail)
     expect(res.body.data.sub_monthly_amount).toBe(600)
@@ -244,7 +251,14 @@ describe('POST /api/sublease-invitations/:token/accept', () => {
     const [arg] = notifySubleaseRequestedMock.mock.calls[0] as any[]
     expect(arg.subleaseId).toBe(f.subleaseId)
     expect(arg.sublesseeName).toBe('Sub Lessee')
-    expect(arg.unitNumber).toMatch(/^U-/)
+    // S615: was toMatch(/^U-/) — a ~6% flake. seedUnit builds the number from
+    // randomUUID().slice(0,6), which is HEX, so roughly one run in sixteen it
+    // is all digits; S614 made the fixture canonicalise like production, where
+    // 'U-123456' becomes 'U 123456'. Asserting the seeded unit's ACTUAL number
+    // is exact and cannot drift with the format.
+    const { rows: [su2] } = await db.query<{ unit_number: string }>(
+      `SELECT unit_number FROM units WHERE id = $1`, [f.unitId])
+    expect(arg.unitNumber).toBe(su2.unit_number)
     expect(arg.propertyName).toBe('Test Property')
     expect(arg.subMonthlyAmount).toBe(600)
   })

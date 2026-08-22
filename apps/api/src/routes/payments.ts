@@ -632,6 +632,11 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.entry_description, p.notes, p.lease_id, u.payment_block,
               u.unit_number, pr.name AS property_name,
+              -- S615: the ONLY reliable mark of a utility-service charge. A
+              -- NULL lease_id is not it: ordinary tenants have lease-less
+              -- payment rows too, and treating those as service charges pulled
+              -- them out of their own balance group.
+              inv.service_agreement_id,
               COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
               -- S607: has this tenant ever had rent satisfied? The first manual
               -- payment is free, so the quote must know which side of that the
@@ -652,6 +657,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
+         LEFT JOIN invoices inv ON inv.id = p.invoice_id
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
@@ -668,7 +674,17 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       paymentBlocked: boolean; outstanding: number; rows: any[]
       manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
     }>()
-    for (const r of rows) {
+    // S615: a UTILITY-SERVICE payer's rows carry NO lease_id. Left in the
+    // grouping below they would all collapse into one group keyed `null`, and
+    // that group would render a Pay button that calls /pay-balance with a null
+    // lease — which resolves to a lease filter matching nothing and answers
+    // "Nothing outstanding to pay" on a bill the person is looking at. They are
+    // split out here and paid per charge instead (see serviceCharges below),
+    // which the pay modal already supports.
+    const serviceRows = rows.filter((r: any) => r.service_agreement_id != null)
+    const leaseRows   = rows.filter((r: any) => r.service_agreement_id == null)
+
+    for (const r of leaseRows) {
       let g = byLease.get(r.lease_id)
       if (!g) {
         g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
@@ -703,12 +719,30 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       }
     }))
 
+    // S615: each open charge on a service agreement, paid on its own through
+    // the existing per-charge route. Deliberately NOT run through /pay-balance:
+    // that path is lease-keyed end to end (FIFO scope, pay-in-full guard,
+    // eviction hold, sublease markup), and widening the engine that moves every
+    // tenant's rent is a bigger change than billing the neighbour needs.
+    const serviceCharges = serviceRows.map((r: any) => ({
+      id: r.id,
+      amount: r.amount,
+      dueDate: r.due_date,
+      type: r.type,
+      entryDescription: r.entry_description,
+      notes: r.notes,
+      unitNumber: r.unit_number,
+      propertyName: r.property_name,
+      methodCosts: paymentMethodCosts(r.amount, { manualFee: 0 }),
+    }))
+
     res.json({ success: true, data: {
       totalOutstanding: total,
       // Legacy scalar retained for older clients: blocked only if EVERY lease
       // is blocked (a per-lease `leases[].paymentBlocked` is the real signal).
       paymentBlocked: leases.length ? leases.every(l => l.paymentBlocked) : false,
       leases,
+      serviceCharges,
       rows,
     } })
   } catch (e) { next(e) }

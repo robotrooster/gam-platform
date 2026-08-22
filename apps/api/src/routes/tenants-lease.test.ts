@@ -190,7 +190,14 @@ describe('GET /lease', () => {
     expect(res.body.success).toBe(true)
     expect(res.body.data.id).toBe(f.leaseId)
     expect(res.body.data.property_name).toBe('Test Property')
-    expect(res.body.data.unit_number).toMatch(/^U-/)
+    // S615: was toMatch(/^U-/) — a ~6% flake. seedUnit builds the number from
+    // randomUUID().slice(0,6), which is HEX, so roughly one run in sixteen it
+    // is all digits; S614 made the fixture canonicalise like production, where
+    // 'U-123456' becomes 'U 123456'. Asserting the seeded unit's ACTUAL number
+    // is exact and cannot drift with the format.
+    const { rows: [lu] } = await db.query<{ unit_number: string }>(
+      `SELECT unit_number FROM units WHERE id = $1`, [f.unitId])
+    expect(res.body.data.unit_number).toBe(lu.unit_number)
     expect(res.body.data.landlord_name).toBe('Test Landlord')
     expect(res.body.data.status).toBe('active')
   })

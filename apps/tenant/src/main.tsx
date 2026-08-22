@@ -488,7 +488,19 @@ function Layout() {
   // application stage — show them the full portal and never the Application tab,
   // regardless of whether a GAM background check was ever run/approved.
   const isExistingTenant = !!(tenantMe as any)?.unitId
-  const showFullNav = bgApproved || isExistingTenant
+  // S615 (Nic): a UTILITY-SERVICE payer — the space next door on this
+  // landlord's trash or power. They have no lease, so unitId is null and
+  // bgApproved is false, which meant the ONLY thing they could see after
+  // logging in was the Application tab: a background check they have no reason
+  // to take, for a tenancy that does not exist. They are here to look at a
+  // utility bill and pay it.
+  const isUtilityServicePayer = !!(tenantMe as any)?.utilityServiceAgreementId
+  const showFullNav = bgApproved || isExistingTenant || isUtilityServicePayer
+  // …and only what applies to them. Someone who buys electricity from this
+  // landlord has no lease to read, no maintenance to request, no amenities to
+  // reserve and no deposit — a nav full of doors that open onto nothing is its
+  // own kind of broken. Home + Payments + Profile is the whole surface.
+  const serviceOnly = isUtilityServicePayer && !isExistingTenant
   const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -531,7 +543,12 @@ function Layout() {
           {!showFullNav && (
             <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={16}/>Application</NavLink>
           )}
-          {showFullNav && <>
+          {serviceOnly && <>
+            <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
+            <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Billing</NavLink>
+            <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
+          </>}
+          {showFullNav && !serviceOnly && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
             {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}><Star size={16}/>Flex Advantage</NavLink>}
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Payments</NavLink>
@@ -549,13 +566,13 @@ function Layout() {
           </>}
           {/* S570 (Nic): Preferences + Security folded into Profile (which already
               has Notification-prefs + Security tabs). Notifications feed → Home. */}
-          {showFullNav && tenantMe?.stripeConnectAccountId && (
+          {showFullNav && !serviceOnly && tenantMe?.stripeConnectAccountId && (
             <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={16}/>Payouts</NavLink>
           )}
-          {showFullNav && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
+          {showFullNav && !serviceOnly && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
           {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
               via ?sso= so the tenant lands signed-in without re-auth. */}
-          {!LAUNCH_HIDE_FITNESS && (
+          {!LAUNCH_HIDE_FITNESS && !serviceOnly && (
           <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}><Dumbbell size={16}/>Fitness</a>
           )}
         </nav>
@@ -576,8 +593,8 @@ function Layout() {
         <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
         <DialogHost />
       </div>
-      {showFullNav && <FlexsuiteReAcceptanceGate />}
-      {showFullNav && <LeaseNoticeGate />}
+      {showFullNav && !serviceOnly && <FlexsuiteReAcceptanceGate />}
+      {showFullNav && !serviceOnly && <LeaseNoticeGate />}
       <AgentChatWidget />
     </div>
   )
@@ -864,6 +881,103 @@ function HomeAlerts() {
   )
 }
 
+/**
+ * S615 — the home page for someone who buys utilities from this landlord and
+ * does not rent from them.
+ *
+ * Nic: "That person should really have access to the tenant portal to get on
+ * and pay their bill. Otherwise the landlord has to bother to take cash from
+ * the other property."
+ *
+ * Everything the normal home page shows — rent, deposit, unit status, lease
+ * notices, Flex — resolves through an active lease and is NULL here. Rather
+ * than render that page full of dashes, this shows the balance and the bills
+ * behind it, and says plainly what the arrangement is.
+ */
+function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) {
+  const { data: balanceCtx } = useQuery<any>('balance-context',
+    () => get<any>('/payments/balance-context'))
+  const charges: any[] = balanceCtx?.serviceCharges ?? []
+  const owed = charges.reduce((s: number, c: any) => s + Number(c.amount || 0), 0)
+  const where = me.utilityServiceAddress || me.utilityServiceSpace || 'your address'
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">Hi, {firstName} 👋</h1>
+          <p className="ps">Utility service at {where}</p>
+        </div>
+      </div>
+
+      <div className="grid3" style={{marginBottom:24}}>
+        <a href="/payments" style={{textDecoration:'none'}} className="kpi"
+          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
+          <div className="kpi-l">Balance Due</div>
+          <div className="kpi-v" style={{color: owed > 0 ? 'var(--gold)' : undefined}}>
+            {formatCurrency(owed)}
+          </div>
+          <div className="kpi-s">
+            {owed > 0 ? 'tap to pay →' : "you're all paid up"}
+          </div>
+        </a>
+        <div className="kpi">
+          <div className="kpi-l">Billed By</div>
+          <div className="kpi-v" style={{fontSize:'1.05rem',marginTop:4}}>
+            {me.utilityServicePropertyName || '—'}
+          </div>
+          <div className="kpi-s">{me.utilityServiceSpace || ''}</div>
+        </div>
+        <div className="kpi">
+          <div className="kpi-l">Bills Due</div>
+          <div className="kpi-v" style={{fontSize:'1.05rem',marginTop:4}}>
+            {me.utilityServiceDueDay === 1 ? '1st of the month'
+              : me.utilityServiceDueDay ? `Day ${me.utilityServiceDueDay}` : '—'}
+          </div>
+          <div className="kpi-s">each month</div>
+        </div>
+      </div>
+
+      <div className="card" style={{padding:16}}>
+        <div style={{fontWeight:700,marginBottom:6}}>What you&apos;re billed for</div>
+        {charges.length === 0 ? (
+          <div style={{fontSize:'.82rem',color:'var(--t3)',lineHeight:1.6}}>
+            Nothing outstanding right now. When a meter is read or a monthly charge comes
+            due, the bill shows up here with the readings behind it.
+          </div>
+        ) : (
+          <table style={{width:'100%',fontSize:'.82rem',borderCollapse:'collapse'}}>
+            <tbody>
+              {charges.map((c: any) => (
+                <tr key={c.id} style={{borderTop:'1px solid var(--b0)'}}>
+                  <td style={{padding:'8px 0'}}>
+                    <div style={{fontWeight:600}}>
+                      {c.type === 'late_fee' ? 'Late fee' : 'Utilities'}
+                    </div>
+                    {c.notes && (
+                      <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{c.notes}</div>
+                    )}
+                  </td>
+                  <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                    <div style={{fontWeight:600}}>{formatCurrency(c.amount)}</div>
+                    <div style={{fontSize:'.72rem',color:'var(--t3)'}}>due {c.dueDate}</div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:12,lineHeight:1.6}}>
+          You don&apos;t rent from {me.utilityServicePropertyName || 'this property'} — this account
+          is only for the utilities they supply to {where}. Each bill shows the meter readings and
+          the dates they were taken.
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
@@ -873,6 +987,14 @@ function HomePage() {
   const { data: propane } = useQuery<any>('tenant-propane', () => get<any>('/propane/mine'))
   const [propaneOpen, setPropaneOpen] = useState(false)
   const flexVis = useFlexVisibility()
+
+  // S615: a utility-service payer has no lease, so every field this page reads
+  // is NULL for them — the header said "undefined · Unit undefined" over a rent
+  // card that can never have a number in it. They get their own home page,
+  // showing the one thing that is true: what they owe for what they used.
+  if (me && me.utilityServiceAgreementId && !me.unitId) {
+    return <UtilityServiceHome me={me} firstName={user?.firstName} />
+  }
 
   return (
     <div>

@@ -479,7 +479,17 @@ describe('GET /applications', () => {
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].first_name).toBe('A1')
-    expect(res.body.data[0].unit_number).toMatch(/^U-/)
+    // S615: was toMatch(/^U-/), which failed ~6% of runs. seedUnit builds the
+    // number from randomUUID().slice(0,6) — HEX, so about one time in sixteen
+    // it is all digits, and S614 made the fixture CANONICALISE like production,
+    // where 'U-123456' formats to 'U 123456' (hyphen → space). S614 fixed the
+    // flake it was chasing in unitRetire and moved this one here rather than
+    // ending it. Asserting the actual number is both exact and format-proof —
+    // and it is the stronger check anyway, since what this test is really about
+    // is that landlord A sees A's unit and not B's.
+    const { rows: [unitA] } = await db.query<{ unit_number: string }>(
+      `SELECT unit_number FROM units WHERE id = $1`, [f.unitAId])
+    expect(res.body.data[0].unit_number).toBe(unitA.unit_number)
   })
 })
 

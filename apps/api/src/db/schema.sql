@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict XKMZXXa41BtRJHeMTzskJchko09oB5gg3Fot4UYeZJfoDttUIneluTIMPcgqgwi
+\restrict s3vsNXJkzHWVIMSLjJxcCJceKB0KTd4tBrFF0CgoxYVwoEKiU9DWfeeQh50i9Ya
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -426,6 +426,37 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: supersede_utility_service_agreement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.supersede_utility_service_agreement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Only a LIVE tenancy supersedes. A draft or a signed-but-not-started lease
+  -- has not put anybody in the space yet, and stamping on those would move the
+  -- fee for a tenancy that may never begin.
+  IF NEW.status = 'active' THEN
+    UPDATE utility_service_agreements sa
+       SET superseded_by_lease_id = NEW.id,
+           updated_at = NOW()
+     WHERE sa.unit_id = NEW.unit_id
+       AND sa.status = 'active'
+       AND sa.superseded_by_lease_id IS NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION supersede_utility_service_agreement(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.supersede_utility_service_agreement() IS 'S615: a lease going active on a serviced space stamps the agreement so the $2 platform fee follows the tenancy and is never charged twice for one space. The agreement keeps billing utilities — only the fee moves.';
 
 
 --
@@ -17837,6 +17868,13 @@ CREATE TRIGGER trg_subleases_updated_at BEFORE UPDATE ON public.subleases FOR EA
 
 
 --
+-- Name: leases trg_supersede_utility_service_agreement; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_supersede_utility_service_agreement AFTER INSERT OR UPDATE OF status ON public.leases FOR EACH ROW EXECUTE FUNCTION public.supersede_utility_service_agreement();
+
+
+--
 -- Name: tenant_identifications trg_tenant_identifications_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -23520,5 +23558,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XKMZXXa41BtRJHeMTzskJchko09oB5gg3Fot4UYeZJfoDttUIneluTIMPcgqgwi
+\unrestrict s3vsNXJkzHWVIMSLjJxcCJceKB0KTd4tBrFF0CgoxYVwoEKiU9DWfeeQh50i9Ya
 
