@@ -91,7 +91,29 @@ function qualifyingInvoicesSql(rowFilter: string): string {
       -- and exactly one of them is present per the invoices CHECK, so the
       -- COALESCE pairs above are unambiguous rather than a precedence rule.
       LEFT JOIN leases l ON l.id = i.lease_id
-      LEFT JOIN utility_service_agreements sa ON sa.id = i.service_agreement_id
+      -- S616 (Nic, DIRECTIVE): "late fees only go to the utility landlord when
+      -- there's only utilities. When there's a lease, late fees go to the
+      -- leasing landlord."
+      --
+      -- So an agreement's own late-fee terms apply ONLY while it is unlinked.
+      -- Once the space is linked to another landlord's leased unit, its charges
+      -- ride that lease's invoice and that lease's late fee governs the whole
+      -- balance — one fee, one landlord, under one document's rules. The
+      -- utility landlord gives up his. Nic, on why: "That way it's smoother.
+      -- The tenant's not getting billed for two separate types of late fees,
+      -- and we're not miscalculating... if it's fifty dollars in electric and
+      -- five hundred dollars in rent, are we taking one eleventh of the late
+      -- fees and ratioing it out? I don't wanna deal with any of that. It
+      -- complicates books on both sides."
+      --
+      -- A linked agreement should have no invoices of its own to reach this
+      -- query at all; the join condition is belt-and-braces for a straggler
+      -- issued before the link went live.
+      LEFT JOIN utility_service_agreements sa
+             ON sa.id = i.service_agreement_id
+            AND NOT EXISTS (
+              SELECT 1 FROM cross_property_service_links cl
+               WHERE cl.service_agreement_id = sa.id AND cl.status = 'active')
       JOIN units u ON u.id = COALESCE(i.unit_id, l.unit_id)
       JOIN properties p ON p.id = u.property_id
       WHERE ${rowFilter}

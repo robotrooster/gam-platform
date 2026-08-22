@@ -111,6 +111,9 @@ export async function cleanupAllSchema(): Promise<void> {
     `DELETE FROM payments WHERE invoice_id IN
        (SELECT id FROM invoices WHERE service_agreement_id IS NOT NULL)`)
   await db.query(`DELETE FROM invoices WHERE service_agreement_id IS NOT NULL`)
+  // S616: a cross-property link holds BOTH the agreement and the other
+  // landlord's unit with RESTRICT, so it clears ahead of both.
+  await db.query(`DELETE FROM cross_property_service_links`)
   await db.query(`DELETE FROM utility_service_agreements`)
   // S533: propane installments FK payments (NO ACTION) — clear the
   // child before payments get wiped; fills cascade from installments'

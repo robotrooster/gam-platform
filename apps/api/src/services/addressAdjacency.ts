@@ -45,9 +45,29 @@ export interface AdjacencyResult {
 }
 
 /** Postcodes compare on the first five digits: 85362 and 85362-1234 are one
- *  postcode, and the +4 is noise a landlord may or may not have typed. */
+ *  postcode, and the +4 is noise a landlord may or may not have typed. Used on
+ *  the STRUCTURED zip column, where the whole value is the postcode. */
 function zip5(zip: string | null | undefined): string | null {
   const m = (zip ?? '').match(/\d{5}/)
+  return m ? m[0] : null
+}
+
+/**
+ * A postcode inside a free-text address line, if there is one.
+ *
+ * NOT the same job as zip5, and conflating them was a real defect: a bare
+ * five-digit scan reads the STREET NUMBER as a postcode, and Oak Park's own
+ * address is "22658 Highway 89". That made the strongest branch below compare
+ * "22658" against the property's real 85362, decide the postcodes disagreed,
+ * and silently downgrade a same-address match to a weaker one.
+ *
+ * So the leading street number is removed first, and only a five-digit group
+ * after it counts. A typed service address usually has no postcode at all,
+ * which is why its absence must never be read as a mismatch.
+ */
+function zipFromFreeText(line: string | null | undefined): string | null {
+  const withoutStreetNumber = (line ?? '').replace(/^\s*\d{1,6}\b/, '')
+  const m = withoutStreetNumber.match(/\b\d{5}\b/)
   return m ? m[0] : null
 }
 
@@ -131,7 +151,7 @@ export function compareAddresses(
     const streetsAgree = sameStreet(serviceAddress, unitStreet)
     // A typed service address rarely carries a postcode, so the postcode is
     // corroboration when present and never a requirement.
-    const svcZip = zip5(serviceAddress)
+    const svcZip = zipFromFreeText(serviceAddress)
     const zipOk = !svcZip || !unitZip || svcZip === unitZip
 
     if (streetsAgree && zipOk && svcNum && unitNum && svcNum === unitNum) {

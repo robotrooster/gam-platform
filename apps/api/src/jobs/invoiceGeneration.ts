@@ -582,7 +582,19 @@ async function runGeneration(
         // did before this existed.
         const covers = (kind: string) => !wt || wt.coveredCharges.length === 0
           || wt.coveredCharges.includes(kind)
-        const utilityCovered = utilityBills.map(b => covers(String(b.utility_type)))
+        // S616: a CONVERGED row is never work-trade creditable, whatever the
+        // agreement says it covers. Work trade is a bargain between this tenant
+        // and THIS landlord — the tenant's hours buy dollars off what this
+        // landlord is owed. A converged row is owed to the landlord next door,
+        // who is not party to that bargain and never agreed to fund it. Leaving
+        // it in would quietly take money out of one landlord's pocket to honour
+        // another landlord's labour deal.
+        //
+        // It leaves the BASIS as well as the distribution, for the S613 reason:
+        // a charge that cannot be discounted must not inflate the pot that
+        // discounts everything else.
+        const utilityCovered = utilityBills.map(b =>
+          (b as any).service_agreement_id == null && covers(String(b.utility_type)))
         const feeCovered     = fees.map(() => covers('fees'))
         const rentCovered    = covers('rent')
         const propaneCovered = covers('propane')
@@ -721,6 +733,20 @@ async function runGeneration(
               ? `${Number((ub as any).allocation_basis)} × $${Number((ub as any).rate_per_unit || 0).toFixed(2)}`
               : null
           const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
+          // S616 — THE DIVERSION. This row's landlord is the bill's own, not the
+          // lease's. For every ordinary utility they are the same value and
+          // nothing changes; on a converged invoice this is the line that sends
+          // the neighbour's electricity money to the landlord whose meter
+          // turned, while the rent on the same document goes to the landlord who
+          // owns the bricks. The payout sweep scopes by payments.landlord_id and
+          // not by invoice, so no other code has to know this happened.
+          //
+          // unit_id and lease_id likewise stay with the SERVICED SPACE rather
+          // than being rewritten to the leased unit: the charge is a fact about
+          // that meter at that space, and re-pointing it would make the utility
+          // landlord's own records show a bill against a unit he does not own.
+          const isCrossPropertyRow = (ub as any).service_agreement_id != null
+          const rowLandlordId = (ub as any).bill_landlord_id ?? lease.landlord_id
           const utilityPayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
@@ -730,7 +756,11 @@ async function runGeneration(
                CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)
              RETURNING id`,
             [
-              invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
+              invoiceId,
+              isCrossPropertyRow ? crossLink!.service_unit_id : lease.unit_id,
+              isCrossPropertyRow ? null : lease.id,
+              effectiveTenantId,
+              rowLandlordId,
               net.toFixed(2), dueDate, rowStatus(net), combinedNote,
             ]
           )

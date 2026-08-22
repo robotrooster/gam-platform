@@ -100,6 +100,18 @@ describe('address adjacency (S616)', () => {
   // locality gate the typed service address — which rarely carries a postcode —
   // matches an identical street line a thousand miles away and calls it the
   // SAME ADDRESS.
+  // A five-digit STREET NUMBER is not a postcode. Oak Park's own address is
+  // "22658 Highway 89", and a bare five-digit scan read that as its zip —
+  // which made the strongest branch decide the postcodes disagreed and quietly
+  // downgrade a same-address match.
+  it('does not mistake a five-digit street number for a postcode', () => {
+    const r = compareAddresses(
+      '22660 Highway 89',
+      OAK_PARK,
+      { street1: '22660 Highway 89', city: 'Yarnell', state: 'AZ', zip: '85362' })
+    expect(r.basis).toBe('same_address')
+  })
+
   it('a same-numbered street in another state does not match', () => {
     const r = compareAddresses(
       '1442 W Second St',

@@ -249,6 +249,12 @@ async function insertUtilityRow(
   return res.rows[0].id
 }
 
+// S616: an agreement whose space is LINKED to another landlord's leased unit
+// no longer cuts its own invoice — its charges ride that unit's tenant invoice
+// instead, so the tenant gets one document. Excluded here rather than left to
+// race the lease run for the bill: whichever attached it first would win, and
+// the loser would produce an invoice that is empty or, worse, a second document
+// for charges already billed.
 const AGREEMENT_SELECT = `
   SELECT sa.id, sa.landlord_id, sa.unit_id, sa.tenant_id, sa.billing_due_day,
          to_char(sa.start_date, 'YYYY-MM-DD') AS start_date,
@@ -257,7 +263,10 @@ const AGREEMENT_SELECT = `
     FROM utility_service_agreements sa
     JOIN units u ON u.id = sa.unit_id
     JOIN properties p ON p.id = u.property_id
-   WHERE sa.status = 'active'`
+   WHERE sa.status = 'active'
+     AND NOT EXISTS (
+       SELECT 1 FROM cross_property_service_links l
+        WHERE l.service_agreement_id = sa.id AND l.status = 'active')`
 
 /** Every active agreement, any timezone. Used by tests and manual catch-up. */
 export async function generateServiceAgreementInvoices(
