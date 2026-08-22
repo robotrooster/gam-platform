@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 19, 2026
+Last Updated: August 22, 2026
 
 ---
 
@@ -99,7 +99,7 @@ GAM charges fees for use of the Platform. The fees applicable to business users 
 - **Per-occupied-unit platform fee** (long-term tenancies): $2.00 per occupied unit per month, with a minimum of $10.00 per property per month. Vacant units are not charged.
 - **Short-term-stay platform fee** (nightly and weekly bookings): billed monthly and **in addition to** the per-occupied-unit fee for any long-term units on the same property, using one of two methods depending on the unit type:
   - **Space-only sites** — RV spots, campsites, and boat slips, where the operator coordinates nothing beyond the space: booked nights are aggregated at **$2.00 per thirty (30) booked nights** that fall within the month.
-  - **Furnished short stays** — apartments, condos, motel/hotel rooms, cabins, and any other furnished unit rented nightly or weekly: **5% of booking revenue**, pro-rated to the month.
+  - **Furnished short stays** — apartments, condos, motel/hotel rooms, cabins, and any other furnished unit rented nightly or weekly: **3% of booking revenue**, pro-rated to the month.
   Bookings that are cancelled or marked no-show are not counted. A property's total monthly platform fee is the greater of (the sum of its per-occupied-unit and short-term-stay amounts) or the $10.00 per-property minimum.
 - **Connect account fee**: $1.00 per active Connect account per month, waived once the associated Landlord or PM Company has ten or more billable units.
 - **Payment processing fees**: ACH at a flat $6.00 per transaction; card at 3.5% + $0.55 per transaction (no cap). Per-property settings determine whether processing fees are passed through to the tenant at checkout or deducted from the Landlord's settlement. **In no case will GAM absorb processing or banking fees on a Landlord's behalf.**
