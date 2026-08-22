@@ -2,6 +2,7 @@ import { query } from '../db'
 import { logger } from '../lib/logger'
 import { proposeLink } from './crossPropertyLink'
 import { checkUnitAgainstAgreement } from './addressAdjacency'
+import { createAdminNotification } from './adminNotifications'
 
 // ============================================================
 // S616 (Nic) — GAM links the two spaces itself.
@@ -93,8 +94,22 @@ export async function autoLinkNeighborServices(): Promise<AutoLinkResult> {
       }
       if (matched.length !== 1) {
         if (matched.length > 1) {
-          logger.warn({ agreementId: sa.id },
-            '[auto-link] more than one unit matches this address — leaving it alone')
+          // S616 (Nic): "if there's ever a system that comes up that may need
+          // attention, we can flag that directly for admin profile to take a
+          // look at." A log line is not a flag — nobody reads it. This is the
+          // one case GAM genuinely cannot decide: the same person, the same
+          // town, and two units that both fit. Linking the wrong one bills a
+          // stranger's electricity to somebody's rent invoice and pays the
+          // wrong landlord, so it stops and asks.
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'cross_property_link_ambiguous',
+            title: 'Two units match one neighbour utility agreement',
+            body: `The same person rents more than one unit that could be the space this landlord supplies, so GAM cannot tell which. Nothing was linked and both parties keep billing separately — no money is at risk. Link it by hand once you know which unit it is.`,
+            context: { service_agreement_id: sa.id, candidate_unit_ids: matched },
+          }).catch(() => {})
+          logger.warn({ agreementId: sa.id, candidates: matched },
+            '[auto-link] more than one unit matches — flagged for admin, left alone')
         }
         continue
       }
