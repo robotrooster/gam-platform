@@ -29,14 +29,26 @@ describe('which questions demand a tool (S617)', () => {
     ]) expect(nudges(m), m).toBe(true)
   })
 
-  it('leaves capability questions to the knowledge base', () => {
-    // These must NOT be nudged — they answer from articles, often as bullets,
-    // and suppressing a bulleted capability answer would be a regression.
+  it('leaves the never-changing things to memory', () => {
+    // S617 (Nic): "memory should only be the things that don't change." A
+    // how-to is the same procedure for everyone, and the platform fee is the
+    // same number for every landlord.
     for (const m of [
-      'how do payouts work?', 'what is the platform fee?', 'how do late fees work',
-      'how do I add a unit?', 'can I bill my neighbor for trash?',
-      'what happens if rent is late', 'how much does a background check cost',
+      'how do I add a unit?', 'how do I report a repair', 'where do I pay my rent',
+      'can I pay with a card', 'what is the platform fee?',
+      'how much do you charge per unit', 'how much does a background check cost',
+      'can tenants pay part of the rent', 'can I pay half now and half later',
     ]) expect(nudges(m), m).toBe(false)
+  })
+
+  it('looks up anything that differs between two users', () => {
+    // Including the general-sounding ones. Nic: late fees are "per property and
+    // per state and landlord", so there is no universal answer to give.
+    for (const m of [
+      'how do late fees work', 'is there a grace period on my rent',
+      'what happens if I pay rent late', 'how do payouts work?',
+      'when do I get paid', 'what happens if rent is late',
+    ]) expect(nudges(m), m).toBe(true)
   })
 })
 

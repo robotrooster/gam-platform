@@ -117,24 +117,18 @@ export const TENANT_INTENTS: Intent[] = [
     ],
   },
   {
-    // How late fees WORK is a policy question the knowledge base answers.
-    audience: 'tenant', id: 'late-fees-policy', needsTool: false,
+    // Nic: late fees are "per property and per state and landlord" — so even
+    // the general-sounding version has to come from THIS lease, not an article.
+    // This tenant: $15 flat after a 5-day grace.
+    audience: 'tenant', id: 'late-fees', needsTool: true, expect: '5',
     mustNotContain: ["I've escalated"],
     phrasings: [
       'how do late fees work?',
       'what happens if I pay rent late',
-      'what is the late fee for',
-    ],
-  },
-  {
-    // How many days THIS tenant gets is a term of THEIR lease — 5 days here —
-    // so it is a lookup, not an article. Grouping the two together was my error
-    // and made the whole intent score 0/4.
-    audience: 'tenant', id: 'late-fees-mine', needsTool: true, expect: '5',
-    phrasings: [
       'how many days do I have before a late fee',
       'is there a grace period on my rent',
       "what's my grace period",
+      'what is the late fee',
     ],
   },
   {

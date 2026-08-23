@@ -81,7 +81,10 @@ describe('runAgentWithTools', () => {
     vi.spyOn(tools, 'getToolsForProfile').mockReturnValue([])
     ;(chatCompletion as any).mockResolvedValueOnce(textTurn('Rent is paid in full, oldest charges first.'))
 
-    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'how do late fees work' })
+    // S617: 'how do late fees work' moved to the lookup side — late fees vary
+    // by property, state and landlord, so there is no universal answer. A
+    // how-to is still universal: the procedure is the same for everyone.
+    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'how do I report a repair' })
     expect(res.reply).toBe('Rent is paid in full, oldest charges first.')
     expect(res.toolInvocations).toHaveLength(0)
     expect(chatCompletion).toHaveBeenCalledTimes(1)

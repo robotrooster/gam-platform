@@ -105,18 +105,62 @@ export function namesNotInToolResults(reply: string, toolResults: unknown[]): st
 /**
  * Does this question have to be answered by a TOOL rather than from memory?
  *
- * ONE definition. It was briefly spelled out in the runner and again in the
- * test, and they drifted within the hour: the test still nudged "how much does
- * a background check cost" after the runner had learned not to. A predicate
- * both sides call cannot disagree.
+ * S617 (Nic), and this is HIS rule, which is simpler and better than the one it
+ * replaced: "memory should only be the things that don't change. Everything
+ * else should be a lookup, instead of making stuff up."
+ *
+ * The old version listed the wordings that deserved a lookup, so anything
+ * phrased a way nobody anticipated fell through to memory and got invented —
+ * "what do I owe?" was handled, "how much do I pay each month" answered $1,200
+ * against a real rent of $750. Listing the safe cases and defaulting everything
+ * else to invention is backwards.
+ *
+ * So it is inverted. Asking for a fact means a LOOKUP, unless the fact is one
+ * of the few that is identical for every user on the platform:
+ *
+ *   memory  — the $2 per occupied unit and the $10 per-property minimum; that
+ *             rent is paid in full and never in part; what a feature is; and
+ *             how to DO something (how do I add a unit, report a repair, pay).
+ *   lookup  — everything else. Nic: late fees are "per property and per state
+ *             and landlord", so even the general-sounding "how do late fees
+ *             work" has to come from THIS lease. Same for the lease dates, the
+ *             balance, the rent, the deposit, occupancy, who is behind.
+ *
+ * When in doubt this returns TRUE, because the cost is asymmetric: a needless
+ * lookup is a wasted second, and a made-up balance is a tenant told they owe
+ * $1,200 when they owe $2,330.
  */
+
+/** Is the person asking for a fact at all (vs. chatting, or giving an instruction)? */
+export const SEEKS_A_FACT =
+  /\b(how many|how much|how long|how often|what'?s?|when'?s?|where'?s?|which|who'?s?|why|is|are|am|do|does|did|can|could|will|would|should|show|list|tell me|pull up|look ?up|check|any)\b/i
+
+/**
+ * The short list that memory may answer: platform-wide constants and how-to.
+ *
+ * A how-to is a procedure, the same for everyone — "how do I report a repair"
+ * has one answer whoever asks. The moment a question wants a NUMBER or a DATE
+ * that could differ between two users, it leaves this list.
+ */
+export const ANSWERABLE_FROM_MEMORY = [
+  // "how do I ...", "where do I ...", "can I ..." — procedure, not data.
+  /\b(how|where)\s+(do|can|would)\s+(i|we|you)\b/i,
+  /\b(can|could)\s+(i|we)\s+(pay|add|set up|create|file|report|upload|invite|book|reserve|cancel|renew)\b/i,
+  // Platform-wide pricing and rules — identical for every landlord and tenant.
+  /\bplatform fee\b|\bwhat does gam (cost|charge)\b|\bhow much do you charge\b|\bper occupied unit\b/i,
+  /\bpartial payment|\bpay in full\b|\bsplit (the |my )?rent\b|\bpay (part|some|half) of\b|\bpay a (partial|portion)\b/i,
+  /\bwhat (is|are) (a |an |the )?[a-z ]{0,24}(flexpay|flexvault|flexdeposit|flexcredit|work trade|rubs)\b/i,
+  // Cost of a service, not of this person's account — "how much does a
+  // background check cost" is a price list, not their data. (Same pattern as
+  // PRICING_QUESTION below, kept here so this array does not depend on
+  // declaration order.)
+  /\b(how much|what)\s+(?:does|do|is|are|would)\b[^?]*\b(cost|charge[ds]?|price[ds]?|run me)\b|\bpricing\b|\bprice of\b/i,
+]
+
 export function demandsAToolCall(message: string): boolean {
-  if (PRICING_QUESTION.test(message)) return false   // capability, not account data
-  return (
-    ACCOUNT_DATA_INTENT.test(message) ||
-    ACCOUNT_DATA_LOOSE.test(message) ||
-    (PORTFOLIO_DATA_NOUN.test(message) && ASKS_FOR_A_FACT.test(message))
-  )
+  if (!SEEKS_A_FACT.test(message)) return false
+  if (ANSWERABLE_FROM_MEMORY.some((re) => re.test(message))) return false
+  return true
 }
 
 /**

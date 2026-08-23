@@ -92,6 +92,22 @@ database, the running services, and the Stripe live account on 2026-08-22.
 - **Database backups + PITR** — nightly dump → local + iCloud, running and
   current (verified 2026-08-22 03:30). Managed-Postgres PITR comes with the host
   pick.
+- **Error reporting** ✅ **S617 — switched on, and it had never been on.** This
+  document listed "Sentry on API + 9 frontends" as shipped infrastructure. The
+  package was installed and the code was wired, but no DSN was ever set, and
+  `instrument.ts` skips init entirely without one. So a tenant hitting a 500
+  while paying rent reported to nobody. Project `gam-api` in the
+  `gold-asset-management` org; key in `apps/api/.env`; verified by a test error
+  that arrived and was then resolved. PII is deliberately not sent and 4xx are
+  filtered — only 5xx and uncaught exceptions.
+- **Uptime alerting** ✅ **S617.** Everything runs on one Mac, and nothing would
+  have told anyone if it stopped. Four Sentry monitors:
+  `api.goldassetmanagement.com/health` every 60s (this is the Mac heartbeat —
+  the API and the marketing site are the parts hosted there), the marketing
+  site, and both portals every 5 minutes. Two consecutive failures to alert, so
+  a single blip stays quiet.
+  **Nic still has to confirm the alerts actually reach him** — Sentry emails the
+  org owner by default; anything louder than email is a setting on his side.
 - **Stripe live activation** ✅ see C3/C4.
 - **Resend domain auth** ✅ verified + delivering ([[gam-launch-accounts]]).
 
