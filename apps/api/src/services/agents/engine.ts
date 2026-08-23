@@ -33,6 +33,8 @@ export interface ToolSchema {
 export interface ChatCompletionOptions {
   tools?: ToolSchema[]
   sampler?: Partial<SamplerSettings>
+  /** 'required' forces the model to call one of `tools` — see the note below. */
+  toolChoice?: 'auto' | 'required' | 'none'
 }
 
 export interface ChatCompletionOutput {
@@ -72,6 +74,13 @@ export async function chatCompletion(
     stream: false,
   }
   if (opts.tools && opts.tools.length > 0) body.tools = opts.tools
+  // S617: force a lookup when the caller insists. The account-data safety net
+  // asks the model to call a tool; on roughly one phrasing in five it declines
+  // and answers from memory anyway, and the answer is invented. Asking again is
+  // a request; tool_choice 'required' is not. Verified supported by the local
+  // mlx server. Only set when explicitly requested, so ordinary turns keep the
+  // option of a plain reply.
+  if (opts.toolChoice) body.tool_choice = opts.toolChoice
 
   // Spread across the worker fleet; fail over on transient errors.
   const data = await getPool(endpoints).run(async (endpoint) => {

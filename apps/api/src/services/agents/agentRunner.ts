@@ -406,6 +406,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForAccountData = false
   let nudgedForPadding = false
   let refusedOneEscalation = false
+  let forceToolThisTurn = false
   let nudgedForDispute = false
   let nudgedForHardStop = false
   let model = ''
@@ -417,10 +418,28 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   }
 
   for (let step = 0; step < maxSteps; step++) {
+    // S617: on the forced turn, take the escalation tools OFF the table. With
+    // tool_choice 'required' the model must call SOMETHING, and given the
+    // choice it called `escalate` — which is deliberately not counted as a
+    // lookup, so the turn still ended with no data and the reply was
+    // suppressed. The point of forcing is to make it look the answer up; an
+    // escalation is the one option that does not.
+    const turnTools = forceToolThisTurn
+      ? toolSchemas.filter((t: any) => !/^escalate(_to_human)?$/.test(t?.function?.name))
+      : toolSchemas
+
     const out = await chatCompletion(messages, {
-      tools: toolSchemas.length > 0 ? toolSchemas : undefined,
+      tools: turnTools.length > 0 ? turnTools : undefined,
       sampler: profile.sampler,
+      // S617: on the turn RIGHT AFTER an account-data nudge, require a tool.
+      // The nudge asks; roughly one phrasing in five the model declines and
+      // answers from memory anyway, and that answer is invented — "$1,200" to a
+      // tenant who owed $2,330. Asking again is a request. This is not.
+      // Only the retry turn is forced, so every ordinary turn keeps the option
+      // of a plain reply (and a knowledge-base answer stays one call).
+      toolChoice: forceToolThisTurn && turnTools.length > 0 ? 'required' : undefined,
     })
+    forceToolThisTurn = false
     model = out.model
     addUsage(out.usage)
 
@@ -473,6 +492,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         demandsAToolCall(message)
       ) {
         nudgedForAccountData = true
+        forceToolThisTurn = true
         logger.warn({ profile: profile.id }, 'agent runner: tool-less answer to an account-data question — forcing one tool retry (safety net)')
         messages.push({ role: 'assistant', content: out.content })
         messages.push({
