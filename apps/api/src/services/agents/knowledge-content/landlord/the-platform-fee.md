@@ -18,7 +18,7 @@ When you onboard, GAM doesn't start charging the platform fee until you go live 
 
 ## Short-term stays
 
-For nightly or weekly bookings, the fee is counted a little differently and added to your occupied-unit total (under the same $10-per-property minimum): space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, while furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **5% of booking revenue**.
+For nightly or weekly bookings, the fee is counted a little differently and added to your occupied-unit total (under the same $10-per-property minimum): space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, while furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **3% of booking revenue**, pro-rated to the month.
 
 ## Lowering your per-unit fee with FlexVault
 
