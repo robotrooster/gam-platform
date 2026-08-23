@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -67,5 +67,39 @@ describe('scrubScopeLeaks (S617)', () => {
 
   it('handles an empty reply without throwing', () => {
     expect(scrubScopeLeaks('').reply).toBe('')
+  })
+})
+
+describe('stripChatMarkdown (S617)', () => {
+  it('removes bold the chat window would print as asterisks', () => {
+    // Real output from a live delinquency lookup.
+    const out = stripChatMarkdown('- **Frank Williams**: $4,840 overdue (8 past due items)')
+    expect(out).not.toContain('*')
+    expect(out).toContain('Frank Williams')
+    expect(out).toContain('$4,840')
+  })
+
+  it('keeps a list a list, without the markdown marker', () => {
+    const out = stripChatMarkdown('- one\n- two\n* three')
+    expect(out.split('\n').every(l => l.startsWith('• '))).toBe(true)
+  })
+
+  it('unwraps headings, code ticks and links', () => {
+    expect(stripChatMarkdown('## Payouts')).toBe('Payouts')
+    expect(stripChatMarkdown('use `get_my_lease` here')).toBe('use get_my_lease here')
+    expect(stripChatMarkdown('see [the terms](https://x.io)')).toBe('see the terms (https://x.io)')
+  })
+
+  it('leaves ordinary prose and real dollar amounts alone', () => {
+    const ok = "Your rent is $750 on the 1st. Bob's balance is $2,330."
+    expect(stripChatMarkdown(ok)).toBe(ok)
+  })
+
+  it('does not eat an asterisk used as a footnote or maths', () => {
+    expect(stripChatMarkdown('2 * 3 = 6')).toBe('2 * 3 = 6')
+  })
+
+  it('runs as part of the reply tail', () => {
+    expect(scrubScopeLeaks('**Bob Chen** owes $2,330.').reply).toBe('Bob Chen owes $2,330.')
   })
 })

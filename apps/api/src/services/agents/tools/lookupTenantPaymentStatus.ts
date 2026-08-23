@@ -30,7 +30,7 @@ export const lookupTenantPaymentStatus: AgentTool = {
   parameters: {
     type: 'object',
     properties: {
-      tenant: { type: 'string', description: 'The tenant’s name or email to look up.' },
+      tenant: { type: 'string', description: 'The tenant’s name or email — or the unit they live in (e.g. "Apt 101", "RV 04", or just "101").' },
     },
     required: ['tenant'],
   },
@@ -40,15 +40,33 @@ export const lookupTenantPaymentStatus: AgentTool = {
     const needle = String(args.tenant ?? '').trim()
     if (needle.length < 2) return { ok: false, error: 'Provide at least part of the tenant’s name or email.' }
 
-    // Tenants on THIS landlord's leases matching the name/email.
+    // Tenants on THIS landlord's leases matching the name, email — or the UNIT.
+    //
+    // S617 (Nic): "it should find the actual lease based on the signed in person
+    // ... unless it's the landlord talking about a specific person and then
+    // should be able to find that by name in occupied units."
+    //
+    // A landlord asking "how much does apt 101 owe" is naming the space, not the
+    // person — often the only handle they have in front of them. This used to
+    // match name and email only, so it answered "I don't see a tenant named
+    // 'Apt 101'", which is true and useless. Unit number is matched too now,
+    // scoped through the same landlord join, so it can never reach a unit that
+    // is not theirs.
     const matches = await query<TenantMatch>(
       `SELECT DISTINCT t.id AS tenant_id, us.first_name, us.last_name, us.email
          FROM lease_tenants lt
          JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1
          JOIN tenants t ON t.id = lt.tenant_id
          JOIN users us ON us.id = t.user_id
-        WHERE us.email ILIKE $2 OR (COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) ILIKE $2`,
-      [actor.profileId, `%${needle}%`]
+         JOIN units un ON un.id = l.unit_id
+        WHERE us.email ILIKE $2
+           OR (COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) ILIKE $2
+           OR un.unit_number ILIKE $2
+           OR ($3 ~ '[0-9]'
+               AND regexp_replace(un.unit_number, '[^0-9]', '', 'g') <> ''
+               AND regexp_replace(un.unit_number, '[^0-9]', '', 'g')
+                   = regexp_replace($3, '[^0-9]', '', 'g'))`,
+      [actor.profileId, `%${needle}%`, needle]
     )
 
     if (matches.length === 0) {

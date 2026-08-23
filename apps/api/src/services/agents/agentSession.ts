@@ -153,10 +153,14 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
     // See scopeGuard.ts for why this is deterministic and not just prompted.
     if (result.reply) {
       const scrubbed = scrubScopeLeaks(result.reply)
+      // ALWAYS take the scrubbed text, not only when a leak sentence was cut.
+      // scrubScopeLeaks also strips markdown the chat window cannot render, and
+      // gating on removed.length threw that away on every reply that was merely
+      // formatted wrong — which is most of them.
+      if (scrubbed.reply !== result.reply) result = { ...result, reply: scrubbed.reply }
       if (scrubbed.removed.length) {
         logger.warn({ profile: finalProfileId, removed: scrubbed.removed },
           '[agent] scope leak scrubbed from reply')
-        result = { ...result, reply: scrubbed.reply }
       }
     }
 

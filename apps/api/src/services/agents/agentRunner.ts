@@ -65,6 +65,26 @@ function promisesHandoff(content: string): boolean {
 const ACCOUNT_DATA_INTENT =
   /\b(my|our)\s+(?:\w+\s+)?(lease|deposit|balance|rent|payments?|payout|invoice|maintenance requests?|documents?|payment methods?|property manager|entry requests?|inspections?)\b|what do (i|we) owe|when('| i)?s my (next |last )?(payment|payout|rent)|\bon file\b|what documents|documents? do (i|we) have|requested entry|entry request/i
 
+// S617: the net above is built entirely around the word "my", and it showed.
+// Running the REAL production path (runAgentSession, real actor, real tools)
+// rather than the bare engine, two questions slipped it and the model answered
+// from imagination in both:
+//
+//   tenant   "how much do I owe right now?"  -> "You currently owe $1,200. Your
+//            rent is due on the 3rd." The lease is $750, due on the 1st. No tool
+//            was called. Both numbers invented.
+//   landlord "is bob behind on rent?"        -> "Bob is current on his rent."
+//            No lookup happened at all.
+//
+// "what do I owe?" was caught; "how much do I owe right now?" was not, because
+// the alternation pinned an exact phrase. And nothing covered a landlord asking
+// about a NAMED tenant or unit — Nic: "unless it's the landlord talking about a
+// specific person and then should be able to find that by name in occupied
+// units." A fabricated delinquency answer is worse than a tenant-side one: it is
+// what an eviction decision gets made on.
+const ACCOUNT_DATA_LOOSE =
+  /how much (do|does|did) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (still )?owe|what'?s (my|the|his|her|their) balance|(am|are|is) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (behind|current|late|caught up|past due)|behind on (rent|payments?)|late on (rent|payments?)|\bdelinquen\w*|\bpast due\b|who('s| is| has)? (not )?(paid|behind|late)|any(one|body) (behind|late|not paid)|(has|did) [a-z]+ paid|paid (yet|this month|their rent)|\bowes?\b.*\b(rent|balance|anything)\b|\b(rent|balance) .*\bowed\b/i
+
 // S553: two more hard-stop nets, same philosophy as MONEY_DISPUTE_INTENT
 // (the prompt rule holds most runs; quantized variance drops it some runs —
 // the deterministic net doesn't). Both must END in the escalation tool:
@@ -228,7 +248,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       if (
         !nudgedForAccountData &&
         toolInvocations.length === 0 &&
-        ACCOUNT_DATA_INTENT.test(message)
+        (ACCOUNT_DATA_INTENT.test(message) || ACCOUNT_DATA_LOOSE.test(message))
       ) {
         nudgedForAccountData = true
         logger.warn({ profile: profile.id }, 'agent runner: tool-less answer to an account-data question — forcing one tool retry (safety net)')

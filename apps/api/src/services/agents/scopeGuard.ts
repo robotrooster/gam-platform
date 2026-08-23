@@ -56,6 +56,29 @@ const LEAK_PATTERNS: { name: string; re: RegExp }[] = [
   },
 ]
 
+/**
+ * Markdown the chat window cannot render.
+ *
+ * S617: the bubbles use whiteSpace: pre-wrap with no markdown parser, so what
+ * the model types is what the customer sees. The prompt says plain text; a live
+ * run listing delinquent tenants came back with "**Frank Williams**: $4,840"
+ * anyway. Asterisks around a name are not emphasis to the reader, they are
+ * asterisks — so they are removed here rather than argued about.
+ *
+ * Bullets are normalised rather than deleted: a real list stays a list, it just
+ * stops carrying a markdown marker.
+ */
+export function stripChatMarkdown(text: string): string {
+  return text
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')      // **bold**
+    .replace(/(?<!\w)__([^_\n]+)__(?!\w)/g, '$1') // __bold__
+    .replace(/(?<!\w)\*([^*\n]+)\*(?!\w)/g, '$1') // *italic*
+    .replace(/`([^`\n]+)`/g, '$1')             // `code`
+    .replace(/^#{1,6}\s+/gm, '')                // # heading
+    .replace(/^\s*[-*]\s+/gm, '• ')             // - bullet -> plain bullet
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url)
+}
+
 export interface ScrubResult {
   reply: string
   removed: string[]
@@ -70,6 +93,7 @@ export interface ScrubResult {
  */
 export function scrubScopeLeaks(reply: string): ScrubResult {
   if (!reply) return { reply, removed: [] }
+  reply = stripChatMarkdown(reply)
   const removed: string[] = []
   const kept = sentences(reply).filter((s) => {
     const hit = LEAK_PATTERNS.find((p) => p.re.test(s))
