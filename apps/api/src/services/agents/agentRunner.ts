@@ -51,10 +51,51 @@ const SUPPORT_TARGET =
  * so routing the tenant to their LANDLORD ("I'll connect you with your landlord")
  * is NOT mistaken for a support escalation.
  */
-function promisesHandoff(content: string): boolean {
+/**
+ * An OFFER to escalate is not an escalation.
+ *
+ * S617. The net above exists for a model that NARRATES a completed handoff
+ * ("I'll connect you with a senior agent — please hold") and then stops,
+ * stranding the customer. It was also firing on ordinary good service:
+ *
+ *   "You currently owe $2,330. This includes several pending payments and a
+ *    failed rent payment from June. If you need help with the failed payment,
+ *    I can connect you with a human support agent. Would you like me to do
+ *    that?"
+ *
+ * That answer is correct and complete — the balance matches the database to the
+ * dollar. The net saw "connect you with ... human", manufactured a real
+ * escalation, and THREW THE ANSWER AWAY, replacing it with "I've escalated this,
+ * someone will email you within 24 hours." The tenant asked what they owed and
+ * was told to wait a day.
+ *
+ * So the sentence carrying the handoff decides. A statement of intent is a
+ * handoff. A conditional or a question — "if you'd like", "would you like me
+ * to", "let me know if" — is an offer, and the customer's answer decides, not
+ * ours.
+ */
+const HANDOFF_IS_ONLY_AN_OFFER =
+  /\b(if\s+(?:you|that|this|something|it|there|anything|nothing)|would\s+you\s+like|do\s+you\s+want|shall\s+i|want\s+me\s+to|let\s+me\s+know|happy\s+to|i\s+can\s+(?:also\s+)?(?:connect|transfer|bring|loop|pass|hand))\b/i
+
+/** The sentence a phrase appears in — offers are judged in context, not globally. */
+function sentenceContaining(content: string, re: RegExp): string {
+  for (const s of content.split(/(?<=[.!?])\s+/)) if (re.test(s)) return s
+  return content
+}
+
+export function promisesHandoff(content: string): boolean {
   if (!content) return false
-  if (/\bescalat\w+/i.test(content)) return true
-  return HANDOFF_VERB.test(content) && SUPPORT_TARGET.test(content)
+
+  const explicit = /\bescalat\w+/i.test(content)
+  const narrated = HANDOFF_VERB.test(content) && SUPPORT_TARGET.test(content)
+  if (!explicit && !narrated) return false
+
+  // Judge the sentence that actually carries it. "I've escalated this" is a
+  // handoff; "I can escalate this if you'd like" is a question.
+  const carrier = sentenceContaining(content, explicit ? /\bescalat\w+/i : HANDOFF_VERB)
+  if (HANDOFF_IS_ONLY_AN_OFFER.test(carrier) || carrier.trim().endsWith('?')) return false
+
+  return true
 }
 
 // S552: user messages that name THEIR OWN account data — "my lease", "my

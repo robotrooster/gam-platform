@@ -124,3 +124,48 @@ describe('namesNotInToolResults — field labels are not invented records (S617)
     expect(bad).toEqual(['Maple Court'])
   })
 })
+
+// ============================================================
+// S617 — an OFFER to escalate is not an escalation.
+//
+// The prose-handoff net exists because this model class sometimes narrates a
+// handoff instead of calling the tool, stranding the customer. It was also
+// firing on ordinary good service, and when it fires it REPLACES the reply with
+// escalation boilerplate — so a correct answer was being deleted.
+// ============================================================
+import { promisesHandoff } from './agentRunner'
+
+describe('promisesHandoff — offers vs actual handoffs (S617)', () => {
+  it('does NOT fire on the real reply that was being thrown away', () => {
+    // Verbatim from the production path. The $2,330 matches the database.
+    expect(promisesHandoff(
+      'You currently owe $2,330. This includes several pending payments and a failed rent ' +
+      'payment from June. If you need help with the failed payment or have questions about ' +
+      'the late fees, I can connect you with a human support agent. Would you like me to do that?'
+    )).toBe(false)
+  })
+
+  it('does NOT fire on a conditional offer at the end of a good answer', () => {
+    expect(promisesHandoff(
+      'Late fees are set by your landlord and outlined in your lease. If something still seems ' +
+      'off, we can connect you with a human GAM Strategist to help.'
+    )).toBe(false)
+    expect(promisesHandoff('I can escalate this to a specialist if you would like.')).toBe(false)
+    expect(promisesHandoff('Want me to bring in someone who can help?')).toBe(false)
+  })
+
+  it('DOES fire when the agent says it has already handed off', () => {
+    // The original failure this net was built for — narrate, then stop.
+    expect(promisesHandoff("I'm connecting you with a senior agent now — please hold.")).toBe(true)
+    expect(promisesHandoff("I've escalated this to our support team.")).toBe(true)
+    expect(promisesHandoff('Transferring you to a human specialist.')).toBe(true)
+  })
+
+  it('still ignores routing to the LANDLORD, which is not a support escalation', () => {
+    expect(promisesHandoff("I'll pass this on to your landlord.")).toBe(false)
+  })
+
+  it('ignores an empty reply', () => {
+    expect(promisesHandoff('')).toBe(false)
+  })
+})
