@@ -99,7 +99,14 @@ export function collapseRepetition(text: string): string {
   const out: string[] = []
   for (const line of lines) {
     const key = line.trim().toLowerCase().replace(/\s+/g, ' ')
-    if (key.length < 12) { out.push(line); continue }   // short/blank: keep
+    // Blank lines separate bubbles and must all survive.
+    if (!key) { out.push(line); continue }
+    // S617: this used to keep any line under 12 characters, on the theory that
+    // short lines are list markers rather than repetition. Then a tenant asked
+    // "do I owe anything?" and got back "What's due?" twelve times — eleven
+    // characters, so every copy was kept. An exact repeat is a repeat at any
+    // length; distinct short lines (bullet items) are all still unique and all
+    // still kept.
     if (seen.has(key)) continue
     seen.add(key)
     out.push(line)

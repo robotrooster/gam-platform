@@ -364,6 +364,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const toolInvocations: ToolInvocation[] = []
   let nudgedForAccountData = false
   let nudgedForPadding = false
+  let refusedOneEscalation = false
   let nudgedForDispute = false
   let nudgedForHardStop = false
   let model = ''
@@ -541,6 +542,42 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // (tool_invocation_count / tool_names / tool_invocations) and hands
       // control back to the session orchestrator.
       const handoff = asHandoff(result)
+
+      // S617: refuse ONE self-chosen escalation on a question a tool could have
+      // answered. Measured on the real path, the agent escalated "how much do I
+      // owe?" and "how do late fees work?" to a human — a balance it could read
+      // and a lease term it could look up. Two rewrites of the escalate tool's
+      // description did not stop it, so this is deterministic.
+      //
+      // Deliberately narrow: it only fires when the question demands a lookup,
+      // NO tool has run yet, and this has not already been refused once. The
+      // genuine hard stops — a refund, a legal dispute, an account-security
+      // incident — do not demand a lookup, and the nets above force THEIR
+      // escalation before this point, so none of them are caught here.
+      if (
+        handoff && !refusedOneEscalation &&
+        toolInvocations.length === 0 &&
+        demandsAToolCall(message)
+      ) {
+        refusedOneEscalation = true
+        logger.warn({ profile: profile.id, message },
+          'agent runner: escalation on an answerable question — looking it up instead')
+        messages.push({ role: 'assistant', content: out.content || null, tool_calls: out.toolCalls })
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          name: call.function.name,
+          content: JSON.stringify({
+            ok: false,
+            error:
+              'Not escalated — this is answerable. You have not looked anything up yet. ' +
+              `Call the tool that answers it (you have: ${(profile.toolNames ?? []).join(', ')}) ` +
+              'and reply from the result. Escalate only if the lookup itself cannot tell you.',
+          }),
+        })
+        continue
+      }
+
       if (handoff) {
         return { reply: '', model, retrieved, grounded, toolInvocations, usage, handoff }
       }

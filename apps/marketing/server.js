@@ -3,7 +3,9 @@ const fs   = require('fs')
 const path = require('path')
 const { marked } = require('marked')
 
-const PORT = 3004
+// S617: honour PORT so build.js can prerender on a spare port without
+// disturbing the live service, which sets nothing and still gets 3004.
+const PORT = Number(process.env.PORT) || 3004
 
 const HTML = fs.readFileSync(path.join(__dirname, 'src/index.html'), 'utf8')
 

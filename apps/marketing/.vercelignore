@@ -1,0 +1,3 @@
+# Deployed with --prebuilt, so only .vercel/output is uploaded. These are only
+# needed locally, by `vercel build`.
+node_modules

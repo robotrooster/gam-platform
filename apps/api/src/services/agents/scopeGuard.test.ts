@@ -135,3 +135,22 @@ describe('collapseRepetition (S617)', () => {
     expect(collapseRepetition(ok)).toBe(ok)
   })
 })
+
+describe('collapseRepetition — short lines repeat too (S617)', () => {
+  it('collapses an 11-character line repeated a dozen times', () => {
+    // Real: a tenant asked "do I owe anything?" and got "What's due?" back
+    // twelve times. The old floor kept anything under 12 characters.
+    const looped = Array.from({ length: 12 }, () => "What's due?").join('\n')
+    expect(collapseRepetition(looped)).toBe("What's due?")
+  })
+
+  it('keeps DISTINCT short lines — a bullet list is not repetition', () => {
+    const list = '• Apt 204\n• Apt 201\n• RV 08\n• RV 01'
+    expect(collapseRepetition(list)).toBe(list)
+  })
+
+  it('still keeps the blank lines that split bubbles', () => {
+    const two = 'Your balance is $2,330.\n\nWant me to help you pay it?'
+    expect(collapseRepetition(two)).toBe(two)
+  })
+})

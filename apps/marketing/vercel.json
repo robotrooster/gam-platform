@@ -1,0 +1,79 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "dist",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "redirects": [
+    {
+      "source": "/landlord",
+      "destination": "https://landlord.goldassetmanagement.com/login",
+      "permanent": false
+    },
+    {
+      "source": "/login",
+      "destination": "https://landlord.goldassetmanagement.com/login",
+      "permanent": false
+    },
+    {
+      "source": "/signin",
+      "destination": "https://landlord.goldassetmanagement.com/login",
+      "permanent": false
+    },
+    {
+      "source": "/sign-in",
+      "destination": "https://landlord.goldassetmanagement.com/login",
+      "permanent": false
+    },
+    {
+      "source": "/register",
+      "destination": "https://landlord.goldassetmanagement.com/register",
+      "permanent": false
+    },
+    {
+      "source": "/signup",
+      "destination": "https://landlord.goldassetmanagement.com/register",
+      "permanent": false
+    },
+    {
+      "source": "/sign-up",
+      "destination": "https://landlord.goldassetmanagement.com/register",
+      "permanent": false
+    },
+    {
+      "source": "/tenant",
+      "destination": "https://tenant.goldassetmanagement.com/login",
+      "permanent": false
+    },
+    {
+      "source": "/tenants",
+      "destination": "https://tenant.goldassetmanagement.com/login",
+      "permanent": false
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/help",
+      "destination": "/support"
+    },
+    {
+      "source": "/book/:slug",
+      "destination": "/book"
+    },
+    {
+      "source": "/update-payment/:token",
+      "destination": "/update-payment"
+    },
+    {
+      "source": "/account/:token",
+      "destination": "/account"
+    },
+    {
+      "source": "/stay/:token",
+      "destination": "/stay"
+    },
+    {
+      "source": "/:path*",
+      "destination": "/"
+    }
+  ]
+}
