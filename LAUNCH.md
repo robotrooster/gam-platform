@@ -112,21 +112,39 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
 1. **E-sign auto-draft workflow** — verify the path Nic is about to use for
    real: upload template → auto-place fields → draft → send. Not yet checked
    this session.
-2. **AI agents — knowledge, scope, and manner.** The single biggest gap:
-   knowledge was last ingested **2026-08-13**, before neighbour utilities,
-   service agreements, cross-property convergence, one-off charges, the payout
-   cadence, the 3% STR fee, no-partial-payments and the owner-use/utility-service
-   unit statuses. The agents do not know the platform they are answering for.
-   - Re-ingest all four scopes (landlord 89 chunks, tenant 76, shared 15,
-     sales 10) against what actually shipped.
-   - Hold the scope line: the landlord agent knows only landlord things, the
-     tenant agent only tenant things — see [[gam-agent-product-siloing]].
-   - Make them conversational and personable rather than correct-and-flat.
-   - ✅ **Reply cadence fixed.** All four surfaces already paced themselves, but
-     the caps (4.5s read / 9s type) meant a 400-character message was "read" at
-     1,067 wpm and a 1,600-character one at 4,267. One definition now lives in
-     `packages/shared/src/chatCadence.ts`; it had been copy-pasted into four
-     files. (apps/marketing has no bundler and keeps a pointer-commented copy.)
+2. **AI agents — ✅ DONE (S617).** Knowledge re-ingested, scope enforced, manner
+   fixed, and — the part nobody knew about — they had been **inventing account
+   data**.
+   - ✅ Knowledge re-ingested: 199 chunks / 67 articles across all four scopes.
+     Three articles written that did not exist (neighbour utilities, one-off
+     charges, the tenant side of a utility-only bill), and a **pricing answer
+     corrected from 5% to 3%** — it had been contradicting the Business Terms
+     of Service a landlord signs.
+   - ✅ Scope: an agent asked about the other side of the platform now answers
+     as someone who has never heard of it, avoiding BOTH tells — the robot
+     ("not in my knowledge base") and the guard ("I can't discuss that").
+     All seven profiles; the landlord agents had had no rule in either
+     direction. Backstopped deterministically in `scopeGuard.ts`.
+   - ✅ Manner: only Lucy had ever been told to write like texting, and the
+     paced-bubble feature every chat surface implements was never firing
+     because nothing asked the model to use blank lines. Plus plain-text-only
+     (the bubbles render no markdown) and a rule against reciting articles —
+     one answer went from 1,489 characters to 483.
+   - ✅ Reply cadence: Sent → unnoticed (10-20s cold, 3-7s engaged) → Seen →
+     read → typing. `packages/shared/src/chatCadence.ts`.
+   - ✅ **Fabrication.** Testing the real path (`runAgentSession` with a signed-in
+     actor) rather than the bare engine found the agents inventing balances,
+     vacancy counts, maintenance requests and whole properties. Fixed and
+     bounded: a tool-demanding question that gets no tool call is retried, and
+     an invented answer is suppressed rather than sent.
+   - **`services/agentBattery.ts`** is the regression net — 25 cases through
+     the production path, every figure checked against SQL. **Currently 25/25**
+     (fabricated=0, leaks=0, placeholders=0, markdown=0, repetitive=0), and the
+     earlier 18-case form ran clean twice consecutively.
+     `DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts`
+     **Do not run it alongside the vitest suite** — together they starve the
+     36B model server, which crashes and respawns mid-run.
+
 3. **Demo server — split the seed data off the live database.** Nic: *"when
    we're having sales calls and demos, I can walk through a process without
    showing real customer data."* Wants seeded data at EVERY STAGE of a flow —
