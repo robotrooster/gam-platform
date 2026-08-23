@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -152,5 +152,36 @@ describe('collapseRepetition — short lines repeat too (S617)', () => {
   it('still keeps the blank lines that split bubbles', () => {
     const two = 'Your balance is $2,330.\n\nWant me to help you pay it?'
     expect(collapseRepetition(two)).toBe(two)
+  })
+})
+
+describe('stripToolMachinery — a tool call is never a reply (S617)', () => {
+  it('removes every wrapper seen in one afternoon', () => {
+    for (const s of [
+      'I\'ll check.\n<call name="get_my_lease"></call>',
+      '<tool_call>{"name":"get_my_deposit","arguments":{}}</tool_call>',
+      'Let me pull that up.\n<10> {"name": "get_late_payment_history", "arguments": {}} </10>',
+      '{"name":"get_my_payment_status","arguments":{}}',
+    ]) {
+      const out = stripToolMachinery(s)
+      expect(out, s).not.toMatch(/\{[\s\S]*"name"\s*:/)
+      expect(out, s).not.toMatch(/<\s*\/?\s*(call|tool_call|invoke|\d+)\s*>/i)
+    }
+  })
+
+  it('keeps the human sentence that came with it', () => {
+    expect(stripToolMachinery('Let me pull that up.\n<10> {"name": "get_late_payment_history"} </10>'))
+      .toBe('Let me pull that up.')
+  })
+
+  it('leaves ordinary prose alone, even naming a tool', () => {
+    const ok = "Your balance is $2,330.\n\nWant me to help you pay it?"
+    expect(stripToolMachinery(ok)).toBe(ok)
+    expect(stripToolMachinery('I checked your lease and the grace period is 5 days.'))
+      .toBe('I checked your lease and the grace period is 5 days.')
+  })
+
+  it('runs as part of the reply tail', () => {
+    expect(scrubScopeLeaks('Checking.\n<call name="get_my_lease"></call>').reply).toBe('Checking.')
   })
 })

@@ -56,6 +56,63 @@ interface RawChatResponse {
 }
 
 /** Low-level call to the chat endpoint. Sends a built message array. */
+/**
+ * A tool call the model TYPED instead of making.
+ *
+ * S617 (Nic): "I don't think there's any reason an agent should ever write a
+ * tool call to you. Should we block that at the source?" He is right on both
+ * counts — it is never a valid reply, and chasing wrappers is the wrong fix.
+ *
+ * The first version matched <call name="..."> and <tool_call>. Within one test
+ * a third shape appeared:
+ *     <10> {"name": "get_late_payment_history", "arguments": {}} </10>
+ * There is always another wrapper. So this does not parse wrappers at all: it
+ * looks for the NAME OF A TOOL THE MODEL WAS ACTUALLY OFFERED sitting next to
+ * something argument-shaped. The allowlist is the offered tools themselves, so
+ * it cannot conjure a call the model could not already have made properly, and
+ * it does not care what envelope the model invented this time.
+ *
+ * Arguments are used only if they parse as JSON; anything else becomes {} and
+ * the tool's own validation handles it. Guessing arguments would be worse than
+ * having none.
+ */
+function recoverTypedToolCalls(content: string, offered: ToolSchema[]): ToolCall[] {
+  if (!content || offered.length === 0) return []
+  // A reply only qualifies if it looks like machinery rather than prose: a JSON
+  // object with a "name", or an XML-ish tag. Ordinary sentences mentioning a
+  // tool name in passing are left alone.
+  const looksMechanical = /\{[^}]*"name"\s*:/.test(content) || /<[^>]+>/.test(content)
+  if (!looksMechanical) return []
+
+  const out: ToolCall[] = []
+  for (const t of offered) {
+    const name = t?.function?.name
+    if (!name || !new RegExp(`\\b${name}\\b`).test(content)) continue
+    // Arguments: the first JSON object after the name that parses.
+    let args = '{}'
+    const after = content.slice(content.indexOf(name) + name.length)
+    const m = after.match(/\{[\s\S]{0,600}?\}/)
+    if (m) {
+      try {
+        const parsed = JSON.parse(m[0])
+        const inner = parsed && typeof parsed === 'object' && 'arguments' in parsed ? parsed.arguments : parsed
+        if (inner && typeof inner === 'object') args = JSON.stringify(inner)
+      } catch { /* not JSON — send none rather than a guess */ }
+    }
+    out.push({
+      id: `recovered_${name}_${Math.random().toString(36).slice(2, 10)}`,
+      type: 'function',
+      function: { name, arguments: args },
+    } as ToolCall)
+    break   // one recovery per turn; the loop re-runs if more are needed
+  }
+  if (out.length) {
+    logger.warn({ recovered: out[0].function.name },
+      'agent engine: model typed a tool call instead of making one — recovered, not shown to the customer')
+  }
+  return out
+}
+
 export async function chatCompletion(
   messages: ChatMessage[],
   opts: ChatCompletionOptions = {}
@@ -106,7 +163,19 @@ export async function chatCompletion(
     return (await res.json()) as RawChatResponse
   })
   const choice = data.choices?.[0]
-  const toolCalls = choice?.message?.tool_calls ?? []
+  const toolCalls = choice?.message?.tool_calls?.length
+    ? choice.message.tool_calls
+    // S617: recover a tool call the model TYPED instead of making. Asked "what
+    // is the late fee", it replied "I'll look up your lease." and then wrote
+    // <call name="get_my_lease"></call> into the message body. It had chosen
+    // the right tool and failed only at the syntax — and the customer would
+    // have seen the markup.
+    //
+    // Recovering it turns a wasted turn into the correct answer. Bounded by the
+    // same allowlist every real call goes through (executeToolCall refuses a
+    // tool the profile does not have), so this cannot reach anything the model
+    // could not already call properly.
+    : recoverTypedToolCalls(choice?.message?.content ?? '', opts.tools ?? [])
   // When the model calls tools it may ALSO emit hallucinated content —
   // discard it; the real answer comes after the tool result is fed back.
   const content = toolCalls.length > 0 ? '' : (choice?.message?.content ?? '').trim()

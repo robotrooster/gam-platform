@@ -251,6 +251,11 @@ export function assertsStoredFacts(text: string): boolean {
     || /\b\d{4}-\d{2}-\d{2}\b/.test(text)                        // an ISO date
     // "End Date: October 15" — a specific calendar date in prose.
     || /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b/i.test(text)
+    // S617: statistics. "15% of rent charges (12 out of 80)" carried no dollar
+    // sign, no date and no bullet, so every check above missed it — and it was
+    // entirely invented. A rate or a ratio is a stored fact like any other.
+    || /\d+\s*%/.test(text)
+    || /\b\d+\s+out of\s+\d+\b/i.test(text)
   )
 }
 
@@ -677,7 +682,23 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   addUsage(final.usage)
   // The no-tools call can still come back empty (model emits a stray
   // tool_call -> content forced to ''). Never return an empty reply.
-  const reply = final.content || STEP_CEILING_FALLBACK
+  let reply = final.content || STEP_CEILING_FALLBACK
+
+  // S617: the guards live in the loop, and this path is OUTSIDE it — so an
+  // answer that reached here had none of them applied. Measured: asked "what's
+  // my late payment rate", the model declined the tool through every step, fell
+  // out here, and produced "<10 days late: 15% of rent charges (12 out of 80)"
+  // — buckets and a tenant count that exist nowhere in the data. A landlord
+  // could act on that.
+  //
+  // The ceiling means the model would not look it up. That is precisely when it
+  // must not be trusted to state figures.
+  if (toolInvocations.length === 0 && demandsAToolCall(message) && assertsStoredFacts(reply)) {
+    logger.error({ profile: profile.id, message },
+      'agent runner: step ceiling produced figures with no lookup behind them — reply suppressed')
+    reply = CANNOT_SEE
+  }
+
   const ceilingHandoff = synthesizeHandoff(profile, reply)
   if (ceilingHandoff) {
     return { reply, model: model || final.model, retrieved, grounded, toolInvocations, usage, handoff: ceilingHandoff }

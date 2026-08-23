@@ -114,6 +114,37 @@ export function collapseRepetition(text: string): string {
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
+/**
+ * Machinery must never reach a customer.
+ *
+ * S617 (Nic): "I don't think there's any reason an agent should ever write a
+ * tool call to you. Should we block that at the source?" There is none, so this
+ * is the floor: whatever the engine did or did not recover, a reply that still
+ * carries the shape of a tool call does not go out with it.
+ *
+ * Format-agnostic on purpose — three different wrappers turned up in one
+ * afternoon (<call name=...>, <tool_call>, and <10>{"name":...}</10>). This
+ * removes the SHAPE: an XML-ish tag wrapping a JSON object with a "name", a
+ * bare {"name":...,"arguments":...} blob, or a lone tag whose body is empty.
+ * Ordinary prose is untouched, including a sentence that happens to mention a
+ * tool by name.
+ */
+export function stripToolMachinery(text: string): string {
+  if (!text) return text
+  return text
+    // <anything> {"name": ..., "arguments": ...} </anything>
+    .replace(/<[^>\n]{1,40}>\s*\{[\s\S]{0,600}?"name"\s*:[\s\S]{0,600}?\}\s*<\/[^>\n]{1,40}>/gi, '')
+    // a naked call object on its own
+    .replace(/\{\s*"name"\s*:\s*"[a-z0-9_]+"\s*(?:,\s*"arguments"\s*:[\s\S]{0,400}?)?\}/gi, '')
+    // <call .../> and <tool_call></tool_call> style tags, with or without a body
+    .replace(/<\s*\/?\s*(call|invoke|tool_call|function_call)\b[^>]*>/gi, '')
+    // leftover numeric tags the model invented as a wrapper
+    .replace(/<\/?\s*\d{1,3}\s*>/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 export interface ScrubResult {
   reply: string
   removed: string[]
@@ -128,7 +159,7 @@ export interface ScrubResult {
  */
 export function scrubScopeLeaks(reply: string): ScrubResult {
   if (!reply) return { reply, removed: [] }
-  reply = collapseRepetition(stripChatMarkdown(reply))
+  reply = collapseRepetition(stripChatMarkdown(stripToolMachinery(reply)))
   const removed: string[] = []
   const kept = sentences(reply).filter((s) => {
     const hit = LEAK_PATTERNS.find((p) => p.re.test(s))
