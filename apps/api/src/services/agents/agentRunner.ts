@@ -232,6 +232,11 @@ export function assertsStoredFacts(text: string): boolean {
     // "I'll get that now. [get_my_lease]" — no dot, so the dotted form below
     // missed it and a tool token went to the customer as prose.
     /\[[a-z][a-z0-9_]*(?:\.[A-Za-z_]+)?\]|\{\{[^}]+\}\}/.test(text)  // unresolved placeholder
+    // S617: a tool call WRITTEN OUT as text. Asked "what is the late fee", the
+    // agent replied "I'll look up your lease..." and then printed
+    // <call name="get_my_lease"></call> into the chat. It had not called
+    // anything; it typed the shape of a call. The customer sees markup.
+    || /<\s*(call|tool_call|function_call|invoke)\b[^>]*>/i.test(text)
     || /^\s*\|.*\|/m.test(text)                                  // a table of records
     || /\b\d+\s+(vacant|occupied|open|pending|active|overdue|delinquent|expiring)\b/i.test(text)
     || /\b(you|they|he|she)\s+(have|has)\s+\d+\b/i.test(text)     // "you have 2 ..."

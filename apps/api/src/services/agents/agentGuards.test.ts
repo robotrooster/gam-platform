@@ -169,3 +169,16 @@ describe('promisesHandoff — offers vs actual handoffs (S617)', () => {
     expect(promisesHandoff('')).toBe(false)
   })
 })
+
+describe('assertsStoredFacts — a written-out tool call is not an answer (S617)', () => {
+  it('catches markup the model typed instead of calling anything', () => {
+    // Real: asked "what is the late fee", the agent replied "I'll look up your
+    // lease..." and then printed this into the chat.
+    expect(assertsStoredFacts('I\'ll look up your lease.\n<call name="get_my_lease"></call>')).toBe(true)
+    expect(assertsStoredFacts('<tool_call>{"name":"get_my_deposit"}</tool_call>')).toBe(true)
+  })
+
+  it('does not flag ordinary prose containing an angle bracket', () => {
+    expect(assertsStoredFacts('Rent is due before the 5th <- that is the grace period.')).toBe(false)
+  })
+})
