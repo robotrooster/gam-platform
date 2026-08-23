@@ -260,8 +260,28 @@ export function assertsStoredFacts(text: string): boolean {
 }
 
 /** What to say instead of a number nobody looked up. */
-const CANNOT_SEE =
-  "I'm not able to pull that up right now, and I don't want to give you a number I haven't checked. Let me get someone on the team to look — or ask me something else in the meantime."
+/**
+ * What to say instead of a number nobody looked up.
+ *
+ * S617 (Nic): "if the agent is unsure about a response, then it should ask a
+ * follow-up question to narrow down the scope... it just needs to adjust itself
+ * to the correct scope."
+ *
+ * This used to be a wall — "I'm not able to pull that up right now... let me get
+ * someone on the team to look." It asked nothing, so the conversation stopped
+ * dead, and it half-promised a handoff for something that is not an escalation.
+ *
+ * A person who could not find something would ask which one you meant. So it
+ * asks, and it asks the question that side of the platform can actually answer:
+ * a tenant has one lease and needs only to say WHICH FACT; a landlord has many
+ * properties and tenants and needs to say WHICH ONE.
+ */
+function cannotSee(audience: string): string {
+  if (audience === 'landlord' || audience === 'pm_company') {
+    return "I don't want to give you a figure I haven't actually checked. Which property or which tenant do you mean, and I'll pull it straight up?"
+  }
+  return "I don't want to give you a number I haven't actually checked. Which part were you after — your balance, your rent, your lease dates, or your deposit?"
+}
 
 /** Distinct tool executions allowed inside ONE model turn. See the loop below. */
 const MAX_TOOL_CALLS_PER_TURN = 6
@@ -545,7 +565,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       ) {
         logger.error({ profile: profile.id, message },
           'agent runner: model asserted stored facts with no tool call after a retry — reply suppressed')
-        return { reply: CANNOT_SEE, model, retrieved, grounded, toolInvocations, usage }
+        return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
       }
       // S617: the tools DID run, and the model added rows they never returned.
       // Suppress rather than hand a landlord a list with invented properties in
@@ -575,7 +595,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           }
           logger.error({ profile: profile.id, message, invented },
             'agent runner: reply named invented records twice — reply suppressed')
-          return { reply: CANNOT_SEE, model, retrieved, grounded, toolInvocations, usage }
+          return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
         }
       }
       return { reply: out.content, model, retrieved, grounded, toolInvocations, usage }
@@ -696,7 +716,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   if (toolInvocations.length === 0 && demandsAToolCall(message) && assertsStoredFacts(reply)) {
     logger.error({ profile: profile.id, message },
       'agent runner: step ceiling produced figures with no lookup behind them — reply suppressed')
-    reply = CANNOT_SEE
+    reply = cannotSee(String((actor as any).role ?? ''))
   }
 
   const ceilingHandoff = synthesizeHandoff(profile, reply)

@@ -114,8 +114,16 @@ describe('runAgentWithTools', () => {
 
     const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'how much do I owe right now?' })
     expect(res.toolInvocations).toHaveLength(0)
+    // The invented figure must not reach the customer...
     expect(res.reply).not.toContain('$1,200')
-    expect(res.reply).toMatch(/not able to pull that up/i)
+    // ...and S617: what replaces it must ASK rather than dead-end. Nic: "if the
+    // agent is unsure, it should ask a follow-up question to narrow down the
+    // scope." The old text ("I'm not able to pull that up... let me get someone
+    // on the team to look") stopped the conversation and half-promised a
+    // handoff for something that is not an escalation.
+    expect(res.reply).toContain('?')
+    expect(res.reply).toMatch(/haven't actually checked/i)
+    expect(res.reply).not.toMatch(/get someone on the team/i)
   })
 
   it('refuses to run a tool the profile is not allowed', async () => {
