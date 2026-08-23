@@ -17,9 +17,16 @@
  *   DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts balance  # one intent
  *
  * Not part of the vitest suite: it needs the live model and embeddings servers.
- * DO NOT run it alongside the vitest suite — together they starve the 36B model
- * server, which crashes and respawns, and this dies on a socket error that looks
- * like a code fault.
+ *
+ * RUN IT ALONE. Nothing else may touch the model while it runs — not the vitest
+ * suite, not a second battery, not a one-off script. The 36B server is a single
+ * process on a machine that also holds Postgres and the API; put two loads on it
+ * and it dies and gets respawned by launchd. It happened three times in S617,
+ * and the failure does not look like a crash: the run keeps going and every
+ * remaining question fails with "LLM endpoint unreachable", which scores as 88
+ * wrong answers and a meaningless 18/108. If a run shows a cliff of ERROR
+ * flags, the model died — check `launchctl list | grep gam.model` before
+ * believing a single number of it.
  *
  * The daily per-user turn budget is raised for the run. Left at its default of
  * 60, a full pass exhausts the test tenant and the agent starts replying "I've

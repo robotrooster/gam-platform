@@ -439,7 +439,12 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // of a plain reply (and a knowledge-base answer stays one call).
       toolChoice: forceToolThisTurn && turnTools.length > 0 ? 'required' : undefined,
     })
-    forceToolThisTurn = false
+    // NOT cleared here. S617: tool_choice 'required' is honoured most of the
+    // time, not every time — the same question that answered "$2,330" on one
+    // run came back empty on the next. Clearing the flag after a single attempt
+    // meant one non-compliant turn dropped straight through to a suppressed
+    // reply. It now stays set until a lookup ACTUALLY runs (see below), so the
+    // model gets every remaining step to comply rather than one.
     model = out.model
     addUsage(out.usage)
 
@@ -644,6 +649,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       }
 
       toolInvocations.push({ name: call.function.name, args, result })
+      forceToolThisTurn = false   // a lookup happened; stop forcing
       messages.push({
         role: 'tool',
         tool_call_id: call.id,
