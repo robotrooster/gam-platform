@@ -136,3 +136,84 @@ describe('agent profile registry', () => {
     expect(getEntryProfile('landlord')?.id).toBe('landlord_entry')
   })
 })
+
+// ============================================================
+// S617 (Nic) — a product on the other side of the platform is not
+// "not relevant to you", it is not known.
+//
+// Retrieval already scopes what an agent can LOOK UP, but the model still knows
+// the words, and the natural reply to "what is FlexVault?" is a helpful "that's
+// a landlord product, not something on your side" — which confirms it exists
+// and names whose it is. Nic: "I don't want it to acknowledge it and say that
+// it's not relevant to them. I want it to say I don't have any knowledge about
+// this."
+// ============================================================
+describe('anything on another side of the platform is unknown, not declined (S617)', () => {
+  const withRule = AGENT_PROFILES.filter(p => p.systemPrompt.includes('OUTSIDE YOUR SIDE OF THE PLATFORM'))
+
+  it('every profile carries the rule — a gap is a leak', () => {
+    expect(withRule.length).toBe(AGENT_PROFILES.length)
+  })
+
+  it('covers more than product names — features, screens, prices, workflows', () => {
+    for (const p of withRule) {
+      expect(p.systemPrompt).toContain('any feature, screen, price, workflow or arrangement')
+    }
+  })
+
+  it('tells renter-facing agents the landlord side is not theirs', () => {
+    for (const p of AGENT_PROFILES.filter(p => p.audience === 'tenant')) {
+      expect(p.systemPrompt).toContain('FlexVault')
+      expect(p.systemPrompt).toContain('You serve renters')
+    }
+  })
+
+  it('tells landlord-facing agents the renter side is not theirs', () => {
+    for (const p of AGENT_PROFILES.filter(p => p.audience === 'landlord')) {
+      expect(p.systemPrompt).toContain('FlexDeposit')
+      expect(p.systemPrompt).toContain('FlexCredit')
+      // FlexVault IS a landlord product — it must never be on THEIR unknown list.
+      const block = p.systemPrompt.slice(p.systemPrompt.indexOf('OUTSIDE YOUR SIDE'))
+      expect(block.split('\n').slice(0, 2).join('\n')).not.toContain('FlexVault')
+    }
+  })
+
+  it('bans the ROBOT tell — reciting its own limits', () => {
+    for (const p of withRule) {
+      expect(p.systemPrompt).toContain("I don't have that in my knowledge base")
+      expect(p.systemPrompt).toContain('outside my configured scope')
+      expect(p.systemPrompt).toContain('Sounding like a machine reciting its limits')
+    }
+  })
+
+  it('bans the GUARDING tell — a polite decline that confirms it exists', () => {
+    for (const p of withRule) {
+      expect(p.systemPrompt).toContain("I can't discuss that")
+      expect(p.systemPrompt).toContain("that's a landlord feature")
+      expect(p.systemPrompt).toContain('not relevant to your account')
+      expect(p.systemPrompt).toContain('Sounding like you are guarding something')
+    }
+  })
+
+  it('gives the agent something natural to actually say', () => {
+    for (const p of withRule) {
+      expect(p.systemPrompt).toContain("doesn't ring a bell")
+      expect(p.systemPrompt).toContain('in your own voice, varied, brief, unbothered')
+    }
+  })
+
+  it('holds the line if the person presses', () => {
+    for (const p of withRule) expect(p.systemPrompt).toContain('If they press, stay unbothered and consistent')
+  })
+
+  it('does not route it to a human — there is nothing to escalate', () => {
+    for (const p of withRule) expect(p.systemPrompt).toContain('Do NOT escalate it')
+  })
+
+  it('leaves the AI-honesty rule untouched — this is scope, not identity', () => {
+    for (const p of AGENT_PROFILES) {
+      if (p.audience === 'prospect' || p.audience === 'guest' || p.audience === 'visitor') continue
+      expect(p.systemPrompt).toContain('NEVER claim to be a human')
+    }
+  })
+})
