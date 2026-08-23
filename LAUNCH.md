@@ -1,85 +1,101 @@
 # GAM — Launch & Backlog (single source of truth)
 
 Consolidates the former OAK_PARK_LAUNCH.md + DEFERRED.md + the S559 utility
-spec (S559). Shipped items are deleted, not tracked here — the audit trail is
-git history. Verbose originals of anything below are recoverable from git.
+spec. Shipped items are deleted, not tracked here — the audit trail is git
+history. Verbose originals of anything below are recoverable from git.
 
-Feature work for launch is effectively done. Remaining launch blockers are all
-**vendor / dev-infra / Nic-pending**, not feature code. Flex Suite
-(FlexPay/FlexCharge/FlexDeposit/FlexCredit) ships **hidden behind feature
-flags** — `system_features` table + `isFeatureEnabled()`; flags stay off at
-launch, products don't render, crons no-op.
+**State as of 2026-08-22 (S617): every launch blocker is cleared.** Nothing in
+sections 1 and 2 is waiting on code, a vendor, or a decision. What has not
+happened is the LAUNCH — Oak Park has no tenants yet, and that is data entry at
+Nic's pace, not a build. Sections 3 and 4 are a real backlog and are NOT done;
+do not read "launch blockers cleared" as "the doc is finished."
+
+Flex Suite (FlexPay/FlexCharge/FlexDeposit/FlexCredit) ships **hidden behind
+feature flags** — `system_features` + `isFeatureEnabled()`; flags stay off,
+products don't render, crons no-op.
 
 ---
 
-## 1. Oak Park launch (Aug 1) — tenants log in + pay rent
+## 1. Oak Park launch — CHECKLIST CLEARED
 
-HARD SCOPE FREEZE: anything not here waits until after Aug 1. The DB Oak Park
-was DoorLoop test junk — **purged 7/20**; Nic rebuilds manually under the real
-business account. Checklist: `~/gam/OAK_PARK_LAUNCH.md` history in git.
+Original scope: tenants log in + pay rent. Every item verified against the live
+database, the running services, and the Stripe live account on 2026-08-22.
 
-**Nic (nothing moves without these):**
-- **N1 — Stripe live account** ✅ DONE 2026-07-21. Sales-rep/account migration
-  resolved; `sk_live`/`pk_live` + both webhook secrets are wired into
-  `apps/api/.env` (backup: `.env.bak-pre-live-20260721`). Payment path is
-  UNBLOCKED. (This doc previously called it the longest pole — stale; corrected
-  2026-07-28.)
-- **N2 — Real Oak Park landlord account**: register under the real business
-  email; tell Claude which email (so prod QA hits the right landlord, never the
-  demo/test accounts). See [[oak-park-gam-entity-separation]].
-- **N3 — Manual data entry** (Nic's pace, real account): property → unit
-  subtypes → units (unit-add forces a late-fee decision per unit type) →
-  tenants/leases. Tenant EMAIL = the invite + login, the one field that matters.
-- **N4 — Connect KYC**: complete embedded Stripe onboarding in the landlord
-  portal once live keys are wired (~10 min w/ EIN + bank).
-- **N5 — Vercel Pro**: click upgrade when Claude says the prod flip is done
-  (straight to Pro at launch).
+**Nic:**
+- **N1 — Stripe live account** ✅ 2026-07-21. `sk_live`/`pk_live` + both webhook
+  secrets wired in `apps/api/.env`.
+- **N2 — Real Oak Park landlord account** ✅ `oakparkaz@gmail.com` owns
+  *Oak Park Motel and RV*. Separate from the demo landlords — see
+  [[oak-park-gam-entity-separation]].
+- **N3 — Manual data entry** 🟡 **the only thing standing between here and a
+  live tenant.** Done: 30 units (21 rv_spot, 8 mobile_home, 1 apartment), 3 unit
+  subtypes, a late-fee policy for all three unit types, utility rates for
+  electric/trash/water, 30 meters with 82 meter→unit assignments and 27 readings,
+  one bank account on file. Not done: **no tenants, no leases, no neighbour
+  service agreements, and the owner-occupied units are still marked `vacant`.**
+  Order that saves a pass: neighbour service points → lease templates → mark the
+  owner-occupied units → invite tenants.
+- **N4 — Connect KYC** ✅ `acct_1U5VpMDz9hhZGjwY` — charges, payouts and
+  details-submitted all enabled.
+- **N5 — Vercel Pro** ⬜ Nic's click. Not blocking; the portals are live on the
+  current plan.
 
 **Claude:**
-- **C1 prod flip** ✅ 7/20 (com.gam.api launchd, NODE_ENV=production, KeepAlive,
-  ENCRYPTION_KEY set; crash-respawn verified).
-- **C2 prod env audit** ✅ 7/20 (all *_APP_URL → prod domains; Vercel portals
-  live on prod API; tunnel + marketing verified; nightly backups current).
-- **C3 Stripe live wiring** ✅ DONE (with N1, 7/21; code verified S562). Live keys
-  in `.env`, prod webhook endpoint + both secrets set, signature verify on
-  platform + connect webhooks, Financial Connections live in the ACH charge/setup,
-  RAW webhook payloads stored append-only. Radar = dashboard-side.
-- **C4 live-fire money test** (needs N1+N4): one small real ACH + one card
-  against a test tenant → lands in Nic's Connect balance, app fee to GAM, then
-  refund. Proof before any tenant pays.
-- **C5 invite→login→pay walkthrough on PROD**: throwaway tenant, real inbox,
-  set password, add bank via Financial Connections, Pay Now.
-- **C6 August billing dry-check**: per lease Nic enters, verify Aug 1 invoice
-  cron produces a correct payable rent invoice (rent_due_day, no move-in
-  double-bill on migrated tenancies, lease's own late-fee class). Re-run eve of
-  Jul 31.
-- **C7 rolling QA** behind Nic's data entry: each occupied unit → active lease,
-  correct rent, tenant email present, invite sent/accepted. Report gaps daily,
-  never edit his data.
-- **C8 launch-day watch (Aug 1)**: invoice cron, first payments, webhook
-  deliveries, email log; fix breakage immediately.
+- **C1 prod flip** ✅ 2026-07-20 (com.gam.api launchd, NODE_ENV=production,
+  KeepAlive, ENCRYPTION_KEY, crash-respawn verified).
+- **C2 prod env audit** ✅ 2026-07-20 (all *_APP_URL on prod domains, portals on
+  the prod API, tunnel + marketing verified, nightly backups current).
+- **C3 Stripe live wiring** ✅ 2026-07-21. Live keys, prod webhook endpoint +
+  both secrets, signature verification on platform + connect webhooks, Financial
+  Connections live in the ACH charge/setup, raw webhook payloads stored
+  append-only.
+- **C4 live-fire money test** ✅ **Real money has moved, both rails.**
+  - Card, 2026-08-10: $2.00 rent + $0.33 fee = **$2.33, succeeded**, available
+    2026-08-13, and a **$1.21 payout reached a bank the same day** — a complete
+    round trip. (Stripe's own fees on that charge came to $0.88, which is what
+    drove the card repricing to 3.5% + $0.55.)
+  - ACH, 2026-08-19: $2.00 rent + $6.00 fee = **$8.00**, `available_on`
+    2026-08-25 — four business days, exactly on schedule.
+  - Both `livemode: true`. **Not re-testing this.** Nic, S617: *"if the code
+    works, it works... you should verify everything and be able to know that
+    it's good because of how we've already moved money."*
+  - One caveat recorded, not a gate: both charges carried no
+    `transfer_data.destination` and no platform cut, because the landlord they
+    were booked under has no Connect account. The split-to-a-landlord path is
+    covered by tests, not by a live charge.
+- **C5 invite → login → pay on PROD** ✅ Real tenant account, password set,
+  email verified, last login 2026-08-17, live Financial Connections bank
+  connection active, and the two charges above are theirs.
+- **C6 August billing dry-check** — n/a. Oak Park has no leases, so there was
+  nothing for the invoice cron to produce. Re-do it the evening before the first
+  month Nic has real leases entered.
+- **C7 rolling QA behind Nic's data entry** — starts when N3 does. Each occupied
+  unit → active lease, correct rent, tenant email present, invite sent/accepted.
+  Report gaps daily, never edit his data.
+- **C8 launch-day watch** — invoice cron, first payments, webhook deliveries,
+  email log; fix breakage immediately.
 
-**In launch scope but Nic-pending design:** Checkr background checks (moved in
-7/21 — new tenants into vacant units; credentials were due "Monday"). FlexPay
-stays tenant-portal demand-test only.
+**Checkr background checks** remain Nic-pending on credentials (vendor).
 
 ---
 
-## 2. Remaining launch blockers (dev-infra / vendor)
+## 2. Infrastructure — no launch gates left, only scale triggers
 
-- **Deploy config / host pick** — no Dockerfile/render.yaml/fly.toml. NOTE:
-  currently self-hosted on the Mac Studio via launchd + Cloudflare tunnel (see
-  [[gam-studio-selfhost]]); a managed host (Render fastest) is the scale
-  trigger, not a launch gate.
-- **Production cron runner** — node-cron runs in-process in the API; a restart
-  drops pending firings. Fine short-term on the Studio; needs a dedicated worker
-  or managed cron at scale.
-- **Database backups + PITR** — nightly dump → local + iCloud is live (restore
-  verified). Managed-Postgres PITR comes with the host pick.
-- **Stripe live activation** — see C3 (blocked on N1).
-- **Resend domain auth** — ✅ verified + delivering (per [[gam-launch-accounts]]).
+- **Production cron runner** — node-cron runs in-process in the API, so a
+  restart drops a pending firing. Now bounded rather than dangerous: payouts are
+  DB-backed triggers (`payout_triggers`), so a dropped firing is picked up by
+  the next run and costs a day, not the money. A dedicated worker or managed
+  cron is a scale item.
+- **Deploy config / host pick** — self-hosted on the Mac Studio via launchd +
+  Cloudflare tunnel ([[gam-studio-selfhost]]). A managed host (Render fastest)
+  is the scale trigger, not a launch gate.
+- **Database backups + PITR** — nightly dump → local + iCloud, running and
+  current (verified 2026-08-22 03:30). Managed-Postgres PITR comes with the host
+  pick.
+- **Stripe live activation** ✅ see C3/C4.
+- **Resend domain auth** ✅ verified + delivering ([[gam-launch-accounts]]).
 
-Shipped infra (do not redo): full Vitest suite (618+ across 32 files), CI
+Shipped infra (do not redo): the Vitest suite (**305 files, 5,093 tests**), CI
 (.github/workflows/ci.yml), Sentry on API + 9 frontends, structured logging
 (pino), rate-limit + login lockout + password reset + email verification + TOTP
 2FA (admin mandatory), legal ToS/Privacy (lawyer review still advised before

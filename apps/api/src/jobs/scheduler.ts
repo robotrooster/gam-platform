@@ -1348,8 +1348,26 @@ export function schedulerInit() {
   // S605: bank-feed sync. Stripe backfills a newly linked account
   // asynchronously ("refresh is still pending"), so the first sync usually
   // returns nothing — without this the landlord would have to keep pressing
-  // Sync themselves. Hourly is plenty; transactions post daily at best.
-  cron.schedule('40 * * * *', async () => {
+  // Sync themselves.
+  //
+  // S617 (Nic): hourly -> every six hours, on the quarters. This calls
+  // financialConnections.accounts.refresh once per ACTIVE CONNECTION per run,
+  // so the cost is linear in connected accounts: hourly was 720 calls a month
+  // each, and at thousands of Connect accounts that is bandwidth spent to
+  // re-learn a number that changes daily at best. Nic: "reducing bandwidth at
+  // scale when we have thousands of connect accounts might save some computer
+  // space."
+  //
+  // Four a day is still well inside what the feature needs — the sync exists so
+  // a landlord does not have to press Sync, not to be a live balance ticker,
+  // and any screen that wants it fresher can refresh that one connection on
+  // demand. Nic flagged one possible reason the old rate existed: the business
+  // portal wanting a card payment to reach a business user within a day. That
+  // path does not read this cron (business money lands on their own Connect at
+  // charge time), so it is not a reason to keep hourly — but if a future
+  // business-portal flow ever does depend on feed freshness, raise it for THAT
+  // connection rather than putting every landlord back on hourly.
+  cron.schedule('0 0,6,12,18 * * *', async () => {
     try {
       const { syncAllActiveConnections } = await import('../services/bankFeed')
       const r = await syncAllActiveConnections()
