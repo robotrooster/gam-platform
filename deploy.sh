@@ -81,8 +81,20 @@ else
 fi
 
 # ── marketing ────────────────────────────────────────────────────────────
-# No build step: server.js reads src/index.html at startup, so restarting IS
-# the deploy. This is the one everybody forgets.
+# S617: THE PUBLIC SITE IS ON VERCEL NOW, not this Mac. goldassetmanagement.com
+# and www both point at cname.vercel-dns.com (project gam-marketing), matching
+# how the seven other GAM sites are already pointed. Nic moved it because the
+# Mac sits somewhere with brownouts and was hosting the public website, the
+# database and the API all at once.
+#
+# To publish a marketing change now:
+#   cd apps/marketing && node build.js && node package-output.js \
+#     && npx vercel deploy --prebuilt --prod --yes
+#
+# The launchd service below is left running deliberately: it still serves the
+# same pages on :3004, so pointing DNS back at the tunnel restores the old site
+# in one step. Recipe: ~/gam-backups/dns-rollback-marketing.md
+# The kickstart here no longer affects what the public sees.
 echo; echo "── marketing (launchd com.gam.marketing) ──"
 if $CHECK_ONLY; then
   warn "would kickstart (reads index.html at startup)"

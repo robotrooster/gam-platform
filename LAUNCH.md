@@ -86,6 +86,16 @@ database, the running services, and the Stripe live account on 2026-08-22.
   DB-backed triggers (`payout_triggers`), so a dropped firing is picked up by
   the next run and costs a day, not the money. A dedicated worker or managed
   cron is a scale item.
+- **Marketing site** ✅ **MOVED TO VERCEL (S617).** goldassetmanagement.com and
+  www now serve from Vercel; the Mac no longer hosts anything the public sees.
+  Verified after the switch: every route 200, all four portal redirects landing
+  correctly, and the page pointing at the production API. The Mac's copy is
+  still running on :3004 as an instant fallback —
+  `~/gam-backups/dns-rollback-marketing.md`.
+  **Still on the Mac and still a single point of failure: the DATABASE and the
+  API.** Nic's call, and he is right: "it's easier to move a database now when
+  there's no tenants on it." Target is DigitalOcean — a droplet for the API and
+  their managed Postgres — which needs Nic to create them or hand over a token.
 - **Deploy config / host pick** — self-hosted on the Mac Studio via launchd +
   Cloudflare tunnel ([[gam-studio-selfhost]]). A managed host (Render fastest)
   is the scale trigger, not a launch gate.
