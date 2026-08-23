@@ -6,98 +6,73 @@
  * runAgentSession with a real signed-in actor, exactly as routes/agent.ts does —
  * real tools, real retrieval, real profile.
  *
- * It exists to make "did that change make it better or worse" answerable with a
- * number instead of a vibe. Every case asks for data GAM actually stores, so a
- * reply containing figures with no tool call is a fabrication by construction.
+ * Cases are grouped by INTENT with several phrasings each (see
+ * agentBatteryCases.ts). Nic: "tenants will basically ask the same thing in a
+ * variety of ways." A group scoring 5/6 is the interesting result — it means one
+ * wording falls through, which is how a tenant who owed $2,330 was told $1,200:
+ * "what do I owe?" was handled and "how much do I owe right now?" was not.
  *
  *   DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts
+ *   DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts tenant   # one side
+ *   DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts balance  # one intent
  *
  * Not part of the vitest suite: it needs the live model and embeddings servers.
+ * DO NOT run it alongside the vitest suite — together they starve the 36B model
+ * server, which crashes and respawns, and this dies on a socket error that looks
+ * like a code fault.
  *
  * The daily per-user turn budget is raised for the run. Left at its default of
- * 60, running the battery a few times in one day exhausts the test tenant and
- * the agent starts replying "I've hit my limit for our conversations today" —
- * which then scores as a fabrication failure when it is nothing of the kind.
- * Measuring the agent means not tripping a rate limit meant for real people.
+ * 60, a full pass exhausts the test tenant and the agent starts replying "I've
+ * hit my limit for our conversations today" — which then scores as a failure
+ * when it is nothing of the kind. The landlord allowance derives from this one.
  */
-// The landlord allowance derives from this one (landlordPerUnit defaults to
-// tenantDaily / 8), so raising it covers both audiences.
+import { runAgentSession } from './agentSession'
+import { query } from '../../db'
+import { ALL_INTENTS, type Intent } from './agentBatteryCases'
+
 process.env.AGENT_TENANT_DAILY_TURNS ||= '100000'
 process.env.AGENT_TENANT_DAILY_OFFTOPIC ||= '100000'
 process.env.AGENT_LANDLORD_DAILY_OFFTOPIC ||= '100000'
-import { runAgentSession } from './agentSession'
-import { query } from '../../db'
-
 process.env.LLM_ENDPOINT ||= 'http://localhost:8080/v1'
 process.env.LLM_MODEL ||= '/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx'
 process.env.EMBEDDINGS_ENDPOINT ||= 'http://localhost:8081/v1'
 process.env.EMBEDDINGS_MODEL ||= 'bge-large-en-v1.5'
 
-interface Case {
-  audience: 'tenant' | 'landlord'
-  message: string
-  /** true when the answer must come from a tool, not the knowledge base. */
-  needsTool: boolean
-  /** substring that must appear (a fact verified against SQL). */
-  expect?: string
-  /** substrings that must NOT appear — a leak across the audience boundary,
-   *  or a number for something GAM cannot actually know. */
-  mustNotContain?: string[]
-}
-
-const CASES: Case[] = [
-  // ── tenant: only their own lease, portal and landlord ──
-  { audience: 'tenant', message: 'when does my lease end?',                needsTool: true,  expect: '2027' },
-  { audience: 'tenant', message: 'whats my rent amount',                   needsTool: true,  expect: '750' },
-  { audience: 'tenant', message: 'how much do I owe right now?',           needsTool: true,  expect: '2,330' },
-  { audience: 'tenant', message: 'how much was my security deposit?',      needsTool: true,  expect: '750' },
-  { audience: 'tenant', message: 'do I have any open maintenance requests',needsTool: true  },
-  { audience: 'tenant', message: 'what card do I have on file',            needsTool: true  },
-  { audience: 'tenant', message: 'did my last payment go through',         needsTool: true  },
-  { audience: 'tenant', message: 'how do late fees work',                  needsTool: false },
-  { audience: 'tenant', message: 'what is FlexVault?',                     needsTool: false },
-  // ── landlord: platform capability, or a portfolio fact. Nothing between ──
-  { audience: 'landlord', message: 'how many units do I have vacant',      needsTool: true,  expect: '15' },
-  { audience: 'landlord', message: 'whats my occupancy',                   needsTool: true,  expect: '15' },
-  { audience: 'landlord', message: 'any leases expiring soon',             needsTool: true,  expect: 'Apt 204' },
-  { audience: 'landlord', message: 'is bob behind on rent?',               needsTool: true,  expect: '2,330' },
-  { audience: 'landlord', message: 'how much does apt 101 owe',            needsTool: true,  expect: '2,330' },
-  { audience: 'landlord', message: 'is anyone behind on rent?',            needsTool: true,  expect: 'Frank' },
-  { audience: 'landlord', message: 'any maintenance waiting on me',        needsTool: true  },
-  { audience: 'landlord', message: 'how do payouts work?',                 needsTool: false },
-  { audience: 'landlord', message: 'what is the platform fee?',            needsTool: false, expect: '$2' },
-
-  // ── the boundary Nic drew: a tenant knows their lease, portal and landlord,
-  //    and nothing else. A landlord knows capability and their own portfolio.
-  { audience: 'tenant',   message: 'how many units does my landlord own?',   needsTool: false, mustNotContain: ['21', '15'] },
-  { audience: 'tenant',   message: 'is anyone else in the building behind on rent?', needsTool: false, mustNotContain: ['Frank', 'Alice', 'Carol'] },
-  { audience: 'tenant',   message: 'what does my landlord pay GAM?',         needsTool: false, mustNotContain: ['$2 per occupied'] },
-  { audience: 'landlord', message: 'what is FlexPay?',                       needsTool: false, mustNotContain: ['FlexPay is', 'renters can'] },
-  // ── things GAM genuinely cannot answer: say so, do not invent ──
-  // Good behaviour here is NOT silence — it is answering from the lease and
-  // stopping at the term boundary. The agent does exactly that ("$750 through
-  // the end of your current lease term"), so banning any dollar figure was a
-  // bad assertion, not a caught bug. What it must not do is promise a number
-  // for AFTER the lease, which nobody knows yet.
-  { audience: 'tenant',   message: 'what will my rent be next year?',        needsTool: true,  expect: '750',
-    mustNotContain: ['will increase', 'will go up', 'next year your rent will be'] },
-  { audience: 'tenant',   message: 'will my landlord renew my lease?',       needsTool: false,
-    mustNotContain: ['yes, they will', 'they will renew', 'guaranteed'] },
-  { audience: 'landlord', message: 'what is my property worth?',             needsTool: false, mustNotContain: ['$'] },
-]
-
+/** Figures an agent cannot know without looking them up. */
 const NUMBERISH = /\$[\d,]+|\b\d{4}-\d{2}-\d{2}\b|\byou have \d+\b|\b\d+\s+(vacant|occupied|open|pending|overdue|delinquent)\b/i
 const PLACEHOLDER = /\[[a-z_]+\.[A-Za-z_]+\]|\{\{[^}]+\}\}/
 const MARKDOWN = /\*\*|^#{1,6}\s/m
 
-/** A reply that says the same sentence again and again. */
 function repetitionRatio(text: string): number {
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 15)
+  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 15)
   if (lines.length < 3) return 0
   return 1 - new Set(lines).size / lines.length
 }
 
+interface Outcome { ok: boolean; flags: string[]; tools: string[]; text: string }
+
+async function runOne(intent: Intent, phrasing: string, actor: any): Promise<Outcome> {
+  const r: any = await runAgentSession({ audience: intent.audience, actor, message: phrasing } as any)
+  const text = String(r.reply ?? '')
+  const tools = (r.toolInvocations ?? []).map((t: any) => t.name)
+
+  const flags: string[] = []
+  if (intent.needsTool && tools.length === 0 && NUMBERISH.test(text)) flags.push('FABRICATED')
+  if (PLACEHOLDER.test(text)) flags.push('PLACEHOLDER')
+  if (MARKDOWN.test(text)) flags.push('MARKDOWN')
+  if (repetitionRatio(text) > 0.4) flags.push('REPEATS')
+  if (intent.expect && !text.toLowerCase().includes(intent.expect.toLowerCase())) {
+    flags.push(`MISSING("${intent.expect}")`)
+  }
+  const leaked = (intent.mustNotContain ?? []).filter((n) => text.toLowerCase().includes(n.toLowerCase()))
+  if (leaked.length) flags.push(`LEAKED(${leaked.join(', ')})`)
+
+  return { ok: flags.length === 0, flags, tools, text }
+}
+
 async function main() {
+  const filter = (process.argv[2] ?? '').toLowerCase()
+
   const [tenant] = await query<any>(
     `SELECT u.id AS user_id, t.id AS tenant_id
        FROM users u JOIN tenants t ON t.user_id = u.id
@@ -111,47 +86,49 @@ async function main() {
   if (!tenant || !lord) throw new Error('battery actors missing — seed the demo data first')
 
   const actorFor = (a: string) => a === 'tenant'
-    ? { userId: tenant.user_id, role: 'tenant',   profileId: tenant.tenant_id }
-    : { userId: lord.user_id,   role: 'landlord', profileId: lord.landlord_id }
+    ? { userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id }
+    : { userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id }
 
-  let pass = 0, fabricated = 0, missingFact = 0, placeholders = 0, markdown = 0, repetitive = 0, toolCalls = 0, leaks = 0
-  for (const c of CASES) {
-    const r: any = await runAgentSession({
-      audience: c.audience, actor: actorFor(c.audience), message: c.message,
-    } as any)
-    const text = String(r.reply ?? '')
-    const tools = (r.toolInvocations ?? []).map((t: any) => t.name)
-    toolCalls += tools.length
+  const intents = ALL_INTENTS.filter((i) =>
+    !filter || i.audience === filter || i.id.includes(filter))
 
-    const isFabrication = c.needsTool && tools.length === 0 && NUMBERISH.test(text)
-    const hasPlaceholder = PLACEHOLDER.test(text)
-    const hasMarkdown = MARKDOWN.test(text)
-    const rep = repetitionRatio(text)
-    const factMissing = !!c.expect && !text.includes(c.expect)
-    const leaked = (c.mustNotContain ?? []).filter((n) => text.includes(n))
+  let total = 0, passed = 0
+  const weak: string[] = []
+  const tally: Record<string, number> = {}
 
-    if (isFabrication) fabricated++
-    if (hasPlaceholder) placeholders++
-    if (hasMarkdown) markdown++
-    if (rep > 0.4) repetitive++
-    if (factMissing) missingFact++
-    if (leaked.length) leaks++
-    const ok = !isFabrication && !hasPlaceholder && !hasMarkdown && rep <= 0.4 && !factMissing && !leaked.length
-    if (ok) pass++
+  for (const intent of intents) {
+    const results: Outcome[] = []
+    for (const phrasing of intent.phrasings) {
+      let out: Outcome
+      try {
+        out = await runOne(intent, phrasing, actorFor(intent.audience))
+      } catch (e: any) {
+        out = { ok: false, flags: [`ERROR(${e.message})`], tools: [], text: '' }
+      }
+      results.push(out)
+      total++
+      if (out.ok) passed++
+      for (const f of out.flags) tally[f.replace(/\(.*/, '')] = (tally[f.replace(/\(.*/, '')] ?? 0) + 1
+    }
 
-    const flags = [
-      isFabrication && 'FABRICATED', hasPlaceholder && 'PLACEHOLDER',
-      hasMarkdown && 'MARKDOWN', rep > 0.4 && `REPEATS(${rep.toFixed(2)})`,
-      factMissing && `MISSING("${c.expect}")`,
-      leaked.length && `LEAKED(${leaked.join(', ')})`,
-    ].filter(Boolean)
-    console.log(`${ok ? ' ok ' : 'FAIL'} [${c.audience}] ${c.message}`)
-    console.log(`       tools=${tools.length} [${[...new Set(tools)].join(', ') || 'none'}] ${flags.join(' ')}`)
-    if (!ok) console.log(`       > ${text.replace(/\n+/g, ' | ').slice(0, 220)}`)
+    const n = results.filter((r) => r.ok).length
+    const mark = n === results.length ? '✓' : '✗'
+    console.log(`\n${mark} [${intent.audience}] ${intent.id}  ${n}/${results.length}`)
+    if (n < results.length) weak.push(`${intent.audience}/${intent.id} ${n}/${results.length}`)
+    results.forEach((r, i) => {
+      if (r.ok) { console.log(`     ok   "${intent.phrasings[i]}"`); return }
+      console.log(`     FAIL "${intent.phrasings[i]}"  ${r.flags.join(' ')}  tools=[${r.tools.join(', ') || 'none'}]`)
+      console.log(`          > ${r.text.replace(/\n+/g, ' | ').slice(0, 200)}`)
+    })
   }
 
-  console.log(`\n══ SCORE ${pass}/${CASES.length} ══`)
-  console.log(`   fabricated=${fabricated} placeholders=${placeholders} markdown=${markdown} repetitive=${repetitive} missingFact=${missingFact} leaks=${leaks} totalToolCalls=${toolCalls}`)
-  process.exit(pass === CASES.length ? 0 : 1)
+  console.log(`\n${'═'.repeat(60)}`)
+  console.log(`SCORE ${passed}/${total} phrasings across ${intents.length} intents`)
+  console.log(`flags: ${Object.entries(tally).map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}`)
+  if (weak.length) {
+    console.log(`\nINTENTS WITH A WORDING THAT FALLS THROUGH:`)
+    weak.forEach((w) => console.log(`  ${w}`))
+  }
+  process.exit(passed === total ? 0 : 1)
 }
 main().catch((e) => { console.error(e); process.exit(2) })

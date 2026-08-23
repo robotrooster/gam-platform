@@ -143,7 +143,10 @@ export function assertsStoredFacts(text: string): boolean {
   if (listLines >= 2) return true
 
   return (
-    /\[[a-z_]+\.[A-Za-z_]+\]|\{\{[^}]+\}\}/.test(text)        // unresolved placeholder
+    // S617: also catches a BARE tool name in brackets. The model wrote
+    // "I'll get that now. [get_my_lease]" — no dot, so the dotted form below
+    // missed it and a tool token went to the customer as prose.
+    /\[[a-z][a-z0-9_]*(?:\.[A-Za-z_]+)?\]|\{\{[^}]+\}\}/.test(text)  // unresolved placeholder
     || /^\s*\|.*\|/m.test(text)                                  // a table of records
     || /\b\d+\s+(vacant|occupied|open|pending|active|overdue|delinquent|expiring)\b/i.test(text)
     || /\b(you|they|he|she)\s+(have|has)\s+\d+\b/i.test(text)     // "you have 2 ..."
@@ -195,7 +198,7 @@ export const ACCOUNT_DATA_INTENT =
 // gets to estimate. So this matches DATA NOUNS rather than sentence shapes —
 // if the question is about a thing GAM stores, a tool answers it.
 export const PORTFOLIO_DATA_NOUN =
-  /\b(lease|leases|rent|rents|deposit|balance|owe[sd]?|payment|payments|payout|payouts|invoice|invoices|statement|unit|units|vacan\w*|occupanc\w*|occupied|tenant|tenants|resident|applicant|application|screening|background check|maintenance|repair|work order|inspection|expiring|expiration|renewal|move[- ]?out|move[- ]?in|delinquen\w*|late fee|utility|utilities|meter|reading|booking|reservation|work trade|notice)\b/i
+  /\b(lease|leases|rent|rents|deposit|balance|owe[sd]?|payment|payments|payout|payouts|invoice|invoices|statement|unit|units|vacan\w*|occupanc\w*|occupied|tenant|tenants|resident|applicant|application|screening|background check|maintenance|repair|work order|inspection|expiring|expiration|renewal|move[- ]?out|move[- ]?in|delinquen\w*|late fee|utility|utilities|meter|reading|booking|reservation|work trade|notice|pay|paying|paid|owe|due|charge[sd]?|bill|balance|grace period|grace|full|empty|portfolio|properties|property)\b/i
 
 // Only a QUESTION or an instruction to look — "how do late fees work?" is a
 // capability question and belongs to the knowledge base, not a tool.
@@ -209,7 +212,10 @@ export const PRICING_QUESTION =
   /\b(how much|what)\s+(?:does|do|is|are|would)\b[^?]*\b(cost|charge[ds]?|price[ds]?|run me)\b|\bpricing\b|\bprice of\b|\bhow much is (a|an|the)\b/i
 
 export const ASKS_FOR_A_FACT =
-  /\b(how many|how much|what'?s|what is|what are|when('| i)?s|when is|when does|when will|who('s| is| are)|which|do i have|do we have|does .* have|is there|are there|any\b|show me|list|pull up|look ?up|check|tell me (about )?(my|our|the)|status of)\b/i
+  // S617: measured against 106 real phrasings. "what day is rent due" and "how
+  // much do I pay each month" both fell through and the model answered from
+  // imagination — the 3rd instead of the 1st, $1,200 instead of $750.
+  /\b(how many|how much|how long|what'?s|what is|what are|what day|what date|which day|when('| i)?s|when is|when does|when do|when will|who('s| is| are)|which|do i have|do we have|does .* have|did i|am i|is my|is the|are my|is there|are there|any\b|show me|list|pull up|look ?up|check|tell me (about )?(my|our|the)|status of)\b/i
 
 export const ACCOUNT_DATA_LOOSE =
   /how much (do|does|did) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (still )?owe|what'?s (my|the|his|her|their) balance|(am|are|is) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (behind|current|late|caught up|past due)|behind on (rent|payments?)|late on (rent|payments?)|\bdelinquen\w*|\bpast due\b|who('s| is| has)? (not )?(paid|behind|late)|any(one|body) (behind|late|not paid)|(has|did) [a-z]+ paid|paid (yet|this month|their rent)|\bowes?\b.*\b(rent|balance|anything)\b|\b(rent|balance) .*\bowed\b/i
