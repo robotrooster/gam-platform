@@ -73,14 +73,46 @@ describe('runAgentWithTools', () => {
     expect(res.toolInvocations).toHaveLength(0) // escalate is not a recorded action
   })
 
-  it('returns immediately when the model answers without a tool', async () => {
+  it('returns immediately when the model answers a CAPABILITY question without a tool', async () => {
+    // S617: the message here used to be "when is rent due?", which now demands a
+    // tool — that is an account fact and answering it from memory is how the
+    // agent came to tell a tenant they owed $1,200 when they owed $2,330. A
+    // question the knowledge base owns still returns in one turn.
     vi.spyOn(tools, 'getToolsForProfile').mockReturnValue([])
-    ;(chatCompletion as any).mockResolvedValueOnce(textTurn('Your rent is due on the 1st.'))
+    ;(chatCompletion as any).mockResolvedValueOnce(textTurn('Rent is paid in full, oldest charges first.'))
 
-    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'when is rent due?' })
-    expect(res.reply).toBe('Your rent is due on the 1st.')
+    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'how do late fees work' })
+    expect(res.reply).toBe('Rent is paid in full, oldest charges first.')
     expect(res.toolInvocations).toHaveLength(0)
     expect(chatCompletion).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT return a tool-less answer to an account question — it retries once', async () => {
+    vi.spyOn(tools, 'getToolsForProfile').mockReturnValue([])
+    ;(chatCompletion as any)
+      .mockResolvedValueOnce(textTurn('Your rent is due on the 1st.'))
+      .mockResolvedValueOnce(textTurn('I cannot see your lease from here.'))
+
+    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'when is rent due?' })
+    expect(chatCompletion).toHaveBeenCalledTimes(2)
+    // The nudge names the tools this profile actually holds — it used to name
+    // tenant tools at every audience, so a landlord agent could not comply.
+    const nudge = (chatCompletion as any).mock.calls[1][0].at(-1)
+    expect(nudge.role).toBe('system')
+    expect(nudge.content).toContain('get_my_lease')
+    expect(res.reply).toBe('I cannot see your lease from here.')
+  })
+
+  it('suppresses an invented answer when the retry is declined', async () => {
+    vi.spyOn(tools, 'getToolsForProfile').mockReturnValue([])
+    ;(chatCompletion as any)
+      .mockResolvedValueOnce(textTurn('You currently owe $1,200.'))
+      .mockResolvedValueOnce(textTurn('You currently owe $1,200.'))
+
+    const res = await runAgentWithTools({ profile: requireProfile('tenant_entry'), actor: ACTOR, message: 'how much do I owe right now?' })
+    expect(res.toolInvocations).toHaveLength(0)
+    expect(res.reply).not.toContain('$1,200')
+    expect(res.reply).toMatch(/not able to pull that up/i)
   })
 
   it('refuses to run a tool the profile is not allowed', async () => {

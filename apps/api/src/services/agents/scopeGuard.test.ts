@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks, stripChatMarkdown } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -101,5 +101,37 @@ describe('stripChatMarkdown (S617)', () => {
 
   it('runs as part of the reply tail', () => {
     expect(scrubScopeLeaks('**Bob Chen** owes $2,330.').reply).toBe('Bob Chen owes $2,330.')
+  })
+})
+
+describe('collapseRepetition (S617)', () => {
+  it('collapses a reply that looped on itself', () => {
+    // Real shape: a tenant asking whether a payment went through got these
+    // three lines back a dozen times over.
+    const looped = Array.from({ length: 12 }, () =>
+      'Want me to pull up your full payment history?\nYou also have some pending charges still outstanding.').join('\n')
+    const out = collapseRepetition(looped)
+    expect(out.split('\n').filter(l => l.trim()).length).toBe(2)
+    expect(out).toContain('full payment history')
+  })
+
+  it('keeps the first occurrence, in order', () => {
+    expect(collapseRepetition('The first long sentence here.\nA different long sentence.\nThe first long sentence here.'))
+      .toBe('The first long sentence here.\nA different long sentence.')
+  })
+
+  it('keeps blank lines so paced bubbles still split', () => {
+    const two = 'Your rent is due on the 1st of the month.\n\nWant me to pull up your lease?'
+    expect(collapseRepetition(two)).toBe(two)
+  })
+
+  it('does not collapse short repeated lines like list markers', () => {
+    const list = '• Apt 204\n• Apt 201\n• RV 08'
+    expect(collapseRepetition(list)).toBe(list)
+  })
+
+  it('leaves an ordinary reply untouched', () => {
+    const ok = "Your balance is $2,330.\n\nWant me to help you pay it?"
+    expect(collapseRepetition(ok)).toBe(ok)
   })
 })

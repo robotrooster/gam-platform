@@ -62,7 +62,100 @@ function promisesHandoff(content: string): boolean {
 // one of these gets one forced retry (see the safety net in the loop).
 // Deliberately narrow: generic product questions ("how do late fees work")
 // must NOT match, or every FAQ turn would pay a second model call.
-const ACCOUNT_DATA_INTENT =
+/**
+ * Names in a reply must have come from a tool result.
+ *
+ * S617. Asked which leases were expiring, the landlord agent CALLED the tool,
+ * got back one real row (Apt 204, Oak Street Apartments, Oct 4) — and reported
+ * three, padding with "Unit 202 at Maple Court" and "Unit 303 at Pine Estates".
+ * Neither property exists anywhere in the database, for any landlord. A prompt
+ * rule spelling this out, with that exact example, did not stop it.
+ *
+ * So the check is mechanical: every Title Case name in the reply must appear in
+ * what the tools actually returned. It only runs when the reply reads like a
+ * LIST OF RECORDS (bullets or a table) — that is where padding happens, and it
+ * keeps ordinary prose from being second-guessed for mentioning a place in
+ * passing.
+ */
+const NAME_ALLOWLIST = new Set([
+  'Want Me', 'Let Me', 'Here Is', 'Here Are', 'Oak Street', 'GAM Team',
+])
+export function namesNotInToolResults(reply: string, toolResults: unknown[]): string[] {
+  if (!/^\s*(?:[-•*]|\|)/m.test(reply)) return []           // not a record list
+  const haystack = JSON.stringify(toolResults).toLowerCase()
+  const found = reply.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g) ?? []
+  const bad: string[] = []
+  for (const name of new Set(found)) {
+    if (NAME_ALLOWLIST.has(name)) continue
+    // A month or weekday ANYWHERE in the phrase — "Due October", "End Date
+    // October" — is a date, not a record name. This checked only the FIRST
+    // word and flagged "Due October" as an invented property.
+    if (/\b(January|February|March|April|May|June|July|August|September|October|November|December|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/.test(name)) continue
+    if (!haystack.includes(name.toLowerCase())) bad.push(name)
+  }
+  return bad
+}
+
+/**
+ * Does this question have to be answered by a TOOL rather than from memory?
+ *
+ * ONE definition. It was briefly spelled out in the runner and again in the
+ * test, and they drifted within the hour: the test still nudged "how much does
+ * a background check cost" after the runner had learned not to. A predicate
+ * both sides call cannot disagree.
+ */
+export function demandsAToolCall(message: string): boolean {
+  if (PRICING_QUESTION.test(message)) return false   // capability, not account data
+  return (
+    ACCOUNT_DATA_INTENT.test(message) ||
+    ACCOUNT_DATA_LOOSE.test(message) ||
+    (PORTFOLIO_DATA_NOUN.test(message) && ASKS_FOR_A_FACT.test(message))
+  )
+}
+
+/**
+ * Does a reply ASSERT specific stored facts?
+ *
+ * S617. The retry above is one attempt; if the model refuses it, the old code
+ * shipped whatever it had. Verified against the database, that meant sending a
+ * landlord "you have 2 vacant units" when there were 15, listing two named
+ * maintenance requests for a tenant with none, and rendering a table of expiring
+ * leases containing a "Jane Doe" whose lease ended in 2023.
+ *
+ * A wrong number is worse than no number here — this is what a landlord serves
+ * a notice on. So when no tool ran and the reply still reads like a record,
+ * the record is not sent.
+ */
+export function assertsStoredFacts(text: string): boolean {
+  if (!text) return false
+  // A LIST OF RECORDS. Two or more bulleted or numbered lines is a report, and
+  // a report with no lookup behind it is fiction. S617: this was the gap that
+  // let "leases ending within the next 60 days" through — a tidy list of units,
+  // tenant names and dates, none of which existed, carrying no dollar sign and
+  // no ISO date for the cruder checks below to catch.
+  const listLines = (text.match(/^\s*(?:[-•*]|\d+[.)])\s+\S/gm) ?? []).length
+  if (listLines >= 2) return true
+
+  return (
+    /\[[a-z_]+\.[A-Za-z_]+\]|\{\{[^}]+\}\}/.test(text)        // unresolved placeholder
+    || /^\s*\|.*\|/m.test(text)                                  // a table of records
+    || /\b\d+\s+(vacant|occupied|open|pending|active|overdue|delinquent|expiring)\b/i.test(text)
+    || /\b(you|they|he|she)\s+(have|has)\s+\d+\b/i.test(text)     // "you have 2 ..."
+    || /\$[\d,]+(\.\d\d)?/.test(text)                            // a money figure
+    || /\b\d{4}-\d{2}-\d{2}\b/.test(text)                        // an ISO date
+    // "End Date: October 15" — a specific calendar date in prose.
+    || /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b/i.test(text)
+  )
+}
+
+/** What to say instead of a number nobody looked up. */
+const CANNOT_SEE =
+  "I'm not able to pull that up right now, and I don't want to give you a number I haven't checked. Let me get someone on the team to look — or ask me something else in the meantime."
+
+/** Distinct tool executions allowed inside ONE model turn. See the loop below. */
+const MAX_TOOL_CALLS_PER_TURN = 6
+
+export const ACCOUNT_DATA_INTENT =
   /\b(my|our)\s+(?:\w+\s+)?(lease|deposit|balance|rent|payments?|payout|invoice|maintenance requests?|documents?|payment methods?|property manager|entry requests?|inspections?)\b|what do (i|we) owe|when('| i)?s my (next |last )?(payment|payout|rent)|\bon file\b|what documents|documents? do (i|we) have|requested entry|entry request/i
 
 // S617: the net above is built entirely around the word "my", and it showed.
@@ -82,7 +175,37 @@ const ACCOUNT_DATA_INTENT =
 // specific person and then should be able to find that by name in occupied
 // units." A fabricated delinquency answer is worse than a tenant-side one: it is
 // what an eviction decision gets made on.
-const ACCOUNT_DATA_LOOSE =
+// S617, second pass. Chasing phrasings is whack-a-mole: after widening the net
+// for "how much do I owe right now", a battery through the production path found
+// SIX more tool-less answers, every one invented — "you have 2 vacant units"
+// (15), "12 occupied, 3 vacant" (6 and 15, and it contradicted its own previous
+// answer), two named maintenance requests for a tenant who has none, and a
+// markdown table of expiring leases featuring a "Jane Doe" with a 2023 date.
+//
+// Nic's framing is the shape of the fix: "landlord questions should scope to
+// platform capability or portfolio realities, things should become narrow
+// quickly. tenant side should be easy as they can only know about their
+// lease/portal and their landlord." There is no third category where the model
+// gets to estimate. So this matches DATA NOUNS rather than sentence shapes —
+// if the question is about a thing GAM stores, a tool answers it.
+export const PORTFOLIO_DATA_NOUN =
+  /\b(lease|leases|rent|rents|deposit|balance|owe[sd]?|payment|payments|payout|payouts|invoice|invoices|statement|unit|units|vacan\w*|occupanc\w*|occupied|tenant|tenants|resident|applicant|application|screening|background check|maintenance|repair|work order|inspection|expiring|expiration|renewal|move[- ]?out|move[- ]?in|delinquen\w*|late fee|utility|utilities|meter|reading|booking|reservation|work trade|notice)\b/i
+
+// Only a QUESTION or an instruction to look — "how do late fees work?" is a
+// capability question and belongs to the knowledge base, not a tool.
+/**
+ * Cost/pricing questions are CAPABILITY questions, answered from the knowledge
+ * base — "how much does a background check cost" is not a request for this
+ * landlord's data, and nudging it would force a tool that does not exist and
+ * then suppress a perfectly good answer. Caught by a test, not in production.
+ */
+export const PRICING_QUESTION =
+  /\b(how much|what)\s+(?:does|do|is|are|would)\b[^?]*\b(cost|charge[ds]?|price[ds]?|run me)\b|\bpricing\b|\bprice of\b|\bhow much is (a|an|the)\b/i
+
+export const ASKS_FOR_A_FACT =
+  /\b(how many|how much|what'?s|what is|what are|when('| i)?s|when is|when does|when will|who('s| is| are)|which|do i have|do we have|does .* have|is there|are there|any\b|show me|list|pull up|look ?up|check|tell me (about )?(my|our|the)|status of)\b/i
+
+export const ACCOUNT_DATA_LOOSE =
   /how much (do|does|did) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (still )?owe|what'?s (my|the|his|her|their) balance|(am|are|is) (i|we|he|she|they|[\w#'-]+(?:\s+[\w#'-]+)?) (behind|current|late|caught up|past due)|behind on (rent|payments?)|late on (rent|payments?)|\bdelinquen\w*|\bpast due\b|who('s| is| has)? (not )?(paid|behind|late)|any(one|body) (behind|late|not paid)|(has|did) [a-z]+ paid|paid (yet|this month|their rent)|\bowes?\b.*\b(rent|balance|anything)\b|\b(rent|balance) .*\bowed\b/i
 
 // S553: two more hard-stop nets, same philosophy as MONEY_DISPUTE_INTENT
@@ -184,6 +307,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
 
   const toolInvocations: ToolInvocation[] = []
   let nudgedForAccountData = false
+  let nudgedForPadding = false
   let nudgedForDispute = false
   let nudgedForHardStop = false
   let model = ''
@@ -248,7 +372,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       if (
         !nudgedForAccountData &&
         toolInvocations.length === 0 &&
-        (ACCOUNT_DATA_INTENT.test(message) || ACCOUNT_DATA_LOOSE.test(message))
+        demandsAToolCall(message)
       ) {
         nudgedForAccountData = true
         logger.warn({ profile: profile.id }, 'agent runner: tool-less answer to an account-data question — forcing one tool retry (safety net)')
@@ -257,23 +381,104 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           role: 'system',
           content:
             'STOP — your last answer stated account-specific facts without fetching them. ' +
-            'You have NOT looked up this customer\'s data; any date or amount you stated was invented. ' +
-            'Call the matching tool NOW (their lease → get_my_lease, deposit → get_my_deposit, ' +
-            'balance/payments → the payment tools, payouts → get_my_payouts, documents → get_my_documents, ' +
-            'payment methods on file → get_my_payment_methods, entry requests → get_my_entry_requests, ' +
-            'property manager / contacts → get_my_contacts) and answer from its result. ' +
-            'If no tool covers it, say plainly that you cannot see that information.',
+            'You have NOT looked up this data; any name, date, count or amount you stated was invented. ' +
+            // S617: this used to name tenant tools only — get_my_lease, get_my_deposit,
+            // get_my_contacts — so a LANDLORD agent was being told to call tools it does
+            // not have. It could not comply, so it either answered tool-less again (and
+            // got suppressed) or floundered. The list is now built from the profile's own
+            // toolNames, which cannot drift from what the agent actually holds.
+            `Call the matching tool NOW. Tools available to you: ${(profile.toolNames ?? []).join(", ")}. ` +
+            'Pick the one that answers this question and answer from its result. ' +
+            'If none of them covers it, say plainly that you cannot see that information — ' +
+            'do not answer from memory.',
         })
         continue
+      }
+      // S617: last gate before this reaches a person. The nudge above already
+      // fired and was declined — no tool ran, yet the answer still states
+      // figures, dates or a list of records. Those cannot have come from
+      // anywhere but the model. Do not send them.
+      if (
+        toolInvocations.length === 0 &&
+        nudgedForAccountData &&
+        assertsStoredFacts(out.content)
+      ) {
+        logger.error({ profile: profile.id, message },
+          'agent runner: model asserted stored facts with no tool call after a retry — reply suppressed')
+        return { reply: CANNOT_SEE, model, retrieved, grounded, toolInvocations, usage }
+      }
+      // S617: the tools DID run, and the model added rows they never returned.
+      // Suppress rather than hand a landlord a list with invented properties in
+      // it — acting on a fake expiring lease is a real-world mistake.
+      if (toolInvocations.length > 0) {
+        const invented = namesNotInToolResults(out.content, toolInvocations.map((t) => t.result))
+        if (invented.length) {
+          // Ask once for the answer again, with the tool output restated. The
+          // real rows ARE there — the model padded a short list rather than
+          // fetched nothing — so suppressing outright throws away a correct
+          // answer along with the invented ones. Only give up if it pads twice.
+          if (!nudgedForPadding) {
+            nudgedForPadding = true
+            logger.warn({ profile: profile.id, invented },
+              'agent runner: reply named records the tools never returned — forcing one retry')
+            messages.push({ role: 'assistant', content: out.content })
+            messages.push({
+              role: 'system',
+              content:
+                `STOP — you named ${invented.map((n) => `"${n}"`).join(', ')}, which the lookup did not return. ` +
+                'You invented those. Answer AGAIN using only what the tool gave you, listed here in full:\n' +
+                JSON.stringify(toolInvocations.map((t) => ({ tool: t.name, result: t.result }))) +
+                '\nReport exactly those rows — no more. If it returned one row, give one. ' +
+                'If it returned none, say none. A short answer is the correct answer.',
+            })
+            continue
+          }
+          logger.error({ profile: profile.id, message, invented },
+            'agent runner: reply named invented records twice — reply suppressed')
+          return { reply: CANNOT_SEE, model, retrieved, grounded, toolInvocations, usage }
+        }
       }
       return { reply: out.content, model, retrieved, grounded, toolInvocations, usage }
     }
 
     // Record the assistant's tool-call turn, then execute each call.
     messages.push({ role: 'assistant', content: out.content || null, tool_calls: out.toolCalls })
+
+    // S617: one turn asking "did my last payment go through" came back with
+    // FORTY-SIX identical get_my_payment_status calls, every one executed and
+    // round-tripped. maxSteps bounds the number of TURNS, not the number of
+    // calls inside a turn, so a model that repeats itself is unbounded — that
+    // is 46 database round trips and 46 tool messages of context for one
+    // question.
+    //
+    // Identical calls are answered from the first result. The protocol still
+    // needs a reply per tool_call_id, so every call is answered; it just is not
+    // re-executed. And the ledger records the tool ONCE, so a repeat does not
+    // inflate tool_invocation_count or make the turn look busier than it was.
+    const turnCache = new Map<string, unknown>()
+    let executedThisTurn = 0
     for (const call of out.toolCalls) {
       const args = parseArgs(call.function.arguments)
+      const cacheKey = `${call.function.name}:${JSON.stringify(args)}`
+      if (turnCache.has(cacheKey)) {
+        messages.push({
+          role: 'tool', tool_call_id: call.id, name: call.function.name,
+          content: JSON.stringify(turnCache.get(cacheKey)),
+        })
+        continue
+      }
+      if (executedThisTurn >= MAX_TOOL_CALLS_PER_TURN) {
+        logger.warn({ profile: profile.id, tool: call.function.name },
+          'agent runner: per-turn tool-call cap hit — remaining calls answered without executing')
+        messages.push({
+          role: 'tool', tool_call_id: call.id, name: call.function.name,
+          content: JSON.stringify({ ok: false, error: 'Too many lookups in one turn. Answer from what you already have.' }),
+        })
+        continue
+      }
+      executedThisTurn++
       const result = await executeToolCall(call, profile, actor, args)
+      turnCache.set(cacheKey, result)
 
       // An escalation tool is a CONTROL signal, not a data/action tool —
       // detect it BEFORE recording, so it never pollutes the tool ledger

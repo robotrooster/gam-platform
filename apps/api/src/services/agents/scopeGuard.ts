@@ -79,6 +79,34 @@ export function stripChatMarkdown(text: string): string {
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)') // [text](url)
 }
 
+/**
+ * Collapse a reply that has started repeating itself.
+ *
+ * S617: a tenant asking "did my last payment go through" got the same three
+ * sentences back over and over — "Want me to pull up your full payment history?
+ * Want me to help you try again? You also have some pending charges..." — for a
+ * dozen cycles. A quantized model that loops is not a rare event, and the reply
+ * is unusable either way, so the duplicates are dropped rather than sent.
+ *
+ * Order is preserved and the FIRST occurrence of each line is kept, so a reply
+ * that merely repeats a short phrase reads normally once collapsed. Only lines
+ * with real content are considered — blank lines separate bubbles and must
+ * survive.
+ */
+export function collapseRepetition(text: string): string {
+  const lines = text.split('\n')
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const line of lines) {
+    const key = line.trim().toLowerCase().replace(/\s+/g, ' ')
+    if (key.length < 12) { out.push(line); continue }   // short/blank: keep
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(line)
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
 export interface ScrubResult {
   reply: string
   removed: string[]
@@ -93,7 +121,7 @@ export interface ScrubResult {
  */
 export function scrubScopeLeaks(reply: string): ScrubResult {
   if (!reply) return { reply, removed: [] }
-  reply = stripChatMarkdown(reply)
+  reply = collapseRepetition(stripChatMarkdown(reply))
   const removed: string[] = []
   const kept = sentences(reply).filter((s) => {
     const hit = LEAK_PATTERNS.find((p) => p.re.test(s))
