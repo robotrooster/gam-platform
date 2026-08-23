@@ -36,6 +36,9 @@ export interface Intent {
   needsTool: boolean
   /** a fact that must appear, whichever way the question was asked */
   expect?: string
+  /** any ONE of these is acceptable — for questions with more than one right
+   *  answer, e.g. the rate card OR this landlord's actual computed bill. */
+  expectAny?: string[]
   /** any of these appearing is a failure (a leak, or a promise nobody can make) */
   mustNotContain?: string[]
   phrasings: string[]
@@ -81,12 +84,23 @@ export const TENANT_INTENTS: Intent[] = [
     ],
   },
   {
-    audience: 'tenant', id: 'deposit', needsTool: true, expect: '750',
+    audience: 'tenant', id: 'deposit-amount', needsTool: true, expect: '750',
     phrasings: [
       'how much was my security deposit?',
       "what's my deposit",
       'how much did I put down',
+    ],
+  },
+  {
+    // S617: this was grouped with the amount and scored a failure for not
+    // saying "$750". It is a WHEN, not a how much — the agent explaining the
+    // move-out process was the correct answer and my assertion was the wrong
+    // one. Third time this session a test was wrong rather than the agent.
+    audience: 'tenant', id: 'deposit-return-timing', needsTool: false,
+    mustNotContain: ["I've escalated"],
+    phrasings: [
       'when do I get my deposit back',
+      'how long until I get my deposit returned',
     ],
   },
   {
@@ -247,7 +261,13 @@ export const LANDLORD_INTENTS: Intent[] = [
     ],
   },
   {
-    audience: 'landlord', id: 'platform-fee', needsTool: false, expect: '$2',
+    // S617: expected the literal "$2" and marked a BETTER answer wrong. Asked
+    // "what am I paying for this", the agent worked out this landlord's actual
+    // bill — $10 per property, because Oak Street has 4 occupied units and
+    // Sunset Palms 2, both under the 5 where $2/unit overtakes the $10 minimum.
+    // Reciting the rate card would have been the worse reply. Now accepts
+    // either the rate or the real figure, and still fails an escalation.
+    audience: 'landlord', id: 'platform-fee', needsTool: false, expectAny: ['$2', '$10'],
     mustNotContain: ["I've escalated"],
     phrasings: [
       'what is the platform fee?',

@@ -71,6 +71,9 @@ async function runOne(intent: Intent, phrasing: string, actor: any): Promise<Out
   if (intent.expect && !text.toLowerCase().includes(intent.expect.toLowerCase())) {
     flags.push(`MISSING("${intent.expect}")`)
   }
+  if (intent.expectAny?.length && !intent.expectAny.some((e) => text.toLowerCase().includes(e.toLowerCase()))) {
+    flags.push(`MISSING(any of ${intent.expectAny.join(' / ')})`)
+  }
   const leaked = (intent.mustNotContain ?? []).filter((n) => text.toLowerCase().includes(n.toLowerCase()))
   if (leaked.length) flags.push(`LEAKED(${leaked.join(', ')})`)
 
