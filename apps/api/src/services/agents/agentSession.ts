@@ -14,6 +14,7 @@
  * handoff signal runAgentWithTools surfaces.
  */
 
+import { scrubScopeLeaks } from './scopeGuard'
 import { runAgentWithTools, type ToolInvocation, type RunWithToolsResult } from './agentRunner'
 import { getEntryProfile, getEscalationProfile } from './profiles'
 import { logInteraction } from './logInteraction'
@@ -146,6 +147,19 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // Single tail: fire-and-forget the log (best-effort) and return the reply
   // immediately — never make the tenant wait on the interaction-log write.
   const finalize = async (result: AgentSessionResult, finalProfileId: string): Promise<AgentSessionResult> => {
+    // S617: strip the two give-aways before ANYTHING else sees this reply —
+    // before it is logged, before it is cached, before it is sent. The cache
+    // matters most: a leaked answer stored there is served to other people.
+    // See scopeGuard.ts for why this is deterministic and not just prompted.
+    if (result.reply) {
+      const scrubbed = scrubScopeLeaks(result.reply)
+      if (scrubbed.removed.length) {
+        logger.warn({ profile: finalProfileId, removed: scrubbed.removed },
+          '[agent] scope leak scrubbed from reply')
+        result = { ...result, reply: scrubbed.reply }
+      }
+    }
+
     void logInteraction(input, result, {
       startedAt,
       conversationId: input.conversationId,
