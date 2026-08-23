@@ -103,6 +103,41 @@ broad public rollout), CSV imports from 8 PM platforms.
 
 ---
 
+## 2b. Current work — agreed order (S617, 2026-08-22)
+
+Nic is entering his three Oak Park lease templates and sending portal invites.
+Everything here is meant to land BEFORE real tenants are on the platform. Nic:
+*"I wanted to knock all those changes out before real people got on there."*
+
+1. **E-sign auto-draft workflow** — verify the path Nic is about to use for
+   real: upload template → auto-place fields → draft → send. Not yet checked
+   this session.
+2. **AI agents — knowledge, scope, and manner.** The single biggest gap:
+   knowledge was last ingested **2026-08-13**, before neighbour utilities,
+   service agreements, cross-property convergence, one-off charges, the payout
+   cadence, the 3% STR fee, no-partial-payments and the owner-use/utility-service
+   unit statuses. The agents do not know the platform they are answering for.
+   - Re-ingest all four scopes (landlord 89 chunks, tenant 76, shared 15,
+     sales 10) against what actually shipped.
+   - Hold the scope line: the landlord agent knows only landlord things, the
+     tenant agent only tenant things — see [[gam-agent-product-siloing]].
+   - Make them conversational and personable rather than correct-and-flat.
+   - ✅ **Reply cadence fixed.** All four surfaces already paced themselves, but
+     the caps (4.5s read / 9s type) meant a 400-character message was "read" at
+     1,067 wpm and a 1,600-character one at 4,267. One definition now lives in
+     `packages/shared/src/chatCadence.ts`; it had been copy-pasted into four
+     files. (apps/marketing has no bundler and keeps a pointer-commented copy.)
+3. **Demo server — split the seed data off the live database.** Nic: *"when
+   we're having sales calls and demos, I can walk through a process without
+   showing real customer data."* Wants seeded data at EVERY STAGE of a flow —
+   a template being built, one with its boxes already placed, one signed — so a
+   demo can jump straight to the relevant moment instead of performing the
+   setup. Also removes the demo landlords (Thornton Properties, Reyes Rentals)
+   and their 37 payment rows from the production database, where they currently
+   sit alongside real money.
+
+---
+
 ## 3. Post-launch backlog
 
 **Deposit custody — Jiko T-bills, near-term, NOT a launch blocker (Nic, S604).**

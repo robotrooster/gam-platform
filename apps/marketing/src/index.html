@@ -893,10 +893,14 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     // each with its own typing beat sized to that bubble. So a long answer arrives
     // paced and typed, never dumped instantly.
     var startedAt = Date.now();
-    var readMs = Math.min(4500, 1100 + text.length * 40);
+    // S617: these four numbers are a COPY of packages/shared/src/chatCadence.ts.
+    // This file is static HTML with no bundler, so it cannot import it. If you
+    // tune one, tune both — the old caps (4.5s read / 9s type) meant a long
+    // message was 'read' at over a thousand words a minute.
+    var readMs = Math.min(13000, 1300 + text.length * 45);
     var typingSince = 0;
     var readTimer = setTimeout(showRead, readMs);
-    var typeTimer = setTimeout(function(){ hideRead(); showTyping(); typingSince = Date.now(); }, readMs + 800);
+    var typeTimer = setTimeout(function(){ hideRead(); showTyping(); typingSince = Date.now(); }, readMs + 900);
     function finish(reply){
       clearTimeout(readTimer); clearTimeout(typeTimer);
       // Split into paragraph bubbles (blank-line separated). Each is sent on its
@@ -908,7 +912,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
       function step(){
         if(i >= parts.length){ sending=false; sendBtn.disabled=false; input.focus(); return; }
         var part = parts[i++];
-        var typeMs = Math.min(9000, Math.max(1800, part.length * 55));
+        var typeMs = Math.min(18000, Math.max(2200, part.length * 70));
         hideRead();
         if(!typingSince){ showTyping(); typingSince = Date.now(); }
         var held = Date.now() - typingSince;
@@ -920,14 +924,14 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
             // Pause long enough to READ the bubble just sent before the next one
             // starts typing — proportional to its length, so a long message isn't
             // followed instantly by the next.
-            var readGap = Math.min(5000, Math.max(1400, part.length * 18));
+            var readGap = Math.min(8000, Math.max(1900, part.length * 30));
             setTimeout(function(){ showTyping(); typingSince = Date.now(); step(); }, readGap);
           }
           else { sending=false; sendBtn.disabled=false; input.focus(); }
         }, Math.max(0, typeMs - held));
       }
       // Never start revealing before the read beat has been felt.
-      setTimeout(step, Math.max(0, (startedAt + readMs + 800) - Date.now()));
+      setTimeout(step, Math.max(0, (startedAt + readMs + 900) - Date.now()));
     }
 
     // History = prior turns only; the current message rides in `message`.

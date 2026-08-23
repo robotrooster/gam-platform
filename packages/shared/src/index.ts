@@ -4332,6 +4332,8 @@ export function formatCurrency(amount: number): string {
 
 // === S25: businessDay + paymentAllocation re-exports ===
 export * from './businessDay'
+// === S617: one definition of how fast an agent reads and types ===
+export * from './chatCadence'
 export * from './paymentAllocation'
 export * from './camelize'
 export * from './versionWatch'

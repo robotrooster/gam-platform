@@ -16,6 +16,7 @@
  * to /inquiry and land as landlord notifications + property_inquiries.
  */
 // S540: self-hosted fonts — no render-blocking external stylesheet
+import { readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
 import '@fontsource/syne/800.css'
@@ -1019,9 +1020,9 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
     })()
 
     // Read receipt → typing → the reply lands as separate, paced bubbles.
-    const readMs = Math.min(4500, 1100 + text.length * 40)
+    const readMs = readBeatMs(text.length)
     await chatSleep(readMs); setIndicator('read')
-    await chatSleep(800); setIndicator('typing')
+    await chatSleep(PAUSE_BEFORE_TYPING_MS); setIndicator('typing')
     let since = Date.now()
 
     const reply = await replyPromise
@@ -1029,13 +1030,13 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
     if (!parts.length) parts.push(String(reply))
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i]
-      const typeMs = Math.min(9000, Math.max(1800, part.length * 55))
+      const typeMs = typeBeatMs(part.length)
       const held = Date.now() - since
       await chatSleep(Math.max(0, typeMs - held))
       setIndicator('none')
       setMessages((m) => [...m, { role: 'agent', text: part }])
       if (i < parts.length - 1) {
-        const readGap = Math.min(5000, Math.max(1400, part.length * 18))
+        const readGap = readGapMs(part.length)
         await chatSleep(readGap)
         setIndicator('typing'); since = Date.now()
       }

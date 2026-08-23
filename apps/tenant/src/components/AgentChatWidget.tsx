@@ -13,6 +13,7 @@
  * names; keep the two in sync when editing.
  */
 
+import { readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
 import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, X, ChevronDown } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
@@ -131,9 +132,9 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
     // the model works, then (3) the reply lands as SEPARATE bubbles (blank-line
     // split), each with its own typing beat + a read gap between them — paced
     // and typed, never dumped instantly.
-    const readMs = Math.min(4500, 1100 + text.length * 40)
+    const readMs = readBeatMs(text.length)
     await sleep(readMs); setIndicator('read')
-    await sleep(800); setIndicator('typing')
+    await sleep(PAUSE_BEFORE_TYPING_MS); setIndicator('typing')
     let since = Date.now()
 
     const reply = await replyPromise
@@ -142,13 +143,13 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
 
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i]
-      const typeMs = Math.min(9000, Math.max(1800, part.length * 55))
+      const typeMs = typeBeatMs(part.length)
       const held = Date.now() - since   // time already spent "typing" (absorbs model latency)
       await sleep(Math.max(0, typeMs - held))
       setIndicator('none')
       setMessages((m) => [...m, { role: 'agent', text: part }])
       if (i < parts.length - 1) {
-        const readGap = Math.min(5000, Math.max(1400, part.length * 18))
+        const readGap = readGapMs(part.length)
         await sleep(readGap)
         setIndicator('typing'); since = Date.now()
       }
