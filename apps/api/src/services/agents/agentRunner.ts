@@ -187,6 +187,13 @@ export const ANSWERABLE_FROM_MEMORY = [
   // "how do I ...", "where do I ...", "can I ..." — procedure, not data.
   /\b(how|where)\s+(do|can|would)\s+(i|we|you)\b/i,
   /\b(can|could)\s+(i|we)\s+(pay|add|set up|create|file|report|upload|invite|book|reserve|cancel|renew)\b/i,
+  // "How does X work" for a PLATFORM MECHANIC. Nic's test: what would a GAM
+  // customer service rep know off the top of their head, versus what would they
+  // have to look up? A rep explains e-signing, invites or autopay setup from
+  // memory — the process is the same for everyone. They would NOT recite a late
+  // fee or a deposit rule from memory, because those are set per property and
+  // per state, which is why those words are deliberately absent from this list.
+  /\bhow (?:do(?:es)?|can|would)\b[^?]*\b(e-?sign\w*|signing|invit\w+|the portal|autopay|auto-?pay|screening|background check|work ?trade|booking|reservation|maintenance request|point of sale|pos)\b/i,
   // Platform-wide pricing and rules — identical for every landlord and tenant.
   /\bplatform fee\b|\bwhat does gam (cost|charge)\b|\bhow much do you charge\b|\bper occupied unit\b/i,
   /\bpartial payment|\bpay in full\b|\bsplit (the |my )?rent\b|\bpay (part|some|half) of\b|\bpay a (partial|portion)\b/i,

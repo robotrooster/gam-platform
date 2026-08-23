@@ -182,3 +182,45 @@ describe('assertsStoredFacts — a written-out tool call is not an answer (S617)
     expect(assertsStoredFacts('Rent is due before the 5th <- that is the grace period.')).toBe(false)
   })
 })
+
+// ============================================================
+// S617 (Nic) — "what would a GAM customer service representative know off the
+// top of their head versus what would they have to search for? ... Anything
+// that's property specific, landlord specific, state specific — that's what the
+// agent should be searching for. That gets it to be the most realistic."
+//
+// The clearest statement of the rule, and the one worth pinning: a rep explains
+// how e-signing works from memory and looks up a late fee, because one is the
+// same for everyone and the other is set per property under local law.
+// ============================================================
+describe('the customer-rep test (S617)', () => {
+  it('answers from memory what a rep would know cold', () => {
+    for (const q of [
+      'how do I add a unit', 'how do I report a repair', 'how do I pay my rent',
+      'can I pay with a card', 'what is the platform fee',
+      'how much do you charge per unit', 'can tenants pay part of the rent',
+      'how much does a background check cost', 'what is FlexPay',
+      'how does e-sign work', 'how do invites work', 'how does autopay work',
+      'how do I invite a tenant',
+    ]) expect(demandsAToolCall(q), q).toBe(false)
+  })
+
+  it('looks up anything a rep would have to search — property, landlord, tenant or state', () => {
+    for (const q of [
+      'what is my late fee', 'how much do I owe', 'when does my lease end',
+      'how much notice does my landlord have to give before entering',
+      'how long does my landlord have to return my deposit',
+      'is there a limit on late fees in Arizona',
+      'how many units do I have vacant', 'who is behind on rent',
+      'what are the utilities set up as on my property',
+      'when is my next payout', 'does my state require deposit interest',
+      'how do late fees work', 'how does my deposit work', 'how do payouts work',
+    ]) expect(demandsAToolCall(q), q).toBe(true)
+  })
+
+  it('splits "how does X work" on whether X varies between two customers', () => {
+    // Same sentence shape, opposite answers — the noun decides, not the verb.
+    expect(demandsAToolCall('how does e-sign work')).toBe(false)   // same for everyone
+    expect(demandsAToolCall('how do late fees work')).toBe(true)   // per property, per state
+  })
+})
