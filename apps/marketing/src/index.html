@@ -862,8 +862,10 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     b.appendChild(dots); row.appendChild(b); msgsEl.appendChild(row); scroll();
   }
   function hideTyping(){ var t=document.getElementById('gsc-typing'); if(t) t.remove(); }
-  function showRead(){ if(document.getElementById('gsc-read')) return; var r=document.createElement('div'); r.id='gsc-read'; r.style.cssText='font-size:.66rem;color:var(--dim);text-align:right;margin:-2px 6px 8px 0'; r.textContent='Read'; msgsEl.appendChild(r); scroll(); }
+  function showRead(){ if(document.getElementById('gsc-read')) return; var r=document.createElement('div'); r.id='gsc-read'; r.style.cssText='font-size:.66rem;color:var(--dim);text-align:right;margin:-2px 6px 8px 0'; r.textContent='Seen'; msgsEl.appendChild(r); scroll(); }
   function hideRead(){ var e=document.getElementById('gsc-read'); if(e) e.remove(); }
+  function showSent(){ if(document.getElementById('gsc-sent')) return; var r=document.createElement('div'); r.id='gsc-sent'; r.style.cssText='font-size:.66rem;color:var(--dim);opacity:.65;text-align:right;margin:-2px 6px 8px 0'; r.textContent='Sent'; msgsEl.appendChild(r); scroll(); }
+  function hideSent(){ var e=document.getElementById('gsc-sent'); if(e) e.remove(); }
 
   function open(){ panel.classList.add('open'); bubble.setAttribute('aria-expanded','true'); render(); setTimeout(function(){ input.focus(); },80); }
   function close(){ panel.classList.remove('open'); bubble.setAttribute('aria-expanded','false'); bubble.focus(); }
@@ -898,9 +900,17 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     // tune one, tune both — the old caps (4.5s read / 9s type) meant a long
     // message was 'read' at over a thousand words a minute.
     var readMs = Math.min(13000, 1300 + text.length * 45);
+    // S617: nobody is at the screen waiting. Sent -> unnoticed -> Seen -> read.
+    // Mirrors noticeDelayMs() in packages/shared/src/chatCadence.ts (see the
+    // pointer note above); shorter once Lucy is already in the conversation.
+    var sinceLucy = state.agentLastSpokeAt ? (Date.now() - state.agentLastSpokeAt) : null;
+    var engaged = sinceLucy !== null && sinceLucy < 90000;
+    var noticeLo = engaged ? 1200 : 10000, noticeHi = engaged ? 4000 : 20000;
+    var noticeMs = Math.round(noticeLo + Math.random() * (noticeHi - noticeLo));
     var typingSince = 0;
-    var readTimer = setTimeout(showRead, readMs);
-    var typeTimer = setTimeout(function(){ hideRead(); showTyping(); typingSince = Date.now(); }, readMs + 900);
+    showSent();
+    var readTimer = setTimeout(function(){ hideSent(); showRead(); }, noticeMs);
+    var typeTimer = setTimeout(function(){ hideRead(); showTyping(); typingSince = Date.now(); }, noticeMs + readMs + 900);
     function finish(reply){
       clearTimeout(readTimer); clearTimeout(typeTimer);
       // Split into paragraph bubbles (blank-line separated). Each is sent on its
@@ -927,11 +937,11 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
             var readGap = Math.min(8000, Math.max(1900, part.length * 30));
             setTimeout(function(){ showTyping(); typingSince = Date.now(); step(); }, readGap);
           }
-          else { sending=false; sendBtn.disabled=false; input.focus(); }
+          else { state.agentLastSpokeAt = Date.now(); sending=false; sendBtn.disabled=false; input.focus(); }
         }, Math.max(0, typeMs - held));
       }
       // Never start revealing before the read beat has been felt.
-      setTimeout(step, Math.max(0, (startedAt + readMs + 900) - Date.now()));
+      setTimeout(step, Math.max(0, (startedAt + noticeMs + readMs + 900) - Date.now()));
     }
 
     // History = prior turns only; the current message rides in `message`.

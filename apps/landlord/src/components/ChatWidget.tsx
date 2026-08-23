@@ -12,7 +12,7 @@
  * Keep the two in sync when editing.
  */
 
-import { readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
+import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
 import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, X, ChevronDown } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
@@ -72,7 +72,9 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
   const [sending, setSending] = useState(false)
   // Human texting cadence: a 'read' receipt → 'typing' → the reply lands as
   // separate bubbles. Mirrors Lucy's marketing widget so every agent feels alike.
-  const [indicator, setIndicator] = useState<'none' | 'read' | 'typing'>('none')
+  const [indicator, setIndicator] = useState<'none' | 'sent' | 'read' | 'typing'>('none')
+  // When the agent last finished a reply — drives the engaged/idle notice delay.
+  const agentLastSpokeAt = useRef<number | null>(null)
   // Prefill (never auto-send) when opened from a "Start walkthrough"-style CTA;
   // the landlord reviews the suggested message and sends it themselves.
   useEffect(() => { if (initialInput) setInput(initialInput) }, [initialInput])
@@ -127,8 +129,17 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
     // the model works, then (3) the reply lands as SEPARATE bubbles (blank-line
     // split), each with its own typing beat + a read gap between them — paced
     // and typed, never dumped instantly.
-    const readMs = readBeatMs(text.length)
-    await sleep(readMs); setIndicator('read')
+    // S617 (Nic): nobody is sitting at the screen waiting. The message shows as
+    // SENT and goes unnoticed for a spell, THEN a "Seen" receipt lands, and only
+    // then does the reading start. "The instant seen and replying is the
+    // suspicious part." Shorter while the agent is already in the conversation —
+    // someone who just replied to you is plainly at their desk.
+    setIndicator('sent')
+    await sleep(noticeDelayMs(agentLastSpokeAt.current === null ? null : Date.now() - agentLastSpokeAt.current))
+    setIndicator('read')
+
+    // Now they are actually reading it — sized by how much there is to read.
+    await sleep(readBeatMs(text.length))
     await sleep(PAUSE_BEFORE_TYPING_MS); setIndicator('typing')
     let since = Date.now()
 
@@ -150,6 +161,7 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
       }
     }
     setIndicator('none')
+    agentLastSpokeAt.current = Date.now()
     setSending(false)
   }
 
@@ -173,6 +185,7 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <Bubble role="agent" text={GREETING} agent={agent} />
         {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} agent={agent} />)}
+        {indicator === 'sent' && <SentMarker />}
         {indicator === 'read' && <ReadMarker />}
         {indicator === 'typing' && <Working agent={agent} />}
       </div>
@@ -218,9 +231,14 @@ function Bubble({ role, text, agent }: { role: 'user' | 'agent'; text: string; a
   )
 }
 
-/** Right-aligned "Read" receipt shown under the user's message for one beat. */
+/** Right-aligned "Sent" tick, shown while the message is still unnoticed. */
+function SentMarker() {
+  return <div style={{ fontSize: 11, color: 'var(--text-3)', textAlign: 'right', margin: '-4px 4px 0 0' }}>Sent</div>
+}
+
+/** Right-aligned "Seen" receipt — the moment the agent actually looks at it. */
 function ReadMarker() {
-  return <div style={{ fontSize: 11, color: 'var(--text-2)', textAlign: 'right', margin: '-4px 4px 0 0' }}>Read</div>
+  return <div style={{ fontSize: 11, color: 'var(--text-2)', textAlign: 'right', margin: '-4px 4px 0 0' }}>Seen</div>
 }
 
 function Working({ agent }: { agent: string }) {

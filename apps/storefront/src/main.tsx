@@ -16,7 +16,7 @@
  * to /inquiry and land as landlord notifications + property_inquiries.
  */
 // S540: self-hosted fonts — no render-blocking external stylesheet
-import { readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
+import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS } from '@gam/shared'
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
 import '@fontsource/syne/800.css'
@@ -26,7 +26,7 @@ import '@fontsource/dm-sans/500.css'
 import '@fontsource/dm-sans/600.css'
 import '@fontsource/dm-mono/400.css'
 import '@fontsource/dm-mono/500.css'
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import axios from 'axios'
 
@@ -973,7 +973,9 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
   const [conversationId, setConversationId] = useState<string | undefined>()
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
-  const [indicator, setIndicator] = useState<'none' | 'read' | 'typing'>('none')
+  const [indicator, setIndicator] = useState<'none' | 'sent' | 'read' | 'typing'>('none')
+  // When the agent last finished a reply — drives the engaged/idle notice delay.
+  const agentLastSpokeAt = useRef<number | null>(null)
   const scrollRef = React.useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -1020,8 +1022,17 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
     })()
 
     // Read receipt → typing → the reply lands as separate, paced bubbles.
-    const readMs = readBeatMs(text.length)
-    await chatSleep(readMs); setIndicator('read')
+    // S617 (Nic): nobody is sitting at the screen waiting. The message shows as
+    // SENT and goes unnoticed for a spell, THEN a "Seen" receipt lands, and only
+    // then does the reading start. "The instant seen and replying is the
+    // suspicious part." Shorter while the agent is already in the conversation —
+    // someone who just replied to you is plainly at their desk.
+    setIndicator('sent')
+    await chatSleep(noticeDelayMs(agentLastSpokeAt.current === null ? null : Date.now() - agentLastSpokeAt.current))
+    setIndicator('read')
+
+    // Now they are actually reading it — sized by how much there is to read.
+    await chatSleep(readBeatMs(text.length))
     await chatSleep(PAUSE_BEFORE_TYPING_MS); setIndicator('typing')
     let since = Date.now()
 
@@ -1060,7 +1071,8 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
       <div className="pc-msgs" ref={scrollRef}>
         <ChatRow role="agent" text={GREETING} />
         {messages.map((m, i) => <ChatRow key={i} role={m.role} text={m.text} />)}
-        {indicator === 'read' && <div className="pc-read">Read</div>}
+        {indicator === 'sent' && <div className="pc-read">Sent</div>}
+        {indicator === 'read' && <div className="pc-read">Seen</div>}
         {indicator === 'typing' && (
           <div className="pc-row"><div className="pc-mav">S</div><div className="pc-typing"><i /><i /><i /></div></div>
         )}

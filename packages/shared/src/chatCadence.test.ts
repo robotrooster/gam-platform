@@ -5,7 +5,11 @@
  * 1,600-character message was paced identically to a 90-character one.
  */
 import { describe, it, expect } from 'vitest';
-import { readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS } from './chatCadence';
+import {
+  readBeatMs, typeBeatMs, readGapMs, PAUSE_BEFORE_TYPING_MS,
+  noticeDelayMs, NOTICE_MIN_MS, NOTICE_ENGAGED_MIN_MS, NOTICE_ENGAGED_MAX_MS,
+  ENGAGED_WINDOW_MS,
+} from './chatCadence';
 
 /** ~5 characters per word is the standard convention. */
 const impliedWpm = (chars: number, ms: number) => (chars / 5) / (ms / 60_000);
@@ -59,6 +63,42 @@ describe('chat cadence (S617)', () => {
     for (const n of [50, 150, 400, 1200]) {
       expect(readBeatMs(n)).toBeGreaterThan(oldRead(n));
       expect(typeBeatMs(n)).toBeGreaterThan(oldType(n));
+    }
+  });
+});
+
+describe('the pause before the message is noticed (S617)', () => {
+  const lo = () => 0, hi = () => 1, mid = () => 0.5;
+
+  it('a cold message sits unseen for ten to twenty seconds', () => {
+    expect(noticeDelayMs(null, lo)).toBe(10_000);
+    expect(noticeDelayMs(null, hi)).toBe(20_000);
+    expect(noticeDelayMs(null, mid)).toBe(15_000);
+  });
+
+  it('is noticed quickly when the agent is already in the conversation', () => {
+    // They replied 5 seconds ago — they are plainly at their desk.
+    const d = noticeDelayMs(5_000, mid);
+    expect(d).toBeGreaterThanOrEqual(NOTICE_ENGAGED_MIN_MS);
+    expect(d).toBeLessThanOrEqual(NOTICE_ENGAGED_MAX_MS);
+    expect(d).toBeLessThan(NOTICE_MIN_MS);
+  });
+
+  it('goes cold again once the conversation has been quiet', () => {
+    expect(noticeDelayMs(ENGAGED_WINDOW_MS - 1, lo)).toBe(NOTICE_ENGAGED_MIN_MS);
+    expect(noticeDelayMs(ENGAGED_WINDOW_MS, lo)).toBe(NOTICE_MIN_MS);
+    expect(noticeDelayMs(ENGAGED_WINDOW_MS + 60_000, lo)).toBe(NOTICE_MIN_MS);
+  });
+
+  it('varies, so the delay is never a recognisable constant', () => {
+    const seen = new Set(Array.from({ length: 200 }, () => noticeDelayMs(null)));
+    expect(seen.size).toBeGreaterThan(50);
+  });
+
+  it('never reports Seen instantly — the tell Nic named', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(noticeDelayMs(null)).toBeGreaterThanOrEqual(NOTICE_MIN_MS);
+      expect(noticeDelayMs(1_000)).toBeGreaterThanOrEqual(NOTICE_ENGAGED_MIN_MS);
     }
   });
 });

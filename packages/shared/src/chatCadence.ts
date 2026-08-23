@@ -57,3 +57,55 @@ export function typeBeatMs(len: number): number {
 export function readGapMs(len: number): number {
   return Math.min(8_000, Math.max(1_900, len * 30))
 }
+
+// ── The pause before the message is even NOTICED ──────────────────────────
+//
+// S617 (Nic): "I wanna have a delay in the actual having the message be seen...
+// Just randomly ten to twenty seconds somewhere in between there where it shows
+// as sent. And then after that initial time, I wanted to pop on with a
+// notification, oh, that message has been seen. From that time, I wanna start
+// the length of the read time and then generating the response. Because the
+// instant seen and replying is the suspicious part. Everybody knows that no
+// agents are just gonna be sitting there at the ready at the computer screen
+// waiting for somebody to message."
+//
+// So the full sequence is now: Sent → (nobody has looked yet) → Seen → (now
+// they are reading it, sized by length) → typing → the reply. The read beat
+// above was always meant to be the READING; it was doing double duty as the
+// noticing, which is why an instant "Seen" was the tell.
+//
+// ENGAGED vs IDLE. A person who has just replied to you IS at the screen — the
+// second message in a live back-and-forth does not sit unseen for fifteen
+// seconds, and pretending it does would be its own tell, on top of making every
+// exchange unusable. So the full delay applies when the agent has not been
+// heard from recently (the first message, or after the conversation has gone
+// quiet); once they are engaged, they notice quickly. ENGAGED_WINDOW_MS is how
+// long "recently" lasts.
+
+export const NOTICE_MIN_MS = 10_000
+export const NOTICE_MAX_MS = 20_000
+
+/** While the agent is already in the conversation, they see it almost at once. */
+export const NOTICE_ENGAGED_MIN_MS = 1_200
+export const NOTICE_ENGAGED_MAX_MS = 4_000
+
+/** How long after their last reply the agent still counts as at the screen. */
+export const ENGAGED_WINDOW_MS = 90_000
+
+/**
+ * Milliseconds before the "Seen" receipt appears.
+ *
+ * @param msSinceAgentLastSpoke  null when the agent has not replied yet.
+ * @param rand                   injectable for tests; defaults to Math.random.
+ */
+export function noticeDelayMs(
+  msSinceAgentLastSpoke: number | null,
+  rand: () => number = Math.random,
+): number {
+  const engaged =
+    msSinceAgentLastSpoke !== null && msSinceAgentLastSpoke < ENGAGED_WINDOW_MS
+  const [lo, hi] = engaged
+    ? [NOTICE_ENGAGED_MIN_MS, NOTICE_ENGAGED_MAX_MS]
+    : [NOTICE_MIN_MS, NOTICE_MAX_MS]
+  return Math.round(lo + rand() * (hi - lo))
+}
