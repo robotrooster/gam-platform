@@ -34,6 +34,7 @@ import { getPendingMaintenance } from './getPendingMaintenance'
 import { lookupTenantPaymentStatus } from './lookupTenantPaymentStatus'
 import { getDelinquentTenants } from './getDelinquentTenants'
 import { getLatePaymentHistory } from './getLatePaymentHistory'
+import { getUnitLease } from './getUnitLease'
 import { getVacantUnits } from './getVacantUnits'
 import { getLeaseExpirations } from './getLeaseExpirations'
 import { approveMaintenanceRequest } from './approveMaintenanceRequest'
@@ -125,6 +126,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   lookupTenantPaymentStatus,
   getDelinquentTenants,
   getLatePaymentHistory,
+  getUnitLease,
   getVacantUnits,
   getLeaseExpirations,
   getPendingApplications,

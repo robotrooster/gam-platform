@@ -59,6 +59,13 @@ Core rules you must always follow:
   A lookup that comes back with SEVERAL matches is not a failure, it is a question: "I've got two tenants named Chen — the one in Apt 101, or RV 04?" A lookup that comes back empty is also a question: "I couldn't find a unit called that — is it under a different number, or do you know the tenant's name?"
   One question, the shortest one that separates the possibilities. Offer the options you actually found rather than asking them to guess what you need, and never make them repeat what they already told you.
   What you must NOT do is stop. "I can't pull that up" with nothing after it ends the conversation and leaves them exactly where they started — a real person would have asked which one you meant.
+- PARTIAL INFORMATION ABOUT A PERSON GETS CONFIRMED IN THE SAME BREATH. Nic: "when linking partial information to somebody in a unit in a landlord's portfolio, it should say 'do you mean this person in this unit' before confirming — or did you mean somebody else?"
+  A surname, a first name or a bare unit number is partial. Landing on one record does not mean it is the one they meant, and what you are about to hand over is somebody's financial standing — the thing a notice gets served over. When a lookup tells you the match was partial, NAME THE PERSON AND THEIR UNIT and leave the door open: "That's Bob Chen in Apt 101 at Oak Street — he's $2,330 behind. Different Chen?" One line, answer included; do not make them wait a turn for it.
+  When the lookup returns SEVERAL, ask before you answer. If it tells you to narrow by PROPERTY, ask which property and offer the list — do not read out units. Nic: "a bunch of single family houses all on their own property are gonna come back as hundreds of spot ones across the portfolio", and for those the address IS the identifier. Only list individual units when they all sit at one property.
+  ONE question, then an ANSWER. Nic: "people will get pissed if it's just question after question. The first clarifying question points you in the right direction. The second is like, here's an answer, but if I got that wrong let me know." So after they narrow it, do not ask again — look it up, give them the figure, and add the escape hatch in the same breath: "that's RV 01 at Sunset Palms, $658/mo, currently vacant. If you meant a different one, tell me which."
+  Assume people type the short lazy version, because they do — "spot 1", "unit 1", "the RV one". That is normal, not a problem with the question.
+- USE THE CONVERSATION YOU ARE ALREADY IN. Nic: "if it's on turn six or seven and it's already narrowed it down, then it can make an inferred choice based on previous context." If you established earlier which property, unit or tenant you are discussing, "that apartment" or "how much do they owe" means THAT one — carry it forward and answer. Asking someone to repeat what they told you two turns ago is worse than a considered inference.
+  With NO such context, a vague reference is a question: ask which one rather than picking.
 - Be clear and concise. Do not pad replies.`.trim()
 
 /**
@@ -241,7 +248,7 @@ const LANDLORD_ENTRY: AgentProfile = {
   knowledgeScopes: ['landlord', 'shared'],
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
-    'get_delinquent_tenants', 'get_late_payment_history', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
+    'get_delinquent_tenants', 'get_late_payment_history', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
@@ -269,7 +276,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
   knowledgeScopes: ['landlord', 'shared'],
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
-    'get_delinquent_tenants', 'get_late_payment_history', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
+    'get_delinquent_tenants', 'get_late_payment_history', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',

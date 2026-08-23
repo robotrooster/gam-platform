@@ -224,3 +224,18 @@ describe('the customer-rep test (S617)', () => {
     expect(demandsAToolCall('how do late fees work')).toBe(true)   // per property, per state
   })
 })
+
+describe('assertsStoredFacts — an address is a stored fact (S617)', () => {
+  it('catches invented street addresses', () => {
+    // Real: asked to narrow "spot number one" to the RV resort, the agent
+    // offered "the one at 123 Main Street, and the one at 456 Oak Avenue".
+    // Neither exists in the portfolio and no lookup had run.
+    expect(assertsStoredFacts('the one at 123 Main Street, and the one at 456 Oak Avenue')).toBe(true)
+    expect(assertsStoredFacts('It is at 4820 Cedar Lane.')).toBe(true)
+  })
+
+  it('does not flag prose that merely contains a number and a word', () => {
+    expect(assertsStoredFacts('There are 3 ways to pay.')).toBe(false)
+    expect(assertsStoredFacts('I can help with that.')).toBe(false)
+  })
+})

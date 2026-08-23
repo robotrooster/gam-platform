@@ -256,6 +256,13 @@ export function assertsStoredFacts(text: string): boolean {
     // entirely invented. A rate or a ratio is a stored fact like any other.
     || /\d+\s*%/.test(text)
     || /\b\d+\s+out of\s+\d+\b/i.test(text)
+    // S617: a street address. Asked to narrow "spot number one" to the RV
+    // resort, the model answered "the one at 123 Main Street, and the one at
+    // 456 Oak Avenue" — with no lookup behind it and neither address existing
+    // anywhere in the portfolio. An address is as much a stored fact as a
+    // balance, and a landlord being told about a property they do not own is
+    // worse than being told nothing.
+    || /\b\d+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Trail|Highway|Hwy)\b/.test(text)
   )
 }
 
