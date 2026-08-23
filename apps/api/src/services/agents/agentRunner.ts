@@ -82,7 +82,13 @@ const NAME_ALLOWLIST = new Set([
 ])
 export function namesNotInToolResults(reply: string, toolResults: unknown[]): string[] {
   if (!/^\s*(?:[-•*]|\|)/m.test(reply)) return []           // not a record list
-  const haystack = JSON.stringify(toolResults).toLowerCase()
+  // Compare with spaces, underscores and case removed. A model writing a
+  // breakdown labels the fields in prose — "Total Units: 21", "Vacant Units:
+  // 15" — while the tool returns them as totalUnits / vacant_units. A literal
+  // match calls those labels invented properties and suppresses a perfectly
+  // good answer, which is exactly what happened to "whats my occupancy".
+  const flatten = (t: string) => t.toLowerCase().replace(/[\s_-]+/g, '')
+  const haystack = flatten(JSON.stringify(toolResults))
   const found = reply.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g) ?? []
   const bad: string[] = []
   for (const name of new Set(found)) {
@@ -91,7 +97,7 @@ export function namesNotInToolResults(reply: string, toolResults: unknown[]): st
     // October" — is a date, not a record name. This checked only the FIRST
     // word and flagged "Due October" as an invented property.
     if (/\b(January|February|March|April|May|June|July|August|September|October|November|December|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/.test(name)) continue
-    if (!haystack.includes(name.toLowerCase())) bad.push(name)
+    if (!haystack.includes(flatten(name))) bad.push(name)
   }
   return bad
 }

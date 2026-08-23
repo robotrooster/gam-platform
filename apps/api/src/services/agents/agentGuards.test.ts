@@ -89,3 +89,26 @@ describe('namesNotInToolResults — padding a real lookup with fake rows', () =>
     expect(namesNotInToolResults('• Apt 204 at Oak Street Apartments\n• Due October 4', results)).toEqual([])
   })
 })
+
+describe('namesNotInToolResults — field labels are not invented records (S617)', () => {
+  // Real false positive: the agent answered "whats my occupancy" correctly from
+  // get_landlord_portfolio and was suppressed, because it wrote the breakdown as
+  // "Total Units / Occupied Units / Vacant Units" while the tool returns
+  // totalUnits / occupiedUnits / vacantUnits.
+  const portfolio = [{ totalUnits: 21, occupiedUnits: 6, vacantUnits: 15 }]
+
+  it('matches a prose label against its camelCase key', () => {
+    expect(namesNotInToolResults(
+      '• Total Units: 21\n• Occupied Units: 6\n• Vacant Units: 15', portfolio)).toEqual([])
+  })
+
+  it('matches through snake_case too', () => {
+    expect(namesNotInToolResults('• Vacant Units: 15', [{ vacant_units: 15 }])).toEqual([])
+  })
+
+  it('still catches a genuinely invented property alongside real labels', () => {
+    const bad = namesNotInToolResults(
+      '• Total Units: 21\n• Maple Court: 4 units', portfolio)
+    expect(bad).toEqual(['Maple Court'])
+  })
+})

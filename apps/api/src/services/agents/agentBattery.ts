@@ -13,7 +13,18 @@
  *   DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts
  *
  * Not part of the vitest suite: it needs the live model and embeddings servers.
+ *
+ * The daily per-user turn budget is raised for the run. Left at its default of
+ * 60, running the battery a few times in one day exhausts the test tenant and
+ * the agent starts replying "I've hit my limit for our conversations today" —
+ * which then scores as a fabrication failure when it is nothing of the kind.
+ * Measuring the agent means not tripping a rate limit meant for real people.
  */
+// The landlord allowance derives from this one (landlordPerUnit defaults to
+// tenantDaily / 8), so raising it covers both audiences.
+process.env.AGENT_TENANT_DAILY_TURNS ||= '100000'
+process.env.AGENT_TENANT_DAILY_OFFTOPIC ||= '100000'
+process.env.AGENT_LANDLORD_DAILY_OFFTOPIC ||= '100000'
 import { runAgentSession } from './agentSession'
 import { query } from '../../db'
 
