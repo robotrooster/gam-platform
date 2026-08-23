@@ -85,9 +85,18 @@ export function readGapMs(len: number): number {
 export const NOTICE_MIN_MS = 10_000
 export const NOTICE_MAX_MS = 20_000
 
-/** While the agent is already in the conversation, they see it almost at once. */
-export const NOTICE_ENGAGED_MIN_MS = 1_200
-export const NOTICE_ENGAGED_MAX_MS = 4_000
+/**
+ * While the agent is already in the conversation.
+ *
+ * S617: started at 1.2-4s and Nic raised it to 3-7s — being in a conversation
+ * is not the same as staring at it. "They could have been on a different tab or
+ * whatever. Who knows?" Even someone right there has to come back to the
+ * window, and a sub-second-feeling receipt reads as a machine registering the
+ * message rather than a person glancing at it. Deliberately erring slow:
+ * "we can always speed it up later on."
+ */
+export const NOTICE_ENGAGED_MIN_MS = 3_000
+export const NOTICE_ENGAGED_MAX_MS = 7_000
 
 /** How long after their last reply the agent still counts as at the screen. */
 export const ENGAGED_WINDOW_MS = 90_000

@@ -905,7 +905,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     // pointer note above); shorter once Lucy is already in the conversation.
     var sinceLucy = state.agentLastSpokeAt ? (Date.now() - state.agentLastSpokeAt) : null;
     var engaged = sinceLucy !== null && sinceLucy < 90000;
-    var noticeLo = engaged ? 1200 : 10000, noticeHi = engaged ? 4000 : 20000;
+    var noticeLo = engaged ? 3000 : 10000, noticeHi = engaged ? 7000 : 20000;
     var noticeMs = Math.round(noticeLo + Math.random() * (noticeHi - noticeLo));
     var typingSince = 0;
     showSent();
