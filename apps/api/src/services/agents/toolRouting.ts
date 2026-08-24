@@ -343,8 +343,14 @@ const TENANT_ROUTES: PhraseRoute[] = [
     audience: 'tenant',
     means: 'the terms of their lease — rent, due day, dates, late fee, grace period',
     patterns: [
-      /\bmy rent\b/i,
-      /\bhow much is (the |my )?rent\b/i,
+      // S620: a QUALIFIER between "my" and "rent" broke the match — "what's my
+      // MONTHLY rent" routed nothing while "what's my rent" routed fine, and
+      // that one phrasing was the only failure in 79 tenant cases. It is the
+      // exact shape S618 built this table for: same question, one wording
+      // falls through, and the tenant gets "I don't want to give you a number
+      // I haven't actually checked" instead of $750.
+      /\bmy (monthly |current |base |total |actual )?rent\b/i,
+      /\bhow much is (the |my )?(monthly |current |base )?rent\b/i,
       /\bhow much do i pay (each|per) month\b/i,
       /\bwhen is (my )?rent due\b/i,
       /\bwhat day (is|does) rent\b/i,
@@ -599,7 +605,174 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
   },
 ]
 
-const ALL_ROUTES: PhraseRoute[] = [...TENANT_ROUTES, ...LANDLORD_ROUTES]
+/**
+ * S620 — the booking side and the front door.
+ *
+ * The phrase table shipped covering tenant and landlord, which is also exactly
+ * the two audiences the battery covered. Measured on the first run that
+ * included the other three: a site visitor asking "do you have anything open
+ * next weekend?" called NO tool on 4 of 4 phrasings and was suppressed to
+ * "I don't want to quote you a figure I haven't actually checked" — the
+ * anti-fabrication guard doing its job over a hole where the routing should
+ * have been. That is the booking front door answering a booking question with
+ * a non-answer.
+ *
+ * Same shape as above: no answers, no numbers, only which lookup runs. It
+ * matters more here than anywhere else, because every figure on a booking site
+ * is per-property and set by that landlord — the ONE thing this model must
+ * never produce from memory.
+ */
+const VISITOR_ROUTES: PhraseRoute[] = [
+  {
+    // DATES FIRST. "Can I book the 15th to the 20th" is an availability
+    // question, not a rate-card question, and check_availability is the only
+    // tool that prorates and adds tax. Above the rate routes deliberately:
+    // a wording with dates in it should never fall through to the rate card.
+    // TWO tools, and the order is the whole point. check_availability is the
+    // right answer and it REQUIRES checkIn/checkOut — which only the model can
+    // resolve, because "next weekend" is a date this table must never guess.
+    // So when the model declines to call it, the direct-execution path skips
+    // it (missing required args) and runs the rate card instead: the visitor
+    // gets real published rates and a request for their dates, rather than
+    // "I don't want to quote you a figure I haven't actually checked", which
+    // is what 4 of 4 availability phrasings produced before this.
+    //
+    // Rates without dates is an honest partial answer. Silence is not.
+    tools: ['check_availability', 'get_property_pricing'],
+    audience: 'visitor',
+    means: 'are these dates open, and what would they cost',
+    patterns: [
+      /\b(availab\w+|opening|open|free|vacan\w+|book\w*)\b[^?]{0,40}\b(next|this|on|for|from|in|the)\b[^?]{0,30}\b(weekend|week|month|night|day|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2})\b/i,
+      /\b(do|are) you (have|got|any)\b[^?]{0,40}\b(availab\w+|open|free|vacan\w+|room|space|site|spot)\b/i,
+      /\b(anything|any sites?|any spots?|any room)\b[^?]{0,25}\b(open|free|availab\w+|left)\b/i,
+      /\bcan i (book|reserve|stay|get)\b[^?]{0,40}\b(\d{1,2}(st|nd|rd|th)?|next|this)\b/i,
+      /\b(from|between)\b[^?]{0,15}\b\d{1,2}(st|nd|rd|th)?\b[^?]{0,15}\b(to|until|through|-)\b[^?]{0,15}\b\d{1,2}(st|nd|rd|th)?\b/i,
+      // A DATE RANGE on its own, with no "from" in front of it: "how much for
+      // the 15th to the 20th". Caught by its own test — that wording fell to
+      // the rate card, which cannot answer it. The rate card would have quoted
+      // a nightly figure for a question about five specific nights, with no
+      // proration and no tax.
+      /\b\d{1,2}(st|nd|rd|th)\b\s*(?:to|until|through|thru|-|–|—)\s*(?:the\s*)?\d{1,2}(st|nd|rd|th)?\b/i,
+      /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b\s*(?:to|until|through|thru|-|–|—)/i,
+      /\b(check[- ]?in|check[- ]?out|arriv\w+|depart\w+)\b[^?]{0,30}\b\d/i,
+    ],
+  },
+  {
+    // The rate card, for "how much" with no dates attached. S618 made this
+    // audience look everything up precisely so a nightly rate could never come
+    // out of the model's head; without a route, "look it up" had no target.
+    tools: ['get_property_pricing'],
+    audience: 'visitor',
+    means: "this property's published rates — nightly, weekly, monthly, deposit, tax",
+    patterns: [
+      /\bhow much\b/i,
+      /\b(rate|rates|pricing|price|prices|cost|costs|charge)\b/i,
+      /\b(per|a) (night|week|month)\b/i,
+      /\b(nightly|weekly|monthly|long[- ]?term|extended)\b/i,
+      /\b(deposit|tax|taxes|fee|fees)\b/i,
+      /\bwhat (do|does) (it|you|a site|a spot) (cost|run|charge)\b/i,
+      /\b(cheap|expensive|affordable)\b/i,
+      /\b(pull[- ]?through|back[- ]?in|\d{2} ?amp)\b/i,
+    ],
+  },
+  {
+    // "What is this place" — the agent is on ONE property's site and should
+    // never have to guess its name. The unresolved "[property name]" that
+    // reached a customer in the S620 battery came from exactly this gap.
+    tools: ['get_property_info'],
+    audience: 'visitor',
+    means: 'what this property is — name, where it is, what is on site',
+    patterns: [
+      /\b(what|where) (is|are) (this|that|the) (place|property|park|resort|site|spot|motel|address)\b/i,
+      /\btell me about\b[^?]{0,25}\b(this|the|your)\b/i,
+      /\bwhere (am i|are you|is it|are we)\b/i,
+      /\b(amenit\w+|pool|laundry|wifi|wi-?fi|clubhouse|hookups?|shower|bathroom|pet|dog|rules?)\b/i,
+      /\bwhat('?s| is) (there|here|on site|available)\b/i,
+    ],
+  },
+]
+
+/**
+ * S620 — the guest with a booking. Every one of these is a fact ON their
+ * booking, which is the definition of a lookup: two guests at the same
+ * property have different dates, different nights and different totals.
+ */
+const GUEST_ROUTES: PhraseRoute[] = [
+  {
+    // ABOVE the read route: a REQUEST is not a question about the booking, and
+    // "can I get a late checkout" answered from get_guest_booking is how the
+    // battery saw four confident replies that changed nothing.
+    tools: ['request_booking_change'],
+    audience: 'guest',
+    means: 'asking the host to change the stay — late checkout, early check-in, an extra night',
+    patterns: [
+      /\b(late|later)\b[^?]{0,20}\bcheck[- ]?out\b/i,
+      /\b(early|earlier)\b[^?]{0,20}\bcheck[- ]?in\b/i,
+      /\bcheck ?out (later|at \d)/i,
+      /\bcheck ?in (early|earlier|at \d)/i,
+      /\b(extra|another|one more|extend|add a)\b[^?]{0,20}\b(night|nights?|day|days?)\b/i,
+      /\b(stay|staying)\b[^?]{0,25}\b(longer|extra|another night|an extra)\b/i,
+      /\bcan i (get|have|request|ask for)\b[^?]{0,30}\b(late|early|extra|another)\b/i,
+    ],
+  },
+  {
+    tools: ['get_guest_booking'],
+    audience: 'guest',
+    means: "the facts on this guest's own stay — dates, nights, unit, total",
+    patterns: [
+      /\b(check[- ]?in|check[- ]?out|checkin|checkout)\b/i,
+      /\bmy (stay|booking|reservation|dates|trip)\b/i,
+      /\bhow (many|long)\b[^?]{0,25}\b(nights?|days?|stay\w*)\b/i,
+      /\bwhen (do|does|am|is)\b[^?]{0,25}\b(i|my)\b[^?]{0,20}\b(leave|arrive|check|stay|start|end)\b/i,
+      /\b(how much|what.{0,12}(total|owe|paid|charged|cost))\b/i,
+      /\b(what|which) (unit|site|spot|space|rv)\b/i,
+      /\bremind me\b/i,
+    ],
+  },
+  {
+    tools: ['get_guest_amenities'],
+    audience: 'guest',
+    means: 'what is on the property and whether it can be reserved',
+    patterns: [
+      /\b(amenit\w+|pool|laundry|clubhouse|gym|hot tub|fire ?pit|wifi|wi-?fi|shower|bathroom)\b/i,
+      /\bwhat('?s| is) there to do\b/i,
+      /\bcan i (book|reserve|use)\b[^?]{0,30}\b(the|a)\b/i,
+    ],
+  },
+]
+
+/**
+ * S620 — the prospect. Lucy holds NO data lookups, so almost nothing here is a
+ * lookup: her figures are GAM's own rate card, the one thing an agent may
+ * answer from the knowledge base (see demandsAToolCall's platform exemption).
+ *
+ * The exception is her actual job. Measured: asked "can I talk to someone?"
+ * and "I want to schedule a demo", the sales agent called NOTHING on 4 of 4
+ * and replied "Want me to grab you a time?" — an offer to book against no
+ * calendar, on the commercial front door. Booking a call IS a tool call.
+ */
+const PROSPECT_ROUTES: PhraseRoute[] = [
+  {
+    tools: ['get_available_call_times'],
+    audience: 'prospect',
+    means: 'they want to speak to a person — offer real times off the real calendar',
+    patterns: [
+      /\b(talk|speak|chat)\b[^?]{0,25}\b(to|with)\b[^?]{0,20}\b(someone|somebody|a (real )?person|a human|sales|the team|a strategist|rep)\b/i,
+      /\b(schedule|book|set ?up|arrange|grab|get)\b[^?]{0,25}\b(a )?(call|demo|meeting|time|appointment|walkthrough)\b/i,
+      /\b(demo|consultation)\b/i,
+      /\bcan we (talk|meet|call|chat)\b/i,
+      /\bwhen (can|could) (we|i)\b[^?]{0,20}\b(talk|meet|call|chat)\b/i,
+      /\bwhat times?\b[^?]{0,25}\b(availab\w+|open|work)\b/i,
+      /\bhow do i get started\b/i,
+      /\b(sign|signing) up\b/i,
+    ],
+  },
+]
+
+const ALL_ROUTES: PhraseRoute[] = [
+  ...TENANT_ROUTES, ...LANDLORD_ROUTES,
+  ...VISITOR_ROUTES, ...GUEST_ROUTES, ...PROSPECT_ROUTES,
+]
 
 /**
  * Which lookup does this message call for?

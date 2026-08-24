@@ -14,7 +14,7 @@
  * handoff signal runAgentWithTools surfaces.
  */
 
-import { scrubScopeLeaks } from './scopeGuard'
+import { scrubScopeLeaks, scrubOffAudienceTopics } from './scopeGuard'
 import { RetryableEndpointError } from './endpointPool'
 import { needsARealPerson, stripPromiseOfAPerson, mentionsLegalAction, LEGAL_CONTACT_LINE } from './escalationPolicy'
 import { runAgentWithTools, type ToolInvocation, type RunWithToolsResult } from './agentRunner'
@@ -181,6 +181,17 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
       if (mentionsLegalAction(input.message) && result.reply
           && !result.reply.includes('support@goldassetmanagement.com')) {
         result = { ...result, reply: `${result.reply.trim()}\n\n${LEGAL_CONTACT_LINE}` }
+      }
+      // S620: another audience's product, removed before the general scrub.
+      // A booking-site visitor was walked through resetting a GAM password —
+      // fluent, confident, and about an account they do not have. None of the
+      // fact guards catch it because it asserts no figure or date. Only the
+      // two no-account audiences are touched; see scopeGuard.ts.
+      const offAudience = scrubOffAudienceTopics(result.reply, audience)
+      if (offAudience.removed.length) {
+        logger.warn({ profile: finalProfileId, audience, removed: offAudience.removed },
+          '[agent] another audience\'s topic removed from reply')
+        result = { ...result, reply: offAudience.reply }
       }
       const scrubbed = scrubScopeLeaks(result.reply)
       // ALWAYS take the scrubbed text, not only when a leak sentence was cut.

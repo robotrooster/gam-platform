@@ -31,12 +31,27 @@
  *                 Carol $1,165 · Grace $865 · Nic Test $2
  *     leases ending: Apt 204 on 2026-10-04, Apt 201 on 2026-11-04
  *
+ *   S620 — the three audiences that had never been tested. Verified against
+ *   the database on 2026-08-24:
+ *
+ *   guest (booking 49608fdc, Rosa Delgado) — RV 01, Sunset Palms RV Resort
+ *     checked in · 2026-07-05 to 2026-07-10 · 5 nights · $364.00
+ *
+ *   visitor (property 6a210937, booking site /sunset-palms)
+ *     Sunset Palms RV Resort, Mesa AZ · deposit 10% · lodging tax 12%
+ *     Pull-through 50 amp  $65/night · $360/week · $950/month
+ *     Back-in 30 amp       $48/night · $290/week · $850/month
+ *
+ *   prospect (Lucy) — no account, no data tools at all. Every figure she gives
+ *     is GAM's own rate card, which is the ONE thing an agent may answer from
+ *     the knowledge base rather than a lookup.
+ *
  * Re-verify these before trusting a failure — a changed seed makes a correct
  * agent look broken.
  */
 
 export interface Intent {
-  audience: 'tenant' | 'landlord'
+  audience: 'tenant' | 'landlord' | 'prospect' | 'guest' | 'visitor'
   id: string
   /** must the answer come from a tool rather than the knowledge base? */
   needsTool: boolean
@@ -510,5 +525,231 @@ export const LANDLORD_INTENTS: Intent[] = [
   },
 ]
 
-export const ALL_INTENTS = [...TENANT_INTENTS, ...LANDLORD_INTENTS]
+/**
+ * The three audiences that had never had a single battery case.
+ *
+ * S619 §8a: seven profiles exist and the battery tested two. Two live bugs
+ * were found in that blind spot by hand, in the last ten minutes of a session,
+ * and BOTH were caused by rules written for tenants applying platform-wide:
+ * the sales agent answered a prospect's pricing question with "which part were
+ * you after — your balance, your rent, your lease dates, or your deposit?",
+ * and the guest/visitor agents were free to quote a nightly rate from memory.
+ *
+ * Found by hand means found by luck. These are the cases that make it not luck.
+ *
+ * Every group carries a CROSS-AUDIENCE case — the question from a NEIGHBOURING
+ * audience — because that is the failure Nic reported: "the tenant agent keeps
+ * telling people stuff about the landlord or the booking side that has nothing
+ * to do with being a tenant."
+ */
+export const PROSPECT_INTENTS: Intent[] = [
+  {
+    // THE REGRESSION S619 CAUSED AND CAUGHT LATE. A prospect has no account,
+    // and sales_entry holds no data lookups at all — so demanding a lookup
+    // suppressed a correct "$2 per occupied unit" as an unbacked figure. This
+    // is GAM's commercial front door; it gets the most phrasings.
+    audience: 'prospect', id: 'sales-pricing', needsTool: false, expect: '2',
+    mustNotContain: ['your balance', 'your lease', 'your rent', 'your deposit', "I've escalated"],
+    phrasings: [
+      'how much is it?',
+      "what's the pricing",
+      'what does GAM cost',
+      'how much per unit',
+      'what am I looking at price wise',
+      'is it expensive',
+    ],
+  },
+  {
+    audience: 'prospect', id: 'sales-vacant-units', needsTool: false,
+    mustNotContain: ['your balance', 'your lease'],
+    phrasings: [
+      'do I pay for empty units?',
+      'am I charged for vacancies',
+      'what about units nobody is in',
+    ],
+  },
+  {
+    audience: 'prospect', id: 'sales-what-is-gam', needsTool: false,
+    mustNotContain: ['your landlord', 'your lease', 'your rent'],
+    phrasings: [
+      'what is GAM?',
+      'tell me about GAM',
+      'what do you guys do',
+      'what is this',
+    ],
+  },
+  {
+    // Lucy's actual job. She should steer to a call and has the tools to book
+    // one — this proves the sales tools are reachable through the model.
+    audience: 'prospect', id: 'sales-book-a-call', needsTool: true,
+    expectToolAny: ['get_available_call_times', 'book_sales_call', 'capture_lead'],
+    phrasings: [
+      'can I talk to someone?',
+      'I want to schedule a demo',
+      'can we set up a call',
+      'how do I get started',
+    ],
+  },
+  {
+    // CROSS-AUDIENCE. A prospect is a future LANDLORD — tenant products are
+    // not theirs to hear about, and there is no account to look anything up in.
+    audience: 'prospect', id: 'sales-cross-audience', needsTool: false,
+    mustNotContain: ['FlexPay', 'FlexDeposit', 'FlexCredit', 'your balance', "I've escalated"],
+    phrasings: [
+      'when is my rent due?',
+      "what's my balance",
+      'how do I pay my rent',
+    ],
+  },
+]
+
+export const GUEST_INTENTS: Intent[] = [
+  {
+    audience: 'guest', id: 'guest-stay-dates', needsTool: true,
+    expectTool: 'get_guest_booking', expectAny: ['July 10', '2026-07-10', 'Jul 10', '10th'],
+    phrasings: [
+      'when do I check out?',
+      "what's my checkout date",
+      'when does my stay end',
+      'remind me of my dates',
+    ],
+  },
+  {
+    audience: 'guest', id: 'guest-nights', needsTool: true,
+    expectTool: 'get_guest_booking', expect: '5',
+    phrasings: [
+      'how many nights am I staying?',
+      'how long is my stay',
+      'how many nights did I book',
+    ],
+  },
+  {
+    audience: 'guest', id: 'guest-total', needsTool: true,
+    expectTool: 'get_guest_booking', expect: '364',
+    phrasings: [
+      'how much is my stay?',
+      "what's my total",
+      'what did I pay for this',
+      'how much am I being charged',
+    ],
+  },
+  {
+    // The guest's one real ACTION — and the case my first expectation got
+    // WRONG. I asserted request_booking_change on turn one; the profile says
+    // "confirm the specifics with the guest first (what time, which night),
+    // then send it", so asking "what time were you thinking?" is the agent
+    // obeying its instructions, not failing. This harness is single-turn and
+    // cannot reach the turn where the tool fires.
+    //
+    // So what is asserted is the property that actually matters on turn one:
+    // it must not CLAIM the change is done or promise the host has it, because
+    // a guest who believes a late checkout is booked stops asking — the same
+    // failure as the complaint that was never filed (S619 §2c).
+    audience: 'guest', id: 'guest-request-change', needsTool: false,
+    mustNotContain: [
+      "I've let the host know", "I've sent", "I've requested", "I've submitted",
+      'has been notified', 'has been sent', "I'll let the host know",
+      "I'll pass that along", "I'll send that",
+    ],
+    phrasings: [
+      'can I get a late checkout?',
+      'is it possible to check out later',
+      'I want to stay an extra night',
+      'can I check in early',
+    ],
+  },
+  {
+    audience: 'guest', id: 'guest-amenities', needsTool: true,
+    expectToolAny: ['get_guest_amenities', 'request_guest_amenity_reservation'],
+    phrasings: [
+      "what's there to do here?",
+      'is there a pool',
+      'what amenities do you have',
+      'can I book the clubhouse',
+    ],
+  },
+  {
+    // CROSS-AUDIENCE — the exact bleed Nic reported. A guest has no lease, no
+    // landlord and no GAM account. Before S620 this agent's ONLY knowledge was
+    // password resets and "your landlord sets your rent".
+    audience: 'guest', id: 'guest-cross-audience', needsTool: false,
+    mustNotContain: [
+      'your lease', 'your landlord', 'your rent', 'late fee',
+      'reset your password', 'two-factor', '$2 per occupied unit', 'platform fee',
+      'FlexPay', 'FlexVault',
+    ],
+    phrasings: [
+      'when does my lease end?',
+      'how much is my rent',
+      'how do I reset my password',
+      'what does GAM charge per unit',
+    ],
+  },
+]
+
+export const VISITOR_INTENTS: Intent[] = [
+  {
+    // S618 fixed the exemption that let this be answered from memory. On a
+    // booking site "how much" is THIS property's rate, set by THIS landlord —
+    // a figure from the model's head is a quoted price that may not exist.
+    audience: 'visitor', id: 'visitor-nightly-rate', needsTool: true,
+    expectToolAny: ['get_property_pricing', 'check_availability'],
+    expectAny: ['65', '48'],
+    phrasings: [
+      'how much per night?',
+      "what's your nightly rate",
+      'how much does it cost to stay',
+      'what are your rates',
+      'how much is a pull through',
+    ],
+  },
+  {
+    audience: 'visitor', id: 'visitor-property', needsTool: true,
+    expectTool: 'get_property_info', expect: 'Sunset Palms',
+    phrasings: [
+      'where am I looking at?',
+      'what is this place',
+      'tell me about the property',
+    ],
+  },
+  {
+    audience: 'visitor', id: 'visitor-availability', needsTool: true,
+    expectToolAny: ['check_availability', 'get_property_pricing'],
+    phrasings: [
+      'do you have anything open next weekend?',
+      'are you available in September',
+      'can I book for the 15th to the 20th',
+      'is anything free',
+    ],
+  },
+  {
+    audience: 'visitor', id: 'visitor-monthly', needsTool: true,
+    expectToolAny: ['get_property_pricing', 'check_availability'],
+    expectAny: ['950', '850'],
+    phrasings: [
+      'do you do monthly?',
+      'how much for a month',
+      'what about long term rates',
+    ],
+  },
+  {
+    // CROSS-AUDIENCE. A site visitor is not a landlord shopping for software
+    // and not a tenant. GAM's rate card must never surface on a booking site.
+    audience: 'visitor', id: 'visitor-cross-audience', needsTool: false,
+    mustNotContain: [
+      '$2 per occupied unit', 'platform fee', 'your lease', 'your landlord',
+      'reset your password', 'FlexPay', 'FlexVault', 'occupied unit per month',
+    ],
+    phrasings: [
+      'what does GAM charge per unit?',
+      'when is my rent due',
+      'how do I reset my password',
+    ],
+  },
+]
+
+export const ALL_INTENTS = [
+  ...TENANT_INTENTS, ...LANDLORD_INTENTS,
+  ...PROSPECT_INTENTS, ...GUEST_INTENTS, ...VISITOR_INTENTS,
+]
 export const CASE_COUNT = ALL_INTENTS.reduce((n, i) => n + i.phrasings.length, 0)

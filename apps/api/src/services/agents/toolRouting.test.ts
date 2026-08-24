@@ -33,6 +33,15 @@ const LANDLORD_TOOLS = [
 const tenant = (m: string) => routeToTool(m, 'tenant', TENANT_TOOLS)
 const landlord = (m: string) => routeToTool(m, 'landlord', LANDLORD_TOOLS)
 
+const VISITOR_TOOLS = [
+  'get_property_info', 'get_property_pricing', 'check_availability', 'create_booking_checkout',
+]
+const GUEST_TOOLS = [
+  'get_guest_booking', 'request_booking_change', 'get_guest_amenities',
+  'request_guest_amenity_reservation',
+]
+const PROSPECT_TOOLS = ['capture_lead', 'get_available_call_times', 'book_sales_call']
+
 describe('tenant phrasings', () => {
   // Nic's example: the word "pet" means go read the fee rows on THIS lease.
   it('sends anything pet-shaped to the lease fees, not the security deposit', () => {
@@ -114,6 +123,22 @@ describe('tenant phrasings', () => {
 // Nic: "just because I say when is my lease over, or say something less
 // specific, like — is my landlord gonna renew? that's gonna say okay, they
 // should infer renewing the lease on expiration, pull up the lease."
+describe('a qualifier between "my" and the noun', () => {
+  it('routes "my MONTHLY rent" the same as "my rent"', () => {
+    // S620: the only failure in 79 tenant phrasings. `\bmy rent\b` cannot see
+    // past a word in the middle, so this one wording fell through to "I don't
+    // want to give you a number I haven't actually checked."
+    for (const q of [
+      "what's my monthly rent",
+      'my monthly rent',
+      'what is my current rent',
+      'how much is the monthly rent',
+    ]) {
+      expect(routeToTool(q, 'tenant', TENANT_TOOLS), q).toBe('get_my_lease')
+    }
+  })
+})
+
 describe('inferring what a vague question actually needs', () => {
   const both = (m: string) => routeToTools(m, 'tenant', TENANT_TOOLS)
 
@@ -290,8 +315,15 @@ describe('the safety properties', () => {
   it('never crosses the audience line', () => {
     // A tenant phrasing must not reach a landlord tool even when it matches
     // landlord-ish words, and vice versa — this is the product siloing.
+    // S620: five audiences now, not two. Declared here rather than as a
+    // ternary so a new audience cannot quietly fall into the landlord pool.
+    const POOLS: Record<string, string[]> = {
+      tenant: TENANT_TOOLS, landlord: LANDLORD_TOOLS,
+      visitor: VISITOR_TOOLS, guest: GUEST_TOOLS, prospect: PROSPECT_TOOLS,
+    }
     for (const r of ROUTES_FOR_TEST) {
-      const pool = r.audience === 'tenant' ? TENANT_TOOLS : LANDLORD_TOOLS
+      const pool = POOLS[r.audience]
+      expect(pool, `no tool pool declared for audience '${r.audience}'`).toBeDefined()
       for (const t of r.tools) expect(pool, `${t} missing from its own audience pool`).toContain(t)
     }
     expect(routeToTool('how many units do I have vacant?', 'tenant', TENANT_TOOLS)).toBeUndefined()
@@ -413,5 +445,136 @@ describe('pronouns that name the person we are already scoped to', () => {
     expect(tenant('what is my balance')).toBe('get_my_balance_breakdown')
     expect(tenant('when does my lease end?')).toBe('get_my_lease')
     expect(tenant('how much is my pet deposit?')).toBe('get_my_lease_fees')
+  })
+})
+
+// ── S620: the booking side and the front door ────────────────────────────
+// The table shipped covering tenant and landlord — the same two audiences the
+// battery covered. On the first run that included the others, a site visitor
+// asking "do you have anything open next weekend?" called no tool on 4 of 4
+// phrasings and was suppressed to "I don't want to quote you a figure I
+// haven't actually checked." The guard was right; the routing was missing.
+
+describe('booking-site visitor phrasings', () => {
+  it('routes availability questions to the availability check', () => {
+    for (const q of [
+      'do you have anything open next weekend?',
+      'are you available in September',
+      'can I book for the 15th to the 20th',
+      'is anything free',
+      'do you have any sites open',
+    ]) {
+      expect(routeToTool(q, 'visitor', VISITOR_TOOLS), q).toBe('check_availability')
+    }
+  })
+
+  it('routes a bare price question to the live rate card', () => {
+    for (const q of [
+      'how much per night?',
+      "what's your nightly rate",
+      'what are your rates',
+      'how much is a pull through',
+      'do you do monthly?',
+      'what about long term rates',
+    ]) {
+      expect(routeToTool(q, 'visitor', VISITOR_TOOLS), q).toBe('get_property_pricing')
+    }
+  })
+
+  it('DATES BEAT THE RATE CARD — a question with dates in it is an availability question', () => {
+    // Ordering, the class of bug this file exists for. check_availability is
+    // the only tool that prorates and adds tax; the rate card cannot answer
+    // "the 15th to the 20th" and would quote a nightly figure instead.
+    expect(routeToTool('how much for the 15th to the 20th', 'visitor', VISITOR_TOOLS))
+      .toBe('check_availability')
+  })
+
+  it('routes "what is this place" to the property, not the rate card', () => {
+    for (const q of ['what is this place', 'tell me about the property', 'where am I looking at?']) {
+      expect(routeToTool(q, 'visitor', VISITOR_TOOLS), q).toBe('get_property_info')
+    }
+  })
+})
+
+describe('booking guest phrasings', () => {
+  it('routes a CHANGE REQUEST to the request tool, not to reading the booking', () => {
+    // A request answered from get_guest_booking is a confident reply that
+    // changes nothing — measured 4/4 before this route existed.
+    for (const q of [
+      'can I get a late checkout?',
+      'is it possible to check out later',
+      'I want to stay an extra night',
+      'can I check in early',
+    ]) {
+      expect(routeToTool(q, 'guest', GUEST_TOOLS), q).toBe('request_booking_change')
+    }
+  })
+
+  it('routes questions about the stay to the booking', () => {
+    for (const q of [
+      'when do I check out?',
+      'how many nights am I staying?',
+      "what's my total",
+      'remind me of my dates',
+      'what unit am I in',
+    ]) {
+      expect(routeToTool(q, 'guest', GUEST_TOOLS), q).toBe('get_guest_booking')
+    }
+  })
+
+  it('routes amenities to the amenity list', () => {
+    for (const q of ["what's there to do here?", 'is there a pool', 'what amenities do you have']) {
+      expect(routeToTool(q, 'guest', GUEST_TOOLS), q).toBe('get_guest_amenities')
+    }
+  })
+})
+
+describe('prospect phrasings', () => {
+  it('routes asking for a person to the real calendar', () => {
+    // Lucy's whole job. Measured 0/4 before this: "Want me to grab you a
+    // time?" against a calendar she never opened.
+    for (const q of [
+      'can I talk to someone?',
+      'I want to schedule a demo',
+      'can we set up a call',
+      'how do I get started',
+      'can I speak with a real person',
+    ]) {
+      expect(routeToTool(q, 'prospect', PROSPECT_TOOLS), q).toBe('get_available_call_times')
+    }
+  })
+
+  it('routes NOTHING for a pricing question — that one is answered from knowledge', () => {
+    // The S619 regression in reverse. A prospect has no account, so demanding
+    // a lookup for "how much is it" suppressed a correct "$2 per occupied
+    // unit" and asked them which of their balance/rent/lease/deposit they
+    // meant. Routing nothing is what keeps that answer allowed.
+    for (const q of ['how much is it?', "what's the pricing", 'what does GAM cost', 'is it expensive']) {
+      expect(routeToTools(q, 'prospect', PROSPECT_TOOLS), q).toEqual([])
+    }
+  })
+})
+
+describe('the wall holds in the routing table too', () => {
+  it('no route names a tool from another audience', () => {
+    const byAudience: Record<string, string[]> = {
+      visitor: VISITOR_TOOLS, guest: GUEST_TOOLS, prospect: PROSPECT_TOOLS,
+    }
+    const crossed: string[] = []
+    for (const route of ROUTES_FOR_TEST) {
+      const allowed = byAudience[route.audience]
+      if (!allowed) continue // tenant/landlord are covered above
+      for (const t of route.tools) {
+        if (!allowed.includes(t)) crossed.push(`${route.audience} route -> ${t}`)
+      }
+    }
+    expect(crossed).toEqual([])
+  })
+
+  it('a guest wording never routes on the visitor audience and vice versa', () => {
+    // Same words, different worlds: "how much" is this guest's total on one
+    // side and the property's rate card on the other. The audience decides.
+    expect(routeToTool('can I get a late checkout?', 'visitor', VISITOR_TOOLS)).toBeUndefined()
+    expect(routeToTool('when do I check out?', 'prospect', PROSPECT_TOOLS)).toBeUndefined()
   })
 })

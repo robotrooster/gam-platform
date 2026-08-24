@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery, stripCitationMarkers } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery, stripCitationMarkers, scrubOffAudienceTopics } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -241,5 +241,58 @@ describe('scrubScopeLeaks — a reply that is only machinery', () => {
   it('does not fire on an empty reply (nothing was there to lose)', () => {
     const res = scrubScopeLeaks('')
     expect(res.removed).toHaveLength(0)
+  })
+})
+
+// ── S620: another audience's product ─────────────────────────────────────
+// Separating the knowledge bases fixed what an agent RETRIEVES; it cannot fix
+// what the model already knows. A visitor on a public booking site was walked
+// through resetting a GAM password — no figure, no date, no list, so none of
+// the fact guards saw it.
+describe('scrubOffAudienceTopics', () => {
+  it('removes password mechanics from a booking-site reply', () => {
+    const r = scrubOffAudienceTopics(
+      "I'm Skye, the booking assistant here. To reset your password, go to the login page and click Forgot Password.",
+      'visitor')
+    expect(r.removed).toContain('password-mechanics')
+    expect(r.reply).not.toMatch(/password/i)
+    expect(r.reply).toContain('Skye')
+  })
+
+  it('substitutes a line when the stray topic WAS the whole reply', () => {
+    const r = scrubOffAudienceTopics('To reset your password, visit the sign-in page.', 'guest')
+    expect(r.reply).toMatch(/here for your stay/i)
+    expect(r.reply).not.toMatch(/password/i)
+  })
+
+  it("removes GAM's landlord rate card from a booking site", () => {
+    const r = scrubOffAudienceTopics(
+      'Our platform fee is $2 per occupied unit per month.', 'visitor')
+    expect(r.removed).toContain('platform-fee')
+    expect(r.reply).not.toMatch(/\$2/)
+  })
+
+  it('removes tenancy talk from a guest reply', () => {
+    const r = scrubOffAudienceTopics(
+      "Your stay runs through the 10th. Your rent is due on the 1st and there's a late fee after that.",
+      'guest')
+    expect(r.reply).toContain('10th')
+    expect(r.reply).not.toMatch(/late fee/i)
+  })
+
+  it('leaves a legitimate guest reply completely alone', () => {
+    const ok = "You're in RV 01 through July 10th — 5 nights, $364 total. Want me to ask about a late checkout?"
+    expect(scrubOffAudienceTopics(ok, 'guest')).toEqual({ reply: ok, removed: [] })
+  })
+
+  it('does NOT touch tenant or landlord replies — those topics are theirs', () => {
+    // A tenant discussing their lease and a landlord discussing the platform
+    // fee are doing exactly their job. This guard is only for the two
+    // audiences with no account at all.
+    const tenantReply = 'Your rent is due on the 1st, and your lease runs to January.'
+    expect(scrubOffAudienceTopics(tenantReply, 'tenant').removed).toEqual([])
+    const landlordReply = 'The platform fee is $2 per occupied unit per month.'
+    expect(scrubOffAudienceTopics(landlordReply, 'landlord').removed).toEqual([])
+    expect(scrubOffAudienceTopics(tenantReply, undefined).removed).toEqual([])
   })
 })

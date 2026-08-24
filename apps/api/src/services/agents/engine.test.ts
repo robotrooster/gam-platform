@@ -17,7 +17,7 @@ const PROFILE: AgentProfile = {
   agentType: 'customer_service',
   audience: 'tenant',
   tier: 'entry',
-  knowledgeScopes: ['tenant', 'shared'],
+  knowledgeScopes: ['tenant'],
   name: 'TestBot',
   label: 'Test Profile',
   systemPrompt: 'You are a test agent.',

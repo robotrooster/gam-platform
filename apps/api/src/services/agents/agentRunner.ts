@@ -306,7 +306,21 @@ export function demandsAToolCall(message: string, audience?: string): boolean {
   // your rent, your lease dates, or your deposit?" to someone who has none of
   // those. The commercial front door, answering a pricing question with
   // nonsense.
-  if (audience === 'prospect') return false
+  //
+  // S620: but "no data lookups" is not "no tools", and a blanket exemption
+  // measured 0/4 on the one thing Lucy is actually for. Asked "can I talk to
+  // someone?" and "I want to schedule a demo" she called nothing on every
+  // phrasing and replied "Want me to grab you a time?" — an offer to book
+  // against a calendar she never opened. Two of those four then had the
+  // promise stripped out by finalize, leaving a prospect who asked for a call
+  // holding nothing at all.
+  //
+  // So a prospect is exempt from LOOKUPS and not from ACTIONS. The phrase
+  // table is the arbiter, which keeps the two in one place: if it routes this
+  // wording to a tool (today, only scheduling), that tool is required; if it
+  // routes nothing, the question is a platform constant and the knowledge base
+  // answers it, exactly as above.
+  if (audience === 'prospect') return routePlan(message, 'prospect').tools.length > 0
 
   // S618: for a GUEST or a site VISITOR, "how much does it cost" is not GAM's
   // rate card — it is the nightly price of the spot they are looking at, which
@@ -348,7 +362,13 @@ export function assertsStoredFacts(text: string): boolean {
     // S617: also catches a BARE tool name in brackets. The model wrote
     // "I'll get that now. [get_my_lease]" — no dot, so the dotted form below
     // missed it and a tool token went to the customer as prose.
-    /\[[a-z][a-z0-9_]*(?:\.[A-Za-z_]+)?\]|\{\{[^}]+\}\}/.test(text)  // unresolved placeholder
+    // S620: also catches a placeholder written as WORDS with spaces. A site
+    // visitor was sent "I'm Skye, the booking assistant for [property name]."
+    // — the tool that knows the name was never called, and the bracket form
+    // below required a single lowercase token, so "property name" slipped
+    // through and a template hole reached a customer. Two-to-four lowercase
+    // words in brackets is a placeholder, never prose.
+    /\[[a-z][a-z0-9_]*(?:\.[A-Za-z_]+)?\]|\{\{[^}]+\}\}|\[[a-z]+(?: [a-z]+){1,3}\]/.test(text)  // unresolved placeholder
     // S617: a tool call WRITTEN OUT as text. Asked "what is the late fee", the
     // agent replied "I'll look up your lease..." and then printed
     // <call name="get_my_lease"></call> into the chat. It had not called

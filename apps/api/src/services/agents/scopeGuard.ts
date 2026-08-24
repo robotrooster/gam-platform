@@ -209,6 +209,76 @@ export interface ScrubResult {
   removed: string[]
 }
 
+/**
+ * Topics that belong to ANOTHER audience entirely — the booking-side leak.
+ *
+ * S620 (Nic): "the tenant agent keeps telling people stuff about the landlord
+ * or the booking side that has nothing to do with being a tenant."
+ *
+ * Separating the knowledge bases fixed what the agent RETRIEVES. It cannot fix
+ * what the model already knows. Measured on the first visitor battery, on a
+ * public booking site, in one reply:
+ *
+ *   "I'm Skye, the booking assistant for [property name]. I can help you with
+ *    questions about this property and booking a stay. To reset your password,
+ *    you'll need to go to the login page and click on..."
+ *
+ * There is no password on a booking site. The visitor has no account, no lease
+ * and no landlord — and none of the fact guards caught it, because it asserts
+ * no figure, no date and no list. It is confident, fluent, and about somebody
+ * else's product.
+ *
+ * ONLY the two no-account audiences. A tenant discussing their lease and a
+ * landlord discussing their platform fee are doing their jobs; a guest or a
+ * site visitor has no business with either. Each pattern needs the EXPLANATORY
+ * shape, not a bare keyword, so "your stay ends on the 10th" survives.
+ */
+const OFF_AUDIENCE_PATTERNS: { name: string; re: RegExp }[] = [
+  // Account mechanics for people who have no account.
+  { name: 'password-mechanics', re: /[^.!?]*\b(reset|resetting|change|changing|forgot|recover)\b[^.!?]{0,40}\bpassword\b[^.!?]*[.!?]*/i },
+  { name: 'two-factor', re: /[^.!?]*\b(two[- ]factor|2fa|authenticator app|recovery codes?)\b[^.!?]*[.!?]*/i },
+  { name: 'sign-in-portal', re: /[^.!?]*\b(sign|log)\s?in\b[^.!?]{0,40}\b(portal|account|dashboard)\b[^.!?]*[.!?]*/i },
+  // Tenancy mechanics. A guest has a booking, not a tenancy.
+  { name: 'lease-mechanics', re: /[^.!?]*\byour lease\b[^.!?]*[.!?]*/i },
+  { name: 'rent-mechanics', re: /[^.!?]*\b(your rent|rent is due|rent due date|late fee|grace period)\b[^.!?]*[.!?]*/i },
+  { name: 'landlord-relationship', re: /[^.!?]*\byour landlord\b[^.!?]*[.!?]*/i },
+  // GAM's rate card is what GAM charges a LANDLORD for software. Quoting it to
+  // someone booking a campsite is answering a different company's question.
+  { name: 'platform-fee', re: /[^.!?]*\b(platform fee|per occupied unit|\$2 per unit)\b[^.!?]*[.!?]*/i },
+]
+
+/** What a booking-side agent says instead. Warm, and honest that it is not
+ *  ducking the question — it genuinely is not their department. */
+const OFF_AUDIENCE_FALLBACK: Record<string, string> = {
+  guest: "That one's not mine to answer, I'm afraid — I'm just here for your stay. Your host can point you the right way.",
+  visitor: "That's not something I'd know — I only handle this property and booking a stay here. Anything about the place itself, though, ask away.",
+}
+
+/**
+ * Remove sentences belonging to another audience's product. No-op for every
+ * audience except 'guest' and 'visitor', and a no-op for them too unless the
+ * reply actually strayed.
+ */
+export function scrubOffAudienceTopics(
+  reply: string,
+  audience?: string
+): ScrubResult {
+  if (!reply || (audience !== 'guest' && audience !== 'visitor')) return { reply, removed: [] }
+  const removed: string[] = []
+  const kept = sentences(reply).filter((sentence) => {
+    const hit = OFF_AUDIENCE_PATTERNS.find((p) => p.re.test(sentence))
+    if (hit) { removed.push(hit.name); return false }
+    return true
+  })
+  if (!removed.length) return { reply, removed: [] }
+
+  const out = kept.join('').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+  // If the stray topic WAS the reply, say the honest thing rather than sending
+  // a stub. If real content survived, keep it — a guest who asked two things
+  // still gets an answer to the one that was theirs.
+  return { reply: hasWords(out) ? out : OFF_AUDIENCE_FALLBACK[audience], removed }
+}
+
 const MACHINERY_ONLY_FALLBACK =
   "Sorry — that came out garbled on my end. Ask me once more and I'll get it right."
 

@@ -33,6 +33,7 @@
  * hit my limit for our conversations today" — which then scores as a failure
  * when it is nothing of the kind. The landlord allowance derives from this one.
  */
+import { randomUUID } from 'crypto'
 import { runAgentSession } from './agentSession'
 import { query } from '../../db'
 import { ALL_INTENTS, type Intent } from './agentBatteryCases'
@@ -101,12 +102,70 @@ async function main() {
       WHERE u.email = 'james@demo.dev' LIMIT 1`)
   if (!tenant || !lord) throw new Error('battery actors missing — seed the demo data first')
 
-  const actorFor = (a: string) => a === 'tenant'
-    ? { userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id }
-    : { userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id }
+  // S620: the three audiences the battery never covered. Each actor is built
+  // EXACTLY as its door in routes/agent.ts builds it — a prospect and a visitor
+  // have no GAM user at all (the conversation id stands in for identity), and a
+  // guest is bound entirely to one booking id. Constructing them any other way
+  // would test a path that does not exist in production.
+  // PINNED, not "whichever comes back first". The first draft took the latest
+  // booking and the alphabetically-first site, and both moved under the
+  // expectations in agentBatteryCases.ts — 11 cases scored MISSING against
+  // facts belonging to a different guest at a different property. A fixture
+  // the harness chooses for itself makes a correct agent look broken.
+  //
+  // Sunset Palms is the richer fixture and the reason it is named here: two
+  // site types with nightly/weekly/MONTHLY rates and a lodging tax. Oak Park
+  // has one type, no monthly rate and 0% tax, so the monthly and tax cases
+  // cannot be written against it at all.
+  const [booking] = await query<any>(
+    `SELECT b.id
+       FROM unit_bookings b
+       JOIN units u ON u.id = b.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE b.status = 'checked_in' AND p.booking_slug = 'sunset-palms'
+      ORDER BY b.check_in DESC LIMIT 1`)
+  const [site] = await query<any>(
+    `SELECT id FROM properties
+      WHERE booking_slug = 'sunset-palms' AND public_booking_enabled = true
+      LIMIT 1`)
+
+  const actorFor = (a: string): any => {
+    switch (a) {
+      case 'tenant':
+        return { userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id }
+      case 'landlord':
+        return { userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id }
+      case 'prospect': {
+        // Anonymous — the sales profile has no account-data tools, so there is
+        // nothing to scope and the session id IS the identity.
+        const id = randomUUID()
+        return { userId: id, role: 'prospect', profileId: id }
+      }
+      case 'guest':
+        // Bound to the token's booking; userId carries the token id, not a user.
+        return { userId: randomUUID(), role: 'guest', profileId: booking.id, bookingId: booking.id }
+      case 'visitor': {
+        // Hard-scoped to one property: profileId AND propertyId are its id.
+        const id = randomUUID()
+        return { userId: id, role: 'visitor', profileId: site.id, propertyId: site.id }
+      }
+      default:
+        throw new Error(`battery: no actor for audience '${a}'`)
+    }
+  }
 
   const intents = ALL_INTENTS.filter((i) =>
     !filter || i.audience === filter || i.id.includes(filter))
+
+  // Fail loudly and EARLY when the data an audience needs is absent, rather
+  // than scoring 0/N and reading like the agent broke. Checked against the
+  // FILTERED set so `battery tenant` never demands a booking site.
+  if (intents.some((i) => i.audience === 'guest') && !booking) {
+    throw new Error("battery: no checked-in booking at sunset-palms — the guest cases have nothing to run against")
+  }
+  if (intents.some((i) => i.audience === 'visitor') && !site) {
+    throw new Error("battery: sunset-palms booking site not published — the visitor cases have nothing to run against")
+  }
 
   let total = 0, passed = 0
   const weak: string[] = []
