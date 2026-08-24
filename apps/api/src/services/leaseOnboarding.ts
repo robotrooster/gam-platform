@@ -125,7 +125,12 @@ export async function autoDraftLeasesForUnit(
       userId: landlord.userId, type: 'lease_draft_blocked',
       title: 'Set a default lease template',
       body: `A tenant accepted their invite for Unit ${unit.unit_number} — ${unit.property_name}, but no default lease template is set for this unit type. Set one to auto-draft the lease.`,
-      data: { unitId }, sendEmail: false,
+      data: { unitId },
+      actionUrl: '/esign',
+      // S620: emailed for the same reason as the success case, and with more
+      // cause — a BLOCKED draft is silent progress that never happens. The
+      // tenant has accepted and is waiting on a lease nobody knows is stuck.
+      sendEmail: true, emailTo: landlord.email,
     }).catch(() => {})
   }
   if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [] } }
@@ -166,8 +171,17 @@ export async function autoDraftLeasesForUnit(
       await createNotification({
         userId: landlord.userId, type: 'lease_ready_to_sign',
         title: 'Lease drafted — ready for your signature',
-        body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Review and sign, then it goes to the tenant(s).`,
-        data: { documentId: doc.id, unitId }, sendEmail: false,
+        body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Sign in to GoldSign to review and sign it — it goes to the tenant(s) straight after.`,
+        data: { documentId: doc.id, unitId },
+        actionUrl: '/esign',
+        // S620 (Nic): "landlords may want email notification when a lease is
+        // drafted. That way they know to log in and complete the workflow...
+        // in case they're out and about." The whole chain STOPS here until the
+        // landlord signs — the tenant has already accepted and can do nothing
+        // until the countersign lands — so a bell nobody is looking at is the
+        // wrong channel for it. createNotification falls back to the standard
+        // email template from title + body.
+        sendEmail: true, emailTo: landlord.email,
       }).catch(() => {})
       drafted.push(doc.id)
     } catch (err: any) {
@@ -176,7 +190,9 @@ export async function autoDraftLeasesForUnit(
         userId: landlord.userId, type: 'lease_draft_blocked',
         title: 'Lease could not be drafted automatically',
         body: `A tenant accepted their invite for Unit ${unit.unit_number} — ${unit.property_name}, but the lease couldn't be auto-drafted: ${err?.message || 'unexpected error'}. This is usually the unit's default lease template missing a required field. Fix it, then draft the lease.`,
-        data: { unitId }, sendEmail: false,
+        data: { unitId },
+        actionUrl: '/esign',
+        sendEmail: true, emailTo: landlord.email,
       }).catch(() => {})
     }
   }
@@ -200,7 +216,9 @@ export async function autoDraftLeasesForUnit(
           userId: landlord.userId, type: 'lease_draft_blocked',
           title: 'Too many co-tenants to auto-draft',
           body: `Unit ${unit.unit_number} — ${unit.property_name} has ${roster.length} people on one lease; auto-draft supports up to 4. Draft this lease manually.`,
-          data: { unitId }, sendEmail: false,
+          data: { unitId },
+          actionUrl: '/esign',
+          sendEmail: true, emailTo: landlord.email,
         }).catch(() => {})
         return { draftedDocumentIds: [] }
       }

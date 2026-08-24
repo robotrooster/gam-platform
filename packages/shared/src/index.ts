@@ -1687,7 +1687,7 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     ]}],
   },
   {
-    category: 'esign', label: 'E-Sign',
+    category: 'esign', label: 'GoldSign',
     sections: [
       { label: 'Tabs', items: [
         { key: 'esign.tab.documents', label: 'Documents' },

@@ -57,7 +57,7 @@ const NAV_ITEMS: Array<{
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
   { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
-  { to: '/esign',         icon: PenTool,          label: 'E-Sign',           section: null,          category: 'esign' },
+  { to: '/esign',         icon: PenTool,          label: 'GoldSign',           section: null,          category: 'esign' },
   // Financials — S575: one "Financials" sidebar item, these render as sub-tabs.
   // Items without a `category` stay owner-only (staff can't see them). Tab order
   // is display order; the first the user can access is the landing tab.

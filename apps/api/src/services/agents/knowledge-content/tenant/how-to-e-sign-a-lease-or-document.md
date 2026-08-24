@@ -1,8 +1,8 @@
 ---
 scope: tenant
-title: E-signing a lease or document, and what "signed" means
+title: Signing a lease or document with GoldSign, and what "signed" means
 ---
-When your landlord sends you a lease or another document to sign, you'll get a notification and an email, and it will appear in your portal. You sign right inside GAM while logged into your own account — there's no separate link to a stranger's site, which is part of how we keep the signature tied securely to you.
+When your landlord sends you a lease or another document to sign, you'll get a notification and an email, and it will appear in your portal. Signing runs on GoldSign, GAM's built-in e-signature tool, so you sign right inside your own account — there's no separate link to a stranger's site, which is part of how we keep the signature tied securely to you.
 
 Here's how signing works. Open the document and you'll see the fields assigned to you — typically your signature, initials, and a date, plus any details your landlord asked you to confirm. You only fill in the fields meant for your role; you can't change parts another person has already signed. Any field marked required has to be completed before you can submit. If you try to finish with something missing, GAM will tell you exactly which fields still need attention.
 

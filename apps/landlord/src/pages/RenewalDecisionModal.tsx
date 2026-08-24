@@ -196,7 +196,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                       <option value="" disabled>Select a template…</option>
                       {templates.map((t:any)=><option key={t.id} value={t.id}>{t.name}{t.id === ctx?.priorTemplateId ? ' (current lease)' : ''}</option>)}
                     </select>
-                    {templates.length === 0 && <div style={{ fontSize:'.72rem', color:'var(--amber)', marginTop:4 }}>No lease templates yet — create one on the E-Sign page first.</div>}
+                    {templates.length === 0 && <div style={{ fontSize:'.72rem', color:'var(--amber)', marginTop:4 }}>No lease templates yet — create one on the GoldSign page first.</div>}
                     <div style={{ fontSize:'.72rem', color:'var(--text-3)', lineHeight:1.5, marginTop:10 }}>
                       The lease is the document: the drafted lease opens for signing <strong>right now</strong> — type the new rent and dates into it, sign, and it goes to the tenant{(lease.tenants||[]).length > 1 ? 's' : ''} automatically. Tenant details, recurring fees, and the held deposit carry over — the deposit is never re-billed.
                     </div>

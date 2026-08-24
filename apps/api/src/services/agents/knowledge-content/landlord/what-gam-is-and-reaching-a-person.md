@@ -3,7 +3,7 @@ scope: landlord
 canonical: what-is-gam
 title: What GAM is and how to reach a person
 ---
-GAM is the software you run your rental operation on: rent collection and payouts, leases and e-signing, maintenance, screening, inspections, books, and the record of all of it in one place.
+GAM is the software you run your rental operation on: rent collection and payouts, leases and signing them through GoldSign, maintenance, screening, inspections, books, and the record of all of it in one place.
 
 ## GAM is the platform — the property decisions stay yours
 

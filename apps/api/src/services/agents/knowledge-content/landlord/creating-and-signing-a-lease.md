@@ -7,7 +7,7 @@ A lease in GAM ties a tenant to a specific unit and holds all the terms you've a
 Here's how it flows:
 
 - Draft the lease. Pick the unit and the tenant, choose the lease type (a fixed-term lease needs an end date; a month-to-month lease doesn't have one), and set the rent and any fees. While the lease is still a draft, you can edit everything freely.
-- Send it for signing. GAM's e-sign step collects signatures from you and the tenant. You can add more than one tenant to a lease — one is the primary, others are additional signers.
+- Send it for signing. GoldSign, GAM's built-in e-signature step, collects signatures from you and the tenant. You always sign first, then it goes to the tenant. You can add more than one tenant to a lease — one is the primary, others are additional signers.
 - It goes active. Once it's signed, the lease is live, the unit shows as occupied, and rent billing follows the schedule you set.
 
 A few things worth knowing once a lease is active:

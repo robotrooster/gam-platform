@@ -17,7 +17,7 @@ The GAM landlord portal groups its navigation into these sections. These are the
 - **Tenants** — your tenants.
 - **Tenant Onboarding** — moving a new tenant through setup.
 - **Leases** — lease agreements, active and past.
-- **E-Sign** — documents out for signature and executed records.
+- **GoldSign** — documents out for signature and executed records.
 
 **Financials** — one sidebar item that opens to these tabs:
 - **Payments** — rent and other payments coming in.

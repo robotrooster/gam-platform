@@ -713,7 +713,7 @@ function ReadOnlyView({
   const banner: { tone: 'green'|'gold'|'red'|'muted'; label: string; sub: string } =
     status === 'completed'         ? { tone:'green', label:'Fully executed', sub:'All parties have signed.' } :
     status === 'voided'            ? { tone:'red',   label:'Voided',         sub: doc?.voidReason || 'This document was voided and is no longer in effect.' } :
-    status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Investigate via the e-sign dashboard.' } :
+    status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Investigate via the GoldSign dashboard.' } :
     signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
     signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
                                      { tone:'muted', label:'Read-only',       sub:'' }

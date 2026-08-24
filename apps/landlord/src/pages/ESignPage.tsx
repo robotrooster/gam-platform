@@ -1109,7 +1109,7 @@ export function ESignPage() {
     <div>
       <div className="page-header">
         <div>
-          <h1 className="page-title">E-Signatures</h1>
+          <h1 className="page-title">GoldSign</h1>
           <p className="page-subtitle">Send documents for electronic signature</p>
         </div>
         <div style={{ display:'flex', gap:8 }}>

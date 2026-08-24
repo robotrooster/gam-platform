@@ -143,7 +143,7 @@ function AddendumCell({ agreement, templates }: { agreement: any; templates: any
   if (doc && doc.status === 'pending') {
     return (
       <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-        <Link to="/esign" style={{ fontSize: '.72rem', color: 'var(--text-3)' }} title={doc.title || 'Open in E-Sign to review'}>Draft</Link>
+        <Link to="/esign" style={{ fontSize: '.72rem', color: 'var(--text-3)' }} title={doc.title || 'Open in GoldSign to review'}>Draft</Link>
         <button className="btn btn-primary btn-sm" disabled={sendExisting.isLoading} onClick={() => sendExisting.mutate(doc.id)}>
           {sendExisting.isLoading ? '…' : 'Review & send'}
         </button>
@@ -164,7 +164,7 @@ function AddendumCell({ agreement, templates }: { agreement: any; templates: any
   if (agreement.status !== 'active') return <span style={{ color: 'var(--text-3)', fontSize: '.75rem' }}>—</span>
 
   if (templates.length === 0) {
-    return <Link to="/esign" style={{ fontSize: '.72rem', color: 'var(--gold)', fontWeight: 600 }} title="Create a Work-Trade Addendum form: E-Sign → Templates → New Template → Form Type = Work-Trade Addendum">Add a form</Link>
+    return <Link to="/esign" style={{ fontSize: '.72rem', color: 'var(--gold)', fontWeight: 600 }} title="Create a Work-Trade Addendum form: GoldSign → Templates → New Template → Form Type = Work-Trade Addendum">Add a form</Link>
   }
 
   if (picking && templates.length > 1) {
