@@ -70,6 +70,19 @@ const LEAK_PATTERNS: { name: string; re: RegExp }[] = [
  */
 export function stripChatMarkdown(text: string): string {
   return text
+    // S620: a LIST THAT LOST ITS LINE BREAKS. Measured on a landlord asking
+    // "what's vacant right now": the model returned every vacant unit as one
+    // run-on string — "right now:Copper Canyon Homes- House 02- House 03Oak
+    // Street Apartments- Apt 202..." — thirteen correct units rendered as an
+    // unreadable wall, because the bubble prints exactly what it is given.
+    //
+    // A dash that (a) follows a non-space, (b) is followed by whitespace, and
+    // (c) precedes a capital or digit is a bullet that lost its newline. The
+    // required space AFTER the dash is what keeps dates and hyphenated words
+    // out of it: "2026-08-24" and "pull-through" have no space there, and
+    // prose that uses " - " as punctuation has a space BEFORE the dash, which
+    // the lookbehind rejects.
+    .replace(/(?<=\S)-[ \t]+(?=[A-Z0-9])/g, '\n• ')
     .replace(/\*\*([^*\n]+)\*\*/g, '$1')      // **bold**
     .replace(/(?<!\w)__([^_\n]+)__(?!\w)/g, '$1') // __bold__
     .replace(/(?<!\w)\*([^*\n]+)\*(?!\w)/g, '$1') // *italic*

@@ -286,11 +286,18 @@ export const TENANT_INTENTS: Intent[] = [
 export const LANDLORD_INTENTS: Intent[] = [
   {
     // S618: "how many" wants a NUMBER.
+    // S620: "what's vacant right now" moved OUT of here and into the list
+    // intent below, which is the same correction S618 already made once and
+    // this phrasing escaped. It is not a "how many" question — asked it, the
+    // agent returned all thirteen units grouped by property, which is exactly
+    // right and contains no "13". Sixth time an assertion has demanded one
+    // SHAPE of answer where another was correct; check the expectation before
+    // reporting a failure.
     audience: 'landlord', id: 'vacancy-count', needsTool: true, expect: '13',
     phrasings: [
       'how many units do I have vacant?',
-      "what's vacant right now",
       'how many empty units',
+      'what is my vacancy count',
     ],
   },
   {
@@ -307,6 +314,9 @@ export const LANDLORD_INTENTS: Intent[] = [
       'show me my vacancies',
       'which units are sitting empty',
       'list my empty units',
+      // S620: moved here from vacancy-count. "What's vacant" asks WHICH, not
+      // HOW MANY — and the agent had been answering it correctly all along.
+      "what's vacant right now",
     ],
   },
   {

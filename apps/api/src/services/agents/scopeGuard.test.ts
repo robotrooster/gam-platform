@@ -296,3 +296,41 @@ describe('scrubOffAudienceTopics', () => {
     expect(scrubOffAudienceTopics(tenantReply, undefined).removed).toEqual([])
   })
 })
+
+// ── S620: a list that lost its line breaks ───────────────────────────────
+describe('stripChatMarkdown — run-on bullet lists', () => {
+  it('restores line breaks on a list the model ran together', () => {
+    // The real reply, measured: 13 correct vacant units as one unreadable line.
+    const out = stripChatMarkdown(
+      "Here's what's vacant right now:Copper Canyon Homes- House 02- House 03Oak Street Apartments- Apt 202")
+    expect(out).toContain('\n• House 02')
+    expect(out).toContain('\n• House 03')
+    expect(out).toContain('\n• Apt 202')
+  })
+
+  it('leaves an ISO date alone — no space after the dash', () => {
+    const d = 'Your lease ends 2027-01-04 and rent is due on the 1st.'
+    expect(stripChatMarkdown(d)).toBe(d)
+  })
+
+  it('leaves hyphenated words alone', () => {
+    const h = 'A pull-through 50 amp site with back-in access and month-to-month terms.'
+    expect(stripChatMarkdown(h)).toBe(h)
+  })
+
+  it('leaves a spaced dash used as punctuation alone', () => {
+    // " - " has a space BEFORE the dash, which the lookbehind rejects.
+    const p = 'The total is $364 - that covers 5 nights.'
+    expect(stripChatMarkdown(p)).toBe(p)
+  })
+
+  it('still normalises a properly formatted list', () => {
+    expect(stripChatMarkdown('Vacant:\n- House 02\n- House 03'))
+      .toBe('Vacant:\n• House 02\n• House 03')
+  })
+
+  it('leaves a negative number alone', () => {
+    const n = 'Your balance changed by -25 this month.'
+    expect(stripChatMarkdown(n)).toBe(n)
+  })
+})
