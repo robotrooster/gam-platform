@@ -14,7 +14,7 @@
  * handoff signal runAgentWithTools surfaces.
  */
 
-import { scrubScopeLeaks, scrubOffAudienceTopics } from './scopeGuard'
+import { scrubScopeLeaks, scrubOffAudienceTopics, isOffAudienceQuestion, offAudienceReply } from './scopeGuard'
 import { RetryableEndpointError } from './endpointPool'
 import { needsARealPerson, stripPromiseOfAPerson, mentionsLegalAction, LEGAL_CONTACT_LINE } from './escalationPolicy'
 import { runAgentWithTools, type ToolInvocation, type RunWithToolsResult } from './agentRunner'
@@ -278,6 +278,22 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
     logger.warn({ audience, reason: (budget as any).reason }, 'agent session: turn refused by daily budget')
     return finalize(
       { reply: BUDGET_CAPPED_REPLY, handledBy: { name: profile.name, tier: 'entry' }, escalations: [], toolInvocations: [], rateLimited: true },
+      profile.id
+    )
+  }
+
+  // S620: a question that was never this agent's to answer. Answered BEFORE the
+  // model runs, because the model's honest attempt is either a leak (a booking
+  // visitor walked through resetting a GAM password) or, once the guards stop
+  // that, the suppression fallback — "I don't want to quote you a figure I
+  // haven't actually checked" to somebody who asked about a password. Safe,
+  // and baffling. Guest and visitor only, and narrower than the reply-side
+  // scrub: a guest asking about a late-checkout fee is asking a real question
+  // about their own stay. See scopeGuard.ts.
+  if (isOffAudienceQuestion(message, audience)) {
+    logger.info({ audience, profile: profile.id }, '[agent] off-audience question answered with a redirect')
+    return finalize(
+      { reply: offAudienceReply(audience), handledBy: { name: profile.name, tier: 'entry' }, escalations: [], toolInvocations: [] },
       profile.id
     )
   }

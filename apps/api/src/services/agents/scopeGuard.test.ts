@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery, stripCitationMarkers, scrubOffAudienceTopics } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery, stripCitationMarkers, scrubOffAudienceTopics, isOffAudienceQuestion } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -345,5 +345,45 @@ describe('stripChatMarkdown — run-on list that is ALSO bolded', () => {
     expect(out).toContain('\n• Pull-through 50 amp: $65 per night')
     expect(out).toContain('\n• Back-in 30 amp: $48 per night')
     expect(out).not.toContain('**')
+  })
+})
+
+describe('isOffAudienceQuestion', () => {
+  it('catches account questions asked of the booking agents', () => {
+    for (const q of [
+      'how do I reset my password',
+      'I forgot my password',
+      'how do I set up two-factor',
+      'when does my lease end',
+      'how much is my rent',
+      'what does GAM charge landlords per unit',
+      'what is the platform fee',
+    ]) {
+      expect(isOffAudienceQuestion(q, 'visitor'), q).toBe(true)
+      expect(isOffAudienceQuestion(q, 'guest'), q).toBe(true)
+    }
+  })
+
+  it('leaves real booking questions alone', () => {
+    // The reason this matcher is narrower than the reply-side one: a guest
+    // asking about a late-checkout fee is asking about their own stay.
+    for (const q of [
+      'is there a fee if I check out late?',
+      'can I get a late checkout',
+      'how much per night',
+      'what is my total',
+      'is there a deposit',
+      'how many nights am I booked for',
+      'what amenities do you have',
+    ]) {
+      expect(isOffAudienceQuestion(q, 'guest'), q).toBe(false)
+      expect(isOffAudienceQuestion(q, 'visitor'), q).toBe(false)
+    }
+  })
+
+  it('never fires for tenant or landlord — those questions are theirs', () => {
+    expect(isOffAudienceQuestion('how do I reset my password', 'tenant')).toBe(false)
+    expect(isOffAudienceQuestion('what is the platform fee', 'landlord')).toBe(false)
+    expect(isOffAudienceQuestion('how much is my rent', undefined)).toBe(false)
   })
 })

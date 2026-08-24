@@ -298,6 +298,48 @@ export function scrubOffAudienceTopics(
   return { reply: hasWords(out) ? out : OFF_AUDIENCE_FALLBACK[audience], removed }
 }
 
+/**
+ * Is the QUESTION itself another audience's business?
+ *
+ * S620, measured live after the reply-side scrub landed. Asked "how do I reset
+ * my password" on a public booking site, the visitor agent no longer leaked
+ * the answer — but what shipped instead was the suppression fallback:
+ *
+ *   "I don't want to quote you a figure I haven't actually checked. What
+ *    exactly were you after and I'll find it?"
+ *
+ * Nobody asked for a figure. The guard chain was working (demandsAToolCall is
+ * true for these audiences, no tool matches a password, so the reply was
+ * suppressed) and the result was safe and baffling. Catching it on the WAY IN
+ * gives the honest answer instead, and costs no model call at all.
+ *
+ * NARROWER than the reply-side patterns on purpose. "Late fee" and "deposit"
+ * are left out entirely: a guest asking "is there a fee if I check out late"
+ * is asking a real question about their own stay, and redirecting that would
+ * be worse than the wart this fixes. Only things that cannot belong to someone
+ * without an account are here.
+ */
+const OFF_AUDIENCE_QUESTIONS: RegExp[] = [
+  /\b(reset|resetting|forgot|forgotten|change|recover)\b[^?.!]{0,25}\bpassword\b/i,
+  /\bpassword\b[^?.!]{0,25}\b(reset|recovery|forgot)\b/i,
+  /\b(two[- ]factor|2fa|authenticator app)\b/i,
+  /\bmy lease\b/i,
+  /\bmy rent\b/i,
+  /\b(platform fee|per occupied unit)\b/i,
+  /\bwhat does gam charge\b/i,
+  /\bgam charge[sd]?\b[^?.!]{0,25}\b(landlord|per unit|a unit)\b/i,
+]
+
+export function isOffAudienceQuestion(message: string, audience?: string): boolean {
+  if (!message || (audience !== 'guest' && audience !== 'visitor')) return false
+  return OFF_AUDIENCE_QUESTIONS.some((re) => re.test(message))
+}
+
+/** The redirect for a question that was never this agent's to answer. */
+export function offAudienceReply(audience: string): string {
+  return OFF_AUDIENCE_FALLBACK[audience] ?? OFF_AUDIENCE_FALLBACK.visitor
+}
+
 const MACHINERY_ONLY_FALLBACK =
   "Sorry — that came out garbled on my end. Ask me once more and I'll get it right."
 
