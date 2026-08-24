@@ -548,4 +548,43 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
     expect(res.body.data.alreadyOnPlatform).toBe(false)
     expect(res.body.data.activationUrl).toBeTruthy()
   })
+
+  // ── S618: importing a lease must mark the unit OCCUPIED ────────────────
+  //
+  // ONBOARDING_PUNCHLIST.md states the shipped rule: units are created
+  // "always vacant; leases flip it." This path never flipped it —
+  // routes/landlords.ts has no UPDATE of units anywhere — so a landlord who
+  // imported the tenants they already had ended up with occupied units still
+  // reading 'vacant'. Two were found live on 2026-08-23 (RV 01 and House 01,
+  // each with a started lease and a tenant on it).
+  //
+  // It is not only cosmetic. units.status is what the agent reads to answer
+  // "how many units are vacant" — so it told the landlord a unit was empty
+  // while someone lived in it — and what the occupancy KPI and rent roll read.
+  //
+  // Enforced by trigger (migration 20260823120000) rather than by an UPDATE
+  // added to each of the three import paths, because a call-site fix is only
+  // correct until the next call site is written.
+  it('marks the unit occupied when a started lease is imported onto it', async () => {
+    const f = await seedTOFixture()
+
+    const before = await db.query<{ status: string }>(
+      `SELECT status FROM units WHERE id = $1`, [f.unitId])
+    expect(before.rows[0].status).toBe('vacant')
+
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        firstName: 'Already', lastName: 'Living', email: `occ${Date.now()}@t.dev`,
+        phone: '555-0122', unitId: f.unitId,
+        leaseStart: '2026-01-01', leaseEnd: '2027-01-01',
+        monthlyRent: 1500, securityDeposit: 1000,
+      })
+    expect(res.status).toBe(200)
+
+    const after = await db.query<{ status: string }>(
+      `SELECT status FROM units WHERE id = $1`, [f.unitId])
+    expect(after.rows[0].status).toBe('active')
+  })
 })

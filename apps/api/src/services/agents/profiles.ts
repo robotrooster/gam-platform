@@ -188,7 +188,7 @@ const TENANT_ENTRY: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests', 'respond_to_entry_request', 'get_my_termination_quote', 'get_my_balance_breakdown', 'get_my_amenities', 'request_amenity_reservation',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
@@ -218,7 +218,7 @@ const TENANT_ESCALATION: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests', 'respond_to_entry_request', 'get_my_termination_quote', 'get_my_balance_breakdown', 'get_my_amenities', 'request_amenity_reservation',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
@@ -248,7 +248,7 @@ const LANDLORD_ENTRY: AgentProfile = {
   knowledgeScopes: ['landlord', 'shared'],
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
-    'get_delinquent_tenants', 'get_late_payment_history', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
+    'get_delinquent_tenants', 'get_late_payment_history', 'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_profit_and_loss', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
@@ -276,7 +276,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
   knowledgeScopes: ['landlord', 'shared'],
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
-    'get_delinquent_tenants', 'get_late_payment_history', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
+    'get_delinquent_tenants', 'get_late_payment_history', 'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_profit_and_loss', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',

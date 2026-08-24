@@ -15,6 +15,8 @@
  */
 
 import { scrubScopeLeaks } from './scopeGuard'
+import { RetryableEndpointError } from './endpointPool'
+import { needsARealPerson, stripPromiseOfAPerson, mentionsLegalAction, LEGAL_CONTACT_LINE } from './escalationPolicy'
 import { runAgentWithTools, type ToolInvocation, type RunWithToolsResult } from './agentRunner'
 import { getEntryProfile, getEscalationProfile } from './profiles'
 import { logInteraction } from './logInteraction'
@@ -22,7 +24,6 @@ import { getTurnGate } from './turnGate'
 import { answerCache, answerCacheEnabled, normalizeQuestion } from './cache'
 import { checkTurnBudget, BUDGET_CAPPED_REPLY } from './turnBudget'
 import { matchCuratedFaq } from './curatedFaq'
-import { loadUserContext } from './conversationHistory'
 import type { AgentActor } from './tools/types'
 import type { HandoffSignal } from './tools/escalation'
 import { logger } from '../../lib/logger'
@@ -152,6 +153,35 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
     // matters most: a leaked answer stored there is served to other people.
     // See scopeGuard.ts for why this is deterministic and not just prompted.
     if (result.reply) {
+      // S618 (Nic): "any sort of bringing an outside person into the
+      // conversation should only be done if it's real money... other than that,
+      // no promises of talking to a real person."
+      //
+      // Here rather than in the runner because EVERY reply passes through
+      // finalize — the runner returns from a dozen places, and a promise that
+      // slips out of any one of them is a customer waiting on a callback that
+      // was never booked. The rest of the answer is kept; only the promise goes.
+      // A handoff that was actually RECORDED is not a false promise — a real
+      // package exists and a person receives it, so that reply stays intact.
+      // What gets removed is the promise nothing backs.
+      if (!needsARealPerson(input.message) && !result.humanHandoff && result.reply) {
+        const kept = stripPromiseOfAPerson(result.reply)
+        if (kept !== result.reply) {
+          logger.warn({ profile: finalProfileId },
+            '[agent] promise of a person removed — not a money problem')
+          result = { ...result, reply: kept }
+        }
+      }
+      // S618 (Nic): legal action gets an ADDRESS, not a promise. The customer
+      // reaches out to us — "anybody that's just blowing smoke isn't gonna
+      // bother reaching out. Anybody that is a little more serious will make
+      // the reach out, and it kind of prefilters some people for us."
+      // Added after the promise-stripping above, so the reply carries the one
+      // commitment GAM can actually keep: an address that works.
+      if (mentionsLegalAction(input.message) && result.reply
+          && !result.reply.includes('support@goldassetmanagement.com')) {
+        result = { ...result, reply: `${result.reply.trim()}\n\n${LEGAL_CONTACT_LINE}` }
+      }
       const scrubbed = scrubScopeLeaks(result.reply)
       // ALWAYS take the scrubbed text, not only when a leak sentence was cut.
       // scrubScopeLeaks also strips markdown the chat window cannot render, and
@@ -241,12 +271,23 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
     )
   }
 
-  // Cross-session memory: on a fresh conversation (and only on the model
-  // path — fast-path hits above skip this), recall what this user recently
-  // contacted support about so the agent feels like a rep who remembers them.
-  const userContext =
-    baseHistory.length === 0 ? await loadUserContext(actor.userId, input.conversationId).catch(() => null) : null
-  const priorContext = userContext ? [{ role: 'system' as const, content: userContext }] : []
+  // CROSS-SESSION MEMORY REMOVED (S618, Nic): "I don't think we should have
+  // cross session memory unless there was ever an issue where a tenant was
+  // waiting for a follow-up from the agent that would be resolved at a later
+  // date, but I don't really see that happening. So we should just get rid of
+  // cross session memory."
+  //
+  // It also measurably HURT. The same five questions, memory on: 1/5 correct.
+  // Memory off: 2/5. Telling the model "this person recently asked about their
+  // balance" made it LESS likely to look the balance up — it behaved as though
+  // it had already answered. The whole point of the feature was to feel like a
+  // rep who remembers you; what it produced was a rep who assumes they already
+  // told you.
+  //
+  // Nothing replaces it: `history` still carries the CURRENT conversation, so a
+  // customer never repeats themselves within a chat. What is gone is dragging
+  // last week's questions into this one.
+  const priorContext: { role: 'system'; content: string }[] = []
 
   // Admit the turn through the concurrency gate. Under overload it sheds
   // rather than piling onto the model fleet and collapsing it.
@@ -334,6 +375,37 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
       knowledgeChunkIds: Array.from(new Set(metrics.knowledgeChunkIds)),
       outcomeError: err instanceof Error ? err.message : String(err),
     }).catch(() => {})
+
+    // S618: the model being down is not something to hand the customer raw.
+    //
+    // Every other error still throws — a bug should be loud. But when the
+    // model or the embeddings server is unreachable the old path rethrew, the
+    // route called next(e), and errorHandler answered the tenant's chat with
+    // HTTP 500 and the literal string "LLM endpoint unreachable at
+    // http://localhost:8080/v1" — an internal address, shown to a renter who
+    // asked what they owe.
+    //
+    // This is not hypothetical and it is not rare: the model is a single
+    // process on a Mac, it has died four times that we know of (88 logged
+    // failures in one hour on 2026-08-23 alone), and §0 of the S618 handoff
+    // exists because that machine is on a grid with brownouts. Whatever else
+    // is true when it happens, the person typing deserves a sentence rather
+    // than a stack trace.
+    //
+    // Deliberately says nothing about AI, servers or scope — scopeGuard bans
+    // reciting limits, and "our system is down" is machine-talk. It also does
+    // NOT claim an escalation, because nothing was escalated. It is logged as
+    // outcome='error' either way, so Sentry and the uptime monitors still see
+    // the truth even though the customer does not.
+    if (err instanceof RetryableEndpointError) {
+      logger.error({ audience, err }, 'agent session: endpoint down — returning a graceful reply instead of a 500')
+      return {
+        reply: "Sorry — I'm having trouble pulling that up right this second. Give it a minute and ask me again, and it should come through.",
+        handledBy: { name: profile.name, tier: profile.tier },
+        escalations,
+        toolInvocations,
+      }
+    }
     throw err
   } finally {
     release() // free the turn slot for the next waiter (idempotent)

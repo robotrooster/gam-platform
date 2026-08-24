@@ -6040,3 +6040,47 @@ export function occupancyRateFrom(
   const occupied = Math.min(totalUnits, activeUnits + shortStayEquivalent)
   return Math.round((100 * occupied) / totalUnits)
 }
+
+// ── Tenant complaints (S618) ────────────────────────────────────────────────
+//
+// Nic: "the table is gonna be created in the agent chat. That's the point of
+// contact where tenants are gonna complain about the neighbor, or they're gonna
+// do it as a maintenance request — hey, tell my neighbor to turn their shit
+// down."
+//
+// So the chat IS the intake. A tenant says it to the agent, the agent records
+// it, and the landlord can then ask who complains most and who gets complained
+// about most — the difference between a tenant who is needy and a tenant with a
+// real problem next door.
+//
+// Deliberately NOT maintenance: maintenance_requests.category is a closed list
+// of hvac/plumbing/electrical/appliance/... with nothing that fits a neighbour,
+// and forcing one in would corrupt repair reporting.
+export const COMPLAINT_CATEGORY_VALUES = [
+  'noise', 'neighbor', 'parking', 'pets', 'smell', 'trash',
+  'property_condition', 'harassment', 'safety', 'other',
+] as const
+export type ComplaintCategory = typeof COMPLAINT_CATEGORY_VALUES[number]
+
+export const COMPLAINT_CATEGORY_LABEL: Record<ComplaintCategory, string> = {
+  noise:              'Noise',
+  neighbor:           'Neighbor',
+  parking:            'Parking',
+  pets:               'Pets',
+  smell:              'Smell or smoke',
+  trash:              'Trash',
+  property_condition: 'Condition of the property',
+  harassment:         'Harassment',
+  safety:             'Safety',
+  other:              'Other',
+}
+
+export const COMPLAINT_STATUS_VALUES = ['open', 'reviewed', 'resolved', 'dismissed'] as const
+export type ComplaintStatus = typeof COMPLAINT_STATUS_VALUES[number]
+
+export const COMPLAINT_STATUS_LABEL: Record<ComplaintStatus, string> = {
+  open:      'Open',
+  reviewed:  'Reviewed',
+  resolved:  'Resolved',
+  dismissed: 'Dismissed',
+}

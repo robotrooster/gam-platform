@@ -16,6 +16,11 @@ import { getMyLandlordPatterns } from './getMyLandlordPatterns'
 import { getMyLease } from './getMyLease'
 import { getMyPayments } from './getMyPayments'
 import { getLandlordPortfolio } from './getLandlordPortfolio'
+import { getPortfolioStats } from './getPortfolioStats'
+import { queryPortfolio } from './queryPortfolio'
+import { logComplaint } from './logComplaint'
+import { getOpenComplaints } from './getOpenComplaints'
+import { getProfitAndLoss } from './getProfitAndLoss'
 import { getMyMaintenanceRequests } from './getMyMaintenanceRequests'
 import { getMyDocuments } from './getMyDocuments'
 import { getMyInspections } from './getMyInspections'
@@ -47,6 +52,8 @@ import { rejectMaintenanceRequest } from './rejectMaintenanceRequest'
 import { scheduleMaintenance } from './scheduleMaintenance'
 import { messageTenant } from './messageTenant'
 import { getMyDeposit } from './getMyDeposit'
+import { getMyLeaseFees } from './getMyLeaseFees'
+import { getMyFullLease } from './getMyFullLease'
 import { getMyInvoices } from './getMyInvoices'
 import { getPendingApplications } from './getPendingApplications'
 import { getMyPayouts } from './getMyPayouts'
@@ -110,6 +117,8 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   resolveServiceInterruptionTool,
   getMyPaymentMethods,
   getMyDeposit,
+  getMyLeaseFees,
+  getMyFullLease,
   getMyInvoices,
   getMyBookings,
   getMyContacts,
@@ -120,6 +129,11 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   declineGuidedInspection,
   // landlord reads
   getLandlordPortfolio,
+  getPortfolioStats,
+  queryPortfolio,
+  logComplaint,
+  getOpenComplaints,
+  getProfitAndLoss,
   getPropertyRentRoll,
   getSetupProgress,
   getPendingMaintenance,

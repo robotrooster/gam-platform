@@ -65,6 +65,12 @@ async function runOne(intent: Intent, phrasing: string, actor: any): Promise<Out
 
   const flags: string[] = []
   if (intent.needsTool && tools.length === 0 && NUMBERISH.test(text)) flags.push('FABRICATED')
+  if (intent.expectTool && !tools.includes(intent.expectTool)) {
+    flags.push(`WRONGTOOL(wanted ${intent.expectTool})`)
+  }
+  if (intent.expectToolAny?.length && !intent.expectToolAny.some((t) => tools.includes(t))) {
+    flags.push(`WRONGTOOL(wanted any of ${intent.expectToolAny.join(' / ')})`)
+  }
   if (PLACEHOLDER.test(text)) flags.push('PLACEHOLDER')
   if (MARKDOWN.test(text)) flags.push('MARKDOWN')
   if (repetitionRatio(text) > 0.4) flags.push('REPEATS')

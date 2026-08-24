@@ -22,6 +22,9 @@ import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
 import type { AgentActor } from './tools/types'
+import { routePlan } from './toolRouting'
+import { needsARealPerson, stripPromiseOfAPerson, LEGAL_ACTION_INTENT } from './escalationPolicy'
+export { needsARealPerson, stripPromiseOfAPerson } from './escalationPolicy'
 import { logger } from '../../lib/logger'
 import type { AgentProfile, ChatMessage, ToolCall } from './types'
 
@@ -121,6 +124,40 @@ export function promisesHandoff(content: string): boolean {
 const NAME_ALLOWLIST = new Set([
   'Want Me', 'Let Me', 'Here Is', 'Here Are', 'Oak Street', 'GAM Team',
 ])
+/**
+ * Counts in the reply that the tools never returned.
+ *
+ * S618, and this one outlived the bug that exposed it. Every no-lookup guard
+ * keys off `toolInvocations.length === 0`, so the moment ANY tool runs the
+ * reply is treated as grounded — but "a tool ran" and "the answer came from the
+ * tool" are not the same claim. A landlord asking their occupancy was told
+ * "26 units across 4 properties, with 22 occupied and 4 vacant" with
+ * get_landlord_portfolio in the invocation list and 21 units across 3
+ * properties in its result. Not one of those four numbers existed anywhere,
+ * and every guard passed it.
+ *
+ * DELIBERATELY NARROW, like namesNotInToolResults above. Only an integer
+ * DIRECTLY attached to a portfolio noun is checked — "26 units", "4
+ * properties", "22 occupied". Money is left alone because a total the model
+ * adds up correctly ($750 + $15 + $50) is right and appears nowhere in the
+ * rows; percentages likewise. Comparison strips separators so "2,330" matches
+ * 2330 in the JSON.
+ */
+export function countsNotInToolResults(reply: string, toolResults: unknown[]): string[] {
+  if (!reply) return []
+  const haystack = JSON.stringify(toolResults).replace(/[",\s]/g, '')
+  const bad: string[] = []
+  const re = /\b(\d{1,4})\s+(units?|properties|propertys?|tenants?|leases?|vacant|occupied|empty)\b/gi
+  for (const m of reply.matchAll(re)) {
+    const n = m[1]
+    // 0 and 1 are ordinary English ("1 unit", "no units") and are not worth a
+    // retry; anything the tools genuinely returned is present in the JSON.
+    if (n === '0' || n === '1') continue
+    if (!new RegExp(`(^|[^\\d])${n}([^\\d]|$)`).test(haystack)) bad.push(`${n} ${m[2]}`)
+  }
+  return [...new Set(bad)]
+}
+
 export function namesNotInToolResults(reply: string, toolResults: unknown[]): string[] {
   if (!/^\s*(?:[-•*]|\|)/m.test(reply)) return []           // not a record list
   // Compare with spaces, underscores and case removed. A model writing a
@@ -196,6 +233,13 @@ export const ANSWERABLE_FROM_MEMORY = [
   /\bhow (?:do(?:es)?|can|would)\b[^?]*\b(e-?sign\w*|signing|invit\w+|the portal|autopay|auto-?pay|screening|background check|work ?trade|booking|reservation|maintenance request|point of sale|pos)\b/i,
   // Platform-wide pricing and rules — identical for every landlord and tenant.
   /\bplatform fee\b|\bwhat does gam (cost|charge)\b|\bhow much do you charge\b|\bper occupied unit\b/i,
+  // S618: "what am I paying for this" is GAM's own rate — platform-wide and
+  // identical for every landlord, so memory may answer it. It was demanding a
+  // lookup, and the model reached for the portfolio tool and answered without
+  // the fee at all. Anchored to this/you/GAM on purpose: "what am I paying for
+  // PARKING" is a lease fee, varies per tenant, and must stay a lookup.
+  /\bwhat (?:am i|do i) pay(?:ing)?\s+(?:for\s+)?(?:this|you|gam)\b/i,
+  /\bwhat(?:'s| is) (?:this|gam) costing me\b/i,
   /\bpartial payment|\bpay in full\b|\bsplit (the |my )?rent\b|\bpay (part|some|half) of\b|\bpay a (partial|portion)\b/i,
   /\bwhat (is|are) (a |an |the )?[a-z ]{0,24}(flexpay|flexvault|flexdeposit|flexcredit|work trade|rubs)\b/i,
   // Cost of a service, not of this person's account — "how much does a
@@ -205,8 +249,74 @@ export const ANSWERABLE_FROM_MEMORY = [
   /\b(how much|what)\s+(?:does|do|is|are|would)\b[^?]*\b(cost|charge[ds]?|price[ds]?|run me)\b|\bpricing\b|\bprice of\b/i,
 ]
 
-export function demandsAToolCall(message: string): boolean {
-  if (!SEEKS_A_FACT.test(message)) return false
+/**
+ * Things that are not a request at all — a greeting, a thanks, an "ok".
+ * Nothing is being asked, so nothing needs looking up.
+ */
+const NOT_A_REQUEST =
+  /^\s*(hi|hey|hello|yo|thanks|thank you|ty|ok|okay|k|got it|sure|yep|yes|no|nope|nvm|never ?mind|bye|goodbye|cool|great|nice|awesome|perfect|sounds good|will do|understood|makes sense)\b[\s!.,?]*$/i
+
+/**
+ * Must this turn be answered from a LOOKUP rather than from memory?
+ *
+ * S618 (Nic), and this is the rule the rest of the file was only approximating:
+ *
+ *   "A tool should always be called for things that have to be searched for
+ *    because they're gonna be different per my next door neighbor versus me —
+ *    two different leases, two different late fees, two different whatevers.
+ *    The only time a tool doesn't get called is for the platform side of things
+ *    that never change... the platform foundational always happens the same way
+ *    type of things."
+ *
+ * So the default is INVERTED. It used to require one of a list of question
+ * verbs before a lookup was demanded at all, and that precondition was a hole
+ * wide enough to drive the whole failure through. Measured against the real
+ * list: "my balance looks off", "i need my lease end date", "i think my late
+ * fee was wrong", "my rent seems too high" — none carried a listed verb, so
+ * none demanded a tool, AND every anti-fabrication guard keys off this same
+ * flag, so none of them was protected either. Seven of eight per-user
+ * statements were free to be answered out of the model's head.
+ *
+ * Now: everything is a lookup EXCEPT two things —
+ *   1. a platform constant, which is identical for every user on the platform
+ *      (the list below), and
+ *   2. a message that asks nothing at all.
+ *
+ * That is deliberately the strict direction. A needless lookup costs a query
+ * and returns the truth; a skipped one is how a tenant hears a number that was
+ * never in the database.
+ */
+export function demandsAToolCall(message: string, audience?: string): boolean {
+  if (!message || !message.trim()) return false
+  if (NOT_A_REQUEST.test(message)) return false
+
+  // S618: the PROSPECT (sales) agent is the exception, and missing it was a
+  // regression I introduced with the inversion itself.
+  //
+  // The rule's premise is that per-user data varies and must be looked up. A
+  // prospect HAS no account, no lease and no property — every honest answer
+  // they can get is a platform constant, and the sales profile holds no data
+  // lookups at all (capture_lead, get_available_call_times, book_sales_call).
+  // Demanding a tool there means demanding one that does not exist.
+  //
+  // Measured before the fix: "what's the price per unit" demanded a lookup, the
+  // agent answered correctly from the knowledge base — "$2 per occupied unit
+  // per month" — and assertsStoredFacts saw a dollar figure with no tool behind
+  // it and replaced the answer with "Which part were you after — your balance,
+  // your rent, your lease dates, or your deposit?" to someone who has none of
+  // those. The commercial front door, answering a pricing question with
+  // nonsense.
+  if (audience === 'prospect') return false
+
+  // S618: for a GUEST or a site VISITOR, "how much does it cost" is not GAM's
+  // rate card — it is the nightly price of the spot they are looking at, which
+  // is per-property and set by that landlord. The platform-pricing exemptions
+  // below were written for a landlord asking what GAM charges THEM, and letting
+  // them through here would let the agent quote a nightly rate from memory on a
+  // booking site. Those two audiences look everything up.
+  if (audience === 'guest' || audience === 'visitor') return true
+
+  // The ONLY other exemption: platform-wide facts that are the same for everyone.
   if (ANSWERABLE_FROM_MEMORY.some((re) => re.test(message))) return false
   return true
 }
@@ -266,7 +376,108 @@ export function assertsStoredFacts(text: string): boolean {
   )
 }
 
-/** What to say instead of a number nobody looked up. */
+/**
+ * A reply that PROMISES a lookup it never performed.
+ *
+ * S618. Both gates below suppress a tool-less reply only when it ASSERTS
+ * something — a figure, a date, a list. That is the right test for a made-up
+ * answer, and it is blind to the other way this fails. Measured on the real
+ * path, a landlord asking "what's bob chen's balance" got back, in full:
+ *
+ *   "I'll look up Bob Chen's balance for you."
+ *
+ * No tool ran. Nothing followed. It states no fact, so assertsStoredFacts says
+ * it is safe — and it is safe, in the sense that nothing in it is wrong. It is
+ * also a dead end that reads like a promise, which is worse than an honest "I
+ * can't see that": the landlord now waits for an answer that is never coming,
+ * and the same question asked four other ways was answered correctly. One
+ * wording in five falling through is exactly the shape this battery exists to
+ * catch.
+ *
+ * DELIBERATELY NARROW, like the leak patterns in scopeGuard. It needs BOTH a
+ * first-person promise AND a lookup verb IN THE SAME SENTENCE, so ordinary
+ * closings survive: "Let me know if you want me to check that" carries the
+ * verb but no promise (the "let me know" exclusion), and "I'll need to know
+ * which unit" carries the promise but no lookup.
+ *
+ * A promised HANDOFF is excluded outright — "I'll check with the team and have
+ * someone get back to you" is a real commitment that synthesizeHandoff turns
+ * into a real escalation, and must not be rewritten here.
+ */
+/**
+ * The agent said it would go and LOOK — so a lookup has to have happened.
+ *
+ * S618 (Nic), and this is the general rule the enumeration below was groping
+ * at: "when the agent responds with the word look, or look for, or search, or
+ * search for, or find out, or any other kind of questing type phrases, that
+ * should require a tool to be called no matter what. Because that means it's
+ * something that is not in the constant knowledge database — it's in the per
+ * property or per user side of the platform where things change user to user."
+ *
+ * That is a better test than listing the ways a model can promise something.
+ * Chasing phrasings, I wrote "look up" and "look into" and missed "look AT" —
+ * which is exactly the reply that then shipped ("Let me look at your late
+ * payment history."). The questing WORD is the signal, whatever grammar wraps
+ * it: if the agent reached for the vocabulary of going and checking, it was
+ * about to read per-user data, and per-user data only comes from a tool.
+ */
+const QUESTING_VERB =
+  /\b(look(?:ing|ed)?(?:\s+(?:up|at|into|for|through|over))?|search(?:ing|ed)?|find(?:ing)?\s+out|check(?:ing|ed)?|pull(?:ing|ed)?(?:\s+(?:up|that|this|it|those|them))?|fetch\w*|retriev\w+|review(?:ing)?|verif\w+|confirm(?:ing)?|dig(?:ging)?\s+(?:in|into)|go(?:ing)?\s+through|take\s+a\s+look)\b/i
+
+/**
+ * Did the agent SAY it would go and check, without anything having been
+ * checked?
+ *
+ * Only counts the agent talking about ITSELF doing the checking. "You can look
+ * that up under Payments" is directing the person to the portal, which is a
+ * fine answer to a how-to and must survive. A promised HANDOFF is excluded for
+ * the same reason as before: synthesizeHandoff turns that into a real
+ * escalation and rewriting it here would break it.
+ */
+const FIRST_PERSON =
+  /\b(?:i'?ll|i\s+will|i'?m|i\s+am|let\s+me(?!\s+know)|we'?ll|we\s+will|lemme|one\s+moment|just\s+a\s+(?:moment|sec(?:ond)?)|hang\s+on|give\s+me\s+a\s+(?:sec(?:ond)?|moment))\b/i
+
+/**
+ * The agent claiming it ALREADY DID something, when nothing ran.
+ *
+ * S618, and this is the worst thing measured all session. A tenant said "tell
+ * my neighbor to turn their music down" and got back:
+ *
+ *   "I've logged your complaint about the noise from your neighbor. Your
+ *    landlord has been notified and will follow up."
+ *
+ * Nothing was logged. No tool ran. The table had zero rows. Three of four
+ * complaint phrasings produced a claim like that.
+ *
+ * This is a category worse than the promise saysItWillCheck catches. "I'll look
+ * into that" leaves the customer waiting; "I've filed it" makes them STOP —
+ * they believe it is handled, so they do not call, do not follow up, and the
+ * landlord never hears about it. The agent has quietly closed the ticket by
+ * lying about it.
+ *
+ * So: a completed-action claim with no action behind it does not go out. This
+ * checks for the CLAIM, not the topic — "your landlord can see your complaints
+ * in their portal" is information and survives; "I've logged it" does not.
+ */
+const CLAIMS_DONE =
+  /\b(?:i'?ve|i have|i)\s+(?:already\s+)?(?:logged|filed|recorded|submitted|reported|created|opened|sent|passed (?:it |this )?(?:on|along)|notified|flagged|scheduled|booked|cancelled|canceled|updated|added|removed|saved)\b/i
+const CLAIMS_DONE_PASSIVE =
+  /\b(?:has|have|been)\s+(?:been\s+)?(?:logged|filed|recorded|submitted|reported|notified|created|sent|passed on|flagged|scheduled|booked|cancelled|canceled|updated)\b/i
+
+export function claimsAnActionItNeverTook(text: string): boolean {
+  if (!text) return false
+  return (text.match(/[^.!?\n]+[.!?]*/g) ?? [text])
+    .some((sentence) => CLAIMS_DONE.test(sentence) || CLAIMS_DONE_PASSIVE.test(sentence))
+}
+
+export function saysItWillCheck(text: string): boolean {
+  if (!text) return false
+  if (promisesHandoff(text)) return false
+  return (text.match(/[^.!?\n]+[.!?]*/g) ?? [text])
+    .some((sentence) => FIRST_PERSON.test(sentence) && QUESTING_VERB.test(sentence))
+}
+
+
 /**
  * What to say instead of a number nobody looked up.
  *
@@ -287,7 +498,29 @@ function cannotSee(audience: string): string {
   if (audience === 'landlord' || audience === 'pm_company') {
     return "I don't want to give you a figure I haven't actually checked. Which property or which tenant do you mean, and I'll pull it straight up?"
   }
+  // S618: a guest has a booking, not a lease, and a visitor on a property site
+  // has neither. Offering "your balance, your rent, your lease dates" to
+  // someone who has none of those is worse than saying nothing — it implies an
+  // account they do not have.
+  if (audience === 'guest') {
+    return "I don't want to give you a number I haven't actually checked. Which booking do you mean — the dates, the total, or the site you're on?"
+  }
+  if (audience === 'visitor' || audience === 'prospect') {
+    return "I don't want to quote you a figure I haven't actually checked. What exactly were you after and I'll find it?"
+  }
   return "I don't want to give you a number I haven't actually checked. Which part were you after — your balance, your rent, your lease dates, or your deposit?"
+}
+
+/**
+ * What to say when the agent claimed to do something and nothing was done.
+ *
+ * Not cannotSee's wording: that asks which FACT they wanted, which is nonsense
+ * in reply to "tell my neighbor to turn their music down". This admits the
+ * action did not happen and asks for the detail needed to take it — the
+ * opposite of quietly closing the ticket with a lie.
+ */
+function couldNotDoIt(): string {
+  return "I haven't got that written down yet — tell me a bit more about what's happening and who it involves, and I'll pass it to your landlord."
 }
 
 /** Distinct tool executions allowed inside ONE model turn. See the loop below. */
@@ -356,8 +589,6 @@ export const ACCOUNT_DATA_LOOSE =
 //   what-does-the-law-say questions, which landlord agents answer with the
 //   law tools by design.
 // - account-security incidents (hacked, someone logged in, compromised).
-const LEGAL_ACTION_INTENT =
-  /take legal action|legal action against|(talk|speak|spoke) to (a |my )?(lawyer|attorney)|(my|a|an|the) (lawyer|attorney)\b|\bsue\b|\bsuing\b|small claims|press charges/i
 const ACCOUNT_SECURITY_INTENT =
   /\bhacked\b|hacker|someone (else )?(logged|signed|got) in(to)?|unauthori[sz]ed (access|login)|account (was |got |is )?(compromised|stolen|taken over)|login (alert|attempt).{0,25}(don'?t|did ?n'?t|do not) recognize/i
 
@@ -453,6 +684,8 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let forceToolThisTurn = false
   let nudgedForDispute = false
   let nudgedForHardStop = false
+  /** The phrase table's lookup is run at most once per turn. */
+  let ranRoutedToolDirectly = false
   let model = ''
   const usage = { promptTokens: 0, completionTokens: 0 }
   const grounded = retrieved.length > 0
@@ -460,6 +693,14 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     usage.promptTokens += u?.promptTokens ?? 0
     usage.completionTokens += u?.completionTokens ?? 0
   }
+
+  // Which lookup does this phrasing call for? Undefined when the table does not
+  // recognise it, in which case a forced turn falls back to plain 'required'.
+  // Consulted ONLY on a forced turn — it never overrides a tool the model chose
+  // for itself, and never fires on an ordinary turn.
+  const plan = routePlan(message, profile.audience, profile.toolNames ?? [])
+  const routedTools = plan.tools
+  const routedTool = routedTools[0]
 
   for (let step = 0; step < maxSteps; step++) {
     // S617: on the forced turn, take the escalation tools OFF the table. With
@@ -481,6 +722,20 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // tenant who owed $2,330. Asking again is a request. This is not.
       // Only the retry turn is forced, so every ordinary turn keeps the option
       // of a plain reply (and a knowledge-base answer stays one call).
+      // S618: plain 'required', NOT the named form.
+      //
+      // Naming the routed tool looked like the obvious improvement and measured
+      // worse. Under the real profile — ~30 tools, long system prompt — pinning
+      // tool_choice to one function made the model LESS likely to call anything
+      // than simply requiring a call: "is bob behind on rent?" and its four
+      // neighbours went from answering correctly to no tool at all. (Both forms
+      // are obeyed perfectly by a three-tool prompt, which is what made the
+      // isolated test misleading.)
+      //
+      // Nothing is lost by dropping it. Where the phrase table knows the lookup
+      // AND it needs no arguments, the runner executes it directly and never
+      // asks the model at all. Where the lookup needs an argument only the model
+      // can supply — WHICH tenant, WHICH unit — 'required' is the better prompt.
       toolChoice: forceToolThisTurn && turnTools.length > 0 ? 'required' : undefined,
     })
     // NOT cleared here. S617: tool_choice 'required' is honoured most of the
@@ -493,7 +748,8 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     addUsage(out.usage)
 
     if (out.toolCalls.length === 0) {
-      const synth = synthesizeHandoff(profile, out.content)
+      // S618: a handoff is only ever real for a money problem.
+      const synth = needsARealPerson(message) ? synthesizeHandoff(profile, out.content) : undefined
       if (synth) {
         logger.warn({ profile: profile.id }, 'agent runner: model promised a handoff in prose without calling escalate — synthesizing the escalation (safety net)')
         return { reply: out.content, model, retrieved, grounded, toolInvocations, usage, handoff: synth }
@@ -521,7 +777,10 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         })
         continue
       }
-      if (!nudgedForHardStop && (LEGAL_ACTION_INTENT.test(message) || ACCOUNT_SECURITY_INTENT.test(message))) {
+      // S618 (Nic): money only. A legal threat no longer forces a handoff —
+      // the agent answers what it can and promises nobody. Account takeover
+      // stays: someone else inside the account is money at risk.
+      if (!nudgedForHardStop && ACCOUNT_SECURITY_INTENT.test(message)) {
         nudgedForHardStop = true
         const kind = LEGAL_ACTION_INTENT.test(message) ? 'a legal dispute' : 'an account-security incident'
         logger.warn({ profile: profile.id, kind }, 'agent runner: hard-stop turn ended without escalation — forcing one retry (safety net)')
@@ -535,10 +794,100 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         })
         continue
       }
+      // ── S618: run the lookup ourselves rather than asking again ────────
+      //
+      // Measured, on the real path, with the phrase table live and the debug
+      // confirming the route resolved and the tool WAS offered on the forced
+      // turn: three of four phrasings of "how often do my tenants pay late"
+      // still came back with no tool call. tool_choice 'required' and the
+      // NAMED form both work in isolation — a three-tool prompt obeys either
+      // every time — and both stop being reliable under the real profile,
+      // which carries ~30 tools and a long system prompt. Forcing has a
+      // ceiling, and asking a fourth time does not move it.
+      //
+      // But by this point we are not guessing. demandsAToolCall says the
+      // question needs data, the model has already declined once, and the
+      // phrase table has named the lookup that answers it. The only thing
+      // still missing is somebody actually calling it — so we call it.
+      //
+      // ONLY for a lookup that takes no arguments from the model. Where the
+      // model must supply a value — which tenant, which unit — it is the only
+      // thing that knows what was meant, and guessing the argument would be
+      // the invention this whole layer exists to prevent. Those keep the
+      // forced-retry path, and measure fine on it (4/4 and 5/5).
+      //
+      // The result is fed back as an ordinary tool result, so the model still
+      // writes the reply out of real data and stays free to call something
+      // else if this was not what the person meant.
+      if (
+        routedTool &&
+        toolInvocations.length === 0 &&
+        demandsAToolCall(message, profile.audience) &&
+        !ranRoutedToolDirectly
+      ) {
+        // Every lookup this wording calls for that needs no argument from the
+        // model. "Is my landlord gonna renew?" runs BOTH the lease and the
+        // renewal tendency, because neither answers it alone.
+        // Runnable = the profile holds it, AND every argument it requires is
+        // either unnecessary or supplied by the wording itself.
+        const runnable = routedTools.filter((name) => {
+          const t = getTool(name)
+          if (!t || !getToolsForProfile(profile).some((pt) => pt.name === name)) return false
+          const req = ((t.parameters as any)?.required ?? []) as string[]
+          if (req.length === 0) return true
+          return req.every((k) => plan.args && plan.args[k] != null && plan.args[k] !== '')
+        })
+        if (runnable.length) {
+          ranRoutedToolDirectly = true
+          const calls: ToolCall[] = runnable.map((name) => {
+            const t = getTool(name)
+            const req = ((t?.parameters as any)?.required ?? []) as string[]
+            const args = req.length && plan.args
+              ? Object.fromEntries(req.map((k) => [k, plan.args![k]]))
+              : {}
+            return {
+              id: `routed_${name}`,
+              type: 'function' as const,
+              function: { name, arguments: JSON.stringify(args) },
+            }
+          })
+          logger.warn({ profile: profile.id, tools: runnable, message },
+            'agent runner: model would not call the lookup — ran it directly from the phrase table')
+          // content: null, DELIBERATELY.
+          //
+          // S618, and this was a real regression caught by the battery. This
+          // used to carry `out.content` — the model's own tool-less reply — into
+          // the conversation ahead of the real result. That reply is precisely
+          // the ungrounded guess we are stepping in to correct: "You have 6
+          // vacant units" when there are 13, "26 units across 4 properties"
+          // against 21 across 3. Handed its own claim and then the true rows,
+          // the model restated the claim and the tools became decoration.
+          //
+          // The assistant turn is the CALL and nothing else, which is also the
+          // ordinary shape of a tool-calling turn. The nudge path below still
+          // keeps the text on purpose — there the model is being shown what it
+          // said in order to correct it — but here the text is not evidence of
+          // anything except the error.
+          messages.push({ role: 'assistant', content: null, tool_calls: calls })
+          for (const call of calls) {
+            const args = parseArgs(call.function.arguments)
+            const result = await executeToolCall(call, profile, actor, args)
+            toolInvocations.push({ name: call.function.name, args, result })
+            messages.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              name: call.function.name,
+              content: JSON.stringify(result),
+            })
+          }
+          forceToolThisTurn = false
+          continue
+        }
+      }
       if (
         !nudgedForAccountData &&
         toolInvocations.length === 0 &&
-        demandsAToolCall(message)
+        demandsAToolCall(message, profile.audience)
       ) {
         nudgedForAccountData = true
         forceToolThisTurn = true
@@ -568,17 +917,26 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       if (
         toolInvocations.length === 0 &&
         nudgedForAccountData &&
-        assertsStoredFacts(out.content)
+        (assertsStoredFacts(out.content) || saysItWillCheck(out.content)
+         || claimsAnActionItNeverTook(out.content))
       ) {
-        logger.error({ profile: profile.id, message },
-          'agent runner: model asserted stored facts with no tool call after a retry — reply suppressed')
-        return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
+        const lied = claimsAnActionItNeverTook(out.content)
+        logger.error({ profile: profile.id, message, claimedAnAction: lied },
+          'agent runner: no tool call after a retry — reply stated, promised or CLAIMED something it never did; suppressed')
+        return {
+          reply: lied ? couldNotDoIt() : cannotSee(String((actor as any).role ?? '')),
+          model, retrieved, grounded, toolInvocations, usage,
+        }
       }
       // S617: the tools DID run, and the model added rows they never returned.
       // Suppress rather than hand a landlord a list with invented properties in
       // it — acting on a fake expiring lease is a real-world mistake.
       if (toolInvocations.length > 0) {
-        const invented = namesNotInToolResults(out.content, toolInvocations.map((t) => t.result))
+        const results = toolInvocations.map((t) => t.result)
+        const invented = [
+          ...namesNotInToolResults(out.content, results),
+          ...countsNotInToolResults(out.content, results),
+        ]
         if (invented.length) {
           // Ask once for the answer again, with the tool output restated. The
           // real rows ARE there — the model padded a short list rather than
@@ -664,10 +1022,16 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // genuine hard stops — a refund, a legal dispute, an account-security
       // incident — do not demand a lookup, and the nets above force THEIR
       // escalation before this point, so none of them are caught here.
+      // S618: ...unless it is a real money problem, which is the one thing
+      // that SHOULD reach a person. Inverting the default in demandsAToolCall
+      // made it true for nearly every message, including "refund please" — so
+      // this guard began intercepting genuine escalations and answering them
+      // with a lookup. A refund is not answerable by any query.
       if (
         handoff && !refusedOneEscalation &&
         toolInvocations.length === 0 &&
-        demandsAToolCall(message)
+        demandsAToolCall(message, profile.audience) &&
+        !needsARealPerson(message)
       ) {
         refusedOneEscalation = true
         logger.warn({ profile: profile.id, message },
@@ -720,13 +1084,20 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   //
   // The ceiling means the model would not look it up. That is precisely when it
   // must not be trusted to state figures.
-  if (toolInvocations.length === 0 && demandsAToolCall(message) && assertsStoredFacts(reply)) {
-    logger.error({ profile: profile.id, message },
-      'agent runner: step ceiling produced figures with no lookup behind them — reply suppressed')
-    reply = cannotSee(String((actor as any).role ?? ''))
+  if (
+    toolInvocations.length === 0 && demandsAToolCall(message, profile.audience) &&
+    (assertsStoredFacts(reply) || saysItWillCheck(reply) || claimsAnActionItNeverTook(reply))
+  ) {
+    const lied = claimsAnActionItNeverTook(reply)
+    logger.error({ profile: profile.id, message, claimedAnAction: lied },
+      'agent runner: step ceiling produced figures, a promise, or a claim with nothing behind it — suppressed')
+    reply = lied ? couldNotDoIt() : cannotSee(String((actor as any).role ?? ''))
   }
 
-  const ceilingHandoff = synthesizeHandoff(profile, reply)
+  // S618: and the same at the ceiling. Where it is NOT a money problem, any
+  // promise of a person is removed from the reply rather than made true.
+  if (!needsARealPerson(message)) reply = stripPromiseOfAPerson(reply)
+  const ceilingHandoff = needsARealPerson(message) ? synthesizeHandoff(profile, reply) : undefined
   if (ceilingHandoff) {
     return { reply, model: model || final.model, retrieved, grounded, toolInvocations, usage, handoff: ceilingHandoff }
   }

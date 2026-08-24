@@ -352,6 +352,44 @@ export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantE
 // a single 'lease_expiring' type. Urgency is in `data.urgent` for consumers
 // that want to differentiate; under S18 the trigger date is per-property
 // expiration_notice_days, not a fixed 60/30-day cron.
+/**
+ * A tenant complained, and the landlord needs it on their list.
+ *
+ * S618 (Nic): "if tenants are gonna complain to the agent, the complaint
+ * generally needs to go to the landlord. That needs to kind of create a task
+ * list for them, things to address — maybe not in the maintenance portal
+ * because it's not a maintenance deal, but it's kind of up there with important
+ * things to take care of."
+ *
+ * IN-PLATFORM ONLY — no email (Nic, S618: "let's not email landlord about
+ * complaints. just in platform."). It appears in the notification bell and on
+ * their list; a complaint is not an emergency and does not belong in an inbox.
+ *
+ * Deliberately quotes the tenant rather than paraphrasing: the landlord should
+ * read what was actually said, and no summary of "my neighbour plays music
+ * until 2am" is better than the sentence itself.
+ */
+export async function notifyTenantComplaint(o: {
+  landlordUserId: string; landlordId: string
+  tenantName: string; unitNumber: string; propertyName: string
+  category: string; about?: string | null; body: string; complaintId: string
+}) {
+  const where = o.about ? ` about ${o.about}` : ''
+  const title = `${o.category} complaint — ${o.unitNumber}`
+  await createNotification({
+    userId: o.landlordUserId,
+    landlordId: o.landlordId,
+    type: 'tenant_complaint',
+    title,
+    body: `${o.tenantName} (${o.unitNumber}, ${o.propertyName})${where}: "${o.body}"`,
+    data: o,
+    actionUrl: `/complaints?open=${o.complaintId}`,
+    // S618 (Nic): "let's not email landlord about complaints. just in platform."
+    // It lands in the bell and on their list; it does not go to their inbox.
+    sendEmail: false,
+  })
+}
+
 export async function notifyLeaseExpiring(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; endDate:string; daysRemaining:number; leaseId:string }) {
   const urgent = o.daysRemaining <= 30
   await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'lease_expiring', title:`${urgent?'⚠️ ':''}Lease Expiring in ${o.daysRemaining} Days — Unit ${o.unitNumber}`, body:`${o.tenantName}'s lease expires ${new Date(o.endDate).toLocaleDateString()}. ${urgent?'Take action soon — check your local notice requirements.':'Take action to renew or send non-renewal.'}`, data:{ ...o, urgent }, actionUrl:`/leases?open=${o.leaseId}`, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`${urgent?'⚠️ URGENT: ':''}Lease Expiring ${o.daysRemaining} Days — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Lease Expiring in ${o.daysRemaining} Days`, `<b>${o.tenantName}'s</b> lease for Unit ${o.unitNumber} expires <b>${new Date(o.endDate).toLocaleDateString()}</b>.${urgent?'<br><br><b style="color:red">Act soon — check your local notice requirements for non-renewal.</b>':''}`) })

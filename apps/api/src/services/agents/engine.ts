@@ -34,7 +34,14 @@ export interface ChatCompletionOptions {
   tools?: ToolSchema[]
   sampler?: Partial<SamplerSettings>
   /** 'required' forces the model to call one of `tools` — see the note below. */
-  toolChoice?: 'auto' | 'required' | 'none'
+  /**
+   * 'required' forces SOME tool. S618 adds the named form —
+   * { type:'function', function:{ name } } — which forces ONE specific tool,
+   * so the phrase table in toolRouting.ts can say WHICH lookup answers a
+   * question instead of leaving the model to pick. Verified honoured by the
+   * local mlx server in both forms.
+   */
+  toolChoice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } }
 }
 
 export interface ChatCompletionOutput {

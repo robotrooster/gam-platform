@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict GWA1t4SaRzPKIdccRfq8KZ1N2OZiucAh8HGg7WgfQThkT8s4705gCcADWXljPeh
+\restrict 7NN6jlsIF7SjAbdkf3v05Setlc1U22rxvUqUP2Uca6npuW8Hgbh58qLT69XBOFI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -337,6 +337,36 @@ BEGIN
     VALUES
       (NEW.id, OLD.sell_price, NEW.sell_price, OLD.cost_price, NEW.cost_price, actor_id);
   END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: occupy_unit_on_active_lease(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.occupy_unit_on_active_lease() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Only a lease that is active AND has actually started occupies a unit. A
+  -- future-dated one has not begun; the nightly reconcile picks it up on the
+  -- day it does.
+  IF NEW.status <> 'active' OR NEW.start_date IS NULL OR NEW.start_date > CURRENT_DATE THEN
+    RETURN NEW;
+  END IF;
+
+  -- Only ever promotes an EMPTY unit. 'delinquent' and 'suspended' are already
+  -- occupied and carry meaning a lease write must not erase; 'owner_use' and
+  -- 'utility_service' cannot hold a lease at all (reject_lease_on_unavailable_unit
+  -- blocks owner_use before this runs), and 'retired' units likewise.
+  UPDATE units
+     SET status = 'active', updated_at = NOW()
+   WHERE id = NEW.unit_id
+     AND status IN ('vacant', 'available')
+     AND retired_at IS NULL;
+
   RETURN NEW;
 END;
 $$;
@@ -698,6 +728,22 @@ CREATE TABLE public.agent_knowledge_chunks (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT agent_knowledge_chunks_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'landlord'::text, 'shared'::text, 'sales'::text])))
+);
+
+
+--
+-- Name: analytics_data_gaps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.analytics_data_gaps (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    audience text DEFAULT 'landlord'::text NOT NULL,
+    tool text NOT NULL,
+    requested text NOT NULL,
+    question text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT analytics_data_gaps_audience_check CHECK ((audience = ANY (ARRAY['landlord'::text, 'tenant'::text, 'guest'::text, 'pm_company'::text])))
 );
 
 
@@ -8075,6 +8121,34 @@ COMMENT ON COLUMN public.tenant_autopay.disarmed_reason IS 'S609: why autopay st
 
 
 --
+-- Name: tenant_complaints; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_complaints (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid,
+    unit_id uuid,
+    property_id uuid,
+    landlord_id uuid NOT NULL,
+    category text NOT NULL,
+    about_unit_id uuid,
+    about_text text,
+    body text NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    source text DEFAULT 'agent_chat'::text NOT NULL,
+    conversation_id text,
+    resolved_at timestamp with time zone,
+    resolution_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_complaints_category_check CHECK ((category = ANY (ARRAY['noise'::text, 'neighbor'::text, 'parking'::text, 'pets'::text, 'smell'::text, 'trash'::text, 'property_condition'::text, 'harassment'::text, 'safety'::text, 'other'::text]))),
+    CONSTRAINT tenant_complaints_source_check CHECK ((source = ANY (ARRAY['agent_chat'::text, 'portal'::text, 'staff'::text]))),
+    CONSTRAINT tenant_complaints_status_check CHECK ((status = ANY (ARRAY['open'::text, 'reviewed'::text, 'resolved'::text, 'dismissed'::text])))
+);
+
+
+--
 -- Name: tenant_credits; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9512,6 +9586,14 @@ ALTER TABLE ONLY public.agent_interaction_logs
 
 ALTER TABLE ONLY public.agent_knowledge_chunks
     ADD CONSTRAINT agent_knowledge_chunks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: analytics_data_gaps analytics_data_gaps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_data_gaps
+    ADD CONSTRAINT analytics_data_gaps_pkey PRIMARY KEY (id);
 
 
 --
@@ -12195,6 +12277,14 @@ ALTER TABLE ONLY public.tenant_autopay
 
 
 --
+-- Name: tenant_complaints tenant_complaints_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_credits tenant_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12791,6 +12881,20 @@ CREATE INDEX idx_adverse_action_notices_landlord ON public.adverse_action_notice
 --
 
 CREATE INDEX idx_adverse_action_notices_tenant ON public.adverse_action_notices USING btree (tenant_user_id, created_at DESC);
+
+
+--
+-- Name: idx_analytics_gaps_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_analytics_gaps_landlord ON public.analytics_data_gaps USING btree (landlord_id);
+
+
+--
+-- Name: idx_analytics_gaps_requested; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_analytics_gaps_requested ON public.analytics_data_gaps USING btree (requested, created_at DESC);
 
 
 --
@@ -15797,6 +15901,34 @@ CREATE INDEX idx_tenant_autopay_tenant ON public.tenant_autopay USING btree (ten
 
 
 --
+-- Name: idx_tenant_complaints_about; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_complaints_about ON public.tenant_complaints USING btree (about_unit_id) WHERE (about_unit_id IS NOT NULL);
+
+
+--
+-- Name: idx_tenant_complaints_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_complaints_landlord ON public.tenant_complaints USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_tenant_complaints_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_complaints_open ON public.tenant_complaints USING btree (landlord_id) WHERE (status = 'open'::text);
+
+
+--
+-- Name: idx_tenant_complaints_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_complaints_tenant ON public.tenant_complaints USING btree (tenant_id);
+
+
+--
 -- Name: idx_tenant_credits_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18065,6 +18197,13 @@ CREATE TRIGGER trg_notification_preferences_updated_at BEFORE UPDATE ON public.n
 
 
 --
+-- Name: leases trg_occupy_unit_on_active_lease; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_occupy_unit_on_active_lease AFTER INSERT OR UPDATE OF status, start_date ON public.leases FOR EACH ROW EXECUTE FUNCTION public.occupy_unit_on_active_lease();
+
+
+--
 -- Name: payments trg_payments_invoice_late_fee_subtotal_rollup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -18160,6 +18299,13 @@ CREATE TRIGGER trg_subleases_updated_at BEFORE UPDATE ON public.subleases FOR EA
 --
 
 CREATE TRIGGER trg_supersede_utility_service_agreement AFTER INSERT OR UPDATE OF status ON public.leases FOR EACH ROW EXECUTE FUNCTION public.supersede_utility_service_agreement();
+
+
+--
+-- Name: tenant_complaints trg_tenant_complaints_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_tenant_complaints_updated_at BEFORE UPDATE ON public.tenant_complaints FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -18296,6 +18442,14 @@ ALTER TABLE ONLY public.agent_interaction_logs
 
 ALTER TABLE ONLY public.agent_interaction_logs
     ADD CONSTRAINT agent_interaction_logs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: analytics_data_gaps analytics_data_gaps_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.analytics_data_gaps
+    ADD CONSTRAINT analytics_data_gaps_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
 
 
 --
@@ -23043,6 +23197,54 @@ ALTER TABLE ONLY public.tenant_autopay
 
 
 --
+-- Name: tenant_complaints tenant_complaints_about_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_about_unit_id_fkey FOREIGN KEY (about_unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_complaints tenant_complaints_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_complaints tenant_complaints_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_complaints tenant_complaints_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_complaints tenant_complaints_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_complaints tenant_complaints_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_complaints
+    ADD CONSTRAINT tenant_complaints_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
 -- Name: tenant_credits tenant_credits_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23958,5 +24160,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict GWA1t4SaRzPKIdccRfq8KZ1N2OZiucAh8HGg7WgfQThkT8s4705gCcADWXljPeh
+\unrestrict 7NN6jlsIF7SjAbdkf3v05Setlc1U22rxvUqUP2Uca6npuW8Hgbh58qLT69XBOFI
 

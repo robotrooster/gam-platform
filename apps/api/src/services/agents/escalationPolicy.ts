@@ -1,0 +1,93 @@
+/**
+ * When may the agent involve a real person? Only for real money.
+ *
+ * S618 (Nic): "any sort of bringing an outside person into the conversation
+ * should only be done if it's real money. If somebody has a problem with
+ * switching bank accounts, switching, getting charged the wrong amount, that
+ * sort of thing, that needs to be escalated to a real person to look into.
+ * Other than that, no promises of talking to a real person or talking to
+ * anybody else."
+ *
+ * The harm being prevented is a promise nobody receives: the customer stops
+ * looking for help and waits for a callback that was never booked. S617
+ * measured the same harm from the other direction — a tenant asked their
+ * balance, got a correct answer, and had it REPLACED with "I've escalated
+ * this, someone will email you within 24 hours."
+ *
+ * Lives in its own module because agentSession needs it too, and
+ * agentSession.test.ts replaces the whole agentRunner module with a mock —
+ * importing it from there made these undefined in every one of those tests.
+ */
+
+/** A demand to move money — refund, double charge, missing payout. */
+export const MONEY_DISPUTE_INTENT =
+  /\brefund\b|double.?charged|charged (me )?twice|overcharged|charge.?back|didn.?t authori[sz]e|(payout|transfer|my money).{0,30}(never|didn'?t|hasn'?t|not) (arrived?|show(ed|n)? up|hit|come)|where('?s| is) my money\b|disput(e|ing|ed).{0,30}(charge|payment|transaction|bank)|(want|get|getting) my money back/i
+
+/** Nic named this one specifically: trouble switching or fixing a bank account. */
+export const BANK_CHANGE_PROBLEM =
+  /\b(bank|account|routing|card)\b[^.?!]{0,40}\b(switch\w*|chang\w+|updat\w+|remov\w+|replac\w+|wrong|incorrect|closed)\b|\b(switch\w*|chang\w+|updat\w+)\b[^.?!]{0,25}\b(bank|bank account|payment method|card|routing)\b/i
+
+/**
+ * Account takeover. Kept deliberately: someone else inside the account is money
+ * at risk, which is the same category. Threats of LEGAL action are not kept —
+ * under this rule the agent answers what it can and promises nobody.
+ */
+export const ACCOUNT_SECURITY_INTENT =
+  /\bhacked\b|hacker|someone (else )?(logged|signed|got) in(to)?|unauthori[sz]ed (access|login)|account (was |got |is )?(compromised|stolen|taken over)|login (alert|attempt).{0,25}(don'?t|did ?n'?t|do not) recognize/i
+
+const HANDOFF_VERB =
+  /\b(transfer(?:ring)?\s+you|connect(?:ing)?\s+you\s+with|put\s+you\s+through|hand(?:ing)?\s+(?:this|you|it)\s+(?:off|up|over)|pass(?:ing)?\s+(?:this|you|it)\s+(?:on|up|along)|bring(?:ing)?\s+in|loop(?:ing)?\s+(?:you\s+)?in)\b/i
+const SUPPORT_TARGET =
+  /\b(senior|supervisor|specialist|strategist|a\s+human|(?:real|live)\s+person|gam\s+support|support\s+(?:team|specialist|strategist|agent|representative)|(?:right|appropriate)\s+(?:team|department|person)|someone\s+(?:who|that)\s+can)\b/i
+
+/**
+ * A threat of legal action. NOT a reason to promise a callback — but not a
+ * reason to say nothing either.
+ *
+ * S618 (Nic): "if there's some sort of legal action mentioned, just have it say
+ * — for assistance, please message support@goldassetmanagement.com to have
+ * someone contact you. That way they have to reach out, not us promising we're
+ * gonna reach out. Anybody that's just blowing smoke isn't gonna bother
+ * reaching out. Anybody that is a little more serious will make the reach out,
+ * and it kind of prefilters some people for us."
+ *
+ * So the agent hands over an address and the customer decides. GAM commits to
+ * nothing it has not scheduled, and the ones who actually matter self-select.
+ */
+export const LEGAL_ACTION_INTENT =
+  /take legal action|legal action against|(talk|speak|spoke) to (a |my )?(lawyer|attorney)|(my|a|an|the) (lawyer|attorney)\b|\bsue\b|\bsuing\b|small claims|press charges|\bcourt\b|\beviction notice\b/i
+
+/** The line to add when someone raises legal action. */
+export const LEGAL_CONTACT_LINE =
+  'For assistance with this, please message support@goldassetmanagement.com and someone will contact you.'
+
+export function mentionsLegalAction(message: string): boolean {
+  return !!message && LEGAL_ACTION_INTENT.test(message)
+}
+
+export function needsARealPerson(message: string): boolean {
+  if (!message) return false
+  return MONEY_DISPUTE_INTENT.test(message)
+    || BANK_CHANGE_PROBLEM.test(message)
+    || ACCOUNT_SECURITY_INTENT.test(message)
+}
+
+/**
+ * Remove a promise of a person from a reply not entitled to make one.
+ *
+ * Keeps every other sentence — the useful part of the answer usually sits in
+ * them, and discarding those is the S617 mistake repeated.
+ */
+export function stripPromiseOfAPerson(reply: string): string {
+  if (!reply) return reply
+  const kept = (reply.match(/[^.!?\n]+[.!?]*/g) ?? [reply]).filter((sentence) => {
+    const promises =
+      /\bescalat\w+/i.test(sentence) ||
+      (HANDOFF_VERB.test(sentence) && SUPPORT_TARGET.test(sentence)) ||
+      /\b(someone|somebody|a (?:team )?member|the team|a rep\w*)\b[^.!?]{0,40}\b(will|to)\b[^.!?]{0,25}\b(get back|reach out|contact|email|call|follow up)\b/i.test(sentence) ||
+      /\b(get back to you|reach out to you|follow up with you)\b/i.test(sentence)
+    return !promises
+  })
+  const out = kept.join('').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+  return out || reply
+}

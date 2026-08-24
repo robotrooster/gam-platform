@@ -19,7 +19,7 @@ import { processMonthlyFeeAccrual } from './monthlyFeeAccrual'
 import {
   cleanupAllSchema,
   seedLandlord, seedManager, seedTenant,
-  seedProperty, seedUnit,
+  seedProperty, seedUnit, seedLease,
   seedAllocationRule,
 } from '../test/dbHelpers'
 
@@ -51,8 +51,12 @@ async function buildManagerStack(opts: {
       landlordId, ownerUserId, managedByUserId: managerUserId,
     })
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-    // Mark unit active (occupied) so the per_unit_fee math counts it.
-    await client.query(`UPDATE units SET status='active' WHERE id=$1`, [unitId])
+    // S618: occupancy for billing is an ACTIVE LEASE covering the month, not
+    // units.status — a late tenant flips the unit to 'delinquent' and used to
+    // drop out of billing entirely. Giving the unit a real lease is now what
+    // makes the per_unit_fee math count it. (The lease also flips the unit to
+    // 'active' via trg_occupy_unit_on_active_lease, which is the point.)
+    await seedLease(client, { unitId, landlordId, rentAmount: 1000 })
 
     // Insert allocation rule directly to set flat/per-unit fees.
     await client.query(

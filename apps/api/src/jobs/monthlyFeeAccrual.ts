@@ -8,7 +8,10 @@
  * time-based.
  *
  * Per-property fee = flat_monthly_fee + (per_unit_fee × occupied_unit_count).
- * Occupied = unit.status='active'. Skipped properties:
+ * Occupied = the unit held an ACTIVE LEASE covering the month — not
+ * unit.status. A late or evicting tenant still occupies the unit and is still
+ * billed (S618, Nic). Same rule as the quote in services/platformFee.ts.
+ * Skipped properties:
  *   - owner-self-managed (owner_user_id === managed_by_user_id)
  *   - both flat and per-unit fees NULL or 0
  *   - resulting fee = 0
@@ -170,12 +173,27 @@ async function accrueOneProperty(propertyId: string, monthIso: string): Promise<
     }
     const prop = propRes.rows[0]
 
-    // Count occupied units (status='active' is the leased/occupied marker
-    // per units_status_check).
+    // Occupied = the unit held an ACTIVE LEASE covering this month.
+    //
+    // S618 (Nic): "no matter their late status or eviction status, we are still
+    // billing the landlord for the occupancy of the unit." This used to count
+    // units.status='active', and a unit flips to 'delinquent' the moment rent is
+    // overdue and nothing ever flips it back — so the first late payment removed
+    // that unit from billing permanently. 'suspended' (eviction) did the same.
+    //
+    // Counting the LEASE also makes the bill agree with the quote: the estimate
+    // in services/platformFee.ts has always counted units this way, so the
+    // number a landlord was shown and the number they were charged came from two
+    // different rules.
     const occRes = await client.query<{ occupied: string }>(
-      `SELECT COUNT(*)::int AS occupied
-         FROM units WHERE property_id=$1 AND status='active'`,
-      [propertyId]
+      `SELECT COUNT(DISTINCT l.unit_id)::int AS occupied
+         FROM leases l JOIN units u ON u.id = l.unit_id
+        WHERE u.property_id = $1
+          AND l.status = 'active'
+          AND u.retired_at IS NULL
+          AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
+          AND (l.end_date IS NULL OR l.end_date >= $2::date)`,
+      [propertyId, monthIso]
     )
     const occupied = parseInt(occRes.rows[0].occupied, 10)
     const flat = parseFloat(prop.flat_monthly_fee ?? '0')
@@ -310,11 +328,18 @@ async function accruePmCompanyFee(
       )
     }
 
-    // Occupied unit count (status='active' is the leased/occupied marker)
+    // Occupied = an active lease covering this month. Same rule as
+    // accrueOneProperty above and as the quote in services/platformFee.ts —
+    // late and evicting tenants still occupy the unit and are still billed.
     const occRes = await client.query<{ occupied: string }>(
-      `SELECT COUNT(*)::int AS occupied
-         FROM units WHERE property_id=$1 AND status='active'`,
-      [propertyId]
+      `SELECT COUNT(DISTINCT l.unit_id)::int AS occupied
+         FROM leases l JOIN units u ON u.id = l.unit_id
+        WHERE u.property_id = $1
+          AND l.status = 'active'
+          AND u.retired_at IS NULL
+          AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
+          AND (l.end_date IS NULL OR l.end_date >= $2::date)`,
+      [propertyId, monthIso]
     )
     const occupied = parseInt(occRes.rows[0].occupied, 10)
 

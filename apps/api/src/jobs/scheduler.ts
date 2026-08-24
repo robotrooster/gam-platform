@@ -91,6 +91,30 @@ export async function activatePendingLeases() {
       await query(`UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`, [l.unit_id])
       logger.info(`[LeaseActivate] pending lease ${l.id} reached start date — now active (unit ${l.unit_id})`)
     }
+
+    // S618: the same sweep for a lease that was created ALREADY ACTIVE but
+    // future-dated. The trigger added in 20260823120000 occupies the unit when
+    // such a lease is written, but a lease starting next month is correctly
+    // skipped then — and nothing rewrites that row on the day it starts, so no
+    // trigger ever fires again. This is what closes that day.
+    //
+    // It doubles as the drift reconcile: any started, active lease whose unit
+    // still reads empty gets corrected here, whatever wrote it. Only ever
+    // promotes vacant/available — 'delinquent' and 'suspended' are already
+    // occupied and must keep their meaning.
+    const occupied = await query<any>(`
+      UPDATE units u
+         SET status='active', updated_at=NOW()
+       WHERE u.status IN ('vacant','available')
+         AND u.retired_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM leases l
+            WHERE l.unit_id = u.id AND l.status='active'
+              AND l.start_date IS NOT NULL AND l.start_date <= CURRENT_DATE)
+      RETURNING u.id`)
+    if (occupied.length) {
+      logger.info(`[LeaseActivate] occupied ${occupied.length} unit(s) holding a started active lease but still marked empty`)
+    }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] activate pending leases') }
 }
 

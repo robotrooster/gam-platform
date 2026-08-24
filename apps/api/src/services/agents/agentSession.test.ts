@@ -31,6 +31,7 @@ vi.mock('./turnBudget', async (importOriginal) => ({
 import { runAgentWithTools } from './agentRunner'
 import { logInteraction } from './logInteraction'
 import { runAgentSession } from './agentSession'
+import { RetryableEndpointError } from './endpointPool'
 import type { AgentActor } from './tools/types'
 
 const ACTOR: AgentActor = { userId: 'u1', role: 'tenant', profileId: 't1' }
@@ -111,14 +112,27 @@ describe('runAgentSession', () => {
     }
   })
 
-  it('injects cross-session memory into the model context on a fresh conversation', async () => {
+  // S618 (Nic): "we should just get rid of cross session memory." It also
+  // measured worse — the same five questions scored 1/5 with it and 2/5
+  // without, because telling the model "this person recently asked about their
+  // balance" made it less likely to actually look the balance up.
+  it('does NOT drag prior conversations into a fresh one', async () => {
     loadUserContextMock.mockResolvedValueOnce('RETURNING CUSTOMER — recent: asked about deposit')
-    mockRun.mockResolvedValueOnce(answer('Welcome back!'))
+    mockRun.mockResolvedValueOnce(answer('Hello.'))
     await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'hi again' })
 
-    expect(loadUserContextMock).toHaveBeenCalledWith('u1', undefined)
+    expect(loadUserContextMock).not.toHaveBeenCalled()
     const history = mockRun.mock.calls[0][0].history
-    expect(history.some((m: any) => m.role === 'system' && /RETURNING CUSTOMER/.test(m.content))).toBe(true)
+    expect(history.some((m: any) => /RETURNING CUSTOMER/.test(String(m.content)))).toBe(false)
+  })
+
+  // The CURRENT conversation still carries — nobody repeats themselves inside
+  // one chat. Only last week's questions are gone.
+  it('still carries the current conversation', async () => {
+    mockRun.mockResolvedValueOnce(answer('Sure.'))
+    const history = [{ role: 'user' as const, content: 'my sink leaks' }]
+    await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'any update?', history })
+    expect(mockRun.mock.calls[0][0].history.some((m: any) => /sink leaks/.test(String(m.content)))).toBe(true)
   })
 
   it('does NOT use a curated answer mid-conversation (history present)', async () => {
@@ -212,5 +226,51 @@ describe('runAgentSession', () => {
     const res = await runAgentSession({ audience: 'landlord', actor: { ...ACTOR, role: 'landlord' }, message: 'payout?' })
     expect(res.escalations).toEqual([{ from: 'David', to: 'Sonny', reason: 'complex payout question' }])
     expect(res.handledBy).toEqual({ name: 'Sonny', tier: 'escalation' })
+  })
+
+  // ── S618: the model going down must not reach the customer ─────────────
+  //
+  // It used to. The error rethrew, the route called next(e), and a tenant who
+  // asked what they owed got HTTP 500 carrying "LLM endpoint unreachable at
+  // http://localhost:8080/v1". 88 of those were logged in a single hour on
+  // 2026-08-23, and the machine it runs on is the reason §0 of the S618
+  // handoff exists.
+  describe('when the model is unreachable', () => {
+    it('answers in plain language instead of throwing the internal error', async () => {
+      mockRun.mockRejectedValueOnce(
+        new RetryableEndpointError('LLM endpoint unreachable at http://localhost:8080/v1')
+      )
+
+      const res = await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'how much do I owe?' })
+
+      expect(res.reply).toBeTruthy()
+      // Nothing internal reaches the person typing.
+      expect(res.reply).not.toMatch(/localhost|endpoint|unreachable|LLM|8080|error/i)
+      // And it must not claim a handoff that never happened.
+      expect(res.reply).not.toMatch(/escalat|someone will|24 hours/i)
+      expect(res.escalations).toEqual([])
+    })
+
+    it('still records it as an error so monitoring sees the truth', async () => {
+      mockRun.mockRejectedValueOnce(
+        new RetryableEndpointError('LLM endpoint unreachable at http://localhost:8080/v1')
+      )
+
+      await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'how much do I owe?' })
+
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ outcomeError: expect.stringContaining('unreachable') })
+      )
+    })
+
+    it('still throws for any OTHER failure — a real bug stays loud', async () => {
+      mockRun.mockRejectedValueOnce(new Error('column "foo" does not exist'))
+
+      await expect(
+        runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'how much do I owe?' })
+      ).rejects.toThrow(/column "foo"/)
+    })
   })
 })

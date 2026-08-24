@@ -425,9 +425,18 @@ describe('POST /api/units/:id/activate', () => {
     await db.query(`UPDATE units SET status='vacant', rent_amount=1500 WHERE id=$1`, [f.unitId])
     // Seed an active lease so the active-lease check passes. Minimal
     // schema columns (no tenant link required for the activation check).
+    //
+    // S618: start date is in the FUTURE, deliberately. A lease that has
+    // already started now marks its unit occupied
+    // (trg_occupy_unit_on_active_lease, migration 20260823120000), so the old
+    // CURRENT_DATE version left the unit 'active' and the route answered
+    // "Unit is already active" before it ever reached the scheduledFor check.
+    // The route's active-lease test has no start-date condition, so a lease
+    // starting next month satisfies it while the unit stays vacant — which is
+    // also the real scenario for scheduling an activation.
     await db.query(
       `INSERT INTO leases (unit_id, landlord_id, start_date, lease_type, rent_amount, status)
-       VALUES ($1, $2, CURRENT_DATE, 'month_to_month', 1500, 'active')`,
+       VALUES ($1, $2, CURRENT_DATE + INTERVAL '30 days', 'month_to_month', 1500, 'active')`,
       [f.unitId, f.landlordId])
 
     const res = await request(buildApp())
