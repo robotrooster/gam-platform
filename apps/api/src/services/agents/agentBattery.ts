@@ -33,6 +33,15 @@
  * hit my limit for our conversations today" — which then scores as a failure
  * when it is nothing of the kind. The landlord allowance derives from this one.
  */
+// S620: same cap-raising as agentConversations.ts. The battery has been
+// sheltered by the answer cache (checked BEFORE the budget), which means it
+// has been partly measuring cache hits rather than the agent on repeat runs.
+// Raising the cap makes the run honest either way.
+process.env.AGENT_TENANT_DAILY_TURNS ||= '100000'
+process.env.AGENT_LANDLORD_TURNS_PER_UNIT ||= '100000'
+process.env.AGENT_TENANT_DAILY_OFFTOPIC ||= '100000'
+process.env.AGENT_LANDLORD_DAILY_OFFTOPIC ||= '100000'
+
 import { randomUUID } from 'crypto'
 import { runAgentSession } from './agentSession'
 import { query } from '../../db'

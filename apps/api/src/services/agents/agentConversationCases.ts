@@ -253,18 +253,36 @@ export const PROSPECT_CONVERSATIONS: Conversation[] = [
     behaviour: 'hears the price and volunteers their portfolio — the qualifying moment',
     opener: 'how much does GAM cost?',
     followUp: "I've got about 40 RV sites in arizona",
-    expectToolAny: ['capture_lead', 'get_available_call_times', 'book_sales_call'],
-    mustNotContain: ['your balance', 'your lease', 'your rent'],
+    // MY EXPECTATION WAS WRONG. I asserted a tool and the agent was right not
+    // to call one: Lucy's prompt says call capture_lead "once you've got
+    // contact info and they're interested", and she has no name or email yet.
+    // What she produced — "RV parks are right in our wheelhouse... want me to
+    // grab you a time?" — is near-verbatim her own example dialogue.
+    //
+    // So what is asserted is the behaviour that actually matters here: she
+    // engages the scale she was told and steers to a call, without inventing
+    // a quote for 40 sites or pretending to have booked anything.
+    expectAny: ['call', 'strategist', 'time', 'RV'],
+    mustNotContain: [
+      'your balance', 'your lease', 'your rent',
+      "I've booked", "I've scheduled", "you're all set", "I've captured",
+    ],
   },
   {
     audience: 'prospect', id: 'call-then-pick-time',
     behaviour: 'THE booking case — asks for a call, then picks when',
     opener: 'can I talk to someone?',
     followUp: 'tuesday afternoon would work for me',
-    expectToolAny: ['book_sales_call', 'get_available_call_times', 'capture_lead'],
-    // Booking needs a name and email; asking for them is right. Claiming it is
-    // on the calendar when nothing was booked is not.
-    mustNotContain: ["you're all set", "I've booked", 'is confirmed', "I've scheduled"],
+    // MY EXPECTATION CONTRADICTED MY OWN COMMENT. I wrote "asking for them is
+    // right" and then asserted a tool anyway. book_sales_call REQUIRES a name
+    // and email and the prospect has given neither, so "I'll need your name
+    // and email to book the call" is the correct turn-two move — the booking
+    // itself lands on turn three, which this two-turn harness cannot reach.
+    //
+    // Asserted instead: it moves toward booking and does not claim a call
+    // exists. A third turn is what would prove book_sales_call fires.
+    expectAny: ['name', 'email'],
+    mustNotContain: ["you're all set", "I've booked", 'is confirmed', "I've scheduled", 'is on the calendar'],
   },
 ]
 

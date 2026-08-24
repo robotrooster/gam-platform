@@ -20,6 +20,27 @@
  *
  * RUN IT ALONE — two loads on the 36B kills it and produces meaningless scores.
  */
+// S620: RAISE THE ABUSE CAP FOR THE HARNESS, before anything imports the
+// budget config. The daily turn budget is 60 productive turns for a tenant and
+// max(60, 7.5 x occupied units) for a landlord — sized for one human, and this
+// suite plus the battery burn hundreds through the same two demo accounts.
+//
+// The first full run scored 9/19 and EIGHT of those failures were this: every
+// tenant and landlord turn came back "I've hit my limit for our conversations
+// today". Nothing to do with the agents.
+//
+// Why it hit here and not the battery: the budget is checked AFTER the answer
+// cache on purpose ("cached answers cost nothing"), and the battery sends no
+// history so it is cache-eligible. Turn two ALWAYS carries history, so it can
+// never be served from cache and always reaches the budget check.
+//
+// Raised, not bypassed — the real check still runs, so a genuine budget
+// regression would still surface.
+process.env.AGENT_TENANT_DAILY_TURNS ||= '100000'
+process.env.AGENT_LANDLORD_TURNS_PER_UNIT ||= '100000'
+process.env.AGENT_TENANT_DAILY_OFFTOPIC ||= '100000'
+process.env.AGENT_LANDLORD_DAILY_OFFTOPIC ||= '100000'
+
 import { runAgentSession } from './agentSession'
 import { query, queryOne } from '../../db'
 import { buildTestActors } from './agentActors'
@@ -35,6 +56,38 @@ function asksAgain(text: string): boolean {
   // A question is fine if the answer came WITH it ("that's $2,330 — different
   // Chen?"). It is only a failure when nothing was answered at all.
   return !/\$[\d,]+|\b\d{2,}\b/.test(t)
+}
+
+/**
+ * Did turn two just re-read turn one?
+ *
+ * S620, and the biggest thing this suite found. 5 of 19 conversations came
+ * back with the second reply repeating the first almost word for word — a
+ * tenant who said "no thanks, I'll sort it out myself later" got the entire
+ * balance breakdown read at them again, and one who said "yes please, go
+ * ahead" was told "I've filed a maintenance request for you" a second time
+ * (having also filed a second request).
+ *
+ * THREE OF THOSE FIVE PASSED every other assertion. Tools fired, no forbidden
+ * phrase appeared — and the reply was still useless, because it answered the
+ * previous question. Nothing in the guard chain looks across turns:
+ * collapseRepetition dedupes lines WITHIN one reply and has no idea what was
+ * said a moment ago.
+ *
+ * Measured as a shared prefix rather than equality: the repeats are not
+ * byte-identical, they trail off differently or append a clause ("...until the
+ * entire balance is settled"). A long identical OPENING is the signal.
+ */
+function repeatsTurnOne(turn1: string, turn2: string): boolean {
+  const a = turn1.replace(/\s+/g, ' ').trim()
+  const b = turn2.replace(/\s+/g, ' ').trim()
+  if (!a || !b) return false
+  if (a === b) return true
+  let i = 0
+  while (i < Math.min(a.length, b.length) && a[i] === b[i]) i++
+  // 60 chars of identical opening, or half of the shorter reply — whichever is
+  // the weaker bar — is well past coincidence for two different questions.
+  return i >= 60 || i >= Math.min(a.length, b.length) * 0.5
 }
 
 interface Result { conv: Conversation; flags: string[]; turn1: string; turn2: string; tools2: string[] }
@@ -73,6 +126,9 @@ async function runConversation(conv: Conversation, actor: any): Promise<Result> 
   if (said.length) flags.push(`SAID(${said.join(', ')})`)
   if (conv.mustNotAskAgain && asksAgain(turn2)) flags.push('ASKED_AGAIN')
   if (!turn2.trim()) flags.push('EMPTY')
+  // Applies to EVERY conversation — no case has to opt in. Answering the
+  // previous question is a failure whatever else the reply got right.
+  if (repeatsTurnOne(turn1, turn2)) flags.push('REPEATS_TURN_1')
 
   return { conv, flags, turn1, turn2, tools2 }
 }
