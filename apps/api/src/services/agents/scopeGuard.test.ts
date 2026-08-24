@@ -334,3 +334,16 @@ describe('stripChatMarkdown — run-on bullet lists', () => {
     expect(stripChatMarkdown(n)).toBe(n)
   })
 })
+
+describe('stripChatMarkdown — run-on list that is ALSO bolded', () => {
+  it('handles the exact live reply: bold labels with no line breaks', () => {
+    // The real production text. The first version of the run-on rule ran
+    // BEFORE the bold strip, so the lookahead saw "*" and matched nothing —
+    // while a unit test written without the asterisks passed happily.
+    const out = stripChatMarkdown(
+      'The rates are as follows:- **Pull-through 50 amp**: $65 per night- **Back-in 30 amp**: $48 per night')
+    expect(out).toContain('\n• Pull-through 50 amp: $65 per night')
+    expect(out).toContain('\n• Back-in 30 amp: $48 per night')
+    expect(out).not.toContain('**')
+  })
+})
