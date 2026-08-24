@@ -81,8 +81,32 @@ export const requestBookingChange: AgentTool = {
     // (bookings + active leases + pending tenants). 'other' requests are
     // unstructured, so they stay host-decided. Dates are day-granular; slice
     // defends against ISO-timestamp serialization (gam-dates rule).
-    const dayOnly = (d: string) => String(d).slice(0, 10)
-    const addDays = (d: string, n: number) => {
+    // S620: `dayOnly` used to be String(d).slice(0,10), which assumed these
+    // came back as ISO STRINGS. They do not — pg hands back a `date` column as
+    // a JavaScript Date, so String(d) is "Fri Jul 10 2026 00:00:00 GMT-0700"
+    // and slicing it gives "Fri Jul 10". addDays then built
+    // new Date("Fri Jul 10T00:00:00Z") — Invalid Date — and toISOString threw
+    // RangeError for EVERY structured change type.
+    //
+    // Consequence: the S552 auto-approval path ("schedule-permitting changes
+    // apply AUTOMATICALLY") could never run. A guest asking for an extra night
+    // — which is more money for the landlord — got "I couldn't get that extra
+    // night for you right now." Found by the two-turn harness; invisible on
+    // turn one because the tool only fires once the guest gives specifics.
+    //
+    // LOCAL parts, not toISOString(). pg builds the Date at LOCAL midnight for
+    // a date column, so local getters return exactly the stored day in any
+    // timezone. toISOString() would be correct only at or west of UTC and
+    // would silently shift the day back on a UTC+ host — which matters,
+    // because the database is moving off this Mac to a droplet.
+    const pad2 = (n: number) => String(n).padStart(2, '0')
+    const dayOnly = (d: string | Date): string => {
+      if (d instanceof Date) {
+        return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+      }
+      return String(d).slice(0, 10)
+    }
+    const addDays = (d: string | Date, n: number): string => {
       const t = new Date(`${dayOnly(d)}T00:00:00Z`)
       t.setUTCDate(t.getUTCDate() + n)
       return t.toISOString().slice(0, 10)
