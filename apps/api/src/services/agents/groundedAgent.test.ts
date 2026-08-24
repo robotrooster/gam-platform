@@ -63,8 +63,10 @@ describe('groundedAnswer', () => {
     const profile = requireProfile('tenant_entry')
     const res = await groundedAnswer({ profile, message: 'when is rent due?' })
 
-    // retrieved with the tenant profile's scopes
-    expect(retrieveSpy).toHaveBeenCalledWith(['tenant', 'shared'], 'when is rent due?', 5)
+    // retrieved with the tenant profile's scope — ONE slice, no shared pool
+    // (S620). A second scope here would mean another audience's articles are
+    // reachable by similarity.
+    expect(retrieveSpy).toHaveBeenCalledWith(['tenant'], 'when is rent due?', 5)
     // engine got the context block built from the chunk
     const runArg = runSpy.mock.calls[0][0]
     expect(runArg.contextBlock).toContain('Due on the 1st.')

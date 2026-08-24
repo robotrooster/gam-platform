@@ -42,11 +42,17 @@ describe('agent profile registry', () => {
     }
   })
 
-  it('scopes knowledge per audience (tenant/landlord + shared)', () => {
-    expect(requireProfile('tenant_entry').knowledgeScopes).toEqual(['tenant', 'shared'])
-    expect(requireProfile('tenant_escalation').knowledgeScopes).toEqual(['tenant', 'shared'])
-    expect(requireProfile('landlord_entry').knowledgeScopes).toEqual(['landlord', 'shared'])
-    expect(requireProfile('landlord_escalation').knowledgeScopes).toEqual(['landlord', 'shared'])
+  // S620: ONE scope per audience and no shared pool. Every profile is asserted
+  // here, not just the four CS ones — the guest and visitor agents are exactly
+  // the ones that used to read nothing but tenant-voiced account articles.
+  it('gives every profile exactly one knowledge scope, matching its audience', () => {
+    expect(requireProfile('tenant_entry').knowledgeScopes).toEqual(['tenant'])
+    expect(requireProfile('tenant_escalation').knowledgeScopes).toEqual(['tenant'])
+    expect(requireProfile('landlord_entry').knowledgeScopes).toEqual(['landlord'])
+    expect(requireProfile('landlord_escalation').knowledgeScopes).toEqual(['landlord'])
+    expect(requireProfile('sales_entry').knowledgeScopes).toEqual(['sales'])
+    expect(requireProfile('guest_entry').knowledgeScopes).toEqual(['guest'])
+    expect(requireProfile('visitor_entry').knowledgeScopes).toEqual(['visitor'])
   })
 
   it('covers both audiences at both tiers (CS)', () => {

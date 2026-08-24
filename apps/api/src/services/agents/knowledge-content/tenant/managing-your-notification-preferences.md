@@ -1,5 +1,6 @@
 ---
 scope: tenant
+canonical: notification-preferences
 title: Managing your notification preferences
 ---
 GAM keeps you in the loop about your rental — payment reminders, maintenance updates, messages from your landlord, and more. You decide how each kind of notification reaches you, so you hear about what matters without the noise you don't want.

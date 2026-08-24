@@ -53,8 +53,28 @@ export type AgentTier = (typeof AGENT_TIERS)[number]
 
 /** Knowledge slices a profile's retrieval may pull from. Single source
  *  for the `scope` CHECK in the agent_knowledge_store migration — keep
- *  the two in sync. 'shared' is content both audiences see. */
-export const KNOWLEDGE_SCOPES = ['tenant', 'landlord', 'shared', 'sales'] as const
+ *  the two in sync.
+ *
+ *  S620 (Nic): "maybe we make them separate things and knowledge bases
+ *  completely." ONE scope per audience and NO shared pool — every profile
+ *  reads exactly one slice, so a tenant agent cannot retrieve a booking or
+ *  marketing chunk by similarity no matter how the question is worded.
+ *
+ *  'shared' is GONE, and removing it was the point. Six articles lived there
+ *  and every profile read all six, including the two that have no account at
+ *  all: the guest and site-visitor agents' ONLY knowledge was password resets,
+ *  two-factor setup and "your landlord sets your rent" — written in tenant
+ *  voice, retrieved for people with no password, no landlord and no lease.
+ *  The recorded cost of one pool is on the other side too: a landlord was told
+ *  a nightly booking cost 5% when it had been 3% since S616, from one stale
+ *  article every audience could reach.
+ *
+ *  The universal facts that genuinely apply to more than one audience are now
+ *  DUPLICATED, one copy per scope in that audience's voice, tied together by a
+ *  `canonical:` key in the article frontmatter. knowledgeSilo.test.ts asserts
+ *  the copies agree on every figure and that no copy is missing — duplication
+ *  without a drift check is how the 5% article happened. */
+export const KNOWLEDGE_SCOPES = ['tenant', 'landlord', 'sales', 'guest', 'visitor'] as const
 export type KnowledgeScope = (typeof KNOWLEDGE_SCOPES)[number]
 
 /**

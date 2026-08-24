@@ -1,5 +1,6 @@
 ---
 scope: tenant
+canonical: account-security
 title: Resetting your password and keeping your account secure
 ---
 Forgot your password, or just want to refresh it? You can reset it yourself in a few steps, and a little routine care keeps your GAM account safe.

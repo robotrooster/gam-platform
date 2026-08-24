@@ -7,7 +7,7 @@
  * sentence reaches for being an AI as the excuse AND names whose feature it is.
  */
 import { describe, it, expect } from 'vitest'
-import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery } from './scopeGuard'
+import { scrubScopeLeaks, stripChatMarkdown, collapseRepetition, stripToolMachinery, stripCitationMarkers } from './scopeGuard'
 
 describe('scrubScopeLeaks (S617)', () => {
   it('removes the exact sentence the model kept producing', () => {
@@ -183,5 +183,63 @@ describe('stripToolMachinery — a tool call is never a reply (S617)', () => {
 
   it('runs as part of the reply tail', () => {
     expect(scrubScopeLeaks('Checking.\n<call name="get_my_lease"></call>').reply).toBe('Checking.')
+  })
+})
+
+// ── S619: citation spam ──────────────────────────────────────────────────
+// The one battery failure across 145 phrasings: asked what they were paying,
+// the model emitted footnote markers and no answer. assertsStoredFacts caught
+// bracketed WORDS and not bracketed NUMBERS, so it shipped.
+describe('stripCitationMarkers', () => {
+  it('removes a run of numeric markers', () => {
+    expect(stripCitationMarkers('[1], [2], [3], [4]')).toBe('')
+  })
+
+  it('keeps the prose and drops only the markers', () => {
+    expect(stripCitationMarkers('Your rent is $1,200 [1] and it is due on the 3rd [2].'))
+      .toBe('Your rent is $1,200 and it is due on the 3rd.')
+  })
+
+  it('handles grouped and footnote forms', () => {
+    expect(stripCitationMarkers('Late fees kick in after 5 days [1, 2] [^3].'))
+      .toBe('Late fees kick in after 5 days.')
+  })
+
+  it('leaves bracketed WORDS alone — those are not citations', () => {
+    // A real reply may legitimately bracket a qualifier; only all-digit
+    // groups are citation machinery.
+    expect(stripCitationMarkers('That is Bob Chen [Apt 101] — different Chen?'))
+      .toBe('That is Bob Chen [Apt 101] — different Chen?')
+  })
+
+  it('leaves an ordinary reply untouched', () => {
+    const plain = "You're all paid up through August. Want the receipt?"
+    expect(stripCitationMarkers(plain)).toBe(plain)
+  })
+})
+
+describe('scrubScopeLeaks — a reply that is only machinery', () => {
+  it('replaces citation-only output rather than sending it', () => {
+    const res = scrubScopeLeaks('[1], [2], [3], [4], [5]')
+    expect(res.removed).toContain('machinery-only-reply')
+    expect(res.reply).toMatch(/ask me once more/i)
+    expect(res.reply).not.toMatch(/\[\d/)
+  })
+
+  it('replaces a reply that was nothing but a written-out tool call', () => {
+    const res = scrubScopeLeaks('<call name="get_my_lease"></call>')
+    expect(res.removed).toContain('machinery-only-reply')
+    expect(res.reply).toMatch(/ask me once more/i)
+  })
+
+  it('does NOT fire when real prose survives alongside the markers', () => {
+    const res = scrubScopeLeaks('Your balance is $340 [1].')
+    expect(res.removed).not.toContain('machinery-only-reply')
+    expect(res.reply).toBe('Your balance is $340.')
+  })
+
+  it('does not fire on an empty reply (nothing was there to lose)', () => {
+    const res = scrubScopeLeaks('')
+    expect(res.removed).toHaveLength(0)
   })
 })

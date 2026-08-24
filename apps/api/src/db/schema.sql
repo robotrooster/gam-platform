@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 7NN6jlsIF7SjAbdkf3v05Setlc1U22rxvUqUP2Uca6npuW8Hgbh58qLT69XBOFI
+\restrict B3sJ5VoZe3v4DvGl9vB5qN8dsgABbiQrMuB4fKiY0DTt6JNtlgkWZw9aHEJx0g2
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -727,7 +727,7 @@ CREATE TABLE public.agent_knowledge_chunks (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT agent_knowledge_chunks_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'landlord'::text, 'shared'::text, 'sales'::text])))
+    CONSTRAINT agent_knowledge_chunks_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'landlord'::text, 'sales'::text, 'guest'::text, 'visitor'::text])))
 );
 
 
@@ -24160,5 +24160,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 7NN6jlsIF7SjAbdkf3v05Setlc1U22rxvUqUP2Uca6npuW8Hgbh58qLT69XBOFI
+\unrestrict B3sJ5VoZe3v4DvGl9vB5qN8dsgABbiQrMuB4fKiY0DTt6JNtlgkWZw9aHEJx0g2
 

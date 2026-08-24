@@ -145,10 +145,72 @@ export function stripToolMachinery(text: string): string {
     .trim()
 }
 
+/**
+ * Numeric citation markers — machinery wearing the shape of a footnote.
+ *
+ * S619 measured exactly one battery failure across 145 phrasings, and it was
+ * this: asked "what am I paying for this", the model replied with
+ *
+ *   [1], [2], [3], [4], [5]
+ *
+ * and nothing else. Not a wrong answer — no answer, in a syntax the chat window
+ * renders literally. The same intent had passed 4/4 the same morning, so it is
+ * a degenerate GENERATION rather than a logic bug, and no amount of prompting
+ * removes the tail of a quantized model's distribution.
+ *
+ * assertsStoredFacts already caught bracketed WORDS ([get_my_lease.endsAt]) and
+ * missed bracketed NUMBERS, because its pattern requires a leading lowercase
+ * letter. It also only runs when no tool ran — but a reply can be citation spam
+ * whether or not a lookup succeeded, so this belongs on every reply instead.
+ *
+ * Markers are STRIPPED, not judged: the retrieval layer has no citation UI, so
+ * "[2]" is never meaningful to a customer. When real prose surrounds them the
+ * prose survives and only the markers go. When nothing is left, the caller
+ * substitutes a plain line — see scrubScopeLeaks.
+ *
+ * Narrow on purpose: only bracket groups whose ENTIRE contents are digits and
+ * separators. "[due on the 3rd]" and "[Apt 101]" are untouched.
+ */
+export function stripCitationMarkers(text: string): string {
+  if (!text) return text
+  return text
+    // [1] · [12] · [1,2] · [1, 2, 3] · [1-3] — and runs of them
+    .replace(/\[\s*\d+(?:\s*[,;&–—-]\s*\d+)*\s*\]/g, '')
+    // [^1] footnote-reference form
+    .replace(/\[\s*\^\s*\d+\s*\]/g, '')
+    // the separators left stranded between removed markers: ", , ," / " · · "
+    .replace(/(?:^|\n)[\s,;·•]+(?=\n|$)/g, '')
+    .replace(/\s+([,.;!?])/g, '$1')
+    .replace(/([,;])\s*(?=[,;])/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/** Does a reply still say anything once the machinery is out?
+ *
+ *  ONE real word is the floor, deliberately. An earlier draft required three
+ *  and swallowed "Checking." — a one-word reply is a poor answer but it is a
+ *  reply, and a different guard (saysItWillCheck) is the one that owns it.
+ *  This function answers only "is there anything here at all". */
+function hasWords(text: string): boolean {
+  return /[A-Za-z]{2,}/.test(text)
+}
+
+/** Was there machinery in this text to begin with? Gates the substitution
+ *  below so it can only ever fire on a reply that CONTAINED machinery — never
+ *  on a terse but legitimate one ("Yes.", "$340."). */
+function containedMachinery(text: string): boolean {
+  return /\[\s*\^?\s*\d/.test(text) || stripToolMachinery(text) !== text
+}
+
 export interface ScrubResult {
   reply: string
   removed: string[]
 }
+
+const MACHINERY_ONLY_FALLBACK =
+  "Sorry — that came out garbled on my end. Ask me once more and I'll get it right."
 
 /**
  * Strip give-away sentences from an agent reply.
@@ -159,7 +221,19 @@ export interface ScrubResult {
  */
 export function scrubScopeLeaks(reply: string): ScrubResult {
   if (!reply) return { reply, removed: [] }
-  reply = collapseRepetition(stripChatMarkdown(stripToolMachinery(reply)))
+  const before = reply
+  reply = collapseRepetition(stripChatMarkdown(stripToolMachinery(stripCitationMarkers(reply))))
+
+  // S619: the cleaners above take out machinery, not answers — so a reply that
+  // CONTAINED machinery and has no words left once it is gone WAS the
+  // machinery. That covers the citation-spam case ("[1], [2], [3]" and nothing
+  // else) and any future wrapper arriving as a whole message rather than
+  // embedded in one. Sending the empty string strands the customer with a blank
+  // bubble; sending the markers is worse. Ask them to say it again.
+  if (containedMachinery(before) && !hasWords(reply)) {
+    return { reply: MACHINERY_ONLY_FALLBACK, removed: ['machinery-only-reply'] }
+  }
+
   const removed: string[] = []
   const kept = sentences(reply).filter((s) => {
     const hit = LEAK_PATTERNS.find((p) => p.re.test(s))

@@ -7,7 +7,8 @@
  *
  * Article format (frontmatter delimited by --- lines):
  *   ---
- *   scope: tenant            # tenant | landlord | shared
+ *   scope: tenant            # tenant | landlord | sales | guest | visitor
+ *   canonical: what-is-gam   # optional — groups per-audience copies of one fact
  *   title: Paying your rent
  *   ---
  *   <markdown body...>
@@ -29,10 +30,17 @@ process.env.EMBEDDINGS_MODEL ||= 'bge-large-en-v1.5'
 
 const CONTENT_ROOT = join(__dirname, 'knowledge-content')
 
-interface ParsedArticle {
+export interface ParsedArticle {
   scope: KnowledgeScope
   title: string
   body: string
+  /** S620: groups the per-audience COPIES of one universal fact. With no
+   *  shared scope, an article that applies to more than one audience is
+   *  duplicated in each audience's voice; this key ties the copies together so
+   *  knowledgeSilo.test.ts can assert they still agree on every figure and
+   *  that none has gone missing. Absent on articles that belong to exactly one
+   *  audience, which is most of them. */
+  canonical?: string
 }
 
 /** Parse a tiny `--- key: value --- body` frontmatter article. */
@@ -47,7 +55,7 @@ export function parseArticle(raw: string): ParsedArticle {
   const scope = front.scope as KnowledgeScope
   if (!KNOWLEDGE_SCOPES.includes(scope)) throw new Error(`invalid scope: ${front.scope}`)
   if (!front.title) throw new Error('missing title')
-  return { scope, title: front.title, body: m[2].trim() }
+  return { scope, title: front.title, body: m[2].trim(), canonical: front.canonical || undefined }
 }
 
 function walk(dir: string): string[] {
@@ -73,8 +81,11 @@ async function main() {
     const source = relative(CONTENT_ROOT, file)
     seen.push(source)
     try {
-      const { scope, title, body } = parseArticle(readFileSync(file, 'utf8'))
-      const res = await ingestArticle({ scope, source, title, body })
+      const { scope, title, body, canonical } = parseArticle(readFileSync(file, 'utf8'))
+      const res = await ingestArticle({
+        scope, source, title, body,
+        metadata: canonical ? { canonical } : undefined,
+      })
       totalChunks += res.inserted
       console.log(`  [${scope.padEnd(8)}] ${title}  (${res.inserted} chunks${res.deleted ? `, replaced ${res.deleted}` : ''})`)
     } catch (e) {
