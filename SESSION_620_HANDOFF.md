@@ -107,6 +107,11 @@ the neighbouring audience's question, asked of the wrong agent.
 | prospect (Lucy) | 16/20 | **20/20** |
 | guest (Skye) | 8/23 | **23/23** |
 | visitor (Skye, booking site) | 2/18 | **18/18** |
+| tenant (regression) | — | **79/79** |
+| landlord (regression) | — | **77/77** |
+
+The two regression runs each surfaced one genuine pre-existing bug (§3e) and
+one wrong expectation of mine (§4).
 
 ### 3a. The sales agent would not book a call — 0/4
 
@@ -166,6 +171,46 @@ Routes added for visitor, guest and prospect. Two things worth keeping:
   skips it (missing required args) and runs the rate card instead, so the
   visitor gets real published rates and a request for their dates. Rates
   without dates is an honest partial answer; silence is not.
+
+### 3e. Two regressions the wider run surfaced on the audiences that worked
+
+- **"What's my MONTHLY rent" routed nothing.** `\bmy rent\b` cannot see past a
+  word in the middle, so that one wording fell through while "what's my rent"
+  was fine — and the tenant got *"I don't want to give you a number I haven't
+  actually checked"* instead of $750. Exactly the shape S618 built the phrase
+  table for. Now 4/4.
+- **A list nobody could read.** Asked "what's vacant right now", a landlord got
+  all thirteen units as ONE line: *"right now:Copper Canyon Homes- House 02-
+  House 03Oak Street Apartments- Apt 202…"*. Thirteen correct units rendered as
+  a wall, because the bubble prints exactly what it is given.
+
+  **Read this before touching that fix.** It shipped once and did nothing. The
+  rule sat FIRST in `stripChatMarkdown`'s chain, so its `(?=[A-Z0-9])`
+  lookahead saw the asterisk of `**Pull-through`, not the P — the live text was
+  bolded and my unit test was not. Source transformed the string correctly
+  every time I called it in isolation; the deployed process kept returning the
+  wall. **Wrapping the real `scrubScopeLeaks` in the deployed build and
+  printing its input is what found it.** "The function works when I call it"
+  and "the function works where it is called" are different claims.
+
+  **Known remaining artifact, deliberately not fixed:** the last bullet still
+  runs into the sentence after it ("per nightRemember, the weekly rate…"). The
+  general fix — split a lowercase letter followed by an uppercase one — would
+  corrupt FlexVault, FlexPay and iPhone, which is a worse failure than a
+  missing line break, and a sentence-starter whitelist is too brittle to trust.
+
+### 3f. Not leaking is the floor, not the goal
+
+With the reply-side scrub in, *"how do I reset my password"* on a booking site
+stopped leaking — and shipped the suppression fallback instead: *"I don't want
+to quote you a figure I haven't actually checked."* Nobody asked for a figure.
+Safe, and baffling.
+
+Off-audience questions are now caught on the way **IN**, before any model call,
+and answered with a warm redirect. The input matcher is deliberately narrower
+than the reply-side one: "late fee" and "deposit" are left out, because a guest
+asking *"is there a fee if I check out late"* is asking a real question about
+their own stay. Seven real booking questions are asserted NOT to match.
 
 ### 3d. And the citation-spam guard (S619 §8c)
 
@@ -260,4 +305,32 @@ DB_NAME=gam npx ts-node src/services/agents/agentBattery.ts visitor    # one aud
 ```
 
 **Tests:** `cd apps/api && DB_NAME=gam_test npx vitest run` — **never without
-DB_NAME, it wipes the dev database.**
+DB_NAME, it wipes the dev database.** 310 files, 5,282 passing at the last full
+run; 416 in the agents suite after the later fixes.
+
+---
+
+## 7. DEPLOYED AND LIVE-VERIFIED
+
+Every commit this session is deployed. `deploy.sh` ran clean at the end — API
+rebuilt and restarted under launchd, marketing kickstarted, all four Vercel
+frontends already in sync.
+
+Verified against the live API, not just the tests:
+
+```
+"how much per night?"        -> real rates, $48 / $65, bullets on their own lines
+"how do I reset my password" -> "That's not something I'd know — I only handle
+                                this property and booking a stay here."
+```
+
+**One thing to know about the order of operations.** The migration and the
+knowledge re-ingest were applied to the LIVE database before the matching code
+was deployed, which left a window where the running build's guest and visitor
+agents retrieved zero chunks (they read only `shared`, which the migration had
+just emptied). Tenant, landlord and sales were unaffected. The window was
+about two hours on a pre-launch system with no real traffic, and the deploy
+closed it — but the correct order is code first, or both together.
+
+**Not pushed to GitHub.** Five commits sit on local `main`; `git push origin
+main` when wanted.
