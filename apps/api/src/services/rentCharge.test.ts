@@ -286,3 +286,101 @@ describe('S622 carried-forward balance', () => {
     }
   })
 })
+
+// ── S622: current charges come first, across the landlord's leases ──
+//
+// Nic: "they couldn't just pay eight hundred dollars on space b while leaving
+// the five hundred dollar lease open." Three Oak Park tenants rent two spaces
+// each; paying old arrears on one while current rent sits open on the other
+// earns a late fee and starts an eviction clock on the unpaid space.
+describe('S622 arrears wait for every space to be current', () => {
+  let f: Fixture
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+    f = await fixture()
+  })
+
+  async function secondSpace(landlordId: string, tenantId: string) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const propertyId = await seedProperty(c, {
+        landlordId, ownerUserId: f.userId, managedByUserId: f.userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId, withLateFeeDecision: true })
+      const leaseId = await seedLease(c, { unitId, landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query('COMMIT')
+      return { unitId, leaseId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const openRent = (unitId: string, leaseId: string, amt: number) => db.query(
+    `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+     VALUES ($1,$2,$3,$4,'rent',$5,'pending','2026-09-01','RENT')`,
+    [unitId, leaseId, f.tenantId, f.landlordId, amt.toFixed(2)])
+
+  it('refuses to touch arrears while the OTHER space still owes rent', async () => {
+    const b = await secondSpace(f.landlordId, f.tenantId)
+    await seedCharge(f, 300, '2026-09-01')        // space A rent (this lease)
+    await seedCarried(f, 1000, '2026-01-01')      // space A arrears
+    await openRent(b.unitId, b.leaseId, 500)      // space B rent, unpaid
+
+    // $800 = A's rent plus $500 into arrears, leaving B open. Refused.
+    await expect(charge(f, 800)).rejects.toMatchObject({ statusCode: 422 })
+    // Paying exactly what this lease owes is still fine.
+    const r = await charge(f, 300)
+    expect(r.appliedTotal).toBeCloseTo(300, 2)
+  })
+
+  it('allows the arrears once every space is current', async () => {
+    const b = await secondSpace(f.landlordId, f.tenantId)
+    await seedCharge(f, 300, '2026-09-01')
+    await seedCarried(f, 1000, '2026-01-01')
+    // Space B has nothing open.
+    const r = await charge(f, 800)
+    expect(r.appliedTotal).toBeCloseTo(800, 2)
+  })
+
+  // The trap that makes a portfolio-wide version wrong: a unit in eviction mode
+  // cannot be paid at all, so requiring it to be current would permanently bar
+  // the tenant from paying arrears anywhere. A floor must always be clearable.
+  it('SKIPS a space in eviction hold — an unpayable lease cannot block arrears', async () => {
+    const b = await secondSpace(f.landlordId, f.tenantId)
+    await seedCharge(f, 300, '2026-09-01')
+    await seedCarried(f, 1000, '2026-01-01')
+    await openRent(b.unitId, b.leaseId, 500)
+    await db.query(`UPDATE units SET payment_block = TRUE WHERE id = $1`, [b.unitId])
+
+    const r = await charge(f, 800)
+    expect(r.appliedTotal).toBeCloseTo(800, 2)
+  })
+
+  it('does not reach across LANDLORDS — GAM never withholds one landlord’s money for another', async () => {
+    const other = await seedOtherLandlordSpace(f)
+    await seedCharge(f, 300, '2026-09-01')
+    await seedCarried(f, 1000, '2026-01-01')
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',500,'pending','2026-09-01','RENT')`,
+      [other.unitId, other.leaseId, f.tenantId, other.landlordId])
+
+    const r = await charge(f, 800)
+    expect(r.appliedTotal).toBeCloseTo(800, 2)
+  })
+
+  async function seedOtherLandlordSpace(f: Fixture) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c)
+      const propertyId = await seedProperty(c, {
+        landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId, withLateFeeDecision: true })
+      const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId: f.tenantId })
+      await c.query('COMMIT')
+      return { unitId, leaseId, landlordId: ll.landlordId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+})

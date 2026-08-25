@@ -295,6 +295,59 @@ export async function chargeLeaseBalance(
         `Rent must be paid in full — the outstanding balance is $${requiredInFull.toFixed(2)}.${extra}`)
     }
 
+    // S622 (Nic): CURRENT CHARGES COME FIRST, ACROSS THE LANDLORD'S LEASES.
+    //
+    //   "I think all active charges should be brought current before... they
+    //    couldn't just pay eight hundred dollars on space b while leaving the
+    //    five hundred dollar lease open."
+    //
+    // Three of Oak Park's tenants rent two spaces each. Paying down old arrears
+    // on one space while current rent sits open on the other is backwards for
+    // everyone: the tenant takes a late fee and starts an eviction clock on the
+    // unpaid space, having just voluntarily handed over money.
+    //
+    // SCOPE, and the reasons — a portfolio-wide version of this rule is a trap:
+    //
+    //  * SAME LANDLORD ONLY. A tenant may hold leases with two different
+    //    landlords (the overlap guard only blocks conflicts inside one bucket,
+    //    so residential with one and storage with another is permitted).
+    //    Refusing landlord B's money because landlord A is unpaid would be GAM
+    //    withholding one landlord's rent over another's ledger.
+    //
+    //  * LEASES IN EVICTION HOLD ARE SKIPPED. payment_block PAUSES payments on
+    //    a unit. Requiring such a lease to be brought current is unsatisfiable —
+    //    the tenant is forbidden from paying it — and would permanently bar them
+    //    from paying arrears anywhere. A floor must always be clearable.
+    //
+    // This reads across leases; it must NEVER leak into allocation. The money
+    // still lands only on THIS lease's charges — see allocateOldestFirst below,
+    // which only ever sees `rows`, scoped to this lease.
+    if (carriedOutstanding > 0 && amount > requiredInFull + 0.005) {
+      const blockers = await client.query<{ unit_number: string; owed: string }>(
+        `SELECT u.unit_number, SUM(p.amount)::text AS owed
+           FROM payments p
+           JOIN units u ON u.id = p.unit_id
+          WHERE p.tenant_id = $1
+            AND p.lease_id <> $2
+            AND p.landlord_id = $3
+            AND p.type <> 'carried_balance'
+            AND u.payment_block IS NOT TRUE
+            AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
+                 OR p.status = 'failed')
+          GROUP BY u.unit_number
+          ORDER BY u.unit_number`,
+        [tenantId, leaseId, ctx.landlord_id])
+      if (blockers.rows.length > 0) {
+        const list = blockers.rows
+          .map(b => `${b.unit_number} ($${Number(b.owed).toFixed(2)})`)
+          .join(', ')
+        throw new AppError(422,
+          `Bring your other rent current first — ${list} still owes for this period. ` +
+          `You can pay $${requiredInFull.toFixed(2)} here now; once every space is current you can put ` +
+          `whatever you like toward your earlier balance.`)
+      }
+    }
+
     // OVER-payment is pay-ahead (S609, Nic). NO CEILING — see the header note.
     // GAM holds the surplus and releases it month by month as it is earned.
 
