@@ -95,14 +95,45 @@ fi
 # same pages on :3004, so pointing DNS back at the tunnel restores the old site
 # in one step. Recipe: ~/gam-backups/dns-rollback-marketing.md
 # The kickstart here no longer affects what the public sees.
-echo; echo "── marketing (launchd com.gam.marketing) ──"
+# S622: this step used to ONLY kickstart the launchd fallback and then check
+# that goldassetmanagement.com returned 200 — a check the Vercel copy passes
+# whether or not it contains your change. A terms-of-service edit was reported
+# as "all surfaces in sync" while the public page stayed two days stale. The 200
+# was true and meaningless. Build and publish to Vercel here, and verify by
+# fetching CONTENT, not a status code.
+echo; echo "── marketing (Vercel: goldassetmanagement.com) ──"
 if $CHECK_ONLY; then
-  warn "would kickstart (reads index.html at startup)"
+  warn "would build + vercel deploy --prebuilt --prod"
 else
+  if ! (cd apps/marketing && node build.js && node package-output.js) >/tmp/gam-deploy-marketing.log 2>&1; then
+    bad "BUILD FAILED — see /tmp/gam-deploy-marketing.log"; FAILED=1
+  elif ! (cd apps/marketing && npx vercel deploy --prebuilt --prod --yes) >>/tmp/gam-deploy-marketing.log 2>&1; then
+    bad "VERCEL DEPLOY FAILED — see /tmp/gam-deploy-marketing.log"; FAILED=1
+  else
+    sleep 4
+    # Content check: compare a fingerprint of what we just built against what the
+    # public site actually serves, on a legal page (the pages most likely to be
+    # edited without a visible layout change).
+    local_fp=$(shasum -a 256 apps/marketing/.vercel/output/static/business/terms.html 2>/dev/null | cut -c1-16)
+    prod_fp=$(curl -s --max-time 15 https://goldassetmanagement.com/business/terms 2>/dev/null | shasum -a 256 | cut -c1-16)
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 https://goldassetmanagement.com/ 2>/dev/null)
+    if [ "$code" != "200" ]; then
+      bad "public site returned $code"; FAILED=1
+    elif [ -z "$local_fp" ]; then
+      warn "deployed; no local terms.html to fingerprint against"
+    elif [ "$local_fp" = "$prod_fp" ]; then
+      ok "deployed and verified (terms byte-identical to local build)"
+    else
+      # Vercel may serve a cached copy for a few seconds; retry once before failing.
+      sleep 8
+      prod_fp=$(curl -s --max-time 15 https://goldassetmanagement.com/business/terms 2>/dev/null | shasum -a 256 | cut -c1-16)
+      if [ "$local_fp" = "$prod_fp" ]; then ok "deployed and verified (terms byte-identical to local build)"
+      else bad "PUBLIC SITE DOES NOT MATCH THE BUILD (local $local_fp vs prod $prod_fp)"; FAILED=1; fi
+    fi
+  fi
+  # The Mac copy on :3004 stays running as the DNS-rollback fallback, so keep it
+  # current too — a stale fallback is worse than none.
   launchctl kickstart -k "gui/$(id -u)/com.gam.marketing" >/dev/null 2>&1
-  sleep 3
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 https://goldassetmanagement.com/ 2>/dev/null)
-  if [ "$code" = "200" ]; then ok "restarted, public site 200"; else bad "public site returned $code"; FAILED=1; fi
 fi
 
 # ── Vercel frontends ─────────────────────────────────────────────────────
