@@ -95,6 +95,10 @@ function columnFor(ctx: string): string | null {
   // Checked BEFORE rent_amount so "rent is due on the ___" tags the due day, not
   // the amount. Platform-locked to the 1st + auto-filled downstream.
   if (/due (on|by) the|day of (the |each )?month|\bdue date\b|payable (on|by) the/.test(c)) return 'rent_due_day'
+  // S622: prepaid rent is its own move-in fee (last_month_rent — refundable,
+  // due_timing='move_in', and the move-in invoice even books it as RENT). It
+  // must be tested BEFORE rent_amount, since "rent pre-payment" contains "rent".
+  if (/pre-?pay|prepaid rent|last month.?s? rent|advance rent/.test(c)) return 'last_month_rent'
   if (/installments of|monthly installments|rental rate|monthly rent|first month.?s rent/.test(c)) return 'rent_amount'
   if (/security deposit/.test(c)) return 'security_deposit'
   if (/pet deposit/.test(c)) return 'pet_deposit'

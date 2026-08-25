@@ -179,3 +179,27 @@ describe('money columns have exactly one owner', () => {
     }
   })
 })
+
+// ── S622: prepaid rent is a move-in fee, not the monthly rent ────────
+describe('columnFor money semantics', () => {
+  it('"Rent pre-payment" is last_month_rent, not rent_amount', () => {
+    // It is refundable, due_timing='move_in', and the move-in invoice books it
+    // as RENT — it IS prepaid rent. Tagging it rent_amount would have made it
+    // fight the actual rent clause for the tenant's monthly figure.
+    expect(roleForLeaseColumn('last_month_rent')).toBe('landlord')
+    expect((LEASE_COLUMN_CATEGORY as Record<string, string>).last_month_rent).toBe('fee_row')
+  })
+
+  it('the amounts GAM computes itself carry no tag', () => {
+    // First month's rent, proration and total due are all produced by
+    // generateMoveInInvoice from the rent clause + start_date. Tagging them
+    // would bill the tenant a second time for arithmetic already on the
+    // invoice — "Total due" worst of all, since it is the sum of the rest.
+    for (const col of ['rent_amount', 'security_deposit', 'pet_deposit', 'pet_fee', 'last_month_rent']) {
+      expect((LEASE_COLUMN_CATEGORY as Record<string, string>)[col]).toBeDefined()
+    }
+    // There is deliberately NO column for a proration or a grand total.
+    expect((LEASE_COLUMN_CATEGORY as Record<string, string>).proration).toBeUndefined()
+    expect((LEASE_COLUMN_CATEGORY as Record<string, string>).total_due).toBeUndefined()
+  })
+})
