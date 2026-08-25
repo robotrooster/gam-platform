@@ -362,11 +362,33 @@ function isLongPersonal(ctx: string): boolean {
 // everything else (property/term/money/fees/utilities/agreement-date/space/
 // roster) → landlord. This is deterministic — the model's role is ignored
 // here because it over-assigned tenant on the mobile-home lease.
+// S622: lease columns the tenant legitimately fills about THEMSELVES. Every
+// other mapped column is a value GAM already holds and stamps on the document at
+// send time.
+const TENANT_OWNED_COLUMNS = new Set(['tenant_name', 'tenant_email'])
+
 function nonSigRole(col: string | null, label: string | null, ctx: string, split: 'per_tenant' | 'none'): SignerRole {
+  // S622: a bound lease column is DECISIVE, and is checked before anything that
+  // reads the words around the blank. If a blank maps to a column, GAM holds
+  // that value and prefills it — so a tenant-entry box for it is wrong by
+  // construction. Nic, on finding the unit number scoped to the tenant: "they're
+  // not gonna type in what apartment they're going into... that's gonna
+  // invalidate the whole thing if they type that wrong."
+  //
+  // The old order let proximity win. "Apartment #" sitting on an "Address:" line
+  // matched the personal-info pattern, so unit_number went to the tenant.
+  // property_address was latently broken the same way — 'address' is literally in
+  // that pattern — and would have handed the tenant the property's own address.
+  if (col) return TENANT_OWNED_COLUMNS.has(col) ? 'primary' : 'landlord'
   if (split === 'per_tenant') return 'primary'
-  if (col === 'tenant_name' || col === 'tenant_email') return 'primary'
   if (isPersonal(label, ctx)) return 'primary'
   return 'landlord'
+}
+
+// S622: exported for the role-scoping test. Given a mapped lease column, who
+// owns the box?
+export function roleForLeaseColumn(col: string): SignerRole {
+  return nonSigRole(col, null, '', 'none')
 }
 
 function heuristicClassify(t: RawTarget): Classification {
