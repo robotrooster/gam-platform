@@ -3185,6 +3185,64 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
         const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal && endVal.trim() !== '-' ? endVal : null)
         if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
+
+        // ────────────────────────────────────────────────────────────────────
+        // S622: SCREENING GATE (Business Terms §9.2).
+        //
+        // Nic: "after the onboarding window is closed, all applicants must
+        // complete the background check to actually have the lease going."
+        //
+        // Enforced at SEND, not at finalize, on purpose: refusing after every
+        // party has signed strands a signed lease and helps nobody. Here the
+        // landlord simply cannot invite an unscreened applicant yet.
+        //
+        // MIGRATED TENANTS ARE EXEMPT. A tenancy that began before the landlord
+        // joined GAM was formed off-Platform, and we do not retroactively
+        // condition it on a report. The window is each landlord's OWN onboarding
+        // date, so it stays correct for everyone who joins later rather than
+        // hanging off a global cutoff that ages badly.
+        //
+        // Renewals are exempt too — renews_lease_id means an existing tenant,
+        // who was either screened already or is themselves a migrated tenancy.
+        // Read the flag as opt-OUT, not opt-in. This is a platform rule stated in
+        // the Business Terms; the row exists so that DISABLING it is a deliberate,
+        // recorded act. isFeatureEnabled() returns false for a missing row, which
+        // would mean an unrun migration silently switches the rule off — the
+        // failure mode we least want on a compliance gate. Absent row = ON.
+        const flag = await queryOne<{ enabled: boolean }>(
+          `SELECT enabled FROM system_features WHERE key = 'screening_required_for_new_leases'`)
+        const gateOn = flag ? flag.enabled === true : true
+        if (gateOn && doc.document_type === 'original_lease' && !doc.renews_lease_id) {
+          const onboarded = await queryOne<{ created_at: string }>(
+            `SELECT created_at FROM landlords WHERE id = $1`, [doc.landlord_id])
+          const leaseStart = new Date(startVal)
+          const onboardedAt = onboarded ? new Date(onboarded.created_at) : null
+          const isMigrated = !onboardedAt || leaseStart < onboardedAt
+          if (!isMigrated) {
+            // LEFT JOIN, deliberately: a signer with no tenants row certainly has
+            // no background check either. An inner join would have let exactly
+            // the least-established applicants through — the gate would have
+            // looked correct and caught nobody.
+            const unscreened = await query<{ name: string }>(
+              `SELECT s.name
+                 FROM lease_document_signers s
+                 LEFT JOIN tenants t ON t.user_id = s.user_id
+                WHERE s.document_id = $1
+                  AND s.role <> 'landlord' AND s.role <> 'witness'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM background_checks bc
+                     WHERE bc.tenant_id = t.id
+                       AND bc.status IN ('approved', 'completed', 'clear')
+                  )`, [doc.id])
+            if (unscreened.length > 0) {
+              const who = unscreened.map(u => u.name).join(', ')
+              throw new AppError(409,
+                `Cannot send: ${who} ${unscreened.length === 1 ? 'has' : 'have'} not completed a background check. ` +
+                `Leases beginning on or after your onboarding date require screening before they are sent ` +
+                `(Business Terms §9.2). Tenants who were already living in the unit before you joined GAM are exempt.`)
+            }
+          }
+        }
       }
     }
 

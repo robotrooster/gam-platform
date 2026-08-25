@@ -590,6 +590,95 @@ describe('template unit-type default (S558)', () => {
 // ─── POST /documents/:id/send ──────────────────────────────────
 
 describe('POST /documents/:id/send', () => {
+  // ─── S622 screening gate (Business Terms §9.2) ───────────────────────
+  //
+  // Nic: "after the onboarding window is closed, all applicants must complete
+  // the background check to actually have the lease going." Enforced at SEND
+  // rather than at finalize — refusing after everyone has signed strands a
+  // signed lease and helps nobody.
+  //
+  // The whole rule turns on one date comparison, so all three cases are pinned:
+  // gated, exempt-because-migrated, and satisfied.
+  describe('S622 screening gate', () => {
+    // Give the document a start_date value; the gate only runs once a start
+    // date exists, since that is what decides migrated vs new.
+    async function setStart(documentId: string, startDate: string) {
+      const signer = await db.query<{ id: string }>(
+        `SELECT id FROM lease_document_signers WHERE document_id=$1 AND role='landlord' LIMIT 1`,
+        [documentId])
+      await db.query(
+        `INSERT INTO lease_document_fields
+           (document_id, signer_id, field_type, signer_role, lease_column, page, x, y, width, height, required, value)
+         VALUES ($1,$2,'date','landlord','start_date',1,10,10,80,20,TRUE,$3)`,
+        [documentId, signer.rows[0]?.id ?? null, startDate])
+    }
+    const tomorrow = () => {
+      const d = new Date(); d.setDate(d.getDate() + 1)
+      return d.toISOString().slice(0, 10)
+    }
+
+    it('blocks a lease starting after onboarding when the tenant has no background check', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await setStart(documentId, tomorrow())
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(409)
+      expect(res.body.error || res.body.message).toMatch(/background check/i)
+      expect(emailSigningRequestMock).not.toHaveBeenCalled()
+    })
+
+    it('lets a MIGRATED tenancy through — lease began before the landlord joined GAM', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      // Landlord onboarded after this lease started: the tenancy predates GAM.
+      await db.query(`UPDATE landlords SET created_at = NOW() + INTERVAL '30 days' WHERE id = $1`, [f.landlordId])
+      await setStart(documentId, tomorrow())
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    it('lets a screened applicant through', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await setStart(documentId, tomorrow())
+      const t = await db.query<{ id: string }>(
+        `SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
+      await db.query(
+        `INSERT INTO background_checks (tenant_id, user_id, landlord_id, unit_id, status, amount_charged, platform_net)
+         VALUES ($1, $2, $3, $4, 'approved', 35, 35)`,
+        [t.rows[0].id, f.tenantUserId, f.landlordId, f.unitId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    it('is off when the flag is off — a disabled gate must be a deliberate act, not a silent skip', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await setStart(documentId, tomorrow())
+      await db.query(
+        `INSERT INTO system_features (key, enabled, description)
+         VALUES ('screening_required_for_new_leases', FALSE, 'test')
+         ON CONFLICT (key) DO UPDATE SET enabled = FALSE`)
+      try {
+        const res = await request(buildApp())
+          .post(`/api/esign/documents/${documentId}/send`)
+          .set('Authorization', `Bearer ${f.landlordToken}`)
+        expect(res.status).toBe(200)
+      } finally {
+        await db.query(`DELETE FROM system_features WHERE key = 'screening_required_for_new_leases'`)
+      }
+    })
+  })
+
   it('happy path: status flips to sent, first signer emailed, in-app notification', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f)
