@@ -63,6 +63,7 @@ import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedUserBankAccount,
 } from '../test/dbHelpers'
+import { resolveTargetLease } from '../services/rentCharge'
 import { paymentsRouter } from './payments'
 import { errorHandler } from '../middleware/errorHandler'
 import * as stripeConnect from '../services/stripeConnect'
@@ -1284,5 +1285,86 @@ describe('S622: the balance endpoint separates arrears from what is due now', ()
     const lease = (res.body.data.leases || []).find((l: any) => l.leaseId === f.lease1Id)
     expect(lease.requiredNow).toBeCloseTo(lease.outstanding, 2)
     expect(lease.carriedBalance).toBeCloseTo(0, 2)
+  })
+})
+
+// S622 (Nic): "I've got three people in Oak Park that each have two spaces
+// occupied, and I don't wanna just total it onto one lease because it is a
+// completely separate unit... if somebody's behind on one and not on the other,
+// I just wanna make sure how that flow goes."
+//
+// One tenant, two units under the SAME landlord, is deliberately allowed
+// (S553 — space rent on two mobile homes). What matters here is that the two
+// tenancies never bleed into each other: separate balances, separate floors, and
+// a payment on one that cannot be swallowed by the other's arrears.
+describe('S622: one tenant, two units, separate ledgers', () => {
+  async function secondLease(f: any) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unit2 = await seedUnit(c, { propertyId: f.aPropId, landlordId: f.aLid })
+      const lease2 = await seedLease(c, { unitId: unit2, landlordId: f.aLid })
+      await seedLeaseTenant(c, { leaseId: lease2, tenantId: f.tenant1Id, role: 'primary' })
+      await c.query('COMMIT')
+      return { unit2, lease2 }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('reports each lease on its own, with its own floor', async () => {
+    const f = await seed()
+    const { unit2, lease2 } = await secondLease(f)
+
+    // Space A: current on rent. Space B: behind, with imported arrears.
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',500,'pending','2026-09-01','RENT')`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',300,'pending','2026-09-01','RENT')`,
+      [unit2, lease2, f.tenant1Id, f.aLid])
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'carried_balance',1000,'pending','2026-01-01','BALANCE')`,
+      [unit2, lease2, f.tenant1Id, f.aLid])
+
+    const res = await request(buildApp())
+      .get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+
+    const leases = res.body.data.leases || []
+    const a = leases.find((l: any) => l.leaseId === f.lease1Id)
+    const b = leases.find((l: any) => l.leaseId === lease2)
+    expect(a).toBeTruthy()
+    expect(b).toBeTruthy()
+
+    // The clean space is untouched by the other's arrears.
+    expect(a.outstanding).toBeCloseTo(500, 2)
+    expect(a.requiredNow).toBeCloseTo(500, 2)
+    expect(a.carriedBalance).toBeCloseTo(0, 2)
+
+    // The behind one carries its own history, and its own floor.
+    expect(b.outstanding).toBeCloseTo(1300, 2)
+    expect(b.requiredNow).toBeCloseTo(300, 2)
+    expect(b.carriedBalance).toBeCloseTo(1000, 2)
+  })
+
+  it('refuses to guess which lease a payment is for', async () => {
+    const f = await seed()
+    const { unit2, lease2 } = await secondLease(f)
+    for (const [u, l] of [[f.aUnitId, f.lease1Id], [unit2, lease2]] as const) {
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'rent',500,'pending','2026-09-01','RENT')`,
+        [u, l, f.tenant1Id, f.aLid])
+    }
+    // Two open balances and no lease named: paying "the balance" is ambiguous,
+    // and guessing would silently pay the wrong space's rent.
+    await expect(resolveTargetLease(f.tenant1Id, null))
+      .rejects.toMatchObject({ statusCode: 400 })
+    // Named explicitly, each resolves to itself.
+    await expect(resolveTargetLease(f.tenant1Id, f.lease1Id)).resolves.toBe(f.lease1Id)
+    await expect(resolveTargetLease(f.tenant1Id, lease2)).resolves.toBe(lease2)
   })
 })
