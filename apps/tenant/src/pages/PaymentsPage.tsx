@@ -157,6 +157,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       // S609: balance + roughly the rest of the lease term. A SUGGESTION for
       // the amount box, not a ceiling — there is no cap on paying ahead.
       suggestedPayAhead?: number
+      requiredNow?: number
     }[]
     rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
     // S616: what the payer owes on each utility service agreement — the same
@@ -194,7 +195,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // S581: each LEASE is paid as its own charge (separate ACH/card + receipt), so
   // a tenant with two leases (overlap move, or two landlords) pays each on its
   // own — a shortfall or an eviction hold on one never blocks the other.
-  const openPayLease = (leaseId: string, outstanding: number, suggestedPayAhead?: number) => {
+  const openPayLease = (leaseId: string, outstanding: number, suggestedPayAhead?: number, requiredNow?: number) => {
     if (!(outstanding > 0)) return
     setPayTarget({
       target: {
@@ -206,6 +207,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         leaseId,
         // S609: lets the modal offer an amount box for paying months ahead.
         suggestedPayAhead,
+        requiredNow,
       },
     })
   }
@@ -390,7 +392,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <WaysToPay lease={lg} />
               </div>
               <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding, lg.suggestedPayAhead)}>
+                <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding, lg.suggestedPayAhead, lg.requiredNow)}>
                   Pay {formatCurrency(lg.outstanding)}
                 </button>
               </div>

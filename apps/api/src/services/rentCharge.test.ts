@@ -238,4 +238,51 @@ describe('S622 carried-forward balance', () => {
     expect(r.appliedTotal).toBeCloseTo(250, 2)
     expect(r.payAhead).toBeCloseTo(0, 2)
   })
+
+  // Nic, double-checking S622: "they definitely cannot in any way, shape, or
+  // form pay a partial amount on a current new charge. All new charges are paid
+  // in full, and that's that."
+  //
+  // The carve-out must not have opened a side door. Sweep a range of amounts and
+  // assert the invariant directly: whatever the tenant pays, every NON-carried
+  // charge is either untouched or paid to the cent — never split.
+  it('NO current charge is ever partially applied, at any payable amount', async () => {
+    await seedCarried(f, 1000, '2026-01-01')
+    await seedCharge(f, 800, '2026-09-01')
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'utility',120,'pending','2026-08-20','PROPANE')`,
+      [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+
+    // requiredInFull = 800 rent + 120 propane = 920. Anything at or above it is
+    // payable; walk across the arrears too.
+    for (const amt of [920, 921, 1000, 1500, 1920, 2500]) {
+      await cleanupAllSchema()
+      f = await fixture()
+      await seedCarried(f, 1000, '2026-01-01')
+      await seedCharge(f, 800, '2026-09-01')
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'utility',120,'pending','2026-08-20','PROPANE')`,
+        [f.unitId, f.leaseId, f.tenantId, f.landlordId])
+
+      const r = await charge(f, amt)
+      const partials = await db.query<{ type: string; n: string }>(
+        `SELECT p.type, COUNT(*)::text AS n
+           FROM payments p
+          WHERE p.lease_id = $1 AND p.is_remainder = TRUE
+          GROUP BY p.type`, [f.leaseId])
+      const nonCarriedSplits = partials.rows.filter(x => x.type !== 'carried_balance')
+      expect(nonCarriedSplits, `paying $${amt} split a current charge`).toEqual([])
+      expect(r.appliedTotal).toBeGreaterThanOrEqual(920)
+    }
+  })
+
+  it('refuses every amount below the current charges, however close', async () => {
+    await seedCarried(f, 1000, '2026-01-01')
+    await seedCharge(f, 800, '2026-09-01')
+    for (const amt of [0.01, 100, 799, 799.99]) {
+      await expect(charge(f, amt), `$${amt} should be refused`).rejects.toMatchObject({ statusCode: 422 })
+    }
+  })
 })

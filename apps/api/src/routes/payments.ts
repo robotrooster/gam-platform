@@ -681,7 +681,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // lease. A tenant with a single lease (launch norm) gets exactly one group.
     const byLease = new Map<string, {
       leaseId: string; propertyName: string; unitNumber: string
-      paymentBlocked: boolean; outstanding: number; rows: any[]
+      paymentBlocked: boolean; outstanding: number; carriedBalance: number; rows: any[]
       manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
     }>()
     // S615: a UTILITY-SERVICE payer's rows carry NO lease_id. Left in the
@@ -698,11 +698,20 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       let g = byLease.get(r.lease_id)
       if (!g) {
         g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
-              paymentBlocked: !!r.payment_block, outstanding: 0, rows: [],
+              paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [],
               manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
         byLease.set(r.lease_id, g)
       }
       g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
+      // S622: arrears carried in from the landlord's previous system are the one
+      // charge payable in part, so they are tracked separately from what must be
+      // paid in full right now. Without this split the tenant portal shows one
+      // figure, refuses anything under it, and a tenant $1,000 behind cannot pay
+      // their rent at all — the server would accept it, but the screen never
+      // lets them try.
+      if (r.type === 'carried_balance') {
+        g!.carriedBalance = Math.round((g!.carriedBalance + r.amount) * 100) / 100
+      }
       g.rows.push(r)
     }
     // S607 (Nic): "maybe on the invoice, it can show a breakdown of what each
@@ -726,6 +735,11 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         // unknowable until a meter is read and any ceiling lands wrong at the
         // end of a lease.
         suggestedPayAhead: Math.round((l.outstanding + await suggestedPayAheadFor(l.leaseId)) * 100) / 100,
+        // S622: the floor. Everything the lease itself billed, which stays
+        // all-or-nothing; the carried balance above it may be paid down in any
+        // amount. Matches rentCharge's `requiredInFull` exactly — one rule, two
+        // places, and the screen must not be stricter than the server.
+        requiredNow: Math.round((l.outstanding - l.carriedBalance) * 100) / 100,
       }
     }))
 

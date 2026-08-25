@@ -79,6 +79,9 @@ export interface PayTarget {
   // the amount box is offered. Absent = the old fixed-amount behaviour, which is
   // what every non-rent target (a utility bill, a single charge) still wants.
   suggestedPayAhead?: number
+  /** S622: the pay-in-full floor — the lease's own charges, excluding any
+   *  carried-forward balance, which may be paid down in part. */
+  requiredNow?: number
 }
 
 interface PayResponse {
@@ -318,9 +321,17 @@ export function PayNowModal({
 
   // Batch ("pay all") keeps its fixed per-lease amounts — the box is not offered
   // there, so nothing to validate.
+  // S622: the floor is what the LEASE billed, not the whole ledger. A carried
+  // balance from the landlord's previous system may be paid down in any amount,
+  // so demanding it in full would stop a tenant $1,000 behind from paying their
+  // rent at all. Mirrors rentCharge's `requiredInFull` — the screen must never
+  // be stricter than the server, or a payment the API would accept is one the
+  // tenant cannot even attempt.
+  const payFloor = target.requiredNow ?? target.amount
+  const carried = Math.round(((target.amount ?? 0) - payFloor) * 100) / 100
   const amountInvalid = !target.batch?.length && (
     !(amount > 0) ||
-    amount < target.amount - 0.005
+    amount < payFloor - 0.005
   )
 
   const noMethods = methods.length === 0
@@ -396,9 +407,16 @@ export function PayNowModal({
               {/* S609 (Nic): NO CEILING. The suggestion below is guidance, not a
                   limit — utilities aren't known until a meter is read, so any cap
                   lands wrong at the end of a lease and forces a refund. */}
-              {amount < target.amount - 0.005 ? (
+              {amount < payFloor - 0.005 ? (
                 <div style={{ fontSize: '.74rem', color: 'var(--warn)', marginTop: 6, lineHeight: 1.5 }}>
-                  Rent is paid in full — the least you can pay is {formatCurrency(target.amount)}.
+                  Rent is paid in full — the least you can pay is {formatCurrency(payFloor)}.
+                </div>
+              ) : carried > 0.005 && amount < target.amount - 0.005 ? (
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+                  This clears everything your lease has billed. The remaining{' '}
+                  <strong>{formatCurrency(Math.round((target.amount - amount) * 100) / 100)}</strong>{' '}
+                  of your earlier balance stays on your account — you can pay it down
+                  a little at a time, and it never has to be paid all at once.
                 </div>
               ) : amount > target.amount + 0.005 ? (
                 <div style={{ fontSize: '.74rem', color: 'var(--green)', marginTop: 6, lineHeight: 1.5 }}>

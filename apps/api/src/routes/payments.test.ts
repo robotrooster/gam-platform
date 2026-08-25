@@ -1236,3 +1236,53 @@ describe('fee settings are per-property and cannot single out a tenant', () => {
     expect(pk.rows.map(r => r.column_name)).toEqual(['property_id'])
   })
 })
+
+// S622 (Nic, double-checking): "they definitely cannot in any way, shape, or
+// form pay a partial amount on a current new charge. All new charges are paid in
+// full, and that's that."
+//
+// The balance endpoint feeds the tenant's pay screen, and the screen disables
+// its button below the floor it is given. If that floor is the WHOLE ledger, a
+// tenant $1,000 behind can never attempt their rent — the server would take it,
+// the screen never offers it. So the two figures have to be reported separately.
+describe('S622: the balance endpoint separates arrears from what is due now', () => {
+  it('reports requiredNow (the lease’s own charges) apart from the carried balance', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',800,'pending','2026-09-01','RENT')`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'carried_balance',1000,'pending','2026-01-01','BALANCE')`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+
+    const res = await request(buildApp())
+      .get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(res.status).toBe(200)
+
+    const lease = (res.body.data.leases || []).find((l: any) => l.leaseId === f.lease1Id)
+    expect(lease).toBeTruthy()
+    expect(lease.outstanding).toBeCloseTo(1800, 2)   // everything owed
+    expect(lease.carriedBalance).toBeCloseTo(1000, 2)
+    // The floor the screen enforces — rent only. This is the number that decides
+    // whether the tenant can pay their rent at all.
+    expect(lease.requiredNow).toBeCloseTo(800, 2)
+  })
+
+  it('requiredNow equals outstanding when there are no arrears — unchanged for everyone else', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,$3,$4,'rent',800,'pending','2026-09-01','RENT')`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])
+
+    const res = await request(buildApp())
+      .get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+    const lease = (res.body.data.leases || []).find((l: any) => l.leaseId === f.lease1Id)
+    expect(lease.requiredNow).toBeCloseTo(lease.outstanding, 2)
+    expect(lease.carriedBalance).toBeCloseTo(0, 2)
+  })
+})
