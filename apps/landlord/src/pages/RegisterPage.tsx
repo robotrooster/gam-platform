@@ -42,12 +42,38 @@ export function RegisterPage() {
   // S567: portfolio-manager referral key — credits the rep as closing manager.
   const [searchParams] = useSearchParams()
   const referralCode = searchParams.get('ref') || undefined
+
+  // S620: A CO-OWNER INVITE MUST SURVIVE REGISTRATION.
+  //
+  // Nic's partner clicked the invite email, pressed "Create my account", and
+  // landed in the business-profile wizard with no sign of the property he had
+  // been invited to. The invite stayed 'pending' and he had no idea.
+  //
+  // AcceptOwnerInvitePage does its part — it stashes the token in
+  // sessionStorage AND passes it here as ?invite=. This page read neither, and
+  // then navigated straight to /onboarding, which skips RoleRedirect, the one
+  // component that reads the stashed token. So the invite survived a SIGN-IN
+  // detour (that lands on /) and silently died on the REGISTRATION detour,
+  // despite the comment in main.tsx claiming both.
+  //
+  // The query param is the primary source; sessionStorage is the fallback for
+  // anything that strips it.
+  const pendingInvite =
+    searchParams.get('invite') || sessionStorage.getItem('gam_pending_owner_invite') || null
+  // Where to go once the account exists: to the invite if there is one, so the
+  // property they were invited to is there the moment they arrive.
+  const afterSignup = pendingInvite ? `/accept-owner-invite/${pendingInvite}` : '/onboarding'
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [showPw, setShowPw] = useState(false)
   const [agreed, setAgreed] = useState(false)
   const [form, setForm] = useState({
-    firstName: '', lastName: '', email: '', phone: '',
+    firstName: '', lastName: '',
+    // S620: prefilled from the invite. The server rejects the acceptance if the
+    // signed-in email does not match the invited one, so letting someone type a
+    // different address here builds an account that CANNOT accept the invite
+    // that created it.
+    email: searchParams.get('email') || '', phone: '',
     password: '', confirmPassword: '', businessName: '', ein: '',
   })
   // S578: mandatory email-2FA at signup — /auth/register returns a pending
@@ -75,7 +101,7 @@ export function RegisterPage() {
       } else {
         // Fallback for any legacy no-2FA response.
         await login(form.email, form.password)
-        navigate('/onboarding')
+        navigate(afterSignup)
       }
     } catch (e: any) {
       setErr(e.response?.data?.error || 'Registration failed. Please try again.')
@@ -87,7 +113,7 @@ export function RegisterPage() {
     setLoading(true); setErr('')
     try {
       await loginWithEmailOtp(emailOtpSession!, code.trim())
-      navigate('/onboarding')
+      navigate(afterSignup)
     } catch (e: any) {
       const msg = e.response?.data?.error || 'Invalid code.'
       setErr(msg)

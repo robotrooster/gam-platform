@@ -5097,7 +5097,10 @@ async function createCoOwnerInvitation(landlordId: string, email: string, invite
   const inviterName = [inviter?.first_name, inviter?.last_name].filter(Boolean).join(' ').trim() || 'A GAM landlord'
   const base = (process.env.LANDLORD_APP_URL || 'https://landlord.goldassetmanagement.com').replace(/\/$/, '')
   await emailLandlordCoOwnerInvitation(
-    email.trim(), inviterName, entity.business_name || 'a property on GAM',
+    // S620: the fallback used to be 'a property on GAM', and the subject line
+    // already ends in "on GAM" — so an entity with no business name produced
+    // "added you as an owner of a property on GAM on GAM".
+    email.trim(), inviterName, entity.business_name || 'a property',
     `${base}/accept-owner-invite/${token}`,
     { landlordId, invitationId: row!.id },
   ).catch(() => { /* the invite row stands; it can be resent */ })
