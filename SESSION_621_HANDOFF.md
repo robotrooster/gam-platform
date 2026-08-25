@@ -174,6 +174,28 @@ accounts, so one combined "next disbursement" could mislead.
 
 ---
 
+## 5a. COLLECT ONCE — SIGNUP NOW ASKS FOR LESS
+
+Nic: "it was shitty putting it in two times for Oak Park. And if I have to do
+it two times for every other entity I add, that's friction."
+
+Signup no longer asks for business name or EIN. Stripe's KYC collects both
+because it legally must; the legal name syncs back on `account.updated`
+(`recordAccountUpdated`), filling only a BLANK name so a working label someone
+typed is never silently overwritten.
+
+**The EIN is not stored at all anymore.** Nothing in the platform ever read
+`landlords.ein` — collected, saved, displayed, nothing else. Stripe holds the
+real one and will not return it (verified: `tax_id_provided` true, value
+withheld — which is why Nic's was unrecoverable). The card reads "On file with
+Stripe". If a future feature genuinely needs an EIN, get it from Stripe or ask
+once, deliberately.
+
+**Nic's business name was restored** from Stripe KYC ("Oak Park Motel and RV
+LLC"). His EIN could not be and must be re-entered if anything ever needs it.
+
+---
+
 ## 5b. SETTINGS PAGE — NIC'S OPEN LIST
 
 Reviewed live at the end of the session. Fixed: **"bank account not
@@ -181,6 +203,21 @@ configured"** showed for a landlord whose Stripe Connect payouts are live —
 the flag read only the legacy bank catalog, not Connect, which is how payouts
 actually work. The same fix landed on /me/todos in S605 and `/auth/me` was
 missed. Both now mean "GAM can pay you".
+
+**FOUR ENDPOINTS ANSWERED "IS THE BANK SET UP?" DIFFERENTLY.** `/me/todos`
+(fixed S605), `/auth/me`, the admin list, and `/landlords/me` — which is the
+one the Settings billing card actually reads, and which never computed the
+field AT ALL, so the badge read `undefined` and printed "Not configured" for
+every landlord forever.
+
+I fixed the other three first and told Nic twice it was done. It wasn't; he had
+to push back twice. **The lesson, cheaply learned: when a page shows a wrong
+value, find the query that SERVES that page before touching anything that looks
+related.** One authenticated call against the real endpoint showed
+`bankAccountReady: undefined` in seconds.
+
+Worth a sweep next session for a fifth. Connect IS the billing account — Nic:
+"landlords can't have some separate account."
 
 Still open, in Nic's words:
 
