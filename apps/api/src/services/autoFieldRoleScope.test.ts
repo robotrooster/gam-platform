@@ -61,3 +61,51 @@ describe('auto-placed field role scoping', () => {
       .toEqual([])
   })
 })
+
+// ── S622: signature-column binding ───────────────────────────────────
+//
+// Nic, reviewing page 8 of the first real lease: "the first two dates for the
+// first two tenants [are] not linked to when they actually sign. It's linked to
+// when the landlord signed." A signing date attributed to the wrong party is a
+// defect in a signed instrument, so this is worth pinning exactly.
+import { signerColumnAt } from './autoFieldPlacement'
+
+describe('signerColumnAt — which signature column a box belongs to', () => {
+  // The real geometry off Oak Park's lease: two columns, each ~182 wide.
+  const LABELS = [
+    { role: 'primary' as const,  x: 43,  y: 334 },
+    { role: 'landlord' as const, x: 295, y: 334 },
+  ]
+  const BELOW = 284 // a date row under the signature line
+
+  it('binds a date under the tenant signature to the TENANT', () => {
+    // The regression: x=132 is inside the tenant column (43..225).
+    expect(signerColumnAt(LABELS, 132, BELOW)).toBe('primary')
+  })
+
+  it('binds a date under the landlord signature to the LANDLORD', () => {
+    expect(signerColumnAt(LABELS, 384, BELOW)).toBe('landlord')
+  })
+
+  it('binds each column at its own left edge', () => {
+    expect(signerColumnAt(LABELS, 43, BELOW)).toBe('primary')
+    expect(signerColumnAt(LABELS, 295, BELOW)).toBe('landlord')
+  })
+
+  it('never lets a box in the left column bind to the right one', () => {
+    // Every x across the tenant block must stay with the tenant — the old
+    // nearest-by-distance rule flipped partway across it.
+    for (let x = 43; x < 295; x += 7) {
+      expect(signerColumnAt(LABELS, x, BELOW), `x=${x} escaped the tenant column`).toBe('primary')
+    }
+  })
+
+  it('falls back to the nearest label when a box sits left of every column', () => {
+    expect(signerColumnAt(LABELS, 5, BELOW)).toBe('primary')
+  })
+
+  it('ignores labels that sit below the box', () => {
+    const onlyBelow = [{ role: 'landlord' as const, x: 295, y: 100 }]
+    expect(signerColumnAt(onlyBelow, 384, BELOW)).toBe('primary') // no label above → default
+  })
+})

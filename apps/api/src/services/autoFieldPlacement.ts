@@ -160,6 +160,31 @@ interface PageMeta {
   textRects: Rect[]
 }
 
+export interface SigLabel { role: SignerRole; x: number; y: number }
+
+/**
+ * S622: which signature COLUMN does a box at (bx, by) sit in?
+ *
+ * Signature labels mark the LEFT EDGE of their column ("TENANT(S) SIGNATURE:"
+ * at x=43, "LANDLORD SIGNATURE:" at x=295, each block ~182 wide), so the
+ * question is containment — the last label at or left of the box — not which
+ * label happens to be nearest.
+ *
+ * Nearest-by-distance put a date at x=132, plainly inside the tenant column, on
+ * the LANDLORD: the lookup ran at the slash glyph's x (192, because a "/  /"
+ * box is drawn 60pt left of the slashes) and 192 is nearer 295 than 43. Nic
+ * found it as tenant signing dates recording the landlord's date. Callers must
+ * pass the BOX's own left x, never a glyph position.
+ */
+export function signerColumnAt(labels: SigLabel[], bx: number, by: number): SignerRole {
+  const above = labels.filter((s) => s.y > by - 6)
+  if (above.length === 0) return 'primary'
+  const containing = above.filter((s) => s.x <= bx + 6).sort((a, b) => b.x - a.x)
+  if (containing.length > 0) return containing[0].role
+  // Box sits left of every label — fall back to the nearest.
+  return above.slice().sort((a, b) => Math.abs(a.x - bx) - Math.abs(b.x - bx))[0].role
+}
+
 function detectTargets(pages: ReturnType<() => any>): { targets: RawTarget[]; pageMeta: PageMeta[] } {
   const targets: RawTarget[] = []
   const pageMeta: PageMeta[] = []
@@ -200,12 +225,21 @@ function detectTargets(pages: ReturnType<() => any>): { targets: RawTarget[]; pa
         }
       }
     }
-    const roleByX = (bx: number, by: number): SignerRole => {
-      const cand = sigLabels
-        .filter((s) => s.y > by - 6)
-        .sort((a, b) => Math.abs(a.x - bx) - Math.abs(b.x - bx))
-      return cand[0]?.role || 'primary'
-    }
+    // S622: which signature COLUMN does this box sit in?
+    //
+    // Signature labels mark the LEFT EDGE of their column ("TENANT(S)
+    // SIGNATURE:" at x=43, "LANDLORD SIGNATURE:" at x=295, each block ~182
+    // wide). So the question is containment — the last label at or left of the
+    // box — not which label centre happens to be nearest. Nearest-by-distance
+    // put a date at x=132, plainly inside the tenant column, on the landlord:
+    // 132 is 89 from the tenant label but the lookup ran at the SLASH GLYPH's x
+    // (192, since a "/ /" box is drawn 60pt to the left of the slashes), and
+    // 192 is nearer 295 than 43.
+    //
+    // Nic found this as tenant signing dates recording the LANDLORD's signing
+    // date. On a signed lease that is not cosmetic, so it is worth being exact:
+    // callers must pass the BOX's own left x, never a glyph position.
+    const roleByX = (bx: number, by: number): SignerRole => signerColumnAt(sigLabels, bx, by)
 
     const flipY = (it: TextItem) => Math.round(H - it.y - (it.height || 10) - 2)
 
@@ -287,7 +321,9 @@ function detectTargets(pages: ReturnType<() => any>): { targets: RawTarget[]; pa
             aboveText,
             belowText,
             sigAboveText,
-            roleByX: roleByX(slash.x, slash.y),
+            // S622: the BOX's x (slash.x - 60), matching where it is drawn —
+            // passing the glyph x looked the role up 60pt into the next column.
+            roleByX: roleByX(Math.round(slash.x - 60), slash.y),
             pageW: W,
             pageH: H,
           })
@@ -612,7 +648,20 @@ function sanitize(r: any, t: RawTarget): Classification {
   if (ft === 'signature') {
     role = t.roleByX
     col = role === 'landlord' ? 'landlord_signature' : 'tenant_signature'
-  } else if (ft === 'date' && (col === 'date_signed' || (!col && /signature|sign/.test(t.sigAboveText)))) {
+  } else if (
+    // S622: a "/  /" placeholder under a signature block IS a signing date —
+    // that is what the shape means on a lease. It was only treated as one when
+    // the word "signature" happened to appear just above it, and on this lease
+    // the line above the dates is the signature RULE (underscores), not the
+    // caption. So both tenant dates came through with NO lease column: they
+    // recorded nothing, and the missing landlord date_signed then triggered an
+    // injected duplicate on top. Bind it from the SHAPE instead.
+    //
+    // Excluding birthdates, which are the other thing written as "__/__/__".
+    (t.kind === 'slashdate' && !BIRTH_RE.test(ctx)) ||
+    (ft === 'date' && (col === 'date_signed' || (!col && /signature|sign/.test(t.sigAboveText))))
+  ) {
+    ft = 'date'
     role = t.roleByX
     col = 'date_signed'
   } else if (ft === 'initials') {
@@ -717,6 +766,34 @@ function buildFields(
   // (Nic S555: 2 tenant lines exist → invent the other 2; add landlord date).
   for (const pm of pageMeta) {
     if (!pageHasSignature[pm.page]) continue
+
+    // S622: a signature RULE that carries no caption reads as a plain blank, so
+    // it lands as an unlabeled text box — and then the injector below, seeing
+    // only one tenant signature, invents replacements ON TOP of it. Nic saw the
+    // result as "a text field box to type something" plus a spare date.
+    //
+    // A blank that lines up EXACTLY with a signature box already found on this
+    // page — same column, same width — is another line of the same block. The
+    // match is deliberately strict (6pt on both x and width, no label, no bound
+    // column) because promoting an ordinary text field to a signature would be
+    // the worse error.
+    const proto = fields.find(
+      (f) => f.page === pm.page && f.fieldType === 'signature' &&
+        f.signerRole !== 'landlord' && f.signerRole !== 'witness')
+    if (proto) {
+      for (const f of fields) {
+        if (f.page !== pm.page || f.fieldType !== 'text') continue
+        if (f.leaseColumn || (f.label && f.label.trim())) continue
+        if (Math.abs(f.x - proto.x) > 6 || Math.abs(f.width - proto.width) > 6) continue
+        f.fieldType = 'signature'
+        f.height = proto.height
+        f.leaseColumn = 'tenant_signature'
+        f.label = 'Signature'
+        // Role is set by vertical order in the reassignment just below.
+        f.signerRole = 'primary'
+      }
+    }
+
     const pageSigs = fields.filter((f) => f.page === pm.page && f.fieldType === 'signature')
     // Tenant side = anything not landlord/witness (classification forced
     // signature role to the positional side, so these are the tenant column).
@@ -1074,3 +1151,4 @@ export async function autoPlaceFields(
 
   return { pageCount: extracted.pageCount, fields: all, modelUsed: !!modelMap }
 }
+
