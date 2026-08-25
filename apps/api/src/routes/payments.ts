@@ -927,9 +927,13 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
               u.payment_block,
-              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer
+              COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
+              -- S620: screened tenants do not get the free first manual
+              -- payment; see the waiver comment below.
+              t.background_check_status
          FROM payments p
          JOIN units u ON u.id = p.unit_id
+         LEFT JOIN tenants t ON t.id = p.tenant_id
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = $1
           FOR UPDATE OF p`,
@@ -992,7 +996,26 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     // landlord covers, that means the LANDLORD gets charged."
     const landlordCovers = pmt.manual_fee_payer === 'landlord'
     const firstPayment = parseInt(priorPaid.n, 10) === 0
-    const feeWaived = firstPayment                    // free — and only this
+
+    // S620 (Nic): the free first payment exists to help a LANDLORD MIGRATE the
+    // tenants they already have — not as a perk for everyone who ever signs up.
+    //
+    //   "It's not a thing for other tenants that just sign up later on and
+    //    exist. It's to help the onboarding flow for landlords... anybody that
+    //    does the background check workflow through Checkr, they do not get
+    //    that protection window."
+    //
+    // The background check IS the discriminator, and it beats a date window:
+    // an existing tenant being carried over is never screened (they already
+    // live there), while after the 21-day onboarding window the ONLY way to
+    // add a tenant is through screening. So the status encodes the window for
+    // free and cannot drift out of sync with it.
+    //
+    // 'not_started' and 'waived' mean nobody ran a check — a migrated tenant.
+    // Anything else means they came through the screening flow and pay the $10.
+    const screened = !['not_started', 'waived', null, undefined]
+      .includes(pmt.background_check_status as any)
+    const feeWaived = firstPayment && !screened       // free — and only this
     const feeToLandlord = !feeWaived && landlordCovers // moved, not erased
     const feeToTenant  = !feeWaived && !landlordCovers
 
@@ -1033,6 +1056,18 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     }
     if (feeToTenant) {
       feePaymentId = (await client.query<{ id: string }>(
+        // NO invoice_id, DELIBERATELY. S620 (Nic): "let's make sure that one
+        // little fee doesn't start accruing extra late fees" — it is already a
+        // fee, and a money order made out for the wrong amount can leave it
+        // sitting unpaid for days or into the next cycle.
+        //
+        // The late-fee engine works invoice by invoice, so a row belonging to
+        // no invoice is invisible to it and CANNOT grow. That matters most on
+        // leases whose late fee accrues DAILY against the outstanding balance
+        // rather than as a flat percentage — a percentage would add pennies to
+        // this, a daily accrual would compound on it indefinitely.
+        //
+        // DO NOT attach these to an invoice. The protection is the absence.
         `INSERT INTO payments
            (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
             entry_description, due_date, notes, revenue_owner)
