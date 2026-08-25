@@ -5,7 +5,7 @@ import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
-  AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs } from '@gam/shared'
+  AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
@@ -44,6 +44,28 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     .filter(c => LEASE_COLUMN_INPUT[c] === 'date' && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
+// S622 (Nic): the Data label dropdown is how a landlord RE-TAGS a box the
+// auto-placer got wrong — "can a landlord mark a box as a lease fee item".
+// They always could. What the form never said is that this tag is what makes
+// GAM BILL the tenant, so there was no way to know that picking "Pet fee"
+// creates a charge, or that leaving it blank means the amount prints and
+// bills nobody. Spell out the consequence under the control.
+function billingEffect(col: string | null | undefined): { text: string; billing: boolean } {
+  if (!col) return { text: 'Prints on the lease only — nothing is billed for this box.', billing: false }
+  const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
+  if (cat === 'fee_row') {
+    const meta = (FEE_TYPE_META as Record<string, any>)[col]
+    const refund = meta?.isRefundable ? ' Refundable — returned at move-out.' : ''
+    if (meta?.dueTiming === 'move_in') return { text: `Billed on the tenant's FIRST invoice, at move-in.${refund}`, billing: true }
+    if (meta?.dueTiming === 'monthly_ongoing') return { text: 'Billed EVERY MONTH alongside rent.', billing: true }
+    if (meta?.dueTiming === 'move_out') return { text: 'Charged at move-out, from the deposit.', billing: true }
+    return { text: 'Recorded on the lease; billed when you choose to bill it.', billing: true }
+  }
+  if (cat === 'writable') return { text: 'Sets this value on the lease itself.', billing: true }
+  if (cat === 'utility_row') return { text: 'Sets who pays this utility.', billing: false }
+  return { text: 'Recorded on the lease.', billing: false }
+}
+
 const ROLE_COLORS: Record<string,string> = {
   landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', co_tenant_3:'#f472b6', witness:'#f59e0b',
   seller:'#c9a227', purchaser:'#22c55e', party_1:'#4a9eff', party_2:'#a78bfa'
@@ -359,6 +381,22 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     return 'Reading the document…'
   }
 
+  // S622: two boxes tagged with the same money column is a real defect — at
+  // execution the lease builder now REFUSES to build rather than pick one
+  // arbitrarily, and discovering that after everyone has signed is miserable.
+  // Surface it here, while it is still a two-second fix.
+  const duplicateMoneyTags = (() => {
+    const byCol: Record<string, string[]> = {}
+    for (const f of fields) {
+      const col = f.leaseColumn
+      if (!col) continue
+      const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
+      if (cat !== 'writable' && cat !== 'fee_row') continue
+      ;(byCol[col] ||= []).push(f.label || col)
+    }
+    return Object.entries(byCol).filter(([, ls]) => ls.length > 1)
+  })()
+
   const pageFields = fields.filter(f => f.page === currentPage)
   const sel = getSelected()
 
@@ -392,6 +430,23 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>
       </div>
+
+      {duplicateMoneyTags.length > 0 && (
+        <div style={{
+          padding:'8px 14px', background:'rgba(239,68,68,.10)',
+          borderBottom:'1px solid rgba(239,68,68,.35)', fontSize:'.72rem',
+          color:'var(--text-1)', lineHeight:1.45,
+        }}>
+          <b style={{ color:'#ef4444' }}>Two boxes are claiming the same amount.</b>{' '}
+          {duplicateMoneyTags.map(([col, labels]) => (
+            <span key={col}>
+              <b>{LEASE_COLUMN_LABEL[col as keyof typeof LEASE_COLUMN_LABEL] || col}</b> is on {labels.length} boxes ({labels.join(', ')}).{' '}
+            </span>
+          ))}
+          Leave the tag on the one box that STATES the amount and set the others to
+          “None (static field)” — they will still print, they just will not bill twice.
+        </div>
+      )}
 
       <div style={{ flex:1, display:'flex', overflow:'hidden' }}>
         {/* Left panel — tools */}
@@ -456,7 +511,16 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                     <option value="">— None (static field) —</option>
                     {DATA_LABELS[sel.fieldType]?.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
-                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Auto-fills from lease data at send time</div>
+                  {(() => {
+                    const eff = billingEffect(sel.leaseColumn)
+                    return (
+                      <div style={{ fontSize:'.62rem', marginTop:3, lineHeight:1.4,
+                        color: eff.billing ? 'var(--gold-1, #c9a227)' : 'var(--text-3)' }}>
+                        {eff.billing ? '💵 ' : ''}{eff.text}
+                        {sel.leaseColumn ? ' Auto-filled from lease data at send time.' : ''}
+                      </div>
+                    )
+                  })()}
                 </div>
               )}
               {sel.fieldType === 'radio_group' && (
