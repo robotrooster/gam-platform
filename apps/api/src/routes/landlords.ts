@@ -966,6 +966,110 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
 // owner concerns regardless of who manages day-to-day. Pre-S183 the
 // dashboard spammed owners with day-to-day items for properties
 // they'd delegated to a PM.
+/**
+ * MULTI-ENTITY: list, switch, create.
+ *
+ * S620 (Nic): "if I wanted to add another property that I am purchasing under
+ * another entity, how would I do that? There's nowhere for that to happen."
+ *
+ * Same land owner, different LLCs is how real estate is actually held, and
+ * until now an entity could only come into existence by somebody registering.
+ * The blocker underneath was not a missing button: the active entity was
+ * DERIVED from "the landlords row where this user is the owner", which has no
+ * answer once a person owns two. users.active_landlord_id (S620 migration)
+ * makes it a choice, and these three routes are how it gets made.
+ */
+
+// GET /api/landlords/me/entities — everything this user can operate in.
+landlordsRouter.get('/me/entities', requireLandlord, async (req, res, next) => {
+  try {
+    const rows = await query<any>(
+      `SELECT l.id,
+              l.business_name,
+              l.ein IS NOT NULL AS has_ein,
+              l.connect_payouts_enabled,
+              (SELECT COUNT(*) FROM properties p WHERE p.landlord_id = l.id)::int AS property_count,
+              (l.user_id = $1) AS is_owner,
+              (l.id = $2) AS is_active
+         FROM landlord_members lm
+         JOIN landlords l ON l.id = lm.landlord_id
+        WHERE lm.user_id = $1
+        ORDER BY (l.user_id = $1) DESC, l.created_at ASC`,
+      [req.user!.userId, req.user!.profileId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/landlords/me/active-entity — switch which entity you are operating in.
+landlordsRouter.post('/me/active-entity', requireLandlord, async (req, res, next) => {
+  try {
+    const landlordId = String(req.body?.landlordId ?? '')
+    if (!landlordId) throw new AppError(400, 'landlordId required')
+
+    // MEMBERSHIP IS THE AUTHORITY. A foreign key cannot express "an entity you
+    // belong to", so it is checked here — otherwise anyone could point their
+    // session at any landlord on the platform and read their whole book.
+    const member = await queryOne<{ id: string }>(
+      `SELECT l.id FROM landlord_members lm
+         JOIN landlords l ON l.id = lm.landlord_id
+        WHERE lm.user_id = $1 AND lm.landlord_id = $2`,
+      [req.user!.userId, landlordId])
+    if (!member) throw new AppError(403, 'You are not a member of that entity')
+
+    await query(`UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
+      [req.user!.userId, landlordId])
+
+    // The entity is stamped into the JWT at login, so the switch lands on the
+    // next authentication rather than this response. Say so plainly instead of
+    // letting them wonder why the dashboard has not moved.
+    res.json({ success: true, data: { landlordId, reloginRequired: true } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/landlords/me/entities — create another entity you own.
+landlordsRouter.post('/me/entities', requireLandlord, async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const businessName = String(req.body?.businessName ?? '').trim()
+    const ein = req.body?.ein ? String(req.body.ein).trim() : null
+    if (!businessName) throw new AppError(400, 'businessName required')
+
+    await client.query('BEGIN')
+    // Billing follows the payout account, and a new entity has no connected
+    // account yet — so it starts in grace exactly like a fresh signup rather
+    // than being billed a minimum before it can receive a cent. Matches the
+    // terms: the $10 minimum attaches to a connected payout account.
+    const created = await client.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, business_name, ein, onboarding_complete, billing_grace_until)
+       VALUES ($1, $2, $3, TRUE, date_trunc('month', now())::date + INTERVAL '2 months')
+       RETURNING id`,
+      [req.user!.userId, businessName, ein])
+    const landlordId = created.rows[0].id
+
+    // Owner-membership is what every scope check reads; without it the creator
+    // could not see the entity they just made.
+    await client.query(
+      `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
+       VALUES ($1, $2, 'owner', $2)`,
+      [landlordId, req.user!.userId])
+
+    // Land them in it. Creating an entity and staying in the old one would be
+    // a confusing no-op.
+    await client.query(`UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
+      [req.user!.userId, landlordId])
+    await client.query('COMMIT')
+
+    // onboarding_complete is TRUE because they are an established landlord —
+    // no five-step wizard. What the new entity DOES still need is its own
+    // connected payout account before money can move, and the dashboard's
+    // standing tasks surface that once it has a property.
+    res.status(201).json({ success: true, data: { landlordId, reloginRequired: true } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
 landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
   try {
     // S620 (Nic): "nobody's seeing a notification for setting up a bank account

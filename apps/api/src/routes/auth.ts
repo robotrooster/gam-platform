@@ -279,7 +279,15 @@ authRouter.post('/login', async (req, res, next) => {
               COALESCE(l.id, t.id, b.id) AS profile_id,
               b.id                       AS business_id
        FROM users u
-       LEFT JOIN landlords  l ON l.user_id = u.id
+       -- S620: prefer the entity the user has CHOSEN. The old join assumed one
+       -- owned entity per person and returns several once someone owns two,
+       -- making the active entity arbitrary. The chosen one wins; the fallback keeps
+       -- every existing landlord on exactly the entity they have today, since
+       -- their active_landlord_id is NULL.
+       LEFT JOIN landlords  active ON active.id = u.active_landlord_id
+       LEFT JOIN landlords  owned  ON owned.user_id = u.id
+                                  AND u.active_landlord_id IS NULL
+       LEFT JOIN landlords  l ON l.id = COALESCE(active.id, owned.id)
        LEFT JOIN tenants    t ON t.user_id = u.id
        -- S453: business_owner login also resolves business_id directly.
        -- business_staff users go through getScopeForUser instead because
@@ -523,7 +531,15 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          ) AS has_mobile_home_units,
          t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
        FROM users u
-       LEFT JOIN landlords  l ON l.user_id = u.id
+       -- S620: prefer the entity the user has CHOSEN. The old join assumed one
+       -- owned entity per person and returns several once someone owns two,
+       -- making the active entity arbitrary. The chosen one wins; the fallback keeps
+       -- every existing landlord on exactly the entity they have today, since
+       -- their active_landlord_id is NULL.
+       LEFT JOIN landlords  active ON active.id = u.active_landlord_id
+       LEFT JOIN landlords  owned  ON owned.user_id = u.id
+                                  AND u.active_landlord_id IS NULL
+       LEFT JOIN landlords  l ON l.id = COALESCE(active.id, owned.id)
        LEFT JOIN tenants    t ON t.user_id = u.id
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        WHERE u.id = $1`, [req.user!.userId]

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict XJecC1fx4SqIUE6tZxcrW1ZRAZ9oTLsRDAt2gQ8zIGwtT7Ma85a1FEICSUCUygN
+\restrict 9OO4WMF6ApHMskpzT7nSBTRCyks43bf6eRob7rNpNuYCiXkdQHgXuZJc6VZYcUm
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8956,6 +8956,7 @@ CREATE TABLE public.users (
     email_2fa_enabled boolean DEFAULT false NOT NULL,
     referral_code text,
     referred_by_user_id uuid,
+    active_landlord_id uuid,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -9028,6 +9029,13 @@ COMMENT ON COLUMN public.users.referral_code IS 'Portfolio manager''s personal r
 --
 
 COMMENT ON COLUMN public.users.referred_by_user_id IS 'S592: this person''s single referral upline (who brought them onto GAM). Anchored to the person so it survives 1031s / new entities. The accrual job (commissionAccrual.ts) reads the landlord ENTITY attribution first and falls back to this. Single-tier — never stacked.';
+
+
+--
+-- Name: COLUMN users.active_landlord_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.active_landlord_id IS 'The landlord entity this user is currently operating in. NULL falls back to the entity they own (pre-S620 behaviour). Only ever set to an entity they are a member of — enforced in the route, since a FK cannot express it.';
 
 
 --
@@ -17020,6 +17028,13 @@ CREATE UNIQUE INDEX uq_business_wo_time_entries_one_running ON public.business_w
 
 
 --
+-- Name: users_active_landlord_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX users_active_landlord_idx ON public.users USING btree (active_landlord_id) WHERE (active_landlord_id IS NOT NULL);
+
+
+--
 -- Name: users_referred_by_user_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -23960,6 +23975,14 @@ ALTER TABLE ONLY public.user_totp_recovery_codes
 
 
 --
+-- Name: users users_active_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_active_landlord_id_fkey FOREIGN KEY (active_landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
 -- Name: users users_default_management_payout_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24267,5 +24290,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XJecC1fx4SqIUE6tZxcrW1ZRAZ9oTLsRDAt2gQ8zIGwtT7Ma85a1FEICSUCUygN
+\unrestrict 9OO4WMF6ApHMskpzT7nSBTRCyks43bf6eRob7rNpNuYCiXkdQHgXuZJc6VZYcUm
 

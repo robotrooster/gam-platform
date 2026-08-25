@@ -19,6 +19,111 @@ const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
 
+// S620 (Nic): "if I wanted to add another property that I am purchasing under
+// another entity, how would I do that? There's nowhere for that to happen."
+//
+// Same land owner, different LLCs is how property is actually held. Until now
+// an entity could only be created by registering a whole new account, and the
+// active entity was inferred rather than chosen — which has no answer once a
+// person owns two. This is where the choice gets made.
+function EntitiesSection() {
+  const qc = useQueryClient()
+  const { data: entities = [], isLoading } = useQuery<any[]>(
+    'landlord-entities', () => apiGet('/landlords/me/entities'))
+  const [adding, setAdding] = useState(false)
+  const [name, setName] = useState('')
+  const [ein, setEin] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+
+  const fail = (e: any) =>
+    setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Something went wrong.')
+
+  const createMut = useMutation(
+    () => api.post('/landlords/me/entities', { businessName: name.trim(), ein: ein.trim() || undefined }).then(r => r.data),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('landlord-entities')
+        setAdding(false); setName(''); setEin(''); setErr(null)
+        setNotice('Entity created and set as your current one. Sign out and back in to switch to it.')
+      },
+      onError: fail,
+    })
+
+  const switchMut = useMutation(
+    (landlordId: string) => api.post('/landlords/me/active-entity', { landlordId }).then(r => r.data),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('landlord-entities')
+        setErr(null)
+        setNotice('Switched. Sign out and back in for it to take effect.')
+      },
+      onError: fail,
+    })
+
+  if (isLoading) return null
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Your entities</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        Each entity keeps its own properties, payouts and books — separate LLCs stay separate.
+        Switching takes effect the next time you sign in.
+      </div>
+
+      {entities.map((e: any) => (
+        <div key={e.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '8px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
+          <div>
+            <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
+              {e.business_name || 'Unnamed entity'}
+              {e.is_active && (
+                <span style={{ marginLeft: 8, fontSize: '.68rem', color: 'var(--gold)' }}>current</span>
+              )}
+            </div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+              {e.property_count} {e.property_count === 1 ? 'property' : 'properties'}
+              {!e.is_owner && ' · co-owned'}
+              {!e.connect_payouts_enabled && ' · payouts not set up'}
+            </div>
+          </div>
+          {!e.is_active && (
+            <button className="btn btn-ghost" style={{ fontSize: '.75rem' }}
+              disabled={switchMut.isLoading}
+              onClick={() => switchMut.mutate(e.id)}>Switch to this</button>
+          )}
+        </div>
+      ))}
+
+      {notice && (
+        <div style={{ fontSize: '.75rem', color: 'var(--gold)', marginTop: 10 }}>{notice}</div>
+      )}
+      {err && <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 10 }}>{err}</div>}
+
+      {adding ? (
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          <input className="input" placeholder="Entity name (e.g. Haws Homes LLC)"
+            value={name} onChange={e => setName(e.target.value)} />
+          <input className="input" placeholder="EIN (optional)"
+            value={ein} onChange={e => setEin(e.target.value)} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary" style={{ fontSize: '.78rem' }}
+              disabled={!name.trim() || createMut.isLoading}
+              onClick={() => createMut.mutate()}>
+              {createMut.isLoading ? 'Creating…' : 'Create entity'}
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: '.78rem' }}
+              onClick={() => { setAdding(false); setErr(null) }}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button className="btn btn-primary" style={{ marginTop: 12, fontSize: '.78rem' }}
+          onClick={() => { setAdding(true); setNotice(null) }}>Add another entity</button>
+      )}
+    </div>
+  )
+}
+
 // S553: owner-members of this landlord entity (multi-owner LLCs — Oak
 // Park). Any owner can add a co-owner by email (they must already have a
 // GAM landlord account); the founding owner can't be removed. Memberships
@@ -295,6 +400,7 @@ export function SettingsPage() {
           )}
 
           {/* S553: entity owner-members (multi-owner LLCs). */}
+          <EntitiesSection />
           <OwnersSection />
 
           {/* W-53 (S531): Notification Prefs merged in as a real section —
