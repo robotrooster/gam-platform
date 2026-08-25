@@ -174,11 +174,10 @@ export function SettingsPage() {
   // both; nothing in the UI ever sent them, so a landlord whose signup dropped
   // them had no way to put them back.
   const [editAccount, setEditAccount] = useState(false)
-  const [acctForm, setAcctForm] = useState({ businessName: '', ein: '' })
+  const [acctForm, setAcctForm] = useState({ businessName: '' })
   const acctMut = useMutation(
     () => apiPatch('/landlords/me', {
       businessName: acctForm.businessName.trim() || undefined,
-      ein: acctForm.ein.trim() || undefined,
     }),
     {
       onSuccess: () => {
@@ -254,7 +253,7 @@ export function SettingsPage() {
               {!editAccount && (
                 <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }}
                   onClick={() => {
-                    setAcctForm({ businessName: me?.businessName || '', ein: me?.ein || '' })
+                    setAcctForm({ businessName: me?.businessName || '' })
                     setEditAccount(true)
                   }}>Edit</button>
               )}
@@ -271,13 +270,18 @@ export function SettingsPage() {
                 )}
               </div>
               <div>
-                <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>EIN</div>
-                {editAccount ? (
-                  <input className="input" value={acctForm.ein} placeholder="12-3456789"
-                    onChange={e => setAcctForm(f => ({ ...f, ein: e.target.value }))} />
-                ) : (
-                  <div className="mono">{me?.ein || '—'}</div>
-                )}
+                {/* S620 (Nic): "replace the EIN field on the account card with
+                    'on file with Stripe'. I like that one."
+                    GAM never read this value — it was collected, stored and
+                    displayed, nothing more. Stripe holds the real one for KYC
+                    and 1099-K and will not return it, so keeping a copy was
+                    liability in exchange for a label. */}
+                <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Tax ID</div>
+                <div style={{ color: me?.connectDetailsSubmitted ? 'var(--text-0)' : 'var(--text-3)' }}>
+                  {me?.connectDetailsSubmitted
+                    ? 'On file with Stripe'
+                    : 'Collected during payout setup'}
+                </div>
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Name</div>

@@ -814,9 +814,25 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
         SET stripe_connect_status_synced_at = NOW(),
             connect_charges_enabled    = $2,
             connect_payouts_enabled    = $3,
-            connect_details_submitted  = $4
+            connect_details_submitted  = $4,
+            -- S620 (Nic): "let's just have it be put into Stripe the first time
+            -- and make a copy of it for the account profile page... it was
+            -- shitty putting it in two times for Oak Park."
+            --
+            -- Stripe's KYC collects the legal entity name because it must, so
+            -- asking for it again at signup was pure duplicate entry. Signup no
+            -- longer asks; this is where it arrives.
+            --
+            -- COALESCE keeps whatever the landlord typed as a working label
+            -- (they need something to identify the entity in a dropdown before
+            -- Connect is finished) and only fills a BLANK one, so Stripe's
+            -- legal name never silently overwrites a name someone chose. Nic's
+            -- own entity sat nameless for weeks because signup dropped it —
+            -- Stripe had "Oak Park Motel and RV LLC" the whole time.
+            business_name = COALESCE(NULLIF(business_name, ''), $5)
       WHERE stripe_connect_account_id = $1`,
-    [account.id, charges, payouts, details]
+    [account.id, charges, payouts, details,
+     account.company?.name ?? account.business_profile?.name ?? null]
   )
 
   // S113-PhaseA: when a Connect account becomes ready (charges + details),

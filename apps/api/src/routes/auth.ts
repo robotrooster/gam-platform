@@ -114,8 +114,15 @@ const registerSchema = z.object({
   // Three symptoms, one cause: a blank business name and EIN on the Settings
   // account card, "Unnamed entity" in the entity list, and a co-owner invite
   // email that said "a property on GAM" instead of naming the LLC.
+  // S620: signup no longer asks for these. Stripe's KYC collects the legal
+  // name and tax ID because it must, and the name syncs back on Connect
+  // completion (services/stripeConnect.recordAccountUpdated). The EIN is never
+  // stored on our side — nothing ever read it, and Stripe will not return it,
+  // so a copy was liability for a display field.
+  //
+  // businessName is still ACCEPTED for assisted-signup paths that already know
+  // the entity name; it just is not asked for on the self-serve form.
   businessName: z.string().trim().min(1).optional(),
-  ein:          z.string().trim().min(1).optional(),
   // Legal acceptance — frontend gate sets this true when the user
   // checks the Terms + Privacy acknowledgement at registration.
   // We refuse the request if it's false or missing so the timestamps
@@ -208,7 +215,7 @@ authRouter.post('/register', async (req, res, next) => {
                    (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date,
                    $5, $6) RETURNING id`,
           [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES,
-           body.businessName ?? null, body.ein ?? null]
+           body.businessName ?? null, null]
         ).then(r => r.rows)
         profileId = l.id
         // S553: founding owner-membership (multi-owner entities).

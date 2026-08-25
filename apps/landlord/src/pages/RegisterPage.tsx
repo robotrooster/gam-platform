@@ -74,7 +74,7 @@ export function RegisterPage() {
     // different address here builds an account that CANNOT accept the invite
     // that created it.
     email: searchParams.get('email') || '', phone: '',
-    password: '', confirmPassword: '', businessName: '', ein: '',
+    password: '', confirmPassword: '',
   })
   // S578: mandatory email-2FA at signup — /auth/register returns a pending
   // session + emails a 6-digit code; we verify it here before the account is
@@ -234,13 +234,15 @@ export function RegisterPage() {
               <input className="input" type="tel" placeholder="(555) 000-0000" value={form.phone} onChange={e => set('phone', e.target.value)} required style={{ width: '100%' }} />
             </div>
 
-            {/* Business name */}
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>
-                Business Name <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional — LLC, partnership, etc.)</span>
-              </label>
-              <input className="input" placeholder="Smith Properties LLC" value={form.businessName} onChange={e => set('businessName', e.target.value)} style={{ width: '100%' }} />
-            </div>
+            {/* S620 (Nic): "it was shitty putting it in two times for Oak Park.
+                And if I have to do it two times for every other entity I add,
+                that's friction."
+                Business name and EIN are GONE from signup. Stripe collects both
+                during Connect onboarding because KYC requires them, and the
+                legal name syncs back here on completion (recordAccountUpdated).
+                The EIN is never stored on our side at all — nothing in the
+                platform ever read it, and Stripe will not hand it back anyway,
+                so keeping a copy was liability for a display field. */}
 
             {/* Password */}
             <div style={{ marginBottom: 20 }}>
