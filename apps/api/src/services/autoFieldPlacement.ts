@@ -34,6 +34,7 @@ import { extractPositionedText, type TextItem } from '../lib/pdfText'
 // came through.
 import { detectConditionalFees, auditUnattributedAmounts } from '../jobs/leaseParser/extractors'
 import type { ParserExtractedConditionalFee } from '@gam/shared'
+import { isScreeningFeeText } from '@gam/shared'
 import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
 
@@ -100,6 +101,13 @@ export interface AutoPlaceResult {
    * mirroring the audit the import path already runs.
    */
   unattributedAmounts: Array<{ amount: number; context: string }>
+  /**
+   * S622: background-check / screening fees the lease states. Pulled OUT of both
+   * lists above and named here so the landlord can see they were found and
+   * excluded on purpose. Applicants pay GAM directly for screening, so billing
+   * the lease's own fee would charge them twice for one report.
+   */
+  screeningFees: Array<{ amount: number; context: string }>
   pageCount: number
   fields: ProposedField[]
   modelUsed: boolean
@@ -1227,15 +1235,34 @@ export async function autoPlaceFields(
     claimed.add(col)
   }
 
-  const cFees = detectConditionalFees(extracted.pages)
+  // S622: split screening fees out of BOTH readers before anything downstream
+  // sees them. They are real amounts, printed on the lease — they simply never
+  // become charges, and the landlord is told so rather than left to notice a
+  // gap. Doing the split here means the template path and the import path
+  // exclude by the same rule, not by two lists that drift.
+  const allConditional = detectConditionalFees(extracted.pages)
+  const cFees = allConditional.filter(c => !isScreeningFeeText(c.conditionText))
+  const screeningFromConditional = allConditional
+    .filter(c => isScreeningFeeText(c.conditionText))
+    .map(c => ({ amount: c.amount, context: c.conditionText }))
+
+  // Attributed = everything accounted for, INCLUDING screening — otherwise a
+  // screening fee we deliberately excluded would reappear as "untracked".
+  const attributed = [...cFees, ...screeningFromConditional].map(c => c.amount)
+  const allUnattributed = auditUnattributedAmounts(extracted.pages, attributed)
+  const unattributed = allUnattributed.filter(u => !isScreeningFeeText(u.context))
+  const screeningFees = [
+    ...screeningFromConditional,
+    ...allUnattributed.filter(u => isScreeningFeeText(u.context)),
+  ]
 
   return {
     pageCount: extracted.pageCount,
     fields: all,
     modelUsed: !!modelMap,
     conditionalFees: cFees,
-    // Attributed = what we DID account for. Everything else is surfaced.
-    unattributedAmounts: auditUnattributedAmounts(extracted.pages, cFees.map(c => c.amount)),
+    unattributedAmounts: unattributed,
+    screeningFees,
   }
 }
 

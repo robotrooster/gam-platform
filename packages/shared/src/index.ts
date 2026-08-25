@@ -4338,6 +4338,7 @@ export * from './paymentAllocation'
 export * from './camelize'
 export * from './versionWatch'
 export * from './autoPlaceEstimate'
+export * from './screeningFee'
 
 // ============================================================
 // S26a: Invoice types
@@ -4698,6 +4699,10 @@ export const PARSER_FLAG_CATEGORIES = [
   'field_suspect',
   'field_low_confidence',
   'unattributed_amount',
+  // S622: a background-check fee the lease states, found and EXCLUDED on
+  // purpose. Named rather than dropped — a fee that vanishes silently is
+  // indistinguishable from one the parser missed.
+  'screening_fee_excluded',
 ] as const
 export type ParserFlagCategory = typeof PARSER_FLAG_CATEGORIES[number]
 
@@ -4708,9 +4713,13 @@ export const PARSER_FLAG_CATEGORY_META: Record<ParserFlagCategory, { label: stri
   field_suspect:        { label: 'Suspect value',        description: 'Lease term was extracted but the value looks wrong (zero rent, dates far in future, etc.).' },
   field_low_confidence: { label: 'Low confidence',       description: 'Parser is not confident in this extraction. Landlord should verify.' },
   unattributed_amount:  { label: 'Unrecognized dollar amount', description: 'The document mentions a dollar amount the parser could not attribute to any known charge — review the clause so no financial obligation is missed.' },
+  screening_fee_excluded: { label: 'Background-check fee (not billed)', description: 'The lease charges the tenant for a background check. Applicants pay GAM directly for screening, so this is deliberately never billed through the lease — shown here so the exclusion is visible rather than silent.' },
 }
 
-export const PARSER_FLAG_SEVERITIES = ['block', 'confirm'] as const
+// 'info' (S622) records something the parser decided ON PURPOSE — it needs no
+// action and never affects parse status; it exists so a deliberate exclusion is
+// visible instead of looking like an omission.
+export const PARSER_FLAG_SEVERITIES = ['block', 'confirm', 'info'] as const
 export type ParserFlagSeverity = typeof PARSER_FLAG_SEVERITIES[number]
 
 // One extracted field: value plus parser's confidence and the raw text it saw.

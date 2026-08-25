@@ -9,6 +9,7 @@ import {
   LeaseColumn,
   LeaseColumnVals,
   LEASE_COLUMN_CATEGORY,
+  isScreeningFeeText,
   LEASE_COLUMN_LABEL,
   LEASE_COLUMN_VALUE_BEARING_CATEGORIES,
   WRITABLE_LEASE_COLUMN_SPECS,
@@ -888,6 +889,10 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       `SELECT label, amount, condition_text FROM lease_template_conditional_fees
         WHERE template_id = $1`, [doc.template_id]).then((r: any) => r.rows)
     for (const cf of tcf as any[]) {
+      // S622 belt-and-braces: screening fees are already filtered out before a
+      // landlord ever confirms one, but a row could be inserted by hand or
+      // predate that filter. A background-check fee must never become a charge.
+      if (isScreeningFeeText(cf.condition_text)) continue
       await client.query(
         `INSERT INTO lease_fees
            (lease_id, fee_type, amount, is_refundable, due_timing, description, condition_text)

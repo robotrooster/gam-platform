@@ -5,7 +5,8 @@ import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
-  AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META } from '@gam/shared'
+  AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
+  SCREENING_FEE_EXCLUSION_REASON } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
@@ -241,6 +242,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // money the lease commits to that GAM would not otherwise know about. Advisory
   // only — not saved; it is a prompt to go tag something.
   const [unattributed, setUnattributed] = useState<any[]>([])
+  // S622: background-check fees found in the lease and deliberately excluded.
+  // Shown, not dropped — Nic: "we wanna identify them just to make sure that
+  // we're purposely ignoring them, not accidentally ignoring them."
+  const [screeningFees, setScreeningFees] = useState<any[]>([])
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -360,6 +365,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         // Merge what the prose scan found, keyed on the clause itself so
         // re-running auto-place never duplicates one the landlord already kept.
         setUnattributed(Array.isArray(result?.unattributedAmounts) ? result.unattributedAmounts : [])
+        setScreeningFees(Array.isArray(result?.screeningFees) ? result.screeningFees : [])
         if (Array.isArray(result?.conditionalFees) && result.conditionalFees.length > 0) {
           setConditionalFees(prev => {
             const seen = new Set(prev.map((c: any) => String(c.conditionText).trim()))
@@ -479,6 +485,29 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           <div style={{ color:'var(--text-3)', marginTop:6 }}>
             Saved with the fields. Remove any the scan got wrong.
           </div>
+        </div>
+      )}
+
+      {screeningFees.length > 0 && (
+        <div style={{
+          padding:'8px 14px', background:'rgba(74,158,255,.10)',
+          borderBottom:'1px solid rgba(74,158,255,.35)', fontSize:'.72rem',
+          color:'var(--text-1)', lineHeight:1.5,
+        }}>
+          <b style={{ color:'#4a9eff' }}>Background-check fee — found, and not billed</b>
+          <span style={{ color:'var(--text-3)' }}>
+            {' '}— {SCREENING_FEE_EXCLUSION_REASON} Billing it here would charge the
+            tenant twice for one report, so GAM excludes it on purpose. Shown so you
+            know it was seen, not missed.
+          </span>
+          {screeningFees.map((sf: any, i: number) => (
+            <div key={i} style={{ marginTop:6 }}>
+              <b>${Number(sf.amount).toFixed(2)}</b>
+              <div style={{ color:'var(--text-3)', fontStyle:'italic', marginTop:1 }}>
+                “{String(sf.context).slice(0, 200)}{String(sf.context).length > 200 ? '…' : ''}”
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

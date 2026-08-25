@@ -33,6 +33,7 @@ import type {
   ParserExtractedIdentification, ParserExtractedEmergencyContact,
   ParserExtractedLiabilityInsurance,
 } from '@gam/shared'
+import { isScreeningFeeText } from '@gam/shared'
 import { logger } from '../../lib/logger'
 
 const pendingPdfDir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
@@ -332,6 +333,9 @@ export async function resolveIntent(
       const amount = Number(cf?.amount)
       const conditionText = String(cf?.conditionText ?? '').trim()
       if (!Number.isFinite(amount) || amount <= 0 || !conditionText) continue
+      // S622: a background-check fee on an imported lease was paid before the
+      // PDF was ever uploaded. Never re-bill it.
+      if (isScreeningFeeText(conditionText)) continue
       await client.query(
         `INSERT INTO lease_fees
            (lease_id, fee_type, amount, is_refundable, due_timing, description, condition_text)

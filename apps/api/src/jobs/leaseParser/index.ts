@@ -17,6 +17,7 @@ import type {
   ParserExtractedTenant, ParserExtractedUnit, ParserExtractedLease,
   ParserExtractedField,
 } from '@gam/shared'
+import { isScreeningFeeText, SCREENING_FEE_EXCLUSION_REASON } from '@gam/shared'
 import { extractPositionedText } from '../../lib/pdfText'
 import { extractAuditTrail, isAuditTrailPage, type AuditTrailExtraction } from './auditTrail'
 import {
@@ -125,7 +126,16 @@ export async function parseLease(pdfBuffer: Buffer): Promise<ParseResult> {
   const { lateFeeAmount, lateFeeGraceDays } = detectLateFees(extracted.pages)
   const subleasingPolicy = detectSubleasingPolicy(extracted.pages)
   // S550: conditional fees ("if not X, then $Y") from the body prose.
-  const conditionalFees = detectConditionalFees(bodyPages)
+  // S622: background-check fees are pulled out and NEVER billed. On an imported
+  // lease the tenant paid theirs before the PDF was ever uploaded, so it is
+  // historical; on a new one the applicant pays GAM directly. Same rule, same
+  // helper, as the e-sign template path — Nic: "either way, there shouldn't be...
+  // we should specifically flag lease background check fees and specifically
+  // isolate them and ignore them. But we wanna identify them just to make sure
+  // that we're purposely ignoring them, not accidentally ignoring them."
+  const allConditionalFees = detectConditionalFees(bodyPages)
+  const conditionalFees = allConditionalFees.filter(f => !isScreeningFeeText(f.conditionText))
+  const screeningFees = allConditionalFees.filter(f => isScreeningFeeText(f.conditionText))
 
   // 9. Lease type heuristic: fixed term + end date -> fixed_term;
   //    no end + monthly -> month_to_month
@@ -278,13 +288,34 @@ export async function parseLease(pdfBuffer: Buffer): Promise<ParseResult> {
     ...(deposit ? [deposit.value] : []),
     ...(lateFeeAmount ? [lateFeeAmount.value] : []),
     ...conditionalFees.map(f => f.amount),
+    // Screening counts as attributed — it was found and excluded on purpose,
+    // and must not reappear below as something we failed to account for.
+    ...screeningFees.map(f => f.amount),
   ]
   for (const ua of auditUnattributedAmounts(bodyPages, attributed)) {
+    // A screening fee stated somewhere the conditional detector did not reach
+    // still gets named as excluded rather than flagged as untracked.
+    if (isScreeningFeeText(ua.context)) {
+      screeningFees.push({ label: 'Background check', amount: ua.amount,
+        conditionText: ua.context, confidence: 1, rawText: ua.context })
+      continue
+    }
     flags.push({
       category: 'unattributed_amount',
       severity: 'confirm',
       message:  `The lease mentions $${ua.amount.toFixed(2)} that isn't attributed to rent, deposit, late fees, or a detected fee — review the clause.`,
       found:    ua.context,
+    })
+  }
+
+  // S622: named, not silent. A fee that disappears without explanation is
+  // indistinguishable from one we failed to find.
+  for (const sf of screeningFees) {
+    flags.push({
+      category: 'screening_fee_excluded',
+      severity: 'info',
+      message:  `The lease charges $${sf.amount.toFixed(2)} for a background check. ${SCREENING_FEE_EXCLUSION_REASON} It will NOT be billed to the tenant.`,
+      found:    sf.conditionText,
     })
   }
 
