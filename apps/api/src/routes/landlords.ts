@@ -968,7 +968,24 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
 // they'd delegated to a PM.
 landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S620 (Nic): "nobody's seeing a notification for setting up a bank account
+    // and Stripe KYC, and it won't let him delete it."
+    //
+    // This scoped to req.user.profileId — the entity where the caller is the
+    // OWNER — while the dashboard a few hundred lines up deliberately spans
+    // every entity they own OR co-own. A co-owner therefore saw Oak Park's
+    // numbers on the dashboard and Oak Park's to-do list nowhere, because the
+    // to-dos were being computed against their OWN entity: the empty one that
+    // registering created so they could accept the invite in the first place.
+    //
+    // The task could not be dismissed because it was not stale. It was a true
+    // statement about an entity with no properties, no tenants and no money —
+    // and therefore useless. Every co-owner would hit this, not just the first
+    // one, since accepting an invite always requires registering first.
+    //
+    // Same scope as the dashboard now: own entity + co-owned entities.
+    const scopeIds = Array.from(
+      new Set([req.user!.profileId, ...(req.user!.landlordIds ?? [])].filter(Boolean)))
     const userId = req.user!.userId
 
     // S67: bank readiness derives from active user_bank_accounts. The
@@ -983,16 +1000,24 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // whole Stripe process hadn't saved. Ready now means what it actually
     // means: Stripe can pay you. The legacy catalog still counts, for the
     // multi-owner allocation-split case that does use it.
+    // READY IF ANY ENTITY IN SCOPE CAN BE PAID. A co-owner of a fully set-up
+    // entity must not be nagged about the empty one registration gave them —
+    // there is no money in it to route anywhere. If they later add a property
+    // of their own, the entity stops being empty and the gate correctly
+    // returns, which is when it actually matters.
     const bankReady = await queryOne<{ ready: boolean }>(`
-      SELECT (
-        (SELECT connect_payouts_enabled FROM landlords WHERE id=$1)
-        OR EXISTS (
-          SELECT 1 FROM user_bank_accounts ba
-           WHERE ba.user_id = (SELECT user_id FROM landlords WHERE id=$1)
-             AND ba.status = 'active'
-        )
+      SELECT EXISTS (
+        SELECT 1 FROM landlords l
+         WHERE l.id = ANY($1)
+           AND (
+             l.connect_payouts_enabled
+             OR EXISTS (
+               SELECT 1 FROM user_bank_accounts ba
+                WHERE ba.user_id = l.user_id AND ba.status = 'active'
+             )
+           )
       ) AS ready
-    `, [landlordId])
+    `, [scopeIds])
 
     // ── LEASE ISSUES ──────────────────────────────────────
     // needs_review OR expiring within that lease's own expiration_notice_days window
@@ -1037,7 +1062,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role = 'primary' AND lt.status = 'active'
       LEFT JOIN tenants t ON t.id = lt.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
-      WHERE l.landlord_id = $1
+      WHERE l.landlord_id = ANY($1)
         AND l.status = 'active'
         AND p.pm_company_id IS NULL
         AND p.managed_by_user_id = $2
@@ -1052,7 +1077,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       ORDER BY
         CASE WHEN l.needs_review = true THEN 0 ELSE 1 END,
         l.end_date NULLS LAST
-    `, [landlordId, userId])
+    `, [scopeIds, userId])
 
     const leases = leaseRows.map((l: any) => {
       const tenantName = [l.tenant_first, l.tenant_last].filter(Boolean).join(' ') || 'Unassigned'
@@ -1098,8 +1123,8 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     const [feed] = await query<{ linked: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM bank_connections
-          WHERE landlord_id = $1 AND status = 'active'
-       ) AS linked`, [landlordId])
+          WHERE landlord_id = ANY($1) AND status = 'active'
+       ) AS linked`, [scopeIds])
     if (!feed?.linked) {
       ach.push({
         id: 'landlord-bank-feed',
@@ -1137,13 +1162,13 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       JOIN tenants t ON t.id = vuo.primary_tenant_id
       JOIN users tu ON tu.id = t.user_id
-      WHERE u.landlord_id = $1
+      WHERE u.landlord_id = ANY($1)
         AND u.status = 'active'
         AND p.pm_company_id IS NULL
         AND p.managed_by_user_id = $2
         AND (t.ach_verified = false OR t.ach_verified IS NULL)
       ORDER BY u.unit_number
-    `, [landlordId, userId])
+    `, [scopeIds, userId])
 
     for (const t of unverifiedTenants) {
       const tenantName = [t.tenant_first, t.tenant_last].filter(Boolean).join(' ') || 'Tenant'
@@ -1175,14 +1200,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN properties pr ON pr.id = u.property_id
       LEFT JOIN tenants t ON t.id = p.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
-      WHERE p.landlord_id = $1
+      WHERE p.landlord_id = ANY($1)
         AND pr.pm_company_id IS NULL
         AND pr.managed_by_user_id = $2
         AND p.type = 'rent'
         AND p.status IN ('failed', 'returned')
         AND p.due_date >= CURRENT_DATE - INTERVAL '30 days'
       ORDER BY p.unit_id, p.due_date DESC
-    `, [landlordId, userId])
+    `, [scopeIds, userId])
 
     for (const f of failed) {
       const tenantName = [f.tenant_first, f.tenant_last].filter(Boolean).join(' ') || 'Tenant'
@@ -1208,10 +1233,10 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       FROM maintenance_requests mr
       JOIN units u ON u.id = mr.unit_id
       JOIN properties p ON p.id = u.property_id
-      WHERE mr.landlord_id = $1
+      WHERE mr.landlord_id = ANY($1)
         AND mr.status = 'awaiting_approval'
       ORDER BY mr.created_at DESC
-    `, [landlordId])
+    `, [scopeIds])
 
     const maintenance = maintRows.map((m: any) => ({
       id: m.id,
@@ -1237,7 +1262,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN users u ON u.id = t.user_id
       JOIN units un ON un.id = wta.unit_id
       JOIN properties p ON p.id = un.property_id
-      WHERE wta.landlord_id = $1
+      WHERE wta.landlord_id = ANY($1)
         AND wta.status = 'paused'
         AND NOT EXISTS (
           SELECT 1 FROM leases l
@@ -1245,7 +1270,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
           WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
             AND l.status = 'active' AND lt.status = 'active')
       ORDER BY wta.updated_at DESC
-    `, [landlordId])
+    `, [scopeIds])
 
     const workTrade = wtRows.map((w: any) => ({
       id: w.id,
@@ -1264,10 +1289,10 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       FROM lease_documents d
       JOIN work_trade_agreements wta ON wta.id = d.work_trade_agreement_id
       JOIN units un ON un.id = d.unit_id
-      WHERE d.landlord_id = $1 AND d.status = 'pending'
+      WHERE d.landlord_id = ANY($1) AND d.status = 'pending'
         AND d.work_trade_agreement_id IS NOT NULL
       ORDER BY d.created_at DESC
-    `, [landlordId])
+    `, [scopeIds])
     for (const a of wtAddendumRows as any[]) {
       workTrade.push({
         id: a.id,
@@ -1300,11 +1325,11 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         JOIN users usr ON usr.id = t.user_id
         LEFT JOIN units un ON un.id = pti.unit_id
         LEFT JOIN properties p ON p.id = un.property_id
-       WHERE pti.landlord_id = $1
+       WHERE pti.landlord_id = ANY($1)
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
        ORDER BY pti.created_at ASC
-    `, [landlordId])
+    `, [scopeIds])
 
     for (const it of intentRows as any[]) {
       const who = [it.first_name, it.last_name].filter(Boolean).join(' ') || 'Tenant'
@@ -1350,11 +1375,11 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         JOIN lease_document_signers s ON s.document_id = d.id AND s.role = 'landlord'
         LEFT JOIN units un ON un.id = d.unit_id
         LEFT JOIN properties p ON p.id = un.property_id
-       WHERE d.landlord_id = $1
+       WHERE d.landlord_id = ANY($1)
          AND d.status IN ('sent', 'in_progress')
          AND s.status <> 'signed'
        ORDER BY d.created_at ASC
-    `, [landlordId])
+    `, [scopeIds])
     for (const d of awaitingSig as any[]) {
       const where = d.unit_number ? ' — Unit ' + d.unit_number + (d.property_name ? ' (' + d.property_name + ')' : '') : ''
       onboarding.push({
@@ -1377,12 +1402,12 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         JOIN units un ON un.id = a.unit_id
         JOIN properties p ON p.id = un.property_id
         LEFT JOIN tenants t ON t.user_id = a.applicant_user_id
-       WHERE a.landlord_id = $1
+       WHERE a.landlord_id = ANY($1)
          AND a.unit_id IS NOT NULL
          AND a.applicant_user_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = a.id)
        ORDER BY a.created_at ASC
-    `, [landlordId])
+    `, [scopeIds])
     for (const a of applicantRows as any[]) {
       const who = [a.first_name, a.last_name].filter(Boolean).join(' ') || 'Applicant'
       const where = a.unit_number ? ' — Unit ' + a.unit_number + (a.property_name ? ' (' + a.property_name + ')' : '') : ''

@@ -408,3 +408,81 @@ describe('GET /api/landlords/me/todos — onboarding control tower', () => {
     expect(item.href).toBe('/sign/' + doc.rows[0].id)
   })
 })
+
+// ── S620: a co-owner must not be nagged about the empty entity that
+//          registering created ────────────────────────────────────────────
+//
+// Nic's partner accepted a co-owner invite to Oak Park and was told to set up a
+// bank account and Stripe KYC, with no way to dismiss it. The task was not
+// stale — it was a TRUE statement about the wrong entity. Accepting an invite
+// requires registering first, and registering always creates an entity, so
+// every co-owner carries an empty one. The to-dos scoped to that entity while
+// the dashboard beside them already spanned both.
+describe('to-dos for a co-owner of somebody else’s entity', () => {
+  async function seedCoOwner() {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // The funded entity — a real property, payouts switched on.
+      const owner = await seedLandlord(client)
+      const propertyId = await seedProperty(client, {
+        landlordId: owner.landlordId,
+        ownerUserId: owner.userId,
+        managedByUserId: owner.userId,
+      })
+      await client.query(
+        `UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`,
+        [owner.landlordId])
+
+      // The partner: their OWN empty entity, plus membership of the funded one.
+      const partner = await seedLandlord(client)
+      await client.query(
+        `INSERT INTO landlord_members (landlord_id, user_id, role)
+         VALUES ($1, $2, 'owner'), ($3, $2, 'owner')
+         ON CONFLICT (landlord_id, user_id) DO NOTHING`,
+        [owner.landlordId, partner.userId, partner.landlordId])
+      await client.query('COMMIT')
+
+      // The JWT carries BOTH entities, exactly as login builds it from
+      // landlord_members — profileId stays their own empty one, because that is
+      // the entity they are the registered owner of.
+      const token = jwt.sign(
+        { userId: partner.userId, role: 'landlord', email: 'partner@test.dev',
+          profileId: partner.landlordId,
+          landlordIds: [partner.landlordId, owner.landlordId], permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { token, propertyId, ownerLandlordId: owner.landlordId }
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  }
+
+  it('does not demand a bank account when a co-owned entity can already be paid', async () => {
+    const f = await seedCoOwner()
+    const res = await getTodos(f.token)
+    expect(res.status).toBe(200)
+    // The bank todos live in the `ach` bucket, by id. An earlier version of
+    // this test looked in `onboarding`, found nothing, and passed for the
+    // wrong reason — the guard test below is what exposed that.
+    const ids = (res.body.data.ach as any[]).map((t) => t.id)
+    expect(
+      ids,
+      'a co-owner of a funded entity was told to set up a bank account for their empty one'
+    ).not.toContain('landlord-bank')
+  })
+
+  it('still demands one when NO entity in scope can be paid', async () => {
+    // The gate has to keep working — this is the case where it is right.
+    const client = await db.connect()
+    let token: string
+    try {
+      const solo = await seedLandlord(client)
+      token = jwt.sign(
+        { userId: solo.userId, role: 'landlord', email: 'solo@test.dev',
+          profileId: solo.landlordId, landlordIds: [solo.landlordId], permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+    } finally { client.release() }
+    const res = await getTodos(token)
+    expect(res.status).toBe(200)
+    expect((res.body.data.ach as any[]).map((t) => t.id)).toContain('landlord-bank')
+  })
+})
