@@ -119,9 +119,23 @@ export async function runAutopayForTimezone(tz: string): Promise<AutopayRunResul
       }
 
       // The live balance, right now. Nothing forecast.
+      // S622: autopay charges what the LEASE billed — never the carried-forward
+      // balance.
+      //
+      // Arrears imported from a landlord's previous system are the one charge a
+      // tenant may pay in part, precisely because they are usually large and on
+      // a catch-up footing. Sweeping them into an automatic pull inverts that:
+      // a tenant who set up autopay for $800 of rent would wake up to an $1,800
+      // debit on their chosen day, out of an account that may hold neither. That
+      // is worse than the FIFO trap this carve-out exists to prevent — it does
+      // not just misapply the money, it takes money that was never authorised.
+      //
+      // Paying arrears down stays a deliberate act by the tenant, in whatever
+      // amount they can manage, through Pay Now.
       const balance = await queryOne<{ total: string }>(
         `SELECT COALESCE(SUM(amount), 0)::text AS total FROM payments
           WHERE lease_id = $1 AND tenant_id = $2
+            AND type <> 'carried_balance'
             AND ((status = 'pending' AND stripe_payment_intent_id IS NULL)
                  OR status = 'failed')`,
         [c.lease_id, c.tenant_id])

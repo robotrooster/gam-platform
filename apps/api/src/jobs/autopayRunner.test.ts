@@ -80,6 +80,13 @@ async function armForToday(f: Fixture, methodId: string | null = 'pm_bank') {
     [f.tenantId, f.leaseId, todayDay(), methodId])
 }
 
+async function seedCarried(f: Fixture, amount: number) {
+  await db.query(
+    `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+     VALUES ($1,$2,$3,$4,'carried_balance',$5,'pending', CURRENT_DATE - 200, 'BALANCE')`,
+    [f.unitId, f.leaseId, f.tenantId, f.landlordId, amount.toFixed(2)])
+}
+
 async function seedCharge(f: Fixture, amount: number, type: 'rent' | 'late_fee' = 'rent') {
   await db.query(
     `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
@@ -124,6 +131,35 @@ describe('S609 autopay runner', () => {
     expect(r.charged).toBe(1)
     // 1035, not the 1000 anyone could have forecast yesterday.
     expect(chargeMock.mock.calls[0][0]).toMatchObject({ amount: 1035, source: 'autopay' })
+  })
+
+  // S622 (Nic): "if somebody has ACH set up, do they have to manually pick the
+  // amount every month, or is it gonna automatically charge them the full
+  // balance or just the current rent charge?"
+  //
+  // Just the lease's own charges. A carried-forward balance is the one charge
+  // payable in part, usually large and on a catch-up footing — sweeping it into
+  // an automatic pull would debit $1,800 from a tenant who set autopay up for
+  // $800 of rent. That does not merely misapply money, it takes money that was
+  // never authorised.
+  it('S622: autopay never sweeps the carried-forward balance', async () => {
+    await armForToday(f)
+    await seedCharge(f, 800)
+    await seedCarried(f, 1000)          // eight months older than the rent
+
+    const r = await runAutopayForTimezone(TZ)
+    expect(r.charged).toBe(1)
+    expect(chargeMock.mock.calls[0][0]).toMatchObject({ amount: 800, source: 'autopay' })
+  })
+
+  it('S622: a tenant whose ONLY open charge is arrears is skipped, not drained', async () => {
+    await armForToday(f)
+    await seedCarried(f, 1000)
+
+    const r = await runAutopayForTimezone(TZ)
+    expect(r.charged).toBe(0)
+    expect(r.skipped).toBe(1)
+    expect(chargeMock).not.toHaveBeenCalled()
   })
 
   it('NEVER CHARGES TWICE — a second run in the same month does nothing', async () => {
