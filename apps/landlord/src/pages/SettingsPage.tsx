@@ -45,18 +45,7 @@ function EntitiesSection() {
       onSuccess: () => {
         qc.invalidateQueries('landlord-entities')
         setAdding(false); setName(''); setEin(''); setErr(null)
-        setNotice('Entity created and set as your current one. Sign out and back in to switch to it.')
-      },
-      onError: fail,
-    })
-
-  const switchMut = useMutation(
-    (landlordId: string) => api.post('/landlords/me/active-entity', { landlordId }).then(r => r.data),
-    {
-      onSuccess: () => {
-        qc.invalidateQueries('landlord-entities')
-        setErr(null)
-        setNotice('Switched. Sign out and back in for it to take effect.')
+        setNotice('Entity created. Choose it when you add a property.')
       },
       onError: fail,
     })
@@ -68,7 +57,7 @@ function EntitiesSection() {
       <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Your entities</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
         Each entity keeps its own properties, payouts and books — separate LLCs stay separate.
-        Switching takes effect the next time you sign in.
+        Your dashboard shows all of them together; choose the entity when you add a property.
       </div>
 
       {entities.map((e: any) => (
@@ -77,9 +66,7 @@ function EntitiesSection() {
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
               {e.businessName || 'Unnamed entity'}
-              {e.isActive && (
-                <span style={{ marginLeft: 8, fontSize: '.68rem', color: 'var(--gold)' }}>current</span>
-              )}
+
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
               {e.propertyCount} {e.propertyCount === 1 ? 'property' : 'properties'}
@@ -87,11 +74,7 @@ function EntitiesSection() {
               {!e.connectPayoutsEnabled && ' · payouts not set up'}
             </div>
           </div>
-          {!e.isActive && (
-            <button className="btn btn-ghost" style={{ fontSize: '.75rem' }}
-              disabled={switchMut.isLoading}
-              onClick={() => switchMut.mutate(e.id)}>Switch to this</button>
-          )}
+
         </div>
       ))}
 

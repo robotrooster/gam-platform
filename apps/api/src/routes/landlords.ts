@@ -1000,32 +1000,6 @@ landlordsRouter.get('/me/entities', requireLandlord, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// POST /api/landlords/me/active-entity — switch which entity you are operating in.
-landlordsRouter.post('/me/active-entity', requireLandlord, async (req, res, next) => {
-  try {
-    const landlordId = String(req.body?.landlordId ?? '')
-    if (!landlordId) throw new AppError(400, 'landlordId required')
-
-    // MEMBERSHIP IS THE AUTHORITY. A foreign key cannot express "an entity you
-    // belong to", so it is checked here — otherwise anyone could point their
-    // session at any landlord on the platform and read their whole book.
-    const member = await queryOne<{ id: string }>(
-      `SELECT l.id FROM landlord_members lm
-         JOIN landlords l ON l.id = lm.landlord_id
-        WHERE lm.user_id = $1 AND lm.landlord_id = $2`,
-      [req.user!.userId, landlordId])
-    if (!member) throw new AppError(403, 'You are not a member of that entity')
-
-    await query(`UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
-      [req.user!.userId, landlordId])
-
-    // The entity is stamped into the JWT at login, so the switch lands on the
-    // next authentication rather than this response. Say so plainly instead of
-    // letting them wonder why the dashboard has not moved.
-    res.json({ success: true, data: { landlordId, reloginRequired: true } })
-  } catch (e) { next(e) }
-})
-
 // POST /api/landlords/me/entities — create another entity you own.
 landlordsRouter.post('/me/entities', requireLandlord, async (req, res, next) => {
   const client = await getClient()
@@ -5285,6 +5259,16 @@ landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
           AND onboarding_complete = FALSE
           AND NOT EXISTS (SELECT 1 FROM properties WHERE landlord_id = $1)`,
       [u.profileId])
+
+    // S620 (Nic): "that co-owner should see everything. It should be defaulted
+    // to the invited entity, not defaulted to a blank entity."
+    //
+    // Land them IN the entity they were invited to. Without this they arrive on
+    // the empty entity registering created for them — which is exactly what
+    // happened to Blue: an onboarding wizard and no sign of Oak Park.
+    await query(
+      `UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
+      [u.userId, inv.landlord_id]).catch(() => {})
 
     // landlordIds is stamped into the JWT at login, so the new entity appears
     // once they re-authenticate. Say so rather than letting them wonder why the

@@ -151,7 +151,34 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   // S527: the bulk "Create Units" step 2 is GONE (Nic: one door for units).
   // Creating a property lands on its detail page — subtypes + Add Unit
   // (with quantity) live there.
+  // S620 (Nic): "property under new entity but same parent company — same land
+  // owner, different LLCs." A property has to be able to land on an entity
+  // other than the one you registered under, and this is the only moment the
+  // choice matters, so it belongs on this form rather than in a mode you switch.
+  const { data: entities = [] } = useQuery<any[]>(
+    'landlord-entities', () => apiGet('/landlords/me/entities'))
+  // S620 (Nic): "if I've got a big portfolio, eight entities that own twelve
+  // different properties" — sending someone to Settings to create the LLC and
+  // then back here to use it is a round trip they would make constantly. The
+  // entity gets created without leaving this form.
+  const [newEntityName, setNewEntityName] = useState('')
+  const [entityErr, setEntityErr] = useState<string | null>(null)
+  const newEntityMut = useMutation(
+    () => apiPost<any>('/landlords/me/entities', { businessName: newEntityName.trim() }),
+    {
+      onSuccess: (res: any) => {
+        const id = res?.data?.landlordId ?? res?.landlordId
+        qc.invalidateQueries('landlord-entities')
+        // Select what they just made — creating it and leaving the dropdown on
+        // something else would be its own small betrayal.
+        if (id) setForm(f => ({ ...f, landlordId: id }))
+        setNewEntityName(''); setEntityErr(null)
+      },
+      onError: (e: any) =>
+        setEntityErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not create that entity.'),
+    })
   const [form, setForm] = useState({
+    landlordId:  '',
     name:        property?.name || '',
     street1:     property?.street1 || '',
     street2:     property?.street2 || '',
@@ -280,7 +307,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         }
         return propRes
       }
-      return apiPost('/properties', data)
+      // Blank means "my own entity" — the server default, so every existing
+      // caller behaves exactly as before.
+      const { landlordId, ...rest } = data
+      const realEntity = landlordId && landlordId !== '__new__' ? landlordId : null
+      return apiPost('/properties', realEntity ? { ...rest, landlordId: realEntity } : rest)
     },
     {
       onSuccess: (res: any) => {
@@ -377,6 +408,51 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         </div>
 
         <>
+          {/* S620: which entity owns this property. Only on create — moving a
+              property between LLCs is a different (and legally weightier)
+              operation than choosing where it starts. Hidden when there is only
+              one entity, so the common case gains no extra field. */}
+          {!isEdit && (
+            <div style={{ marginBottom: 12 }}>
+              <label className="form-label">Entity</label>
+              <select className="input" value={form.landlordId}
+                onChange={e => setForm(f => ({ ...f, landlordId: e.target.value }))}>
+                <option value="">My own entity</option>
+                {entities.map((en: any) => (
+                  <option key={en.id} value={en.id}>
+                    {en.businessName || 'Unnamed entity'}
+                    {en.propertyCount ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}
+                  </option>
+                ))}
+                <option value="__new__">+ Add a new entity…</option>
+              </select>
+              {form.landlordId === '__new__' ? (
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <input className="input" style={{ flex: 1 }} autoFocus
+                    placeholder="New entity name (e.g. Haws Homes LLC)"
+                    value={newEntityName}
+                    onChange={e => setNewEntityName(e.target.value)} />
+                  <button type="button" className="btn btn-primary" style={{ fontSize: '.75rem' }}
+                    disabled={!newEntityName.trim() || newEntityMut.isLoading}
+                    onClick={() => newEntityMut.mutate()}>
+                    {newEntityMut.isLoading ? 'Creating…' : 'Create'}
+                  </button>
+                  <button type="button" className="btn btn-ghost" style={{ fontSize: '.75rem' }}
+                    onClick={() => { setForm(f => ({ ...f, landlordId: '' })); setEntityErr(null) }}>
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                  Which LLC owns this property.
+                </div>
+              )}
+              {entityErr && (
+                <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{entityErr}</div>
+              )}
+            </div>
+          )}
+
           {/* Unit Types — full width up top */}
           {!isEdit && (
             <div style={{ marginBottom: 12 }}>

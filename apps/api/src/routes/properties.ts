@@ -14,6 +14,7 @@ import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
+import { landlordScopeIds } from '../lib/landlordScope'
 import {
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
@@ -84,6 +85,11 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       operatorOwnsLand: z.boolean().optional(),
       // S179 / B3: per-property booking acknowledgment toggle.
       requiresBookingAcknowledgment: z.boolean().optional(),
+      // S620 (Nic): "property under new entity but same parent company — same
+      // land owner, different LLCs." Which entity this property belongs to.
+      // Optional so every existing caller keeps landing on the caller's own
+      // entity; supplied by the entity picker on the Add Property form.
+      landlordId: z.string().uuid().optional(),
       // 16a: allocation rule required on every property creation.
       // S116: three independent fee toggles replace bankingFeePayer.
       // Legacy callers passing bankingFeePayer auto-mirror into ACH+card.
@@ -189,6 +195,18 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         `if you believe this is an error.`)
     }
 
+    // S620: WHICH ENTITY DOES THIS PROPERTY BELONG TO?
+    //
+    // Defaults to the caller's own entity, which is what every existing caller
+    // gets. When the Add Property form names one, it must be an entity the
+    // caller is actually a member of — otherwise anyone could create a property
+    // inside somebody else's LLC, which is a far worse bug than the one this
+    // feature fixes.
+    const targetLandlordId = body.landlordId ?? req.user!.profileId
+    if (body.landlordId && !landlordScopeIds(req.user!).includes(body.landlordId)) {
+      throw new AppError(403, 'You are not a member of that entity')
+    }
+
     await client.query('BEGIN')
 
     // Property INSERT — owner_user_id + managed_by_user_id default to the
@@ -205,7 +223,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
          (SELECT user_id FROM landlords WHERE id=$1),
          (SELECT user_id FROM landlords WHERE id=$1))
       RETURNING *`,
-      [req.user!.profileId, body.name, body.street1, body.street2 ?? null,
+      [targetLandlordId, body.name, body.street1, body.street2 ?? null,
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
        body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true])
     const prop = propRes.rows[0]

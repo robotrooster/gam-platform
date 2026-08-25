@@ -17,12 +17,14 @@ import jwt from 'jsonwebtoken'
 import { db, query, queryOne } from '../db'
 import { seedLandlord, seedProperty } from '../test/dbHelpers'
 import { landlordsRouter } from './landlords'
+import { propertiesRouter } from './properties'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
   const app = express()
   app.use(express.json())
   app.use('/api/landlords', landlordsRouter)
+  app.use('/api/properties', propertiesRouter)
   app.use(errorHandler)
   return app
 }
@@ -77,40 +79,10 @@ describe('multi-entity ownership', () => {
     expect(res.body.data.every((e: any) => e.is_owner)).toBe(true)
   })
 
-  it('REFUSES to switch to an entity the user does not belong to', async () => {
-    // The whole security property. A foreign key cannot express "an entity you
-    // belong to", so without this check a session could be pointed at any
-    // landlord on the platform and read their entire book.
-    const mine = await seedOwnerWithEntity()
-    const theirs = await seedOwnerWithEntity()
-    const res = await request(buildApp())
-      .post('/api/landlords/me/active-entity')
-      .set('Authorization', `Bearer ${tokenFor(mine.userId, mine.landlordId, [mine.landlordId])}`)
-      .send({ landlordId: theirs.landlordId })
-
-    expect(res.status).toBe(403)
-    const u = await queryOne<{ active_landlord_id: string | null }>(
-      `SELECT active_landlord_id FROM users WHERE id = $1`, [mine.userId])
-    expect(u!.active_landlord_id).not.toBe(theirs.landlordId)
-  })
-
-  it('switches to an entity the user co-owns', async () => {
-    const mine = await seedOwnerWithEntity()
-    const partners = await seedOwnerWithEntity()
-    await query(
-      `INSERT INTO landlord_members (landlord_id, user_id, role)
-       VALUES ($1, $2, 'owner')`, [partners.landlordId, mine.userId])
-
-    const res = await request(buildApp())
-      .post('/api/landlords/me/active-entity')
-      .set('Authorization', `Bearer ${tokenFor(mine.userId, mine.landlordId, [mine.landlordId, partners.landlordId])}`)
-      .send({ landlordId: partners.landlordId })
-    expect(res.status).toBe(200)
-  })
-
-  it('a new property lands on the ACTIVE entity, not the first one owned', async () => {
-    // The failure this whole change exists to prevent: two owned entities and
-    // a property landing on whichever the database returned first.
+  it('a property can be created on a second entity the user owns', async () => {
+    // S620: "property under new entity but same parent company." The picker on
+    // the Add Property form names the entity; the server bounds it by
+    // membership.
     const a = await seedOwnerWithEntity()
     const created = await request(buildApp())
       .post('/api/landlords/me/entities')
@@ -131,5 +103,27 @@ describe('multi-entity ownership', () => {
       `SELECT COUNT(*) AS n FROM properties WHERE landlord_id = $1`, [a.landlordId])
     expect(Number(onNew[0].n)).toBe(1)
     expect(Number(onOld[0].n)).toBe(0)
+  })
+})
+
+// S620: the security boundary on the entity picker. Without it, naming any
+// landlord id on the Add Property form would create a property inside somebody
+// else's LLC — a far worse bug than the one the picker fixes.
+describe('creating a property on a named entity', () => {
+  it('REFUSES an entity the caller is not a member of', async () => {
+    const mine = await seedOwnerWithEntity()
+    const theirs = await seedOwnerWithEntity()
+    const res = await request(buildApp())
+      .post('/api/properties')
+      .set('Authorization', `Bearer ${tokenFor(mine.userId, mine.landlordId, [mine.landlordId])}`)
+      .send({
+        name: 'Sneaky', street1: '1 Main', city: 'Mesa', state: 'AZ', zip: '85201',
+        landlordId: theirs.landlordId,
+        allocationRule: { achFeePayer: 'tenant', cardFeePayer: 'tenant' },
+      })
+    expect(res.status).toBe(403)
+    const n = await query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM properties WHERE landlord_id = $1`, [theirs.landlordId])
+    expect(Number(n[0].n)).toBe(0)
   })
 })
