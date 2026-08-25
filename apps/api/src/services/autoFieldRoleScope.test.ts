@@ -24,15 +24,25 @@ const PROPERTY_AND_MONEY = [
   'start_date', 'end_date', 'rent_due_day',
   'rent_amount', 'security_deposit', 'pet_deposit', 'pet_fee', 'other_fee',
 ]
-const TENANT_OWN = ['tenant_name', 'tenant_email']
+// S622: Nic extended the rule to names — "for accuracy, and that way if there
+// ever is a fault, the landlord can't blame it on the tenant." Every value GAM
+// already holds is the landlord's to state, so NO bound column is tenant-filled.
+const LANDLORD_TOO = ['tenant_name', 'tenant_email']
 
 describe('auto-placed field role scoping', () => {
   it.each(PROPERTY_AND_MONEY)('%s is landlord-filled — the tenant never types it', (col) => {
     expect(roleForLeaseColumn(col)).toBe('landlord')
   })
 
-  it.each(TENANT_OWN)('%s stays with the tenant (their own identity)', (col) => {
-    expect(roleForLeaseColumn(col)).toBe('primary')
+  it.each(LANDLORD_TOO)('%s is landlord-filled — the landlord states it, not the tenant', (col) => {
+    expect(roleForLeaseColumn(col)).toBe('landlord')
+  })
+
+  it('NO bound lease column is tenant-filled — the landlord owns every value GAM holds', () => {
+    const all = [...PROPERTY_AND_MONEY, ...LANDLORD_TOO]
+    const tenantScoped = all.filter(c => roleForLeaseColumn(c) !== 'landlord')
+    expect(tenantScoped, `a tenant typing these is a lease defect the landlord caused: ${tenantScoped}`)
+      .toEqual([])
   })
 
   it('unit_number is landlord-scoped — the regression Nic found', () => {

@@ -362,10 +362,6 @@ function isLongPersonal(ctx: string): boolean {
 // everything else (property/term/money/fees/utilities/agreement-date/space/
 // roster) → landlord. This is deterministic — the model's role is ignored
 // here because it over-assigned tenant on the mobile-home lease.
-// S622: lease columns the tenant legitimately fills about THEMSELVES. Every
-// other mapped column is a value GAM already holds and stamps on the document at
-// send time.
-const TENANT_OWNED_COLUMNS = new Set(['tenant_name', 'tenant_email'])
 
 function nonSigRole(col: string | null, label: string | null, ctx: string, split: 'per_tenant' | 'none'): SignerRole {
   // S622: a bound lease column is DECISIVE, and is checked before anything that
@@ -379,7 +375,17 @@ function nonSigRole(col: string | null, label: string | null, ctx: string, split
   // matched the personal-info pattern, so unit_number went to the tenant.
   // property_address was latently broken the same way — 'address' is literally in
   // that pattern — and would have handed the tenant the property's own address.
-  if (col) return TENANT_OWNED_COLUMNS.has(col) ? 'primary' : 'landlord'
+  // Nic S622, extending the rule to names: "Names should be landlord filled out
+  // too just for accuracy. And that way if there ever is a fault, the landlord
+  // can't blame it on the tenant." That reasoning covers every value GAM already
+  // holds, so the rule is simply: a bound lease column is landlord-filled. The
+  // tenant's own name and email are on the send form the landlord fills in, so
+  // they are the landlord's to state correctly.
+  //
+  // Genuinely tenant-supplied facts — date of birth, emergency contact, driver's
+  // licence, phone — carry NO lease column (the landlord does not hold them), so
+  // they fall through to the personal-info path below and stay with the tenant.
+  if (col) return 'landlord'
   if (split === 'per_tenant') return 'primary'
   if (isPersonal(label, ctx)) return 'primary'
   return 'landlord'
@@ -677,7 +683,14 @@ function buildFields(
           width: bw,
           height: 20,
           fieldType: c.fieldType === 'signature' ? 'signature' : c.fieldType === 'date' ? 'date' : 'text',
-          signerRole: TENANT_ROLES[n],
+          // S622: a per-tenant SIGNATURE or INITIAL belongs to that tenant slot —
+          // and its role is what the send path prunes on, so an unfilled slot
+          // disappears. A per-tenant landlord-filled value (the names) keeps the
+          // landlord role: the sign view serves each signer only the fields
+          // carrying their own role, so this is what actually stops a tenant
+          // typing their own name. Unused name boxes simply stay blank, the way
+          // they would on paper.
+          signerRole: c.signerRole === 'landlord' ? 'landlord' : TENANT_ROLES[n],
           leaseColumn: tenantColumnFor(c.leaseColumn, n),
           label: c.label ? `${c.label} ${n + 1}` : `Tenant ${n + 1}`,
         })
