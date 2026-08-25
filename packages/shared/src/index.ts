@@ -4337,6 +4337,7 @@ export * from './chatCadence'
 export * from './paymentAllocation'
 export * from './camelize'
 export * from './versionWatch'
+export * from './autoPlaceEstimate'
 
 // ============================================================
 // S26a: Invoice types

@@ -4,7 +4,8 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
-  STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL } from '@gam/shared'
+  STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
+  AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
@@ -264,14 +265,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       const start: any = await apiPost(`/esign/templates/${template.id}/auto-fields`, {})
       const jobId = start?.data?.jobId
       if (!jobId) throw new Error('Could not start auto-placement')
-      // S622: the cap must scale with the document. Placement costs roughly
-      // ~13s/page (an 8-page lease measured at 1m42s end to end) and the SERVER
-      // allows up to 180s for a single page, so a flat 4 minutes silently killed
-      // any lease past ~18 pages — and threw away work that had actually
-      // succeeded. Budget 60s/page over a 4-minute floor, from the page count we
-      // already know here.
-      const pages = Number(template.pageCount) || 8
-      const deadline = Date.now() + Math.max(240000, pages * 60000 + 60000)
+      // S622: the cap scales with the document (see autoPlaceTimeoutMs). A flat
+      // cap is what discarded a finished 8-page placement.
+      const deadline = Date.now() + autoPlaceTimeoutMs(template.pageCount)
       for (;;) {
         await new Promise(r => setTimeout(r, 2500))
         // apiGet UNWRAPS the envelope (returns r.data.data); apiPost does NOT
@@ -345,14 +341,6 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     }
     return 'Reading the document…'
   }
-  const autoEstimate = (): string => {
-    const pages = Number(template.pageCount) || 0
-    if (!pages) return 'about 15 seconds per page'
-    const secs = Math.round(pages * 13)
-    return secs < 90
-      ? `usually about ${secs} seconds for ${pages} page${pages === 1 ? '' : 's'}`
-      : `usually about ${Math.round(secs / 30) / 2} minutes for ${pages} pages`
-  }
 
   const pageFields = fields.filter(f => f.page === currentPage)
   const sel = getSelected()
@@ -374,12 +362,13 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         {currentPage > 1 && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p-1)}>← Prev</button>}
         {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
         <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading}
-          title={autoMut.isLoading ? 'Placement is running — you can keep this tab open' : `Detect and place field boxes from the lease PDF (${autoEstimate()})`}>
+          title={autoMut.isLoading ? 'Placement is running — you can keep this tab open' : `Detect and place field boxes from the lease PDF — ${AUTO_PLACE_ESTIMATE}`}>
           {autoMut.isLoading ? <><span className="spinner" /> {autoStatus()}</> : <>✨ Auto-place fields</>}
         </button>
         {autoMut.isLoading && (
           <div style={{ fontSize:'.68rem', color:'var(--text-3)', maxWidth:210, lineHeight:1.35 }}>
-            Reading every page with the labeling model — {autoEstimate()}. Leave this open.
+            Reading every page with the labeling model — {AUTO_PLACE_ESTIMATE}. Still faster
+            than placing every box by hand, so leave this open and let it work.
           </div>
         )}
         <button className="btn btn-primary btn-sm" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
