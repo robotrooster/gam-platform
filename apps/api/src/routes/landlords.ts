@@ -105,9 +105,30 @@ export const adminLandlordsListHandler = async (req: any, res: any, next: any) =
         COUNT(DISTINCT u2.id) FILTER (WHERE u2.status <> 'utility_service')::int AS unit_count,
         COUNT(DISTINCT u2.id) FILTER (
           WHERE u2.status <> 'vacant' AND u2.status <> 'utility_service')::int AS occupied_count,
-        EXISTS (
-          SELECT 1 FROM user_bank_accounts ba
-           WHERE ba.user_id = l.user_id AND ba.status = 'active'
+        -- S620 (Nic): "the bank account on the billing should be the same
+        -- account automatically as the one that Stripe has for know your
+        -- customer for doing deposits. We are billing out of that same
+        -- account. Landlords can't have some separate account."
+        --
+        -- Exactly right, and this asked the wrong question. It checked only the
+        -- legacy user_bank_accounts catalog, so a landlord whose Stripe Connect
+        -- payouts are live was told "Bank account: Not configured" on the
+        -- billing card — while GAM was perfectly able to pay them and deduct
+        -- its fee from those payouts.
+        --
+        -- Connect IS the billing account. There is no second one. The legacy
+        -- catalog still counts, for the multi-owner allocation-split case that
+        -- genuinely uses it.
+        --
+        -- The same fix landed on /me/todos in S605 and on /auth/me earlier this
+        -- session; THIS is the endpoint the Settings page actually reads, which
+        -- is why the badge never changed.
+        (
+          COALESCE(l.connect_payouts_enabled, FALSE)
+          OR EXISTS (
+            SELECT 1 FROM user_bank_accounts ba
+             WHERE ba.user_id = l.user_id AND ba.status = 'active'
+          )
         ) AS bank_account_ready
       FROM landlords l
       JOIN users u ON u.id = l.user_id
