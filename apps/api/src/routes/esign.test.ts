@@ -1614,6 +1614,60 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     expect(unit.rows[0].status).not.toBe('active')
   })
 
+  // S622 (Nic): "say that process is delayed here and there, and they don't get
+  // around to signing it till September fifth... because we are also setting the
+  // leases to start for September first. So if they sign it after it was active,
+  // does that create another problem?"
+  //
+  // The realistic Oak Park shape: lease dated the 1st, signature lands days
+  // later. Nothing may quietly not-happen because a date moved. Nic's own words
+  // on what matters: "as long as the pieces stay on track with whatever delays,
+  // and we still get to the end result."
+  //
+  // NOTE the late fee running from the real due date is DELIBERATE, not an
+  // oversight — Nic: "they already live at the property, they're already aware
+  // of late fees... anybody that pays on the fifth or the sixth would have paid
+  // on the fifth or the sixth anyway." This test pins the chain, not the timing.
+  it('S622: a lease signed AFTER its start date still completes the whole chain', async () => {
+    const f = await seedFixture()
+    // Signed today, but the lease began four days ago — the delayed-signature case.
+    const backdated = new Date(Date.now() - 1000 * 60 * 60 * 24 * 4).toISOString().slice(0, 10)
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ start_date: backdated, end_date: '2099-12-31' }),
+    })
+
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.completed).toBe(true)
+
+    // 1. The lease exists and is ACTIVE — not stuck 'pending' because its start
+    //    date is behind us.
+    const lease = await db.query<{ id: string; status: string; start_date: string }>(
+      `SELECT id, status, start_date::text AS start_date FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(lease.rows.length).toBe(1)
+    expect(lease.rows[0].status).toBe('active')
+    expect(lease.rows[0].start_date).toBe(backdated)
+
+    // 2. The unit flipped to occupied.
+    const unit = await db.query<{ status: string }>(
+      `SELECT status FROM units WHERE id = $1`, [f.unitId])
+    expect(unit.rows[0].status).toBe('active')
+
+    // 3. The tenant is on the lease.
+    const tenants = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM lease_tenants WHERE lease_id = $1`, [lease.rows[0].id])
+    expect(Number(tenants.rows[0].n)).toBeGreaterThan(0)
+
+    // 4. Billing was kicked off, dated the lease's real start — the money step
+    //    is the one that would silently not happen if a date guard rejected it.
+    expect(generateMoveInInvoiceMock).toHaveBeenCalledTimes(1)
+    const billedWith = generateMoveInInvoiceMock.mock.calls[0]
+    expect(JSON.stringify(billedWith)).toContain(backdated)
+  })
+
   it('seeds lease_fees rows from FEE_ROW_SPECS (security_deposit + pet_deposit + cleaning_fee)', async () => {
     const f = await seedFixture()
     const { documentId } = await seedCompleteableDoc(f, {

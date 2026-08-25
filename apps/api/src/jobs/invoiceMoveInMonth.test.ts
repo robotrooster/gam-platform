@@ -98,3 +98,42 @@ describe('move-in month is never double-billed by daily generation', () => {
     expect(dates).toContain('2026-07-01')
   })
 })
+
+// S622 (Nic): "I just wanted to make sure that the tenant would actually still
+// get charged. The lease would still get created, all that kind of stuff if they
+// took till the fifth or the sixth to sign it."
+//
+// Oak Park's shape: leases dated the 1st, signatures landing days later. The
+// esign suite mocks generateMoveInInvoice, so the billing step is asserted as
+// "called" there and proven for real here — the money has to actually appear.
+describe('S622: a lease finalized AFTER its start date still bills', () => {
+  it('creates the move-in invoice dated the lease start, with rent the tenant owes', async () => {
+    // Lease began on the 1st of last month; the signature lands today.
+    const d = new Date()
+    d.setMonth(d.getMonth() - 1, 1)
+    const startDate = d.toISOString().slice(0, 10)
+
+    const { leaseId, unitId, landlordId, tenantId } = await seedStack({ startDate, rentDueDay: 1, rent: 1000 })
+    const res = await genMoveIn({
+      lease_id: leaseId, unit_id: unitId, tenant_id: tenantId,
+      landlord_id: landlordId, rent_amount: 1000, start_date: startDate,
+    } as any)
+
+    // The invoice exists, dated the lease's real start — not the signing date.
+    expect(res.invoiceCreated).toBe(true)
+    const inv = await db.query<{ due_date: string }>(
+      `SELECT to_char(due_date,'YYYY-MM-DD') AS due_date FROM invoices WHERE lease_id=$1`, [leaseId])
+    expect(inv.rows.length).toBe(1)
+    expect(inv.rows[0].due_date).toBe(startDate)
+
+    // And the tenant is actually charged: a rent row for the full month, since
+    // the lease starts on the 1st (nothing to prorate).
+    const rent = await db.query<{ amount: string; due_date: string }>(
+      `SELECT amount::text AS amount, to_char(due_date,'YYYY-MM-DD') AS due_date
+         FROM payments WHERE lease_id=$1 AND type='rent'`, [leaseId])
+    expect(rent.rows.length).toBe(1)
+    expect(Number(rent.rows[0].amount)).toBe(1000)
+    expect(rent.rows[0].due_date).toBe(startDate)
+    expect(res.rentAmount).toBe(1000)
+  })
+})
