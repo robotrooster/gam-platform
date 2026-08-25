@@ -570,7 +570,31 @@ landlordsRouter.get('/:id', async (req, res, next) => {
       throw new AppError(403, 'Forbidden')
     }
     const landlord = await queryOne<any>(`
-      SELECT l.*, u.first_name, u.last_name, u.email, u.phone
+      SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
+        -- S620 (Nic): "the billing card, the bank account shows not
+        -- configured. That is exactly where I'm looking."
+        --
+        -- THIS is the query behind /landlords/me and the Settings billing card.
+        -- It returned l.* and never computed bank_account_ready at all, so the
+        -- badge read undefined, which is falsy, and printed "Not configured" for
+        -- everyone, forever, no matter what they had set up. I fixed the same
+        -- expression in two OTHER endpoints first (/auth/me and the admin list)
+        -- and neither is what this page calls, which is why his hard refresh
+        -- kept changing nothing.
+        --
+        -- Nic: "the bank account on the billing should be the same account
+        -- automatically as the one that Stripe has for know your customer for
+        -- doing deposits. We are billing out of that same account. Landlords
+        -- can't have some separate account." Connect IS the billing account;
+        -- the legacy catalog is only still consulted for the multi-owner
+        -- allocation-split case that genuinely uses it.
+        (
+          COALESCE(l.connect_payouts_enabled, FALSE)
+          OR EXISTS (
+            SELECT 1 FROM user_bank_accounts ba
+             WHERE ba.user_id = l.user_id AND ba.status = 'active'
+          )
+        ) AS bank_account_ready
       FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [id])
     if (!landlord) throw new AppError(404, 'Landlord not found')
     res.json({ success: true, data: landlord })
