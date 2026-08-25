@@ -635,6 +635,23 @@ function sanitize(r: any, t: RawTarget): Classification {
   let ft: FieldType = VALID_FIELD_TYPES.has(r.fieldType) ? r.fieldType : h.fieldType
   let col: string | null = null
   if (typeof r.leaseColumn === 'string' && VALID_COLUMNS.has(r.leaseColumn)) col = r.leaseColumn
+  // S622: on MONEY columns the deterministic lexical map wins over the model.
+  //
+  // columnFor() only answers when the text beside the blank matches an explicit
+  // pattern, so when it does answer it is the more reliable of the two — and a
+  // wrong money column is a money bug, not a cosmetic one. The model tagged
+  // "Rent pre-payment" as rent_amount; columnFor calls it last_month_rent,
+  // which is what it is. Without this the model's answer stood, the dedupe then
+  // stripped it as a duplicate of the real rent clause, and a genuine move-in
+  // charge silently billed nobody. (Same reasoning that already makes sanitize
+  // ignore the model's signerRole.)
+  //
+  // The model still decides every column columnFor has no opinion about.
+  const hCol = h.leaseColumn
+  if (hCol && hCol !== col) {
+    const hCat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[hCol]
+    if (hCat === 'writable' || hCat === 'fee_row') col = hCol
+  }
   let split: 'per_tenant' | 'none' = r.split === 'per_tenant' ? 'per_tenant' : 'none'
   const label = typeof r.label === 'string' && r.label ? r.label.slice(0, 60) : h.label
   const ctx = `${t.leftCtx} ${t.lineText} ${t.aboveText}`
