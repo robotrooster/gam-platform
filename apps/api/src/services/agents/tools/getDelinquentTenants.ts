@@ -16,8 +16,29 @@ interface Row {
   oldest_due: string | null
 }
 
-// Unpaid + past due = behind.
-const UNPAID = ['pending', 'processing', 'failed', 'returned']
+/**
+ * Unpaid + past due = behind.
+ *
+ * S620 (Nic): "when the tenant pays and the agent on the tenant side says that
+ * they owe no money, at that same time that balance needs to show as pending
+ * for the landlord... our back end settling period doesn't matter to the
+ * landlord."
+ *
+ * 'processing' USED TO BE IN THIS LIST and it was the only place on the
+ * platform that counted a tenant who had paid as still owing. A bank payment
+ * sits in 'processing' for days AFTER the tenant's account was debited, so a
+ * landlord asking "who owes me money?" was handed people who had already paid
+ * — and the agent read it out to them. Nic found his own $2 on that list.
+ *
+ * Everywhere else already agrees that sending it counts: the payout engine
+ * (payoutTriggers.rollProgressForLandlordUser counts settled + processing +
+ * paid_via_deposit), the late-fee engine's postmark rule, the tenant's own
+ * balance, portfolio stats, and the portfolio query. This line was the outlier.
+ *
+ * 'returned' and 'failed' STAY. Those are payments that came back or never
+ * went through — that money really is still owed.
+ */
+const UNPAID = ['pending', 'failed', 'returned']
 
 export const getDelinquentTenants: AgentTool = {
   name: 'get_delinquent_tenants',
