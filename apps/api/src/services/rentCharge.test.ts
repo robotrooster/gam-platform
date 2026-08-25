@@ -72,6 +72,14 @@ async function seedCharge(f: Fixture, amount: number, dueDate: string) {
   return r.rows[0].id
 }
 
+async function seedCarried(f: Fixture, amount: number, dueDate: string) {
+  const r = await db.query<{ id: string }>(
+    `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+     VALUES ($1,$2,$3,$4,'carried_balance',$5,'pending',$6,'BALANCE') RETURNING id`,
+    [f.unitId, f.leaseId, f.tenantId, f.landlordId, amount.toFixed(2), dueDate])
+  return r.rows[0].id
+}
+
 const charge = (f: Fixture, amount: number) => chargeLeaseBalance({
   tenantId: f.tenantId, leaseId: f.leaseId, amount,
   paymentMethodId: 'pm_test', paymentMethodType: 'ach', source: 'portal',
@@ -155,5 +163,79 @@ describe('S609 pay-ahead', () => {
   it('a month-to-month lease suggests a year', async () => {
     await db.query(`UPDATE leases SET end_date = NULL WHERE id = $1`, [f.leaseId])
     expect(await suggestedPayAheadFor(f.leaseId)).toBeCloseTo(12000, 2)
+  })
+})
+
+// ── S622: arrears are payable in part; the lease's own charges are not ──
+//
+// Nic: "if they are behind a thousand dollars and we're carrying forward, they
+// need to be paying on the new lease and making payments towards the outstanding
+// balance... that balance should allow partial payments. The invoiced portion of
+// the lease shouldn't allow partial payments."
+//
+// Before this, the two rules collided and trapped the tenant: arrears are the
+// oldest charge, so pay-in-full demanded rent PLUS the whole old debt before it
+// would accept anything. Someone $1,000 behind could not pay their rent at all,
+// and took a late fee every month for it.
+describe('S622 carried-forward balance', () => {
+  let f: Fixture
+  beforeEach(async () => {
+    await cleanupAllSchema()
+    ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+    f = await fixture()
+  })
+
+  it('rent alone is payable while $1,000 of arrears sits on the ledger', async () => {
+    await seedCarried(f, 1000, '2026-01-01')   // older than the rent
+    await seedCharge(f, 800, '2026-09-01')
+
+    const r = await charge(f, 800)
+    expect(r.appliedTotal).toBeCloseTo(800, 2)
+    // Every cent went to RENT — the arrears did not crowd it out despite being
+    // eight months older. Applications are recorded on the remittance.
+    const applied = await db.query<{ type: string; amount_applied: string }>(
+      `SELECT p.type, ra.amount_applied::text
+         FROM remittance_applications ra JOIN payments p ON p.id = ra.payment_id
+        WHERE ra.remittance_id = $1`, [r.remittanceId])
+    expect(applied.rows.length).toBe(1)
+    expect(applied.rows[0].type).toBe('rent')
+    expect(Number(applied.rows[0].amount_applied)).toBeCloseTo(800, 2)
+  })
+
+  it('paying above the rent chips away at the arrears — a PARTIAL payment on them', async () => {
+    await seedCarried(f, 1000, '2026-01-01')
+    await seedCharge(f, 800, '2026-09-01')
+
+    const r = await charge(f, 950)
+    expect(r.appliedTotal).toBeCloseTo(950, 2)
+
+    // $150 of the arrears was applied...
+    const applied = await db.query<{ amount_applied: string }>(
+      `SELECT ra.amount_applied::text
+         FROM remittance_applications ra JOIN payments p ON p.id = ra.payment_id
+        WHERE ra.remittance_id = $1 AND p.type = 'carried_balance'`, [r.remittanceId])
+    expect(applied.rows.length).toBe(1)
+    expect(Number(applied.rows[0].amount_applied)).toBeCloseTo(150, 2)
+
+    // ...and the rest stays open as a remainder row. A partial payment on
+    // arrears is allowed and expected — this is the whole carve-out.
+    const stillOwed = await db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS total FROM payments
+        WHERE lease_id=$1 AND type='carried_balance' AND status='pending'`, [f.leaseId])
+    expect(Number(stillOwed.rows[0].total)).toBeCloseTo(850, 2)
+  })
+
+  it('still refuses an underpayment of the RENT itself', async () => {
+    await seedCarried(f, 1000, '2026-01-01')
+    await seedCharge(f, 800, '2026-09-01')
+    // The carve-out is only for arrears; the lease's own charges stay all-or-nothing.
+    await expect(charge(f, 600)).rejects.toMatchObject({ statusCode: 422 })
+  })
+
+  it('with no rent outstanding, the arrears can be paid down in any amount', async () => {
+    await seedCarried(f, 1000, '2026-01-01')
+    const r = await charge(f, 250)
+    expect(r.appliedTotal).toBeCloseTo(250, 2)
+    expect(r.payAhead).toBeCloseTo(0, 2)
   })
 })

@@ -262,12 +262,37 @@ export async function chargeLeaseBalance(
 
     const totalOutstanding = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
 
+    // S622 (Nic): the CARRIED-FORWARD balance is the one charge a tenant may pay
+    // partially. Everything the new lease itself invoiced stays pay-in-full.
+    //
+    //   "Outstanding balance that is carried forward should be exempt from first
+    //    in, first out, and that balance should allow partial payments. The
+    //    invoiced portion of the lease shouldn't allow partial payments."
+    //
+    // Without this the two rules collide and the tenant is trapped: arrears are
+    // the oldest charge, so pay-in-full demands rent PLUS the entire old debt
+    // before it will accept a cent. A tenant a thousand dollars behind could
+    // never pay their rent at all — and would take a late fee every month for it.
+    //
+    // The debt does not shrink. It is still on the ledger, still owed, still
+    // collected by anything paid above the required figure (it sorts last, so
+    // the surplus reaches it only after current charges are whole).
+    const carriedOutstanding = Math.round(
+      rows.filter((r: any) => r.type === 'carried_balance')
+          .reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
+    const requiredInFull = Math.round((totalOutstanding - carriedOutstanding) * 100) / 100
+
     // UNDER-PAYMENT IS BLOCKED (Nic, standing directive). Rent is pay-in-full:
     // a partial can reset a landlord's eviction clock. This branch is the
-    // server-side guarantee and must not be softened.
-    if (amount < totalOutstanding - 0.005) {
+    // server-side guarantee and must not be softened — note the figure it guards
+    // is now the lease's OWN charges, which is exactly what the eviction clock
+    // runs on. Arrears from a previous system never started that clock.
+    if (amount < requiredInFull - 0.005) {
+      const extra = carriedOutstanding > 0
+        ? ` Your carried balance of $${carriedOutstanding.toFixed(2)} can be paid down separately, in any amount.`
+        : ''
       throw new AppError(422,
-        `Rent must be paid in full — the outstanding balance is $${totalOutstanding.toFixed(2)}.`)
+        `Rent must be paid in full — the outstanding balance is $${requiredInFull.toFixed(2)}.${extra}`)
     }
 
     // OVER-payment is pay-ahead (S609, Nic). NO CEILING — see the header note.

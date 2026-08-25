@@ -67,3 +67,55 @@ describe('S609 propane is allocated last', () => {
     expect(res.lines).toEqual([{ payment_id: 'a', amount_applied: 50 }])
   })
 })
+
+// ── S622: carried-forward arrears sit outside FIFO ───────────────────
+//
+// Nic: "if they are behind a thousand dollars and we're carrying forward, they
+// need to be paying on the new lease and making payments towards the outstanding
+// balance. Outstanding balance that is carried forward should be exempt from
+// first in, first out."
+//
+// Arrears are by definition the OLDEST charge, so pure oldest-first hands every
+// rent dollar to the old debt and leaves the new lease short — a late fee and an
+// eviction clock on a lease the tenant has been paying in full.
+describe('carried-forward balance is paid last', () => {
+  const arrears = {
+    id: 'arrears', amount: 1000, due_date: '2026-01-01', type: 'carried_balance',
+  }
+  const rent = { id: 'rent', amount: 800, due_date: '2026-09-01', type: 'rent' }
+
+  it('a rent-sized payment pays the RENT, not the older arrears', () => {
+    const r = allocateOldestFirst([arrears, rent], 800)
+    expect(r.lines).toEqual([{ payment_id: 'rent', amount_applied: 800 }])
+    expect(r.unapplied).toBe(0)
+  })
+
+  it('anything above the rent flows on to the arrears', () => {
+    const r = allocateOldestFirst([arrears, rent], 950)
+    expect(r.lines).toEqual([
+      { payment_id: 'rent',    amount_applied: 800 },
+      { payment_id: 'arrears', amount_applied: 150 },
+    ])
+  })
+
+  it('the arrears still take a PARTIAL payment — that is the point of the carve-out', () => {
+    const r = allocateOldestFirst([{ ...arrears, amount_paid: 150 }], 200)
+    expect(r.lines).toEqual([{ payment_id: 'arrears', amount_applied: 200 }])
+  })
+
+  it('propane is still paid before arrears — a fill would otherwise age into the same trap', () => {
+    const propane = {
+      id: 'propane', amount: 120, due_date: '2026-08-20',
+      type: 'utility', entry_description: 'PROPANE',
+    }
+    const r = allocateOldestFirst([arrears, propane, rent], 920)
+    expect(r.lines.map(l => l.payment_id)).toEqual(['rent', 'propane'])
+  })
+
+  it('rent is still paid oldest-first among itself', () => {
+    const sept = { id: 'sept', amount: 800, due_date: '2026-09-01', type: 'rent' }
+    const aug  = { id: 'aug',  amount: 800, due_date: '2026-08-01', type: 'rent' }
+    const r = allocateOldestFirst([arrears, sept, aug], 1600)
+    expect(r.lines.map(l => l.payment_id)).toEqual(['aug', 'sept'])
+  })
+})
