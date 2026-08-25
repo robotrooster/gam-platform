@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
-import { ChevronDown } from 'lucide-react'
+import { ChevronDown, Plus, X } from 'lucide-react'
 import { toast } from '../components/dialogs'
 
 const STATUS_MAP: Record<string, string> = { active: 'badge-green', paused: 'badge-amber', ended: 'badge-muted' }
@@ -40,6 +40,7 @@ function PropertyTargetRow({ propertyId, name }: { propertyId: string; name: str
 }
 
 export function WorkTradePage() {
+  const [showNew, setShowNew] = useState(false)
   const { data: agreements = [], isLoading } = useQuery<any[]>('work-trade', () => apiGet('/work-trade'))
   // S576 (B-8): the landlord's own work-trade addendum forms (Form Type =
   // Work-Trade Addendum). Fetched once, passed to each row's addendum cell.
@@ -57,7 +58,12 @@ export function WorkTradePage() {
     <div>
       <div className="page-header">
         <div><h1 className="page-title">Work Trade</h1><p className="page-subtitle">Rent-for-labor — hours buy a percent of the monthly bill</p></div>
+        <button className="btn btn-primary" onClick={() => setShowNew(true)}>
+          <Plus size={14} /> New agreement
+        </button>
       </div>
+
+      {showNew && <NewAgreementModal onClose={() => setShowNew(false)} />}
 
       {properties.length > 0 && (
         <div className="card" style={{ marginBottom: 16, padding: 16 }}>
@@ -294,6 +300,132 @@ function AgreementTargetCell({ agreementId, target }: { agreementId: string; tar
           {save.isLoading ? '…' : 'Save'}
         </button>
       )}
+    </div>
+  )
+}
+
+// S622 (Nic): "how do I initiate that agreement so somebody could track hours,
+// just so I can start experimenting on that flow?"
+//
+// POST /work-trade has existed since S397 and NOTHING in the portal ever called
+// it — the page could list agreements and send addenda, but never create one.
+// Hour tracking was reachable only by API.
+//
+// NO TEMPLATE IS INVOLVED, and the modal says so, because the Templates screen
+// offering a "Work-Trade Addendum" form type implies otherwise. Nic: "I don't
+// understand the need to have a separate template for it... in terms of just
+// tracking the hours, I don't think it's necessary." He is right.
+// work_trade_agreements carries no template or document reference. The server's
+// only requirement is an ACTIVE lease for that tenant on that unit, because
+// rent-for-labor needs a rent obligation to offset. The addendum form is
+// separate, optional paperwork for stating duties in writing.
+function NewAgreementModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient()
+  const [leaseKey, setLeaseKey] = useState('')
+  const [hours, setHours] = useState('')
+  const [duties, setDuties] = useState('')
+  const [startDate, setStartDate] = useState(new Date().toISOString().slice(0, 10))
+  const [covers, setCovers] = useState<string[]>([])
+  const [err, setErr] = useState('')
+
+  // Only a LIVE tenancy can hold a work-trade agreement, so the picker offers
+  // exactly those pairs rather than letting the landlord choose something the
+  // server will refuse.
+  const { data: leases = [] } = useQuery<any[]>('wt-active-leases', () => apiGet('/leases'))
+  const options = (leases as any[])
+    .filter((l: any) => l.status === 'active')
+    .flatMap((l: any) => (l.tenants || [])
+      .filter((t: any) => t.status === 'active')
+      .map((t: any) => ({
+        key: `${l.unitId}:${t.tenantId ?? t.id}`,
+        unitId: l.unitId,
+        tenantId: t.tenantId ?? t.id,
+        label: `${(t.firstName ?? '').trim()} ${(t.lastName ?? '').trim()}`.trim() +
+               ` — Unit ${l.unitNumber ?? '—'}${l.propertyName ? ` (${l.propertyName})` : ''}`,
+      })))
+
+  const picked = options.find(o => o.key === leaseKey)
+
+  const save = useMutation(
+    () => apiPost('/work-trade', {
+      unitId: picked!.unitId,
+      tenantId: picked!.tenantId,
+      startDate,
+      duties: duties.trim() || undefined,
+      monthlyHoursTarget: hours.trim() ? Number(hours) : undefined,
+      // Omitted = covers everything, which is what every agreement before S613 did.
+      coveredCharges: covers.length ? covers : undefined,
+    }),
+    {
+      onSuccess: () => { qc.invalidateQueries('work-trade'); toast('Work-trade agreement created.'); onClose() },
+      onError: (e: any) => setErr(e?.response?.data?.error || e?.message || 'Could not create the agreement'),
+    })
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.5)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:16 }}
+      onClick={onClose}>
+      <div className="card" style={{ width:'100%', maxWidth:520, padding:20, maxHeight:'90vh', overflowY:'auto' }}
+        onClick={e => e.stopPropagation()}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:4 }}>
+          <div className="modal-title">New work-trade agreement</div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginBottom:14, lineHeight:1.5 }}>
+          Hours logged against this agreement buy a percent of the tenant's monthly bill.
+          No template or signed form is needed to track hours — if you want the duties
+          in writing, send a Work-Trade Addendum from the row afterwards.
+        </div>
+
+        {err && <div style={{ background:'rgba(239,68,68,.12)', border:'1px solid rgba(239,68,68,.4)', padding:'8px 10px', borderRadius:6, fontSize:'.78rem', marginBottom:12 }}>{err}</div>}
+
+        <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Tenant &amp; unit</label>
+        <select className="input" value={leaseKey} onChange={e => setLeaseKey(e.target.value)} style={{ width:'100%', marginBottom:12 }}>
+          <option value="">— Choose an active tenancy —</option>
+          {options.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+        </select>
+        {options.length === 0 && (
+          <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:-6, marginBottom:12 }}>
+            No active tenancies yet. Work trade offsets rent, so it needs a live lease first.
+          </div>
+        )}
+
+        <div style={{ display:'flex', gap:12, marginBottom:12 }}>
+          <div style={{ flex:1 }}>
+            <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Start date</label>
+            <input className="input" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={{ width:'100%' }} />
+          </div>
+          <div style={{ flex:1 }}>
+            <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Monthly hours target</label>
+            <input className="input" inputMode="numeric" placeholder="property default" value={hours}
+              onChange={e => setHours(e.target.value.replace(/[^0-9]/g, ''))} style={{ width:'100%' }} />
+          </div>
+        </div>
+
+        <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Duties (optional)</label>
+        <textarea className="input" value={duties} onChange={e => setDuties(e.target.value)} rows={2}
+          placeholder="Grounds work, snow removal…" style={{ width:'100%', marginBottom:12 }} />
+
+        <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:6 }}>
+          What the hours pay for <span style={{ opacity:.8 }}>— leave all unchecked for the whole bill</span>
+        </label>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:8, marginBottom:16 }}>
+          {COVERABLE.map(c => (
+            <label key={c.key} style={{ display:'flex', alignItems:'center', gap:5, fontSize:'.76rem' }}>
+              <input type="checkbox" checked={covers.includes(c.key)}
+                onChange={e => setCovers(prev => e.target.checked ? [...prev, c.key] : prev.filter(x => x !== c.key))} />
+              {c.label}
+            </label>
+          ))}
+        </div>
+
+        <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!picked || save.isLoading}
+            onClick={() => { setErr(''); save.mutate() }}>
+            {save.isLoading ? <span className="spinner" /> : 'Create agreement'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
