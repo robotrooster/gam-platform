@@ -14,6 +14,8 @@ import { registerRefreshCron, refreshTimezoneCrons, summary as tzCronSummary } f
 import { expireStaleInvitations as expireStalePmPropertyInvitations } from '../services/pm'
 import { getPropertyResponsibleParty } from '../services/responsibleParty'
 import { logger } from '../lib/logger'
+import { reconcileStuckPayments } from './paymentReconcile'
+import { getStripe } from '../lib/stripe'
 
 // ============================================================
 // GAM PAYMENT SCHEDULER
@@ -943,6 +945,25 @@ async function processBackgroundCheckExpiry() {
 
 export function schedulerInit() {
   logger.info('⏰ Scheduler initialized')
+
+  // ── PAYMENT RECONCILIATION ──────────────────────────────────
+  // S620. The ONLY path from 'processing' to 'settled' is the
+  // payment_intent.succeeded webhook arriving. Miss it — endpoint down, Mac
+  // mid-brownout, Stripe retries exhausted — and the payment stays
+  // 'processing' forever with nothing ever looking again: the tenant has
+  // paid, GAM holds the money, and the platform keeps calling them
+  // delinquent while late fees accrue.
+  //
+  // Twice daily rather than hourly: this asks Stripe about payments already
+  // 24h old, so there is nothing an hourly cadence would catch sooner, and
+  // it keeps the API-call volume trivial.
+  cron.schedule('0 9,21 * * *', async () => {
+    try {
+      await reconcileStuckPayments(getStripe())
+    } catch (err) {
+      logger.error({ err }, '[reconcile] payment reconciliation failed')
+    }
+  })
 
   // ── LEASE EXPIRATION NOTICES ────────────────────────────────
   // Daily at 8am — notify landlord when lease approaches end_date
