@@ -528,6 +528,7 @@ async function classifyChunk(targets: RawTarget[]): Promise<Map<number, Classifi
 // to heuristic in autoPlaceFields (boxes are still placed — only labels degrade).
 async function modelClassify(
   targets: RawTarget[],
+  totalPages: number,
   onProgress?: AutoPlaceProgress,
 ): Promise<Map<number, Classification> | null> {
   if (!MODEL_ENABLED || targets.length === 0) return null
@@ -540,15 +541,22 @@ async function modelClassify(
   const combined = new Map<number, Classification>()
   let anySuccess = false
   // S622: this loop IS the wait — one model call per page, sequential. Report
-  // after each page so the editor can show "page 3 of 8" instead of a spinner
-  // that looks identical to a hang. Pages WITH targets are the only ones that
-  // cost model time, so they are what we count.
-  let done = 0
-  onProgress?.(0, byPage.size)
-  for (const pageTargets of byPage.values()) {
+  // after each page so the editor can show real progress instead of a spinner
+  // that looks identical to a hang.
+  //
+  // Progress is denominated in DOCUMENT pages, not in pages the model visits.
+  // Only pages containing blanks cost model time (an 8-page lease commonly has
+  // 5), but every page ends up with fields on it — initials are injected
+  // per-page AFTER classification — so counting the model's work unit reported
+  // "3 of 5" for a lease the landlord can see is 8 pages long. Ascending page
+  // order means finishing page N settles every page up to N: the ones with no
+  // blanks needed no work, so they are done the moment we pass them.
+  const pagesAscending = [...byPage.entries()].sort((a, b) => a[0] - b[0])
+  onProgress?.(0, totalPages)
+  for (const [pageNo, pageTargets] of pagesAscending) {
     const m = await classifyChunk(pageTargets)
     if (m) { anySuccess = true; for (const [id, c] of m) combined.set(id, c) }
-    onProgress?.(++done, byPage.size)
+    onProgress?.(Math.min(pageNo, totalPages), totalPages)
   }
   return anySuccess ? combined : null
 }
@@ -994,7 +1002,14 @@ export async function autoPlaceFields(
   const extracted = await extractPositionedText(pdfBuffer)
   const { targets, pageMeta } = detectTargets(extracted.pages)
 
-  const modelMap = await modelClassify(targets, onProgress)
+  // S622: the document's own page count is the progress denominator — it is the
+  // number the landlord sees in the editor ("Page 4 of 8").
+  const totalPages = extracted.pages.length
+  const modelMap = await modelClassify(targets, totalPages, onProgress)
+  // Settle the bar from here rather than inside the loop, so the paths that
+  // return early (model disabled, nothing detected) still finish at 100% instead
+  // of leaving the editor parked mid-count on a run that did complete.
+  onProgress?.(totalPages, totalPages)
   const cls = new Map<number, Classification>()
   for (const t of targets) {
     cls.set(t.id, modelMap?.get(t.id) ?? heuristicClassify(t))

@@ -337,12 +337,11 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // the difference between waiting and wondering whether it has hung.
   const autoStatus = (): string => {
     if (progress && progress.total > 0) {
-      // NB: total counts pages that actually CONTAIN blanks (only those cost
-      // model time) — an 8-page lease commonly reports 5. Say "pages with
-      // fields" so this never reads as a contradiction of the "Page 4 of 8"
-      // indicator sitting next to it.
+      // Denominated in DOCUMENT pages, matching the "Page 4 of 8" indicator
+      // beside it. Every page of a lease ends up with fields (initials at
+      // minimum), so anything narrower reads as if pages were being skipped.
       const at = Math.min(progress.done + 1, progress.total)
-      return `Analyzing ${at} of ${progress.total} pages with fields…`
+      return `Analyzing page ${at} of ${progress.total}…`
     }
     return 'Reading the document…'
   }
