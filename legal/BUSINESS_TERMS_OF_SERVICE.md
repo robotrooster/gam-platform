@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 22, 2026
+Last Updated: August 25, 2026
 
 ---
 
@@ -187,6 +187,24 @@ You are solely responsible for compliance with the Fair Credit Reporting Act ("*
 
 **GAM is not the consumer reporting agency.** The third-party screening provider is the consumer reporting agency under the FCRA, and any dispute about the contents of a screening report must be directed to that provider. GAM provides the integration; the provider determines the accuracy of the report.
 
+### 9.1 Who Pays for Screening, and What the Platform Will Not Bill
+
+The applicant pays for their screening report once, directly through the Platform, at the price disclosed in the screening flow at the time the report is ordered.
+
+**The Platform will never bill a Tenant a screening or background-check fee through their lease.** If a lease you upload or generate states a background-check, credit-check, screening, or application fee tied to screening, the Platform identifies that amount, records it, and deliberately excludes it from every charge it creates — the move-in invoice, recurring rent, and any deduction from the security deposit. This applies whether the lease reached the Platform by upload of an existing signed lease or through the Platform's own electronic-signature flow. You will see the excluded amount identified in the lease-field editor or in the import review, so that the exclusion is visible to you rather than silent.
+
+**You must not charge a Tenant a second time for a screening report the Tenant already paid for through the Platform.** Charging a Tenant separately for the same report is a breach of these Terms.
+
+Nothing in this Section prevents you from collecting a fee outside the Platform that a Tenant separately owes you under your lease and applicable law. Where you do so, GAM is not a party to that charge, does not collect it, does not process it, and takes no position on its enforceability; any dispute about it is between you and your Tenant. **You remain responsible for compliance with any state or local law limiting application or screening fees, including caps, receipt requirements, and refund obligations.**
+
+### 9.2 Migrated Tenancies and the Screening Requirement
+
+Tenants already occupying a unit under a lease that began **before** your onboarding to the Platform ("**Migrated Tenants**") are not required to complete Platform screening. Those tenancies were formed off-Platform, and GAM does not retroactively condition them on a report.
+
+For every lease beginning **on or after** your onboarding date, each applicant must complete Platform screening before the lease is activated on the Platform. Activating a lease means the Platform will generate invoices, collect rent, and hold deposits for that tenancy.
+
+This requirement governs what the Platform will do. It does not determine whom you may lawfully rent to, and it does not relieve you of your obligations under the Fair Housing Act, its state equivalents, or any local source-of-income or screening-criteria ordinance. **Your screening criteria, and every decision you make on the basis of a report, remain yours.**
+
 ## 10. Lease Generation and Electronic Signature
 
 The Platform offers a lease-generation flow that produces lease agreements based on your configured terms. The generated lease is a starting template; **you are responsible for reviewing each lease for compliance with the law of the property's state and for any clause specific to the property or tenancy.** GAM does not draft or provide legal advice on lease content.
@@ -257,6 +275,7 @@ You agree that you will **not**, and will not attempt to:
 - Discriminate against any Tenant, applicant, or other User in violation of the federal Fair Housing Act, the Americans with Disabilities Act, or any state or local equivalent;
 - Impersonate any person or entity, or misrepresent your relationship to a Landlord, Tenant, or property;
 - Submit false, misleading, or forged information during registration, screening, or payment;
+- Charge a Tenant for a screening or background-check report the Tenant has already paid for through the Platform, or bill a Tenant separately for a screening fee the Platform has identified and excluded under Section 9.1;
 - Interfere with the Platform's operation, including by introducing malware, attempting to defeat rate limits, scraping, reverse-engineering, decompiling, or extracting data via any means other than the surfaces provided to you;
 - Use the Platform to send unsolicited bulk communications ("spam") to other Users;
 - Resell, sublicense, or commercially exploit Platform features outside the scope of your role's permissions;

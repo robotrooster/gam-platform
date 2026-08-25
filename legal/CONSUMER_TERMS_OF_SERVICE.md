@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 19, 2026
+Last Updated: August 25, 2026
 
 ---
 
@@ -166,6 +166,20 @@ When you apply to rent a unit listed on the Platform, your Landlord may request 
 **The screening provider is the consumer reporting agency.** If you believe a report about you contains inaccurate information, you have the right under FCRA to dispute the report directly with the screening provider. Your Landlord and GAM are not the consumer reporting agency for purposes of FCRA disputes about report accuracy.
 
 **Adverse-action notices.** If a Landlord declines your rental application based in whole or in part on the contents of a consumer report, the Landlord (through the Platform) will send you an adverse-action notice that includes the contact information of the screening provider and your rights to dispute the report.
+
+### 7.1 You Pay for Screening Once
+
+You pay for your screening report once, directly through the Platform, at the price shown to you before you authorize it.
+
+**GAM will never bill you a background-check or screening fee through your lease.** Many leases state a background-check, credit-check, or application fee in their own wording. Where your lease does, the Platform identifies that amount and deliberately excludes it from everything it charges you — your first invoice, your monthly rent, and any deduction from your security deposit. This is true whether your Landlord uploaded an existing signed lease or sent you one through the Platform to sign.
+
+If your Landlord asks you to pay separately for a background check you already paid for through the Platform, that charge is not coming from GAM and GAM is not collecting it. Your Landlord's agreement with GAM prohibits charging you a second time for the same report. **If it happens, raise it with your Landlord, and you may report it to GAM at the contact address below.** Charges your Landlord collects outside the Platform are between you and your Landlord, and your rights under your lease and your state's law are unaffected by these Terms.
+
+### 7.2 If You Already Live There
+
+If you were already living in your unit before your Landlord began using the Platform, **you are not required to complete a screening report to keep your tenancy or to use the Platform.** Your tenancy was formed before the Platform was involved, and GAM does not condition it on a report after the fact.
+
+Screening applies to applications for leases beginning after your Landlord's onboarding.
 
 ## 8. Lease Generation and Electronic Signature
 
