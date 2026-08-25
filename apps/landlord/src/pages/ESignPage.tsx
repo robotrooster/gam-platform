@@ -236,6 +236,11 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // them ("$100 at move-out unless the carpets were professionally cleaned").
   // Detected from the template text, kept or dropped here, saved with the fields.
   const [conditionalFees, setConditionalFees] = useState<any[]>(template.conditionalFees || [])
+  // S622: dollar figures hard-coded in the lease TEXT that nothing tracks. On a
+  // blank form every amount in the prose is a stated amount, so each of these is
+  // money the lease commits to that GAM would not otherwise know about. Advisory
+  // only — not saved; it is a prompt to go tag something.
+  const [unattributed, setUnattributed] = useState<any[]>([])
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -354,6 +359,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         setSelectedField(null)
         // Merge what the prose scan found, keyed on the clause itself so
         // re-running auto-place never duplicates one the landlord already kept.
+        setUnattributed(Array.isArray(result?.unattributedAmounts) ? result.unattributedAmounts : [])
         if (Array.isArray(result?.conditionalFees) && result.conditionalFees.length > 0) {
           setConditionalFees(prev => {
             const seen = new Set(prev.map((c: any) => String(c.conditionText).trim()))
@@ -473,6 +479,33 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           <div style={{ color:'var(--text-3)', marginTop:6 }}>
             Saved with the fields. Remove any the scan got wrong.
           </div>
+        </div>
+      )}
+
+      {unattributed.length > 0 && (
+        <div style={{
+          padding:'8px 14px', background:'rgba(245,158,11,.10)',
+          borderBottom:'1px solid rgba(245,158,11,.35)', fontSize:'.72rem',
+          color:'var(--text-1)', lineHeight:1.5,
+        }}>
+          <b style={{ color:'#f59e0b' }}>Amounts your lease names that nothing is tracking</b>
+          <span style={{ color:'var(--text-3)' }}>
+            {' '}— GAM will not bill these. If one should be charged, tag the box for it
+            with the matching fee type, or bill it as a one-off from the lease.
+          </span>
+          {unattributed.map((u: any, i: number) => (
+            <div key={i} style={{ marginTop:6, display:'flex', gap:8, alignItems:'flex-start' }}>
+              <button className="btn btn-ghost btn-sm" title="Not a charge — dismiss"
+                onClick={() => setUnattributed(prev => prev.filter((_, j) => j !== i))}
+                style={{ padding:'0 6px', lineHeight:1.2, flexShrink:0 }}>×</button>
+              <div>
+                <b>${Number(u.amount).toFixed(2)}</b>
+                <div style={{ color:'var(--text-3)', fontStyle:'italic', marginTop:1 }}>
+                  “{String(u.context).slice(0, 200)}{String(u.context).length > 200 ? '…' : ''}”
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

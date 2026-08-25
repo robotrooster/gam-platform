@@ -32,7 +32,7 @@ import { extractPositionedText, type TextItem } from '../lib/pdfText'
 // Same detector the IMPORT path uses, over the same Page[] this file already
 // extracts, so a clause in prose is found identically whichever door the lease
 // came through.
-import { detectConditionalFees } from '../jobs/leaseParser/extractors'
+import { detectConditionalFees, auditUnattributedAmounts } from '../jobs/leaseParser/extractors'
 import type { ParserExtractedConditionalFee } from '@gam/shared'
 import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
@@ -91,6 +91,15 @@ export interface AutoPlaceResult {
    * move-out inspection before it can ever charge.
    */
   conditionalFees: ParserExtractedConditionalFee[]
+  /**
+   * S622: dollar figures HARD-CODED in the template's text that nothing
+   * tracks. On a blank form every amount in the prose is a stated amount by
+   * definition — a blank the landlord fills has no number in it yet — so
+   * anything here is money the lease commits to and GAM would not know about.
+   * The safety net for "the parser must handle every financial liability",
+   * mirroring the audit the import path already runs.
+   */
+  unattributedAmounts: Array<{ amount: number; context: string }>
   pageCount: number
   fields: ProposedField[]
   modelUsed: boolean
@@ -1218,11 +1227,15 @@ export async function autoPlaceFields(
     claimed.add(col)
   }
 
+  const cFees = detectConditionalFees(extracted.pages)
+
   return {
     pageCount: extracted.pageCount,
     fields: all,
     modelUsed: !!modelMap,
-    conditionalFees: detectConditionalFees(extracted.pages),
+    conditionalFees: cFees,
+    // Attributed = what we DID account for. Everything else is surfaced.
+    unattributedAmounts: auditUnattributedAmounts(extracted.pages, cFees.map(c => c.amount)),
   }
 }
 
