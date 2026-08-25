@@ -50,7 +50,7 @@ const ROLE_COLORS: Record<string,string> = {
 }
 
 // ── FIELD ITEM ON CANVAS ──────────────────────────────────────
-function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scale }: any) {
+function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scale, parentLabel }: any) {
   const ft = FIELD_TYPES.find(f => f.type === field.fieldType) || FIELD_TYPES[0]
   const color = ROLE_COLORS[field.signerRole] || '#888'
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
@@ -105,6 +105,8 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
     window.addEventListener('mouseup', onMouseUp)
   }
 
+  const isConditional = !!field.parentFieldId
+
   return (
     <div style={{ position:'absolute', left: field.x * scale - 1, top: field.y * scale - 1 }} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}>
       {/* Delete button — outside the draggable area. Hidden for locked late-fee boxes. */}
@@ -117,9 +119,24 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         </div>
       )}
       {/* Field box. Late-fee boxes render locked (no drag cursor, lock badge). */}
-      <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : undefined} style={{
+      {/* S622: a CONDITIONAL child looked identical to a top-level field on the
+          canvas — its parent link only showed in the properties panel, and only
+          while selected. Nic read a correctly-nested sub-radio ("at end of term"
+          under lease type = Fixed term) as a stray second radio group, because
+          nothing on the page said otherwise. Dashed border + a caption naming
+          the condition. */}
+      {isConditional && (
+        <div style={{
+          position:'absolute', bottom:'100%', left:0, marginBottom:2,
+          fontSize: Math.max(7, 8.5 * scale), color, fontWeight:700,
+          whiteSpace:'nowrap' as const, pointerEvents:'none', opacity:.9,
+        }}>
+          ↳ only if {parentLabel ? `${parentLabel} = ` : ''}{field.parentOption || 'parent is set'}
+        </div>
+      )}
+      <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
-        border: `2px solid ${selected ? color : color + '99'}`,
+        border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
         cursor: locked ? 'not-allowed' : 'move', userSelect:'none', boxSizing:'border-box' as const,
@@ -545,6 +562,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
               style={{ position:'absolute', inset:0, cursor: activeTool ? 'crosshair' : 'default' }}>
               {pageFields.map(f => (
                 <FieldItem key={f.id} field={f} selected={selectedField===f.id}
+                  parentLabel={f.parentFieldId ? (fields.find((x: any) => x.id === f.parentFieldId)?.label ?? null) : null}
                   onSelect={setSelectedField} onMove={moveField}
                   onResize={resizeField}
                   onDelete={(id: string) => { setFields(prev => prev.filter(x => x.id !== id || isLockedLeaseColumn(x.leaseColumn))); setSelectedField(null) }}
