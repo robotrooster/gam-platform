@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { DOCUMENT_CATEGORIES } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { streamStoredFile } from '../lib/fileServe'
 
@@ -38,7 +39,9 @@ const docUpload = multer({
 function scopeFor(user: any): { filter: string; params: any[] } | null {
   const role = user.role
   if (role === 'admin' || role === 'super_admin') return { filter: '', params: [] }
-  if (role === 'landlord') return { filter: 'AND d.landlord_id = $1', params: [user.profileId] }
+  // S620: own + co-owned entities, so a co-owner sees the same documents
+  // the primary owner does.
+  if (role === 'landlord') return { filter: 'AND d.landlord_id = ANY($1)', params: [landlordScopeIds(user)] }
   if (role === 'tenant') return { filter: 'AND d.tenant_id = $1', params: [user.profileId] }
   if (['property_manager', 'onsite_manager', 'maintenance', 'bookkeeper'].includes(role)) {
     if (!user.landlordId) return null

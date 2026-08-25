@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 
@@ -27,10 +28,11 @@ bookingsRouter.get('/', requirePerm('bookings.view'), async (req, res, next) => 
 
     // Landlord-scope. Owners read their own; admins read all.
     if (role !== 'admin' && role !== 'super_admin') {
-      const landlordId = role === 'landlord' ? u.profileId : u.landlordId
-      if (!landlordId) throw new AppError(403, 'No landlord scope')
-      params.push(landlordId)
-      filters.push(`b.landlord_id = $${params.length}`)
+      // S620: own + co-owned entities.
+      const scope = role === 'landlord' ? landlordScopeIds(u) : (u.landlordId ? [u.landlordId] : [])
+      if (!scope.length) throw new AppError(403, 'No landlord scope')
+      params.push(scope)
+      filters.push(`b.landlord_id = ANY($${params.length})`)
     }
 
     // Property-scope: a property-locked worker only sees reservations at
@@ -134,10 +136,11 @@ bookingsRouter.get('/change-requests', requirePerm('bookings.change_requests', '
     const params: any[] = []
 
     if (role !== 'admin' && role !== 'super_admin') {
-      const landlordId = role === 'landlord' ? u.profileId : u.landlordId
-      if (!landlordId) throw new AppError(403, 'No landlord scope')
-      params.push(landlordId)
-      filters.push(`cr.landlord_id = $${params.length}`)
+      // S620: own + co-owned entities.
+      const scope = role === 'landlord' ? landlordScopeIds(u) : (u.landlordId ? [u.landlordId] : [])
+      if (!scope.length) throw new AppError(403, 'No landlord scope')
+      params.push(scope)
+      filters.push(`cr.landlord_id = ANY($${params.length})`)
     }
 
     // Property-scope (see GET / above).

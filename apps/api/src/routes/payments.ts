@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
@@ -69,7 +70,8 @@ paymentsRouter.get('/', async (req, res, next) => {
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isTeamRole = role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance'
     if (role === 'landlord') {
-      conditions.push(`p.landlord_id = $${pi++}`); params.push(req.user!.profileId)
+      // S620: own + co-owned entities (Nic: a co-owner sees what the owner sees).
+      conditions.push(`p.landlord_id = ANY($${pi++})`); params.push(landlordScopeIds(req.user!))
     } else if (role === 'tenant') {
       conditions.push(`p.tenant_id = $${pi++}`); params.push(req.user!.profileId)
     } else if (isTeamRole) {

@@ -76,18 +76,18 @@ function EntitiesSection() {
           padding: '8px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
-              {e.business_name || 'Unnamed entity'}
-              {e.is_active && (
+              {e.businessName || 'Unnamed entity'}
+              {e.isActive && (
                 <span style={{ marginLeft: 8, fontSize: '.68rem', color: 'var(--gold)' }}>current</span>
               )}
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-              {e.property_count} {e.property_count === 1 ? 'property' : 'properties'}
-              {!e.is_owner && ' · co-owned'}
-              {!e.connect_payouts_enabled && ' · payouts not set up'}
+              {e.propertyCount} {e.propertyCount === 1 ? 'property' : 'properties'}
+              {!e.isOwner && ' · co-owned'}
+              {!e.connectPayoutsEnabled && ' · payouts not set up'}
             </div>
           </div>
-          {!e.is_active && (
+          {!e.isActive && (
             <button className="btn btn-ghost" style={{ fontSize: '.75rem' }}
               disabled={switchMut.isLoading}
               onClick={() => switchMut.mutate(e.id)}>Switch to this</button>

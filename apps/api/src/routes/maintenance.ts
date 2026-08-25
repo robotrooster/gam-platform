@@ -6,6 +6,7 @@ import multer from 'multer'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification, notifyMaintenanceUpdated, createNotification } from '../services/notifications'
@@ -43,7 +44,9 @@ maintenanceRouter.get('/', async (req, res, next) => {
     if (role === 'tenant') {
       roleFilter = `AND mr.tenant_id = $${params.push(req.user!.profileId)}`
     } else if (role === 'landlord') {
-      roleFilter = `AND mr.landlord_id = $${params.push(req.user!.profileId)}`
+      // S620: every entity this landlord can read — own + co-owned.
+      // Nic: "co-owner should see all things the primary owner sees."
+      roleFilter = `AND mr.landlord_id = ANY($${params.push(landlordScopeIds(req.user!))})`
     } else if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
       if (!req.user!.landlordId) return res.json({ success: true, data: [] })
       roleFilter = `AND mr.landlord_id = $${params.push(req.user!.landlordId)}`
@@ -620,7 +623,9 @@ maintenanceRouter.get('/stats/summary', requirePerm('work_orders.complete', 'wor
     const params: any[] = []
     let where = ''
     if (role === 'landlord') {
-      where = `WHERE landlord_id = $${params.push(req.user!.profileId)}`
+      // S620: every entity this landlord can read — own + co-owned.
+      // Nic: "co-owner should see all things the primary owner sees."
+      where = `WHERE landlord_id = ANY($${params.push(landlordScopeIds(req.user!))})`
     } else if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
       if (!req.user!.landlordId) return res.json({ success: true, data: {} })
       where = `WHERE landlord_id = $${params.push(req.user!.landlordId)}`
