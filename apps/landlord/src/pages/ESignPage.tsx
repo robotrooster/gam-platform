@@ -445,14 +445,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
         <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading}
           title={autoMut.isLoading ? 'Placement is running — you can keep this tab open' : `Detect and place field boxes from the lease PDF — ${AUTO_PLACE_ESTIMATE}`}>
-          {autoMut.isLoading ? <><span className="spinner" /> {autoStatus()}</> : <>✨ Auto-place fields</>}
+          {autoMut.isLoading ? <><span className="spinner" /> Analyzing…</> : <>✨ Auto-place fields</>}
         </button>
-        {autoMut.isLoading && (
-          <div style={{ fontSize:'.68rem', color:'var(--text-3)', maxWidth:210, lineHeight:1.35 }}>
-            Reading every page with the labeling model — {AUTO_PLACE_ESTIMATE}. Still faster
-            than placing every box by hand, so leave this open and let it work.
-          </div>
-        )}
         <button className="btn btn-primary btn-sm" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>
@@ -484,6 +478,31 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           ))}
           <div style={{ color:'var(--text-3)', marginTop:6 }}>
             Saved with the fields. Remove any the scan got wrong.
+          </div>
+        </div>
+      )}
+
+      {/* S622: the wait message used to sit INLINE between Auto-place and Save
+          Fields, capped at 210px, where it wrapped into a cramped block that did
+          not fit the space — Nic: "your message does not fit in the space
+          provided... maybe you should make that message display as a header or a
+          banner across the top of the screen. You have more room there."
+          It is a full-width strip now, in the same stack as the other notices,
+          and the button just says "Analyzing…". */}
+      {autoMut.isLoading && (
+        <div style={{
+          padding:'10px 14px', background:'rgba(201,162,39,.10)',
+          borderBottom:'1px solid rgba(201,162,39,.35)',
+          display:'flex', alignItems:'center', gap:10,
+          fontSize:'.76rem', color:'var(--text-1)', lineHeight:1.45,
+        }}>
+          <span className="spinner" style={{ flexShrink:0 }} />
+          <div>
+            <b>{autoStatus()}</b>{' '}
+            <span style={{ color:'var(--text-3)' }}>
+              Reading every page with the labeling model — {AUTO_PLACE_ESTIMATE}.
+              Still faster than placing every box by hand, so leave this open and let it work.
+            </span>
           </div>
         </div>
       )}
