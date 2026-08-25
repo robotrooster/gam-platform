@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
+import { chargeLandlord } from '../services/landlordGamAccount'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -1053,6 +1054,24 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
          pmt.id,
          `$${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee absorbed by the landlord — ${body.method} rent payment due ${pmt.due_date}`,
          pmt.unit_id])
+
+      // S620: and RECORD THAT THE LANDLORD OWES IT. The line above books the
+      // fee as GAM revenue; nothing recorded that GAM had not actually been
+      // paid. A cash payment moves no money through GAM, so there was nothing
+      // to net it out of and no trace it was owed — GAM was booking income it
+      // had no mechanism to collect. This charge is what the next disbursement
+      // nets against.
+      const propRow = await client.query<{ property_id: string }>(
+        `SELECT property_id FROM units WHERE id = $1`, [pmt.unit_id])
+      await chargeLandlord(client, {
+        landlordId: pmt.landlord_id,
+        propertyId: propRow.rows[0]?.property_id ?? null,
+        kind: 'manual_payment_fee',
+        amount: MANUAL_PAYMENT_FEE,
+        sourceType: 'manual_payment_fee',
+        sourceId: pmt.id,
+        notes: `${body.method} rent payment due ${pmt.due_date} — fee absorbed by the landlord`,
+      })
     }
     if (feeToTenant) {
       feePaymentId = (await client.query<{ id: string }>(

@@ -38,6 +38,7 @@
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { createPmCompanyTransfer } from './stripeConnect'
+import { netAgainstDisbursement, markBalance } from './landlordGamAccount'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
@@ -160,8 +161,38 @@ async function reservePlatformHeldBatch(landlordUserId: string): Promise<Reserve
     }
 
     const netted = await applyReversalNetting(client, landlordRow.landlord_id, owed)
-    const transferAmount = Math.round((owed - netted) * 100) / 100
+
+    // S620 (Nic): "if six people pay cash and then four people pay card for the
+    // remainder, we'll just take it all out of the card balance. It doesn't
+    // make sense to debit the account of the landlord — that's just more money
+    // moving back and forth, and we wanna eliminate moves."
+    //
+    // So whatever the landlord owes GAM comes out of the money on its way to
+    // them, and a direct debit is only ever the fallback for when there is no
+    // money to take it from. Runs AFTER the reversal netting because a
+    // reversal is somebody else's money being returned; GAM's own fees queue
+    // behind that.
+    //
+    // Unlike reversal netting this takes PARTIAL amounts — carrying a $20
+    // remainder to next week is exactly what stops a bank debit happening.
+    const gamTaken = await netAgainstDisbursement(
+      client, landlordRow.landlord_id, Math.round((owed - netted) * 100) / 100)
+
+    const transferAmount = Math.round((owed - netted - gamTaken) * 100) / 100
     const fullyNetted = transferAmount <= 0
+
+    // S620: record where this landlord's GAM balance stands after the netting,
+    // trip or no trip. Nic: "we should flag those properties when that happens
+    // and see how close it was to happening. Maybe we raise the limit per
+    // property... if the fees are not worth the extra money movement."
+    // A property that peaks at $80 and never crosses is the useful signal, and
+    // it only exists if the near-misses are written down too.
+    void markBalance(landlordRow.landlord_id).then((b) => {
+      if (b.overThreshold) {
+        logger.warn({ landlordId: landlordRow.landlord_id, owed: b.owed, threshold: b.threshold },
+          '[gam-account] still over threshold after netting — a direct debit is the only route left')
+      }
+    }).catch(() => {})
 
     // Create the durable intent. For a fully-netted batch there is no Stripe
     // Transfer to make, so it's born already 'transferred'.

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict B3sJ5VoZe3v4DvGl9vB5qN8dsgABbiQrMuB4fKiY0DTt6JNtlgkWZw9aHEJx0g2
+\restrict XJecC1fx4SqIUE6tZxcrW1ZRAZ9oTLsRDAt2gQ8zIGwtT7Ma85a1FEICSUCUygN
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3948,6 +3948,44 @@ COMMENT ON COLUMN public.landlord_expenses.utility_type IS 'S613: which utility 
 
 
 --
+-- Name: landlord_gam_balance_marks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_gam_balance_marks (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    peak_owed numeric(12,2) NOT NULL,
+    threshold numeric(12,2) NOT NULL,
+    debited boolean DEFAULT false NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: landlord_gam_charges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_gam_charges (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    kind text NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    collected_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    collected_at timestamp with time zone,
+    source_type text NOT NULL,
+    source_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT collected_never_exceeds_amount CHECK ((collected_amount <= amount)),
+    CONSTRAINT landlord_gam_charges_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT landlord_gam_charges_collected_amount_check CHECK ((collected_amount >= (0)::numeric)),
+    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text])))
+);
+
+
+--
 -- Name: landlord_instant_margins; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6439,6 +6477,7 @@ CREATE TABLE public.properties (
     booking_about text,
     booking_area text,
     lease_signer_user_id uuid,
+    gam_debit_threshold numeric(12,2) DEFAULT 100.00 NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -6500,6 +6539,13 @@ COMMENT ON COLUMN public.properties.booking_area IS 'S602 public booking site â€
 --
 
 COMMENT ON COLUMN public.properties.lease_signer_user_id IS 'S605: on-site manager designated to sign leases for this property, in place of the account owner. Exactly one. Entitlement is re-checked at signing time; NULL or an un-entitled user means the owner signs.';
+
+
+--
+-- Name: COLUMN properties.gam_debit_threshold; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.gam_debit_threshold IS 'Outstanding balance owed to GAM at which we debit the landlord directly rather than waiting to net it out of their next disbursement. Raise it when the cost of the movement outweighs the fees. Default $100 (S620).';
 
 
 --
@@ -10746,6 +10792,22 @@ ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
 
 ALTER TABLE ONLY public.landlord_expenses
     ADD CONSTRAINT landlord_expenses_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlord_gam_balance_marks landlord_gam_balance_marks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_balance_marks
+    ADD CONSTRAINT landlord_gam_balance_marks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlord_gam_charges landlord_gam_charges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_charges
+    ADD CONSTRAINT landlord_gam_charges_pkey PRIMARY KEY (id);
 
 
 --
@@ -16608,6 +16670,27 @@ CREATE INDEX ix_tenant_questionnaires_pending ON public.tenant_questionnaires US
 
 
 --
+-- Name: landlord_gam_balance_marks_landlord_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_gam_balance_marks_landlord_idx ON public.landlord_gam_balance_marks USING btree (landlord_id, observed_at DESC);
+
+
+--
+-- Name: landlord_gam_charges_outstanding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_gam_charges_outstanding_idx ON public.landlord_gam_charges USING btree (landlord_id) WHERE (collected_amount < amount);
+
+
+--
+-- Name: landlord_gam_charges_source_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlord_gam_charges_source_uniq ON public.landlord_gam_charges USING btree (source_type, source_id) WHERE (source_id IS NOT NULL);
+
+
+--
 -- Name: landlord_members_user_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20509,6 +20592,30 @@ ALTER TABLE ONLY public.landlord_expenses
 
 
 --
+-- Name: landlord_gam_balance_marks landlord_gam_balance_marks_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_balance_marks
+    ADD CONSTRAINT landlord_gam_balance_marks_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_gam_charges landlord_gam_charges_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_charges
+    ADD CONSTRAINT landlord_gam_charges_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_gam_charges landlord_gam_charges_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_charges
+    ADD CONSTRAINT landlord_gam_charges_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
 -- Name: landlord_instant_margins landlord_instant_margins_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24160,5 +24267,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict B3sJ5VoZe3v4DvGl9vB5qN8dsgABbiQrMuB4fKiY0DTt6JNtlgkWZw9aHEJx0g2
+\unrestrict XJecC1fx4SqIUE6tZxcrW1ZRAZ9oTLsRDAt2gQ8zIGwtT7Ma85a1FEICSUCUygN
 
