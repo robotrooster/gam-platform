@@ -106,6 +106,16 @@ const registerSchema = z.object({
   // rep's code is attributed to that rep as CLOSING manager (protects the rep
   // when the landlord signs up on their own instead of an assisted flow).
   referralCode: z.string().trim().min(1).optional(),
+  // S620 (Nic): "the business name and EIN were already input. I filled all
+  // that stuff out when I was signing up." The signup form has collected both
+  // for a landlord and SENT them all along — the schema dropped them on the
+  // floor and the INSERT below never mentioned them, so they went nowhere.
+  //
+  // Three symptoms, one cause: a blank business name and EIN on the Settings
+  // account card, "Unnamed entity" in the entity list, and a co-owner invite
+  // email that said "a property on GAM" instead of naming the LLC.
+  businessName: z.string().trim().min(1).optional(),
+  ein:          z.string().trim().min(1).optional(),
   // Legal acceptance — frontend gate sets this true when the user
   // checks the Terms + Privacy acknowledgement at registration.
   // We refuse the request if it's false or missing so the timestamps
@@ -192,10 +202,13 @@ authRouter.post('/register', async (req, res, next) => {
         // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
         // extendable for long large-portfolio setups.
         const [l] = await client.query(
-          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until)
+          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until,
+                                  business_name, ein)
            VALUES ($1, $2, $3, NOW() + INTERVAL '21 days',
-                   (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date) RETURNING id`,
-          [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES]
+                   (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date,
+                   $5, $6) RETURNING id`,
+          [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES,
+           body.businessName ?? null, body.ein ?? null]
         ).then(r => r.rows)
         profileId = l.id
         // S553: founding owner-membership (multi-owner entities).

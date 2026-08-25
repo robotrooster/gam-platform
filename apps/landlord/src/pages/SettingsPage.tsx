@@ -170,6 +170,26 @@ export function SettingsPage() {
   const [depThreshold, setDepThreshold] = useState<string>('')
   const [saved, setSaved] = useState(false)
 
+  // S620: editing the entity's business name + EIN. The PATCH already accepted
+  // both; nothing in the UI ever sent them, so a landlord whose signup dropped
+  // them had no way to put them back.
+  const [editAccount, setEditAccount] = useState(false)
+  const [acctForm, setAcctForm] = useState({ businessName: '', ein: '' })
+  const acctMut = useMutation(
+    () => apiPatch('/landlords/me', {
+      businessName: acctForm.businessName.trim() || undefined,
+      ein: acctForm.ein.trim() || undefined,
+    }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('landlord-me')
+        // The entity list renders the same name, so refresh it too — otherwise
+        // it keeps saying "Unnamed entity" right below the name you just set.
+        qc.invalidateQueries('landlord-entities')
+        setEditAccount(false)
+      },
+    })
+
   useEffect(() => {
     if (me) {
       setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
@@ -221,15 +241,43 @@ export function SettingsPage() {
           {/* Account */}
           {can('settings.account_view') && (
           <div className="card">
-            <div className="card-header"><span className="card-title">Account</span></div>
+            <div className="card-header">
+              <span className="card-title">Account</span>
+              {/* S620 (Nic): "the business name and EIN were already input. I
+                  filled all that stuff out when I was signing up." Signup DID
+                  collect and send both — the server dropped them, so his entity
+                  has been nameless ever since (hence "Unnamed entity" in the
+                  entity list, and a co-owner invite that said "a property on
+                  GAM"). Signup keeps them now, but every landlord who already
+                  registered needs a way to put them back, and this card was
+                  read-only display with no edit path anywhere. */}
+              {!editAccount && (
+                <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }}
+                  onClick={() => {
+                    setAcctForm({ businessName: me?.businessName || '', ein: me?.ein || '' })
+                    setEditAccount(true)
+                  }}>Edit</button>
+              )}
+            </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Business Name</div>
-                <div style={{ fontWeight: 500 }}>{me?.businessName || '—'}</div>
+                {editAccount ? (
+                  <input className="input" value={acctForm.businessName} autoFocus
+                    placeholder="Oak Park Motel and RV LLC"
+                    onChange={e => setAcctForm(f => ({ ...f, businessName: e.target.value }))} />
+                ) : (
+                  <div style={{ fontWeight: 500 }}>{me?.businessName || '—'}</div>
+                )}
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>EIN</div>
-                <div className="mono">{me?.ein || '—'}</div>
+                {editAccount ? (
+                  <input className="input" value={acctForm.ein} placeholder="12-3456789"
+                    onChange={e => setAcctForm(f => ({ ...f, ein: e.target.value }))} />
+                ) : (
+                  <div className="mono">{me?.ein || '—'}</div>
+                )}
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Name</div>
@@ -240,6 +288,22 @@ export function SettingsPage() {
                 <div>{me?.email || '—'}</div>
               </div>
             </div>
+            {editAccount && (
+              <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+                <button className="btn btn-primary" style={{ fontSize: '.78rem' }}
+                  disabled={acctMut.isLoading}
+                  onClick={() => acctMut.mutate()}>
+                  {acctMut.isLoading ? 'Saving…' : 'Save'}
+                </button>
+                <button className="btn btn-ghost" style={{ fontSize: '.78rem' }}
+                  onClick={() => setEditAccount(false)}>Cancel</button>
+                {acctMut.isError && (
+                  <span style={{ fontSize: '.75rem', color: 'var(--red)', alignSelf: 'center' }}>
+                    Could not save. Try again.
+                  </span>
+                )}
+              </div>
+            )}
           </div>
           )}
 
