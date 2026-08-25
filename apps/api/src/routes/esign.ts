@@ -870,6 +870,33 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   }
 
   // ────────────────────────────────────────────────────────────────────────
+  // S622: conditional fees the template states in PROSE — no blank, so no
+  // tagged field could ever carry them. The landlord confirmed these on the
+  // template; every lease sent from it inherits them.
+  //
+  // Written in the SAME shape the import path uses (resolveIntent, S550):
+  // other_fee / move_out / condition_text verbatim. That shape is what makes
+  // the deposit-return sum skip them until a human assesses the condition as
+  // failed at the move-out inspection — unassessed or met never charges.
+  //
+  // Nic's requirement, and the reason this is here and not only on import:
+  // "some leases are gonna be imported, scanned PDFs, and other ones are gonna
+  // be electronic signature. It needs to work both ways universally."
+  // ────────────────────────────────────────────────────────────────────────
+  if (doc.template_id) {
+    const tcf = await client.query(
+      `SELECT label, amount, condition_text FROM lease_template_conditional_fees
+        WHERE template_id = $1`, [doc.template_id]).then((r: any) => r.rows)
+    for (const cf of tcf as any[]) {
+      await client.query(
+        `INSERT INTO lease_fees
+           (lease_id, fee_type, amount, is_refundable, due_timing, description, condition_text)
+         VALUES ($1, 'other_fee', $2, FALSE, 'move_out', $3, $4)`,
+        [lease.id, cf.amount, String(cf.label).slice(0, 120), String(cf.condition_text).slice(0, 1000)])
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
   // S28: write lease_utility_responsibilities rows from UTILITY_ROW_SPECS
   // One row per tagged utility recording who is contractually responsible.
   // Meter pointer (lease_utility_assignments) is a separate operational
@@ -1398,6 +1425,21 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
         AND ($3::uuid IS NULL OR t.property_id IS NULL OR t.property_id = $3)
         AND ($4::text IS NULL OR t.purpose = $4)
       GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [req.user!.profileId, unitTypeFilter, propertyFilter, purposeFilter])
+    // S622: the prose-stated conditional fees the landlord confirmed, so the
+    // editor can show what is already tracked and not re-ask on every open.
+    if (templates.length > 0) {
+      const cfRows = await query<any>(
+        `SELECT template_id, id, label, amount::text AS amount, condition_text
+           FROM lease_template_conditional_fees WHERE template_id = ANY($1::uuid[])`,
+        [templates.map((t: any) => t.id)])
+      const byTemplate: Record<string, any[]> = {}
+      for (const r of cfRows) {
+        (byTemplate[r.template_id] ||= []).push({
+          id: r.id, label: r.label, amount: Number(r.amount), conditionText: r.condition_text,
+        })
+      }
+      for (const t of templates as any[]) t.conditional_fees = byTemplate[t.id] || []
+    }
     res.json({ success: true, data: templates })
   } catch (e) { next(e) }
 })
@@ -1592,6 +1634,24 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
           [clientToDbId.get(parentKey), f.parentOption || null, dbId])
       }
     }
+    // S622: conditional fees the landlord kept from the prose scan. Full
+    // replace, same as the fields above — the editor sends the surviving set, so
+    // removing one in the UI removes it here. Omitting the key entirely leaves
+    // the stored set alone (a caller that predates this field must not wipe it).
+    if (Array.isArray(req.body.conditionalFees)) {
+      await query('DELETE FROM lease_template_conditional_fees WHERE template_id=$1', [template.id])
+      for (const cf of req.body.conditionalFees) {
+        const amount = Number(cf?.amount)
+        const conditionText = String(cf?.conditionText ?? '').trim()
+        if (!Number.isFinite(amount) || amount <= 0 || !conditionText) continue
+        await query(
+          `INSERT INTO lease_template_conditional_fees (template_id, label, amount, condition_text)
+           VALUES ($1, $2, $3, $4)`,
+          [template.id, String(cf?.label ?? 'Lease condition fee').slice(0, 120),
+           amount, conditionText.slice(0, 1000)])
+      }
+    }
+
     const updated = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY page, sort_order', [template.id])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

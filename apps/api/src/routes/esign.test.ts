@@ -1392,6 +1392,65 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     expect(generateMoveInInvoiceMock).toHaveBeenCalledTimes(1)
   })
 
+  // S622 (Nic): "some leases are gonna be imported, scanned PDFs, and other ones
+  // are gonna be electronic signature. It needs to work both ways universally —
+  // you never know what a landlord is gonna choose to do with migrating."
+  //
+  // A fee stated in PROSE has no blank, so no placed box can ever carry it. The
+  // import path already reads these out of the text; this is the e-sign half.
+  // The row must land in the SAME shape import writes, because that shape is
+  // what makes the deposit-return sweep skip it until a human assesses the
+  // condition as failed at move-out.
+  it('S622: a conditional fee stated in the template PROSE rides onto the lease at finalize', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedCompleteableDoc(f)
+
+    const tmpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'Prose Fee Template', '/api/esign/files/x.pdf', 8) RETURNING id`,
+      [f.landlordId])
+    const templateId = tmpl.rows[0].id
+    await db.query(`UPDATE lease_documents SET template_id = $1 WHERE id = $2`, [templateId, documentId])
+
+    const CLAUSE = 'Carpet: Upon move out, a fee of $100 will be charged unless Tenant '
+      + 'provides a copy of a receipt for professional carpet cleaning.'
+    await db.query(
+      `INSERT INTO lease_template_conditional_fees (template_id, label, amount, condition_text)
+       VALUES ($1, 'Carpet cleaning', 100, $2)`, [templateId, CLAUSE])
+
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.completed).toBe(true)
+
+    const leaseId = (await db.query<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])).rows[0].id
+
+    const fee = await db.query<any>(
+      `SELECT fee_type, amount::text AS amount, is_refundable, due_timing, description, condition_text
+         FROM lease_fees WHERE lease_id = $1 AND condition_text IS NOT NULL`, [leaseId])
+    expect(fee.rows.length).toBe(1)
+    const row = fee.rows[0]
+    // Same shape resolveIntent writes on the import path.
+    expect(row.fee_type).toBe('other_fee')
+    expect(row.due_timing).toBe('move_out')
+    expect(row.is_refundable).toBe(false)
+    expect(Number(row.amount)).toBe(100)
+    expect(row.description).toBe('Carpet cleaning')
+    // Lease-is-law: the clause is stored VERBATIM, not paraphrased.
+    expect(row.condition_text).toBe(CLAUSE)
+
+    // And it must NOT be chargeable yet — unassessed conditions never charge.
+    // (This mirrors the deposit-return filter: condition_result IS NULL.)
+    const chargeable = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM lease_fees
+        WHERE lease_id = $1 AND due_timing IN ('move_out','other')
+          AND (condition_text IS NULL OR condition_result = 'failed')`, [leaseId])
+    expect(Number(chargeable.rows[0].n)).toBe(0)
+  })
+
   it('S581: the finalize guard is uniform — a finalized addendum also no-ops (not just leases)', async () => {
     const f = await seedFixture()
     // A document already stamped finalized_at, as a completed build leaves it.

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 9OO4WMF6ApHMskpzT7nSBTRCyks43bf6eRob7rNpNuYCiXkdQHgXuZJc6VZYcUm
+\restrict vkZpGnLPIbfMEQlsZlkQUq2fgGGGl8KhBg4fjHiAT6lvGFygEwpRZwZEtHRtNs9
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -885,6 +885,8 @@ CREATE TABLE public.auto_field_jobs (
     error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    pages_total integer,
+    pages_done integer DEFAULT 0 NOT NULL,
     CONSTRAINT auto_field_jobs_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'done'::text, 'error'::text])))
 );
 
@@ -4557,6 +4559,21 @@ CREATE TABLE public.lease_rent_components (
 --
 
 COMMENT ON TABLE public.lease_rent_components IS 'S568: itemized rent breakdown for a lease (space rent + trailer rent + other). Amounts sum to leases.rent_amount; billing remains one rent payment. Presentational + metrics only.';
+
+
+--
+-- Name: lease_template_conditional_fees; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_template_conditional_fees (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    template_id uuid NOT NULL,
+    label text NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    condition_text text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_template_conditional_fees_amount_check CHECK ((amount > (0)::numeric))
+);
 
 
 --
@@ -11003,6 +11020,14 @@ ALTER TABLE ONLY public.lease_rent_components
 
 
 --
+-- Name: lease_template_conditional_fees lease_template_conditional_fees_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_conditional_fees
+    ADD CONSTRAINT lease_template_conditional_fees_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: lease_template_fields lease_template_fields_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15954,6 +15979,13 @@ CREATE INDEX idx_surveys_landlord ON public.surveys USING btree (landlord_id) WH
 --
 
 CREATE INDEX idx_surveys_property ON public.surveys USING btree (property_id) WHERE is_active;
+
+
+--
+-- Name: idx_template_conditional_fees_template; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_template_conditional_fees_template ON public.lease_template_conditional_fees USING btree (template_id);
 
 
 --
@@ -21063,6 +21095,14 @@ ALTER TABLE ONLY public.lease_rent_components
 
 
 --
+-- Name: lease_template_conditional_fees lease_template_conditional_fees_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_conditional_fees
+    ADD CONSTRAINT lease_template_conditional_fees_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
+
+
+--
 -- Name: lease_template_fields lease_template_fields_parent_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24290,5 +24330,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 9OO4WMF6ApHMskpzT7nSBTRCyks43bf6eRob7rNpNuYCiXkdQHgXuZJc6VZYcUm
+\unrestrict vkZpGnLPIbfMEQlsZlkQUq2fgGGGl8KhBg4fjHiAT6lvGFygEwpRZwZEtHRtNs9
 

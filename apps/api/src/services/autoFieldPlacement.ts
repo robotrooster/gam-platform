@@ -26,6 +26,14 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { extractPositionedText, type TextItem } from '../lib/pdfText'
+// S622 (Nic): "some leases are gonna be imported, scanned PDFs, and other ones
+// are gonna be electronic signature. It needs to work both ways universally —
+// you never know what a landlord is gonna choose to do with migrating."
+// Same detector the IMPORT path uses, over the same Page[] this file already
+// extracts, so a clause in prose is found identically whichever door the lease
+// came through.
+import { detectConditionalFees } from '../jobs/leaseParser/extractors'
+import type { ParserExtractedConditionalFee } from '@gam/shared'
 import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
 
@@ -74,6 +82,15 @@ export interface ProposedField {
 export type AutoPlaceProgress = (done: number, total: number) => void
 
 export interface AutoPlaceResult {
+  /**
+   * S622: fees the lease states in PROSE, with no blank to place a box on —
+   * "$200 deducted from the deposit at move-out if the carpets have not been
+   * professionally cleaned". These can never be found by looking for blanks, so
+   * they are read from the text instead. The landlord confirms them; each one
+   * then rides every lease sent from this template and is assessed at the
+   * move-out inspection before it can ever charge.
+   */
+  conditionalFees: ParserExtractedConditionalFee[]
   pageCount: number
   fields: ProposedField[]
   modelUsed: boolean
@@ -1201,6 +1218,11 @@ export async function autoPlaceFields(
     claimed.add(col)
   }
 
-  return { pageCount: extracted.pageCount, fields: all, modelUsed: !!modelMap }
+  return {
+    pageCount: extracted.pageCount,
+    fields: all,
+    modelUsed: !!modelMap,
+    conditionalFees: detectConditionalFees(extracted.pages),
+  }
 }
 

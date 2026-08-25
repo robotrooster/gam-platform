@@ -232,6 +232,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // S622: real placement progress, reported per page by the job (the model
   // classifies one page at a time). null until the first poll carries a count.
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
+  // S622: fees the lease states in PROSE — no blank, so no box could ever carry
+  // them ("$100 at move-out unless the carpets were professionally cleaned").
+  // Detected from the template text, kept or dropped here, saved with the fields.
+  const [conditionalFees, setConditionalFees] = useState<any[]>(template.conditionalFees || [])
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -290,6 +294,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       // parentClientId points at the parent field's clientId (the server maps
       // both to new DB ids after the full-replace insert).
       clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null
+    })), conditionalFees: conditionalFees.map((c: any) => ({
+      label: c.label, amount: c.amount, conditionText: c.conditionText,
     })) }),
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); onClose() } }
   )
@@ -346,6 +352,15 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         }
         setFields(proposed)
         setSelectedField(null)
+        // Merge what the prose scan found, keyed on the clause itself so
+        // re-running auto-place never duplicates one the landlord already kept.
+        if (Array.isArray(result?.conditionalFees) && result.conditionalFees.length > 0) {
+          setConditionalFees(prev => {
+            const seen = new Set(prev.map((c: any) => String(c.conditionText).trim()))
+            const fresh = result.conditionalFees.filter((c: any) => !seen.has(String(c.conditionText).trim()))
+            return [...prev, ...fresh]
+          })
+        }
         // S582: when the AI labeling couldn't run (model offline), boxes are still
         // placed by pattern detection — tell the landlord to double-check labels
         // rather than trust silent guesses.
@@ -430,6 +445,36 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>
       </div>
+
+      {conditionalFees.length > 0 && (
+        <div style={{
+          padding:'8px 14px', background:'rgba(201,162,39,.10)',
+          borderBottom:'1px solid rgba(201,162,39,.35)', fontSize:'.72rem',
+          color:'var(--text-1)', lineHeight:1.5,
+        }}>
+          <b style={{ color:'var(--gold-1, #c9a227)' }}>Fees written into the lease text</b>
+          <span style={{ color:'var(--text-3)' }}>
+            {' '}— no blank to place a box on, so these are read from the wording. Each is
+            charged only if you mark the condition failed at the move-out inspection.
+          </span>
+          {conditionalFees.map((c: any, i: number) => (
+            <div key={i} style={{ marginTop:6, display:'flex', gap:8, alignItems:'flex-start' }}>
+              <button className="btn btn-ghost btn-sm" title="Not a fee — remove"
+                onClick={() => setConditionalFees(prev => prev.filter((_, j) => j !== i))}
+                style={{ padding:'0 6px', lineHeight:1.2, flexShrink:0 }}>×</button>
+              <div>
+                <b>{c.label}</b> — ${Number(c.amount).toFixed(2)} at move-out
+                <div style={{ color:'var(--text-3)', fontStyle:'italic', marginTop:1 }}>
+                  “{String(c.conditionText).slice(0, 200)}{String(c.conditionText).length > 200 ? '…' : ''}”
+                </div>
+              </div>
+            </div>
+          ))}
+          <div style={{ color:'var(--text-3)', marginTop:6 }}>
+            Saved with the fields. Remove any the scan got wrong.
+          </div>
+        </div>
+      )}
 
       {duplicateMoneyTags.length > 0 && (
         <div style={{
