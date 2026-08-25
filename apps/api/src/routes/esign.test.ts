@@ -411,6 +411,56 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     expect(vals.unit_number).toBeTruthy()
   })
 
+  // S622: an auto-placed lease carries per-page initials for ALL FOUR tenant
+  // slots (primary + co_tenant_1..3) because the template cannot know how many
+  // people will sign. The send path prunes fields whose role nobody fills —
+  // otherwise a two-tenant lease would ship with unsignable initial boxes on
+  // every page and could never reach 'completed'. The pruning was implemented
+  // and correct but had NO test; this is that test.
+  it('S622: prunes template fields for tenant slots nobody fills (4-slot template, 2 signers)', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount'])
+    // Per-page initials for all four tenant slots, on 3 pages — what auto-place produces.
+    for (const role of ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']) {
+      for (const page of [1, 2, 3]) {
+        await db.query(
+          `INSERT INTO lease_template_fields (template_id, field_type, signer_role, page, x, y, width, height)
+           VALUES ($1, 'initials', $2, $3, 10, 10, 40, 20)`, [tid, role, page])
+      }
+    }
+
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Two Tenant Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+
+    const rows = await db.query<{ signer_role: string; n: string }>(
+      `SELECT signer_role, count(*)::text AS n FROM lease_document_fields
+       WHERE document_id=$1 AND field_type='initials' GROUP BY signer_role`,
+      [res.body.data.id])
+    const byRole = Object.fromEntries(rows.rows.map(r => [r.signer_role, Number(r.n)]))
+
+    expect(byRole.primary).toBe(3)              // one per page, kept
+    expect(byRole.co_tenant_1).toBeUndefined()  // nobody fills it → pruned
+    expect(byRole.co_tenant_2).toBeUndefined()
+    expect(byRole.co_tenant_3).toBeUndefined()
+
+    // And every surviving field is bound to a real signer — an unbound initials
+    // box is one the document can never collect.
+    const orphan = await db.query(
+      `SELECT 1 FROM lease_document_fields
+       WHERE document_id=$1 AND field_type='initials' AND signer_id IS NULL`,
+      [res.body.data.id])
+    expect(orphan.rows.length).toBe(0)
+  })
+
   it('S582: rent_due_day is auto-filled to "1st" so the signed lease STATES the due day (document-first)', async () => {
     const f = await seedFixture()
     const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'rent_due_day'])
