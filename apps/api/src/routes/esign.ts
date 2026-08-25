@@ -615,6 +615,17 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // every completion (S28 chain wired but never executed). No production
   // exposure because pre-launch.
   const vals: LeaseColumnVals = {}
+  // S622: this loop used to be `vals[col] = f.value` — last row wins, on a query
+  // with no ORDER BY. A template whose move-in table tagged four different
+  // amounts as rent_amount ("First month's rent", "Rent pre-payment",
+  // "Proration", "Total due") would therefore set the tenant's MONTHLY RENT from
+  // whichever row Postgres returned last. The placer now allows only one owner
+  // per money column, but a template can also be hand-edited, so refuse the
+  // ambiguity here rather than resolve it arbitrarily: silently charging a
+  // tenant the move-in total every month is far worse than failing to build.
+  //
+  // Duplicates that AGREE are harmless (the same figure restated on the lease).
+  const seen: Record<string, string> = {}
   for (const f of fields) {
     const col = f.lease_column as LeaseColumn | null
     if (!col) continue
@@ -622,6 +633,14 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     const cat = LEASE_COLUMN_CATEGORY[col]
     if (cat === 'identity' || cat === 'signature') continue
     if (f.value == null) continue
+    const v = String(f.value).trim()
+    if (col in seen && seen[col] !== v) {
+      throw new AppError(400,
+        `This lease has two different values tagged "${col}" (${seen[col]} and ${v}). ` +
+        `Open the template, and leave that tag on only the field that states the lease's ${col} — ` +
+        `the others can stay as plain text boxes.`)
+    }
+    seen[col] = v
     vals[col] = f.value
   }
 

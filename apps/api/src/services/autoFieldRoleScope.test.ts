@@ -109,3 +109,73 @@ describe('signerColumnAt — which signature column a box belongs to', () => {
     expect(signerColumnAt(onlyBelow, 384, BELOW)).toBe('primary') // no label above → default
   })
 })
+
+// ── S622: one owner per money column ─────────────────────────────────
+//
+// Nic, on page 8 of his lease: "first month's rent, security deposit, rent
+// pre-payment, proration, pet deposit, pet fee, and total due... is the back
+// end going to tally up these fees?" Four of those seven came back tagged
+// rent_amount. The lease builder collapses field values into one dict keyed by
+// column, last row wins, on a query with no ORDER BY — so the tenant's MONTHLY
+// RENT was going to be set by whichever of the four Postgres returned last.
+import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
+
+describe('money columns have exactly one owner', () => {
+  // The real page-8 move-in table, in document order, as the placer produced it.
+  const PAGE8 = [
+    { page: 2, y: 300, label: 'Rent amount',        leaseColumn: 'rent_amount' },
+    { page: 8, y: 100, label: "First month's rent", leaseColumn: 'rent_amount' },
+    { page: 8, y: 130, label: 'Security deposit',   leaseColumn: 'security_deposit' },
+    { page: 8, y: 160, label: 'Rent pre-payment',   leaseColumn: 'rent_amount' },
+    { page: 8, y: 190, label: 'Proration',          leaseColumn: 'rent_amount' },
+    { page: 8, y: 220, label: 'Pet deposit',        leaseColumn: 'pet_deposit' },
+    { page: 8, y: 250, label: 'Pet fee',            leaseColumn: 'pet_fee' },
+    { page: 8, y: 280, label: 'Total due',          leaseColumn: 'rent_amount' },
+  ]
+
+  // Mirrors the dedupe in autoPlaceFields: first in document order keeps the tag.
+  const dedupe = (fields: typeof PAGE8) => {
+    const claimed = new Set<string>()
+    return [...fields]
+      .sort((a, b) => (a.page - b.page) || (a.y - b.y))
+      .map(f => {
+        const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[f.leaseColumn]
+        if (cat !== 'writable' && cat !== 'fee_row') return f
+        if (claimed.has(f.leaseColumn)) return { ...f, leaseColumn: null as any }
+        claimed.add(f.leaseColumn)
+        return f
+      })
+  }
+
+  it('the rent CLAUSE keeps rent_amount, not the move-in summary table', () => {
+    const out = dedupe(PAGE8)
+    const owner = out.find(f => f.leaseColumn === 'rent_amount')
+    expect(owner?.label).toBe('Rent amount')  // page 2, the actual clause
+  })
+
+  it('"Total due" never sets the monthly rent', () => {
+    const out = dedupe(PAGE8)
+    expect(out.find(f => f.label === 'Total due')?.leaseColumn).toBeNull()
+  })
+
+  it('no writable or fee_row column is claimed twice', () => {
+    const out = dedupe(PAGE8)
+    const counts: Record<string, number> = {}
+    for (const f of out) {
+      if (!f.leaseColumn) continue
+      const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[f.leaseColumn]
+      if (cat !== 'writable' && cat !== 'fee_row') continue
+      counts[f.leaseColumn] = (counts[f.leaseColumn] || 0) + 1
+    }
+    const dupes = Object.entries(counts).filter(([, n]) => n > 1)
+    expect(dupes, `two fields would fight over these: ${JSON.stringify(dupes)}`).toEqual([])
+  })
+
+  it('the real charge-bearing tags survive untouched', () => {
+    const out = dedupe(PAGE8)
+    // These each become a lease_fees row the tenant is actually billed.
+    for (const col of ['security_deposit', 'pet_deposit', 'pet_fee']) {
+      expect(out.some(f => f.leaseColumn === col), `${col} lost its tag`).toBe(true)
+    }
+  })
+})

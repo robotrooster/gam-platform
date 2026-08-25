@@ -1149,6 +1149,37 @@ export async function autoPlaceFields(
   )
   const all = [...deduped, ...radios]
 
+  // S622: ONE owner per money column.
+  //
+  // A move-in cost table ("First month's rent / Rent pre-payment / Proration /
+  // Total due") is four different amounts, and all four came back tagged
+  // rent_amount. At execution the lease builder collapses field values into one
+  // dict keyed by column — `vals[col] = f.value`, last row wins, on a query with
+  // no ORDER BY. So the tenant's MONTHLY RENT would have been set by whichever
+  // of those four Postgres happened to return last. If that was "Total due",
+  // the monthly rent becomes the entire move-in total.
+  //
+  // Only writable/fee_row columns are deduped: signature, initials and
+  // date_signed legitimately repeat on every page and every signer.
+  //
+  // First occurrence in document order wins, which is the substantive clause
+  // (the rent clause on page 2) rather than a summary table at the back. The
+  // losers keep their box and stay landlord-filled — they still PRINT on the
+  // lease, they just no longer claim to be the lease's rent.
+  const ordered = [...all].sort((a, b) => (a.page - b.page) || (a.y - b.y) || (a.x - b.x))
+  const claimed = new Set<string>()
+  for (const f of ordered) {
+    const col = f.leaseColumn
+    if (!col) continue
+    const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
+    if (cat !== 'writable' && cat !== 'fee_row') continue
+    if (claimed.has(col)) {
+      f.leaseColumn = null   // display-only from here on
+      continue
+    }
+    claimed.add(col)
+  }
+
   return { pageCount: extracted.pageCount, fields: all, modelUsed: !!modelMap }
 }
 
