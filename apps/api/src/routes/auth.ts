@@ -506,9 +506,26 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          b.id   AS business_id,
          b.name AS business_name_b,
          b.business_type,
-         EXISTS (
-           SELECT 1 FROM user_bank_accounts ba
-            WHERE ba.user_id = u.id AND ba.status = 'active'
+         -- S620 (Nic): "that user interface is wrong because I've added Oak
+         -- Park's bank account as well." Settings said "bank account not
+         -- configured" for a landlord whose Stripe Connect payouts are live.
+         --
+         -- This asked only "is there a row in the legacy bank catalog?" — but
+         -- rent pays out through STRIPE CONNECT (autoPayouts fires
+         -- stripe.payouts.create against the Connect account and never reads
+         -- that table). So completing Stripe onboarding, bank account and all,
+         -- still read as unconfigured. Ready now means what it actually means:
+         -- GAM can pay you.
+         --
+         -- The same fix landed on /me/todos in S605 and this endpoint was
+         -- missed. The legacy catalog still counts, for the multi-owner
+         -- allocation-split case that genuinely uses it.
+         (
+           COALESCE(l.connect_payouts_enabled, FALSE)
+           OR EXISTS (
+             SELECT 1 FROM user_bank_accounts ba
+              WHERE ba.user_id = u.id AND ba.status = 'active'
+           )
          ) AS bank_account_ready,
          -- Gates the "Lot Rent & Net" nav item. Owner landlords only; l.id is
          -- NULL for non-landlord roles so the flag is false for them.

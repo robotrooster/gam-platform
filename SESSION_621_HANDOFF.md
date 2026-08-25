@@ -174,6 +174,32 @@ accounts, so one combined "next disbursement" could mislead.
 
 ---
 
+## 5b. SETTINGS PAGE — NIC'S OPEN LIST
+
+Reviewed live at the end of the session. Fixed: **"bank account not
+configured"** showed for a landlord whose Stripe Connect payouts are live —
+the flag read only the legacy bank catalog, not Connect, which is how payouts
+actually work. The same fix landed on /me/todos in S605 and `/auth/me` was
+missed. Both now mean "GAM can pay you".
+
+Still open, in Nic's words:
+
+- **"Maintenance approval threshold... should be scoped per property, not on
+  the entity level."** It sits on the entity today. A real change — the
+  threshold is read wherever maintenance approval is gated.
+- **Business name and EIN are empty on the account card.** Not a bug — unset
+  data on Nic's Oak Park entity. Worth filling in: it is also why the co-owner
+  invite email said "a property" instead of naming it.
+- **"That settings main overview page needs to be relinked to whatever route it
+  actually needs nowadays."** Nic suspects an abandoned route. There is only
+  ONE SettingsPage and one /settings route, so nothing is stale in the routing
+  — but the page has grown by accretion and he finds it disorienting. Worth a
+  pass for structure, not plumbing.
+- **The entities section is live** (verified in the deployed bundle); Nic was
+  on a cached page. If it looks missing again, hard-refresh first.
+
+---
+
 ## 6. MISTAKES THIS SESSION
 
 - **I over-concluded from one Stripe field.** `amount_received: 0` on a
