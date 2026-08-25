@@ -65,6 +65,14 @@ export interface ProposedField {
   parentOption?: string | null
 }
 
+/**
+ * S622: called after each page the model classifies — (pagesDone, pagesTotal).
+ * Fire-and-forget: a progress sink must never be able to fail the placement, so
+ * callers keep their own errors to themselves (runAutoFieldJob swallows its
+ * write failures).
+ */
+export type AutoPlaceProgress = (done: number, total: number) => void
+
 export interface AutoPlaceResult {
   pageCount: number
   fields: ProposedField[]
@@ -518,7 +526,10 @@ async function classifyChunk(targets: RawTarget[]): Promise<Map<number, Classifi
 // local model serves one request at a time, so parallel calls would only contend.
 // A page whose call fails contributes nothing to the map; those targets fall back
 // to heuristic in autoPlaceFields (boxes are still placed — only labels degrade).
-async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classification> | null> {
+async function modelClassify(
+  targets: RawTarget[],
+  onProgress?: AutoPlaceProgress,
+): Promise<Map<number, Classification> | null> {
   if (!MODEL_ENABLED || targets.length === 0) return null
   const byPage = new Map<number, RawTarget[]>()
   for (const t of targets) {
@@ -528,9 +539,16 @@ async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classifi
   }
   const combined = new Map<number, Classification>()
   let anySuccess = false
+  // S622: this loop IS the wait — one model call per page, sequential. Report
+  // after each page so the editor can show "page 3 of 8" instead of a spinner
+  // that looks identical to a hang. Pages WITH targets are the only ones that
+  // cost model time, so they are what we count.
+  let done = 0
+  onProgress?.(0, byPage.size)
   for (const pageTargets of byPage.values()) {
     const m = await classifyChunk(pageTargets)
     if (m) { anySuccess = true; for (const [id, c] of m) combined.set(id, c) }
+    onProgress?.(++done, byPage.size)
   }
   return anySuccess ? combined : null
 }
@@ -969,11 +987,14 @@ function detectCheckOneRadios(pages: any[]): { radios: ProposedField[]; consumed
   return { radios, consumed }
 }
 
-export async function autoPlaceFields(pdfBuffer: Buffer): Promise<AutoPlaceResult> {
+export async function autoPlaceFields(
+  pdfBuffer: Buffer,
+  onProgress?: AutoPlaceProgress,
+): Promise<AutoPlaceResult> {
   const extracted = await extractPositionedText(pdfBuffer)
   const { targets, pageMeta } = detectTargets(extracted.pages)
 
-  const modelMap = await modelClassify(targets)
+  const modelMap = await modelClassify(targets, onProgress)
   const cls = new Map<number, Classification>()
   for (const t of targets) {
     cls.set(t.id, modelMap?.get(t.id) ?? heuristicClassify(t))

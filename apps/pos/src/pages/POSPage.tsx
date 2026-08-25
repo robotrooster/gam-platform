@@ -301,7 +301,9 @@ export function POSPage() {
   async function resumeSession(id: string) {
     try {
       const res: any = await apiGet(`/pos/sessions/${id}`)
-      const items = res?.items || res?.data?.items || []
+      // apiGet already unwraps the { success, data } envelope, so `res` IS the
+      // payload — the old `res.data.items` fallback could never match.
+      const items = res?.items || []
       // Pre-map server ids → self so the queue resolves them synchronously
       // for any subsequent PATCH/DELETE/VOID against this session.
       await preloadMapping(id, id)

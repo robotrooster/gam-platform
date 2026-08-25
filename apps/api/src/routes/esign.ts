@@ -1612,7 +1612,12 @@ esignRouter.get('/templates/:id/auto-fields/:jobId', requireAuth, requirePerm('e
     const { getAutoFieldJob } = await import('../services/autoFieldJobs')
     const job = await getAutoFieldJob(req.params.jobId, req.user!.profileId)
     if (!job || job.template_id !== req.params.id) throw new AppError(404, 'Job not found')
-    res.json({ success: true, data: { status: job.status, result: job.result, error: job.error } })
+    // S622: pagesTotal/pagesDone let the editor show real progress instead of an
+    // unlabelled spinner. pagesTotal is null until the PDF has been parsed.
+    res.json({ success: true, data: {
+      status: job.status, result: job.result, error: job.error,
+      pagesTotal: job.pages_total ?? null, pagesDone: job.pages_done ?? 0,
+    } })
   } catch (e) { next(e) }
 })
 

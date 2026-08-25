@@ -189,6 +189,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const [activeTool, setActiveTool] = useState<string|null>(null)
   const [activeRole, setActiveRole] = useState('primary')
   const [currentPage, setCurrentPage] = useState(1)
+  // S622: real placement progress, reported per page by the job (the model
+  // classifies one page at a time). null until the first poll carries a count.
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -261,13 +264,26 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       const start: any = await apiPost(`/esign/templates/${template.id}/auto-fields`, {})
       const jobId = start?.data?.jobId
       if (!jobId) throw new Error('Could not start auto-placement')
-      const deadline = Date.now() + 240000 // client safety cap (4 min)
+      // S622: the cap must scale with the document. Placement costs roughly
+      // ~13s/page (an 8-page lease measured at 1m42s end to end) and the SERVER
+      // allows up to 180s for a single page, so a flat 4 minutes silently killed
+      // any lease past ~18 pages — and threw away work that had actually
+      // succeeded. Budget 60s/page over a 4-minute floor, from the page count we
+      // already know here.
+      const pages = Number(template.pageCount) || 8
+      const deadline = Date.now() + Math.max(240000, pages * 60000 + 60000)
       for (;;) {
         await new Promise(r => setTimeout(r, 2500))
+        // apiGet UNWRAPS the envelope (returns r.data.data); apiPost does NOT
+        // (returns r.data). Reading this poll the apiPost way — s.data.status —
+        // made `st` undefined on every pass, so a job that finished in 100s span
+        // the spinner until the 4-minute client cap and threw the placed fields
+        // away. Read the payload directly.
         const s: any = await apiGet(`/esign/templates/${template.id}/auto-fields/${jobId}`)
-        const st = s?.data?.status
-        if (st === 'done') return s.data.result
-        if (st === 'error') throw new Error(s?.data?.error || 'Auto-placement failed')
+        const st = s?.status
+        if (st === 'done') return s.result
+        if (st === 'error') throw new Error(s?.error || 'Auto-placement failed')
+        if (typeof s?.pagesTotal === 'number') setProgress({ done: s.pagesDone || 0, total: s.pagesTotal })
         if (Date.now() > deadline) throw new Error('Auto-placement is taking too long — please try again')
       }
     },
@@ -305,12 +321,38 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         }
       },
       onError: (e: any) => toast.error(e?.message || 'Auto-placement failed'),
+      onSettled: () => setProgress(null),
     }
   )
 
   const handleAutoPlace = async () => {
     if (fields.length > 0 && !(await appConfirm('Replace the current fields with auto-placed ones? Your current fields will be cleared.'))) return
+    setProgress(null)
     autoMut.mutate()
+  }
+
+  // S622: what the landlord reads while the model works. Before the first page
+  // lands we only know the page count, so we quote the estimate; after that we
+  // report actual pages. An eight-page lease is ~1m45s, and saying so up front is
+  // the difference between waiting and wondering whether it has hung.
+  const autoStatus = (): string => {
+    if (progress && progress.total > 0) {
+      // NB: total counts pages that actually CONTAIN blanks (only those cost
+      // model time) — an 8-page lease commonly reports 5. Say "pages with
+      // fields" so this never reads as a contradiction of the "Page 4 of 8"
+      // indicator sitting next to it.
+      const at = Math.min(progress.done + 1, progress.total)
+      return `Analyzing ${at} of ${progress.total} pages with fields…`
+    }
+    return 'Reading the document…'
+  }
+  const autoEstimate = (): string => {
+    const pages = Number(template.pageCount) || 0
+    if (!pages) return 'about 15 seconds per page'
+    const secs = Math.round(pages * 13)
+    return secs < 90
+      ? `usually about ${secs} seconds for ${pages} page${pages === 1 ? '' : 's'}`
+      : `usually about ${Math.round(secs / 30) / 2} minutes for ${pages} pages`
   }
 
   const pageFields = fields.filter(f => f.page === currentPage)
@@ -332,9 +374,15 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Page {currentPage} of {template.pageCount}</div>
         {currentPage > 1 && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p-1)}>← Prev</button>}
         {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
-        <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading} title="Detect and place field boxes from the lease PDF">
-          {autoMut.isLoading ? <><span className="spinner" /> Analyzing…</> : <>✨ Auto-place fields</>}
+        <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading}
+          title={autoMut.isLoading ? 'Placement is running — you can keep this tab open' : `Detect and place field boxes from the lease PDF (${autoEstimate()})`}>
+          {autoMut.isLoading ? <><span className="spinner" /> {autoStatus()}</> : <>✨ Auto-place fields</>}
         </button>
+        {autoMut.isLoading && (
+          <div style={{ fontSize:'.68rem', color:'var(--text-3)', maxWidth:210, lineHeight:1.35 }}>
+            Reading every page with the labeling model — {autoEstimate()}. Leave this open.
+          </div>
+        )}
         <button className="btn btn-primary btn-sm" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>

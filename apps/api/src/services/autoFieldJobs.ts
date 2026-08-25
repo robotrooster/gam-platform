@@ -24,6 +24,8 @@ export interface AutoFieldJob {
   status:      'processing' | 'done' | 'error'
   result:      any | null
   error:       string | null
+  pages_total: number | null
+  pages_done:  number
   created_at:  string
   updated_at:  string
 }
@@ -67,7 +69,15 @@ export async function runAutoFieldJob(jobId: string): Promise<void> {
       return
     }
 
-    const result = await autoPlaceFields(fs.readFileSync(pdfPath))
+    // S622: record per-page progress as the model works so the editor can show
+    // "page 3 of 8". Detached like the job itself — a failed progress write must
+    // never fail the placement, so it is swallowed. Progress is advisory; the
+    // result is what matters.
+    const result = await autoPlaceFields(fs.readFileSync(pdfPath), (done, total) => {
+      void query(
+        `UPDATE auto_field_jobs SET pages_done=$2, pages_total=$3, updated_at=now() WHERE id=$1`,
+        [jobId, done, total]).catch(() => {})
+    })
     await query(
       `UPDATE auto_field_jobs SET status='done', result=$2, updated_at=now() WHERE id=$1`,
       [jobId, JSON.stringify(result)])
