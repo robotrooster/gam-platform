@@ -4,6 +4,7 @@ import { db, query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX } from '@gam/shared'
 import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
@@ -37,15 +38,21 @@ unitsRouter.get('/', async (req, res, next) => {
     // maintenance_worker / onsite_manager). Team members got an empty list
     // because user_id never matches units.landlord_id. Resolve to landlordId
     // for team members. Same pattern as credit.ts (line 109).
-    const callerLandlordId = req.user!.role === 'landlord'
-      ? req.user!.profileId
-      : req.user!.landlordId
+    // S620: EVERY entity this caller can read, not just the one they registered
+    // under. Nic's co-owner opened Oak Park and saw "0 units, 0 of 0 occupied"
+    // — the property listed (that query scopes differently) while its units
+    // were filtered to his OWN entity, the empty one registering created so he
+    // could accept the invite. Oak Park is his entity too; that is what
+    // co-ownership means. A half-working screen is worse than a broken one:
+    // nothing errored, it just looked like the park had no units.
+    const callerScope = landlordScopeIds(req.user!)
     // S567 portfolio scoping: super sees all; a regular admin (portfolio
     // manager) sees only units under landlords they close or service; a
     // landlord/team member sees only their own.
     let landlordFilter = ''
     if (!isAdmin) {
-      landlordFilter = `AND u.landlord_id = $${params.push(callerLandlordId)}`
+      if (!callerScope.length) throw new AppError(403, 'Forbidden')
+      landlordFilter = `AND u.landlord_id = ANY($${params.push(callerScope)})`
     } else if (!isSuper) {
       const i = params.push(req.user!.userId)
       landlordFilter = `AND u.landlord_id IN (SELECT id FROM landlords WHERE portfolio_manager_id = $${i} OR service_manager_id = $${i})`
