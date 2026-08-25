@@ -179,7 +179,7 @@ If your Landlord asks you to pay separately for a background check you already p
 
 If you were already living in your unit before your Landlord began using the Platform, **you are not required to complete a screening report to keep your tenancy or to use the Platform.** Your tenancy was formed before the Platform was involved, and GAM does not condition it on a report after the fact.
 
-Screening applies to applications for leases beginning after your Landlord's onboarding.
+Screening applies to applicants for new tenancies, once your Landlord's onboarding migration window has closed.
 
 ## 8. Lease Generation and Electronic Signature
 

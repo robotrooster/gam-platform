@@ -199,9 +199,15 @@ Nothing in this Section prevents you from collecting a fee outside the Platform 
 
 ### 9.2 Migrated Tenancies and the Screening Requirement
 
-Tenants already occupying a unit under a lease that began **before** your onboarding to the Platform ("**Migrated Tenants**") are not required to complete Platform screening. Those tenancies were formed off-Platform, and GAM does not retroactively condition them on a report.
+When you join the Platform you receive an **onboarding migration window of 21 days** in which to bring your existing tenancies onto the Platform. The exact end date for your account is shown in your account settings.
 
-For every lease beginning **on or after** your onboarding date, each applicant must complete Platform screening before the lease is activated on the Platform. Activating a lease means the Platform will generate invoices, collect rent, and hold deposits for that tenancy.
+During the window, you may send lease documents to tenants already living in your units without those tenants completing Platform screening. This applies whether you upload an existing signed lease or issue a new electronically signed one — a landlord recording an existing tenancy on newly dated paperwork is still recording an existing tenancy, and GAM does not retroactively condition it on a report.
+
+**After your migration window closes**, each tenant signing a new lease must have completed Platform screening before that lease document can be sent for signature.
+
+Two exceptions survive the window. A lease that genuinely begins before you joined the Platform is treated as an existing tenancy. So is a lease on which you indicate that you already hold the tenant's security deposit, which is your assertion that the tenant was already living in the unit.
+
+This window is separate from, and has no effect on, the billing grace described in Section 6.
 
 This requirement governs what the Platform will do. It does not determine whom you may lawfully rent to, and it does not relieve you of your obligations under the Fair Housing Act, its state equivalents, or any local source-of-income or screening-criteria ordinance. **Your screening criteria, and every decision you make on the basis of a report, remain yours.**
 

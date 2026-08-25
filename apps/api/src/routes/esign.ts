@@ -3213,11 +3213,28 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
           `SELECT enabled FROM system_features WHERE key = 'screening_required_for_new_leases'`)
         const gateOn = flag ? flag.enabled === true : true
         if (gateOn && doc.document_type === 'original_lease' && !doc.renews_lease_id) {
-          const onboarded = await queryOne<{ created_at: string }>(
-            `SELECT created_at FROM landlords WHERE id = $1`, [doc.landlord_id])
+          const ll = await queryOne<{ created_at: string; migration_window_ends_at: string | null }>(
+            `SELECT created_at, migration_window_ends_at FROM landlords WHERE id = $1`, [doc.landlord_id])
           const leaseStart = new Date(startVal)
-          const onboardedAt = onboarded ? new Date(onboarded.created_at) : null
-          const isMigrated = !onboardedAt || leaseStart < onboardedAt
+          const onboardedAt = ll ? new Date(ll.created_at) : null
+          const windowEnds = ll?.migration_window_ends_at ? new Date(ll.migration_window_ends_at) : null
+
+          // A tenancy counts as MIGRATED — and is exempt — on any of:
+          //
+          //  1. The onboarding window is still open. For a period after joining,
+          //     a landlord is transcribing tenancies that already exist. This is
+          //     the case the first cut got wrong: Oak Park onboarded 2026-08-14
+          //     and is papering 30 sitting tenants with documents dated today.
+          //     The tenancy is old even though the paperwork is new.
+          //  2. The landlord marked that they already hold this tenant's deposit
+          //     — an explicit assertion that the tenant was already living there,
+          //     and it holds even after the window closes.
+          //  3. The lease genuinely starts before the landlord joined GAM.
+          const windowOpen = !windowEnds || new Date() < windowEnds
+          const isMigrated =
+            windowOpen ||
+            doc.deposit_already_held === true ||
+            (!!onboardedAt && leaseStart < onboardedAt)
           if (!isMigrated) {
             // LEFT JOIN, deliberately: a signer with no tenants row certainly has
             // no background check either. An inner join would have let exactly
@@ -3236,10 +3253,12 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
                   )`, [doc.id])
             if (unscreened.length > 0) {
               const who = unscreened.map(u => u.name).join(', ')
+              const closed = windowEnds ? windowEnds.toISOString().slice(0, 10) : 'your onboarding'
               throw new AppError(409,
                 `Cannot send: ${who} ${unscreened.length === 1 ? 'has' : 'have'} not completed a background check. ` +
-                `Leases beginning on or after your onboarding date require screening before they are sent ` +
-                `(Business Terms §9.2). Tenants who were already living in the unit before you joined GAM are exempt.`)
+                `Your onboarding migration window closed on ${closed}, so new applicants must be screened before ` +
+                `a lease is sent (Business Terms §9.2). If this tenant was already living in the unit, mark that ` +
+                `you already hold their deposit on the send form and they are treated as an existing tenancy.`)
             }
           }
         }

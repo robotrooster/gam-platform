@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict bKt9CF9NpNnhvMBssfjB7IlgP1hC6xaAPPoR99pFDXTLR2krYcHpfjDV6sNF0js
+\restrict U9RmjrRx8oFk2KIshAGEqEfyV4dCzpWptCwDMMedvVe4mpXTIqOyRmrQ4qIeTAe
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4212,6 +4212,7 @@ CREATE TABLE public.landlords (
     billing_grace_until date,
     welcome_outreach_sent_at timestamp with time zone,
     books_start_date date,
+    migration_window_ends_at timestamp with time zone,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
@@ -24330,5 +24331,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict bKt9CF9NpNnhvMBssfjB7IlgP1hC6xaAPPoR99pFDXTLR2krYcHpfjDV6sNF0js
+\unrestrict U9RmjrRx8oFk2KIshAGEqEfyV4dCzpWptCwDMMedvVe4mpXTIqOyRmrQ4qIeTAe
 

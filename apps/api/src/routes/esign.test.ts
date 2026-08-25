@@ -617,9 +617,14 @@ describe('POST /documents/:id/send', () => {
       return d.toISOString().slice(0, 10)
     }
 
-    it('blocks a lease starting after onboarding when the tenant has no background check', async () => {
+    // Closing the window is what turns a migration into ordinary leasing.
+    const closeWindow = (landlordId: string) =>
+      db.query(`UPDATE landlords SET migration_window_ends_at = NOW() - INTERVAL '1 day' WHERE id = $1`, [landlordId])
+
+    it('blocks an unscreened applicant once the migration window has closed', async () => {
       const f = await seedFixture()
       const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
       await setStart(documentId, tomorrow())
 
       const res = await request(buildApp())
@@ -630,10 +635,38 @@ describe('POST /documents/:id/send', () => {
       expect(emailSigningRequestMock).not.toHaveBeenCalled()
     })
 
-    it('lets a MIGRATED tenancy through — lease began before the landlord joined GAM', async () => {
+    // THE CASE THAT MATTERS FOR OAK PARK. A landlord who just joined is
+    // transcribing tenancies that already exist, using documents dated today.
+    // The first cut of this gate keyed on "lease starts before onboarding" and
+    // would have blocked all 30 of his sitting tenants.
+    it('lets a sitting tenant through while the migration window is OPEN, even on a lease dated today', async () => {
       const f = await seedFixture()
       const { documentId } = await seedDoc(f)
-      // Landlord onboarded after this lease started: the tenancy predates GAM.
+      await setStart(documentId, tomorrow())   // brand-new paperwork, old tenancy
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    it('lets an existing tenant through AFTER the window when the landlord already holds their deposit', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
+      await db.query(`UPDATE lease_documents SET deposit_already_held = TRUE WHERE id = $1`, [documentId])
+      await setStart(documentId, tomorrow())
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+    })
+
+    it('lets a lease that genuinely predates onboarding through after the window', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
       await db.query(`UPDATE landlords SET created_at = NOW() + INTERVAL '30 days' WHERE id = $1`, [f.landlordId])
       await setStart(documentId, tomorrow())
 
@@ -643,9 +676,10 @@ describe('POST /documents/:id/send', () => {
       expect(res.status).toBe(200)
     })
 
-    it('lets a screened applicant through', async () => {
+    it('lets a screened applicant through after the window', async () => {
       const f = await seedFixture()
       const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
       await setStart(documentId, tomorrow())
       const t = await db.query<{ id: string }>(
         `SELECT id FROM tenants WHERE user_id = $1`, [f.tenantUserId])
@@ -663,6 +697,7 @@ describe('POST /documents/:id/send', () => {
     it('is off when the flag is off — a disabled gate must be a deliberate act, not a silent skip', async () => {
       const f = await seedFixture()
       const { documentId } = await seedDoc(f)
+      await closeWindow(f.landlordId)
       await setStart(documentId, tomorrow())
       await db.query(
         `INSERT INTO system_features (key, enabled, description)
