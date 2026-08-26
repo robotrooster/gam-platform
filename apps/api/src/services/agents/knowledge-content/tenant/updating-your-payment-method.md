@@ -2,7 +2,7 @@
 scope: tenant
 title: Updating Your Payment Method
 ---
-You can change how you pay rent in GAM at any time. GAM supports electronic payments only — a **bank account (ACH)** or a **card** (debit or credit). There's no cash or check option.
+You can change how you pay rent in GAM at any time. The methods you can save and pay with in the app are a **bank account (ACH)** or a **card** (debit or credit) — cash, checks and money orders can't be entered here, but you can still pay your landlord that way and have it recorded against your balance.
 
 ## How to update it
 
@@ -15,6 +15,7 @@ You can change how you pay rent in GAM at any time. GAM supports electronic paym
 A processing fee may apply based on how you pay, and your payment screen shows it before you confirm:
 
 - **ACH (bank account):** a flat $6.00 per payment.
+- **Cash, check or money order:** a flat $6.00 manual-payment fee — the same as ACH, so no payment method costs you more than another.
 - **Card:** 3.5% plus $0.55 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 

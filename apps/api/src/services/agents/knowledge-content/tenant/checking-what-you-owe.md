@@ -21,7 +21,9 @@ Sign in to your tenant portal and open your payments area. There you can see:
 
 ## A note on off-platform payments
 
-If you paid your landlord off-platform — cash, check, or money order — it shows as unpaid here until your landlord records that payment. Once they record it, your balance updates to reflect it.
+If you paid your landlord off-platform — cash, check, or money order — it shows as unpaid here until that payment is recorded. Once it is, your balance updates to reflect it. A flat $6.00 manual-payment fee applies to a recorded payment, the same figure as the ACH fee, and it's waived on your first one.
+
+If you deposited the money straight into your landlord's bank account, you can speed this up with **"I paid at the bank"** on your payments screen — report it after you've been, and it's applied automatically once the deposit appears, dated to the day you paid.
 
 ## If your records don't match
 

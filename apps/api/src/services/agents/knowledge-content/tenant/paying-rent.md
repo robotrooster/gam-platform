@@ -2,23 +2,33 @@
 scope: tenant
 title: Paying Rent: Bank Account vs. Card
 ---
-GAM collects rent and other charges electronically — you pay online by bank account or card (there's no cash or check option inside GAM). If you pay your landlord off-platform in cash, check, or money order, it shows as unpaid here until your landlord records that payment; once they do, your balance updates to reflect it.
+GAM collects rent and other charges electronically — you pay online by bank account or card. You can also pay your landlord in cash, by check or by money order; that money doesn't move through GAM, so it shows as unpaid here until it's recorded, and then your balance updates to reflect it.
 
-You can pay two ways:
+You can pay three ways:
 
 - **Bank account (ACH):** A transfer directly from your checking or savings account.
 - **Card:** A debit or credit card.
+- **Cash, check or money order:** Handed to the office, or deposited straight into your landlord's bank.
 
 ## What it costs to pay
 
 A processing fee may apply depending on how you pay:
 
 - **ACH (bank account):** a flat $6.00 per payment, whatever the amount.
+- **Cash, check or money order:** a flat $6.00 manual-payment fee — the same as ACH, so paying this way never costs you more than paying through the app.
 - **Card:** 3.5% of the payment plus $0.55 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 - **Declined card attempt:** a flat $1.00 declined-payment fee.
 
-Because ACH is a flat $6.00, paying from a bank account is usually the lowest-cost way to pay larger amounts; for a small payment, a card can be cheaper.
+Because ACH and cash both cost a flat $6.00, either is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
+
+The manual-payment fee is **waived on your first recorded payment** on a lease, and some landlords choose to cover it for their tenants entirely — your payments screen shows which applies to you before you decide how to pay. The fee applies per payment recorded, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft.
+
+## If you deposit rent at the bank yourself
+
+If you pay by depositing straight into your landlord's account, tell us with **"I paid at the bank"** on your payments screen. Report the amount, the day you went, and whether it was cash, a check or a money order. When the deposit shows up in your landlord's bank feed we apply it automatically — **dated to the day you paid, not the day the bank posted it**, which matters if you deposited on a Friday and it didn't land until Monday.
+
+Two things to know. Report it **after** you've actually been to the bank and given it a few hours to show up — reporting it beforehand means there's nothing to match and the report expires. And reporting a deposit doesn't change your balance on its own: what you owe stays exactly the same until the deposit actually appears. If it never appears, you'll be told, and your balance will still be unchanged.
 
 ## If a card payment is declined
 
