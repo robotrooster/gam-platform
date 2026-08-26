@@ -1265,7 +1265,7 @@ function detectCheckOneRadios(pages: any[]): {
 
     const emit = (
       group: Opt[], parentKey: string | null, parentOption: string | null,
-      caption: { page: number; H: number; y: number },
+      caption: { page: number; H: number; y: number; endX: number },
     ): string => {
       const joined = group.map((o) => o.full).join(' ')
       const leaseColumn = columnFromText(joined)
@@ -1282,7 +1282,10 @@ function detectCheckOneRadios(pages: any[]): {
       // outside the options entirely, and every option gets the same marker.
       radios.push({
         page: caption.page,
-        x: Math.round(anchor.x),
+        // At the END of the caption text, not at the options' left margin — a
+        // box at x=43 on that line lands underneath the printed sentence and
+        // collided with the end-date field beside it.
+        x: Math.round(caption.endX + 6),
         y: flipY(caption.H, caption.y, 12),
         // a radio marker is a dot on the checkbox blank — the choices are picked
         // in the signing panel, so the on-document box stays tiny (Nic S556).
@@ -1353,8 +1356,12 @@ function detectCheckOneRadios(pages: any[]): {
       }
       openGroups.splice(k, 1)   // same or deeper indent: that group is closed
     }
+    const capItems = docLines[i].items
+    const capEnd = capItems.length
+      ? Math.max(...capItems.map((it: any) => (it.x2 ?? it.x) || 0))
+      : opts[0].x
     const key = emit(opts, parentKey, parentOption,
-      { page: docLines[i].page, H: docLines[i].H, y: docLines[i].y })
+      { page: docLines[i].page, H: docLines[i].H, y: docLines[i].y, endX: capEnd })
     openGroups.push({ x: myX, key, opts: opts.map(o => ({ label: o.label, page: o.page, y: o.y })) })
   }
 

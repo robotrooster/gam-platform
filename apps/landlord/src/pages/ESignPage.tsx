@@ -148,15 +148,27 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
           under lease type = Fixed term) as a stray second radio group, because
           nothing on the page said otherwise. Dashed border + a caption naming
           the condition. */}
-      {isConditional && (
+      {/* S622: this caption is nowrap and can run far wider than its 14px box,
+          so on a dense page it laid itself across the fields either side —
+          Nic saw "wording highlighted, kinda hidden behind the end date box".
+          Only the selected field explains itself now; the rest carry a small
+          marker, with the full condition on hover. */}
+      {isConditional && (selected ? (
         <div style={{
           position:'absolute', bottom:'100%', left:0, marginBottom:2,
           fontSize: Math.max(7, 8.5 * scale), color, fontWeight:700,
-          whiteSpace:'nowrap' as const, pointerEvents:'none', opacity:.9,
+          whiteSpace:'nowrap' as const, pointerEvents:'none', opacity:.95,
+          background:'var(--bg-0)', padding:'0 3px', borderRadius:3, zIndex:30,
         }}>
           ↳ only if {parentLabel ? `${parentLabel} = ` : ''}{field.parentOption || 'parent is set'}
         </div>
-      )}
+      ) : (
+        <div style={{
+          position:'absolute', bottom:'100%', left:0, marginBottom:1,
+          fontSize: Math.max(6, 7 * scale), color, fontWeight:700,
+          pointerEvents:'none', opacity:.75, lineHeight:1,
+        }}>↳</div>
+      ))}
       <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
@@ -237,38 +249,52 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // to declare its boundaries. Snapshots are coarser and always correct.
   // Consecutive snapshots within 400ms collapse into one, so a drag lands as a
   // single undo step instead of forty.
-  const [history, setHistory] = useState<any[][]>([template.fields || []])
-  const [histAt, setHistAt] = useState(0)
+  // ONE piece of state, because two cannot be kept in step. The first version
+  // held the stack and the cursor separately and called setHistAt from INSIDE
+  // the setHistory updater — React may run an updater twice, so the cursor could
+  // advance past the end of the stack, `fields` became undefined, and the first
+  // .filter on it took the whole editor down. Nic hit it by dragging a box:
+  // "the thing crashed and I lost the rendering of the whole page."
+  //
+  // Snapshots rather than an action log: a drag emits many setFields calls, so
+  // a log would need every caller to declare its own boundaries. Bursts within
+  // 400ms collapse, so one drag is one undo step.
+  const [hist, setHist] = useState<{ stack: any[][]; at: number }>(
+    () => ({ stack: [template.fields || []], at: 0 }))
   const lastPush = useRef(0)
-  const fields = history[histAt]
+  // Never index past the end, whatever happens above.
+  const fields = hist.stack[Math.min(hist.at, hist.stack.length - 1)] ?? []
 
   const setFields = useCallback((next: any) => {
-    setHistory(prev => {
-      const cur = prev[Math.min(histAt, prev.length - 1)] ?? []
+    setHist(prev => {
+      const at = Math.min(prev.at, prev.stack.length - 1)
+      const cur = prev.stack[at] ?? []
       const value = typeof next === 'function' ? next(cur) : next
       const now = Date.now()
-      // Collapse a rapid burst (one drag) into the step already on top.
-      if (now - lastPush.current < 400 && prev.length > 0) {
+      if (now - lastPush.current < 400) {
         lastPush.current = now
-        const copy = prev.slice(0, histAt + 1)
-        copy[copy.length - 1] = value
-        return copy
+        const stack = prev.stack.slice(0, at + 1)
+        stack[stack.length - 1] = value
+        return { stack, at: stack.length - 1 }
       }
       lastPush.current = now
-      // A new edit after undoing discards the redo tail, as every editor does.
-      const trimmed = prev.slice(0, histAt + 1)
-      trimmed.push(value)
-      // Bound the tape so a long session cannot grow without limit.
-      if (trimmed.length > 60) trimmed.shift()
-      else setHistAt(a => a + 1)
-      return trimmed
+      const stack = prev.stack.slice(0, at + 1)   // a new edit drops the redo tail
+      stack.push(value)
+      if (stack.length > 60) stack.shift()
+      return { stack, at: stack.length - 1 }
     })
-  }, [histAt])
+  }, [])
 
-  const canUndo = histAt > 0
-  const canRedo = histAt < history.length - 1
-  const undo = useCallback(() => { lastPush.current = 0; setHistAt(a => Math.max(0, a - 1)) }, [])
-  const redo = useCallback(() => { lastPush.current = 0; setHistAt(a => Math.min(history.length - 1, a + 1)) }, [history.length])
+  const canUndo = hist.at > 0
+  const canRedo = hist.at < hist.stack.length - 1
+  const undo = useCallback(() => {
+    lastPush.current = 0
+    setHist(p => ({ ...p, at: Math.max(0, p.at - 1) }))
+  }, [])
+  const redo = useCallback(() => {
+    lastPush.current = 0
+    setHist(p => ({ ...p, at: Math.min(p.stack.length - 1, p.at + 1) }))
+  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
