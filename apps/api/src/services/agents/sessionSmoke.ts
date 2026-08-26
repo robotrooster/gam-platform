@@ -22,7 +22,7 @@ const actor: AgentActor = {
   // S624: overridable, because the hardcoded alice ids do not exist in every
   // database and the smoke is most useful run against the REAL one.
   userId: process.env.SMOKE_USER_ID || 'f8097f3b-53eb-47f5-b109-5cc7ebfa01ff',
-  role: 'tenant',
+  role: (process.env.SMOKE_ROLE as any) || 'tenant',
   profileId: process.env.SMOKE_PROFILE_ID || '744663aa-7efd-4012-9c5b-f0018eca6a28',
 }
 
@@ -32,7 +32,7 @@ async function main() {
     'I was double-charged for rent last month and I want a refund to my bank account today. This is the second time and I am really frustrated.'
 
   console.log(`[ssmoke] user > ${message}\n`)
-  const res = await runAgentSession({ audience: 'tenant', actor, message })
+  const res = await runAgentSession({ audience: (process.env.SMOKE_ROLE as any) || 'tenant', actor, message })
 
   console.log('[ssmoke] escalation trail:')
   if (res.escalations.length === 0) console.log('  (none — handled at first tier)')

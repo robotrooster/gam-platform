@@ -26,7 +26,7 @@ The GAM landlord portal groups its navigation into these sections. These are the
 - **Disbursements** — what's paid out to you and how it's split, including on-demand withdrawals of your available balance.
 - **Reports** — reporting across your portfolio.
 - **Expenses** — record property expenses that feed your profit-and-loss.
-- **Bank Feed** — link your operating bank and categorize spending.
+- **Bank Feed** — link your operating bank, match cash and check deposits to the rent they paid, check that what was collected in person reached the bank, and categorize spending.
 - **Bank Reconciliation** — reconcile and categorize bank charges.
 - **Banking** — your connected payout bank and identity verification.
 - **Lot Rent & Net** — lot rent and investor-operator net (appears when you have mobile-home / lot-rent units).

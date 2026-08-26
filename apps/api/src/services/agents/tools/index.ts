@@ -62,6 +62,10 @@ import { getBackgroundCheckStatus } from './getBackgroundCheckStatus'
 // account-data question, and there was no tool to answer it — the agent refused
 // rather than guess, which was correct and useless.
 import { getWorkTradeStanding } from './getWorkTradeStanding'
+// S624: the landlord counterparts. Both read the same ledgers as the tenant
+// tool and the portal, so no two surfaces can state different numbers.
+import { getUnreconciledCash } from './getUnreconciledCash'
+import { getWorkTradeStatus } from './getWorkTradeStatus'
 import { sendBulkMessage } from './sendBulkMessage'
 import { getMyBookings } from './getMyBookings'
 import { getPropertyRentRoll } from './getPropertyRentRoll'
@@ -151,6 +155,8 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyPayouts,
   getBackgroundCheckStatus,
   getWorkTradeStanding,
+  getUnreconciledCash,
+  getWorkTradeStatus,
   getMaintenanceTeam,
   getBooksSummary,
   getTenantContact,

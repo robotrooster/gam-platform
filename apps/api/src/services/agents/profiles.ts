@@ -256,6 +256,9 @@ const LANDLORD_ENTRY: AgentProfile = {
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_late_payment_history', 'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_profit_and_loss', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
+    // S624: cash that arrived but is unattributed, cash collected but never
+    // banked, and who is behind on work-trade hours.
+    'get_unreconciled_cash', 'get_work_trade_status',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
@@ -284,6 +287,9 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_late_payment_history', 'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_profit_and_loss', 'get_unit_lease', 'get_vacant_units', 'get_lease_expirations', 'get_pending_amenity_requests', 'decide_amenity_reservation', 'get_service_interruptions', 'post_service_interruption', 'resolve_service_interruption',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
+    // S624: cash that arrived but is unattributed, cash collected but never
+    // banked, and who is behind on work-trade hours.
+    'get_unreconciled_cash', 'get_work_trade_status',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
