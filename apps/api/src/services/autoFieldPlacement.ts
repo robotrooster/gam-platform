@@ -1269,13 +1269,17 @@ function detectCheckOneRadios(pages: any[]): {
     ): string => {
       const joined = group.map((o) => o.full).join(' ')
       const leaseColumn = columnFromText(joined)
-      // S622 (Nic): "all you have to do is switch the second radio button with
-      // the second checkbox." The control type follows the GROUP, not the
-      // position inside it. The top-level election is radio buttons on BOTH its
-      // options; a nested election — the a/b inside option one — is checkboxes
-      // on both of ITS options. Typing by position gave option one a radio and
-      // everything after it a checkbox, which mixed the two levels together.
-      const boxType: FieldType = parentKey ? 'checkbox' : 'radio_group'
+      // S622 (Nic, final shape): EVERY election is a radio pair — the top-level
+      // one, and the a/b nested inside its first option. "So when somebody picks
+      // the first radio button, then they have to pick a or b on the next
+      // radio."
+      //
+      // What distinguishes the two is the NESTING, not the control. Typing by
+      // position gave option one a radio and everything after it a checkbox,
+      // which mixed the levels; typing by depth then made the sub-election
+      // checkboxes, which made a one-of-two choice look like two independent
+      // ticks. A choice is a radio wherever it sits.
+      const boxType: FieldType = 'radio_group'
       const key = `radio_${keyc++}`
       const anchor = group[0]
       // S622 (Nic): "the checkboxes need to be one or the other, and they need
