@@ -1269,6 +1269,13 @@ function detectCheckOneRadios(pages: any[]): {
     ): string => {
       const joined = group.map((o) => o.full).join(' ')
       const leaseColumn = columnFromText(joined)
+      // S622 (Nic): "all you have to do is switch the second radio button with
+      // the second checkbox." The control type follows the GROUP, not the
+      // position inside it. The top-level election is radio buttons on BOTH its
+      // options; a nested election — the a/b inside option one — is checkboxes
+      // on both of ITS options. Typing by position gave option one a radio and
+      // everything after it a checkbox, which mixed the two levels together.
+      const boxType: FieldType = parentKey ? 'checkbox' : 'radio_group'
       const key = `radio_${keyc++}`
       const anchor = group[0]
       // S622 (Nic): "the checkboxes need to be one or the other, and they need
@@ -1294,7 +1301,7 @@ function detectCheckOneRadios(pages: any[]): {
         // in the signing panel, so the on-document box stays tiny (Nic S556).
         width: 14,
         height: 14,
-        fieldType: 'radio_group',
+        fieldType: boxType,
         signerRole: 'landlord', // term selection is set at drafting
         leaseColumn,
         label: leaseColumn === 'lease_type' ? 'Lease type'
@@ -1327,7 +1334,7 @@ function detectCheckOneRadios(pages: any[]): {
           x: Math.round(o.x),
           y: flipY(o.H, o.y, o.h),
           width: 14, height: 14,
-          fieldType: 'checkbox',
+          fieldType: boxType,
           signerRole: 'landlord',
           leaseColumn: null,
           label: o.label,
