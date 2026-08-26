@@ -82,6 +82,14 @@ export interface ProposedField {
  */
 export type AutoPlaceProgress = (done: number, total: number) => void
 
+/** S622: where each radio option's blank sits, so branch fields can be nested under it. */
+export interface OptionAnchor {
+  page: number; x: number; y: number
+  groupKey: string; option: string; isFirst: boolean
+  /** End of this option's paragraph — the next option, or the section's end. */
+  endPage: number; endY: number
+}
+
 export interface AutoPlaceResult {
   /**
    * S622: fees the lease states in PROSE, with no blank to place a box on —
@@ -1053,15 +1061,29 @@ const SELECT_MARKER = /\(?\s*(?:check|select|choose|mark|pick|initial)\s+(?:one|
 // instead of loose checkboxes, with nesting when a second group sits inside a
 // fixed-term clause (Nic S556). Returns the radios plus the blank positions
 // consumed, so the caller can drop the duplicate single-blank boxes.
-function detectCheckOneRadios(pages: any[]): { radios: ProposedField[]; consumed: Array<{ page: number; x: number; y: number }> } {
+function detectCheckOneRadios(pages: any[]): {
+  radios: ProposedField[]
+  consumed: Array<{ page: number; x: number; y: number }>
+  optionAnchors: OptionAnchor[]
+} {
   const radios: ProposedField[] = []
   const consumed: Array<{ page: number; x: number; y: number }> = []
+  const optionAnchors: OptionAnchor[] = []
   let keyc = 0
 
+  // S622: lines for the WHOLE DOCUMENT, in reading order, each carrying its page.
+  //
+  // A "(check one)" block does not respect page boundaries. Oak Park's section 4
+  // puts FIXED TERM and its two sub-choices on page 1 and MONTH-TO-MONTH on page
+  // 2, so a per-page scan ended at the break and never saw the second choice —
+  // which is why no box was ever placed on month-to-month, and why the options
+  // list came from a hardcoded fallback instead of the document. Nic guessed
+  // this on first sight: "I don't know if it's because of a break in the page."
+  type DocLine = { page: number; H: number; y: number; items: TextItem[]; text: string; x0: number }
+  const docLines: DocLine[] = []
   for (const pg of pages) {
     const H = pg.height
     const items: TextItem[] = (pg.items as TextItem[]).filter((i) => i.text && i.text.length)
-    // group into lines
     const lines: Array<{ y: number; items: TextItem[] }> = []
     for (const it of items.slice().sort((a, b) => b.y - a.y || a.x - b.x)) {
       let line = lines.find((l) => Math.abs(l.y - it.y) < 3)
@@ -1069,81 +1091,79 @@ function detectCheckOneRadios(pages: any[]): { radios: ProposedField[]; consumed
       line.items.push(it)
     }
     lines.forEach((l) => l.items.sort((a, b) => a.x - b.x))
-    lines.sort((a, b) => b.y - a.y) // top → bottom
+    lines.sort((a, b) => b.y - a.y)
+    for (const l of lines) {
+      docLines.push({
+        page: pg.pageNumber, H, y: l.y, items: l.items,
+        text: l.items.map((it) => it.text).join(' ').replace(/\s+/g, ' '),
+        x0: l.items[0]?.x ?? 0,
+      })
+    }
+  }
+  const flipY = (H: number, y: number, h: number) => Math.round(H - y - (h || 10) - 2)
 
-    const flipY = (y: number, h: number) => Math.round(H - y - (h || 10) - 2)
-    let lastLeaseTypeKey: string | null = null
+  // Groups still "open" as we walk down the document, innermost last, so a
+  // nested election can find the branch it sits inside.
+  const openGroups: Array<{ x: number; key: string; opts: Array<{ label: string; page: number; y: number }> }> = []
 
-    for (let i = 0; i < lines.length; i++) {
-      const text = lines[i].items.map((it) => it.text).join(' ').replace(/\s+/g, ' ')
-      if (!SELECT_MARKER.test(text)) continue
+  for (let i = 0; i < docLines.length; i++) {
+    if (!SELECT_MARKER.test(docLines[i].text)) continue
 
-      // Collect option lines below this marker: a line whose FIRST token is an
-      // underscore blank. Stop at the next marker or after a gap.
-      const opts: Array<{ label: string; full: string; x: number; y: number; h: number }> = []
-      for (let j = i + 1; j < lines.length && j <= i + 8; j++) {
-        const first = lines[j].items[0]
-        const lineText = lines[j].items.map((it) => it.text).join(' ').replace(/\s+/g, ' ')
-        if (SELECT_MARKER.test(lineText)) break
-        // A checkbox option line STARTS with the blank ("___ Label"). A blank
-        // mid-line (e.g. "and ending on ___") is a fill-in, not an option.
-        if (!first || !/^\s*_{2,}/.test(first.text)) {
-          if (opts.length > 0) break
-          continue
-        }
-        // label = the option text after the leading blank, up to a sentence
-        // break. The blank + label are usually one text item ("____ FIXED TERM.
-        // The Tenant…"), so strip the leading underscores off the whole line.
-        const after = lineText.replace(/^[\s_]*_{2,}[\s_]*/, '').trim()
-        const label = (after.split(/[.,(]/)[0] || after).trim().slice(0, 40) || 'Option'
-        // keep the FULL option text for keyword matching (the short label can
-        // truncate the very words we key on, e.g. "…under the same terms")
-        opts.push({ label, full: after.toLowerCase(), x: first.x, y: first.y, h: first.height })
-        consumed.push({ page: pg.pageNumber, x: Math.round(first.x), y: flipY(first.y, first.height) })
+    // Collect option lines below the marker. A line whose FIRST token is an
+    // underscore blank is an option; anything else is continuation prose, which
+    // must NOT end the list — a lease option runs on ("…beginning on ___ and
+    // ending on ___"), and breaking there hid every later option.
+    type Opt = { label: string; full: string; x: number; y: number; h: number; page: number; H: number }
+    const opts: Opt[] = []
+    // S622: this lease carries TWO "(check one)" markers — the outer election
+    // (FIXED TERM / MONTH-TO-MONTH) and, inside the fixed-term branch, a second
+    // one (May continue / Must vacate). Scanning naively, the outer scan stopped
+    // dead at the inner marker and never reached MONTH-TO-MONTH, while the inner
+    // scan ran past its own two options and swallowed it.
+    //
+    // INDENTATION SEPARATES THEM. A group's indent is set by its first option;
+    // an option indented FURTHER belongs to a nested marker and is skipped here,
+    // and an option indented LESS belongs to an outer group and ends this scan.
+    // Nic: "you pick option one, and then you pick either a or b inside of one."
+    let groupX: number | null = null
+    let sectionEnd: { page: number; y: number } | null = null
+    for (let j = i + 1; j < docLines.length && j <= i + 30; j++) {
+      const L = docLines[j]
+      const first = L.items[0]
+      if (!first || !/^\s*_{2,}/.test(first.text)) {
+        // A new numbered clause ends the section; prose and nested markers do not.
+        if (opts.length > 0 && /^\s*\d+\s*\./.test(L.text)) { sectionEnd = { page: L.page, y: flipY(L.H, L.y, 10) - 8 }; break }
+        continue
       }
-      if (opts.length === 0) continue
+      if (groupX === null) groupX = first.x
+      else if (first.x > groupX + 8) continue        // nested group's option
+      else if (first.x < groupX - 8) break           // outer group's option
+      const after = L.text.replace(/^[\s_]*_{2,}[\s_]*/, '').trim()
+      const label = (after.split(/[.,(]/)[0] || after).trim().slice(0, 40) || 'Option'
+      opts.push({ label, full: after.toLowerCase(), x: first.x, y: first.y, h: first.height,
+                  page: L.page, H: L.H })
+      consumed.push({ page: L.page, x: Math.round(first.x), y: flipY(L.H, first.y, first.height) })
+    }
+    if (opts.length === 0) continue
 
-      // Generalize across arbitrary leases (no standardization): the OPTION
-      // LABELS are extracted from the document, so any "select one" group with
-      // 2+ printed choices becomes a radio with those exact choices. Keyword
-      // mapping to a known lease column (lease_type / auto_renew_mode) is a
-      // best-effort overlay; unknown groups still become radios (column left
-      // for the landlord). The single common case where a lease prints only the
-      // affirmative checkbox (Fixed term / auto-renew) is inferred to a binary.
-      const labels = opts.map((o) => o.label)
-      const joined = opts.map((o) => o.full).join(' ') // full text for keywords
-      // Order matters: the "end of term" choice text also says "month-to-month"
-      // (…continue on a month-to-month basis…), so match its verbs FIRST, then
-      // fall back to lease_type on "fixed term".
-      let leaseColumn: string | null = null
-      if (/\bcontinue\b|\brenew(al|s|ed)?\b|must vacate|shall vacate|move[- ]?out|end of the (rental )?term/.test(joined)) leaseColumn = 'auto_renew_mode'
-      else if (/fixed term|month[- ]to[- ]month/.test(joined)) leaseColumn = 'lease_type'
 
-      let options: string
-      let parentKey: string | null = null
-      let parentOption: string | null = null
-      if (labels.length >= 2) {
-        options = labels.join(', ') // real choices printed on the doc
-      } else if (leaseColumn === 'lease_type') {
-        options = 'Fixed term, Month-to-month'
-      } else if (leaseColumn === 'auto_renew_mode') {
-        options = 'Continue month-to-month, Must vacate'
-      } else {
-        continue // a lone option with no known meaning isn't a radio — leave as-is
-      }
-      // an end-of-term choice sits inside the fixed-term clause → conditional
-      if (leaseColumn === 'auto_renew_mode' && lastLeaseTypeKey) {
-        parentKey = lastLeaseTypeKey
-        parentOption = 'Fixed term'
-      }
+    const columnFromText = (joined: string): string | null => {
+      if (/\bcontinue\b|\brenew(al|s|ed)?\b|must vacate|shall vacate|move[- ]?out|end of the (rental )?term/.test(joined)) return 'auto_renew_mode'
+      if (/fixed term|month[- ]to[- ]month/.test(joined)) return 'lease_type'
+      return null
+    }
 
+    const emit = (
+      group: Opt[], parentKey: string | null, parentOption: string | null,
+    ): string => {
+      const joined = group.map((o) => o.full).join(' ')
+      const leaseColumn = columnFromText(joined)
       const key = `radio_${keyc++}`
-      if (leaseColumn === 'lease_type') lastLeaseTypeKey = key
-      const anchor = opts[0]
+      const anchor = group[0]
       radios.push({
-        page: pg.pageNumber,
+        page: anchor.page,
         x: Math.round(anchor.x),
-        y: flipY(anchor.y, anchor.h),
+        y: flipY(anchor.H, anchor.y, anchor.h),
         // a radio marker is a dot on the checkbox blank — the choices are picked
         // in the signing panel, so the on-document box stays tiny (Nic S556).
         width: 14,
@@ -1151,15 +1171,74 @@ function detectCheckOneRadios(pages: any[]): { radios: ProposedField[]; consumed
         fieldType: 'radio_group',
         signerRole: 'landlord', // term selection is set at drafting
         leaseColumn,
-        label: leaseColumn === 'lease_type' ? 'Lease type' : leaseColumn === 'auto_renew_mode' ? 'At end of term' : 'Select one',
-        options,
+        label: leaseColumn === 'lease_type' ? 'Lease type'
+             : leaseColumn === 'auto_renew_mode' ? 'At end of term'
+             : 'Select one',
+        options: group.map((o) => o.label).join(', '),
         key,
         parentKey,
         parentOption,
+      } as ProposedField)
+
+      // S622: every option gets its OWN marker on the page, at its own blank.
+      // The group above places one box at the FIRST option; without these the
+      // second choice has nothing on it, which is exactly what Nic went looking
+      // for and could not find. A marker carries no lease column — it is the
+      // visible tick for its option, conditional on that option being chosen.
+      group.forEach((o, n) => {
+        const next = group[n + 1]
+        const end = next
+          ? { page: next.page, y: flipY(next.H, next.y, next.h) }
+          : (sectionEnd ?? { page: o.page, y: flipY(o.H, o.y, o.h) + 44 })
+        optionAnchors.push({
+          page: o.page, y: flipY(o.H, o.y, o.h), x: Math.round(o.x),
+          groupKey: key, option: o.label, isFirst: n === 0,
+          endPage: end.page, endY: end.y,
+        })
+        if (n === 0) return
+        radios.push({
+          page: o.page,
+          x: Math.round(o.x),
+          y: flipY(o.H, o.y, o.h),
+          width: 14, height: 14,
+          fieldType: 'checkbox',
+          signerRole: 'landlord',
+          leaseColumn: null,
+          label: o.label,
+          key: `${key}_opt${n}`,
+          parentKey: key,
+          parentOption: o.label,
+        } as ProposedField)
       })
+      return key
     }
+
+    // A group indented further than an earlier one is nested INSIDE that group's
+    // most recent option — the sub-election belongs to the branch it printed under.
+    const myX = opts[0].x
+    const markerPage = docLines[i].page
+    const markerY = docLines[i].y
+    let parentKey: string | null = null
+    let parentOption: string | null = null
+    for (let k = openGroups.length - 1; k >= 0; k--) {
+      if (openGroups[k].x < myX - 8) {
+        parentKey = openGroups[k].key
+        // The branch this sub-election sits INSIDE is the parent option most
+        // recently printed ABOVE it — not the parent's last option, which on
+        // this lease is MONTH-TO-MONTH, further down page 2 and nothing to do
+        // with it. Page ascending, then y descending (PDF y counts up the page).
+        const preceding = openGroups[k].opts.filter(o =>
+          o.page < markerPage || (o.page === markerPage && o.y >= markerY))
+        parentOption = (preceding[preceding.length - 1] ?? openGroups[k].opts[0])?.label ?? null
+        break
+      }
+      openGroups.splice(k, 1)   // same or deeper indent: that group is closed
+    }
+    const key = emit(opts, parentKey, parentOption)
+    openGroups.push({ x: myX, key, opts: opts.map(o => ({ label: o.label, page: o.page, y: o.y })) })
   }
-  return { radios, consumed }
+
+  return { radios, consumed, optionAnchors }
 }
 
 export async function autoPlaceFields(
@@ -1187,7 +1266,7 @@ export async function autoPlaceFields(
   // S556: replace loose "(check one)" checkboxes with proper (nested) radio
   // groups. Drop any placed box that sits on a blank a radio group consumed,
   // then append the radios.
-  const { radios, consumed } = detectCheckOneRadios(extracted.pages)
+  const { radios, consumed, optionAnchors } = detectCheckOneRadios(extracted.pages)
   const near = (a: number, b: number) => Math.abs(a - b) <= 6
   // A radio group replaces the loose checkboxes for its lease column — drop any
   // checkbox the radios now cover (lease_type / auto_renew[_mode]), including
@@ -1203,6 +1282,53 @@ export async function autoPlaceFields(
       !(f.fieldType === 'checkbox' && covered(f.leaseColumn)),
   )
   const all = [...deduped, ...radios]
+
+  // S622: a field printed inside an option's paragraph belongs to that option.
+  //
+  // Nic: "if I'm not selecting fixed term and I want the lease to be the month
+  // to month, it doesn't need to have a start and end date... that way the lease
+  // isn't contradicting itself by having extra dates and times in places that
+  // would just be crossed out in the event of choosing the other option."
+  //
+  // The conditional machinery already existed (parentFieldId + parentOption,
+  // "shown and required only when the parent equals this option", with
+  // clear-on-parent-change so a stale answer cannot survive a switch). Nothing
+  // was ever ASSIGNED to it, so both branches' fields were unconditionally
+  // required and a month-to-month lease demanded fixed-term dates.
+  //
+  // Ownership is positional: between this option's blank and the start of the
+  // next one, bounded by the section's end for the last option. Radios are left
+  // alone — their nesting is decided by indentation in the detector.
+  // Values that belong to the lease as a whole and must never become
+  // conditional — a rent amount nested under a branch would go uncollected the
+  // moment the other branch is chosen, which is the quiet failure this feature
+  // could most easily cause. (The rent blank sits on the line that ENDS this
+  // section, and was picked up before the bound was tightened.)
+  const SIGNING_COLUMNS = new Set([
+    'date_signed', 'tenant_signature', 'landlord_signature', 'tenant_initial',
+  ])
+  const NEVER_BRANCH = new Set([
+    'rent_amount', 'rent_due_day', 'security_deposit', 'last_month_rent',
+    'pet_deposit', 'pet_fee', 'other_fee', 'move_in_fee', 'cleaning_fee',
+    'tenant_name', 'tenant_email', 'unit_number', 'property_address',
+  ])
+  const before = (aPage: number, aY: number, bPage: number, bY: number) =>
+    aPage < bPage || (aPage === bPage && aY < bY)
+  for (const f of all) {
+    if (f.fieldType === 'radio_group' || f.parentKey) continue
+    // Signing apparatus is never branch data. Expressed by TYPE, not by role:
+    // keying on signerRole skipped the month-to-month dates, which the
+    // heuristic happens to attribute to the tenant, even though they are plainly
+    // part of that branch's paragraph.
+    if (f.fieldType === 'signature' || f.fieldType === 'initials') continue
+    if (f.leaseColumn && SIGNING_COLUMNS.has(f.leaseColumn)) continue
+    if (f.leaseColumn && NEVER_BRANCH.has(f.leaseColumn)) continue
+    const owner = optionAnchors.find(a =>
+      !before(f.page, f.y, a.page, a.y - 4) && before(f.page, f.y, a.endPage, a.endY))
+    if (!owner) continue
+    ;(f as any).parentKey = owner.groupKey
+    ;(f as any).parentOption = owner.option
+  }
 
   // S622: ONE owner per money column.
   //

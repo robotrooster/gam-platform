@@ -10,7 +10,7 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
-import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
+import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical, Undo2, Redo2 } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -225,7 +225,63 @@ function PDFCanvas({ url, page, width, height }: { url:string; page:number; widt
 function TemplateEditor({ template, onClose }: { template: any; onClose: () => void }) {
   console.log('[TEMPLATE EDITOR] template:', template)
   const qc = useQueryClient()
-  const [fields, setFields] = useState<any[]>(template.fields || [])
+  // S622 (Nic): "if I accidentally move a box over a little bit, and I wanna undo
+  // it to get the placement back right... like on a paintbrush program."
+  //
+  // Placement is direct manipulation — drag, resize, delete — and every one of
+  // those is a small destructive edit with nothing behind it. Nudging a box off a
+  // blank meant dragging it back by eye and never quite recovering the original.
+  //
+  // History wraps the field list itself rather than recording per-action deltas:
+  // a drag emits many setFields calls, so an action-log would need every caller
+  // to declare its boundaries. Snapshots are coarser and always correct.
+  // Consecutive snapshots within 400ms collapse into one, so a drag lands as a
+  // single undo step instead of forty.
+  const [history, setHistory] = useState<any[][]>([template.fields || []])
+  const [histAt, setHistAt] = useState(0)
+  const lastPush = useRef(0)
+  const fields = history[histAt]
+
+  const setFields = useCallback((next: any) => {
+    setHistory(prev => {
+      const cur = prev[Math.min(histAt, prev.length - 1)] ?? []
+      const value = typeof next === 'function' ? next(cur) : next
+      const now = Date.now()
+      // Collapse a rapid burst (one drag) into the step already on top.
+      if (now - lastPush.current < 400 && prev.length > 0) {
+        lastPush.current = now
+        const copy = prev.slice(0, histAt + 1)
+        copy[copy.length - 1] = value
+        return copy
+      }
+      lastPush.current = now
+      // A new edit after undoing discards the redo tail, as every editor does.
+      const trimmed = prev.slice(0, histAt + 1)
+      trimmed.push(value)
+      // Bound the tape so a long session cannot grow without limit.
+      if (trimmed.length > 60) trimmed.shift()
+      else setHistAt(a => a + 1)
+      return trimmed
+    })
+  }, [histAt])
+
+  const canUndo = histAt > 0
+  const canRedo = histAt < history.length - 1
+  const undo = useCallback(() => { lastPush.current = 0; setHistAt(a => Math.max(0, a - 1)) }, [])
+  const redo = useCallback(() => { lastPush.current = 0; setHistAt(a => Math.min(history.length - 1, a + 1)) }, [history.length])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (!mod || e.key.toLowerCase() !== 'z') return
+      const t = e.target as HTMLElement | null
+      if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return  // let the field own it
+      e.preventDefault()
+      if (e.shiftKey) redo(); else undo()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [undo, redo])
   const [selectedField, setSelectedField] = useState<string|null>(null)
   const [activeTool, setActiveTool] = useState<string|null>(null)
   const [activeRole, setActiveRole] = useState('primary')
@@ -443,6 +499,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Page {currentPage} of {template.pageCount}</div>
         {currentPage > 1 && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p-1)}>← Prev</button>}
         {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
+        <button className="btn btn-ghost btn-sm" onClick={undo} disabled={!canUndo}
+          title="Undo (⌘Z)"><Undo2 size={13} /></button>
+        <button className="btn btn-ghost btn-sm" onClick={redo} disabled={!canRedo}
+          title="Redo (⇧⌘Z)"><Redo2 size={13} /></button>
         <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading}
           title={autoMut.isLoading ? 'Placement is running — you can keep this tab open' : `Detect and place field boxes from the lease PDF — ${AUTO_PLACE_ESTIMATE}`}>
           {autoMut.isLoading ? <><span className="spinner" /> Analyzing…</> : <>✨ Auto-place fields</>}
