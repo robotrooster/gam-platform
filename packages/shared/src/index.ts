@@ -3012,11 +3012,49 @@ export interface WritableLeaseColumnSpec {
   parse: (vals: LeaseColumnVals) => Record<string, WritableLeaseColumnSqlValue>
 }
 
+/**
+ * S622: a radio's options are the words the LEASE prints, not machine values.
+ * These map whatever a landlord's form says onto the values the columns accept.
+ * Unrecognised input resolves to the safe default rather than reaching the
+ * database — a signed document must never fail to become a lease over wording.
+ */
+export function normaliseLeaseType(raw: string | null | undefined): string {
+  const t = String(raw ?? '').toLowerCase()
+  if (/month\s*[-–]?\s*to\s*[-–]?\s*month|\bm2m\b/.test(t)) return 'month_to_month'
+  if (/\bnnn\b|triple net|commercial/.test(t)) return 'nnn_commercial'
+  return 'fixed_term'
+}
+
+/**
+ * Does the end-of-term election mean the tenancy CONTINUES? "Must vacate the
+ * Premises" is not a renewal mode — it is the absence of one — so it has to
+ * answer auto_renew, not be forced into one of the two mode values.
+ */
+export function autoRenewFromElection(raw: string | null | undefined): boolean | null {
+  const t = String(raw ?? '').toLowerCase()
+  if (!t.trim()) return null
+  if (/vacate|move[- ]?out|surrender|shall terminate|must leave/.test(t)) return false
+  if (/continue|renew|month\s*[-–]?\s*to\s*[-–]?\s*month|extend/.test(t)) return true
+  return null
+}
+
+export function normaliseAutoRenewMode(raw: string | null | undefined): string {
+  const t = String(raw ?? '').toLowerCase()
+  if (/extend|same term|another (year|term)|additional (year|term)/.test(t)) return 'extend_same_term'
+  return 'convert_to_month_to_month'
+}
+
 export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLeaseColumnSpec> = {
   rent_amount: {
     parse: (v) => {
       if (!v.rent_amount) throw new Error('Template missing rent_amount field — cannot build lease')
-      return { rent_amount: v.rent_amount }
+      // S622: leases.rent_amount is numeric — coerce the same way fee rows do,
+      // so "$1,250.00" lands and a stray "N/A" fails LOUDLY here rather than as
+      // a database error after everyone has signed.
+      const n = parseMoney(v.rent_amount)
+      // Same wording the route has always used, so the contract is unchanged.
+      if (n == null) throw new Error(`Invalid rent_amount: ${v.rent_amount}`)
+      return { rent_amount: String(n) }
     },
   },
   start_date: {
@@ -3051,19 +3089,41 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     // whatever the lease-type field says — a fixed term without an end
     // date is incoherent, and the dash convention exists precisely so
     // blank-end leases resolve predictably.
+    //
+    // S622: NORMALISE. This value arrives from a radio whose options are the
+    // words the LEASE prints — "FIXED TERM", "MONTH-TO-MONTH TERM", whatever a
+    // landlord's own form says — and it was written into a CHECK-constrained
+    // column verbatim. A real signing run died here: everyone had signed, the
+    // document completed, and the lease INSERT threw
+    // leases_lease_type_check. The document is the wrong place to demand
+    // machine values; the lease says what it says. Map it instead, and fall
+    // back to fixed_term rather than ever writing something the column refuses.
     parse: (v) => {
       const rawEnd = (v.end_date || '').trim()
       if (!rawEnd || rawEnd === '-') return { lease_type: 'month_to_month' }
-      return { lease_type: v.lease_type || 'fixed_term' }
+      return { lease_type: normaliseLeaseType(v.lease_type) }
     },
   },
   auto_renew: {
-    parse: (v) => ({ auto_renew: v.auto_renew === 'true' || v.auto_renew === 'yes' }),
+    // S622: the end-of-term ELECTION answers this. A lease that prints
+    // "____ Must vacate the Premises" against "____ May continue…" is stating
+    // whether it renews; reading only a separate auto_renew checkbox ignored
+    // the choice the parties actually made on the page.
+    parse: (v) => {
+      const explicit = v.auto_renew === 'true' || v.auto_renew === 'yes'
+      if (explicit) return { auto_renew: true }
+      const fromElection = autoRenewFromElection(v.auto_renew_mode)
+      return { auto_renew: fromElection === true }
+    },
   },
   auto_renew_mode: {
+    // S622: same normalisation, same reason — the radio carries the lease's own
+    // wording ("May continue to rent the Premises…", "Must vacate the Premises")
+    // and the column takes two fixed values.
     parse: (v) => {
-      const autoRenew = v.auto_renew === 'true' || v.auto_renew === 'yes'
-      return { auto_renew_mode: autoRenew ? (v.auto_renew_mode || 'convert_to_month_to_month') : null }
+      const explicit = v.auto_renew === 'true' || v.auto_renew === 'yes'
+      const autoRenew = explicit || autoRenewFromElection(v.auto_renew_mode) === true
+      return { auto_renew_mode: autoRenew ? normaliseAutoRenewMode(v.auto_renew_mode) : null }
     },
   },
   notice_days_required: {
@@ -3312,15 +3372,42 @@ export interface FeeRowSpec {
   }
 }
 
+/**
+ * S622: a money field that does not apply is written "N/A" — and the signing
+ * pass TELLS the landlord to do exactly that ("'N/A' / '0' are valid entries for
+ * fields that don't apply", S535). That string then reached lease_fees.amount,
+ * which is numeric(12,2), and the INSERT threw:
+ *
+ *   invalid input syntax for type numeric: "N/A"
+ *
+ * After every party had signed. Found by driving a real signing run end to end:
+ * a template with pet_deposit and pet_fee on it, and no pets. The system asked
+ * for N/A and then could not swallow it.
+ *
+ * Parse the money properly instead: strip currency formatting, and treat
+ * anything that is not a positive number — N/A, none, a dash, zero, blank — as
+ * NO FEE rather than as a value. A fee that does not apply should not become a
+ * row at all, which is what `return null` already meant.
+ */
+function parseMoney(raw: unknown): number | null {
+  if (raw == null) return null
+  const t = String(raw).trim()
+  if (!t) return null
+  if (/^(n\/?a|none|no|nil|--?|—)$/i.test(t)) return null
+  const n = Number(t.replace(/[$,\s]/g, ''))
+  if (!Number.isFinite(n) || n <= 0) return null
+  return Math.round(n * 100) / 100
+}
+
 function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
   return {
     parse: (v) => {
-      const val = v[tag]
-      if (val == null || val === '') return null
+      const amount = parseMoney(v[tag])
+      if (amount == null) return null
       const meta = FEE_TYPE_META[tag]
       return {
         fee_type: tag,
-        amount: val,
+        amount: String(amount),
         is_refundable: meta.isRefundable,
         due_timing: meta.dueTiming,
       }

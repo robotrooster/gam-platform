@@ -109,9 +109,13 @@ describe('move-in month is never double-billed by daily generation', () => {
 describe('S622: a lease finalized AFTER its start date still bills', () => {
   it('creates the move-in invoice dated the lease start, with rent the tenant owes', async () => {
     // Lease began on the 1st of last month; the signature lands today.
+    // Built from LOCAL parts: toISOString() converts to UTC, which pushed the
+    // 1st to the 2nd whenever this ran after ~17:00 local and quietly turned a
+    // full month's rent into a prorated one. A date-only value must never make
+    // a round trip through a timestamp.
     const d = new Date()
     d.setMonth(d.getMonth() - 1, 1)
-    const startDate = d.toISOString().slice(0, 10)
+    const startDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`
 
     const { leaseId, unitId, landlordId, tenantId } = await seedStack({ startDate, rentDueDay: 1, rent: 1000 })
     const res = await genMoveIn({
