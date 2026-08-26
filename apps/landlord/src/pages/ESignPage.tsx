@@ -302,6 +302,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // Shown, not dropped — Nic: "we wanna identify them just to make sure that
   // we're purposely ignoring them, not accidentally ignoring them."
   const [screeningFees, setScreeningFees] = useState<any[]>([])
+  // S622: the late-fee terms the lease states in words, read from the prose.
+  const [lateFeeTerms, setLateFeeTerms] = useState<any>(template.lateFeeTerms ?? null)
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -360,7 +362,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       // parentClientId points at the parent field's clientId (the server maps
       // both to new DB ids after the full-replace insert).
       clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null
-    })), conditionalFees: conditionalFees.map((c: any) => ({
+    })), lateFeeTerms, conditionalFees: conditionalFees.map((c: any) => ({
       label: c.label, amount: c.amount, conditionText: c.conditionText,
     })) }),
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); onClose() } }
@@ -422,6 +424,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         // re-running auto-place never duplicates one the landlord already kept.
         setUnattributed(Array.isArray(result?.unattributedAmounts) ? result.unattributedAmounts : [])
         setScreeningFees(Array.isArray(result?.screeningFees) ? result.screeningFees : [])
+        if (result?.lateFeeTerms) setLateFeeTerms(result.lateFeeTerms)
         if (Array.isArray(result?.conditionalFees) && result.conditionalFees.length > 0) {
           setConditionalFees(prev => {
             const seen = new Set(prev.map((c: any) => String(c.conditionText).trim()))

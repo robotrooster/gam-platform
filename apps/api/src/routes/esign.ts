@@ -277,7 +277,16 @@ export async function createDocumentRecord(client: any, opts: {
                 WHERE template_id = $1 AND lease_column = ANY($2)`,
               [opts.templateId, policyTags]).then((r: any) => new Set(r.rows.map((x: any) => x.lease_column)))
           : new Set<string>()
-        const missing = policyTags.filter(t => !bound.has(t))
+        // S622: a template can satisfy this in PROSE. Most leases print the late
+        // charge as a clause, never as a blank, so no field can exist to bind —
+        // and refusing on that basis blocks drafting for a document that states
+        // the policy perfectly well in words. The guard's purpose is that the
+        // terms APPEAR in the signed document; a clause does that.
+        const proseTerms = opts.templateId
+          ? await client.query('SELECT late_fee_terms FROM lease_templates WHERE id=$1', [opts.templateId])
+              .then((r: any) => r.rows[0]?.late_fee_terms ?? null)
+          : null
+        const missing = proseTerms ? [] : policyTags.filter(t => !bound.has(t))
         if (missing.length > 0) {
           const labels = missing.map(t => LEASE_COLUMN_LABEL[t as LeaseColumn] || t).join(', ')
           const typeLabel = plf.unit_type ? String(plf.unit_type).replace('_', ' ') : 'this unit type'
@@ -884,6 +893,32 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // "some leases are gonna be imported, scanned PDFs, and other ones are gonna
   // be electronic signature. It needs to work both ways universally."
   // ────────────────────────────────────────────────────────────────────────
+  // S622: LEASE IS LAW. When the template states its late-fee terms in prose,
+  // those words are what the parties signed, so they are what GAM charges —
+  // stamped onto the lease rather than left to the property policy, which may
+  // say something else. Oak Park's clause reads "$5.00 per day … not received by
+  // the due date" while the property policy carried a five-day grace; the
+  // document wins.
+  if (doc.template_id) {
+    const lft = await client.query(
+      'SELECT late_fee_terms FROM lease_templates WHERE id=$1', [doc.template_id]
+    ).then((r: any) => r.rows[0]?.late_fee_terms ?? null)
+    if (lft) {
+      await client.query(
+        `UPDATE leases SET
+           late_fee_enabled        = TRUE,
+           late_fee_grace_days     = COALESCE($2, late_fee_grace_days),
+           late_fee_initial_amount = COALESCE($3, late_fee_initial_amount),
+           late_fee_initial_type   = COALESCE($4, late_fee_initial_type),
+           late_fee_accrual_amount = COALESCE($5, late_fee_accrual_amount),
+           late_fee_accrual_type   = COALESCE($6, late_fee_accrual_type),
+           late_fee_accrual_period = COALESCE($7, late_fee_accrual_period)
+         WHERE id = $1`,
+        [lease.id, lft.graceDays, lft.initialAmount, lft.initialType,
+         lft.accrualAmount, lft.accrualType, lft.accrualPeriod])
+    }
+  }
+
   if (doc.template_id) {
     const tcf = await client.query(
       `SELECT label, amount, condition_text FROM lease_template_conditional_fees
@@ -1643,6 +1678,12 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     // replace, same as the fields above — the editor sends the surviving set, so
     // removing one in the UI removes it here. Omitting the key entirely leaves
     // the stored set alone (a caller that predates this field must not wipe it).
+    // S622: the late-fee terms the template states in prose, saved with the
+    // fields so drafting can rely on them.
+    if (req.body.lateFeeTerms !== undefined) {
+      await query('UPDATE lease_templates SET late_fee_terms=$2 WHERE id=$1',
+        [template.id, req.body.lateFeeTerms ? JSON.stringify(req.body.lateFeeTerms) : null])
+    }
     if (Array.isArray(req.body.conditionalFees)) {
       await query('DELETE FROM lease_template_conditional_fees WHERE template_id=$1', [template.id])
       for (const cf of req.body.conditionalFees) {

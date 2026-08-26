@@ -83,6 +83,16 @@ export interface ProposedField {
 export type AutoPlaceProgress = (done: number, total: number) => void
 
 /** S622: where each radio option's blank sits, so branch fields can be nested under it. */
+export interface LateFeeTerms {
+  graceDays:      number | null
+  initialAmount:  number | null
+  initialType:    'flat' | 'percent' | null
+  accrualAmount:  number | null
+  accrualType:    'flat' | 'percent' | null
+  accrualPeriod:  'daily' | 'weekly' | 'monthly' | null
+  rawText:        string
+}
+
 export interface OptionAnchor {
   page: number; x: number; y: number
   groupKey: string; option: string; isFirst: boolean
@@ -116,6 +126,14 @@ export interface AutoPlaceResult {
    * the lease's own fee would charge them twice for one report.
    */
   screeningFees: Array<{ amount: number; context: string }>
+  /**
+   * S622: the late-fee terms the lease STATES in prose. Most leases print the
+   * late charge as words in a clause, not as a fill-in blank, so no field can
+   * ever be placed for it — and the drafting guard, which insists the policy
+   * appear IN the document, then refuses to draft at all. The terms are in the
+   * document; they simply are not in a box. Read them.
+   */
+  lateFeeTerms: LateFeeTerms | null
   pageCount: number
   fields: ProposedField[]
   modelUsed: boolean
@@ -1061,6 +1079,98 @@ const SELECT_MARKER = /\(?\s*(?:check|select|choose|mark|pick|initial)\s+(?:one|
 // instead of loose checkboxes, with nesting when a second group sits inside a
 // fixed-term clause (Nic S556). Returns the radios plus the blank positions
 // consumed, so the caller can drop the duplicate single-blank boxes.
+
+/**
+ * S622: read the late-fee terms out of the lease's own words.
+ *
+ * Oak Park's lease says: "A late charge of Five dollars ($5.00) per day shall be
+ * added to all Rent not received by the due date." That is a complete late-fee
+ * policy — amount, cadence, and grace — printed in a clause, with no blank
+ * anywhere for a field to attach to. Field auto-placement can never find it, so
+ * the drafting guard saw a template with no late-fee fields and refused to draft
+ * a lease at all.
+ *
+ * Nic, on being offered the alternatives: "Why would you offer the other two
+ * options when they are, like, garbage, short term, shortcuts? We don't do
+ * things that way around here."
+ *
+ * Parsed conservatively — every field is nullable and an unreadable clause
+ * yields null rather than a guess, because a wrong late fee is a wrong charge.
+ */
+const WORD_NUM: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, fifteen: 15, twenty: 20, thirty: 30,
+}
+const numFrom = (t: string): number | null => {
+  // Prefer a parenthesised digit — leases write "five (5)" and "Five dollars ($5.00)".
+  const paren = t.match(/\(\s*\$?\s*([\d,]+(?:\.\d+)?)\s*\)/)
+  if (paren) { const n = Number(paren[1].replace(/,/g, '')); if (Number.isFinite(n)) return n }
+  const dollars = t.match(/\$\s*([\d,]+(?:\.\d+)?)/)
+  if (dollars) { const n = Number(dollars[1].replace(/,/g, '')); if (Number.isFinite(n)) return n }
+  const word = t.match(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty)\b/i)
+  if (word) return WORD_NUM[word[1].toLowerCase()]
+  const bare = t.match(/\b([\d,]+(?:\.\d+)?)\b/)
+  if (bare) { const n = Number(bare[1].replace(/,/g, '')); if (Number.isFinite(n)) return n }
+  return null
+}
+
+export function detectLateFeeTerms(pages: any[]): LateFeeTerms | null {
+  const text = pages
+    .map((pg: any) => (pg.items as TextItem[]).map((i) => i.text).join(' '))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+  // Sentence-scoped: the clause that actually names a late charge.
+  const sentences = text.split(/(?<=[.;])\s+/)
+  const clause = sentences.find((sn) =>
+    /\blate\s+(charge|fee|payment\s+(charge|fee))\b/i.test(sn) && /\$|\bdollars?\b/i.test(sn))
+  if (!clause) return null
+
+  const out: LateFeeTerms = {
+    graceDays: null, initialAmount: null, initialType: null,
+    accrualAmount: null, accrualType: null, accrualPeriod: null,
+    rawText: clause.trim().slice(0, 400),
+  }
+
+  // The amount, and whether it repeats.
+  const amountPart = clause.match(/late\s+(?:charge|fee)[^.]*?(?:of|equal to)\s+([^,.;]*)/i)?.[1] ?? clause
+  const amt = numFrom(amountPart)
+  const isPercent = /%|percent/i.test(amountPart)
+  const perDay = /\bper\s+day\b|\beach\s+day\b|\bdaily\b|\bper\s+diem\b/i.test(clause)
+  const perWeek = /\bper\s+week\b|\bweekly\b/i.test(clause)
+  const perMonth = /\bper\s+month\b|\bmonthly\b/i.test(clause)
+
+  if (amt != null && amt > 0) {
+    if (perDay || perWeek || perMonth) {
+      out.accrualAmount = amt
+      out.accrualType = isPercent ? 'percent' : 'flat'
+      out.accrualPeriod = perDay ? 'daily' : perWeek ? 'weekly' : 'monthly'
+      out.initialAmount = 0
+      out.initialType = 'flat'
+    } else {
+      out.initialAmount = amt
+      out.initialType = isPercent ? 'percent' : 'flat'
+    }
+  }
+
+  // Grace. "not received by the due date" is a real answer — zero — and the
+  // commonest one; treating it as unknown would leave the policy unstated.
+  const graceSentence = sentences.find((sn) =>
+    /\blate\s+(charge|fee)\b/i.test(sn) &&
+    /(grace|not (received|paid)|after the|within|if .* is not)/i.test(sn)) ?? clause
+  if (/\bgrace\s+period\b/i.test(graceSentence)) {
+    const g = numFrom(graceSentence.match(/grace\s+period[^.]*/i)?.[0] ?? '')
+    if (g != null) out.graceDays = g
+  } else if (/after the\s+[^.]*?\bday\b/i.test(graceSentence)) {
+    const g = numFrom(graceSentence.match(/after the\s+[^.]*?\bday\b/i)?.[0] ?? '')
+    if (g != null) out.graceDays = g
+  } else if (/not (received|paid)[^.]*\bby the due date\b|\bon the due date\b/i.test(graceSentence)) {
+    out.graceDays = 0
+  }
+
+  const anything = out.initialAmount != null || out.accrualAmount != null || out.graceDays != null
+  return anything ? out : null
+}
+
 function detectCheckOneRadios(pages: any[]): {
   radios: ProposedField[]
   consumed: Array<{ page: number; x: number; y: number }>
@@ -1389,6 +1499,7 @@ export async function autoPlaceFields(
     conditionalFees: cFees,
     unattributedAmounts: unattributed,
     screeningFees,
+    lateFeeTerms: detectLateFeeTerms(extracted.pages),
   }
 }
 

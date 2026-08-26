@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict U9RmjrRx8oFk2KIshAGEqEfyV4dCzpWptCwDMMedvVe4mpXTIqOyRmrQ4qIeTAe
+\restrict Rrhn1ucEolSLeTYORrRFU0YlPKkhCtM4lVN8942KMLiZc8bzwsQsveGqiX5q5yI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4624,6 +4624,7 @@ CREATE TABLE public.lease_templates (
     default_term_months integer,
     is_unit_type_default boolean DEFAULT false NOT NULL,
     purpose text DEFAULT 'lease'::text NOT NULL,
+    late_fee_terms jsonb,
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
     CONSTRAINT lease_templates_purpose_check CHECK ((purpose = ANY (ARRAY['lease'::text, 'work_trade_addendum'::text]))),
@@ -24331,5 +24332,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict U9RmjrRx8oFk2KIshAGEqEfyV4dCzpWptCwDMMedvVe4mpXTIqOyRmrQ4qIeTAe
+\unrestrict Rrhn1ucEolSLeTYORrRFU0YlPKkhCtM4lVN8942KMLiZc8bzwsQsveGqiX5q5yI
 
