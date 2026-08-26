@@ -25,6 +25,7 @@
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { getStripe } from '../lib/stripe'
+import { logger } from '../lib/logger'
 import { createLandlordExpense } from './landlordExpenses'
 import type { MerchantRuleScope } from '@gam/shared'
 import { OTHER_INCOME_CATEGORIES, EXPENSE_CATEGORIES } from '@gam/shared'
@@ -219,6 +220,8 @@ export async function upsertTransactions(
     if (res?.id) inserted++
   }
   await autoMatchLandlord(landlordId)
+  // S624: and settle any deposit a tenant declared that the bank now confirms.
+  await autoSettleDeclaredDeposits(landlordId)
   if (skippedDuplicate) {
     console.log(`[bankFeed] connection ${connectionId}: skipped ${skippedDuplicate} row(s) already imported via a prior link to the same account`)
   }
@@ -352,6 +355,73 @@ export async function autoMatchLandlord(landlordId: string): Promise<number> {
     }
   }
   return matched
+}
+
+/**
+ * S624 — auto-settle a deposit the TENANT declared and the BANK confirms.
+ *
+ * The only case that settles with nobody in the loop, and it is safe for a
+ * specific reason: it takes TWO INDEPENDENT SIGNALS that had to agree, neither
+ * of them the landlord's guess. The tenant said they deposited $X on a date; a
+ * bank row for exactly $X posted within the window; and the instrument they
+ * named does not contradict what the memo describes. Amount alone never
+ * qualifies — in a park where every lot pays the same rent an amount identifies
+ * nobody, and a confident wrong answer books one tenant's money onto another's
+ * ledger and then onto their credit file.
+ *
+ * This overrides the S570 design lock ("landlord ALWAYS confirms") for TENANT
+ * PAYMENTS ONLY, on Nic's S624 decision. Expense categorization keeps the lock:
+ * there is no second signal there, only a merchant name.
+ *
+ * Never throws. A deposit that cannot be auto-settled simply stays in the review
+ * queue with its shortlist, which is exactly where it would have been anyway.
+ */
+export async function autoSettleDeclaredDeposits(landlordId: string): Promise<number> {
+  const { candidatesForDeposit } = await import('./bankDepositCandidates')
+  const { confirmDepositMatch } = await import('./bankDepositConfirm')
+  const { isPreselectable } = await import('./bankDepositMatch')
+
+  const rows = await query<any>(
+    `SELECT id, landlord_id, amount::float AS amount,
+            to_char(posted_date,'YYYY-MM-DD') AS posted_date, description
+       FROM bank_transactions
+      WHERE landlord_id = $1 AND status = 'needs_review' AND amount > 0`,
+    [landlordId])
+
+  let settled = 0
+  for (const txn of rows) {
+    try {
+      const { candidates } = await candidatesForDeposit(txn)
+      const top = candidates[0]
+      // 'declared' is the only confidence that auto-settles. `isPreselectable`
+      // also admits a unique amount match and a named check — good enough to
+      // PRE-TICK for a landlord who is looking at it, not good enough to move
+      // money unattended.
+      if (!top || top.confidence !== 'declared' || !isPreselectable(top)) continue
+      if (top.chargeIds.length === 0) continue
+
+      const decl = await queryOne<{ id: string; method: string }>(
+        `SELECT id, method FROM tenant_declared_deposits
+          WHERE lease_id = $1 AND status = 'pending' AND amount = $2
+          ORDER BY declared_date DESC LIMIT 1`,
+        [top.leaseId, Number(txn.amount).toFixed(2)])
+      if (!decl) continue
+
+      await confirmDepositMatch({
+        bankTransactionId: txn.id,
+        chargeIds: top.chargeIds,
+        method: decl.method as any,
+        declarationId: decl.id,
+        confirmedByUserId: null,
+      })
+      settled++
+    } catch (e) {
+      // One bad deposit must not stop the rest, and must not fail a bank sync.
+      logger.warn({ err: e, transaction_id: txn.id },
+        '[bank-feed] auto-settle skipped')
+    }
+  }
+  return settled
 }
 
 // ── Suggestions (per-landlord merchant memory) ──────────────────────────────

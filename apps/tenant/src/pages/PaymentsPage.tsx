@@ -13,6 +13,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { formatCurrency, humanize, humanizeEntryDescription, chargeLabel, MANUAL_PAYMENT_FEE_SCOPE } from '@gam/shared'
+import { ReportBankDepositModal, ReportedDeposits } from '../components/ReportBankDeposit'
 import { apiGet } from '../lib/api'
 import { AutopaySection } from './AutopayCard'
 import {
@@ -82,7 +83,12 @@ const STATUS_BADGE: Record<string, string> = {
 // covering that and that they may choose to stop covering that at any time" — so
 // if a $10 ever does appear later, they recognise it as the landlord stopping
 // rather than a new charge nobody warned them about.
-function WaysToPay({ lease }: { lease: any }) {
+function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
+  lease: any
+  reports?: any[]
+  onReportDeposit?: () => void
+  onWithdrawn?: () => void
+}) {
   const costs: any[] = lease?.methodCosts ?? []
   if (!costs.length) return null
   const covered = !!lease.manualFeeCoveredByLandlord
@@ -136,6 +142,17 @@ function WaysToPay({ lease }: { lease: any }) {
           to {MANUAL_PAYMENT_FEE_SCOPE}. It is waived on a first payment only.
         </div>
       )}
+
+      {/* S624: the entry point sits HERE, under the cash row, because this is
+          where a tenant is already deciding to pay that way — not buried on a
+          separate screen they would have to know to look for. */}
+      {onReportDeposit && (
+        <button className="btn-ghost" onClick={onReportDeposit}
+          style={{ width: '100%', marginTop: 10, fontSize: '.78rem', padding: '8px 12px' }}>
+          I paid at the bank — report a deposit
+        </button>
+      )}
+      <ReportedDeposits reports={reports} onWithdrawn={onWithdrawn ?? (() => {})} />
     </div>
   )
 }
@@ -176,13 +193,24 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     'remittances',
     () => apiGet('/payments/remittances'),
   )
+  // S624: bank deposits this tenant has reported, and what became of them.
+  const { data: declaredDeposits = [] } = useQuery<any[]>(
+    'declared-deposits',
+    () => apiGet('/declared-deposits'),
+  )
 
   const [payTarget, setPayTarget] = useState<{ target: PayTarget } | null>(null)
   const [addMethodOpen, setAddMethodOpen] = useState<'ach' | 'card' | null>(null)
+  // S624: "I paid at the bank". Reporting a branch deposit is what lets it be
+  // matched and dated automatically — otherwise it sits unattributed until a
+  // landlord works out whose it was.
+  const [reportDepositFor, setReportDepositFor] =
+    useState<{ leaseId: string; outstanding: number } | null>(null)
 
   const refetchAll = () => {
     qc.invalidateQueries('payments')
     qc.invalidateQueries('balance-context')
+    qc.invalidateQueries('declared-deposits')
     qc.invalidateQueries('tenant-payment-methods')
     qc.invalidateQueries('remittances')
   }
@@ -389,7 +417,13 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   Rent is paid in full — this covers your entire balance on this lease,
                   oldest charges first.
                 </div>
-                <WaysToPay lease={lg} />
+                <WaysToPay
+                  lease={lg}
+                  reports={declaredDeposits.filter((d: any) => d.leaseId === lg.leaseId)}
+                  onReportDeposit={() => setReportDepositFor({
+                    leaseId: lg.leaseId, outstanding: lg.outstanding })}
+                  onWithdrawn={refetchAll}
+                />
               </div>
               <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
                 <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding, lg.suggestedPayAhead, lg.requiredNow)}>
@@ -492,6 +526,15 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           </table>
         )}
       </div>
+
+      {reportDepositFor && (
+        <ReportBankDepositModal
+          leaseId={reportDepositFor.leaseId}
+          outstanding={reportDepositFor.outstanding}
+          onReported={refetchAll}
+          onClose={() => setReportDepositFor(null)}
+        />
+      )}
 
       {payTarget && (
         <PayNowModal

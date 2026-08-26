@@ -1,4 +1,5 @@
 import cron from 'node-cron'
+import { DateTime } from 'luxon'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
   emailSigningReminder, emailDocumentAutoVoided,
@@ -1322,6 +1323,42 @@ export function schedulerInit() {
       logger.info(result, '[monthly-fee-accrual]')
     } catch (e) {
       logger.error({ err: e }, '[monthly-fee-accrual] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S624 — expire tenant deposit reports the bank never confirmed. Daily,
+  // 3:40am Phoenix, after the overnight bank syncs have had their chance to
+  // produce the matching row.
+  cron.schedule('40 3 * * *', async () => {
+    try {
+      const { sweepExpiredDeclarations } = await import('./declaredDepositExpiry')
+      const result = await sweepExpiredDeclarations()
+      logger.info(result, '[declared-deposit-expiry]')
+    } catch (e) {
+      logger.error({ err: e }, '[declared-deposit-expiry] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S624 — WORK-TRADE MONTH CLOSE. 1st of the month, 2:15am Phoenix.
+  //
+  // Deliberately AFTER invoice generation and the fee accruals: it settles the
+  // month that just ENDED, using hours logged during it, against the invoice
+  // that issued at the start of it. Running it before those would settle a month
+  // whose late-arriving approvals had not landed yet.
+  //
+  // Nic (S623): "when you're working, those hours should be covering the month
+  // that you're gonna be staying." That is only expressible once the month is
+  // over — September's hours do not exist on September 1st — which is why this
+  // is a job and not part of billing.
+  cron.schedule('15 2 1 * *', async () => {
+    try {
+      const { runWorkTradeSettlement } = await import('./workTradeSettlement')
+      const closed = DateTime.now().setZone('America/Phoenix')
+        .minus({ months: 1 }).startOf('month').toISODate()!
+      const result = await runWorkTradeSettlement(closed)
+      logger.info({ ...result, period: closed }, '[work-trade-settlement]')
+    } catch (e) {
+      logger.error({ err: e }, '[work-trade-settlement] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 

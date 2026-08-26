@@ -8,6 +8,7 @@ import { useMemo, useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe } from '@stripe/stripe-js'
 import { apiGet, apiPost , apiPut } from '../lib/api'
+import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
 import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 import { Landmark, RefreshCw, Check, X, Plus } from 'lucide-react'
@@ -199,6 +200,26 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
           This is for <strong>categorizing spending</strong> from a linked bank into your P&L.
         </div>
       )}
+
+      {/* S624 — DEPOSITS THAT PAID RENT, above the expense queue on purpose.
+          A tenant's rent sitting unattributed is time-sensitive in a way a
+          Home Depot receipt is not: late fees are accruing on it while it waits,
+          and every day it sits is a day of fees that will have to be reversed. */}
+      <div style={{ marginBottom: 20 }}>
+        <div className="card-title" style={{ marginBottom: 8 }}>Deposits that may be rent</div>
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+          Money paid in at a branch, matched to what each tenant owes. Recording it
+          here dates the payment to when the deposit was actually made — so any late
+          fee charged while it was in transit comes back off.
+        </div>
+        <DepositMatchPanel />
+      </div>
+
+      {/* The other side of the same question: cash marked collected in person
+          that no deposit has accounted for. */}
+      <div style={{ marginBottom: 20 }}>
+        <CashPositionPanel />
+      </div>
 
       {/* Linked banks */}
       <div className="card" style={{ marginBottom: 20 }}>

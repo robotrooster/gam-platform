@@ -177,6 +177,17 @@ export async function cleanupAllSchema(): Promise<void> {
   // forces an order — but they MUST be cleared, or one test file's triggers
   // are still due in the next one's and every dueTriggers() assertion drifts.
   await db.query(`DELETE FROM payout_triggers`)
+  // S624: bank_transactions.matched_payment_id FKs payments, so it must clear
+  // FIRST. This was latent until the deposit-match path became the first thing
+  // to ever populate that column — the constraint has always been there, nothing
+  // had exercised it. (bank_transactions is deleted again further down with its
+  // connection; a second DELETE on an empty table is free.)
+  // S624: a confirmed declaration RESTRICTs its bank transaction, and an
+  // allocation RESTRICTs both the transaction and the payment — the proof of a
+  // settled rent payment is not throwaway. Both clear before either parent.
+  await db.query(`DELETE FROM bank_deposit_allocations`)
+  await db.query(`DELETE FROM tenant_declared_deposits`)
+  await db.query(`DELETE FROM bank_transactions`)
   await db.query(`DELETE FROM payments`)
   // S550: the audit journal records every DELETE this cleanup performs —
   // clear it too or gam_test grows without bound across runs.

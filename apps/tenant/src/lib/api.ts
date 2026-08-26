@@ -43,6 +43,12 @@ export const apiPatch = <T = any>(url: string, body?: any): Promise<T> =>
 export const apiPut = <T = any>(url: string, body?: any): Promise<T> =>
   api.put<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
 
+// S624: added for withdrawing a reported bank deposit. Nothing in the tenant app
+// had needed a DELETE before — and a tenant taking back a claim they have not
+// proved is the one thing here that genuinely removes something.
+export const apiDelete = <T = any>(url: string): Promise<T> =>
+  api.delete<{ success: boolean; data: T }>(url).then(r => r.data.data)
+
 // Multipart upload (photos/video). axios sets the multipart boundary itself.
 export const apiUpload = <T = any>(url: string, form: FormData): Promise<T> =>
   api.post<{ success: boolean; data: T }>(url, form).then(r => r.data.data)

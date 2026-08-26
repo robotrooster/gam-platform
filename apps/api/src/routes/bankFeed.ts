@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
+import { queryOne } from '../db'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
@@ -107,5 +108,96 @@ bankFeedRouter.post('/transactions/:id/categorize', requireLandlord, async (req:
 bankFeedRouter.post('/transactions/:id/ignore', requireLandlord, async (req: any, res, next) => {
   try {
     res.json({ success: true, data: await ignoreTransaction(scope(req), req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// ── S624: MATCHING A DEPOSIT TO THE RENT IT PAID ────────────────────────────
+//
+// The bank feed already auto-matched inbound deposits to GAM's own
+// disbursements. It never matched the OTHER kind of inbound money: a tenant
+// depositing their own rent at a branch. That gap is why a landlord running a
+// property remotely had to reconstruct every cash payment by hand — find it,
+// date it, waive the late fee it accrued in transit, mark the charges, and
+// unwind the lot if a check bounced.
+
+// GET /api/bank-feed/deposits/unmatched — the queue, each with its shortlist.
+bankFeedRouter.get('/deposits/unmatched', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { unmatchedDepositsWithCandidates } = await import('../services/bankDepositCandidates')
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50))
+    const out = await unmatchedDepositsWithCandidates(scope(req), limit)
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/deposits/:id/confirm — this deposit paid these charges.
+//
+// The landlord CONFIRMS; GAM never decides on its own from an amount alone. In
+// a park where every lot pays the same rent, an amount identifies nobody, and a
+// confident wrong answer books one tenant's money onto another's ledger and then
+// onto their credit file. The only case that settles without a person is a
+// tenant declaration corroborated by the bank — two independent signals, neither
+// of them the landlord's guess (see the auto-settle path in the sync job).
+bankFeedRouter.post('/deposits/:id/confirm', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { z } = await import('zod')
+    const { MANUAL_PAYMENT_METHODS } = await import('@gam/shared')
+    const body = z.object({
+      chargeIds: z.array(z.string().uuid()).min(1).max(20),
+      method: z.enum(MANUAL_PAYMENT_METHODS),
+      declarationId: z.string().uuid().nullish(),
+    }).parse(req.body)
+
+    const landlordId = scope(req)
+    // Scope check before anything else: the transaction must be this landlord's.
+    // confirmDepositMatch re-checks charge ownership against the transaction, so
+    // this is the outer of two gates rather than the only one.
+    const owned = await queryOne<{ id: string }>(
+      `SELECT id FROM bank_transactions WHERE id = $1 AND landlord_id = $2`,
+      [req.params.id, landlordId])
+    if (!owned) throw new AppError(404, 'Deposit not found')
+
+    const { confirmDepositMatch } = await import('../services/bankDepositConfirm')
+    const result = await confirmDepositMatch({
+      bankTransactionId: req.params.id,
+      chargeIds: body.chargeIds,
+      method: body.method,
+      declarationId: body.declarationId ?? null,
+      confirmedByUserId: req.user.id,
+    })
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/deposits/:id/not-rent — it was not a tenant payment.
+//
+// Sends the row back to the ordinary categorize flow (other income), which is
+// where it would have gone before any of this existed. Offering this explicitly
+// matters: without it, a landlord facing a shortlist of tenants who did NOT pay
+// this deposit has no honest way out except to pick one.
+bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, res, next) => {
+  try {
+    const landlordId = scope(req)
+    const row = await queryOne<{ id: string }>(
+      `UPDATE bank_transactions
+          SET updated_at = NOW()
+        WHERE id = $1 AND landlord_id = $2 AND status = 'needs_review'
+        RETURNING id`, [req.params.id, landlordId])
+    if (!row) throw new AppError(404, 'Deposit not found or already handled')
+    res.json({ success: true, data: { id: row.id, categorizeAsIncome: true } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/bank-feed/cash-position — did the office bank what it collected?
+//
+// S624 (Nic): the on-site "double verification". Rents marked collected in
+// person with no bank deposit accounting for them, oldest first, with names.
+bankFeedRouter.get('/cash-position', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { cashBankingPosition } = await import('../services/cashBankingControl')
+    const graceDays = req.query.graceDays != null
+      ? Math.min(30, Math.max(0, Number(req.query.graceDays))) : undefined
+    const data = await cashBankingPosition(scope(req), { graceDays })
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })

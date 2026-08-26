@@ -89,6 +89,8 @@ import { portfolioRouter }    from './routes/portfolio'
 import { webhooksRouter }     from './routes/webhooks'
 import { stripeRouter }       from './routes/stripe'
 import { workTradeRouter }    from './routes/workTrade'
+// S624: "I paid at the bank" — tenant-declared deposits, matched against the feed.
+import { declaredDepositsRouter } from './routes/declaredDeposits'
 import { posRouter }          from './routes/pos'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
@@ -353,6 +355,7 @@ app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)
 app.use('/api/portfolio',     portfolioRouter)  // S592: PM-scoped surface (allow-list)
 app.use('/api/work-trade',    workTradeRouter)
+app.use('/api/declared-deposits', declaredDepositsRouter)
 app.use('/api/stripe',        stripeRouter)
 app.use('/api/pos',           posRouter)
 app.use('/api/reports',       reportsRouter)
