@@ -3,7 +3,7 @@
 **Gold Asset Management**
 2843 East Frontage Road, Amado, AZ 85645
 Effective Date: August 10, 2026
-Last Updated: August 25, 2026
+Last Updated: August 26, 2026
 
 ---
 
@@ -199,7 +199,7 @@ Nothing in this Section prevents you from collecting a fee outside the Platform 
 
 ### 9.2 Migrated Tenancies and the Screening Requirement
 
-When you join the Platform you receive an **onboarding migration window of 21 days** in which to bring your existing tenancies onto the Platform. The exact end date for your account is shown in your account settings.
+When you join the Platform you receive an **onboarding migration window of 28 days** in which to bring your existing tenancies onto the Platform. The exact end date for your account is shown in your account settings.
 
 During the window, you may send lease documents to tenants already living in your units without those tenants completing Platform screening. This applies whether you upload an existing signed lease or issue a new electronically signed one — a landlord recording an existing tenancy on newly dated paperwork is still recording an existing tenancy, and GAM does not retroactively condition it on a report.
 

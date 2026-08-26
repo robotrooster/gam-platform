@@ -15,7 +15,9 @@
 -- period after joining, a landlord is transcribing tenancies that already
 -- exist. After it closes, everyone signing a new lease is an applicant.
 --
--- 21 DAYS, Nic's call: "during the onboarding window, the twenty one day grace
+-- 28 DAYS (raised from 21, Nic S623: "we never know when people are actually
+-- gonna get around to finalizing all their details… maybe we should increase
+-- the onboarding window to twenty eight days"). Originally 21, Nic's call: "during the onboarding window, the twenty one day grace
 -- period that we set... they can sign a new e-signature lease without doing the
 -- background check. After that, they have to do the background check."
 --
@@ -34,5 +36,5 @@ ALTER TABLE landlords
 
 -- Existing landlords get a window measured from when they joined.
 UPDATE landlords
-   SET migration_window_ends_at = created_at + INTERVAL '21 days'
+   SET migration_window_ends_at = created_at + INTERVAL '28 days'
  WHERE migration_window_ends_at IS NULL;
