@@ -93,6 +93,15 @@ export interface LateFeeTerms {
   rawText:        string
 }
 
+export interface DetectionReport {
+  /** Conventions this document actually matched. */
+  recognised: string[]
+  /** Elections laid out, with how many options each. */
+  elections: Array<{ label: string; options: number; page: number }>
+  /** Reads like a choice, could not be structured. Needs a human. */
+  unstructured: Array<{ page: number; text: string; why: string }>
+}
+
 export interface OptionAnchor {
   page: number; x: number; y: number
   groupKey: string; option: string; isFirst: boolean
@@ -134,6 +143,14 @@ export interface AutoPlaceResult {
    * document; they simply are not in a box. Read them.
    */
   lateFeeTerms: LateFeeTerms | null
+  /**
+   * S622: what the placer RECOGNISED, and what looked like a choice it could
+   * not lay out. Without this an unfamiliar lease fails silently — boxes appear
+   * on the blanks it understood and nothing says a whole election was missed.
+   * Same principle as naming the screening fees we exclude on purpose: a gap
+   * the landlord can see is a gap they can fix.
+   */
+  detection: DetectionReport
   pageCount: number
   fields: ProposedField[]
   modelUsed: boolean
@@ -1171,6 +1188,76 @@ export function detectLateFeeTerms(pages: any[]): LateFeeTerms | null {
   return anything ? out : null
 }
 
+
+/**
+ * S622: find choice language the structural pass did NOT capture.
+ *
+ * Nic: "somebody could literally just have a word document drafted up with no
+ * numbers, no indentations... every landlord's gonna have different lease
+ * types." The recognisers here cover the conventions this engine understands.
+ * Anything that reads like an either/or and did not become an election is
+ * reported rather than dropped, so an unfamiliar format is a flagged gap
+ * instead of a silent one.
+ *
+ * Deliberately noisy in one direction only: it would rather point at a sentence
+ * that turns out to be prose than let a real election pass unmentioned.
+ */
+const CHOICE_LANGUAGE = [
+  { re: /\(\s*(?:check|select|choose|mark|initial)\s+(?:one|only one|all that apply)/i,
+    why: 'a "check one" instruction with no options we could line up beneath it' },
+  { re: /\bshall be either\b|\bis either\b|\bwhichever\b|\bone of the following\b/i,
+    why: 'either/or wording with no blanks to attach a choice to' },
+  { re: /\beither\b[^.]{0,80}\bor\b[^.]{0,80}(?:term|tenancy|option|basis)\b/i,
+    why: 'reads like a choice of terms, written as prose' },
+]
+
+function buildDetectionReport(
+  pages: any[], radios: ProposedField[], consumed: Array<{ page: number; x: number; y: number }>,
+): DetectionReport {
+  const recognised: string[] = []
+  const elections = radios
+    .filter((r) => r.fieldType === 'radio_group' && r.leaseColumn)
+    .map((r) => ({
+      label: String(r.label ?? 'Choice'),
+      options: String(r.options ?? '').split(',').filter(Boolean).length,
+      page: r.page,
+    }))
+  if (elections.length > 0) recognised.push('"(check one)" elections with underscore blanks')
+  if (radios.some((r) => r.parentKey)) recognised.push('nesting by indentation')
+  if (consumed.length > 0) recognised.push('option blanks')
+
+  // Lines already consumed as options are structured; everything else is fair
+  // game for the sweep.
+  const claimed = new Set(consumed.map((c) => `${c.page}:${Math.round(c.y / 4)}`))
+  const unstructured: DetectionReport['unstructured'] = []
+  const seen = new Set<string>()
+
+  for (const pg of pages) {
+    const lines = new Map<number, string>()
+    for (const it of (pg.items as TextItem[])) {
+      const k = Math.round(it.y)
+      lines.set(k, `${lines.get(k) ?? ''} ${it.text}`)
+    }
+    for (const [y, raw] of lines) {
+      const text = raw.replace(/\s+/g, ' ').trim()
+      if (text.length < 25) continue
+      const near = `${pg.pageNumber}:${Math.round((pg.height - y) / 4)}`
+      for (const c of CHOICE_LANGUAGE) {
+        if (!c.re.test(text)) continue
+        // Skip anything sitting where we already laid an election out.
+        if (claimed.has(near)) break
+        if (elections.some((e) => e.page === pg.pageNumber)) break
+        const key = text.slice(0, 60)
+        if (seen.has(key)) break
+        seen.add(key)
+        unstructured.push({ page: pg.pageNumber, text: text.slice(0, 220), why: c.why })
+        break
+      }
+    }
+  }
+  return { recognised, elections, unstructured }
+}
+
 function detectCheckOneRadios(pages: any[]): {
   radios: ProposedField[]
   consumed: Array<{ page: number; x: number; y: number }>
@@ -1532,6 +1619,7 @@ export async function autoPlaceFields(
     unattributedAmounts: unattributed,
     screeningFees,
     lateFeeTerms: detectLateFeeTerms(extracted.pages),
+    detection: buildDetectionReport(extracted.pages, radios, consumed),
   }
 }
 

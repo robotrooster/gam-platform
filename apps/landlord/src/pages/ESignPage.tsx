@@ -340,6 +340,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const [screeningFees, setScreeningFees] = useState<any[]>([])
   // S622: the late-fee terms the lease states in words, read from the prose.
   const [lateFeeTerms, setLateFeeTerms] = useState<any>(template.lateFeeTerms ?? null)
+  // S622: what the placer recognised, and what read like a choice it could not
+  // lay out. Advisory — not saved.
+  const [detection, setDetection] = useState<any>(null)
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
   const lastSizes = useRef<Record<string,{w:number,h:number}>>({})
@@ -461,6 +464,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         setUnattributed(Array.isArray(result?.unattributedAmounts) ? result.unattributedAmounts : [])
         setScreeningFees(Array.isArray(result?.screeningFees) ? result.screeningFees : [])
         if (result?.lateFeeTerms) setLateFeeTerms(result.lateFeeTerms)
+        setDetection(result?.detection ?? null)
         if (Array.isArray(result?.conditionalFees) && result.conditionalFees.length > 0) {
           setConditionalFees(prev => {
             const seen = new Set(prev.map((c: any) => String(c.conditionText).trim()))
@@ -632,6 +636,32 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
               Still faster than placing every box by hand, so leave this open and let it work.
             </span>
           </div>
+        </div>
+      )}
+
+      {detection?.unstructured?.length > 0 && (
+        <div style={{
+          padding:'8px 14px', background:'rgba(74,158,255,.08)',
+          borderBottom:'1px solid rgba(74,158,255,.3)', fontSize:'.72rem',
+          color:'var(--text-1)', lineHeight:1.5,
+        }}>
+          <b style={{ color:'#4a9eff' }}>Reads like a choice — check these yourself</b>
+          <span style={{ color:'var(--text-3)' }}>
+            {' '}— the layout here isn’t one this reader understands, so no boxes were
+            placed for it. If it IS a choice, add the boxes by hand and set what each
+            one sits inside. Often it’s just wording, in which case ignore it.
+          </span>
+          {detection.unstructured.map((u: any, i: number) => (
+            <div key={i} style={{ marginTop:6, display:'flex', gap:8, alignItems:'flex-start' }}>
+              <button className="btn btn-ghost btn-sm" title="Not a choice — dismiss"
+                onClick={() => setDetection((d: any) => ({ ...d, unstructured: d.unstructured.filter((_: any, j: number) => j !== i) }))}
+                style={{ padding:'0 6px', lineHeight:1.2, flexShrink:0 }}>×</button>
+              <div>
+                <b>Page {u.page}</b> <span style={{ color:'var(--text-3)' }}>— {u.why}</span>
+                <div style={{ color:'var(--text-3)', fontStyle:'italic', marginTop:1 }}>“{u.text}”</div>
+              </div>
+            </div>
+          ))}
         </div>
       )}
 
