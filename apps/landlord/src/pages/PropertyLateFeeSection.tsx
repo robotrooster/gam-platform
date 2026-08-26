@@ -250,10 +250,24 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <div>
           <span style={lbl}>Unit type</span>
-          <select className="form-select" value={unitType} onChange={e => setUnitType(e.target.value)} style={{ width: 140 }}>
+          {/* S622 (Nic): "when I click edit on any of the existing late fees, the
+              unit type all says single family home, and the real type is not
+              selectable because they've already been selected previously."
+              The filter hides every type that already HAS a policy — which,
+              while editing, includes the very row being edited. The select was
+              handed a value not in its own option list, so the browser showed
+              the first option instead, and every policy appeared to be for a
+              single family home.
+              Editing keeps its own type visible, and locked: the save is an
+              UPSERT keyed on (property, unit type), so changing it here would
+              silently write a NEW policy and strand the old one. */}
+          <select className="form-select" value={unitType} disabled={!!editing}
+            onChange={e => setUnitType(e.target.value)}
+            title={editing ? 'Editing this unit type — remove the policy to move it to another type' : undefined}
+            style={{ width: 140, opacity: editing ? 0.85 : 1 }}>
             <option value="" disabled>Select…</option>
             {Object.entries(UNIT_TYPE_LABELS)
-              .filter(([t]) => !(rows as any[]).some((o: any) => o.unitType === t))
+              .filter(([t]) => t === editing || !(rows as any[]).some((o: any) => o.unitType === t))
               .map(([t, label]) => <option key={t} value={t}>{label}</option>)}
           </select>
         </div>
