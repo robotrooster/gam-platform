@@ -1280,13 +1280,16 @@ function detectCheckOneRadios(pages: any[]): {
       // different-looking controls for one either/or choice. The control now
       // sits on the CAPTION line ("…shall be considered a: (check one)"),
       // outside the options entirely, and every option gets the same marker.
+      // S622, third attempt and Nic's answer: the box goes ON THE OPTION'S OWN
+      // BLANK. The document already has a blank per choice — that IS the
+      // checkbox — so there is nothing to invent and nowhere else to put it.
+      // Moving the group's control onto the caption line left it "in the middle
+      // of nothing"; the version before that had the first one right and only
+      // lacked a box on the second option, which is what the markers below add.
       radios.push({
-        page: caption.page,
-        // At the END of the caption text, not at the options' left margin — a
-        // box at x=43 on that line lands underneath the printed sentence and
-        // collided with the end-date field beside it.
-        x: Math.round(caption.endX + 6),
-        y: flipY(caption.H, caption.y, 12),
+        page: anchor.page,
+        x: Math.round(anchor.x),
+        y: flipY(anchor.H, anchor.y, anchor.h),
         // a radio marker is a dot on the checkbox blank — the choices are picked
         // in the signing panel, so the on-document box stays tiny (Nic S556).
         width: 14,
@@ -1318,6 +1321,7 @@ function detectCheckOneRadios(pages: any[]): {
           groupKey: key, option: o.label, isFirst: n === 0,
           endPage: end.page, endY: end.y,
         })
+        if (n === 0) return   // option one already carries the group's own box
         radios.push({
           page: o.page,
           x: Math.round(o.x),
