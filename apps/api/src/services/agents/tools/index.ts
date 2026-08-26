@@ -58,6 +58,10 @@ import { getMyInvoices } from './getMyInvoices'
 import { getPendingApplications } from './getPendingApplications'
 import { getMyPayouts } from './getMyPayouts'
 import { getBackgroundCheckStatus } from './getBackgroundCheckStatus'
+// S624: a tenant asking about their own work-trade hours is asking an
+// account-data question, and there was no tool to answer it — the agent refused
+// rather than guess, which was correct and useless.
+import { getWorkTradeStanding } from './getWorkTradeStanding'
 import { sendBulkMessage } from './sendBulkMessage'
 import { getMyBookings } from './getMyBookings'
 import { getPropertyRentRoll } from './getPropertyRentRoll'
@@ -146,6 +150,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getPendingApplications,
   getMyPayouts,
   getBackgroundCheckStatus,
+  getWorkTradeStanding,
   getMaintenanceTeam,
   getBooksSummary,
   getTenantContact,

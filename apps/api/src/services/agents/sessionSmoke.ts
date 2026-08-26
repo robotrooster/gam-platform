@@ -19,9 +19,11 @@ process.env.EMBEDDINGS_ENDPOINT ||= 'http://localhost:8081/v1'
 process.env.EMBEDDINGS_MODEL ||= 'bge-large-en-v1.5'
 
 const actor: AgentActor = {
-  userId: 'f8097f3b-53eb-47f5-b109-5cc7ebfa01ff', // alice user
+  // S624: overridable, because the hardcoded alice ids do not exist in every
+  // database and the smoke is most useful run against the REAL one.
+  userId: process.env.SMOKE_USER_ID || 'f8097f3b-53eb-47f5-b109-5cc7ebfa01ff',
   role: 'tenant',
-  profileId: '744663aa-7efd-4012-9c5b-f0018eca6a28', // alice tenant
+  profileId: process.env.SMOKE_PROFILE_ID || '744663aa-7efd-4012-9c5b-f0018eca6a28',
 }
 
 async function main() {
