@@ -238,6 +238,50 @@ lease, `deposit_already_held`, and renewals. Four tests.
 
 ---
 
+## 10a. WORK TRADE MUST BE PAID FORWARD — DESIGN AGREED, HALF BUILT
+
+Nic, S623: "When you pay rent, you pay for the month that you're going to be
+staying. So when you're working, those hours should be covering the month that
+you're gonna be staying… people aren't gonna pay the first month and then work.
+Why would they pay and then start working to build up an arrears credit for the
+following month? If they just paid, they think, oh, I'm paid. Why would I work?"
+
+He is right, and the behavioural argument settles it. TODAY the credit works the
+other way: computed AT INVOICE GENERATION from approved hours in the month
+BEFORE the due date — work in June, reduces July. That means the first month of
+every work-trade tenancy is uncovered forever, and it asks a tenant to pay
+before they have any reason to work.
+
+**THE AGREED MODEL**
+1. The invoice issues for the month as normal.
+2. It sits in a suspended state — open, not chased, no late fees — while the
+   tenant works THAT month.
+3. At month close, that month's approved hours credit that month's invoice.
+4. Any uncovered remainder carries to the next month as a line item, and the
+   next invoice states both the new month's hours owed and the hours still owed
+   from the carried balance.
+
+**BUILT SO FAR (S623):** work-trade invoices are created `late_fee_exempt`, so
+nobody is fined while doing exactly what the agreement asks. Safe on its own and
+strictly an improvement in the right direction.
+
+**NOT BUILT — the actual model change.** The credit window in
+`loadWorkTradeCreditContext` is one line (`due.minus({ months: 1 })`), but moving
+it to the invoice's OWN month means the credit can no longer be computed at
+generation — September's hours do not exist on September 1st. It has to become a
+MONTH-CLOSE SETTLEMENT job: sum that month's approved hours, credit that month's
+invoice, leave the remainder open. The carry-forward then falls out of the
+arrears machinery built earlier this session (outside FIFO, partially payable).
+
+Deliberately not rushed in overnight before a launch day — it changes when money
+is credited, and it needs its own tests.
+
+**FOR NIC'S RV WORK-TRADE TEST TOMORROW:** the move-in invoice still bills the
+full first month plus deposit and applies no work-trade credit. Expect it. Either
+waive it with a tenant credit or let it stand; do not be surprised by it.
+
+---
+
 ## 11. COMMANDS
 
 ```

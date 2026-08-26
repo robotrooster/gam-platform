@@ -671,8 +671,22 @@ async function runGeneration(
              landlord_id, tenant_id, lease_id, unit_id,
              invoice_number, due_date,
              subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
-             work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id,
+             late_fee_exempt
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             -- S623 (Nic): a work-trade tenant must not be fined while they are
+             -- working off the month. "Why would they pay and then start working
+             -- to build up an arrears credit for the following month?" Rent is
+             -- paid FORWARD, so the work that pays for a month happens DURING
+             -- that month — which means the invoice is necessarily open while
+             -- the hours are being earned. Fining that is fining someone for
+             -- doing exactly what the agreement asks.
+             --
+             -- This is half of the change. The other half — crediting a month
+             -- from ITS OWN hours at month close, instead of from the previous
+             -- month at generation — is a real billing change and is written up
+             -- in the handoff rather than rushed in overnight.
+             $13::uuid IS NOT NULL)
            ON CONFLICT (lease_id, due_date) DO NOTHING
            RETURNING id`,
           [
