@@ -109,14 +109,25 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'tenant', id: 'maintenance-then-accept',
-    behaviour: 'ACCEPTS the offer the agent made — the commonest two-turn shape there is',
+    behaviour: 'CONFIRMS something already done — the agent filed it on turn one, so turn two must not file it again',
     opener: 'my kitchen sink has been leaking since yesterday',
-    followUp: 'yes please, go ahead and put that in for me',
-    // The offer must become a real row. "I'll file that" with nothing behind
-    // it is the failure that put an empty complaints table in front of a
-    // tenant who thought they had filed one.
+    // S624 (Nic): the old follow-up was "yes please, go ahead and put that in
+    // for me", written as though the agent had OFFERED. It had already FILED —
+    // so the case was unrealistic and the repeat it provoked was partly the
+    // test's fault. What IS real is the tenant confirming, and the agent filing
+    // a SECOND request off the back of it. That duplicate is the defect worth
+    // holding: a real row on the landlord's board and a maintenance history
+    // that disagrees with itself.
+    followUp: 'ok great, thanks — so that is definitely logged?',
+    // The offer must become a real row on turn ONE. "I'll file that" with
+    // nothing behind it is the failure that put an empty complaints table in
+    // front of a tenant who thought they had filed one.
     expectTool: 'file_maintenance_request',
-    mustNotContain: ["I'll file", "I'll get that", "I'll put that in", "I'll submit"],
+    mustNotContain: [
+      "I'll file", "I'll get that", "I'll put that in", "I'll submit",
+      // Filing it twice, or announcing a second filing.
+      "I've filed another", "filed a second", "submitted another",
+    ],
   },
   {
     audience: 'tenant', id: 'deposit-then-correction',
@@ -229,13 +240,23 @@ export const VISITOR_CONVERSATIONS: Conversation[] = [
   },
   {
     audience: 'visitor', id: 'quote-then-book',
-    behaviour: 'says yes to booking — must confirm details or collect what it needs, never book silently',
+    behaviour: 'gives the month when asked, then says yes — the agent must not have told them their dates were in the past',
     opener: 'do you have a pull through site available the 15th to the 20th?',
-    followUp: "yeah let's go ahead and book that",
-    // Confirm-first is REQUIRED here: read back type, dates, total and deposit
-    // and get an explicit yes before create_booking_checkout. Asking for the
-    // name and email is also correct. Booking without either is the failure.
-    mustNotContain: ['card number', 'credit card', 'enter your card', "I've charged"],
+    // S624 (Nic): the old follow-up was "yeah let's go ahead and book that",
+    // said to an agent that had given them NO information — nobody does that,
+    // and that bad follow-up is what provoked the verbatim repeat. Rewritten to
+    // the real exchange: a bare day number is ambiguous, the agent should ASK
+    // WHICH MONTH rather than declare the dates past, and the customer answers.
+    followUp: 'september — the 15th through the 20th',
+    // Confirm-first is REQUIRED: read back type, dates, total and deposit and
+    // get an explicit yes before create_booking_checkout. Asking for the name
+    // and email is also correct. Booking without either is the failure.
+    mustNotContain: [
+      'card number', 'credit card', 'enter your card', "I've charged",
+      // Never tell a customer trying to give you money that their dates have
+      // already happened — ask which month instead.
+      'in the past', 'already passed', 'past date',
+    ],
   },
   {
     audience: 'visitor', id: 'rates-then-monthly',

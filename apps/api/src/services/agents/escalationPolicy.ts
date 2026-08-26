@@ -110,7 +110,17 @@ export function needsARealPerson(message: string): boolean {
  */
 export function stripPromiseOfAPerson(reply: string): string {
   if (!reply) return reply
-  const kept = (reply.match(/[^.!?\n]+[.!?]*/g) ?? [reply]).filter((sentence) => {
+  // S624 — KEEP THE WHITESPACE. The pattern excluded \n from every match and the
+  // pieces were rejoined with '', so EVERY newline in the reply was destroyed —
+  // a rate list ran straight into the sentence after it ("$48 per nightRemember,
+  // the weekly rate..."). It read as a cosmetic quirk of one booking reply and
+  // was actually happening to every reply this function touched, which is any
+  // reply that promised a person without being entitled to.
+  //
+  // Trailing whitespace now rides along with its sentence, so join('') puts the
+  // structure back exactly as the model wrote it, and a REMOVED sentence takes
+  // its own separator with it rather than leaving a hole.
+  const kept = (reply.match(/[^.!?\n]+[.!?]*\s*/g) ?? [reply]).filter((sentence) => {
     const promises =
       /\bescalat\w+/i.test(sentence) ||
       (HANDOFF_VERB.test(sentence) && SUPPORT_TARGET.test(sentence)) ||
