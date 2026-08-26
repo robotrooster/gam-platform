@@ -73,7 +73,14 @@ const ROLE_COLORS: Record<string,string> = {
 }
 
 // ── FIELD ITEM ON CANVAS ──────────────────────────────────────
-function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scale, parentLabel }: any) {
+// S622 (Nic): "how would a user manually doing it make it nested... how do you
+// know what subordinates inside of another one without any sort of visual
+// indicator?" Nesting was invisible on the canvas — you had to select a field
+// and read a dropdown. A ring per depth makes the structure legible at a glance:
+// no ring is top level, blue sits inside one option, purple inside that.
+const DEPTH_RING = ['', '#4a9eff', '#a78bfa', '#f472b6']
+
+function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scale, parentLabel, depth = 0 }: any) {
   const ft = FIELD_TYPES.find(f => f.type === field.fieldType) || FIELD_TYPES[0]
   const color = ROLE_COLORS[field.signerRole] || '#888'
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
@@ -172,6 +179,9 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
       <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
+        // Depth ring — drawn outside the box so it never eats the field's own
+        // colour, which still says WHO fills it.
+        boxShadow: depth > 0 ? `0 0 0 ${Math.max(1, Math.round(2 * scale))}px ${DEPTH_RING[Math.min(depth, 3)]}` : undefined,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
         cursor: locked ? 'not-allowed' : 'move', userSelect:'none', boxSizing:'border-box' as const,
@@ -509,6 +519,19 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     return Object.entries(byCol).filter(([, ls]) => ls.length > 1)
   })()
 
+  // How deep a field sits: 0 top level, 1 inside an option, 2 inside that.
+  // Walks the parent chain with a bound, so a cycle from hand-editing cannot
+  // hang the editor.
+  const depthOf = (f: any): number => {
+    let d = 0, cur = f, guard = 0
+    while (cur?.parentFieldId && guard++ < 8) {
+      cur = fields.find((x: any) => x.id === cur.parentFieldId)
+      if (!cur) break
+      d++
+    }
+    return d
+  }
+
   const pageFields = fields.filter(f => f.page === currentPage)
   const sel = getSelected()
 
@@ -686,6 +709,22 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
             ))}
           </div>
 
+            {/* S622: the rings need to say what they mean, or they are just
+                decoration. Also points at HOW to nest by hand, which was only
+                discoverable by selecting a field and finding the dropdown. */}
+            <div style={{ padding:'8px 10px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.7rem', color:'var(--text-3)', lineHeight:1.6, marginBottom:8 }}>
+              <div style={{ fontWeight:700, color:'var(--text-2)', marginBottom:4 }}>Nesting</div>
+              <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                <span style={{ width:11, height:11, borderRadius:3, border:'2px solid var(--text-3)' }} /> top level
+              </div>
+              <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                <span style={{ width:11, height:11, borderRadius:3, border:'2px solid var(--text-3)', boxShadow:'0 0 0 2px #4a9eff' }} /> inside an option
+              </div>
+              <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                <span style={{ width:11, height:11, borderRadius:3, border:'2px solid var(--text-3)', boxShadow:'0 0 0 2px #a78bfa' }} /> inside that one
+              </div>
+              <div style={{ marginTop:5 }}>Select a field to set or change what it sits inside.</div>
+            </div>
           {activeTool && (
             <div style={{ padding:'8px 10px', background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.2)', borderRadius:8, fontSize:'.72rem', color:'var(--gold)', lineHeight:1.5 }}>
               Click on the document to place a <b>{FIELD_TYPES.find(f => f.type === activeTool)?.label || humanize(activeTool)}</b> field for <b>{humanize(activeRole)}</b>.
@@ -841,6 +880,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
               style={{ position:'absolute', inset:0, cursor: activeTool ? 'crosshair' : 'default' }}>
               {pageFields.map(f => (
                 <FieldItem key={f.id} field={f} selected={selectedField===f.id}
+                  depth={depthOf(f)}
                   parentLabel={f.parentFieldId ? (fields.find((x: any) => x.id === f.parentFieldId)?.label ?? null) : null}
                   onSelect={setSelectedField} onMove={moveField}
                   onResize={resizeField}
