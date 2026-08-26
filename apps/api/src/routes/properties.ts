@@ -24,6 +24,7 @@ import {
   OCCUPANCY_MODES,
   LISTING_MIN_PHOTOS_BY_UNIT_TYPE,
   LISTING_MIN_PHOTOS_DEFAULT,
+  timezoneForState,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -100,7 +101,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         // volume discounts must never reach a tenant's bill. Accepted for
         // backward compatibility with older clients, then ignored below.
         platformFeePayer:   z.enum(FEE_PAYER_VALUES).default('landlord'),
-        // S607 (Nic): who reimburses the $10 cash/check/money-order fee.
+        // S607 (Nic): who reimburses the cash/check/money-order fee.
         // Defaults to the tenant — a landlord who has not opted in has not
         // agreed to absorb anything.
         manualFeePayer:     z.enum(FEE_PAYER_VALUES).default('tenant'),
@@ -207,6 +208,20 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       throw new AppError(403, 'You are not a member of that entity')
     }
 
+    // S624: the property's TIME ZONE, from its state.
+    //
+    // Every property used to take the column default `America/Phoenix` — right
+    // for the first ones, three hours wrong for the first out-of-state signup.
+    // The late-fee engine runs on `NOW() AT TIME ZONE p.timezone`.
+    //
+    // ONE ZONE PER STATE (Nic S624). A ZIP-level version of this existed for
+    // about an hour and was cut: grace periods are measured in days, so an hour
+    // of drift only changes an outcome for someone paying within sixty minutes
+    // of local midnight on the last day of grace. Not worth a fifteen-state
+    // table that is wrong at the edges anyway. A landlord in the minority half
+    // of a split state sets it themselves.
+    const timezone = timezoneForState(body.state)
+
     await client.query('BEGIN')
 
     // Property INSERT — owner_user_id + managed_by_user_id default to the
@@ -217,15 +232,17 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       INSERT INTO properties
         (landlord_id, name, street1, street2, city, state, zip, type, unit_types,
          requires_booking_acknowledgment, operator_owns_land,
-         owner_user_id, managed_by_user_id)
+         owner_user_id, managed_by_user_id, timezone, timezone_source)
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
          (SELECT user_id FROM landlords WHERE id=$1),
-         (SELECT user_id FROM landlords WHERE id=$1))
+         (SELECT user_id FROM landlords WHERE id=$1),
+         $12,'derived')
       RETURNING *`,
       [targetLandlordId, body.name, body.street1, body.street2 ?? null,
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
-       body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true])
+       body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true,
+       timezone])
     const prop = propRes.rows[0]
 
     // S579: open the property's onboarding window. While it's open the landlord

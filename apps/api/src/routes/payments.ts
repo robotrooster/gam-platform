@@ -919,7 +919,7 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 // holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
 // so the $10 fee below stays GAM revenue (same as RETURNFEE).
 //
-// Each manual payment carries a flat $10 fee (a tenant-owed 'fee' row,
+// Each manual payment carries a flat fee (a tenant-owed 'fee' row,
 // entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the
 // lease — waived to give them time to onboard ACH. The tenant portal discloses
 // the future $10 charge.
@@ -971,149 +971,23 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
     }
 
-    // Waiver (Nic, S607 — supersedes the S570 two-part rule): the $10 manual fee
-    // is waived when this is the tenant's FIRST satisfied rent on the lease.
-    // Because this code only runs inside record-manual, that is exactly Nic's
-    // rule: "only the first payment ran through the platform, and only if it was
-    // cash on that first payment. If they pay card the first time, they lose that
-    // freebie." A tenant who paid an earlier invoice by card has priorPaid > 0 and
-    // gets no waiver on a later manual payment.
+    // S624: the waiver rules, the fee routing and the settle itself now live in
+    // services/manualPaymentSettle.ts, because the BANK-DEPOSIT match path has to
+    // settle a payment identically. Every rule that used to be inline here moved
+    // there verbatim, comments included — see that file's header for why a second
+    // copy was not acceptable.
     //
-    // THE 21-DAY PROPERTY-CREATION GATE IS GONE (Nic): "the anchor is wrong."
-    // It counted from properties.created_at, so it burned down during the
-    // landlord's SETUP — meters, units, templates, invites — and tenants
-    // inherited whatever slice was left. At Oak Park that was four days. The
-    // waiver is meant to give each tenant one gentle first payment, not to reward
-    // whoever happened to pay while the park was still being configured.
-    //
-    // Deliberately NO date gate of any kind. Nic: "I like not gating it because I
-    // specifically have people at Oak Park that come in on the fifth because of
-    // the grace period." A tenant paying September rent on the 10th still gets
-    // their one free manual payment — they simply owe whatever LATE FEES have
-    // accrued by then, which is a separate charge on a separate clock.
-    //
-    // Rent rows carry a lease_id in production; fall back to tenant_id if absent.
-    const scopeCol = pmt.lease_id ? 'lease_id' : 'tenant_id'
-    const scopeVal = pmt.lease_id ?? pmt.tenant_id
-    const priorPaid = (await client.query<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM payments
-        WHERE ${scopeCol} = $1 AND type = 'rent'
-          AND status IN ('settled', 'paid_via_deposit')
-          AND id <> $2`,
-      [scopeVal, pmt.id])).rows[0]
-    // S607 (Nic): exactly ONE thing makes this fee free — the tenant's FIRST
-    // rent payment, paid this way. Nothing else.
-    //
-    //   "It's only free the first payment and only if they do cash. If they do
-    //    any old school payments any other months, that's not free."
-    //
-    // The landlord's toggle does NOT waive the fee, it MOVES it. An earlier cut
-    // of this treated 'landlord covers' as 'nobody pays', which quietly billed
-    // GAM's $10 to no one at all. Nic: "if they use cash the second month and the
-    // landlord covers, that means the LANDLORD gets charged."
+    // settledAt is null: a landlord recording a payment is recording it as they
+    // enter it, so it settles NOW. The deposit-match path passes the date the
+    // money actually moved instead.
+    const { settleManualRentPayment } = await import('../services/manualPaymentSettle')
+    const { feeWaived, feeBilledTo, feePaymentId, firstPayment } = await settleManualRentPayment(client, {
+      payment: pmt,
+      method: body.method,
+      settledAt: null,
+      reference: body.reference ?? null,
+    })
     const landlordCovers = pmt.manual_fee_payer === 'landlord'
-    const firstPayment = parseInt(priorPaid.n, 10) === 0
-
-    // S620 (Nic): the free first payment exists to help a LANDLORD MIGRATE the
-    // tenants they already have — not as a perk for everyone who ever signs up.
-    //
-    //   "It's not a thing for other tenants that just sign up later on and
-    //    exist. It's to help the onboarding flow for landlords... anybody that
-    //    does the background check workflow through Checkr, they do not get
-    //    that protection window."
-    //
-    // The background check IS the discriminator, and it beats a date window:
-    // an existing tenant being carried over is never screened (they already
-    // live there), while after the 21-day onboarding window the ONLY way to
-    // add a tenant is through screening. So the status encodes the window for
-    // free and cannot drift out of sync with it.
-    //
-    // 'not_started' and 'waived' mean nobody ran a check — a migrated tenant.
-    // Anything else means they came through the screening flow and pay the $10.
-    const screened = !['not_started', 'waived', null, undefined]
-      .includes(pmt.background_check_status as any)
-    const feeWaived = firstPayment && !screened       // free — and only this
-    const feeToLandlord = !feeWaived && landlordCovers // moved, not erased
-    const feeToTenant  = !feeWaived && !landlordCovers
-
-    // Satisfy the rent obligation off-platform. platform_held stays FALSE.
-    const refNote = body.reference ? ` (ref ${body.reference})` : ''
-    await client.query(
-      `UPDATE payments
-          SET status = 'settled', settled_at = NOW(), manual_method = $2,
-              platform_held = FALSE,
-              notes = COALESCE(notes || ' — ', '') || $3
-        WHERE id = $1`,
-      [pmt.id, body.method, `Recorded as manual ${body.method} payment${refNote}`])
-
-    // The flat manual-payment fee — GAM revenue either way. Billed to the tenant
-    // as an ordinary charge, or posted straight to GAM's revenue ledger when the
-    // landlord absorbs it (their payouts net it out, the same route the
-    // landlord-borne platform fee takes).
-    let feePaymentId: string | null = null
-    if (feeToLandlord) {
-      const prev = await client.query<{ balance_after: string }>(
-        `SELECT balance_after FROM platform_revenue_ledger
-          ORDER BY created_at DESC, id DESC LIMIT 1`)
-      const prevBal = prev.rowCount ? parseFloat(prev.rows[0].balance_after) : 0
-      // Idempotent on (reference_id, reference_type, type) — a retried recording
-      // cannot post the fee twice.
-      await client.query(
-        `INSERT INTO platform_revenue_ledger
-           (type, amount, balance_after, reference_id, reference_type, property_id, notes)
-         SELECT 'manual_withdrawal_fee', $1, $2, $3, 'manual_payment_fee', u.property_id, $4
-           FROM units u WHERE u.id = $5
-         ON CONFLICT (reference_id, reference_type, type) WHERE reference_id IS NOT NULL
-         DO NOTHING`,
-        [MANUAL_PAYMENT_FEE.toFixed(2),
-         (Math.round((prevBal + MANUAL_PAYMENT_FEE) * 100) / 100).toFixed(2),
-         pmt.id,
-         `$${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee absorbed by the landlord — ${body.method} rent payment due ${pmt.due_date}`,
-         pmt.unit_id])
-
-      // S620: and RECORD THAT THE LANDLORD OWES IT. The line above books the
-      // fee as GAM revenue; nothing recorded that GAM had not actually been
-      // paid. A cash payment moves no money through GAM, so there was nothing
-      // to net it out of and no trace it was owed — GAM was booking income it
-      // had no mechanism to collect. This charge is what the next disbursement
-      // nets against.
-      const propRow = await client.query<{ property_id: string }>(
-        `SELECT property_id FROM units WHERE id = $1`, [pmt.unit_id])
-      await chargeLandlord(client, {
-        landlordId: pmt.landlord_id,
-        propertyId: propRow.rows[0]?.property_id ?? null,
-        kind: 'manual_payment_fee',
-        amount: MANUAL_PAYMENT_FEE,
-        sourceType: 'manual_payment_fee',
-        sourceId: pmt.id,
-        notes: `${body.method} rent payment due ${pmt.due_date} — fee absorbed by the landlord`,
-      })
-    }
-    if (feeToTenant) {
-      feePaymentId = (await client.query<{ id: string }>(
-        // NO invoice_id, DELIBERATELY. S620 (Nic): "let's make sure that one
-        // little fee doesn't start accruing extra late fees" — it is already a
-        // fee, and a money order made out for the wrong amount can leave it
-        // sitting unpaid for days or into the next cycle.
-        //
-        // The late-fee engine works invoice by invoice, so a row belonging to
-        // no invoice is invisible to it and CANNOT grow. That matters most on
-        // leases whose late fee accrues DAILY against the outstanding balance
-        // rather than as a flat percentage — a percentage would add pennies to
-        // this, a daily accrual would compound on it indefinitely.
-        //
-        // DO NOT attach these to an invoice. The protection is the absence.
-        `INSERT INTO payments
-           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-            entry_description, due_date, notes, revenue_owner)
-         -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share. Nic confirmed S609 this one stays
-         -- GAM's: it covers manual reconciliation and both Terms documents say so.
-         VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'MANUALPAY', CURRENT_DATE, $6, 'gam')
-         RETURNING id`,
-        [pmt.unit_id, pmt.lease_id, pmt.tenant_id, pmt.landlord_id,
-         MANUAL_PAYMENT_FEE.toFixed(2),
-         `$${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee — ${body.method} rent payment due ${pmt.due_date}`])).rows[0].id
-    }
 
     await client.query('COMMIT')
     res.json({
@@ -1133,7 +1007,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         // the caller must be able to tell them apart — "your first one is free"
         // and "your landlord covers this" are different things to say to a
         // tenant, and only one of them stops being true next month.
-        firstPayment: parseInt(priorPaid.n, 10) === 0,
+        firstPayment,
         coveredByLandlord: landlordCovers,
       },
     })

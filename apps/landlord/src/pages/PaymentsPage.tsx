@@ -55,7 +55,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
 
   // S562: record a rent charge paid off-platform (cash/check/money order). GAM
   // moves no money — the row just flips to settled. The tenant's first rent
-  // payment is fee-free; subsequent ones bill a $10 manual-payment fee (the
+  // payment is fee-free; subsequent ones bill a manual-payment fee (the
   // server decides + returns feeWaived). Only open, unpaid RENT rows qualify.
   const isManualRecordable = canRecord && p.type === 'rent' &&
     (p.status === 'pending' || p.status === 'failed')

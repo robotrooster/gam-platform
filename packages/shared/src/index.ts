@@ -4452,7 +4452,7 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
 // S561: 'RETURNFEE' (9 chars) added for the pass-through Stripe reversal fee
 // ($4 ACH / $15 card) billed to the tenant on a post-settlement reversal.
-// S562: 'MANUALPAY' (9 chars) for the $10 manual-payment fee; 'FLEXPAY' added
+// S562: 'MANUALPAY' (9 chars) for the manual-payment fee; 'FLEXPAY' added
 // to close a long-standing drift (the DB CHECK always carried it).
 // S583: 'FCPAYDOWN' — a customer FlexCharge revolving-balance pay-down.
 // S603: 'DECLINEFEE' (10 chars — the NACHA field limit exactly) for the flat
@@ -4485,7 +4485,27 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   check: 'Check (incl. cashier\'s or certified)',
   money_order: 'Money order',
 }
-export const MANUAL_PAYMENT_FEE = 10.00
+// S624 (Nic): DROPPED FROM $10 TO $6 — the same flat figure as ACH.
+//
+// The $10 priced MANUAL RECONCILIATION: someone had to find the deposit, work
+// out whose it was, date it, waive the late fee that accrued while it was in
+// transit, and unwind the lot if a check bounced. The bank-deposit matcher
+// (services/bankDepositMatch.ts + bankDepositConfirm.ts) deletes that work — the
+// feed finds the deposit, the bank's own posted date settles it, and a tenant
+// declaration identifies the payer. The cost the premium priced is largely gone,
+// so the premium goes with it.
+//
+// KNOWN TRADE, MADE DELIBERATELY: at $6 = $6 there is no longer a PRICE signal
+// pushing tenants toward ACH, and ACH volume is the path to the ODFI
+// partnership. Nic accepted that in exchange for the sale — "it costs the same
+// either way" ends the fee argument with a landlord who does not want to strain
+// a tenant relationship, and it stops cash-paying tenants (often unbanked, often
+// in low-rent parks where $10 is 4% of the rent) from carrying a surcharge for a
+// payment method they may have no alternative to.
+//
+// THE ACH FEE ITSELF IS UNTOUCHABLE (Nic, S624) — this moved toward ACH, never
+// the other way. See PROCESSING_FEES.ACH_FLAT.
+export const MANUAL_PAYMENT_FEE = 6.00
 
 /** S607 (Nic): the ONE description of what the manual-payment fee covers, so no
  *  surface can quietly disagree with another. Category first, examples second,
@@ -4518,6 +4538,25 @@ export const CARD_DECLINE_FEE = 1.00
 // FIRST rent charge only, lease_source='imported' only, within
 // PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding. Not a general cash method —
 // it is its own `payments.manual_method` value, kept out of MANUAL_PAYMENT_METHODS.
+/**
+ * S624 — the ONBOARDING MIGRATION WINDOW, in days.
+ *
+ * How long after joining a landlord may paper tenancies that ALREADY EXIST
+ * without each tenant passing a background check. Business Terms §9.1/§9.2 and
+ * Consumer Terms §7.1/§7.2 state this figure; changing it here without
+ * republishing them makes GAM's code and its published terms disagree.
+ *
+ * Raised 21 → 28 at S623 (Nic: "we never know when people are actually gonna get
+ * around to finalizing all their details"). Measured from each landlord's own
+ * join date, so no landlord's window moves when another's does.
+ *
+ * IT LIVES HERE BECAUSE IT WAS HARDCODED IN THREE PLACES AND MISSING FROM A
+ * FOURTH — the two backfill migrations said 28 days, the signup path set nothing
+ * at all, and the gate read a NULL as "open forever". A landlord who signed up
+ * after the backfill therefore had screening silently disabled for life.
+ */
+export const MIGRATION_WINDOW_DAYS = 28
+
 export const PRIOR_ARRANGEMENT_METHOD = 'prior_arrangement' as const
 export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21
 
@@ -4747,6 +4786,9 @@ export function formatInvoiceNumber(year: number, sequence: number): string {
 
 export * from './lateFees';
 export * from './autopaySchedule';
+// S624: property timezone from state + ZIP. Fifteen states split, so state alone
+// is wrong for all of them — and an unresolvable ZIP is FLAGGED, not guessed.
+export * from './propertyTimezone';
 
 // ============================================================================
 // Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)

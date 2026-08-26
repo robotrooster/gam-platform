@@ -242,7 +242,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       cardFeePayer: 'tenant' as FeePayer,
       platformFeePayer:
         (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
-      // S607 (Nic): who reimburses the $10 cash/check/money-order fee.
+      // S607 (Nic): who reimburses the cash/check/money-order fee.
       manualFeePayer:
         (property?.allocationRule?.manualFeePayer || 'tenant') as FeePayer,
       rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',

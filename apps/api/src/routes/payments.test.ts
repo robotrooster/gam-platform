@@ -59,6 +59,10 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
+// S624: assert the FEE, not a figure — the manual fee moved $10 → $6 and every
+// literal here had to be chased down. Bind to the constant and it never happens
+// again. Same rule the fee-label copy follows (PROCESSING_FEES → derived labels).
+import { MANUAL_PAYMENT_FEE, PROCESSING_FEES } from '@gam/shared'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedUserBankAccount,
@@ -693,7 +697,7 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(fees.length).toBe(0)
   })
 
-  it('second rent payment → $10 MANUALPAY fee row created (GAM revenue)', async () => {
+  it('second rent payment → MANUALPAY fee row created (GAM revenue)', async () => {
     const f = await seed()
     // prior satisfied rent = the tenant already made their first payment
     await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
@@ -703,13 +707,13 @@ describe('POST /api/payments/:id/record-manual', () => {
       .send({ method: 'cash' })
     expect(res.status).toBe(200)
     expect(res.body.data.feeWaived).toBe(false)
-    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
     expect(res.body.data.feePaymentId).toBeTruthy()
     const { rows: [fee] } = await db.query<any>(
       `SELECT type, amount::float AS amount, status, entry_description FROM payments WHERE id=$1`,
       [res.body.data.feePaymentId])
     expect(fee.type).toBe('fee')
-    expect(fee.amount).toBe(10)
+    expect(fee.amount).toBe(MANUAL_PAYMENT_FEE)
     expect(fee.status).toBe('pending')
     expect(fee.entry_description).toBe('MANUALPAY')
   })
@@ -758,7 +762,7 @@ describe('POST /api/payments/:id/record-manual', () => {
       .send({ method: 'cash' })
     expect(res.status).toBe(200)
     expect(res.body.data.feeWaived).toBe(false)
-    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
   })
 
   it('non-rent charge → 409', async () => {
@@ -919,7 +923,7 @@ describe('POST /payments/:id/record-manual — landlord covers the manual fee', 
       `SELECT amount::text FROM platform_revenue_ledger
         WHERE reference_type='manual_payment_fee'`)
     expect(rev.rows).toHaveLength(1)
-    expect(Number(rev.rows[0].amount)).toBeCloseTo(10, 2)
+    expect(Number(rev.rows[0].amount)).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
   })
 
   it('defaults to billing the tenant when the property says nothing', async () => {
@@ -933,7 +937,7 @@ describe('POST /payments/:id/record-manual — landlord covers the manual fee', 
       .send({ method: 'check' })
     expect(res.status).toBe(200)
     expect(res.body.data.coveredByLandlord).toBe(false)
-    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
     expect(res.body.data.feePaymentId).toBeTruthy()
   })
 
@@ -953,10 +957,14 @@ describe('POST /payments/:id/record-manual — landlord covers the manual fee', 
 // rent. ACH makes that $456. $450 with a debit card is $466.30. $450 with cash
 // is $460. That way they see all the avenues and the price at the point the
 // invoice comes out."
+//
+// S624: the cash figure in that quote is now $456, not $460 — the manual fee
+// dropped to match ACH exactly. Nic's words are left as he said them; the
+// assertions below are bound to the constants, so they follow the price.
 describe('GET /payments/balance-context — per-method price breakdown', () => {
   it('prices bank, card and cash for the outstanding balance', async () => {
     const f = await seed()
-    // Burn the free first payment so the cash row reflects the real $10.
+    // Burn the free first payment so the cash row reflects the real fee.
     const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
     await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 450 })
@@ -966,9 +974,13 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
     expect(res.status).toBe(200)
     const lease = res.body.data.leases[0]
     const by = Object.fromEntries(lease.methodCosts.map((m: any) => [m.method, m]))
-    expect(by.ach.total).toBeCloseTo(456, 2)
+    expect(by.ach.total).toBeCloseTo(450 + PROCESSING_FEES.ACH_FLAT, 2)
     expect(by.card.total).toBeCloseTo(466.30, 2)
-    expect(by.manual.total).toBeCloseTo(460, 2)
+    // S624: cash now costs the tenant EXACTLY what ACH does. This assertion is
+    // the whole repricing in one line — if it ever drifts apart again, the
+    // "it costs the same either way" promise on the invoice has quietly broken.
+    expect(by.manual.total).toBeCloseTo(450 + MANUAL_PAYMENT_FEE, 2)
+    expect(by.manual.total).toBeCloseTo(by.ach.total, 2)
   })
 
   it('shows cash at no extra cost while the first payment is still free', async () => {
@@ -1001,9 +1013,9 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
     const lease = res.body.data.leases[0]
     expect(lease.manualFeeCoveredByLandlord).toBe(true)
-    expect(lease.manualFeeAbsorbed).toBeCloseTo(10, 2)
+    expect(lease.manualFeeAbsorbed).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
     const manual = lease.methodCosts.find((m: any) => m.method === 'manual')
-    expect(manual.total).toBeCloseTo(450, 2)   // $450, not $460
+    expect(manual.total).toBeCloseTo(450, 2)   // landlord covers it — no fee at all
   })
 })
 
@@ -1036,7 +1048,7 @@ describe('POST /payments/:id/record-manual — the free first payment is spent o
       .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
     expect(r2.body.data.firstPayment).toBe(false)
     expect(r2.body.data.coveredByLandlord).toBe(false)
-    expect(r2.body.data.feeAmount).toBe(10)
+    expect(r2.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
     expect(r2.body.data.feePaymentId).toBeTruthy()
   })
 
@@ -1051,7 +1063,8 @@ describe('POST /payments/:id/record-manual — the free first payment is spent o
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
     const lease = res.body.data.leases[0]
     expect(lease.manualFeeFirstFree).toBe(false)
-    expect(lease.methodCosts.find((m: any) => m.method === 'manual').total).toBeCloseTo(460, 2)
+    expect(lease.methodCosts.find((m: any) => m.method === 'manual').total)
+      .toBeCloseTo(450 + MANUAL_PAYMENT_FEE, 2)
   })
 })
 
@@ -1088,7 +1101,7 @@ describe('POST /payments/:id/record-manual — landlord-covered fee still reache
     const rev = await db.query<{ amount: string }>(
       `SELECT amount::text FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
     expect(rev.rows).toHaveLength(1)
-    expect(Number(rev.rows[0].amount)).toBeCloseTo(10, 2)
+    expect(Number(rev.rows[0].amount)).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
   })
 
   it('re-recording the same payment cannot post the fee twice', async () => {
@@ -1133,7 +1146,7 @@ describe('GET /payments/absorbed-manual-fees', () => {
     const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.total).toBeCloseTo(10, 2)
+    expect(res.body.data.total).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
     expect(res.body.data.count).toBe(1)
     // NOTE: buildApp() mounts the router WITHOUT index.ts's camelize middleware,
     // so DB-derived columns arrive snake_case here. In production the response is

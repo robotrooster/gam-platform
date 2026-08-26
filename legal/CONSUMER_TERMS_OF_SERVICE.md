@@ -88,7 +88,7 @@ If you enroll in FlexDeposit, the FlexDeposit terms (Section 9.1) govern the ins
 
 ### 5.3 Electronic Payments and Recorded Off-Platform Payments
 
-The Platform processes electronic payments (ACH and card). If you pay your Landlord off-platform — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — your Landlord or their staff can **record that payment** on the Platform so your balance reflects it. Recording an off-platform payment carries a **$10.00 manual-payment fee.**
+The Platform processes electronic payments (ACH and card). If you pay your Landlord off-platform — any payment handed to the office instead of made in the app, including cash, a personal, cashier's or certified check, a money order, or a bank draft — your Landlord or their staff can **record that payment** on the Platform so your balance reflects it. Recording an off-platform payment carries a **$6.00 manual-payment fee** — the same flat figure as the ACH payment fee, so paying in cash, by check or by money order never costs you more than paying through the app.
 
 **When the fee is waived.** The fee is waived on **your first rent payment on your lease, and only if that first payment is an off-platform payment.** If your first rent payment is made electronically (ACH or card), the waiver is used up and does not carry forward — later off-platform payments are charged the fee. The waiver does not depend on when you joined or how long the property has been on the Platform, and paying after your rent due date does not forfeit it (late fees under your lease are separate and still apply).
 

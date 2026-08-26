@@ -1,5 +1,5 @@
 /**
- * S620: the $10 manual-payment fee — who pays it, and what it must never do.
+ * S620: the manual-payment fee — who pays it, and what it must never do.
  *
  * Two rules from Nic, both easy to undo by accident:
  *
@@ -18,7 +18,7 @@
 import { describe, it, expect } from 'vitest'
 import { query } from '../db'
 
-describe('the $10 manual-payment fee never grows', () => {
+describe('the manual-payment fee never grows', () => {
   it('is created with no invoice, which is what keeps the late-fee engine off it', async () => {
     // The engine selects per invoice_id. A row with none is unreachable by it.
     // If someone ever attaches these to an invoice, this fails and says why.

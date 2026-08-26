@@ -44,9 +44,12 @@ describe('paymentMethodCosts', () => {
     expect(waived.fee).toBe(0)
     expect(waived.total).toBeCloseTo(450, 2)
 
-    const charged = paymentMethodCosts(rent, { manualFee: 10 })[2]
-    expect(charged.fee).toBeCloseTo(10, 2)
-    expect(charged.total).toBeCloseTo(460, 2)
+    // Deliberately NOT MANUAL_PAYMENT_FEE. The point of this test is that the
+    // function uses whatever it is handed and never reaches for the constant
+    // itself — so the figure here has to be one the constant has never been.
+    const charged = paymentMethodCosts(rent, { manualFee: 12.34 })[2]
+    expect(charged.fee).toBeCloseTo(12.34, 2)
+    expect(charged.total).toBeCloseTo(462.34, 2)
   })
 
   it('rounds to the cent so the quote is payable as shown', () => {
