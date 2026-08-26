@@ -1265,15 +1265,25 @@ function detectCheckOneRadios(pages: any[]): {
 
     const emit = (
       group: Opt[], parentKey: string | null, parentOption: string | null,
+      caption: { page: number; H: number; y: number },
     ): string => {
       const joined = group.map((o) => o.full).join(' ')
       const leaseColumn = columnFromText(joined)
       const key = `radio_${keyc++}`
       const anchor = group[0]
+      // S622 (Nic): "the checkboxes need to be one or the other, and they need
+      // to be within the same option of the first part. The radio button needs
+      // to be outside of the checkboxes."
+      //
+      // The group's control used to sit ON the first option, so option one
+      // rendered as a radio and every other option as a checkbox — two
+      // different-looking controls for one either/or choice. The control now
+      // sits on the CAPTION line ("…shall be considered a: (check one)"),
+      // outside the options entirely, and every option gets the same marker.
       radios.push({
-        page: anchor.page,
+        page: caption.page,
         x: Math.round(anchor.x),
-        y: flipY(anchor.H, anchor.y, anchor.h),
+        y: flipY(caption.H, caption.y, 12),
         // a radio marker is a dot on the checkbox blank — the choices are picked
         // in the signing panel, so the on-document box stays tiny (Nic S556).
         width: 14,
@@ -1305,7 +1315,6 @@ function detectCheckOneRadios(pages: any[]): {
           groupKey: key, option: o.label, isFirst: n === 0,
           endPage: end.page, endY: end.y,
         })
-        if (n === 0) return
         radios.push({
           page: o.page,
           x: Math.round(o.x),
@@ -1344,7 +1353,8 @@ function detectCheckOneRadios(pages: any[]): {
       }
       openGroups.splice(k, 1)   // same or deeper indent: that group is closed
     }
-    const key = emit(opts, parentKey, parentOption)
+    const key = emit(opts, parentKey, parentOption,
+      { page: docLines[i].page, H: docLines[i].H, y: docLines[i].y })
     openGroups.push({ x: myX, key, opts: opts.map(o => ({ label: o.label, page: o.page, y: o.y })) })
   }
 
