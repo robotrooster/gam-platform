@@ -200,8 +200,13 @@ the next real data point.
 
 Business §9.1/§9.2 and Consumer §7.1/§7.2: applicants pay for screening once,
 GAM never bills it through a lease, charging twice is a breach (also in §12
-Prohibited Conduct), and a **21-day onboarding migration window** during which
-existing tenants need no screening. Oak Park's window closes **2026-09-04**.
+Prohibited Conduct), and a **28-day onboarding migration window** during which
+existing tenants need no screening. Oak Park's window closes **2026-09-11**.
+
+Raised from 21 to 28 at the end of S623 (Nic: "we never know when people are
+actually gonna get around to finalizing all their details"). Applied to existing
+landlords measured from when they joined, so no window moves relative to
+another's. Terms republished.
 
 Enforced in code at SEND, with exemptions for the open window, an eviction-held
 lease, `deposit_already_held`, and renewals. Four tests.
