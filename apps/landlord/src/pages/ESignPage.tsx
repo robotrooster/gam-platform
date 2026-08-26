@@ -522,12 +522,28 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   // How deep a field sits: 0 top level, 1 inside an option, 2 inside that.
   // Walks the parent chain with a bound, so a cycle from hand-editing cannot
   // hang the editor.
+  //
+  // S622, corrected: an OPTION MARKER is a sibling, not a child. An election's
+  // first option is the group field itself; options two onward hang off that
+  // group so they can be conditional on it. Counting parent links therefore put
+  // two options of the SAME choice at different depths — month-to-month looked
+  // nested inside the very election it is half of, and "must vacate" looked a
+  // level below "may continue". Nic spotted it from the rings alone: "the next
+  // suboption has a purple ring, which shouldn't exist because it's at the same
+  // depth level as the first suboption."
+  //
+  // A field whose own label IS the option it hangs on is that option's marker,
+  // so it sits at its parent's depth. Anything else hanging on an option is a
+  // field printed INSIDE that branch, and is one deeper.
   const depthOf = (f: any): number => {
     let d = 0, cur = f, guard = 0
     while (cur?.parentFieldId && guard++ < 8) {
-      cur = fields.find((x: any) => x.id === cur.parentFieldId)
-      if (!cur) break
-      d++
+      const parent = fields.find((x: any) => x.id === cur.parentFieldId)
+      if (!parent) break
+      const isOptionMarker =
+        !!cur.parentOption && String(cur.label ?? '').trim() === String(cur.parentOption).trim()
+      if (!isOptionMarker) d++
+      cur = parent
     }
     return d
   }
