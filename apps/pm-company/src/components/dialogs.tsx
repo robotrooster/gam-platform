@@ -14,6 +14,10 @@
  * is mounted once in Layout. The module-level bus means callsites need
  * no context/hooks — mechanical replacement of the native calls.
  */
+// S622: a modal question and a toast must outrank every surface that can raise
+// them. These sat at 300/310, below full-screen editors at 1000, so a confirm
+// rendered BEHIND the editor that asked it — the click looked like it did
+// nothing at all.
 import { useEffect, useState } from 'react'
 import { AlertTriangle } from 'lucide-react'
 
@@ -113,7 +117,7 @@ export function DialogHost() {
   return (
     <>
       {/* toast stack */}
-      <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 300, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center', pointerEvents: 'none' }}>
+      <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 5000, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center', pointerEvents: 'none' }}>
         {toasts.map((t) => (
           <div key={t.id} style={{
             pointerEvents: 'auto', maxWidth: 480, padding: '10px 16px', borderRadius: 8,
@@ -128,7 +132,7 @@ export function DialogHost() {
 
       {/* prompt modal */}
       {promptReq && (
-        <div onClick={() => { promptReq.resolve(null); setPromptReq(null) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 310, padding: 16 }}>
+        <div onClick={() => { promptReq.resolve(null); setPromptReq(null) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
           <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
             <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>{promptReq.title}</div>
             <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 10, whiteSpace: 'pre-wrap' }}>{promptReq.message}</div>
@@ -146,7 +150,7 @@ export function DialogHost() {
 
       {/* confirm modal */}
       {confirmReq && (
-        <div onClick={() => settle(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 310, padding: 16 }}>
+        <div onClick={() => settle(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
           <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
             <div style={{ padding: '16px 20px 0', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
               {confirmReq.danger && <AlertTriangle size={18} style={{ color: 'var(--red, #dc2626)', flexShrink: 0, marginTop: 2 }} />}
