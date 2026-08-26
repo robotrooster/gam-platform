@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
+import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp } from '../services/email'
@@ -209,13 +209,18 @@ authRouter.post('/register', async (req, res, next) => {
         // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
         // extendable for long large-portfolio setups.
         const [l] = await client.query(
+          // S624: migration_window_ends_at MUST be set here. It was not, and a
+          // NULL read as "window open forever" in the screening gate — so every
+          // landlord who signed up after the S623 backfill had the background-check
+          // requirement silently disabled for life, in contradiction of the
+          // published Terms (§9.2). Found on a real organic signup 15 minutes old.
           `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until,
-                                  business_name, ein)
+                                  business_name, ein, migration_window_ends_at)
            VALUES ($1, $2, $3, NOW() + INTERVAL '21 days',
                    (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date,
-                   $5, $6) RETURNING id`,
+                   $5, $6, NOW() + ($7::int * INTERVAL '1 day')) RETURNING id`,
           [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES,
-           body.businessName ?? null, null]
+           body.businessName ?? null, null, MIGRATION_WINDOW_DAYS]
         ).then(r => r.rows)
         profileId = l.id
         // S553: founding owner-membership (multi-owner entities).

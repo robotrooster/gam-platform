@@ -20,6 +20,7 @@ import {
   NO_LEASE_DOCUMENT_TYPES,
   LEASE_TEMPLATE_PURPOSES,
   isValidSignerRole,
+  MIGRATION_WINDOW_DAYS,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -3258,7 +3259,24 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
             `SELECT created_at, migration_window_ends_at FROM landlords WHERE id = $1`, [doc.landlord_id])
           const leaseStart = new Date(startVal)
           const onboardedAt = ll ? new Date(ll.created_at) : null
-          const windowEnds = ll?.migration_window_ends_at ? new Date(ll.migration_window_ends_at) : null
+          // S624: DERIVE the window when the column is null rather than treating
+          // null as "open forever".
+          //
+          // That fail-open default is what let a signup bug become a compliance
+          // hole: nothing set the column at signup, so every landlord created
+          // after the S623 backfill was permanently inside their onboarding
+          // window and never had to screen anybody. The gate looked correct and
+          // caught nobody — the same failure mode the feature-flag default just
+          // above this deliberately avoids ("absent row = ON").
+          //
+          // Deriving from created_at gives the identical answer the backfill
+          // migration computed, so a missing column can never again mean a
+          // missing rule.
+          const windowEnds = ll?.migration_window_ends_at
+            ? new Date(ll.migration_window_ends_at)
+            : (onboardedAt
+                ? new Date(onboardedAt.getTime() + MIGRATION_WINDOW_DAYS * 86400000)
+                : null)
 
           // A tenancy counts as MIGRATED — and is exempt — on any of:
           //
