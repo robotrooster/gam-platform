@@ -276,8 +276,17 @@ describe('file_maintenance_request.execute', () => {
     expect(createMaintenanceRequest).not.toHaveBeenCalled()
   })
 
+  // S624: the tool now runs TWO queries — the tenant's units, then a check for
+  // an identical request filed moments ago. A blanket mockResolvedValue answers
+  // both with the units row, which reads as "already filed" and short-circuits.
+  // Route by SQL so each query gets the answer it actually asked for.
+  const mockUnitsAndNoDuplicate = (units: any[]) => {
+    ;(query as any).mockImplementation((sql: string) =>
+      Promise.resolve(String(sql).includes('maintenance_requests') ? [] : units))
+  }
+
   it('files for the tenant’s single active unit', async () => {
-    ;(query as any).mockResolvedValue([{ unit_id: 'unit-9', unit_number: '12', property_name: 'Maple Court' }])
+    mockUnitsAndNoDuplicate([{ unit_id: 'unit-9', unit_number: '12', property_name: 'Maple Court' }])
     ;(createMaintenanceRequest as any).mockResolvedValue({ id: 'req-1', status: 'open', priority: 'normal' })
 
     const res: any = await fileMaintenanceRequest.execute(
@@ -325,6 +334,29 @@ describe('file_maintenance_request.execute', () => {
     )
     expect(res.ok).toBe(false)
     expect(res.error).toMatch(/no active lease/i)
+  })
+
+  // The defect from the two-turn review: the agent filed it, the tenant said
+  // "yes please, go ahead", and it filed a SECOND one. A duplicate is a real row
+  // on the landlord's board and a maintenance history that disagrees with itself.
+  it('does not file the same request twice when the tenant confirms', async () => {
+    ;(query as any).mockImplementation((sql: string) =>
+      Promise.resolve(String(sql).includes('maintenance_requests')
+        ? [{ id: 'req-1', status: 'open', created_at: new Date().toISOString() }]
+        : [{ unit_id: 'unit-9', unit_number: '12', property_name: 'Maple Court' }]))
+
+    const res: any = await fileMaintenanceRequest.execute(
+      { title: 'Leaking sink', description: 'Kitchen sink drips constantly' },
+      TENANT_ACTOR
+    )
+
+    expect(createMaintenanceRequest).not.toHaveBeenCalled()
+    expect(res.ok).toBe(true)
+    expect(res.alreadyFiled).toBe(true)
+    expect(res.requestId).toBe('req-1')
+    // Tells the agent what to say instead of "done" a second time.
+    expect(res.message).toMatch(/do NOT file it again/i)
+    expect(res.message).toMatch(/24-48 hours/i)
   })
 })
 

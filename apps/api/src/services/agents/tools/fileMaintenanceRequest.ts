@@ -101,6 +101,42 @@ export const fileMaintenanceRequest: AgentTool = {
       return { ok: false, error: 'That unit is not one of the tenant’s active units.' }
     }
 
+    // S624 — DO NOT FILE THE SAME THING TWICE.
+    //
+    // From the two-turn review: the agent filed the request, the tenant replied
+    // "yes please, go ahead and put that in for me", and it filed a SECOND one.
+    // Confirming something already done is the commonest two-turn shape there
+    // is, and the duplicate is not cosmetic — it is a real row on the landlord's
+    // board, a second notification, and a maintenance history that disagrees
+    // with itself.
+    //
+    // Matched on the same unit and the same title within a short window, which
+    // is what a re-confirmation looks like. Deliberately narrow: a tenant with a
+    // genuinely recurring problem ("sink leaking again") files it days later, and
+    // an identical title minutes apart is not that.
+    const recent = await query<{ id: string; status: string; created_at: string }>(
+      `SELECT id, status, created_at
+         FROM maintenance_requests
+        WHERE unit_id = $1
+          AND LOWER(TRIM(title)) = LOWER(TRIM($2))
+          AND status NOT IN ('completed', 'cancelled')
+          AND created_at > NOW() - INTERVAL '30 minutes'
+        ORDER BY created_at DESC LIMIT 1`,
+      [unitId, title])
+    if (recent.length > 0) {
+      const unit = units.find((u) => u.unit_id === unitId)
+      return {
+        ok: true,
+        alreadyFiled: true,
+        requestId: recent[0].id,
+        status: recent[0].status,
+        unit: unit ? `${unit.property_name ?? 'Property'}${unit.unit_number ? ` — Unit ${unit.unit_number}` : ''}` : undefined,
+        // Tell the agent what to SAY, since the useful reply here is not "done"
+        // a second time — it is confirmation plus what happens next.
+        message: 'This was already filed a moment ago — do NOT file it again. Confirm it is in, and tell them maintenance usually responds within 24-48 hours.',
+      }
+    }
+
     try {
       const request = await createMaintenanceRequest({
         unitId,

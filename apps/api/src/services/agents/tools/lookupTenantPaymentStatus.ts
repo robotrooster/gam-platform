@@ -23,6 +23,53 @@ interface TenantMatch {
 
 const OUTSTANDING_STATUSES = ['pending', 'processing', 'failed', 'returned']
 
+/**
+ * S624 — strip the question off a name before searching for it.
+ *
+ * "what's chen's balance?" reached this tool as tenant="what's chen", and it was
+ * searched literally: "I couldn't find a tenant matching 'what's chen'". The
+ * landlord then had to narrow a question that was never ambiguous — and the
+ * reply gave away that nothing was reading it like a person would.
+ *
+ * A human sees "Chen's", reads the possessive, and searches Chen. So: drop
+ * leading interrogatives and filler, drop trailing possessives, and drop the
+ * noun the landlord was asking ABOUT ("balance", "rent") when it trails a name.
+ *
+ * Deliberately conservative — it only trims recognised words from the ENDS. A
+ * real name is never removed, because whatever remains after the known filler is
+ * what gets searched.
+ */
+const LEAD_NOISE = /^(?:what(?:'|’)?s|what is|whats|hows|how(?:'|’)?s|how is|who(?:'|’)?s|who is|show me|tell me|check|look ?up|get|find|pull ?up|about|for|the|my|is|does|did|can you)\s+/i
+const TRAIL_NOISE = /\s+(?:balance|rent|payment|payments|status|account|ledger|owe|owes|owing|due|total|info|information|details|doing|on|with|at|right now|now|lately)\??$/i
+/** A question word left standing alone is not a name. */
+const BARE_NOISE = /^(?:what|whats|who|how|show|tell|check|find|get|about|for|the|my|is|does|did|look|pull)$/i
+
+export function cleanNeedle(raw: unknown): string {
+  let s = String(raw ?? '').trim()
+  // A separator means the name is what comes AFTER it — "tenant: dan okafor",
+  // "who's behind — dan okafor". Only when something substantial follows, so a
+  // hyphenated name (Anne-Marie) is untouched.
+  const sep = s.match(/^[^:—–]*[:—–]\s*(.+)$/)
+  if (sep && sep[1].trim().length >= 2) s = sep[1].trim()
+  // Repeat: "what's my tenant chen" has two leading words to shed.
+  for (let i = 0; i < 4; i++) {
+    const next = s.replace(LEAD_NOISE, '')
+    if (next === s) break
+    s = next
+  }
+  for (let i = 0; i < 3; i++) {
+    const next = s.replace(TRAIL_NOISE, '')
+    if (next === s) break
+    s = next
+  }
+  // Possessive: Chen's → Chen. Left until last so "chen's balance" loses the
+  // noun first and does not strip an apostrophe out of a name like O'Neill.
+  s = s.replace(/(?:'|’)s$/i, '')
+  s = s.replace(/[?!.,]+$/, '').trim()
+  // "what's" on its own reduces to "what", which is a question, not a tenant.
+  return BARE_NOISE.test(s) ? '' : s
+}
+
 export const lookupTenantPaymentStatus: AgentTool = {
   name: 'lookup_tenant_payment_status',
   description:
@@ -39,7 +86,7 @@ export const lookupTenantPaymentStatus: AgentTool = {
   audiences: ['landlord'],
 
   async execute(args, actor: AgentActor) {
-    const needle = String(args.tenant ?? '').trim()
+    const needle = cleanNeedle(args.tenant)
     // S617 (Nic): "I've got RV spot number one in four different RV parks." A
     // bare "1" is a real way to name a unit, so a single character is allowed
     // when it is a digit. Anything else still needs two, or the match is noise.
