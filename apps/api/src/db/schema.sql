@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Rrhn1ucEolSLeTYORrRFU0YlPKkhCtM4lVN8942KMLiZc8bzwsQsveGqiX5q5yI
+\restrict IjfiSFriaXtWq5lBYadG0B5bbcJg8j5GcH14u4aE1Mg2mLNpwMnhz1CjSZSaqIM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -996,6 +996,29 @@ COMMENT ON TABLE public.bank_connections IS 'S570: a landlord''s linked operatin
 --
 
 COMMENT ON COLUMN public.bank_connections.current_balance IS 'S605: cached account balance from Stripe FC, refreshed on sync. NULL = the link has no balances consent (pre-S605 links) or none reported.';
+
+
+--
+-- Name: bank_deposit_allocations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bank_deposit_allocations (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    bank_transaction_id uuid NOT NULL,
+    payment_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    effective_paid_date date NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bank_deposit_allocations_amount_positive CHECK ((amount > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE bank_deposit_allocations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.bank_deposit_allocations IS 'S624: every charge a bank deposit settled. Also the basis for the on-site cash control — collected-but-not-banked is what has no allocation row.';
 
 
 --
@@ -6497,6 +6520,7 @@ CREATE TABLE public.properties (
     booking_area text,
     lease_signer_user_id uuid,
     gam_debit_threshold numeric(12,2) DEFAULT 100.00 NOT NULL,
+    timezone_source text DEFAULT 'derived'::text NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -6514,6 +6538,7 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (booking_slug IS NOT NULL))),
     CONSTRAINT properties_review_status_check CHECK ((review_status = ANY (ARRAY['active'::text, 'pending_review'::text, 'rejected'::text]))),
     CONSTRAINT properties_short_term_tax_rate_range CHECK (((short_term_tax_rate >= (0)::numeric) AND (short_term_tax_rate <= (100)::numeric))),
+    CONSTRAINT properties_timezone_source_check CHECK ((timezone_source = ANY (ARRAY['derived'::text, 'manual'::text]))),
     CONSTRAINT properties_work_trade_hours_target_pos CHECK ((work_trade_hours_target > 0))
 );
 
@@ -6565,6 +6590,13 @@ COMMENT ON COLUMN public.properties.lease_signer_user_id IS 'S605: on-site manag
 --
 
 COMMENT ON COLUMN public.properties.gam_debit_threshold IS 'Outstanding balance owed to GAM at which we debit the landlord directly rather than waiting to net it out of their next disbursement. Raise it when the cost of the movement outweighs the fees. Default $100 (S620).';
+
+
+--
+-- Name: COLUMN properties.timezone_source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.timezone_source IS 'S624: derived = from the property state; manual = a human set it and no derivation may overwrite it.';
 
 
 --
@@ -8239,6 +8271,39 @@ CREATE TABLE public.tenant_credits (
 
 
 --
+-- Name: tenant_declared_deposits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_declared_deposits (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    declared_date date NOT NULL,
+    method text NOT NULL,
+    reference text,
+    status text DEFAULT 'pending'::text NOT NULL,
+    bank_transaction_id uuid,
+    confirmed_at timestamp with time zone,
+    resolution_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_declared_deposits_amount_positive CHECK ((amount > (0)::numeric)),
+    CONSTRAINT tenant_declared_deposits_confirmed_has_txn CHECK (((status <> 'confirmed'::text) OR (bank_transaction_id IS NOT NULL))),
+    CONSTRAINT tenant_declared_deposits_method_check CHECK ((method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text]))),
+    CONSTRAINT tenant_declared_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'unconfirmed'::text, 'withdrawn'::text])))
+);
+
+
+--
+-- Name: TABLE tenant_declared_deposits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_declared_deposits IS 'S624: a tenant''s claim that they deposited rent at the bank. Changes nothing until a bank transaction confirms it — see the migration header for why that is the anti-fraud design.';
+
+
+--
 -- Name: tenant_identifications; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9557,8 +9622,12 @@ CREATE TABLE public.work_trade_agreements (
     monthly_hours_target integer DEFAULT 80 NOT NULL,
     paused_by_hibernation boolean DEFAULT false NOT NULL,
     covered_charges text[] DEFAULT ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text] NOT NULL,
+    banked_hours numeric(8,2) DEFAULT 0 NOT NULL,
+    carry_forward_months integer DEFAULT 1 NOT NULL,
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
+    CONSTRAINT work_trade_banked_hours_nonneg CHECK ((banked_hours >= (0)::numeric)),
+    CONSTRAINT work_trade_carry_forward_months_nonneg CHECK ((carry_forward_months >= 0)),
     CONSTRAINT work_trade_covered_charges_check CHECK ((covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text]))
 );
 
@@ -9575,6 +9644,20 @@ COMMENT ON COLUMN public.work_trade_agreements.paused_by_hibernation IS 'S594: T
 --
 
 COMMENT ON COLUMN public.work_trade_agreements.covered_charges IS 'S613: what this agreement trades for. A charge NOT listed is billed in full and takes no part in the credit basis. Default is everything, which is the behaviour every pre-S613 agreement had.';
+
+
+--
+-- Name: COLUMN work_trade_agreements.banked_hours; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.banked_hours IS 'S624: hours worked beyond every obligation, carried forward without limit. Buys future months; never converts to cash.';
+
+
+--
+-- Name: COLUMN work_trade_agreements.carry_forward_months; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.carry_forward_months IS 'S624: how many further month-closes a deficit may survive before it is billed in cash and the agreement ends. 0 = bill at the first close. Landlord-set.';
 
 
 --
@@ -9595,6 +9678,35 @@ CREATE TABLE public.work_trade_logs (
     rejection_reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT work_trade_logs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))
+);
+
+
+--
+-- Name: work_trade_settlements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.work_trade_settlements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    agreement_id uuid NOT NULL,
+    invoice_id uuid,
+    period_month date NOT NULL,
+    target_hours numeric(8,2) NOT NULL,
+    hours_worked numeric(8,2) DEFAULT 0 NOT NULL,
+    hours_applied numeric(8,2) DEFAULT 0 NOT NULL,
+    hour_rate numeric(12,4) NOT NULL,
+    basis_amount numeric(12,2) NOT NULL,
+    credit_applied numeric(12,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    settled_at timestamp with time zone,
+    billed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT work_trade_settlements_applied_within_target CHECK ((hours_applied <= target_hours)),
+    CONSTRAINT work_trade_settlements_credit_nonneg CHECK (((credit_applied >= (0)::numeric) AND (credit_applied <= basis_amount))),
+    CONSTRAINT work_trade_settlements_hours_nonneg CHECK (((hours_worked >= (0)::numeric) AND (hours_applied >= (0)::numeric))),
+    CONSTRAINT work_trade_settlements_period_is_month_start CHECK ((period_month = (date_trunc('month'::text, (period_month)::timestamp with time zone))::date)),
+    CONSTRAINT work_trade_settlements_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'billed'::text]))),
+    CONSTRAINT work_trade_settlements_target_positive CHECK ((target_hours > (0)::numeric))
 );
 
 
@@ -9723,6 +9835,14 @@ ALTER TABLE ONLY public.background_checks
 
 ALTER TABLE ONLY public.bank_connections
     ADD CONSTRAINT bank_connections_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bank_deposit_allocations bank_deposit_allocations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_allocations
+    ADD CONSTRAINT bank_deposit_allocations_pkey PRIMARY KEY (id);
 
 
 --
@@ -12390,6 +12510,14 @@ ALTER TABLE ONLY public.tenant_credits
 
 
 --
+-- Name: tenant_declared_deposits tenant_declared_deposits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_identifications tenant_identifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12750,6 +12878,14 @@ ALTER TABLE ONLY public.work_trade_logs
 
 
 --
+-- Name: work_trade_settlements work_trade_settlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_settlements
+    ADD CONSTRAINT work_trade_settlements_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: agent_interaction_logs_actor_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13083,6 +13219,20 @@ CREATE UNIQUE INDEX idx_bank_connections_fc_account ON public.bank_connections U
 --
 
 CREATE INDEX idx_bank_connections_landlord ON public.bank_connections USING btree (landlord_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_bank_deposit_allocations_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bank_deposit_allocations_landlord ON public.bank_deposit_allocations USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_bank_deposit_allocations_txn; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bank_deposit_allocations_txn ON public.bank_deposit_allocations USING btree (bank_transaction_id);
 
 
 --
@@ -16054,6 +16204,20 @@ CREATE INDEX idx_tenant_credits_tenant ON public.tenant_credits USING btree (ten
 
 
 --
+-- Name: idx_tenant_declared_deposits_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_declared_deposits_open ON public.tenant_declared_deposits USING btree (landlord_id, declared_date) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_tenant_declared_deposits_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_declared_deposits_tenant ON public.tenant_declared_deposits USING btree (tenant_id, created_at DESC);
+
+
+--
 -- Name: idx_tenant_identifications_tenant; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16635,6 +16799,20 @@ CREATE INDEX idx_work_trade_logs_status ON public.work_trade_logs USING btree (s
 
 
 --
+-- Name: idx_work_trade_settlements_invoice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_settlements_invoice ON public.work_trade_settlements USING btree (invoice_id) WHERE (invoice_id IS NOT NULL);
+
+
+--
+-- Name: idx_work_trade_settlements_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_settlements_open ON public.work_trade_settlements USING btree (agreement_id, period_month) WHERE (status = 'open'::text);
+
+
+--
 -- Name: invitations_unique_pending; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17090,6 +17268,20 @@ CREATE UNIQUE INDEX utility_meter_readings_one_cycle_read_per_month ON public.ut
 
 
 --
+-- Name: ux_bank_deposit_allocations_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_bank_deposit_allocations_payment ON public.bank_deposit_allocations USING btree (payment_id);
+
+
+--
+-- Name: ux_bank_deposit_allocations_txn_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_bank_deposit_allocations_txn_payment ON public.bank_deposit_allocations USING btree (bank_transaction_id, payment_id);
+
+
+--
 -- Name: ux_cpsl_live_agreement; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17244,6 +17436,13 @@ CREATE UNIQUE INDEX ux_properties_booking_slug ON public.properties USING btree 
 
 
 --
+-- Name: ux_tenant_declared_deposits_bank_txn; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_declared_deposits_bank_txn ON public.tenant_declared_deposits USING btree (bank_transaction_id) WHERE (bank_transaction_id IS NOT NULL);
+
+
+--
 -- Name: ux_unit_booking_waitlists_claim_token; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17283,6 +17482,13 @@ CREATE UNIQUE INDEX ux_users_tenant_invite_token ON public.users USING btree (te
 --
 
 CREATE UNIQUE INDEX ux_utility_service_agreement_live ON public.utility_service_agreements USING btree (unit_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: ux_work_trade_settlements_agreement_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_work_trade_settlements_agreement_month ON public.work_trade_settlements USING btree (agreement_id, period_month);
 
 
 --
@@ -18091,6 +18297,20 @@ CREATE TRIGGER pos_items_price_history_trg BEFORE UPDATE ON public.pos_items FOR
 
 
 --
+-- Name: tenant_declared_deposits set_updated_at_tenant_declared_deposits; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER set_updated_at_tenant_declared_deposits BEFORE UPDATE ON public.tenant_declared_deposits FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: work_trade_settlements set_updated_at_work_trade_settlements; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER set_updated_at_work_trade_settlements BEFORE UPDATE ON public.work_trade_settlements FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
 -- Name: application_pool trg_application_pool_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -18718,6 +18938,30 @@ ALTER TABLE ONLY public.background_checks
 
 ALTER TABLE ONLY public.bank_connections
     ADD CONSTRAINT bank_connections_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: bank_deposit_allocations bank_deposit_allocations_bank_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_allocations
+    ADD CONSTRAINT bank_deposit_allocations_bank_transaction_id_fkey FOREIGN KEY (bank_transaction_id) REFERENCES public.bank_transactions(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: bank_deposit_allocations bank_deposit_allocations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_allocations
+    ADD CONSTRAINT bank_deposit_allocations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: bank_deposit_allocations bank_deposit_allocations_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_deposit_allocations
+    ADD CONSTRAINT bank_deposit_allocations_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id) ON DELETE RESTRICT;
 
 
 --
@@ -23441,6 +23685,38 @@ ALTER TABLE ONLY public.tenant_credits
 
 
 --
+-- Name: tenant_declared_deposits tenant_declared_deposits_bank_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_bank_transaction_id_fkey FOREIGN KEY (bank_transaction_id) REFERENCES public.bank_transactions(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: tenant_declared_deposits tenant_declared_deposits_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: tenant_declared_deposits tenant_declared_deposits_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_declared_deposits tenant_declared_deposits_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_declared_deposits
+    ADD CONSTRAINT tenant_declared_deposits_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
 -- Name: tenant_identifications tenant_identifications_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24329,8 +24605,24 @@ ALTER TABLE ONLY public.work_trade_logs
 
 
 --
+-- Name: work_trade_settlements work_trade_settlements_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_settlements
+    ADD CONSTRAINT work_trade_settlements_agreement_id_fkey FOREIGN KEY (agreement_id) REFERENCES public.work_trade_agreements(id) ON DELETE CASCADE;
+
+
+--
+-- Name: work_trade_settlements work_trade_settlements_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_settlements
+    ADD CONSTRAINT work_trade_settlements_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.invoices(id) ON DELETE SET NULL;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Rrhn1ucEolSLeTYORrRFU0YlPKkhCtM4lVN8942KMLiZc8bzwsQsveGqiX5q5yI
+\unrestrict IjfiSFriaXtWq5lBYadG0B5bbcJg8j5GcH14u4aE1Mg2mLNpwMnhz1CjSZSaqIM
 
