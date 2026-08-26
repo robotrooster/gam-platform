@@ -6,9 +6,10 @@
 # time: it builds everything, compares each build against what production is
 # actually serving, and only deploys what differs.
 #
-#   bash deploy.sh              # deploy whatever is stale
+#   bash deploy.sh              # test, then deploy whatever is stale
 #   bash deploy.sh --check      # report only, change nothing
 #   bash deploy.sh --all        # force redeploy even if in sync
+#   bash deploy.sh --skip-tests # ship without running the suite (says so loudly)
 #
 # WHY THIS EXISTS RATHER THAN VERCEL'S GIT INTEGRATION:
 # Vercel's remote build 404s on @gam/shared (workspace package), so every
@@ -31,8 +32,15 @@ cd "$(dirname "$0")"
 MODE="${1:-}"
 CHECK_ONLY=false
 FORCE=false
-[ "$MODE" = "--check" ] && CHECK_ONLY=true
-[ "$MODE" = "--all" ] && FORCE=true
+SKIP_TESTS=false
+for arg in "$@"; do
+  [ "$arg" = "--check" ] && CHECK_ONLY=true
+  [ "$arg" = "--all" ] && FORCE=true
+  # S624: an escape hatch, because a deploy blocked by an unrelated red test
+  # during an incident is worse than no gate at all. It PRINTS LOUDLY, so
+  # skipping is a thing somebody chose and can be seen to have chosen.
+  [ "$arg" = "--skip-tests" ] && SKIP_TESTS=true
+done
 
 # Vercel-linked frontends and the domain each one serves from.
 FRONTENDS=(
@@ -52,6 +60,40 @@ FAILED=0
 
 echo "═══ GAM deploy $(date '+%Y-%m-%d %H:%M:%S') ═══"
 $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
+
+# ── tests, BEFORE anything ships ─────────────────────────────────────────
+#
+# S624 (Nic asked for this after a red suite shipped twice in S623): deploy.sh
+# built, deployed and verified — and never once ran a test. "Verified" meant the
+# bytes on the server matched the bytes on disk, which is true and says nothing
+# about whether they work.
+#
+# DB_NAME=gam_test IS NOT OPTIONAL. Running vitest without it points the suite at
+# the DEV/PROD database and its cleanup helpers truncate real tables. It is set
+# here explicitly rather than trusted to a shell profile.
+#
+# The gate runs FIRST — before the shared build, before the API build — because
+# the point is to fail before anything is published, not after.
+if $CHECK_ONLY; then
+  echo; echo "── tests ──"; warn "would run the API suite (skipped in --check)"
+elif $SKIP_TESTS; then
+  echo; echo "── tests ──"
+  bad "SKIPPED (--skip-tests). You are shipping code nothing verified."
+else
+  echo; echo "── tests (API suite, ~8 min) ──"
+  if (cd apps/api && DB_NAME=gam_test npx vitest run --reporter=dot) >/tmp/gam-deploy-tests.log 2>&1; then
+    ok "$(grep -oE '[0-9]+ passed' /tmp/gam-deploy-tests.log | tail -1) — suite green"
+  else
+    bad "TESTS FAILED — nothing has been deployed."
+    echo
+    # Show the actual failures rather than a log path nobody opens.
+    grep -E "FAIL|✕|Tests +[0-9]+ failed" /tmp/gam-deploy-tests.log | head -20
+    echo
+    echo "Full output: /tmp/gam-deploy-tests.log"
+    echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
+    exit 1
+  fi
+fi
 
 # ── shared package first: every frontend compiles against it ──────────────
 echo; echo "── @gam/shared ──"
