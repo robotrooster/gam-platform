@@ -134,44 +134,66 @@ async function invoiceFor(leaseId: string) {
   return { invoice: inv.rows[0], payments: pays.rows }
 }
 
-describe('generateInvoices — work-trade credit', () => {
-  it('50% of target → half the rent invoice is credited; rent row reduced, pending', async () => {
-    const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 40 }) // target default 80
+// S624 — THE CREDIT MOVED OUT OF INVOICE GENERATION.
+//
+// It used to be applied here, from the PREVIOUS month's approved hours. Nic
+// (S623): "when you're working, those hours should be covering the month that
+// you're gonna be staying... people aren't gonna pay the first month and then
+// work." Rent is paid forward, so a month is paid for by work done DURING it —
+// which cannot be known on the 1st. Generation now issues the invoice GROSS and
+// OPENS a settlement period; jobs/workTradeSettlement.ts credits it at month
+// close. These tests were rewritten rather than deleted: the old expectations
+// describe behaviour that was wrong for the reason above, and the new ones pin
+// what replaced it.
+describe('generateInvoices — opens a work-trade period, credits nothing', () => {
+  const periodOf = async (agreementId: string | null) => (await db.query<any>(
+    `SELECT target_hours::float AS target, hour_rate::float AS rate,
+            basis_amount::float AS basis, hours_applied::float AS applied, status
+       FROM work_trade_settlements WHERE agreement_id=$1`, [agreementId])).rows
+
+  it('issues the invoice GROSS even when the tenant worked last month', async () => {
+    const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 40 })
     await generateInvoices(NOW)
     const { invoice, payments } = await invoiceFor(s.leaseId)
-    expect(invoice.subtotal_rent).toBe('1000.00')          // gross preserved
-    expect(invoice.work_trade_credit_amount).toBe('500.00')
-    expect(invoice.work_trade_credit_hours).toBe('40.00')
+    expect(invoice.subtotal_rent).toBe('1000.00')
+    // Last month's hours buy nothing here any more — they belonged to last month.
+    expect(invoice.work_trade_credit_amount).toBe('0.00')
+    expect(invoice.total_amount).toBe('1000.00')
+    // Still stamped with the agreement, which is what makes it late-fee exempt
+    // while the tenant works the month off (S623).
     expect(invoice.work_trade_agreement_id).toBe(s.agreementId)
-    expect(invoice.total_amount).toBe('500.00')            // net
+    expect(invoice.late_fee_exempt).toBe(true)
     const rent = payments.find(p => p.type === 'rent')
-    expect(rent.amount).toBe('500.00')
+    expect(rent.amount).toBe('1000.00')
     expect(rent.status).toBe('pending')
   })
 
-  it('100% of target → rent fully covered; $0 rent row recorded settled', async () => {
-    const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 80 })
+  it('opens one period priced from the covered basis', async () => {
+    const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 40 })
     await generateInvoices(NOW)
-    const { invoice, payments } = await invoiceFor(s.leaseId)
-    expect(invoice.work_trade_credit_amount).toBe('1000.00')
-    expect(invoice.total_amount).toBe('0.00')
-    const rent = payments.find(p => p.type === 'rent')
-    expect(rent.amount).toBe('0.00')
-    expect(rent.status).toBe('settled')
-    expect(rent.notes).toMatch(/work-trade/i)
+    const [period] = await periodOf(s.agreementId)
+    expect(period).toBeTruthy()
+    expect(period.target).toBe(80)
+    expect(period.basis).toBe(1000)
+    expect(period.rate).toBe(12.5)      // $1000 ÷ 80 hours
+    expect(period.applied).toBe(0)
+    expect(period.status).toBe('open')
   })
 
-  it('credit basis includes monthly fees; lands on rent first', async () => {
+  it('prices the hour off the WHOLE covered bill, not the rent alone', async () => {
+    // Nic (S624): work trade "detects all charges according to the lease... it
+    // gives a percentage of the utilities as well as whatever the rent is."
     const s = await seedWorkTradeStack({
       rentAmount: 1000, approvedHours: 40, monthlyFees: [{ type: 'pet_rent', amount: 200 }],
     })
     await generateInvoices(NOW)
     const { invoice, payments } = await invoiceFor(s.leaseId)
-    // billable 1200 × 0.5 = 600 credit, taken off rent first
-    expect(invoice.work_trade_credit_amount).toBe('600.00')
-    expect(invoice.total_amount).toBe('600.00')
-    expect(payments.find(p => p.type === 'rent').amount).toBe('400.00')
+    expect(invoice.total_amount).toBe('1200.00')          // gross, nothing credited
+    expect(payments.find(p => p.type === 'rent').amount).toBe('1000.00')
     expect(payments.find(p => p.type === 'fee').amount).toBe('200.00')
+    const [period] = await periodOf(s.agreementId)
+    expect(period.basis).toBe(1200)                        // rent + the fee
+    expect(period.rate).toBe(15)                           // $1200 ÷ 80
   })
 
   it('only APPROVED hours count — pending hours give no credit', async () => {
@@ -182,8 +204,10 @@ describe('generateInvoices — work-trade credit', () => {
     expect(invoice.total_amount).toBe('1000.00')
   })
 
-  it('hours in the wrong month do not credit this invoice', async () => {
-    // Logged in May (the invoice month), not April (the prior/earned month).
+  it('hours logged in the invoice’s OWN month still credit nothing here', async () => {
+    // Under the old model this was the "wrong month". Under the new one it is
+    // the RIGHT month — and it still credits nothing at generation, because the
+    // month is not over. It settles at close, which is the whole point.
     const s = await seedWorkTradeStack({ rentAmount: 1000, approvedHours: 80, hoursMonth: '2026-05' })
     await generateInvoices(NOW)
     const { invoice } = await invoiceFor(s.leaseId)
@@ -191,13 +215,16 @@ describe('generateInvoices — work-trade credit', () => {
     expect(invoice.total_amount).toBe('1000.00')
   })
 
-  it('no agreement → no credit, gross invoice unchanged', async () => {
+  it('no agreement → no period opened, and no late-fee exemption', async () => {
     const s = await seedWorkTradeStack({ rentAmount: 1000, agreement: false })
     await generateInvoices(NOW)
     const { invoice } = await invoiceFor(s.leaseId)
     expect(invoice.work_trade_credit_amount).toBe('0.00')
     expect(invoice.work_trade_agreement_id).toBeNull()
     expect(invoice.total_amount).toBe('1000.00')
+    expect(invoice.late_fee_exempt).toBe(false)
+    const periods = await db.query(`SELECT 1 FROM work_trade_settlements`)
+    expect(periods.rowCount).toBe(0)
   })
 })
 

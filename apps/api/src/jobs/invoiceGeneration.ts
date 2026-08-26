@@ -1,10 +1,13 @@
 import { DateTime } from 'luxon'
+// S624: the month-close settlement model. This file OPENS a period; the credit
+// itself is applied by jobs/workTradeSettlement.ts once the month is over.
+import { proratedTarget, hourRateFor } from '../services/workTradeSettlement'
 import { formatInvoiceNumber } from '@gam/shared'
 import { getClient, query, queryOne } from '../db'
 import type { PoolClient } from 'pg'
 import { logger } from '../lib/logger'
 import {
-  loadWorkTradeCreditContext, workTradeFraction, distributeWorkTradeCredit, round2,
+  loadWorkTradeCreditContext, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
 import { applyCreditsToOpenCharges } from '../services/creditApplication'
@@ -593,7 +596,28 @@ async function runGeneration(
         const wt = (!sublease && lease.tenant_id)
           ? await loadWorkTradeCreditContext(client, { unitId: lease.unit_id, tenantId: lease.tenant_id, dueDate })
           : null
-        const wtFraction = wt ? workTradeFraction(wt.verifiedHours, wt.target) : 0
+        // S624 — THE CREDIT NO LONGER HAPPENS HERE.
+        //
+        // Nic (S623): "when you're working, those hours should be covering the
+        // month that you're gonna be staying." Rent is paid FORWARD, so the work
+        // that pays for September happens DURING September — and September's
+        // hours do not exist on September 1st. Crediting at generation could
+        // therefore only ever use the PREVIOUS month's hours, which left the
+        // first month of every work-trade tenancy uncovered forever and asked a
+        // tenant to pay before they had any reason to work.
+        //
+        // So this invoice issues GROSS. It is `late_fee_exempt` while the tenant
+        // works the month off (S623), and jobs/workTradeSettlement.ts credits it
+        // at month close from its OWN approved hours. All this pass does now is
+        // OPEN the period — recording what the month asks for, what it is worth,
+        // and what an hour of it buys — because the covered basis is known here
+        // and nowhere else.
+        //
+        // wtFraction is pinned to 0 so `dist` distributes nothing: the machinery
+        // below still runs (it computes the covered basis, which the period needs)
+        // but removes no dollars. Deleting it outright would also delete the
+        // covered-charge reasoning in S613/S616 that the basis depends on.
+        const wtFraction = 0
 
         // S613 (Nic): an agreement covers only what it says it covers — "fifty
         // percent of the work for the rent and the electric... but propane is
@@ -704,6 +728,35 @@ async function runGeneration(
         }
 
         const invoiceId = invoiceRes.rows[0].id as string
+
+        // S624 — OPEN THE WORK-TRADE PERIOD for the month this invoice covers.
+        //
+        // This is the only place the COVERED BASIS is known: which charges this
+        // agreement actually trades for is decided just above, from the
+        // agreement's covered_charges against this cycle's real rows (S613/S616).
+        // Recomputing it at month close would mean duplicating that reasoning in
+        // a second place and letting the two drift.
+        //
+        // The TARGET is prorated with the bill. A move-in on the 20th bills 11/31
+        // of the rent, so it asks 11/31 of the hours — otherwise every work-trade
+        // tenancy would open ~69 hours in deficit for a month that charged eleven
+        // days. `hourRate` is frozen here and never recomputed: a later rent
+        // change must not reprice labour owed for THIS month.
+        if (wt && creditBasis > 0) {
+          const monthStart = DateTime.fromISO(dueDate).startOf('month').toISODate()!
+          const fullMonthBasis = round2(
+            (rentCovered ? Number(lease.rent_amount ?? effectiveRentAmount) : 0)
+            + (creditBasis - (rentCovered ? rentAmountNum : 0)))
+          const target = proratedTarget(wt.target, creditBasis, fullMonthBasis)
+          await client.query(
+            `INSERT INTO work_trade_settlements
+               (agreement_id, invoice_id, period_month, target_hours,
+                hour_rate, basis_amount)
+             VALUES ($1, $2, $3::date, $4, $5, $6)
+             ON CONFLICT (agreement_id, period_month) DO NOTHING`,
+            [wt.agreementId, invoiceId, monthStart, target.toFixed(2),
+             hourRateFor(creditBasis, target).toFixed(4), creditBasis.toFixed(2)])
+        }
 
         // Rent child row at the work-trade-NET amount. entry_description is the
         // NACHA-shaped categorical enum (CHECK on payments.entry_description).

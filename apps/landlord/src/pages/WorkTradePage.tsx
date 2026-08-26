@@ -80,7 +80,7 @@ export function WorkTradePage() {
       <div className="card" style={{ padding: 0 }}>
         {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
           <table className="data-table">
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Covers</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Grace</th><th>Covers</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
             <tbody>
               {agreements.length ? agreements.map((a: any) => (
                 // W-56: the row pulls up the tenant's LEASE; the target cell
@@ -93,6 +93,7 @@ export function WorkTradePage() {
                   <td>{a.propertyName || '—'}</td>
                   <td className="mono">{Number(a.hoursThisMonth || 0).toFixed(1)} / {a.target} hrs</td>
                   <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)} /></td>
+                  <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} /></td>
                   <td onClick={e => e.stopPropagation()}><AgreementCoversCell agreement={a} /></td>
                   <td className="mono">{Number(a.pendingCount) > 0
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
@@ -300,6 +301,52 @@ function AgreementTargetCell({ agreementId, target }: { agreementId: string; tar
           {save.isLoading ? '…' : 'Save'}
         </button>
       )}
+    </div>
+  )
+}
+
+/**
+ * S624 — how long a shortfall may carry before it is billed and the agreement ends.
+ *
+ * Nic: "my two month rule was just an example. If a landlord wants to give
+ * leniency for six months, they may choose to do so or however long. But at some
+ * point, a landlord's gonna know that somebody's never gonna be able to
+ * physically catch up. There's just not that many hours in a month."
+ *
+ * So it is a setting, not a constant — and the copy names the consequence rather
+ * than the mechanism, because "carry_forward_months" means nothing to anybody.
+ */
+function CarryForwardCell({ agreementId, months }: { agreementId: string; months: number }) {
+  const qc = useQueryClient()
+  const [value, setValue] = useState<string | null>(null)
+  const shown = value ?? String(months ?? 1)
+  const save = useMutation(
+    (m: number) => apiPatch(`/work-trade/${agreementId}`, { carryForwardMonths: m }),
+    { onSuccess: () => { qc.invalidateQueries('work-trade'); setValue(null) } }
+  )
+  const n = Number(shown)
+  const dirty = value != null && n !== months && n >= 0 && n <= 24
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <input type="number" min={0} max={24} value={shown}
+          onChange={e => setValue(e.target.value)}
+          style={{ width: 56, padding: '4px 6px', textAlign: 'right' }} className="input" />
+        <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>
+          {n === 1 ? 'month' : 'months'}
+        </span>
+        {dirty && (
+          <button className="btn btn-primary btn-sm" disabled={save.isLoading}
+            onClick={() => save.mutate(n)}>
+            {save.isLoading ? '…' : 'Save'}
+          </button>
+        )}
+      </div>
+      <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+        {n === 0
+          ? 'Unworked hours are billed at the end of the month they were owed.'
+          : `Unworked hours carry for ${n} more ${n === 1 ? 'month' : 'months'}. After that they're billed and the agreement ends.`}
+      </div>
     </div>
   )
 }

@@ -4,6 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordIdForUser } from '../lib/scope'
+import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
 
@@ -35,6 +36,35 @@ async function getAgreementForUser(agreementId: string, user: any) {
     throw new AppError(403, 'Forbidden')
   }
   return agreement
+}
+
+/**
+ * S624: the STANDING is the one work-trade fact both audiences read.
+ *
+ * `getAgreementForUser` is landlord-scope only, which is right for everything
+ * that edits an agreement — but the hours a tenant owes are the tenant's own
+ * business, and Nic's requirement is that they appear on the tenant's invoice.
+ * Locking them behind landlord scope would mean a tenant being billed for hours
+ * they were never shown.
+ *
+ * So this resolves EITHER party, and nobody else: the landlord side through the
+ * usual scope check, and the tenant only when the agreement is theirs. It never
+ * widens what a tenant can see — one agreement, their own.
+ */
+async function getAgreementForEitherParty(agreementId: string, user: any) {
+  const agreement = await queryOne<any>(
+    'SELECT * FROM work_trade_agreements WHERE id=$1', [agreementId])
+  if (!agreement) throw new AppError(404, 'Agreement not found')
+
+  if (canManageLandlordResource(user, agreement.landlord_id, ['property_manager'])) {
+    return agreement
+  }
+  const mine = await queryOne<{ id: string }>(
+    `SELECT t.id FROM tenants t WHERE t.user_id = $1 AND t.id = $2`,
+    [user?.id, agreement.tenant_id])
+  if (mine) return agreement
+
+  throw new AppError(403, 'Forbidden')
 }
 
 // ── PROPERTY HOURS TARGET (the credit denominator) ───────────
@@ -343,20 +373,47 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
   } catch (e) { next(e) }
 })
 
+// ── WHERE THE TENANT STANDS, IN HOURS ─────────────────────────
+//
+// S624 (Nic, S623): the next invoice must state "both the new month's hours owed
+// and the hours still owed from the carried balance." Both audiences read the
+// same figures from the same place — a tenant seeing one number and a landlord
+// seeing another is how a work-trade argument starts.
+workTradeRouter.get('/:id/standing', async (req, res, next) => {
+  try {
+    await getAgreementForEitherParty(req.params.id, req.user!)
+    const { loadWorkTradeStanding } = await import('../services/workTradeStanding')
+    const standing = await loadWorkTradeStanding(
+      req.params.id,
+      typeof req.query.month === 'string' ? req.query.month : undefined)
+    if (!standing) throw new AppError(404, 'Work-trade agreement not found')
+    res.json({ success: true, data: standing })
+  } catch (e) { next(e) }
+})
+
 // ── UPDATE AGREEMENT STATUS ───────────────────────────────────
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate, monthlyHoursTarget, coveredCharges } = z.object({
+    const { status, endDate, monthlyHoursTarget, coveredCharges, carryForwardMonths } = z.object({
       coveredCharges: z.array(z.enum(
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
       // W-56: per-person target is editable on the agreement.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      // S624 (Nic): how long a shortfall may carry before it is billed in cash
+      // and the agreement ends. "My two month rule was just an example. If a
+      // landlord wants to give leniency for six months, they may choose to do
+      // so... but at some point, a landlord's gonna know that somebody's never
+      // gonna be able to physically catch up." 0 = bill at the first close.
+      carryForwardMonths: z.number().int().min(0).max(24).optional(),
     }).parse(req.body)
 
-    await getAgreementForUser(req.params.id, req.user!)
+    const before = await getAgreementForUser(req.params.id, req.user!)
+    // Only a LIVE agreement has a remainder to bill. Re-ending an ended one must
+    // not charge the tenant a second time.
+    const wasActive = (before as any)?.status !== 'ended'
 
     const updated = await queryOne<any>(`
       UPDATE work_trade_agreements SET
@@ -364,11 +421,34 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         end_date=COALESCE($2,end_date),
         monthly_hours_target=COALESCE($4,monthly_hours_target),
         covered_charges=COALESCE($5::text[], covered_charges),
+        carry_forward_months=COALESCE($6,carry_forward_months),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
-       coveredCharges ?? null]
+       coveredCharges ?? null, carryForwardMonths ?? null]
     )
-    res.json({ success: true, data: updated })
+
+    // S624 (Nic): "when the landlord marks the work trade agreement as over, any
+    // percentage of hours unpaid or uncompleted is billed immediately."
+    //
+    // Settling here rather than waiting for the next month-close is the whole
+    // point — an ended agreement has no next month, and the hours owed would
+    // otherwise sit open forever with nothing to collect them. Runs AFTER the
+    // status write so the settlement sees the agreement in its final state.
+    //
+    // Deliberately not fatal: the status change is the landlord's decision and
+    // must stand even if billing the remainder fails. A failure here leaves open
+    // periods that the month-close run will still find.
+    let settlement = null
+    if (status === 'ended' && wasActive) {
+      try {
+        const { settleAgreementOnEnd } = await import('../jobs/workTradeSettlement')
+        settlement = await settleAgreementOnEnd(req.params.id)
+      } catch (e) {
+        logger.error({ err: e, agreement_id: req.params.id },
+          '[work-trade] ending settlement failed; status change stands')
+      }
+    }
+    res.json({ success: true, data: { ...updated, settlement } })
   } catch (e) { next(e) }
 })

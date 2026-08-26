@@ -19,6 +19,13 @@ export function WorkTradePage() {
       const agreement = await apiGet(`/work-trade/unit/${(me as any).unitId}`)
       if (!agreement) { setLoading(false); return }
       const detail = await apiGet(`/work-trade/${(agreement as any).id}`)
+      // S624: the hours ledger — this month's target, anything carried, and what
+      // it would cost if it is never worked. Non-fatal: an agreement with no
+      // settlement period yet simply has no standing to show.
+      let standing: any = null
+      try { standing = await apiGet(`/work-trade/${(agreement as any).id}/standing`) }
+      catch { standing = null }
+      ;(detail as any).standing = standing
       setData(detail)
     } catch (e) {}
     setLoading(false)
@@ -67,6 +74,7 @@ export function WorkTradePage() {
   )
 
   const agreement = data.agreement
+  const standing = data.standing
   const logs = data.logs || []
   const stats = data.stats || {}
   const pending = logs.filter((l: any) => l.status === 'pending')
@@ -86,6 +94,45 @@ export function WorkTradePage() {
         </div>
       )}
 
+      {/* S624 — WHERE YOU STAND, IN HOURS.
+          Nic (S623): the invoice must state "both the new month's hours owed and
+          the hours still owed from the carried balance." A tenant told only
+          "80 hours" when they actually need 100 to get straight has been told the
+          least useful true thing available. */}
+      {standing && (standing.currentMonthHours > 0 || standing.carriedHours > 0
+                    || standing.bankedHours > 0) && (
+        <div style={style.card}>
+          <div style={style.label}>Where you stand</div>
+          <div style={{ fontSize: '.85rem', color: '#eef1f8', lineHeight: 1.6, marginTop: 4 }}>
+            {standing.summary}
+          </div>
+          {standing.carriedHours > 0 && (
+            <div style={{
+              display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap' as const,
+            }}>
+              <Figure label="This month" value={`${standing.currentMonthHours} hrs`} />
+              <Figure label="Carried over" value={`${standing.carriedHours} hrs`} />
+              <Figure label="To get straight" value={`${standing.catchUpHours} hrs`} accent />
+            </div>
+          )}
+          {standing.bankedHours > 0 && (
+            <div style={{ fontSize: '.74rem', color: '#7a8aaa', marginTop: 10, lineHeight: 1.5 }}>
+              You've worked <b>{standing.bankedHours} hours</b> ahead. Those carry forward
+              and come off future months — they never expire.
+            </div>
+          )}
+          {/* Say what happens if the hours are not worked, before it happens. */}
+          {standing.carriedHours > 0 && (
+            <div style={{ fontSize: '.74rem', color: '#7a8aaa', marginTop: 10, lineHeight: 1.5 }}>
+              If the carried hours aren't worked, that part of the bill
+              ({new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+                 .format(standing.carriedValue)}) is charged as an ordinary balance —
+              never a late fee, and you can pay it down in any amount.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Agreement header */}
       <div style={style.card}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
@@ -101,8 +148,14 @@ export function WorkTradePage() {
         <div style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px' }}>
           <div style={style.label}>How it works</div>
           <div style={{ fontSize: '.78rem', color: '#b8c4d8', lineHeight: 1.6 }}>
+            {/* S624: this used to say "next month is fully covered", which was the
+                old model — hours worked in one month credited the NEXT month's
+                bill. Rent is paid forward, so the work that pays for a month now
+                happens DURING it: your invoice sits open and unchased while you
+                work, and settles at month end from that month's own hours. */}
             Each approved hour covers <b>1/{target}</b> of your monthly bill (rent + utilities + fees).
-            Work the full <b>{target} hours</b> in a month and next month is fully covered.
+            Work the full <b>{target} hours</b> during the month and <b>that month</b> is
+            covered. Your bill stays open while you work it off — no late fees.
           </div>
         </div>
 
@@ -192,6 +245,23 @@ export function WorkTradePage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/** One number with its label. Kept local — nothing else needs it. */
+function Figure({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div>
+      <div style={{ fontSize: '.65rem', color: '#7a8aaa', textTransform: 'uppercase' as const, letterSpacing: '.06em' }}>
+        {label}
+      </div>
+      <div style={{
+        fontSize: '1.05rem', fontWeight: 800, marginTop: 2,
+        color: accent ? '#c9a227' : '#eef1f8',
+      }}>
+        {value}
+      </div>
     </div>
   )
 }
