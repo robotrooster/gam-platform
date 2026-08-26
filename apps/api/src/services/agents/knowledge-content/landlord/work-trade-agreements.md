@@ -10,9 +10,17 @@ There are no dollar rates and no per-hour wages. Each agreement has a **monthly 
 
 - Hit the full target → 100% of that month's invoice is covered.
 - Work half the target → half the invoice is covered.
-- Extra hours beyond the target earn nothing — it's a trade, not paid labor.
+- Extra hours beyond the target are banked and come off future months — they never pay out as cash, because it's a trade, not paid labor.
 
-The credit applies one month behind: approved hours logged this calendar month reduce the invoice that comes due **next** month. The dollars land on rent first, then spill into utilities and fees only when a near-full target month is worked.
+The month a tenant works is the month they're paying for. Rent is paid forward, so the work that covers a month happens **during** that month: the invoice issues as normal at the start of the month, sits open while they work it off, and **accrues no late fees** in the meantime. At month close, that month's approved hours are applied to that month's invoice. The dollars land on rent first, then spill into utilities and fees only when a near-full target month is worked.
+
+That timing is why approving logs promptly matters — hours still sitting unapproved when the month closes can't count toward it.
+
+**A shortfall carries forward in hours, not dollars.** On an 80-hour agreement, a tenant who works 60 carries 20 hours into the next month and would need 100 to be completely straight. Both figures show on their portal and yours.
+
+**You decide how long a shortfall may carry.** The **Grace** column on each agreement sets it, from 0 (settle at the end of the month the hours were owed) upward. When the window closes with hours still owed, the uncovered part of that month's bill is charged as an ordinary balance and the agreement ends. That charge never takes a late fee, and the tenant may pay it down in any amount rather than all at once. Each carried hour is valued at the rate of the month it was owed for, so a rent increase since then doesn't change what old hours are worth.
+
+Setting the grace is a judgement call worth making deliberately: at some point a tenant is far enough behind that no realistic month of work catches them up, and their portal states plainly how many hours that would take. Ending the agreement yourself does the same settlement immediately.
 
 ## Targets are per person
 
