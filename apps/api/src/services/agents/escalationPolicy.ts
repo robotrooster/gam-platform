@@ -65,11 +65,41 @@ export function mentionsLegalAction(message: string): boolean {
   return !!message && LEGAL_ACTION_INTENT.test(message)
 }
 
+/**
+ * ANNOUNCING legal action, as opposed to merely mentioning the law.
+ *
+ * Deliberately NARROWER than LEGAL_ACTION_INTENT. That pattern also matches bare
+ * topic words — "court", "eviction notice" — which is right for appending a
+ * support contact line, and wrong for forcing a handoff: "how do I serve an
+ * eviction notice?" is a routine landlord question with a routine answer, and
+ * sending it to a human every time would make the agent useless to the people
+ * who use it most.
+ *
+ * What belongs here is INTENT: someone saying they are going to act against the
+ * other party. That is a hard stop no lookup can serve.
+ */
+export const LEGAL_DISPUTE_INTENT =
+  /take legal action|legal action against|taking (them|him|her|this|my landlord|my tenant) to court|(talk|speak|spoke|talking) to (a |my )?(lawyer|attorney)|(get|hire|hiring|getting) (a |an )?(lawyer|attorney)|\bmy (lawyer|attorney)\b|\bsue\b|\bsuing\b|small claims|press charges/i
+
 export function needsARealPerson(message: string): boolean {
   if (!message) return false
   return MONEY_DISPUTE_INTENT.test(message)
     || BANK_CHANGE_PROBLEM.test(message)
     || ACCOUNT_SECURITY_INTENT.test(message)
+    // S624: A LEGAL DISPUTE IS A HARD STOP AND WAS MISSING FROM THIS LIST.
+    //
+    // The profile prompts have always called it one, using this literal example
+    // ("my landlord is illegally withholding my deposit and I want to act on
+    // it"). But the anti-over-escalation guard in agentRunner asks THIS function
+    // whether a message needs a person, and legal intent was not in it — so the
+    // guard saw "deposit", decided a tool could answer it, CANCELLED the
+    // agent's correct escalation, and looked the deposit up instead.
+    //
+    // A tenant announcing legal action got a balance figure rather than a human.
+    // That is the single worst turn in the suite to get wrong: it is where GAM
+    // has legal exposure and where the person is most distressed, and it failed
+    // in a way that looked like helpfulness.
+    || LEGAL_DISPUTE_INTENT.test(message)
 }
 
 /**
