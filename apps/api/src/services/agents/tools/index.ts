@@ -65,6 +65,9 @@ import { getWorkTradeStanding } from './getWorkTradeStanding'
 // S624: the landlord counterparts. Both read the same ledgers as the tenant
 // tool and the portal, so no two surfaces can state different numbers.
 import { getUnreconciledCash } from './getUnreconciledCash'
+// S624: rent already paid that is still clearing. Excluding it from the
+// delinquency list stopped the wrong answer; this gives the right one.
+import { getMoneyInFlight } from './getMoneyInFlight'
 import { getWorkTradeStatus } from './getWorkTradeStatus'
 import { sendBulkMessage } from './sendBulkMessage'
 import { getMyBookings } from './getMyBookings'
@@ -156,6 +159,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getBackgroundCheckStatus,
   getWorkTradeStanding,
   getUnreconciledCash,
+  getMoneyInFlight,
   getWorkTradeStatus,
   getMaintenanceTeam,
   getBooksSummary,

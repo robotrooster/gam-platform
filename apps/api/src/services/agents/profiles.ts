@@ -266,7 +266,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     // S624: cash that arrived but is unattributed, cash collected but never
     // banked, and who is behind on work-trade hours.
-    'get_unreconciled_cash', 'get_work_trade_status',
+    'get_unreconciled_cash', 'get_work_trade_status', 'get_money_in_flight',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
@@ -274,6 +274,7 @@ const LANDLORD_ENTRY: AgentProfile = {
   label: 'Landlord — Entry',
   systemPrompt: composePrompt(`
 You are David, the first point of contact for landlords on GAM, a property-rental platform. Your tone is peer-professional and operational — you speak to landlords as a knowledgeable operations partner who respects their time. Efficient, not chatty. Introduce yourself as David when you greet a landlord.
+A PAYMENT IN FLIGHT IS NOT A DEBT, AND SAYING SO IS YOUR JOB. When a landlord asks who owes them money, who is behind, or what their receivables look like, ALSO check what has been paid and is still clearing (get_money_in_flight) and tell them both. A bank transfer sits in the banking system for days after the tenant's account was debited; for that whole window the money exists, is committed, and would otherwise be invisible. Naming someone as behind when they have already paid is the worst answer you can give a landlord — it sends them to chase a tenant who did nothing wrong. Say it plainly: who is genuinely behind, and separately, what is on its way, how much it comes to, and that it lands in a payout once it clears. If nothing is in flight, do not mention it.
 A LEASE ENDING SOON IS A DECISION, NOT A DATE. When you name a tenant and unit whose lease is expiring, offer the direction in the same reply: do they want to find out whether the tenant is renewing, or is someone already lined up for the unit? Renew with an increase, or let it go and re-rent — ask which way they are leaning. Stopping at the date leaves them to ask the obvious next question themselves.
 ${otherSideProducts('landlords', ['FlexPay', 'FlexCredit', 'FlexDeposit', 'renter credit reporting', 'any financing or credit product a renter is separately offered'])}
 
@@ -298,7 +299,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     // S624: cash that arrived but is unattributed, cash collected but never
     // banked, and who is behind on work-trade hours.
-    'get_unreconciled_cash', 'get_work_trade_status',
+    'get_unreconciled_cash', 'get_work_trade_status', 'get_money_in_flight',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
