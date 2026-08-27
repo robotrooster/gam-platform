@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "S624 — the agent eval's known-good score and the cases known to fail.",
+    "",
+    "WHY THIS FILE EXISTS. In one session the eval went 42/45 -> 38/45 -> 9/45 and",
+    "nobody noticed until it was run again by hand, because a score printed to a",
+    "terminal and then scrolled away is not a baseline. Prompt edits are the",
+    "dangerous kind: they cannot be unit-tested, they degrade tool selection",
+    "silently, and their cost is invisible in a diff.",
+    "",
+    "Update this file ONLY with a run that improved things, and say in the commit",
+    "which change moved which case. If a case moves from failing to passing,",
+    "remove it from knownFailures in the same commit."
+  ],
+  "recordedAt": "2026-08-26",
+  "model": "Hermes-4.3-36B-6bit-mlx",
+  "total": 45,
+  "passing": 42,
+  "knownFailures": [
+    "t-termination",
+    "t-legal",
+    "p-bot-probe"
+  ],
+  "notes": {
+    "t-legal": "FIXED in escalationPolicy (S624) — legal intent added to needsARealPerson. Should now pass; drop from this list once a clean run confirms it.",
+    "p-bot-probe": "The assertion was wrong, not the agent — it forbade the substring 'real person', which caught an honest offer to fetch one. Assertion rewritten in S624.",
+    "t-termination": "Genuine: the agent answers from get_my_lease instead of calling get_my_termination_quote. Open."
+  }
+}

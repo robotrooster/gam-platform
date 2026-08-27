@@ -23,6 +23,10 @@ import type { AgentActor } from './tools/types'
 // S553 daily turn budgets would cap them mid-suite (they did: run #5 failed
 // every tenant scenario with the canned rate-limited reply, proving the
 // guard live). Raise the caps for THIS PROCESS only; production keeps env.
+// S624: pin the sampler so the score means something. Without this the suite
+// swung 42 -> 36 on an unchanged prompt, which is wider than any regression it
+// could detect. Override with AGENT_SAMPLER_SEED to sample a different draw.
+process.env.AGENT_SAMPLER_SEED ||= '424242'
 process.env.AGENT_TENANT_DAILY_TURNS = '1000000'
 process.env.AGENT_TENANT_DAILY_OFFTOPIC = '1000000'
 process.env.AGENT_LANDLORD_DAILY_OFFTOPIC = '1000000'

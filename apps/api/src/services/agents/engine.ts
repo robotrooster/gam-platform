@@ -137,6 +137,23 @@ export async function chatCompletion(
     max_tokens: maxTokens,
     stream: false,
   }
+  // S624 — A FIXED SEED FOR EVALUATION ONLY.
+  //
+  // The agent eval scored 42/45 and then 36/45 on a BYTE-IDENTICAL prompt file,
+  // with only one failing case in common. At temperature 0.6 the run-to-run
+  // spread is larger than any regression worth catching, so the number cannot
+  // gate anything — and it cost real work: a prompt batch was reverted on the
+  // strength of a 4-point "regression" that was almost certainly noise.
+  //
+  // Turning the temperature down is NOT the fix here: the Hermes sampler
+  // defaults above are deliberately non-greedy because Hermes degenerates into
+  // looping when sampled greedily. A seed keeps the sampling behaviour exactly
+  // as it is in production and only makes it repeatable.
+  //
+  // Unset in production, where variety between two tenants asking the same
+  // question is a feature, not a flaw.
+  const seed = process.env.AGENT_SAMPLER_SEED
+  if (seed !== undefined && seed !== '') body.seed = Number(seed)
   if (opts.tools && opts.tools.length > 0) body.tools = opts.tools
   // S617: force a lookup when the caller insists. The account-data safety net
   // asks the model to call a tool; on roughly one phrasing in five it declines

@@ -182,6 +182,54 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
 
 ---
 
+## 2c. Open items raised S624 (2026-08-26)
+
+### Documents tab has no way to UPLOAD a document — only "send" one
+Nic: "do I want to upload my specific property notices to the templates page?
+It's not something people are gonna be signing, but if we have to print and give
+notice at a property, I'd like to have all my other documents that have to
+physically be handed out kind of in a folder uploaded to this platform. I'd like
+them to show up in the documents tab but there's no upload a document button. It
+just says send a document. So that workflow is kinda broken."
+
+The gap: every document path assumes a SIGNING flow. There is no notion of a
+reference document a landlord keeps on the platform to print and hand over —
+notices, park rules, utility instructions, anything physically delivered.
+
+Not the templates page: a template is a thing that gets filled and signed. This
+is a filing cabinet. Likely wants its own storage on the property (or landlord)
+with a plain upload, and to appear in the Documents tab alongside signed ones,
+clearly marked as reference-only so nobody tries to send it for signature.
+
+Worth deciding before building: does it live per-PROPERTY (park rules differ by
+park) or per-LANDLORD (one folder for everything)? Nic's phrasing — "my specific
+property notices" — points at per-property with a landlord-wide fallback.
+
+### Move the model server off the payments host — CONFIRMED, sequenced after launch
+Nic (S624): "we're gonna do the DigitalOcean droplet for the other part of the
+server where the rent payments are not affected. Just wanted to wait till we get
+other stuff done."
+
+Why it moved from "probably a good idea" to a known risk: on 2026-08-26 the Mac
+Studio took a KERNEL PANIC under sustained agent-eval load —
+
+    panic(cpu 9): "completeMemory() prepare count underflow" @IOGPUMemory.cpp:550
+
+A GPU memory-accounting bug in macOS, triggered by continuous Metal allocation
+from the 36B model. Apple's bug that userspace can panic the kernel; the trigger
+was ours.
+
+That one machine runs the production API, Postgres, marketing, storefront,
+embeddings AND the model. So an AGENT workload can take down RENT COLLECTION.
+It cost nothing this time — no tenants were live and Postgres replayed its WAL
+cleanly — but the same panic during a September rent run is a different event.
+
+Jitsi already has its own droplet for related reasons. The model (and probably
+embeddings with it) should follow. Minimum bar: the payments API and the
+database must not share a host with GPU inference.
+
+Interim discipline: never run agent evals back-to-back. One run, then a pause.
+
 ## 3. Post-launch backlog
 
 **Deposit custody — Jiko T-bills, near-term, NOT a launch blocker (Nic, S604).**
