@@ -1,6 +1,6 @@
 # SESSION 625 HANDOFF
 
-End of S624. 22 commits. Supersedes SESSION_623_HANDOFF.md.
+End of S624. 24 commits, **ALL DEPLOYED**. Supersedes SESSION_623_HANDOFF.md.
 
 Nic is asleep. He asked for an overnight session: keep testing, keep fixing,
 rinse and repeat until the agents are 100%. Read §0 before you run anything.
@@ -47,7 +47,19 @@ but a crash loop with nobody awake is not.
 
 ## 1. WHAT IS LIVE IN PRODUCTION RIGHT NOW
 
-Deployed 14:04 today, verified. The API `dist` is from **13:55**.
+**EVERYTHING IS DEPLOYED.** Final deploy 20:18, API `dist` from **20:27**, all
+surfaces in sync, 5588 tests green through the gate. There is nothing sitting
+committed-but-unshipped, and `HEAD` is a clean revert point — Nic's reasoning:
+"if we're in a safe enough spot to do a handoff, we're in a safe enough spot to
+have a spot to revert back to if future testing doesn't go as good as we want."
+
+Verified after deploy:
+- `/health` → `{"status":"ok","db":"up"}` (it now actually checks the database)
+- live consumer Terms → `$6.00 manual-payment fee`
+- 4 cron engines registered across **2 timezones** (Phoenix + New_York)
+
+**Agent code IS live**, including the legal-dispute escalation and the forced
+money handoff. Portal invites are no longer blocked on a deploy.
 
 - **Work trade pays for the month you are living in.** Invoice issues GROSS and
   `late_fee_exempt`, month-close settles it from that month's own hours,
@@ -66,20 +78,27 @@ Deployed 14:04 today, verified. The API `dist` is from **13:55**.
   Carolina property was billing on Arizona time.
 - **`deploy.sh` gates on the test suite** and refuses to ship red.
 
-## 2. COMMITTED BUT **NOT** DEPLOYED
+## 2. THE DEPLOY GATE EARNED ITSELF ON ITS FIRST BLOCK
 
-Everything from `78da03e` onward — all the agent work. The live API predates:
+The final deploy was REFUSED the first time: six failures in
+`declaredDeposits.test.ts`. They were not flaky.
 
-- the legal-dispute escalation fix (a tenant announcing legal action currently
-  gets a **balance lookup instead of a human**)
-- the forced money handoff
-- the bot-probe fix
-- the lead-capture net and repetition guard
-- `get_money_in_flight`, `get_unreconciled_cash`, `get_work_trade_status`,
-  `get_work_trade_standing`
+"I paid at the bank" compared the tenant's date against PHOENIX'S date and
+rejected anything ahead of it. A tenant east of the property is legitimately on
+tomorrow's date for part of every evening — someone in New York reporting at 10pm
+is on the 27th while an Arizona property is still on the 26th — so GAM told them
+their deposit was in the future and refused it.
 
-**Nic must not send portal invites until this deploys.** `bash deploy.sh` runs
-the suite first (~8 min) — that is expected, not a hang.
+It surfaced because the test helper used `toISOString()` (UTC), so after 5pm
+Phoenix it sent tomorrow's date. The suite passed all afternoon and started
+failing that evening. **The test bug and the product bug were the same bug from
+two sides**, and only one of them mattered.
+
+Fixed (one day of slack, covering every US offset) and deployed. Without the gate
+that ships, and only ever appears as a support ticket months later.
+
+**Lesson for tonight: when the gate blocks, READ THE FAILURE.** Do not reach for
+`--skip-tests`.
 
 ---
 
