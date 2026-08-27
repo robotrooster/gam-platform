@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "S624 — the agent eval's known-good score and the cases known to fail.",
+    "S624 \u2014 the agent eval's known-good score and the cases known to fail.",
     "",
     "WHY THIS FILE EXISTS. In one session the eval went 42/45 -> 38/45 -> 9/45 and",
     "nobody noticed until it was run again by hand, because a score printed to a",
@@ -15,15 +15,13 @@
   "recordedAt": "2026-08-26",
   "model": "Hermes-4.3-36B-6bit-mlx",
   "total": 45,
-  "passing": 42,
-  "knownFailures": [
-    "t-termination",
-    "t-legal",
-    "p-bot-probe"
-  ],
+  "passing": 45,
+  "knownFailures": [],
   "notes": {
-    "t-legal": "FIXED in escalationPolicy (S624) — legal intent added to needsARealPerson. Should now pass; drop from this list once a clean run confirms it.",
-    "p-bot-probe": "The assertion was wrong, not the agent — it forbade the substring 'real person', which caught an honest offer to fetch one. Assertion rewritten in S624.",
-    "t-termination": "Genuine: the agent answers from get_my_lease instead of calling get_my_termination_quote. Open."
-  }
+    "howThisWasReached": "45/45 across two paced blocks (21 tenant, 24 landlord/guest/prospect). Four of the six problems fixed to get here were GUARDS OR ASSERTIONS punishing correct behaviour, not agents being wrong.",
+    "readItAsADiff": "One seeded run is ONE DRAW. It makes a change comparable before and after, which is what regression detection needs. It is not a grade \u2014 a clean score is not proof the agents are good.",
+    "doNotChunkAndCompare": "The seed is per PROCESS, so a chunked run and a single run are not comparable to each other. Compare like with like."
+  },
+  "seed": "424242 (AGENT_SAMPLER_SEED, set by agentEval.ts)",
+  "pacing": "AGENT_EVAL_PAUSE_MS, default 3000 \u2014 the host kernel-panicked twice under unpaced runs"
 }
