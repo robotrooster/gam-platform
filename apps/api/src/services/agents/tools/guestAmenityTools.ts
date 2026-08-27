@@ -1,7 +1,7 @@
 /**
  * Guest amenity tools (S553) — the stay-link guest's amenity window.
  *
- * get_guest_amenities (READ) — reservable amenities at the property the
+ * get_guest_amenities (READ) — the amenities at the property the
  * guest is staying at, plus their own reservations. Scoped through
  * actor.bookingId only.
  *
@@ -120,7 +120,18 @@ export const requestGuestAmenityReservation: AgentTool = {
 
     const area = await loadArea(areaId)
     if (!area || area.property_id !== b.property_id || !area.active) return { ok: false, error: 'No such amenity at this property.' }
-    if (!area.reservable) return { ok: false, error: 'That area is not reservable.' }
+    // S626: a dead-end string became a likelier path the moment the list above
+    // stopped hiding non-reservable areas — a guest who can now SEE the laundry
+    // will ask to book it. The error says what to tell them instead, because a
+    // tool error is what the agent repeats.
+    if (!area.reservable) {
+      return {
+        ok: false,
+        error: `${area.name} is open to use during the stay but is not something that gets reserved — ` +
+          'there is no booking to make. Tell them it is there and free to use, with the hours if the ' +
+          'listing gives any. Do not apologise for it and do not offer to ask the host.',
+      }
+    }
 
     // The reservation day must fall inside THIS stay (same check as the
     // public stay-link route — status + date window).

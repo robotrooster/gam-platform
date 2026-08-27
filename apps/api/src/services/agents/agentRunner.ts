@@ -671,6 +671,38 @@ const FIRST_PERSON =
   /\b(?:i'?ll|i\s+will|i'?m|i\s+am|let\s+me(?!\s+know)|we'?ll|we\s+will|lemme|one\s+moment|just\s+a\s+(?:moment|sec(?:ond)?)|hang\s+on|give\s+me\s+a\s+(?:sec(?:ond)?|moment))\b/i
 
 /**
+ * The agent promising to DO something, when nothing ran.
+ *
+ * S626. QUESTING_VERB covers going and LOOKING — look up, check, pull, verify.
+ * It has never covered ACTING, so "I'll file a maintenance request for the
+ * leaking kitchen sink. How urgent is this issue?" passed every guard in the
+ * file: it is not a past-tense claim, so claimsAnActionItNeverTook missed it,
+ * and it promises no lookup, so saysItWillCheck missed it too.
+ *
+ * Nothing was filed. The tenant in the two-turn suite happens to reply, and the
+ * request gets filed on turn two — which is why this never showed up as a
+ * failure. A tenant who reads "I'll file a maintenance request" and closes the
+ * tab has reported a leak to nobody, and the first anyone hears of it is the
+ * damage.
+ *
+ * profiles.ts has said so since S552, in its own words: "Phrases like 'I'll
+ * file that' do NOTHING on their own and strand the customer." It was never
+ * enforced.
+ *
+ * Promises of a PERSON are deliberately excluded — an escalation has its own
+ * net (synthesizeHandoff) and its own rules about when it is allowed.
+ */
+const ACTION_VERB =
+  /\b(file|filing|submit(?:ting)?|open(?:ing)?|log(?:ging)?|report(?:ing)?|put(?:ting)?\s+(?:that|this|it|in)|send(?:ing)?|schedul\w+|book(?:ing)?|cancell?(?:ing|ed|s)?|creat\w+|rais(?:e|ing)|start(?:ing)?|set(?:ting)?\s+(?:that|this|it)?\s*up|arrang\w+|add(?:ing)?|remov\w+|updat\w+)\b/i
+
+export function promisesAnAction(text: string): boolean {
+  if (!text) return false
+  if (promisesHandoff(text)) return false
+  return (text.match(/[^.!?\n]+[.!?]*/g) ?? [text])
+    .some((sentence) => FIRST_PERSON.test(sentence) && ACTION_VERB.test(sentence))
+}
+
+/**
  * The agent claiming it ALREADY DID something, when nothing ran.
  *
  * S618, and this is the worst thing measured all session. A tenant said "tell
@@ -943,6 +975,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForRepeat = false
   let nudgedForWaiverMath = false
   let nudgedForSalesTime = false
+  let nudgedForPromisedAction = false
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
@@ -1310,6 +1343,39 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'agent runner: reply named invented records twice — reply suppressed')
           return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
         }
+      }
+      // S626: the turn promised to DO something and did nothing. See
+      // promisesAnAction. Only when NO tool ran at all — if something ran, the
+      // promise has an action behind it and the padding/invention nets own the
+      // rest.
+      if (
+        !nudgedForPromisedAction &&
+        toolInvocations.length === 0 &&
+        promisesAnAction(out.content)
+      ) {
+        nudgedForPromisedAction = true
+        logger.warn({ profile: profile.id, message },
+          'agent runner: reply promised an action and called nothing — forcing one retry')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — you just told them you would do something, and you called no tool, so nothing ' +
+            'happened. If they stop replying now, the thing you promised does not exist and they ' +
+            'will not know.\n' +
+            'Do it NOW: call the tool that performs it, in this reply, and then tell them it is done ' +
+            'and what happens next.\n' +
+            // S626: this is the specific stall that produced the bug. The
+            // maintenance tool requires only a title and a description; the
+            // model held the whole filing hostage to a priority it did not need.
+            'Do not wait on optional details first. If the tool only requires what you already have, ' +
+            'call it with that and use a sensible default for the rest — you can ask about urgency, ' +
+            'category or extras AFTER it is filed, and then update it. Filing late is recoverable; ' +
+            'not filing is not.\n' +
+            'If no tool you hold can actually do it, say so plainly and tell them who can — do not ' +
+            'promise it in the hope it resolves itself.',
+        })
+        continue
       }
       // S626: a sales turn that offered or confirmed a TIME without ever opening
       // the calendar. See OFFERS_A_MEETING_TIME. Prospect only — no other
