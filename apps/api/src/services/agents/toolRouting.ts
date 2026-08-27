@@ -464,6 +464,33 @@ const TENANT_ROUTES: PhraseRoute[] = [
       /\bif i pay (rent )?late\b/i,
     ],
   },
+  {
+    // S626: unrouted until now. See routeCoverage.test.ts — this tool and 28
+    // others were reachable only when the model happened to pick them, which is
+    // how t-amenities, l-books and g-amenities all failed at once on one prompt
+    // change. Distinctive vocabulary, and placed at the END of the tenant routes
+    // so every lease/balance/complaint route above keeps first refusal.
+    tools: ['get_my_contacts'],
+    audience: 'tenant',
+    means: 'who to contact about the property, and how',
+    patterns: [
+      /\b(who('?s| is)|who do i)\b[^?]{0,30}\b(property manager|landlord|manager|contact|call|email|talk to|reach)\b/i,
+      /\bhow do i (reach|contact|get (hold|a hold) of|get in touch with)\b/i,
+      /\b(contact (details|info\w*|number)|phone number|email address)\b[^?]{0,25}\b(landlord|manager|office|property)\b/i,
+      /\b(landlord|manager|office)('?s)?\b[^?]{0,20}\b(phone|number|email|contact)\b/i,
+    ],
+  },
+  {
+    tools: ['get_my_notifications'],
+    audience: 'tenant',
+    means: 'the tenant\'s own alerts and unread notices',
+    patterns: [
+      /\bnotifications?\b/i,
+      /\b(any )?(new |unread )?(alerts?|notices?)\b[^?]{0,20}\bfor me\b/i,
+      /\banything (new|i (missed|need to know))\b/i,
+      /\bdo i have any (updates|alerts|notifications)\b/i,
+    ],
+  },
 ]
 
 /**
@@ -722,6 +749,29 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bunit by unit\b/i,
       /\brents? (by|per) unit\b/i,
       /\bhow much (rent )?(am i|do i) collect\b/i,
+    ],
+  },
+  {
+    // S626: unrouted until now — see routeCoverage.test.ts.
+    tools: ['get_my_payouts'],
+    audience: 'landlord',
+    means: 'money on its way to the landlord\'s bank',
+    patterns: [
+      /\bpay ?outs?\b/i,
+      /\bwhen (do|will) i get paid\b/i,
+      /\bwhen (does|will)\b[^?]{0,30}\b(hit|land in|reach|arrive in)\b[^?]{0,15}\b(my )?(bank|account)\b/i,
+      /\b(next|last) (deposit|transfer)\b[^?]{0,20}\b(from gam|to my bank)\b/i,
+    ],
+  },
+  {
+    tools: ['get_pending_applications'],
+    audience: 'landlord',
+    means: 'rental applications waiting on the landlord',
+    patterns: [
+      /\bapplications?\b/i,
+      /\bapplicants?\b/i,
+      /\bwho('?s| has)\b[^?]{0,20}\bapplied\b/i,
+      /\banyone (applied|applying)\b/i,
     ],
   },
 ]

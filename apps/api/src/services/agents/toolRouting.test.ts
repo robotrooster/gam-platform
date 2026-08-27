@@ -24,12 +24,12 @@ const TENANT_TOOLS = [
   // S626: the tenant profile has held this since S552; this hand-maintained
   // fixture had never listed it, so the first route to it failed the
   // audience-line check against a list that was simply out of date.
-  'get_my_amenities',
+  'get_my_amenities', 'get_my_contacts', 'get_my_notifications',
 ]
 const LANDLORD_TOOLS = [
   'lookup_tenant_payment_status', 'get_delinquent_tenants', 'get_unit_lease',
   'get_late_payment_history', 'get_vacant_units', 'get_landlord_portfolio',
-  'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_books_summary',
+  'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_books_summary', 'get_my_payouts', 'get_pending_applications',
   'get_profit_and_loss',
   'get_lease_expirations', 'get_pending_maintenance', 'get_property_rent_roll',
 ]
