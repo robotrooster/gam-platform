@@ -18,6 +18,7 @@
 
 import { chatCompletion } from './engine'
 import { retrieve, type RetrievedChunk } from './knowledge'
+import { DateTime } from 'luxon'
 import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
@@ -449,8 +450,73 @@ function claimedDaysLate(message: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+/**
+ * WHAT DAY IS IT?
+ *
+ * S626, and nothing in this system had ever told an agent. Not the system
+ * prompt, not the context block, not a tool result — so every agent reasoned
+ * about dates from its training prior, and Hermes' prior is 2024.
+ *
+ * It surfaced on the booking site, where it was worst. A visitor asked about
+ * "the 15th to the 20th"; profiles.ts correctly says to ask which month rather
+ * than declare the dates past; the agent asked — and then proposed "September
+ * 2024". Told September, it tried 2025. Both are in the past, so
+ * check_availability rejected both, and the customer was asked which month
+ * twice in a row while the agent cycled through years it had guessed. Handing
+ * it the exact ISO date to use did not help, because a model that does not know
+ * the year cannot tell that the string it was given is the right one.
+ *
+ * It is not a booking bug. A date-blind agent cannot judge whether a lease ends
+ * "soon", whether a payment is late, or what "next month" means — it had simply
+ * never been measured anywhere else.
+ *
+ * Deliberately three short lines. Prompt length costs tool selection, and this
+ * sits in every turn for every audience.
+ */
+export function buildTemporalBlock(now: DateTime): string {
+  return [
+    `TODAY IS ${now.toFormat('cccc, d LLLL yyyy')} (${now.zoneName}). The current year is ${now.year}.`,
+    `Every date you state or pass to a tool must agree with that. Never write a year you have not been given.`,
+    `A bare day number means the soonest that day is still ahead — this month if it has not passed, otherwise next month. Never a past date.`,
+  ].join('\n')
+}
+
+/**
+ * Did a sales reply put a TIME in front of a prospect without opening the calendar?
+ *
+ * S626. Asked "can I talk to someone?", Lucy answered: "I've got a few times
+ * open today and tomorrow. How about tomorrow at 1:00 PM MST? I can send over a
+ * calendar invite once we confirm." She had called nothing. Told "Tuesday
+ * afternoon would work for me", she replied "I'll send over the calendar invite
+ * for tomorrow at 1:00 PM" — ignoring the day they picked, and promising an
+ * invite that no tool was ever going to send.
+ *
+ * S620 fixed the version of this that CLAIMED a booking. This is the version
+ * that PROMISES one, and claimsAnActionItNeverTook is past-tense only, so
+ * nothing caught it. A prospect who believes a call is booked stops looking for
+ * a platform, and nobody finds out until the call does not happen.
+ *
+ * The sales calendar is real — listAvailableSlots reads live windows from
+ * sales_call_availability, excludes booked slots and honours the notice period.
+ * There is no reason to guess at it.
+ */
+const OFFERS_A_MEETING_TIME = new RegExp([
+  // a clock time: "1:00 PM", "1pm", "at 2 PM MST"
+  /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/,
+  // a named day being proposed or confirmed
+  /\b(?:how about|what about|does|would|shall we say|let's say|pencil(?:ling)? (?:you )?in|set (?:you )?up for)\b[^.?!]{0,40}\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week)\b/,
+  // promising the artefact of a booking
+  /\b(?:calendar invite|meeting invite|invite|invitation)\b/,
+  /\b(?:i'?ll|i will|i can)\s+(?:send|shoot|fire|get)\b[^.?!]{0,30}\b(?:invite|link|calendar|confirmation)\b/,
+].map((r) => r.source).join('|'), 'i')
+
+/** The scheduling tools. Any one of them means the calendar was actually opened. */
+const SCHEDULING_TOOLS = new Set(['get_available_call_times', 'book_sales_call'])
+
 /** Exposed for waiverMath.test.ts — these are guard internals, not API. */
 export const __waiverInternals = { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults }
+/** Exposed for salesTimeGuard.test.ts — guard internals, not API. */
+export const __salesInternals = { OFFERS_A_MEETING_TIME }
 
 /**
  * Did this reply just re-answer the PREVIOUS turn?
@@ -813,6 +879,9 @@ export interface RunWithToolsInput {
   minSimilarity?: number
   /** max model<->tool round trips before giving up. Default 4. */
   maxSteps?: number
+  /** IANA zone the agent should consider "today" in. Defaults to the platform's
+   *  America/Phoenix — see buildTemporalBlock. */
+  timezone?: string
 }
 
 export interface ToolInvocation {
@@ -855,8 +924,14 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const tools = getToolsForProfile(profile)
   const toolSchemas = tools.map(toToolSchema)
 
+  // The platform's own timezone. GAM is Arizona-based and every other piece of
+  // business logic defaults here; what matters for an agent is the DATE, which
+  // only differs across US zones for a few hours around midnight.
+  const now = DateTime.now().setZone(input.timezone || 'America/Phoenix')
+
   const messages: ChatMessage[] = [
     { role: 'system', content: profile.systemPrompt },
+    { role: 'system', content: buildTemporalBlock(now) },
     { role: 'system', content: buildContextBlock(retrieved) },
     ...history,
     { role: 'user', content: message },
@@ -867,6 +942,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForPadding = false
   let nudgedForRepeat = false
   let nudgedForWaiverMath = false
+  let nudgedForSalesTime = false
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
@@ -1234,6 +1310,74 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'agent runner: reply named invented records twice — reply suppressed')
           return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
         }
+      }
+      // S626: a sales turn that offered or confirmed a TIME without ever opening
+      // the calendar. See OFFERS_A_MEETING_TIME. Prospect only — no other
+      // audience books anything on this calendar.
+      if (
+        !nudgedForSalesTime && profile.audience === 'prospect' &&
+        !toolInvocations.some((t) => SCHEDULING_TOOLS.has(t.name)) &&
+        OFFERS_A_MEETING_TIME.test(out.content)
+      ) {
+        nudgedForSalesTime = true
+        // S626: ASKING DOES NOT WORK HERE, AND NEITHER DOES INSISTING.
+        //
+        // First attempt pushed the correction and left the tools optional. The
+        // model agreed with it and answered "Let me check the available times.
+        // I'll send over the calendar invite once we confirm" — still calling
+        // nothing, now promising twice. Second attempt set tool_choice
+        // 'required', which S617 relies on elsewhere; instrumented, the turn
+        // came back with content and an EMPTY tool_calls array anyway. Whatever
+        // the local server does with tool_choice on this profile, it is not
+        // guaranteeing a call.
+        //
+        // So take the same route the phrase table takes when the model will not
+        // call a lookup: RUN IT, and hand back the result. Real slots in the
+        // context beat any instruction about fetching them, and
+        // get_available_call_times takes no arguments, so nothing is being
+        // guessed on the model's behalf — which is the line that path draws.
+        logger.warn({ profile: profile.id, message },
+          'agent runner: sales reply offered a meeting time with no calendar lookup — running it directly')
+        const slotsTool = getTool('get_available_call_times')
+        const slotsCall: ToolCall = {
+          id: 'routed_get_available_call_times',
+          type: 'function' as const,
+          function: { name: 'get_available_call_times', arguments: '{}' },
+        }
+        if (slotsTool && getToolsForProfile(profile).some((t) => t.name === 'get_available_call_times')) {
+          const slotsResult = await executeToolCall(slotsCall, profile, actor, {})
+          toolInvocations.push({ name: 'get_available_call_times', args: {}, result: slotsResult })
+          // content: null — the invented time is not evidence of anything, and
+          // handing the model its own claim back is how S618 got it restated.
+          messages.push({ role: 'assistant', content: null, tool_calls: [slotsCall] })
+          messages.push({
+            role: 'tool', tool_call_id: slotsCall.id,
+            name: 'get_available_call_times', content: JSON.stringify(slotsResult),
+          })
+        } else {
+          messages.push({ role: 'assistant', content: out.content })
+        }
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — your last reply put a meeting time in front of a prospect, or promised them an ' +
+            'invite, and you had not opened the calendar. Those times were invented and nothing you ' +
+            'said would have sent anything.\n' +
+            'The real openings are in the tool result above. Offer two or three of THOSE, ' +
+            'conversationally — never the whole list.\n' +
+            'If they have already named a day or a rough time, honour it: offer what is free then, ' +
+            'and if nothing is, say so plainly and offer the nearest alternative. Do not quietly ' +
+            'move them to a different day.\n' +
+            'ASK FOR THEIR NAME AND EMAIL IN THIS SAME REPLY. book_sales_call cannot run without ' +
+            'both, so a slot offered without them goes nowhere — offer the time and ask for the two ' +
+            'details together, in one short line: "Tuesday at 1 works — what name and email should I ' +
+            'put on it?" Offering a time and waiting is the failure; it leaves the prospect thinking ' +
+            'something is being held when nothing is.\n' +
+            'Nothing is scheduled until book_sales_call has run: do not say an invite is coming, do ' +
+            'not say you will send anything, and do not say "once we confirm" as though the booking ' +
+            'is already in motion.',
+        })
+        continue
       }
       // S626: a waiver request answered without the arithmetic. Nic's note on
       // this exact conversation: "do the math out loud — the grace period

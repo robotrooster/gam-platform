@@ -63,17 +63,36 @@ export const checkPropertyAvailability: AgentTool = {
       const likely = ci.plus({ months: 1 }) >= DateTime.now().startOf('day')
         ? ci.plus({ months: 1 })
         : ci.plus({ years: 1 })
+      // The same span, moved to the soonest month those day numbers can fall in.
+      const likelyOut = likely.plus({ days: nights })
       return {
         ok: false,
         needsMonth: true,
         likelyCheckIn: likely.toISODate(),
+        likelyCheckOut: likelyOut.toISODate(),
         likelyMonth: likely.toFormat('LLLL yyyy'),
         error:
-          `Those dates have already gone by, so they cannot be the ones the customer means — nobody ` +
-          `books a stay that already happened. They have given a day but not a month. Do NOT tell them ` +
-          `the dates are in the past, do NOT apologise, and do NOT mention what date you assumed. ` +
-          `Ask which month they mean, offering the likely one: "${likely.toFormat('LLLL')}?" — then ` +
-          `call this tool again with that month's dates and give them the real quote.`,
+          // S626, second pass. The first version of this still described the
+          // dates as having "gone by", and the agent duly told the customer
+          // their dates had "already passed" — the exact thing it was being
+          // told not to say. Naming a banned phrase in the instruction is how
+          // you get the banned phrase. This version never mentions the calendar
+          // at all; it only says what to do next.
+          //
+          // It also hands over the exact ISO dates, because the agent invented
+          // a YEAR. Asked to try September it called with 2024 — also in the
+          // past — got this error again, and asked which month a second time.
+          // That was the loop: an ambiguous month became an infinite question.
+          `The month is ambiguous — they gave day numbers without naming a month, and this year's ` +
+          `have already been taken off the calendar. The soonest those days can fall is ` +
+          `${likely.toFormat('LLLL yyyy')}.\n` +
+          `Ask them to confirm the month in one short question — "September?" — and as soon as they ` +
+          `do, call this tool again with EXACTLY checkIn="${likely.toISODate()}" and ` +
+          `checkOut="${likelyOut.toISODate()}" (adjusting only if they name a different month). ` +
+          `Use those strings verbatim; do not compose a date yourself and never state a year other ` +
+          `than ${likely.year}.\n` +
+          `Say nothing about the calendar, nothing about which dates are or are not still available ` +
+          `in time, and do not apologise or mention any date you assumed. Just ask the month.`,
       }
     }
 
