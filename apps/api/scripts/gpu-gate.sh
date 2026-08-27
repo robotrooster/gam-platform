@@ -49,6 +49,21 @@ minutes_last_hour() {
 
 load_now() { uptime | sed -E 's/.*load averages?: *([0-9.]+).*/\1/'; }
 
+# ── HARD STOP, S626 ────────────────────────────────────────────────────────
+# Two kernel panics in 71 minutes, both DURING a run rather than between runs.
+# GPU work on this machine is disabled until Nic clears it. Delete this block,
+# or set GPU_GATE_OVERRIDE=1, to re-enable — deliberately a decision somebody
+# has to make on purpose.
+if [ "${1:-status}" = "acquire" ] && [ "${GPU_GATE_OVERRIDE:-0}" != "1" ]; then
+  echo "✗ GPU WORK IS DISABLED (S626 hard stop)."
+  echo "  Panics 2026-08-27 10:05 and 11:16, both mid-run. The pacing gate did"
+  echo "  not prevent either, because the smallest useful unit of GPU work here"
+  echo "  — one eval, ~26 minutes of continuous inference — is already longer"
+  echo "  than the machine survives. Idle gaps between jobs cannot fix that."
+  echo "  Re-enable only with a deliberate GPU_GATE_OVERRIDE=1."
+  exit 3
+fi
+
 case "${1:-status}" in
   acquire)
     if [ -f "$RUNNING" ]; then
