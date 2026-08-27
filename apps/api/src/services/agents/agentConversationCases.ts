@@ -63,6 +63,12 @@ export interface Conversation {
   expectToolAny?: string[]
   /** turn two must NOT run any tool (e.g. a decline) */
   expectNoTool?: boolean
+  /** tools that must NOT run on turn two, while others still may.
+   *  S626: "did it do it twice?" had no way to be expressed. expectNoTool is
+   *  all-or-nothing, so the only way to say "do not file a SECOND request" was
+   *  to forbid every tool — which would also forbid checking the status of the
+   *  first, a perfectly good thing to do. */
+  mustNotTool?: string[]
   /** a fact that must appear in the second reply */
   expect?: string
   expectAny?: string[]
@@ -137,10 +143,27 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
     // holding: a real row on the landlord's board and a maintenance history
     // that disagrees with itself.
     followUp: 'ok great, thanks — so that is definitely logged?',
-    // The offer must become a real row on turn ONE. "I'll file that" with
-    // nothing behind it is the failure that put an empty complaints table in
-    // front of a tenant who thought they had filed one.
-    expectTool: 'file_maintenance_request',
+    // S626: THIS ASSERTION DEMANDED THE DEFECT IT WAS WRITTEN TO CATCH.
+    //
+    // The comment underneath said the filing must happen on turn ONE — and the
+    // harness checks expectTool against turn TWO. So the suite required
+    // file_maintenance_request to run again on the confirmation, which is
+    // exactly the duplicate row Nic called "the actual defect": a real row on
+    // the landlord's board and a maintenance history that disagrees with
+    // itself. It passed all day by filing twice.
+    //
+    // It went unnoticed because turn one never filed at all — it said "I'll
+    // file a maintenance request" and called nothing (see promisesAnAction in
+    // agentRunner). One row per run, created on turn two, so the count looked
+    // right. Two bugs cancelling out.
+    //
+    // Now: turn one files, turn two must not file again. Checking the STATUS of
+    // the existing request on turn two is fine and rather good, so this forbids
+    // the one tool rather than all of them.
+    mustNotTool: ['file_maintenance_request'],
+    // Nic: "acknowledge and add the useful next fact — 'yep, good to go,
+    // maintenance usually gets back within 24-48 hours'."
+    expectAny: ['24', '48', 'hours', 'landlord', 'open', 'soon'],
     mustNotContain: [
       "I'll file", "I'll get that", "I'll put that in", "I'll submit",
       // Filing it twice, or announcing a second filing.

@@ -141,6 +141,8 @@ async function runConversation(conv: Conversation, actor: any): Promise<Result> 
     flags.push(`WRONGTOOL(wanted any of ${conv.expectToolAny.join(' / ')})`)
   }
   if (conv.expectNoTool && tools2.length) flags.push(`UNWANTEDTOOL(${tools2.join(', ')})`)
+  const banned = (conv.mustNotTool ?? []).filter((t) => tools2.includes(t))
+  if (banned.length) flags.push(`RANTWICE(${banned.join(', ')})`)
   if (conv.expect && !turn2.toLowerCase().includes(conv.expect.toLowerCase())) {
     flags.push(`MISSING("${conv.expect}")`)
   }

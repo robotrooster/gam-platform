@@ -224,7 +224,21 @@ export const SEEKS_A_FACT =
 export const ANSWERABLE_FROM_MEMORY = [
   // "how do I ...", "where do I ...", "can I ..." — procedure, not data.
   /\b(how|where)\s+(do|can|would)\s+(i|we|you)\b/i,
-  /\b(can|could)\s+(i|we)\s+(pay|add|set up|create|file|report|upload|invite|book|reserve|cancel|renew)\b/i,
+  // S626: ANCHORED TO THE START, and that anchor is the whole point.
+  //
+  // Unanchored, this matched "what amenities can I reserve at my property?" —
+  // and exempted it. So the eval's t-amenities case never demanded a lookup,
+  // the phrase table was never consulted, and adding a route for
+  // get_my_amenities changed nothing at all: demandsAToolCall had already said
+  // no before routing was ever reached. The tool looked unreachable when what
+  // was actually broken sat one layer above it.
+  //
+  // "can I pay with a card?" is a procedure and belongs here. "WHAT can I
+  // reserve at MY property" is a list of their own amenities and never did.
+  // The difference is whether the sentence opens with the "can I", so that is
+  // what is tested — with a little slack for the way people actually start
+  // sentences.
+  /^\W*(?:so|ok|okay|hey|hi|and|but|also)?[\s,]*(can|could)\s+(i|we)\s+(pay|add|set up|create|file|report|upload|invite|book|reserve|cancel|renew)\b/i,
   // "How does X work" for a PLATFORM MECHANIC. Nic's test: what would a GAM
   // customer service rep know off the top of their head, versus what would they
   // have to look up? A rep explains e-signing, invites or autopay setup from

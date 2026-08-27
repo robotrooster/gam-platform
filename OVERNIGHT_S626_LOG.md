@@ -181,3 +181,50 @@ bash apps/api/scripts/gpu-gate.sh release   # ALWAYS on job end
 - **30 GPU minutes per rolling hour**, ledgered.
 - One job at a time, enforced by a lock rather than by my memory.
 - Load is still checked, but as a floor, never as the sole gate.
+---
+
+## Iteration 4 — the eval caught a real regression, and named a systemic one
+
+Post-panic eval: **45/45 → 42/45.** The gate refused it, correctly, and nothing
+shipped. Three failures:
+
+```
+t-amenities   did not call get_my_amenities    (called: none)
+l-books       did not call get_books_summary   (called: none)
+g-amenities   did not call get_guest_amenities (called: get_guest_booking)
+```
+
+**They were not three bugs. They were three symptoms of one.** Every one was a
+tool with **no phrase route behind it**, passing only because the model happened
+to pick it unaided. The first prompt change of the day tipped all three at once.
+
+`g-amenities` is the instructive one, and it is mine. S624 had put *"You do NOT
+need their booking first"* into `get_guest_amenities`' description precisely to
+stop the model looking up the booking to find out where the guest is. I
+lengthened that description to cover non-reservable amenities and left the S624
+line at the end. It regressed to `get_guest_booking` on the next eval — the
+exact S624 failure, reproduced. The sentence was still there and no longer
+carried.
+
+> **A fix buried at the end of a longer description is a fix you have deleted.**
+
+### The systemic finding — `routeCoverage.test.ts`
+
+If three tools were reachable only by luck, which others are? Twenty-nine —
+counting only the ones a route could actually help (READ tools with no required
+parameters, the same line the forced path draws). `get_my_contacts` and
+`get_my_payment_status` are on that list and pass the eval **today**: unrouted
+does not mean broken, it means the case works by luck and nothing tells you when
+the luck runs out.
+
+Four routed this session → **25 left**, locked behind a ratchet. Adding a lookup
+without a route now fails in three seconds on CPU instead of on the next
+26-minute eval run.
+
+Two things fell out of writing the tenant route:
+- *"someone is smoking by the pool"* matched **nothing at all** — the complaint
+  pattern requires "in my spot", so a complaint about behaviour in a COMMON area
+  routed nowhere.
+- "pool" and "laundry" name a facility *and* a thing that breaks. The route
+  requires the question word BEFORE the noun, so "is there a pool" matches and
+  "my washer is broken" stays maintenance.
