@@ -123,7 +123,12 @@ export const SCENARIOS: Scenario[] = [
     ],
     message: 'yes, send it now.',
     expect: { anyTools: ['send_bulk_message', 'post_service_interruption'] } },
-  { id: 'l-portfolio', audience: 'landlord', message: 'give me a quick overview of my portfolio', expect: { tools: ['get_landlord_portfolio'] } },
+  // S624: BOTH of these honestly answer "a quick overview" — get_landlord_portfolio
+  // gives properties/units and occupied-vs-vacant, get_portfolio_stats gives
+  // occupancy rate, rent roll and how much arrives late. Demanding one and
+  // failing the other marked a good answer wrong, which is the same mistake the
+  // bot-probe assertion made. Grade the intent, not the pick.
+  { id: 'l-portfolio', audience: 'landlord', message: 'give me a quick overview of my portfolio', expect: { anyTools: ['get_landlord_portfolio', 'get_portfolio_stats'] } },
   { id: 'l-rentroll', audience: 'landlord', message: 'show me the rent roll for this month', expect: { tools: ['get_property_rent_roll'] } },
   { id: 'l-expirations', audience: 'landlord', message: 'which of my leases are expiring in the next 60 days?', expect: { tools: ['get_lease_expirations'] } },
   { id: 'l-applications', audience: 'landlord', message: 'do I have any new rental applications to review?', expect: { tools: ['get_pending_applications'] } },

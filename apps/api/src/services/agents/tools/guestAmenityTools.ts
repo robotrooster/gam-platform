@@ -28,7 +28,13 @@ export const getGuestAmenities: AgentTool = {
   description:
     'The reservable amenities at the property the guest is staying at — name, capacity, reservation fee, ' +
     'hours, whether booking is instant or needs the host’s approval — plus the guest’s own reservations. Use ' +
-    'before requesting a reservation and for “what can I book / is there a pool?”. Read-only.',
+    'before requesting a reservation and for “what can I book / is there a pool? / is there a clubhouse?”. ' +
+    // S624: asked "is there a pool or clubhouse I can book during my stay?", the
+    // agent called get_guest_booking first. It takes no arguments and resolves
+    // the guest's property itself, so looking up the booking to find out WHERE
+    // they are is a wasted turn — say so, since "during my stay" is what pulls
+    // the model toward the booking tool.
+    'You do NOT need their booking first — this resolves their property on its own. Read-only.',
   parameters: { type: 'object', properties: {} },
   audiences: ['guest'],
 
