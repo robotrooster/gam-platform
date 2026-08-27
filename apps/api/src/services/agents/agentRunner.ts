@@ -683,6 +683,24 @@ function synthesizeHandoff(profile: AgentProfile, content: string): HandoffSigna
   }
 }
 
+/**
+ * S624: a handoff the model would not call, built anyway.
+ *
+ * Same routing as synthesizeHandoff — a senior hands to a human, everyone else
+ * hands up to the senior — but with no requirement that the model said anything
+ * about a person. Reserved for a real money dispute that has already had its one
+ * nudge and still ended without an escalation.
+ */
+export function forceHandoff(profile: AgentProfile, content: string): HandoffSignal | undefined {
+  const allow = profile.toolNames ?? []
+  if (!allow.includes('escalate') && !allow.includes('escalate_to_human')) return undefined
+  return {
+    kind: profile.tier === 'escalation' ? 'human' : 'tier',
+    reason: 'Money dispute — the agent would not escalate after being told to, so the handoff was forced.',
+    summary: content.replace(/\s+/g, ' ').trim().slice(0, 400),
+  }
+}
+
 export interface RunWithToolsInput {
   profile: AgentProfile
   actor: AgentActor
@@ -814,7 +832,26 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
 
     if (out.toolCalls.length === 0) {
       // S618: a handoff is only ever real for a money problem.
-      const synth = needsARealPerson(message) ? synthesizeHandoff(profile, out.content) : undefined
+      //
+      // S624 — AND THE SECOND TIME OF ASKING IS THE LAST. synthesizeHandoff only
+      // fires when the model PROMISED a person in prose. Asked "my last payout
+      // never arrived in my bank account, where is my money?", the model instead
+      // answered about payouts, promised nothing, and escalated nothing — so the
+      // nudge below fired, the model declined it, and the prose-promise synthesis
+      // had nothing to latch onto. A landlord asking where their money went was
+      // handled entirely by a bot.
+      //
+      // The nudge is a REQUEST and a request can be refused; that is exactly why
+      // tool_choice 'required' is documented above as honoured "most of the time,
+      // not every time". So once the money nudge has already been spent on this
+      // turn, stop asking and synthesize it. The escalation is the floor for a
+      // money dispute, not a preference.
+      const disputeUnhandled = needsARealPerson(message) && nudgedForDispute
+      const synth = needsARealPerson(message)
+        ? (synthesizeHandoff(profile, out.content) ?? (disputeUnhandled
+            ? forceHandoff(profile, out.content)
+            : undefined))
+        : undefined
       if (synth) {
         logger.warn({ profile: profile.id }, 'agent runner: model promised a handoff in prose without calling escalate — synthesizing the escalation (safety net)')
         return { reply: out.content, model, retrieved, grounded, toolInvocations, usage, handoff: synth }
