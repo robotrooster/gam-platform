@@ -41,9 +41,18 @@ describe('getDelinquentTenants — who is actually behind', () => {
     // THE bug. The tenant has paid; the money is in flight. Every other
     // surface on the platform already treats this as paid.
     await seedOverdue('processing')
-    const res = await run()
+    const res: any = await run()
     expect(res.count).toBe(0)
-    expect(res.delinquentTenants).toHaveLength(0)
+    // S626: the shape changed — "who's outstanding" is now two groups, because
+    // never-tried and tried-and-returned are different problems. Neither may
+    // contain somebody whose money is already moving.
+    expect(res.noPaymentAttempted).toHaveLength(0)
+    expect(res.paymentReturned).toHaveLength(0)
+    // And the money must be REPORTED, not merely omitted. Nic: "money was
+    // already out of my bank account, and the agent still told the landlord
+    // that person hadn't paid yet." Silence was the other half of that bug.
+    expect(res.moneyInFlight.amount).toBeGreaterThan(0)
+    expect(res.note).toMatch(/still clearing|NOT overdue/i)
   })
 
   it('still lists a tenant who has not paid at all', async () => {

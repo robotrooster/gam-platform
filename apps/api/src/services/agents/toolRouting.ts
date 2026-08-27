@@ -532,6 +532,28 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
     ],
   },
   {
+    // S626 (Nic): "The $8 ACH was not stuck. It was paid. Money was already out
+    // of my bank account, and the agent still told the landlord that person
+    // hadn't paid yet." get_money_in_flight answers exactly that and had no
+    // route, so it only ran when the model happened to reach for it.
+    //
+    // Above the delinquency route on purpose: "has anyone paid that hasn't
+    // landed?" is a question about money ARRIVING, and answering it with a list
+    // of debtors is the wrong answer in the most alarming direction.
+    tools: ['get_money_in_flight'],
+    audience: 'landlord',
+    means: 'rent already paid that is still clearing the bank',
+    patterns: [
+      /\bin[- ]flight\b/i,
+      /\bstill (clearing|processing|settling|in transit)\b/i,
+      /\bon (its|the) way\b/i,
+      /\bwhat('?s| is)\b[^?]{0,25}\b(coming|pending payout|next payout)\b/i,
+      /\b(has |have )?any(one|body)\b[^?]{0,30}\bpaid\b[^?]{0,30}\b(not|hasn'?t|haven'?t)\b[^?]{0,20}\b(land|landed|arrived|cleared|hit)\b/i,
+      /\bmoney\b[^?]{0,20}\b(coming|on the way|in transit|clearing)\b/i,
+      /\bwaiting (on|for)\b[^?]{0,20}\b(funds|money|payments?|it to clear)\b/i,
+    ],
+  },
+  {
     // S626: get_books_summary had NO route — the same hole as the tenant
     // amenities tool. It only ever fired when the model happened to pick it,
     // and the first prompt change of the day tipped it to calling nothing.

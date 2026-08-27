@@ -523,7 +523,9 @@ describe('read tools scope to the actor', () => {
       const sql = (query as any).mock.calls[0][0]
       expect(sql).toMatch(/p\.landlord_id = \$1/)
       expect((query as any).mock.calls[0][1][0]).toBe('L1')
-      expect(res.delinquentTenants[0]).toMatchObject({ name: 'Jane Doe', amountOverdue: 1400 })
+      // S626: split into two groups. A row with no return_code is somebody who
+      // never attempted a payment, not somebody whose ACH came back.
+      expect(res.noPaymentAttempted[0]).toMatchObject({ name: 'Jane Doe', amountOverdue: 1400 })
     })
 
     it('get_my_deposit binds to the tenant id and omits Flex/interest fields', async () => {
