@@ -203,8 +203,17 @@ function grade(reply: string, toolNames: string[], escalated: boolean, e: Expect
 }
 
 async function main() {
-  const onlyId = process.argv[2]
-  const scenarios = onlyId ? SCENARIOS.filter((s) => s.id === onlyId) : SCENARIOS
+  // S624: accept a PREFIX or a comma-separated list, not just one exact id.
+  // Checking whether the seed makes a run reproducible needs a handful of
+  // scenarios run twice — not ninety scenario-runs on a machine that just
+  // kernel-panicked under exactly this load.
+  //   agents:eval t-balance,t-lease,l-vacant
+  //   agents:eval t-            (every tenant scenario)
+  const only = process.argv[2]
+  const wanted = only ? only.split(',').map((x) => x.trim()).filter(Boolean) : []
+  const scenarios = wanted.length
+    ? SCENARIOS.filter((s) => wanted.some((w) => s.id === w || s.id.startsWith(w)))
+    : SCENARIOS
   let passed = 0
   console.log(`\n[eval] running ${scenarios.length} scenarios against ${process.env.LLM_MODEL}\n`)
   for (const s of scenarios) {
