@@ -257,6 +257,40 @@ const NOT_A_REQUEST =
   /^\s*(hi|hey|hello|yo|thanks|thank you|ty|ok|okay|k|got it|sure|yep|yes|no|nope|nvm|never ?mind|bye|goodbye|cool|great|nice|awesome|perfect|sounds good|will do|understood|makes sense)\b[\s!.,?]*$/i
 
 /**
+ * "Are you a real person?" and its relatives.
+ *
+ * S624. Asked this, Skye replied: "I don't want to give you a number I haven't
+ * actually checked. Which booking do you mean — the dates, the total, or the
+ * site you're on?" She had answered honestly; the account-data net classified
+ * the question as being about their booking, demanded a tool, got none, and
+ * SUPPRESSED her real reply in favour of a canned deflection — to someone who
+ * had asked whether she was human.
+ *
+ * This is why the bot-probe scenarios kept failing for tenant, landlord and
+ * guest while passing for the prospect agent: a prospect is already exempt from
+ * lookups, so the net never fired for Lucy. The disclosure rule was working the
+ * whole time. The guard was eating it.
+ *
+ * No tool answers this, and the honest reply is a platform constant — which is
+ * precisely the category the lookup rule is meant to exclude.
+ */
+// The noun must be a PREDICATE OF "YOU" — "are you a real person" — not merely
+// somewhere after it. A first cut allowed twenty characters of slack and
+// swallowed "are you charging me a REAL late fee?", which is the customer's own
+// fee and very much needs its lookup.
+const ABOUT_THE_AGENT = new RegExp([
+  // are you (really|actually|even)? (a|an)? (real|actual|live)? person/human/bot/AI
+  /\b(?:are|r)\s+(?:you|u)\s+(?:really\s+|actually\s+|even\s+|just\s+)?(?:an?\s+)?(?:real\s+|actual\s+|live\s+)?(?:person|human|humans|bot|robot|ai|a\.i\.|machine|computer|chatbot|automated)\b/,
+  // am I talking to a real person / who am I speaking with
+  /\b(?:am\s+i|are\s+we)\s+(?:talking|chatting|speaking|dealing)\s+(?:to|with)\b/,
+  /\bwho\s+am\s+i\s+(?:talking|chatting|speaking|dealing)\s+(?:to|with)\b/,
+  // is this a bot / is this a real person
+  /\bis\s+th(?:is|at)\s+(?:an?\s+)?(?:real\s+)?(?:bot|robot|human|person|ai|a\.i\.|automated)\b/,
+  // you're a bot, aren't you
+  /\byou'?re\s+(?:an?\s+)?(?:bot|robot|ai|a\.i\.|machine|computer)\b/,
+].map((r) => r.source).join('|'), 'i')
+
+/**
  * Must this turn be answered from a LOOKUP rather than from memory?
  *
  * S618 (Nic), and this is the rule the rest of the file was only approximating:
@@ -289,6 +323,9 @@ const NOT_A_REQUEST =
 export function demandsAToolCall(message: string, audience?: string): boolean {
   if (!message || !message.trim()) return false
   if (NOT_A_REQUEST.test(message)) return false
+  // S624: a question ABOUT THE AGENT is not a question about the customer's
+  // account, and no tool can answer it.
+  if (ABOUT_THE_AGENT.test(message)) return false
 
   // S618: the PROSPECT (sales) agent is the exception, and missing it was a
   // regression I introduced with the inversion itself.
