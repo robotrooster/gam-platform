@@ -182,7 +182,7 @@ describe('assertsStoredFacts — a written-out tool call is not an answer (S617)
   })
 
   it('does not flag ordinary prose containing an angle bracket', () => {
-    expect(assertsStoredFacts('Rent is due before the 5th <- that is the grace period.')).toBe(false)
+    expect(assertsStoredFacts('Your landlord reviews it first <- that is the normal order.')).toBe(false)
   })
 })
 

@@ -613,6 +613,44 @@ export function assertsStoredFacts(text: string): boolean {
     // entirely invented. A rate or a ratio is a stored fact like any other.
     || /\d+\s*%/.test(text)
     || /\b\d+\s+out of\s+\d+\b/i.test(text)
+    // ── S626: TWELVE OF FOURTEEN INVENTED FACTS WALKED THROUGH THIS ──────
+    //
+    // Probed with the things an agent actually fabricates, this function caught
+    // exactly two: a dollar figure and an ISO date. Everything below was
+    // MISSED — each one a per-tenant, per-lease or per-property fact that the
+    // model is perfectly happy to invent, stated to somebody who will act on
+    // it. This is the guard whose entire job is "do not send a number nobody
+    // looked up", and it was checking for punctuation.
+    //
+    // Only reached when the question DEMANDED a lookup and no tool ran, so a
+    // reply here has no source for any of it. Being strict is correct: the
+    // alternative reply asks which thing they meant, which is recoverable.
+    // A wrong due date is not.
+    //
+    // "Your rent is due on the 1st" — the one that started this. Ordinals were
+    // invisible, so the commonest lease fact of all was unguarded.
+    || /\b\d{1,2}(?:st|nd|rd|th)\b/i.test(text)
+    // A bare month. The check above this one needs month AND day, so "your
+    // lease ends in January" was fine by it.
+    || /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/i.test(text)
+    // A weekday being used as a date — "due every Monday", "payout lands
+    // Tuesday". Anchored to a temporal preposition so ordinary prose that
+    // happens to name a day (office hours from the knowledge base) is left be.
+    || /\b(?:on|by|every|next|this|last|before|after|lands?|due)\s+(?:coming\s+)?(mon|tues|wednes|thurs|fri|satur|sun)day\b/i.test(text)
+    // COUNTS SPELLED OUT. "you have 2" was caught; "you have two open
+    // maintenance requests" was not, and it is the same claim.
+    || /\b(?:you|they|he|she|there)\s+(?:have|has|are|is)\s+(?:no|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i.test(text)
+    // A duration in words — "your grace period is five days", "thirty days
+    // notice". These are lease terms and vary per lease.
+    || /\b(one|two|three|four|five|six|seven|eight|nine|ten|fourteen|fifteen|twenty|thirty|sixty|ninety)[\s-]+(day|days|week|weeks|month|months|year|years)\b/i.test(text)
+    // Money spelled out — "seventy-five dollars" evades the dollar sign.
+    || /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)[\w\s-]{0,24}\bdollars?\b/i.test(text)
+    // A UNIT OR SITE DESIGNATOR. "Your unit is Apt 101" names a specific row.
+    || /\b(apt|apartment|unit|lot|site|space|suite|spot)\s*#?\s*\d+\b/i.test(text)
+    // CONTACT DETAILS. Inventing a phone number or an email address sends
+    // somebody to a stranger, and neither carried a dollar sign or a date.
+    || /\b\(?\d{3}\)?[-. ]\s?\d{3}[-. ]\d{4}\b/.test(text)
+    || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text)
     // S617: a street address. Asked to narrow "spot number one" to the RV
     // resort, the model answered "the one at 123 Main Street, and the one at
     // 456 Oak Avenue" — with no lookup behind it and neither address existing
