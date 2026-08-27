@@ -144,3 +144,40 @@ the actual nightly rate instead of "settled with the property as usual"; the
 rate card must quote the weekly figure rather than allude to it.
 
 509 agent unit tests.
+---
+
+## THE THIRD KERNEL PANIC — 10:05, and it was my fault
+
+`panic-full-2026-08-27-101414`, same signature as the other two:
+`completeMemory() prepare count underflow` @IOGPUMemory.cpp:550.
+
+Production recovered clean on its own: Postgres up, all nine services up,
+`/health` ok, crons re-registered across both timezones. September rent is safe.
+
+**What I did wrong.** I followed the letter of the pacing rule and missed its
+point. Within blocks: paced 5s. Concurrency: never two model jobs at once. But
+I never put a gap BETWEEN blocks — the 36B ran near-continuously from 08:44 to
+10:05, ~80 minutes. The final stretch was the worst pattern available: four
+separate single-case runs seconds apart, each a fresh process building model
+context from scratch. Many short jobs back-to-back churns GPU allocation harder
+than one long paced job.
+
+**The gate was the wrong metric, and that is the real lesson.** I checked
+`uptime` between every block exactly as S625 said. Load sat at 2–3 the whole
+time and never once warned me. The panic is a refcount leak that accumulates
+with CUMULATIVE ALLOCATION CHURN — load average cannot see it. I used the one
+number that structurally could not detect the failure, and it gave me
+confidence instead of caution for eighty minutes.
+
+**Replaced with `apps/api/scripts/gpu-gate.sh`**, which gates on what actually
+matters and keeps state on disk so it survives a crash and a new session:
+
+```
+bash apps/api/scripts/gpu-gate.sh acquire   # blocks until safe
+bash apps/api/scripts/gpu-gate.sh release   # ALWAYS on job end
+```
+
+- **600s of genuine idle** required between jobs — a real wait, not a check.
+- **30 GPU minutes per rolling hour**, ledgered.
+- One job at a time, enforced by a lock rather than by my memory.
+- Load is still checked, but as a floor, never as the sole gate.

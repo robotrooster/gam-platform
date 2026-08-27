@@ -26,17 +26,23 @@ import type { AgentTool, AgentActor } from './types'
 export const getGuestAmenities: AgentTool = {
   name: 'get_guest_amenities',
   description:
-    'The amenities at the property the guest is staying at — name, description, capacity, hours, whether it ' +
-    'can be reserved at all, and if so whether booking is instant or needs the host’s approval — plus the ' +
-    'guest’s own reservations. Use for “is there a pool? / is there laundry? / what can I book?” and before ' +
-    'requesting a reservation. Includes amenities that CANNOT be booked (a laundry room, a walk-up pool); ' +
-    'those still answer the question of whether the property has one. ' +
     // S624: asked "is there a pool or clubhouse I can book during my stay?", the
     // agent called get_guest_booking first. It takes no arguments and resolves
     // the guest's property itself, so looking up the booking to find out WHERE
-    // they are is a wasted turn — say so, since "during my stay" is what pulls
-    // the model toward the booking tool.
-    'You do NOT need their booking first — this resolves their property on its own. Read-only.',
+    // they are is a wasted turn — "during my stay" is what pulls the model
+    // toward the booking tool.
+    //
+    // S626: THIS LINE HAS TO STAY NEAR THE FRONT. I lengthened the description
+    // to cover non-reservable amenities and left the disambiguation at the end;
+    // g-amenities regressed on the next eval — get_guest_booking again, exactly
+    // the S624 failure. The sentence was still there and no longer carried,
+    // which is its own lesson: a fix buried at the end of a longer description
+    // is a fix you have deleted.
+    'You do NOT need their booking first — this resolves their property on its own. ' +
+    'The amenities at the property the guest is staying at: name, description, hours, capacity, whether it ' +
+    'can be reserved, and if so instant or host approval — plus the guest’s own reservations. ' +
+    'Use for “is there a pool? / is there laundry? / what can I book?”, and before a reservation. ' +
+    'Includes amenities that CANNOT be booked; those still answer whether the property has one. Read-only.',
   parameters: { type: 'object', properties: {} },
   audiences: ['guest'],
 

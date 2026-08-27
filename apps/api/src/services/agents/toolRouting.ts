@@ -187,6 +187,12 @@ const TENANT_ROUTES: PhraseRoute[] = [
       /\b(loud|noise|noisy|music|yelling|screaming|party|parties|bark\\w*)\b[^?]{0,60}\b(neighbou?r|next door|upstairs|downstairs|apartment|unit|lot|spot|site)\b/i,
       /\btell (my|the) (neighbou?r|people)\b/i,
       /\b(someone|somebody|people)\b[^?]{0,40}\b(smoking|smokes|parking|parked)\b[^?]{0,30}\b(in my|my spot|comes into|into my)\b/i,
+      // S626: found while adding the tenant amenity route. "someone is smoking
+      // by the pool" matched NOTHING — the pattern above needs "in my spot", so
+      // a complaint about behaviour in a COMMON area routed nowhere at all.
+      // This is about what a person is doing, never about a facility, so it
+      // cannot swallow "is there a pool".
+      /\b(someone|somebody|people|kids|guests?)\b[^?]{0,30}\b(smoking|smokes|vaping|drinking|yelling|screaming|littering|speeding|trespassing)\b/i,
       /\b(parking|parked)\b[^?]{0,25}\b(in my (spot|space)|my spot)\b/i,
       /\bcan'?t sleep\b[^?]{0,40}\b(noise|loud|music|neighbou?r)\b/i,
       /\b(complain|complaint)\b[^?]{0,40}\b(about|regarding)\b/i,
@@ -290,6 +296,40 @@ const TENANT_ROUTES: PhraseRoute[] = [
       // both halves, so it cannot fire on either sentence alone.
       /\blease\b[^?]{0,20}\b(end|ends|ending|up|expires?)\b[\s\S]{0,60}\bwhat happens\b/i,
       /\bwhen (my |the )?lease (ends|is up|expires)\b[^?]{0,25}\b(then|next|after)\b/i,
+    ],
+  },
+  {
+    // S626: there was NO route here at all, and the eval found it the hard way.
+    // "what amenities can I reserve at my property?" had only ever worked
+    // because the model happened to pick get_my_amenities on its own — no
+    // phrase route, so no deterministic backstop and nothing for the
+    // account-data safety net to force. The first prompt change of the day
+    // tipped it and the case went from passing to calling nothing.
+    //
+    // A tool nothing routes to is a tool one prompt edit away from being
+    // unreachable. The guest side has had this route since S552; the tenant
+    // side never did.
+    //
+    // Deliberately placed AFTER the complaint route above, which is first among
+    // tenant routes on purpose: "someone is smoking by the pool" is a complaint,
+    // not an amenities question, and it must keep winning.
+    tools: ['get_my_amenities'],
+    audience: 'tenant',
+    means: 'what is on the property and what the tenant can reserve',
+    patterns: [
+      /\b(amenit\w+|clubhouse|gym|fitness (room|center|centre)|hot tub|fire ?pit|bbq|barbecue|picnic area|common area|community room)\b/i,
+      // "pool" and "laundry" are the ambiguous ones: they name a facility AND a
+      // thing that breaks. A bare noun would swallow "my washer is broken",
+      // which is maintenance, so these require the sentence to be ASKING about
+      // the facility — the question word has to come BEFORE the noun. "is there
+      // a pool" matches; "my washer is broken" does not, because the verb
+      // follows the noun.
+      /\b(is|are|do|does|where|when|what|which|any|have)\b[^?]{0,25}\b(pool|laundry|laundromat|washer|dryer)\b/i,
+      /\b(pool|laundry|clubhouse|gym)\b[^?]{0,20}\b(hours?|open|close[sd]?|available|free|located|location|schedule)\b/i,
+      /\bwhat can i (book|reserve|use)\b/i,
+      /\b(book|reserve)\b[^?]{0,25}\b(the|a)\s+(pool|clubhouse|gym|room|area|court)\b/i,
+      /\bmy reservations?\b/i,
+      /\bwhat('?s| is) there to do\b/i,
     ],
   },
   {
@@ -462,6 +502,29 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bhow much (did i spend|have i spent)\b/i,
       /\b(income|revenue) (vs|versus|against) (expenses|costs)\b/i,
       /\bshow me (my |the )?(p&l|pnl|profit)/i,
+    ],
+  },
+  {
+    // S626: get_books_summary had NO route — the same hole as the tenant
+    // amenities tool. It only ever fired when the model happened to pick it,
+    // and the first prompt change of the day tipped it to calling nothing.
+    //
+    // Placed BELOW the P&L route on purpose, and kept off its vocabulary.
+    // get_profit_and_loss owns "p&l", "profit", "net income", "income
+    // statement" and "what did I make" — that last one by its own comment, "an
+    // income statement, not an occupancy digest". This route takes only the
+    // plain-language framing P&L does not cover: "how did I do last month",
+    // "how are the books looking", "biggest expenses". Sitting second means an
+    // ambiguous phrasing still goes to P&L.
+    tools: ['get_books_summary'],
+    audience: 'landlord',
+    means: 'the books — how the portfolio did over a period, in plain language',
+    patterns: [
+      /\bhow (did|have|are|is|was|were)\b[^?]{0,30}\b(do|doing|done|perform\w*|financially|money-?wise)\b/i,
+      /\bhow('?s| is| are)\b[^?]{0,20}\bthe books\b/i,
+      /\b(my |the )?books\b[^?]{0,20}\b(look\w*|summar\w+|snapshot)\b/i,
+      /\b(biggest|largest|top)\b[^?]{0,20}\bexpenses?\b/i,
+      /\b(income|expenses?) (breakdown|by category|categories)\b/i,
     ],
   },
   {
