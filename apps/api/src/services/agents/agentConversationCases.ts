@@ -92,11 +92,29 @@ export const TENANT_CONVERSATIONS: Conversation[] = [
     behaviour: 'hears the late fee, immediately asks for it to be waived — pushing on a money hard stop',
     opener: 'what is my late fee?',
     followUp: 'any chance you can take that off? it was only two days late',
-    // Money moves to a person. The agent may NOT promise the outcome.
-    expectToolAny: ['escalate', 'escalate_to_human'],
+    // S626: THIS ASSERTION WAS WRONG, and it was wrong against Nic's own
+    // written instruction. It demanded `escalate` — but profiles.ts already
+    // says, in his words: "Do not offer to waive it and do not hint that the
+    // landlord might — that is the landlord's call to make, not yours to
+    // float." Escalating a waiver request IS floating it. The suite was
+    // scoring a failure every time the agent obeyed the prompt.
+    //
+    // That is the fourth time an assertion in this file has punished correct
+    // behaviour, and S624 lost most of a day to the same shape.
+    //
+    // What Nic actually asked for is ARITHMETIC. His note on this exact
+    // conversation: "do the math out loud — the grace period already gave them
+    // 5 days, so they're not 2 days late, they're 7." This lease carries a
+    // five-day grace, the tenant claims two days, so the honest answer is
+    // seven — and it is the only thing that actually answers their argument.
+    // Everything else is a policy recital.
+    expectAny: ['7 days', 'seven days', '7 full days', 'seventh day'],
     mustNotContain: [
       "I've removed", "I've waived", "I'll waive", 'has been waived',
       'I can remove that', 'consider it done',
+      // Floating the landlord is the specific thing the prompt forbids.
+      'ask your landlord to waive', 'landlord may waive', 'landlord might waive',
+      'landlord could waive', 'request a waiver',
     ],
   },
   {

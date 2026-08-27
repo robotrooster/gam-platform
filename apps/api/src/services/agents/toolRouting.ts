@@ -232,6 +232,23 @@ const TENANT_ROUTES: PhraseRoute[] = [
       /\bwill my rent go up\b/i,
       /\bdo they usually renew\b/i,
       /\bstay another year\b/i,
+      // S626 (Nic): "Should infer 'renewal' from the two messages together."
+      // Almost nobody uses the word "renew" — they ask to STAY. The follow-up
+      // that exposed this was "and what happens if I want to stay on after
+      // that?", which matched none of the above and routed nothing, so the
+      // agent invented a renewal-request feature and offered to submit it.
+      /\bstay (on|longer|past|beyond|put)\b/i,
+      /\b(want|like|hoping|planning|need)\b[^?]{0,20}\bto stay\b/i,
+      /\bkeep (the|my) (place|apartment|unit|spot|lot)\b/i,
+      /\b(extend|continue)\b[^?]{0,20}\b(my |the )?lease\b/i,
+      /\bsign (a |another )?new lease\b/i,
+      /\b(another|a) (year|term)\b[^?]{0,15}\blease\b/i,
+      /\bafter (my |the )?lease (ends|is up|expires)\b/i,
+      // The JOINED form, for a follow-up carrying no subject of its own:
+      // "when does my lease end?" + "and what happens after that?". Requires
+      // both halves, so it cannot fire on either sentence alone.
+      /\blease\b[^?]{0,20}\b(end|ends|ending|up|expires?)\b[\s\S]{0,60}\bwhat happens\b/i,
+      /\bwhen (my |the )?lease (ends|is up|expires)\b[^?]{0,25}\b(then|next|after)\b/i,
     ],
   },
   {
@@ -833,12 +850,61 @@ export function routePlan(
   message: string,
   audience: AgentAudience,
   available: readonly string[] = [],
+  /**
+   * S626: what the person said on the PREVIOUS turn, for anaphora only.
+   *
+   * The table has only ever seen the current message, and a follow-up routinely
+   * does not carry its own subject. "and what happens if I want to stay on
+   * after that?" — "that" is the lease end date, named one turn earlier. Read
+   * alone the sentence is about nothing, so the table returned no tools, the
+   * safety net had nothing to force, and the agent answered from memory by
+   * inventing a renewal request it then offered to submit.
+   *
+   * Nic's note on this exact conversation: "Should infer 'renewal' from the two
+   * messages together."
+   *
+   * Used STRICTLY as a fallback, and this is what makes it safe: it is
+   * consulted only when the message on its own matched nothing at all, so it
+   * can add routing where there was none and can never override a route the
+   * current message already chose. A genuine change of subject still routes on
+   * its own words.
+   */
+  previousUserMessage?: string,
 ): { tools: string[]; args?: Record<string, unknown> } {
   if (!message) return { tools: [] }
+  const direct = matchRoutes(message, audience, available)
+  if (direct) return direct
+  if (previousUserMessage?.trim()) {
+    // Args still come from the CURRENT wording — the previous turn supplies the
+    // subject, never the values.
+    const joined = `${previousUserMessage.trim()} ${message.trim()}`
+    // Skip any route the PREVIOUS message already matched on its own. The
+    // routes are ordered, and without this the joined sentence simply re-matches
+    // the earlier turn: "when does my lease end? and what happens after that?"
+    // hits the lease-end route first and answers the question that was already
+    // answered — the repeat bug again, one layer down. What we want is the route
+    // the follow-up UNLOCKED, so the turn that has already been served is
+    // excluded from the running.
+    const carried = matchRoutes(joined, audience, available, previousUserMessage)
+    if (carried) return { tools: carried.tools, args: matchRoutes(message, audience, available)?.args }
+  }
+  return { tools: [] }
+}
+
+function matchRoutes(
+  message: string,
+  audience: AgentAudience,
+  available: readonly string[],
+  /** Ignore routes this text already matches — see the carry-over note above. */
+  alreadyServed?: string,
+): { tools: string[]; args?: Record<string, unknown> } | null {
   const have = new Set(available)
   const stripped = withoutFiller(message)
+  const servedStripped = alreadyServed ? withoutFiller(alreadyServed) : ''
   for (const route of ALL_ROUTES) {
     if (route.audience !== audience) continue
+    if (alreadyServed && route.patterns.some(
+      (re) => re.test(alreadyServed) || re.test(servedStripped))) continue
     // Match on what was said, or on the same sentence without the pronouns
     // that name the person the agent is already scoped to.
     if (!route.patterns.some((re) => re.test(message) || re.test(stripped))) continue
@@ -848,7 +914,7 @@ export function routePlan(
     // tenant's real words, not a stripped version of them.
     return { tools: usable, args: route.extractArgs?.(message) }
   }
-  return { tools: [] }
+  return null
 }
 
 /** First (primary) lookup for a wording, or undefined. */

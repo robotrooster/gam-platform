@@ -393,6 +393,66 @@ export function demandsAToolCall(message: string, audience?: string): boolean {
  * the record is not sent.
  */
 /**
+ * Is this someone asking for a late fee to be taken off?
+ *
+ * S626. profiles.ts has carried Nic's instruction for this since S624 — do the
+ * arithmetic out loud, count from the END of the grace period, "only two days
+ * late" after a five-day grace is seven days past due — and the agent recited
+ * policy instead every single time. The bullet is correct and it is one of
+ * fifteen; salience alone was not making it happen.
+ *
+ * The arithmetic is the only thing that actually answers the argument they
+ * made, so it is worth making deterministic rather than hoping for it.
+ */
+const WAIVER_REQUEST = new RegExp([
+  /\b(waive|waived|waiver|wave)\b/,
+  /\b(take|knock|write|let)\s+(it|that|this|the fee)?\s*(off|down)\b/,
+  /\b(remove|drop|cancel|reverse|refund|forgive|excuse)\b[^?]{0,25}\b(fee|charge|late)\b/,
+  /\b(get|got)\s+(out of|rid of)\b[^?]{0,15}\bfee\b/,
+  /\bany chance\b[^?]{0,30}\b(off|waive|remove)\b/,
+  // The other word order — "get that fee removed", "the charge dropped".
+  /\b(fee|charge)s?\b[^?]{0,25}\b(removed|waived|dropped|cancell?ed|reversed|refunded|taken off)\b/,
+].map((r) => r.source).join('|'), 'i')
+
+/** The grace period from whatever the lookups returned, or null. */
+function graceDaysFromResults(results: readonly unknown[]): number | null {
+  for (const r of results) {
+    const found = findNumeric(r, /grace/i)
+    if (found != null) return found
+  }
+  return null
+}
+
+function findNumeric(node: unknown, key: RegExp, depth = 0): number | null {
+  if (!node || typeof node !== 'object' || depth > 5) return null
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (key.test(k)) {
+      const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN
+      if (Number.isFinite(n)) return n
+    }
+    const nested = findNumeric(v, key, depth + 1)
+    if (nested != null) return nested
+  }
+  return null
+}
+
+/** The number of days they CLAIMED, so the reply can answer their own figure. */
+function claimedDaysLate(message: string): number | null {
+  const words: Record<string, number> = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  }
+  const m = message.match(/\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+(late|past|over|overdue)\b/i)
+    ?? message.match(/\b(?:only|just)\s+(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\b/i)
+  if (!m) return null
+  const raw = m[1].toLowerCase()
+  const n = words[raw] ?? Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+/** Exposed for waiverMath.test.ts — these are guard internals, not API. */
+export const __waiverInternals = { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults }
+
+/**
  * Did this reply just re-answer the PREVIOUS turn?
  *
  * S626, and it was under four of the six tenant conversations and five of the
@@ -806,6 +866,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForAccountData = false
   let nudgedForPadding = false
   let nudgedForRepeat = false
+  let nudgedForWaiverMath = false
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
@@ -825,7 +886,14 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   // recognise it, in which case a forced turn falls back to plain 'required'.
   // Consulted ONLY on a forced turn — it never overrides a tool the model chose
   // for itself, and never fires on an ordinary turn.
-  const plan = routePlan(message, profile.audience, profile.toolNames ?? [])
+  // S626: hand the table the previous user turn so an anaphoric follow-up can
+  // resolve its subject ("...after that?"). Fallback only — see routePlan.
+  const lastUserMessage = [...history].reverse()
+    .find((m: any) => m.role === 'user' && typeof m.content === 'string' && m.content.trim())
+  const plan = routePlan(
+    message, profile.audience, profile.toolNames ?? [],
+    lastUserMessage ? String((lastUserMessage as any).content) : undefined,
+  )
   const routedTools = plan.tools
   const routedTool = routedTools[0]
 
@@ -1167,6 +1235,63 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
         }
       }
+      // S626: a waiver request answered without the arithmetic. Nic's note on
+      // this exact conversation: "do the math out loud — the grace period
+      // already gave them 5 days, so they're not 2 days late, they're 7." The
+      // instruction has been in profiles.ts since S624 and was followed on none
+      // of the runs; the agent recited the fee policy back instead, which
+      // answers a question they did not ask.
+      //
+      // Only fires when the numbers are actually known — a grace period from a
+      // real lookup and a figure the person themselves put forward. Where the
+      // lease has no grace period there is no arithmetic to do and this stays
+      // out of the way.
+      if (!nudgedForWaiverMath && WAIVER_REQUEST.test(message) && toolInvocations.length > 0) {
+        const grace = graceDaysFromResults(toolInvocations.map((t) => t.result))
+        const claimed = claimedDaysLate(message)
+        const total = grace != null && claimed != null ? grace + claimed : null
+        if (total != null && grace != null && grace > 0 && !new RegExp(`\\b${total}\\b`).test(out.content)) {
+          nudgedForWaiverMath = true
+          logger.warn({ profile: profile.id, grace, claimed, total },
+            'agent runner: waiver answered without the grace-period arithmetic — forcing one rewrite')
+          messages.push({ role: 'assistant', content: out.content })
+          messages.push({
+            role: 'system',
+            content:
+              // S626: this instruction did not work as a polite briefing. The
+              // model read it and recited the fee policy again anyway. Every
+              // net in this file that actually changes behaviour opens by
+              // REJECTING the draft — "STOP —" — rather than describing a
+              // better one, so this now does the same.
+              'STOP — you answered a request to remove a fee by reading the fee policy back to ' +
+              'them. They did not ask how late fees work. They made an argument, and you have not ' +
+              'answered it.\n' +
+              // S626: the first two versions of this told the model the ANSWER
+              // and it declined to say it, twice, regenerating a policy recital
+              // instead. It was not being stubborn — it had no reason to
+              // contradict the customer's own count. So give it the reasoning
+              // rather than the conclusion: the fee EXISTS, therefore the grace
+              // period was already spent. That is what makes the number
+              // sayable, and it is also what makes it true.
+              `Reason it through before you answer. Their lease has a ${grace}-day grace period, ` +
+              `so a late fee cannot be charged at all until day ${grace + 1}. They HAVE been ` +
+              `charged one. So their "${claimed} days" cannot be counted from the due date — ` +
+              `it is ${claimed} days past the end of the grace period, which is ${total} days past ` +
+              `the due date. ${total}, not ${claimed}. That is the answer to the argument they made, ` +
+              'and it is the only part of this they do not already know.\n' +
+              `Write the reply again, and it MUST contain the number ${total}. Open with the ` +
+              'arithmetic in your own words — something equivalent to: "the fee only kicks in after ' +
+              `the ${grace}-day grace period, so by the time it applied you were ${total} days past ` +
+              `due, not ${claimed}." Say it once, kindly, and do not lecture.\n` +
+              'Then close on the frame rather than the rule: you are not arguing with them, that is ' +
+              'what their lease says, and the platform runs on the lease.\n' +
+              'Do NOT restate the fee amount, the due date or the grace period as a policy summary — ' +
+              'they read all of that in your last message. Do NOT offer to waive it and do NOT ' +
+              "suggest their landlord might; that is the landlord's call, not yours to float.",
+          })
+          continue
+        }
+      }
       // S626: the reply is fine on its own terms — but is it an answer to the
       // question that was just asked, or to the one before it? See
       // repeatsPreviousReply. Last gate before this reaches a person, and it
@@ -1179,14 +1304,45 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         messages.push({
           role: 'system',
           content:
-            'STOP — that is the same answer you just gave. They already read it; ' +
-            'repeating it tells them you were not listening. ' +
-            `They have now said: "${message}" — respond to THAT. ` +
-            'Do not restate the figures or the explanation from your previous reply. ' +
-            'Assume everything in it still stands and say only what is new: ' +
-            'answer the question they actually asked, acknowledge what they told you, ' +
-            'or — if they declined something or closed the subject — simply accept it and stop. ' +
-            'Keep it short. A brief reply that moves forward beats a complete one that does not.',
+            // S626: where a lookup DID run this turn, hand the rows back with
+            // the correction. The verification case is the one that defeated a
+            // pure instruction: asked "that doesn't sound right — check my
+            // actual lease", the model called get_my_full_lease, found the same
+            // $75, and reissued its one-line answer unchanged, because being
+            // told not to repeat left it with nothing it believed it was
+            // allowed to say. It is not short of material — the full lease came
+            // back — so restating that material is what unblocks it. Same
+            // technique the padding net uses.
+            (toolInvocations.length
+              ? 'You DID look this up. Here is exactly what came back:\n' +
+                JSON.stringify(toolInvocations.map((t) => ({ tool: t.name, result: t.result }))) +
+                '\nUse it — say what you checked and what it actually says.\n'
+              : '') +
+            'STOP — that is the same answer you just gave, almost word for word. ' +
+            'They have already read it; sending it again tells them you were not listening. ' +
+            `They have now said: "${message}" — respond to THAT, and only to that.\n` +
+            // S626: the first version of this said flatly "do not restate the
+            // figures", and that is wrong for the commonest case of all. Asked
+            // "that doesn't sound right — can you check what my lease says?"
+            // the figure IS the answer, so the model was told not to give it,
+            // had nothing else to give, and reissued the identical sentence.
+            // The instruction has to name the shape of the follow-up, not ban
+            // a category of content.
+            'Pick whichever of these fits what they just said:\n' +
+            '- They QUESTIONED a figure or asked you to double-check it: they are not asking to ' +
+            'hear the same sentence again — they are asking whether you actually looked. ' +
+            'Name the document you opened, give what it says, and state plainly whether that ' +
+            'confirms or corrects what you told them. If it confirms it, say so directly — ' +
+            '"I pulled your signed lease and it does say X" — and add the surrounding detail ' +
+            'they have not seen yet, so the check is visible. Never re-send the original sentence.\n' +
+            '- They DECLINED, said no thanks, or closed the subject: accept it in one line and stop. ' +
+            'Do not re-sell, do not re-explain, do not repeat what they owe.\n' +
+            '- They CONFIRMED something you already did: acknowledge it and add the next useful ' +
+            'fact — what happens now, and roughly when. Do not do it a second time.\n' +
+            '- They asked something NEW: answer that. Everything in your previous reply still ' +
+            'stands, so do not repeat it — say only what they do not know yet.\n' +
+            'Keep it short. A brief reply that moves the conversation forward beats a complete ' +
+            'one that hands them back what they just read.',
         })
         continue
       }
