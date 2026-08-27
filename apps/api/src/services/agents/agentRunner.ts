@@ -253,6 +253,13 @@ export const ANSWERABLE_FROM_MEMORY = [
  * Things that are not a request at all — a greeting, a thanks, an "ok".
  * Nothing is being asked, so nothing needs looking up.
  */
+/**
+ * An email address or a phone number — a prospect handing over how to reach them.
+ * S624: the signal that a lead must be captured before the turn ends.
+ */
+const CONTACT_DETAILS =
+  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}\b/i
+
 const NOT_A_REQUEST =
   /^\s*(hi|hey|hello|yo|thanks|thank you|ty|ok|okay|k|got it|sure|yep|yes|no|nope|nvm|never ?mind|bye|goodbye|cool|great|nice|awesome|perfect|sounds good|will do|understood|makes sense)\b[\s!.,?]*$/i
 
@@ -740,6 +747,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
+  let nudgedForLead = false
   let nudgedForHardStop = false
   /** The phrase table's lookup is run at most once per turn. */
   let ranRoutedToolDirectly = false
@@ -821,6 +829,37 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // Money-dispute turns must end in the escalation tool, tool-less or
       // not — a refund demand where the model only investigated (or only
       // explained) still strands the customer without a human.
+      // S624 — A PROSPECT WHO HANDS OVER THEIR DETAILS MUST BE RECORDED.
+      //
+      // Given "Sam Rivera, sam@example.com — that's correct, go ahead", Lucy
+      // called nothing and replied "I'll send over the call details" — a promise
+      // to follow up on a lead that was never saved. Then she repeated it fifty
+      // times until the token ceiling. A prospect who volunteered their name and
+      // email on the public marketing chat simply vanished.
+      //
+      // The phrase table cannot cover this: capture_lead needs arguments only
+      // the model can read out of the conversation, so the direct-run path
+      // (which is for argument-free lookups) does not apply. And the wording that
+      // triggers it — a bare name and email — carries no keyword at all.
+      //
+      // An email or phone number in a prospect turn, with nothing recorded, is
+      // unambiguous. Ask once, firmly.
+      if (!nudgedForLead && profile.audience === 'prospect'
+          && toolInvocations.length === 0 && CONTACT_DETAILS.test(message)) {
+        nudgedForLead = true
+        logger.warn({ profile: profile.id },
+          'agent runner: prospect gave contact details and nothing was captured — forcing one retry (safety net)')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — this prospect has just given you their contact details. CALL capture_lead now, ' +
+            'in this reply, with their name and email or phone plus everything you have learned about ' +
+            'their portfolio. Do not promise to send anything or to have someone reach out until the ' +
+            'lead is saved — a promise with no lead behind it is a lost customer.',
+        })
+        continue
+      }
       if (!nudgedForDispute && MONEY_DISPUTE_INTENT.test(message)) {
         nudgedForDispute = true
         logger.warn({ profile: profile.id }, 'agent runner: money-dispute turn ended without escalation — forcing one retry (safety net)')

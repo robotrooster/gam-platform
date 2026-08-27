@@ -17,6 +17,7 @@
 import { scrubScopeLeaks, scrubOffAudienceTopics, isOffAudienceQuestion, offAudienceReply } from './scopeGuard'
 import { RetryableEndpointError } from './endpointPool'
 import { needsARealPerson, stripPromiseOfAPerson, mentionsLegalAction, LEGAL_CONTACT_LINE } from './escalationPolicy'
+import { collapseRepetition } from './collapseRepetition'
 import { runAgentWithTools, type ToolInvocation, type RunWithToolsResult } from './agentRunner'
 import { getEntryProfile, getEscalationProfile } from './profiles'
 import { logInteraction } from './logInteraction'
@@ -172,6 +173,29 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
           result = { ...result, reply: kept }
         }
       }
+      // S624 — A MODEL STUCK IN A LOOP MUST NOT REACH THE CUSTOMER.
+      //
+      // Asked to confirm a lead, Lucy repeated "I'll send over the call
+      // details. I'll also send over a personalized call invitation with the
+      // time and link." roughly fifty times until she hit the token ceiling,
+      // and the whole wall of it went out — on the PUBLIC marketing chat, to a
+      // prospect who had just given their name and email.
+      //
+      // Nothing anywhere caught it. Sampler settings reduce the odds of Hermes
+      // degenerating (the defaults carry a comment saying so) but cannot remove
+      // them, and a generation failure should never be something a customer
+      // reads. Runs FIRST, so every later guard works on a sane reply.
+      if (result.reply) {
+        const collapsed = collapseRepetition(result.reply)
+        if (collapsed.removed > 0) {
+          logger.warn({
+            profile: finalProfileId, removed: collapsed.removed,
+            degenerate: collapsed.degenerate, message: input.message,
+          }, '[agent] repeated itself — collapsed')
+          result = { ...result, reply: collapsed.reply }
+        }
+      }
+
       // S618 (Nic): legal action gets an ADDRESS, not a promise. The customer
       // reaches out to us — "anybody that's just blowing smoke isn't gonna
       // bother reaching out. Anybody that is a little more serious will make
