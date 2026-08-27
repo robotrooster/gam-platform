@@ -19,4 +19,4 @@ GAM doesn't own properties, set rents, write lease terms or approve repairs. The
 
 ## What happens next
 
-The fastest way to know whether it fits is a short call with someone on the team who can walk it through live and give real numbers for the portfolio in question — a lot gets lost in chat, and the exact pricing depends on the setup.
+The fastest way to know whether it fits is a short call with someone on the team who can walk it through live and give real numbers for the portfolio in question — a lot gets lost in chat, and a bigger portfolio can bring the per-unit price down.

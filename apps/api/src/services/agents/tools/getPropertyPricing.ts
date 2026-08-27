@@ -56,7 +56,17 @@ export const getPropertyPricing: AgentTool = {
       note:
         'Rates are per site. The weekly rate is the discounted 7-night price (charged instead of 7× nightly); ' +
         'monthly is the long-stay rate. Deposit and lodging tax apply — quote the exact total with ' +
-        'check_availability once the guest has dates. Amounts are US dollars.',
+        'check_availability once the guest has dates. Amounts are US dollars.\n' +
+        // S626 (Nic): "Give the WEEKLY rate as an upsell with the actual
+        // number; saying 'better rates for weekly and monthly' without the
+        // figures wastes the pitch. RV people expect longer stays to be
+        // cheaper." The discount is the strongest thing on this rate card and
+        // it was being described instead of shown.
+        'QUOTE THE WEEKLY FIGURE, DO NOT ALLUDE TO IT. When you give a nightly rate, give the weekly ' +
+        'number alongside it — "$48 a night, or $290 for the week" — and say what that works out to ' +
+        'per night if it is lower. Never say "we have better rates for longer stays" without the ' +
+        'actual figures; the discount is the reason someone books a week, and a vague version of it ' +
+        'persuades nobody. Same for monthly on a long-stay question.',
     }
   },
 }

@@ -46,7 +46,36 @@ export const checkPropertyAvailability: AgentTool = {
     if (!ci.isValid || !co.isValid) return { ok: false, error: 'Please give valid check-in and check-out dates (YYYY-MM-DD).' }
     const nights = Math.round(co.startOf('day').diff(ci.startOf('day'), 'days').days)
     if (nights <= 0) return { ok: false, error: 'Check-out must be after check-in.' }
-    if (ci < DateTime.now().startOf('day')) return { ok: false, error: 'That check-in date is in the past.' }
+    // S626: this used to return the bare string "That check-in date is in the
+    // past." — and the model, quite reasonably, said that to the customer.
+    //
+    // profiles.ts already tells the booking agent that a bare day number is
+    // never in the past and to ASK WHICH MONTH, but a prompt bullet loses to a
+    // tool result every time: the result is the most recent and most specific
+    // thing in the context, and it said "in the past" in plain English. So the
+    // agent told someone trying to hand over money that their dates had already
+    // happened, and apologised for "using the current date".
+    //
+    // The error now carries the instruction instead of the phrase, and offers
+    // the month they most likely meant so the question can be a confirmation
+    // rather than an interrogation.
+    if (ci < DateTime.now().startOf('day')) {
+      const likely = ci.plus({ months: 1 }) >= DateTime.now().startOf('day')
+        ? ci.plus({ months: 1 })
+        : ci.plus({ years: 1 })
+      return {
+        ok: false,
+        needsMonth: true,
+        likelyCheckIn: likely.toISODate(),
+        likelyMonth: likely.toFormat('LLLL yyyy'),
+        error:
+          `Those dates have already gone by, so they cannot be the ones the customer means — nobody ` +
+          `books a stay that already happened. They have given a day but not a month. Do NOT tell them ` +
+          `the dates are in the past, do NOT apologise, and do NOT mention what date you assumed. ` +
+          `Ask which month they mean, offering the likely one: "${likely.toFormat('LLLL')}?" — then ` +
+          `call this tool again with that month's dates and give them the real quote.`,
+      }
+    }
 
     const units = await bookableUnits(prop.id)
     if (units.length === 0) return { ok: true, nights, siteTypes: [], note: 'This property has no bookable sites published yet.' }

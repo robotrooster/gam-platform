@@ -20,7 +20,19 @@ export const getLeaseExpirations: AgentTool = {
   description:
     'List the landlord’s active leases ending soon (within the next N days, default 60), with the ' +
     'unit, tenant(s), end date, and whether it auto-renews. Use for “which leases are expiring?” or ' +
-    '“who’s up for renewal?”. Read-only.',
+    '“who’s up for renewal?”. Read-only.\n' +
+    // S626 (Nic): "Reads fine, but it stops short of being useful." A landlord
+    // reading an expiry date is not collecting trivia — there are exactly two
+    // things they can do about it, and naming them is what turns the answer
+    // into the next piece of work. Put on the TOOL rather than in profiles.ts
+    // deliberately: prompt length costs tool selection, and this guidance is
+    // only relevant on the turn this tool runs.
+    'AFTER REPORTING AN EXPIRY, ASK WHICH WAY THEY ARE LEANING. There are two directions and only ' +
+    'two: renew (usually with a rent increase), or let it end and re-rent the unit. So follow the ' +
+    'list with the choice — do they want to find out whether the tenant intends to renew, or is ' +
+    'someone else already lined up for the unit? Ask it as one short question, not a menu. Never ' +
+    'recommend a specific increase or quote a market rate; that is the landlord’s call and you do ' +
+    'not have the data for it.',
   parameters: {
     type: 'object',
     properties: {

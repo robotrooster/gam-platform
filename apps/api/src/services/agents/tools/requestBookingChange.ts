@@ -58,6 +58,15 @@ export const requestBookingChange: AgentTool = {
     if (!type) return { ok: false, error: 'Tell me which kind of request: a late checkout, early check-in, extra night, or something else.' }
 
     const b = await loadGuestBookingContext(actor.bookingId)
+    // The average nightly they are already paying — total over nights. Not the
+    // published rate card (that can have moved since they booked), which is the
+    // point: this is the number that applies to THEM.
+    const bookedNights = Number((b as any)?.nights)
+    const bookedTotal = Number((b as any)?.total_amount)
+    const nightlyRate =
+      Number.isFinite(bookedNights) && bookedNights > 0 && Number.isFinite(bookedTotal) && bookedTotal > 0
+        ? bookedTotal / bookedNights
+        : null
     if (!b) return { ok: false, error: 'That booking could not be found.' }
     if (['cancelled', 'checked_out', 'no_show'].includes(b.status)) {
       return { ok: false, error: `This stay is ${b.status.replace('_', ' ')}, so a change request can’t be submitted. The host can still be reached directly.` }
@@ -185,7 +194,18 @@ export const requestBookingChange: AgentTool = {
         autoApproved: true,
         ...(newCheckOut ? { newCheckOut } : {}),
         note: type === 'extra_night'
-          ? `Confirmed — the stay now runs through ${newCheckOut}. Any charge for the extra night is settled with the property as usual. The host has been notified.`
+          // S626 (Nic): "Confirm the nightly rate when offering the extension.
+          // It can already read the booking, so it can read the property's
+          // rates — quote them rather than making the guest ask." "Any charge
+          // ... is settled with the property as usual" is the sentence that
+          // makes someone ask how much, which is the one thing they were always
+          // going to ask. The average nightly off their OWN booking is a real
+          // figure and needs no extra lookup.
+          ? `Confirmed — the stay now runs through ${newCheckOut}.` +
+            (nightlyRate != null
+              ? ` Tell them the extra night is about $${nightlyRate.toFixed(2)}, the same nightly rate as the rest of the stay, settled with the property as usual.`
+              : ' Any charge for the extra night is settled with the property as usual.') +
+            ' The host has been notified.'
           : `Confirmed — the schedule has room, so the ${label.toLowerCase()} is approved. The host has been notified.`,
       }
     }

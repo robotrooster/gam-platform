@@ -55,3 +55,31 @@ describe('anaphoric follow-ups resolve against the previous turn', () => {
     expect(plan('when does my lease end?')).toContain('get_my_lease')
   })
 })
+
+describe('the drill-down — same question, narrowed', () => {
+  const LL = ['get_vacant_units', 'get_landlord_portfolio', 'get_delinquent_tenants',
+              'lookup_tenant_payment_status', 'get_lease_expirations']
+  const ll = (m: string, prev?: string) => routePlan(m, 'landlord' as any, LL, prev).tools
+
+  it('"which of those are at sunset palms?" still reaches the vacancy lookup', () => {
+    // Alone it is about nothing — "those" is the previous turn's 13 units.
+    expect(ll('which of those are at sunset palms?')).toEqual([])
+    expect(ll('which of those are at sunset palms?', 'how many units do I have vacant?'))
+      .toContain('get_vacant_units')
+  })
+
+  it('answering the broad question and failing the narrow one is the bug', () => {
+    // Nic: "If it can list 13 across the portfolio, it can filter to one
+    // property... the narrower query is the easier one."
+    const broad = ll('how many units do I have vacant?')
+    const narrow = ll('which of those are at sunset palms?', 'how many units do I have vacant?')
+    expect(broad).toContain('get_vacant_units')
+    expect(narrow).toContain('get_vacant_units')
+  })
+
+  it('a real change of subject still wins on its own words', () => {
+    const tools = ll('who is behind on rent?', 'how many units do I have vacant?')
+    expect(tools).toContain('get_delinquent_tenants')
+    expect(tools).not.toContain('get_vacant_units')
+  })
+})

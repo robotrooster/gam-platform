@@ -109,16 +109,57 @@ const NAME_RE = [
   /\b(?:look ?up|check on|about)\s+([a-z][a-z'-]+(?:\s+[a-z][a-z'-]+)?)\b/i,
 ]
 
+/**
+ * Words that are never part of somebody's name.
+ *
+ * S626, and this was the whole of Nic's "narrow-then-answer" failure. The name
+ * patterns allow an apostrophe inside a word — they have to, for O'Brien and
+ * D'Angelo — and a two-word name is allowed for "Frank Chen". Put together on
+ * "what's chen's balance?" they capture **"what's chen"**, so the agent went
+ * looking for a tenant of that name, found nobody, and asked the landlord which
+ * Chen they meant. His verdict: "The landlord should never have had to narrow
+ * this. The question word gives away that no human is reading it."
+ *
+ * A person seeing "Chen's" reads a possessive and searches Chen.
+ */
+const NOT_A_NAME_WORD = new Set([
+  'what', "what's", 'whats', 'who', "who's", 'whos', 'how', "how's", 'hows',
+  'when', "when's", 'where', "where's", 'why', 'which', 'whose',
+  'is', 'are', 'was', 'does', 'do', 'did', 'has', 'have', 'can', 'could',
+  'tell', 'show', 'give', 'find', 'get', 'look', 'check', 'pull',
+  'me', 'my', 'the', 'a', 'an', 'about', 'on', 'for', 'of', 'to', 'and',
+  'so', 'ok', 'okay', 'hey', 'hi', 'please', 'up', 'out',
+  'anyone', 'anybody', 'someone', 'somebody', 'everyone', 'everybody', 'all',
+  'they', 'he', 'she', 'it', 'that', 'this', 'them', 'their', 'his', 'her',
+  'tenant', 'tenants', 'unit', 'lot', 'spot', 'site', 'apartment',
+])
+
+/**
+ * Drop leading question words from a captured name.
+ *
+ * Leading only: a stop word INSIDE a name is somebody else's problem, but a
+ * name that begins with one is a parse that ate the question.
+ */
+function cleanName(raw: string): string | undefined {
+  const words = raw.trim().split(/\s+/).filter(Boolean)
+  while (words.length && NOT_A_NAME_WORD.has(words[0].toLowerCase())) words.shift()
+  // And a trailing one, for "chen the tenant".
+  while (words.length && NOT_A_NAME_WORD.has(words[words.length - 1].toLowerCase())) words.pop()
+  if (!words.length) return undefined
+  // Every remaining word being a stop word means nothing was named.
+  if (words.every((w) => NOT_A_NAME_WORD.has(w.toLowerCase()))) return undefined
+  return words.join(' ')
+}
+
 /** The unit if one is named, else the person, else nothing. */
 function whoOrWhere(message: string): string | undefined {
   const u = UNIT_RE.exec(message)
   if (u) return `${u[1]} ${u[2]}`.replace(/\s+/g, ' ').trim()
   for (const re of NAME_RE) {
     const m = re.exec(message)
-    // Guard the indefinite words — "is ANYONE behind" is not a person.
-    if (m && !/^(anyone|anybody|someone|somebody|everyone|everybody|all|my|the|they|he|she|it|that|this)$/i.test(m[1].trim())) {
-      return m[1].trim()
-    }
+    if (!m) continue
+    const cleaned = cleanName(m[1])
+    if (cleaned) return cleaned
   }
   return undefined
 }
@@ -885,8 +926,23 @@ export function routePlan(
     // answered — the repeat bug again, one layer down. What we want is the route
     // the follow-up UNLOCKED, so the turn that has already been served is
     // excluded from the running.
-    const carried = matchRoutes(joined, audience, available, previousUserMessage)
-    if (carried) return { tools: carried.tools, args: matchRoutes(message, audience, available)?.args }
+    // Stage one: what did the follow-up UNLOCK? Skipping the routes the
+    // previous message already matched finds a genuinely new subject.
+    const unlocked = matchRoutes(joined, audience, available, previousUserMessage)
+    if (unlocked) return { tools: unlocked.tools, args: matchRoutes(message, audience, available)?.args }
+    // Stage two: THE DRILL-DOWN. "how many units are vacant?" then "which of
+    // those are at Sunset Palms?" is the same question narrowed to one
+    // property, so the route that served the first turn is exactly the right
+    // one — the second turn only changes an argument. Stage one deliberately
+    // excludes it, which would have left the commonest landlord follow-up in
+    // the portfolio routing nothing at all. Reached only when nothing else
+    // matched, so a real change of subject still wins on its own words.
+    const narrowed = matchRoutes(joined, audience, available)
+    if (narrowed) {
+      // Arguments come from THIS turn — the previous one supplies the query,
+      // this one supplies what to filter it to.
+      return { tools: narrowed.tools, args: narrowed.extractFrom?.(message) ?? narrowed.args }
+    }
   }
   return { tools: [] }
 }
@@ -897,7 +953,12 @@ function matchRoutes(
   available: readonly string[],
   /** Ignore routes this text already matches — see the carry-over note above. */
   alreadyServed?: string,
-): { tools: string[]; args?: Record<string, unknown> } | null {
+): {
+  tools: string[]
+  args?: Record<string, unknown>
+  /** The matched route's own extractor, so a drill-down can re-read the new turn. */
+  extractFrom?: (message: string) => Record<string, unknown> | undefined
+} | null {
   const have = new Set(available)
   const stripped = withoutFiller(message)
   const servedStripped = alreadyServed ? withoutFiller(alreadyServed) : ''
@@ -912,7 +973,7 @@ function matchRoutes(
     if (!usable.length) continue
     // Arguments come from the ORIGINAL wording — a complaint is recorded in the
     // tenant's real words, not a stripped version of them.
-    return { tools: usable, args: route.extractArgs?.(message) }
+    return { tools: usable, args: route.extractArgs?.(message), extractFrom: route.extractArgs }
   }
   return null
 }

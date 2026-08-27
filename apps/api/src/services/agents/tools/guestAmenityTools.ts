@@ -26,9 +26,11 @@ import type { AgentTool, AgentActor } from './types'
 export const getGuestAmenities: AgentTool = {
   name: 'get_guest_amenities',
   description:
-    'The reservable amenities at the property the guest is staying at — name, capacity, reservation fee, ' +
-    'hours, whether booking is instant or needs the host’s approval — plus the guest’s own reservations. Use ' +
-    'before requesting a reservation and for “what can I book / is there a pool? / is there a clubhouse?”. ' +
+    'The amenities at the property the guest is staying at — name, description, capacity, hours, whether it ' +
+    'can be reserved at all, and if so whether booking is instant or needs the host’s approval — plus the ' +
+    'guest’s own reservations. Use for “is there a pool? / is there laundry? / what can I book?” and before ' +
+    'requesting a reservation. Includes amenities that CANNOT be booked (a laundry room, a walk-up pool); ' +
+    'those still answer the question of whether the property has one. ' +
     // S624: asked "is there a pool or clubhouse I can book during my stay?", the
     // agent called get_guest_booking first. It takes no arguments and resolves
     // the guest's property itself, so looking up the booking to find out WHERE
@@ -42,13 +44,22 @@ export const getGuestAmenities: AgentTool = {
     if (!actor.bookingId) return { ok: false, error: 'No booking is associated with this session.' }
     const b = await loadGuestBookingContext(actor.bookingId)
     if (!b?.property_id) return { ok: true, amenities: [], reservations: [], note: 'This stay has no property amenities to show.' }
+    // S626: this filtered on `AND reservable`, and that made the tool lie.
+    //
+    // It is the tool that answers "is there a pool?" — its own description says
+    // so — but it only ever returned areas a guest can BOOK. The demo property's
+    // Community Laundry is active and not reservable, so a guest asking about
+    // laundry was told the property has none. An amenity you can walk to is
+    // still an amenity; it simply cannot be reserved, and the `reservable`
+    // column now carries that distinction into the answer instead of deciding
+    // in silence that the thing does not exist.
     const areas = await query<any>(
       `SELECT id, name, description, requires_approval, capacity,
               reservation_fee::float AS reservation_fee, open_time, close_time,
               max_reservation_hours, events_enabled,
-              event_deposit_amount::float AS event_deposit_amount
+              event_deposit_amount::float AS event_deposit_amount, reservable
          FROM common_areas
-        WHERE property_id = $1 AND active AND reservable
+        WHERE property_id = $1 AND active
         ORDER BY name`, [b.property_id])
     const mine = await query<any>(
       `SELECT car.id, ca.name AS area_name, car.kind, car.starts_at, car.ends_at,
@@ -62,9 +73,15 @@ export const getGuestAmenities: AgentTool = {
       ok: true,
       amenities: areas,
       reservations: mine,
-      note: 'Reservations must fall within the stay dates. Weekend dates can carry a different fee — the exact ' +
-        'fee is computed when a request is made and the property collects it with the stay. Areas with ' +
-        'requires_approval=false confirm instantly; others go to the host for approval.',
+      note: 'ANSWER THE QUESTION THEY ASKED FIRST. "Is there a pool?" is a yes/no question about the ' +
+        'property — answer it, with the hours and whatever the description says about it. Only mention ' +
+        'reserving, approval or fees if they ask to book it or the answer needs it. Do not open with ' +
+        'the reservation mechanics and do not propose a time slot they did not ask for.\n' +
+        'reservable=false means the area is there to use but cannot be booked — say it exists, and do ' +
+        'NOT tell them it needs approval or offer to reserve it. reservable=true areas can be booked: ' +
+        'requires_approval=false confirms instantly, otherwise it goes to the host. Reservations must ' +
+        'fall within the stay dates. Weekend dates can carry a different fee — the exact fee is computed ' +
+        'when a request is made and the property collects it with the stay.',
     }
   },
 }
