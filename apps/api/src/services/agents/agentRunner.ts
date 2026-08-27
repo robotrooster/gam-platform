@@ -392,6 +392,49 @@ export function demandsAToolCall(message: string, audience?: string): boolean {
  * a notice on. So when no tool ran and the reply still reads like a record,
  * the record is not sent.
  */
+/**
+ * Did this reply just re-answer the PREVIOUS turn?
+ *
+ * S626, and it was under four of the six tenant conversations and five of the
+ * nineteen in Nic's review. A tenant who said "no thanks, I'll sort it out
+ * myself later" had the entire $2,330 breakdown read at them a second time,
+ * word for word. One who asked the agent to double-check the lease got the same
+ * sentence about a $75 pet deposit back, unchanged, as though they had not
+ * spoken.
+ *
+ * Nothing in the guard chain looked ACROSS turns. collapseRepetition dedupes
+ * lines within a single reply and has no idea what was said a moment ago, and
+ * every other net reasons about the current message in isolation. So the model
+ * could answer the previous question perfectly and no layer would notice it had
+ * answered the wrong one.
+ *
+ * Measured as a shared PREFIX rather than equality, because the repeats are not
+ * byte-identical — they trail off differently or append a clause. A long
+ * identical opening is the signal; two different questions do not start their
+ * answers with the same sixty characters by chance.
+ *
+ * Compared only against the LAST assistant turn. Legitimately restating a
+ * figure from three turns ago ("as I mentioned, it's $2,330") is normal
+ * conversation; immediately reissuing the reply just given is not.
+ */
+export function repeatsPreviousReply(
+  history: ReadonlyArray<{ role: string; content?: string | null }>,
+  text: string,
+): boolean {
+  if (!text?.trim()) return false
+  const prior = [...history].reverse().find((m) => m.role === 'assistant' && m.content?.trim())
+  if (!prior) return false
+  const a = String(prior.content).replace(/\s+/g, ' ').trim()
+  const b = text.replace(/\s+/g, ' ').trim()
+  if (!a || !b) return false
+  if (a === b) return true
+  let i = 0
+  while (i < Math.min(a.length, b.length) && a[i] === b[i]) i++
+  // Same bar the two-turn harness asserts at, so anything it would flag gets
+  // one correction attempt before it reaches a person.
+  return i >= 60 || i >= Math.min(a.length, b.length) * 0.5
+}
+
 export function assertsStoredFacts(text: string): boolean {
   if (!text) return false
   // A LIST OF RECORDS. Two or more bulleted or numbered lines is a report, and
@@ -762,6 +805,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const toolInvocations: ToolInvocation[] = []
   let nudgedForAccountData = false
   let nudgedForPadding = false
+  let nudgedForRepeat = false
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
@@ -1017,10 +1061,37 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           continue
         }
       }
+      // S626: ...and the reply must actually DO the thing this net exists to
+      // correct. The STOP text below opens "your last answer stated
+      // account-specific facts without fetching them" — and nobody checked that
+      // it had. demandsAToolCall defaults to TRUE for a tenant or a landlord, so
+      // ANY follow-up that was not a bare "ok" satisfied it, including a
+      // decline. Measured: a tenant answered their balance said "no thanks,
+      // I'll sort it out myself later", the model replied appropriately and
+      // tool-lessly, this net fired on a reply containing no figures at all,
+      // forced get_my_payment_status, and the model — told to "answer from its
+      // result" — reissued the $2,330 breakdown verbatim. The guard against
+      // invented numbers was manufacturing the repeat.
+      //
+      // A reply that states no fact, makes no promise and claims no action has
+      // nothing in it to invent. This is the same three-way test the step
+      // ceiling has always used before suppressing; the nudge simply never
+      // shared it.
+      //
+      // SCOPED TO FOLLOW-UP TURNS. On turn one the net stays exactly as
+      // aggressive as it was: "when is rent due?" answered "the 1st" with no
+      // lookup is a per-lease fact stated from memory, assertsStoredFacts does
+      // NOT catch a bare ordinal, and that answer must still be forced through
+      // a tool. The repeat only exists where there is something to repeat, so
+      // the relaxation is confined to turns that carry history — which is also
+      // the only place the old behaviour was doing harm.
       if (
         !nudgedForAccountData &&
         toolInvocations.length === 0 &&
-        demandsAToolCall(message, profile.audience)
+        demandsAToolCall(message, profile.audience) &&
+        (history.length === 0
+          || assertsStoredFacts(out.content) || saysItWillCheck(out.content)
+          || claimsAnActionItNeverTook(out.content))
       ) {
         nudgedForAccountData = true
         forceToolThisTurn = true
@@ -1095,6 +1166,29 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'agent runner: reply named invented records twice — reply suppressed')
           return { reply: cannotSee(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
         }
+      }
+      // S626: the reply is fine on its own terms — but is it an answer to the
+      // question that was just asked, or to the one before it? See
+      // repeatsPreviousReply. Last gate before this reaches a person, and it
+      // costs nothing on a turn that does not repeat.
+      if (!nudgedForRepeat && repeatsPreviousReply(history, out.content)) {
+        nudgedForRepeat = true
+        logger.warn({ profile: profile.id, message },
+          'agent runner: reply repeated the previous turn — forcing one rewrite')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — that is the same answer you just gave. They already read it; ' +
+            'repeating it tells them you were not listening. ' +
+            `They have now said: "${message}" — respond to THAT. ` +
+            'Do not restate the figures or the explanation from your previous reply. ' +
+            'Assume everything in it still stands and say only what is new: ' +
+            'answer the question they actually asked, acknowledge what they told you, ' +
+            'or — if they declined something or closed the subject — simply accept it and stop. ' +
+            'Keep it short. A brief reply that moves forward beats a complete one that does not.',
+        })
+        continue
       }
       return { reply: out.content, model, retrieved, grounded, toolInvocations, usage }
     }

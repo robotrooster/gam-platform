@@ -41,6 +41,31 @@ process.env.AGENT_LANDLORD_TURNS_PER_UNIT ||= '100000'
 process.env.AGENT_TENANT_DAILY_OFFTOPIC ||= '100000'
 process.env.AGENT_LANDLORD_DAILY_OFFTOPIC ||= '100000'
 
+// S626: SEED IT, like agentEval.ts does. Agents sample at temperature 0.6, so
+// an unseeded run of this harness is ONE DRAW and two runs of a byte-identical
+// file disagree. S624 reverted a batch of good work over a 4-point swing that
+// was noise. If the transcripts are going to be compared before and after an
+// edit — which is the entire point of an overnight loop — the sampling has to
+// be the constant. Same seed as the eval, for the same reason.
+process.env.AGENT_SAMPLER_SEED ||= '424242'
+
+// S626: PACE IT. This is a GPU-safety change, not a performance one.
+//
+// The Mac Studio kernel-panicked TWICE on 2026-08-26 with
+// `completeMemory() prepare count underflow` @IOGPUMemory.cpp:550 — a macOS
+// GPU memory refcount bug that continuous Metal allocation from the 36B model
+// walks straight into. The second panic took Postgres down with it for eleven
+// minutes, and that machine also serves production.
+//
+// agentEval.ts already pauses between cases (AGENT_EVAL_PAUSE_MS, default
+// 3000). THIS harness did not, and it is strictly heavier: every conversation
+// is TWO full generations, and turn two always carries history so it can never
+// be served from the answer cache. It was the un-paced job on the box.
+//
+// The problem is CADENCE, not concurrency — the suite is already sequential.
+process.env.AGENT_EVAL_PAUSE_MS ||= '5000'
+
+
 import { runAgentSession } from './agentSession'
 import { query, queryOne } from '../../db'
 import { buildTestActors } from './agentActors'
@@ -170,16 +195,22 @@ async function restoreBooking(bookingId: string | null, snap: any) {
 }
 
 async function main() {
+  const pauseMs = Number(process.env.AGENT_EVAL_PAUSE_MS ?? 5000)
   const filter = (process.argv[2] ?? '').toLowerCase()
   const { actorFor, bookingId } = await buildTestActors()
   const convs = ALL_CONVERSATIONS.filter(
     (c) => !filter || c.audience === filter || c.id.includes(filter))
   const snap = convs.some((c) => c.audience === 'guest') ? await snapshotBooking(bookingId) : null
 
-  console.log(`\n${convs.length} two-turn conversation(s)\n${'═'.repeat(60)}`)
+  console.log(`\n${convs.length} two-turn conversation(s)  ${D}seed=${process.env.AGENT_SAMPLER_SEED} pause=${pauseMs}ms${O}\n${'═'.repeat(60)}`)
   const results: Result[] = []
   try {
+  let first = true
   for (const conv of convs) {
+    // Let the GPU's memory settle between conversations. See the pacing note
+    // at the top of this file — this is what keeps the box alive overnight.
+    if (!first && pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs))
+    first = false
     const r = await runConversation(conv, actorFor(conv.audience))
     results.push(r)
     const mark = r.flags.length ? `${R}✗${O}` : `${G}✓${O}`
