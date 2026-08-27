@@ -5,6 +5,7 @@ import './instrument'
 import * as Sentry from '@sentry/node'
 
 import express from 'express'
+import { db } from './db'
 import path from 'path'
 import fs from 'fs'
 // S86: scheduleOtpCron import removed. The cron's INSERT references the
@@ -286,7 +287,35 @@ const loginLimiter = rateLimit({
 app.use('/api/auth/login', loginLimiter)
 
 // ── ROUTES ──────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }))
+// S624 — A HEALTH CHECK THAT DOES NOT TOUCH THE DATABASE IS A HEALTH CHECK
+// THAT LIES.
+//
+// This returned {status:'ok'} unconditionally. On 2026-08-26 Postgres was down
+// for eleven minutes after a kernel panic (stale postmaster.pid) and this
+// endpoint answered 200 the entire time, so every external check looked green
+// while every request underneath it failed. The watchdog, the deploy verifier
+// and anything else asking "is it up?" were all told yes.
+//
+// Kept deliberately cheap — one SELECT 1 on the pool, with a short timeout, so
+// polling it can never become a load source. 503 when the database is
+// unreachable, because that is what "not healthy" means for this service: an
+// API that cannot read the database serves nothing.
+app.get('/health', async (_req, res) => {
+  try {
+    await Promise.race([
+      db.query('SELECT 1'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('db timeout')), 2000)),
+    ])
+    res.json({ status: 'ok', db: 'up', ts: new Date() })
+  } catch (e) {
+    res.status(503).json({
+      status: 'degraded',
+      db: 'unreachable',
+      error: e instanceof Error ? e.message : String(e),
+      ts: new Date(),
+    })
+  }
+})
 
 app.use('/api/auth',          authRouter)
 app.use('/api/auth/totp',     totpRouter)

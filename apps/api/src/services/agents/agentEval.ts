@@ -215,8 +215,30 @@ async function main() {
     ? SCENARIOS.filter((s) => wanted.some((w) => s.id === w || s.id.startsWith(w)))
     : SCENARIOS
   let passed = 0
-  console.log(`\n[eval] running ${scenarios.length} scenarios against ${process.env.LLM_MODEL}\n`)
+  // S624 — BREATHE BETWEEN SCENARIOS.
+  //
+  // This suite kernel-panicked the host twice in one day:
+  //   panic: "completeMemory() prepare count underflow" @IOGPUMemory.cpp:550
+  // a GPU memory refcount bug in macOS, surfaced by continuous Metal
+  // allocation churn. The suite is already sequential, so the fix is not
+  // concurrency — it is CADENCE. A pause between scenarios lets the GPU
+  // allocator settle instead of being hammered flat out for ten minutes.
+  //
+  // Default is a real pause, not zero: the cost is a few minutes on a suite
+  // nobody watches, and the alternative cost is the machine that runs rent
+  // collection going down. Set AGENT_EVAL_PAUSE_MS=0 only on a host where the
+  // model is not sharing silicon with production.
+  const pauseMs = Number(process.env.AGENT_EVAL_PAUSE_MS ?? 3000)
+  const breathe = () => pauseMs > 0
+    ? new Promise((r) => setTimeout(r, pauseMs))
+    : Promise.resolve()
+
+  console.log(`\n[eval] running ${scenarios.length} scenarios against ${process.env.LLM_MODEL}`)
+  console.log(`[eval] pacing: ${pauseMs}ms between scenarios\n`)
+  let first = true
   for (const s of scenarios) {
+    if (!first) await breathe()
+    first = false
     const actor = ACTORS[s.audience]
     try {
       const res = await runAgentSession({ audience: s.audience, actor, message: s.message, history: s.history })
