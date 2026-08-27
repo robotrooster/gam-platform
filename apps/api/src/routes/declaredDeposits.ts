@@ -83,11 +83,26 @@ declaredDepositsRouter.post('/', async (req, res, next) => {
     // A deposit cannot have happened in the future, and a date the tenant has
     // to scroll back to is almost certainly a mistake. Both are refused with a
     // sentence rather than a validation code.
-    const today = DateTime.now().setZone('America/Phoenix').toISODate()!
-    if (body.declaredDate > today) {
+    // S624 — "TOMORROW" DEPENDS ON WHERE YOU ARE STANDING.
+    //
+    // This compared the tenant's date against Phoenix's, and rejected anything
+    // ahead of it. A tenant EAST of the property is legitimately on tomorrow's
+    // date for part of every evening: someone in New York reporting a deposit at
+    // 10pm is on the 27th while an Arizona property is still on the 26th, and
+    // they were told their deposit was "in the future". GAM now has properties
+    // in two timezones and will have more.
+    //
+    // It also broke the test suite after 5pm Phoenix, which is how it surfaced —
+    // the deploy gate caught it before it shipped.
+    //
+    // One day of slack covers every US offset with room to spare, and still
+    // refuses a date genuinely days out.
+    const today = DateTime.now().setZone('America/Phoenix')
+    const latestSensible = today.plus({ days: 1 }).toISODate()!
+    if (body.declaredDate > latestSensible) {
       throw new AppError(400, 'That date is in the future — report the deposit after you have made it.')
     }
-    if (body.declaredDate < DateTime.fromISO(today).minus({ days: 45 }).toISODate()!) {
+    if (body.declaredDate < today.minus({ days: 45 }).toISODate()!) {
       throw new AppError(400, 'That date is more than 45 days ago. Contact your landlord so they can look it up directly.')
     }
 

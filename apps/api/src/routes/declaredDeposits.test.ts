@@ -8,6 +8,7 @@
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import { DateTime } from 'luxon'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { declaredDepositsRouter } from './declaredDeposits'
@@ -58,9 +59,13 @@ async function fixture(): Promise<Fx> {
   } finally { client.release() }
 }
 
-const today = () => new Date().toISOString().slice(0, 10)
-const daysAgo = (n: number) =>
-  new Date(Date.now() - n * 86400000).toISOString().slice(0, 10)
+// S624: these used UTC, so after 5pm Phoenix they produced TOMORROW's date and
+// the suite started failing every evening. Use the property's own zone, which is
+// what the route compares against.
+const phx = (offsetDays = 0) =>
+  DateTime.now().setZone('America/Phoenix').plus({ days: offsetDays }).toISODate()!
+const today = () => phx()
+const daysAgo = (n: number) => phx(-n)
 
 describe('a tenant reporting a deposit', () => {
   it('records the claim and says the balance has not moved', async () => {
@@ -107,7 +112,9 @@ describe('a tenant reporting a deposit', () => {
     const res = await request(buildApp()).post('/api/declared-deposits')
       .set('Authorization', `Bearer ${f.token}`)
       .send({ leaseId: f.leaseId, amount: 250,
-              declaredDate: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+              // Two days out — one day of slack is allowed on purpose, for a
+              // tenant east of the property who is already on tomorrow's date.
+              declaredDate: phx(2),
               method: 'cash' })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/after you have made it/i)
