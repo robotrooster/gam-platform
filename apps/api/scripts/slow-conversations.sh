@@ -53,7 +53,9 @@ for ID in $IDS; do
   echo "───────── [$N/$TOTAL] $ID  $(date '+%H:%M:%S') ─────────" >> "$LOG"
   # AGENT_EVAL_PAUSE_MS=0: there is only one conversation in this process, so
   # the harness's own inter-case pause has nothing to pace.
-  AGENT_EVAL_PAUSE_MS=0 DB_NAME=gam AGENT_TWO_PASS="${AGENT_TWO_PASS:-0}" \
+  # AGENT_HARNESS_NO_MONEY: this runs against the production database with live
+  # Stripe keys. Recording a payment is fine; taking one is not.
+  AGENT_EVAL_PAUSE_MS=0 DB_NAME=gam AGENT_HARNESS_NO_MONEY=1 AGENT_TWO_PASS="${AGENT_TWO_PASS:-0}" \
     npx ts-node src/services/agents/agentConversations.ts "$ID" \
     >> "$LOG" 2>&1
   # Was the machine still alive? A panic takes the whole box, so this line not

@@ -43,6 +43,15 @@ export function __setTransport(t: Transport | null) { transport = t }
 
 const BASE = () => process.env.AGENT_DISPATCH_BASE || `http://127.0.0.1:${process.env.PORT || 4000}`
 
+/**
+ * Actions that actually MOVE money, as opposed to recording that money moved.
+ *
+ * Deliberately short. pay_bill, record_cash_payment and the rest write a record
+ * of something that already happened outside GAM — running those in a test
+ * dirties demo data and nothing more. These two reach Stripe.
+ */
+const MOVES_MONEY = new Set(['pay_my_balance', 'set_up_autopay'])
+
 async function defaultTransport(url: string, init: any) {
   const res = await fetch(url, init)
   let json: any = null
@@ -76,6 +85,27 @@ export async function dispatchPortalAction(
     // Belt and braces — the profile should never have offered it.
     return { ok: false, refused: 'wrong_audience', error: 'That action does not belong to this user.' }
   }
+  // S628 — A TEST RUN MUST NOT MOVE REAL MONEY.
+  //
+  // The conversation harness runs against DB_NAME=gam, which IS the production
+  // database, with LIVE Stripe keys — and once the harness actors were given
+  // real credentials (agentActors.ts) every allowlisted action became genuinely
+  // executable from a test. `pay_my_balance` charges a saved payment method.
+  //
+  // Today it would have failed harmlessly because the demo tenant has no Stripe
+  // customer on file. That is luck, not a control, and it stops being true the
+  // first time somebody seeds a demo card. Set AGENT_HARNESS_NO_MONEY=1 in any
+  // batch run; the refusal is worded so the agent still says something true
+  // rather than claiming a payment went through.
+  if (process.env.AGENT_HARNESS_NO_MONEY === '1' && MOVES_MONEY.has(actionId)) {
+    logger.warn({ actionId }, 'agent dispatch: money action blocked — harness mode')
+    return {
+      ok: false, refused: 'no_credentials',
+      error: 'Payments are disabled in this environment. Say plainly that the payment could NOT ' +
+        'be taken and do NOT claim it went through.',
+    }
+  }
+
   if (!actor.auth) {
     return {
       ok: false, refused: 'no_credentials',
