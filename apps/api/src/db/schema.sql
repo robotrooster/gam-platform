@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict IjfiSFriaXtWq5lBYadG0B5bbcJg8j5GcH14u4aE1Mg2mLNpwMnhz1CjSZSaqIM
+\restrict eSHfCefsrqB0PnlbhQ1QQ6Ps08PSRNCKPYnGl6aSm7ZzYXbOoFC4ETOcVHYabsZ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4826,6 +4826,8 @@ CREATE TABLE public.leases (
     hibernated_at timestamp with time zone,
     late_fee_accrual_from text DEFAULT 'grace_end'::text NOT NULL,
     source_application_id uuid,
+    tenant_renewal_pinged_at timestamp with time zone,
+    landlord_renewal_alerted_at timestamp with time zone,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -4839,6 +4841,20 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
     CONSTRAINT leases_tenant_renewal_intent_check CHECK (((tenant_renewal_intent IS NULL) OR (tenant_renewal_intent = ANY (ARRAY['yes'::text, 'no'::text, 'unsure'::text]))))
 );
+
+
+--
+-- Name: COLUMN leases.tenant_renewal_pinged_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.tenant_renewal_pinged_at IS 'S628: when the 60-day tenant-first renewal question was sent. Guard against re-asking.';
+
+
+--
+-- Name: COLUMN leases.landlord_renewal_alerted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.landlord_renewal_alerted_at IS 'S628: when the landlord was told where the renewal stands (~32 days out). Guard against repeat alerts.';
 
 
 --
@@ -24624,5 +24640,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IjfiSFriaXtWq5lBYadG0B5bbcJg8j5GcH14u4aE1Mg2mLNpwMnhz1CjSZSaqIM
+\unrestrict eSHfCefsrqB0PnlbhQ1QQ6Ps08PSRNCKPYnGl6aSm7ZzYXbOoFC4ETOcVHYabsZ
 

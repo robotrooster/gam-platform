@@ -1299,9 +1299,11 @@ leasesRouter.post('/:id/offer-renewal', requirePerm('leases.edit'), async (req, 
 // "do you plan to renew?" survey shown near lease expiry. Records the intent on
 // the lease (so the survey hides), opens a renewal request when they want to
 // renew, and notifies the landlord. Tenant-facing (mirrors terminate-early auth).
-// S562: gated — the tenant only SEES this survey after the landlord offers
-// renewal (landlord_renewal_offered_at set); the tenant UI enforces it, and the
-// landlord-first model means a bare 'yes' here always follows an offer.
+// S628 (Nic): TENANT-FIRST. S562 gated the survey on landlord_renewal_offered_at,
+// so a bare 'yes' here always followed an offer. It no longer does — the tenant
+// is asked at 60 days by jobs/renewalPing.ts, before any offer exists, and a
+// 'yes' now means "I want to stay", not "I accept your terms". Nothing here
+// quotes or agrees a rent for the new term; the landlord still makes the offer.
 leasesRouter.post('/:id/renewal-intent', requireAuth, async (req, res, next) => {
   try {
     const u = req.user!

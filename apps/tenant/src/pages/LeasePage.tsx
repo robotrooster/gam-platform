@@ -223,10 +223,19 @@ export function LeasePage() {
     ? Math.ceil((new Date(lease.endDate).getTime() - Date.now()) / 86400000) : null
   const needsTenantSig = lease.signedByLandlord && !lease.signedByTenant
   const fullyExecuted = lease.signedByLandlord && lease.signedByTenant
-  // S562 (Nic): landlord-first — the survey ONLY releases to the tenant AFTER the
-  // landlord has offered renewal (landlord_renewal_offered_at). No reason to ask
-  // the tenant if the landlord doesn't plan to renew.
-  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted && !!lease.landlordRenewalOfferedAt
+  // S628 (Nic): TENANT-FIRST. S562 gated this on landlord_renewal_offered_at —
+  // the landlord had to offer before the tenant was asked anything. Nic asked
+  // for the other order: the tenant is asked at 60 days, the landlord hears
+  // where it stands at 32 (jobs/renewalPing.ts sends both).
+  //
+  // The reason is the clock. Notice periods run 30 or 60 days depending on the
+  // state, nothing auto-renews, and the person who knows first whether they are
+  // staying is the one living there. Waiting for the landlord to open the
+  // conversation means a tenant who has already decided to leave says nothing
+  // until it is too late for either side to act on it.
+  //
+  // The offer is still a real event — it just no longer gates the question.
+  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
 
   return (
     <div>

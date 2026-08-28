@@ -1111,6 +1111,20 @@ export function schedulerInit() {
     }
   })
 
+  // S628 (Nic): renewal is TENANT-FIRST — ask the tenant at 60 days, tell the
+  // landlord at 32. Nothing sent that question before; it waited on a landlord
+  // who had no prompt to ask it. 10:30, just after the invite nudge, so the two
+  // tenant-facing daily emails do not land in the same minute.
+  cron.schedule('30 10 * * *', async () => {
+    try {
+      const { runRenewalPings } = await import('./renewalPing')
+      const r = await runRenewalPings()
+      if (r.pinged > 0 || r.alerted > 0 || r.errors > 0) logger.info(r, '[renewal-ping]')
+    } catch (e) {
+      logger.error({ err: e }, '[renewal-ping] fatal')
+    }
+  })
+
   // S550 (Nic): daily growth snapshot — per-(state,city) + platform totals
   // (landlords/properties/units/occupancy/rent-roll). History starts the
   // day it landed; powers growth-velocity charts + the heat map over time.
