@@ -189,3 +189,55 @@ describe('surveys are anonymous, and the agent must never promise otherwise', ()
     expect(r.error).toMatch(/matches|options/i)
   })
 })
+
+describe('renewal intent — the per-lease questionnaire, not the anonymous survey', () => {
+  // Two different features that both get called "the survey":
+  //   surveys.*            — anonymous, property-wide, general questions
+  //   leases.tenant_renewal_intent — named, per-lease, on a legal clock
+  // Conflating them is how a landlord gets told a survey can identify who is
+  // renewing, and how a tenant's notice to leave goes nowhere.
+  it('exists, is tenant-only, and the profile carries it', () => {
+    const t = getTool('submit_renewal_intent')
+    expect(t).toBeTruthy()
+    expect(t!.audiences).toEqual(['tenant'])
+    expect(getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name))
+      .toContain('submit_renewal_intent')
+  })
+
+  it('takes only the three values the lease CHECK allows', async () => {
+    const t = getTool('submit_renewal_intent')!
+    const ACTOR = { userId: 'u', role: 'tenant', profileId: '00000000-0000-0000-0000-000000000000' } as any
+    for (const bad of ['maybe', 'renew', 'YES please', '']) {
+      const r: any = await t.execute({ intent: bad }, ACTOR)
+      expect(r.ok, bad).toBe(false)
+      expect(r.error, bad).toMatch(/yes.*no.*unsure/i)
+    }
+  })
+
+  it('says out loud that "no" is written notice — the tenant must not learn that afterwards', () => {
+    const d = getTool('submit_renewal_intent')!.description
+    expect(d).toMatch(/WRITTEN NOTICE THAT THEY ARE LEAVING/i)
+    expect(d).toMatch(/nothing renews automatically/i)
+    expect(d).toMatch(/explicit yes/i)
+  })
+
+  it('is NOT anonymous, unlike the property survey', () => {
+    expect(getTool('submit_renewal_intent')!.description).toMatch(/NOT anonymous/i)
+    // And the anonymous one still says the opposite, so they cannot be confused.
+    expect(getTool('create_and_send_survey')!.description).toMatch(/ANONYMOUS/i)
+  })
+
+  it('does not claim success when there is no active lease', async () => {
+    const r: any = await getTool('submit_renewal_intent')!.execute(
+      { intent: 'no' },
+      { userId: 'u', role: 'tenant', profileId: '00000000-0000-0000-0000-000000000000' } as any)
+    expect(r.ok).toBe(false)
+    expect(r.recorded).toBeUndefined()
+    expect(r.error).toMatch(/do NOT tell them it was recorded/i)
+  })
+
+  it('sends questions ABOUT renewing to the read tools instead', () => {
+    expect(getTool('submit_renewal_intent')!.description)
+      .toMatch(/get_my_landlord_renewal_tendency/)
+  })
+})
