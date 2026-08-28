@@ -41,6 +41,22 @@ describe('the deciding prompt', () => {
     }
   })
 
+  it('does not tell somebody without an account about their account', () => {
+    // The first version built this line from one template, and produced, for a
+    // prospect: "ANYTHING ABOUT THIS PERSON'S OWN ACCOUNT — what GAM costs and
+    // what it does". A prospect has no account and neither does a visitor.
+    // That is not clumsy phrasing, it is a false premise handed to the model
+    // every turn — and the risk runs both ways: it can read public pricing as
+    // account data, or decide the look-it-up rule does not apply because there
+    // is no account to look up.
+    const accountless = AGENT_PROFILES.filter(
+      (p) => p.audience === 'prospect' || p.audience === 'visitor')
+    expect(accountless.length).toBeGreaterThan(0)
+    for (const p of accountless) {
+      expect(buildDecisionPrompt(p), p.id).not.toMatch(/own account/i)
+    }
+  })
+
   it('names the audience, so it cannot offer the wrong side its own tools', () => {
     for (const p of AGENT_PROFILES) {
       expect(buildDecisionPrompt(p)).toContain(p.audience.toUpperCase())

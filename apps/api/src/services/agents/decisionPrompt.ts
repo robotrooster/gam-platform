@@ -35,17 +35,38 @@
  */
 import type { AgentProfile } from './types'
 
-/** What each audience's own data looks like, in the words they would use. */
-const OWN_DATA: Record<string, string> = {
+/**
+ * The sentence that makes the model look something up, per audience.
+ *
+ * WRITTEN PER AUDIENCE RATHER THAN FROM A TEMPLATE, because the first version
+ * was a template and it produced, for a prospect: "ANYTHING ABOUT THIS PERSON'S
+ * OWN ACCOUNT — what GAM costs and what it does". A prospect has no account.
+ * That is not a clumsy sentence, it is a false premise handed to the model on
+ * every turn, and the risk is that it reads public pricing as account data —
+ * or, worse, decides the rule does not apply because there is no account.
+ *
+ * A visitor has no account either. What both DO have is a set of facts that
+ * must come from a tool rather than from memory, which is the thing actually
+ * being asked for.
+ */
+const MUST_LOOK_UP: Record<string, string> = {
   tenant:
-    'their balance, what they owe, their rent, their lease, their deposit, their payments, ' +
-    'their maintenance requests, their documents, their inspections',
+    "ANYTHING ABOUT THIS PERSON'S OWN ACCOUNT — their balance, what they owe, their rent, " +
+    'their lease, their deposit, their payments, their maintenance requests, their documents, ' +
+    'their inspections',
   landlord:
-    'their properties, units, tenants, leases, rent roll, payouts, occupancy, expenses, ' +
-    'books, maintenance, screening, utility meters and bills',
-  guest: 'their booking, their stay, the amenities at the property they are staying at',
-  visitor: 'the property, its rates and its availability',
-  prospect: 'what GAM costs and what it does',
+    "ANYTHING ABOUT THIS PERSON'S OWN PORTFOLIO — their properties, units, tenants, leases, " +
+    'rent roll, payouts, occupancy, expenses, books, maintenance, screening, utility meters ' +
+    'and bills',
+  guest:
+    'ANYTHING ABOUT THEIR BOOKING OR THEIR STAY — the dates, the site, what it cost, the ' +
+    'amenities at the property they are staying at',
+  visitor:
+    'ANY FACT ABOUT THE PROPERTY — its rates, its availability, what is on site. They have no ' +
+    'account and you have no memory of this place',
+  prospect:
+    'ANY FIGURE ABOUT WHAT GAM COSTS, and anything about times you could offer them. They are ' +
+    'not a customer yet and have no account',
 }
 
 /**
@@ -57,14 +78,14 @@ const OWN_DATA: Record<string, string> = {
  * symptom is an invented number, not an error.
  */
 export function buildDecisionPrompt(profile: AgentProfile): string {
-  const own = OWN_DATA[profile.audience] ?? 'their own account'
+  const mustLookUp = MUST_LOOK_UP[profile.audience]
+    ?? 'ANYTHING SPECIFIC TO THIS PERSON OR THIS PROPERTY'
   return [
     `You are ${profile.name}, a support agent for GAM, a property-rental platform. ` +
       `You are talking to a ${profile.audience.toUpperCase()}.`,
     '',
-    `ANYTHING ABOUT THIS PERSON'S OWN ACCOUNT — ${own} — MUST come from a tool. ` +
-      'Never state such a fact without calling one first. You do not know their numbers; ' +
-      'the tools do.',
+    `${mustLookUp} — MUST come from a tool. Never state such a fact without calling one ` +
+      'first. You do not know these numbers; the tools do.',
     '',
     'Call the tool that fits what they asked. Call more than one if more than one is needed. ' +
       'If they are asking you to DO something — change, add, cancel, record, send — call the ' +
