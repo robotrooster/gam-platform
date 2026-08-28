@@ -44,12 +44,16 @@ session. The launchd prod API (`com.gam.api`) runs from `apps/api` with
   `leases.tenant_renewal_pinged_at` and `landlord_renewal_alerted_at` exist in
   `gam` now.
 
-**NEVER run two vitest processes at once.** I did this today: started a full run
-in the background, then ran the agents suite while it was going. `globalSetup`
-DROPs and recreates `gam_test`, so the two runs pull the database out from under
-each other. It produced a phantom FK violation in `cleanupAllSchema` that looked
-like a real bug in `getMoneyInFlight`. **Before starting any vitest, check
-`ps aux | grep -c "[v]itest"` is 1.**
+**TWO VITEST RUNS AT ONCE IS NOW BLOCKED IN CODE.** `globalSetup` takes a PID
+lock and refuses to start if a live run holds it. It cost an hour in S626 and
+twice more in S628 — once a phantom FK violation that looked like a bug in
+`getMoneyInFlight`, once 175 failures across six files that looked like a
+regression and were a collision (creditLedger reported 44 of 44 failed in 118 ms
+— a file that never loaded). The handoff had said "never do this" in bold and I
+did it twice in one day anyway, because a four-second agents-only run does not
+FEEL like "a run". A note could not fix that; the lock can. Stale locks are
+checked for liveness, so a killed run never blocks the next one.
+`VITEST_ALLOW_CONCURRENT=1` overrides.
 
 **The full suite takes 25-40 minutes on this box**, not the 4 minutes the old
 handoff said — the MLX server and the desktop app are eating cores. Plan around
@@ -60,10 +64,81 @@ one when you are ready to commit.
 
 ---
 
-## 1. WHAT TO DO NEXT — read this before picking anything
+## 1. WHAT THE CONVERSATION RUN FOUND — this is the real story of S628
+
+The action work was the easy half and it was not what was broken. Running the
+agent through real two-turn conversations found three things, and two were mine.
+
+### THE SYSTEM PROMPT WAS SUPPRESSING THE TOOL CALLS
+
+Same question, same 67 tools, only the system prompt length varying:
+
+```
+ 2 KB → calls the tool
+ 4 KB → calls the tool
+ 8 KB → calls the tool
+16 KB → NO TOOL. Invents "$1,200 rent, $25 late fee, $1,225 total" — as a
+        markdown bullet list, breaking the PLAIN TEXT rule in that same prompt.
+26 KB → NO TOOL. Invents a figure. THIS IS PRODUCTION.
+```
+
+Past a point every rule added makes the earlier rules weaker, and the first to
+go is the one that matters most: look it up before you say it. That is why
+`toolRouting`'s phrase table exists and rescues nearly every lookup, and why the
+S618 note above `tool_choice` says it is "honoured most of the time" — that note
+was measuring this without knowing it.
+
+**The fix is `AGENT_TWO_PASS`, and it is DEFAULT OFF pending the validation run.**
+Deciding gets a 1 KB prompt and the tools; composing gets the full 26 KB and no
+tools. On three conversations it passed 3/3, halved the phrase-table rescues,
+and produced the sentence four prompt rewrites could not:
+
+> "The fee only kicks in after the 5-day grace period, so by the time it applied
+> you were 7 days past due, not 2. I'm not arguing with you — that's what your
+> lease says, and the platform runs on the lease."
+
+**If the 29-conversation validation is clean, flip the default.** That is the
+single highest-value thing left.
+
+I had a wrong explanation first and it is worth knowing why: the prompt
+contained "$1,200 on the 3rd" as a formatting example, so an echo looked
+obvious. With the example changed to $1,145 the model still said "$1,200". It
+invents that figure; it does not quote it. Length is the variable.
+
+### 239 TOOLS PER TURN TRIPLED GPU MEMORY
+
+Giving the landlord agent 228 endpoints put 230 KB of schema — ~59k tokens — in
+front of it every turn. KV cache per conversation went 5.5 GB → 18 GB, which on
+a 96 GB box with a 27.7 GB model and a ~72 GB wired limit is TWO concurrent
+conversations before Metal refuses and the server aborts. It did, four times in
+an hour.
+
+`toolSelection.ts` sends only the actions this turn reaches for: ~14k tokens,
+3.45 GB median per conversation, and 16 of 16 realistic sentences still find
+their action. Reads are never dropped — a missing lookup invents a number, a
+missing action says "let me check", and those are not the same kind of wrong.
+
+`concurrencyGate.ts` then makes the 7th conversation WAIT rather than pushing
+past the limit. Nic asked for this explicitly: "it should queue things up... a
+GAM representative will be with you soon."
+
+### REAL RECORDS WERE QUOTED IN THE GUARDRAILS
+
+Bob Chen, Apt 101, Oak Street, Sunset Palms, $658 — and $2,330, the demo
+tenant's ACTUAL balance, inside the anti-fabrication rule as an example.
+
+The measurement consequence is worse than the replies: `agentConversationCases`
+asserts a reply CONTAINS "2,330", and that string was in the prompt. **That
+assertion could pass on a reply that looked nothing up.** Some of what we
+believed we had verified was verifying the prompt. Fixed, and
+`promptDataCollision.test.ts` now checks prompts against seeded records.
+
+---
+
+## 1b. WHAT TO DO NEXT
 
 The obvious next move is **not** more actions. There are none left to add. The
-three things that matter now, in order:
+things that matter now, in order:
 
 ### (a) NOTHING HAS BEEN WATCHED
 
