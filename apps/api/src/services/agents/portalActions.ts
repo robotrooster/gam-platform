@@ -63,18 +63,26 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
   },
   {
     id: 'update_unit',
-    audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId',
+    // The path was '/api/units/:unitId' until portalActionPaths.test.ts caught
+    // it: that route does not exist. Unit edits are split by concern —
+    // /details, /status, /number, /type — and a guessed path would have 404'd
+    // in front of a customer with the agent unable to say why.
+    audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId/details',
     pathParams: ['unitId'],
     description:
-      'Change a unit’s details — rent, deposit, bedrooms, status, description. Use for "put 204 up ' +
-      'to $1,250" or "mark lot 7 out of service". Say what you are changing and what it was before.',
+      'Change a unit’s details — rent, deposit, bedrooms, bathrooms, size, accessibility. Use for ' +
+      '"put 204 up to $1,250" or "204 is actually a two bed". Say what you are changing and what it ' +
+      'was before, so a wrong unit is caught before it is saved.\n' +
+      'This does NOT change whether the unit is available — that is set_unit_status.',
     params: {
       unitId: { type: 'string', description: 'The unit id, resolved from a lookup — never asked of the landlord.' },
       rentAmount: { type: 'number', description: 'New asking rent.' },
       securityDeposit: { type: 'number', description: 'New standard deposit.' },
-      status: { type: 'string', description: 'vacant, occupied, maintenance, unavailable — only if they asked to change it.' },
       bedrooms: { type: 'integer', description: 'Bedrooms.' },
       bathrooms: { type: 'number', description: 'Bathrooms.' },
+      sqft: { type: 'integer', description: 'Square feet.' },
+      unitType: { type: 'string', description: 'apartment, single_family, rv_spot, campsite, mobile_home, hotel_room, storage, parking, boat_slip, land_lot, commercial' },
+      isAdaAccessible: { type: 'boolean', description: 'Whether the unit is ADA accessible.' },
     },
     required: ['unitId'],
     confirmFirst: true,
@@ -233,6 +241,70 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     },
     required: ['unitId', 'unitNumber'],
     confirmFirst: true,
+  },
+
+  // ── LANDLORD · documents out for signature ───────────────────────────
+  {
+    id: 'send_document_for_signature',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/:documentId/send',
+    pathParams: ['documentId'],
+    description:
+      'Send a prepared document to its signers. Use for "send the lease to apt 204". The document ' +
+      'must already exist and be built — this only puts it in front of the people who sign it.\n' +
+      'It goes to a real person and cannot be recalled, so read back what the document is and who is ' +
+      'about to receive it. If they are unsure which document, list them rather than picking one.',
+    params: { documentId: { type: 'string', description: 'The document id, from a lookup — never asked of the landlord.' } },
+    required: ['documentId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'void_document',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/:documentId/void',
+    pathParams: ['documentId'],
+    description:
+      'Void a document that should not be signed — wrong terms, wrong tenant, superseded. It stays ' +
+      'on record as voided rather than vanishing. Signers can no longer sign it. Use for "kill the ' +
+      'lease I sent to 204, the rent was wrong".',
+    params: {
+      documentId: { type: 'string', description: 'The document id, from a lookup.' },
+      reason: { type: 'string', description: 'Why it is being voided, in their words — this is the audit trail.' },
+    },
+    required: ['documentId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · meters and utility billing ────────────────────────────
+  {
+    id: 'record_meter_reading',
+    audience: 'landlord', method: 'POST', path: '/api/utility/meters/:meterId/readings',
+    pathParams: ['meterId'],
+    description:
+      'Record a meter reading so the utility can be billed for that cycle. Use when they read a meter ' +
+      'and tell you the number: "lot 14 water is at 89,120". readingValue is the number ON THE DIAL, ' +
+      'not the usage since last time — GAM works the usage out from the previous reading. ' +
+      'billingCycleMonth is the month being billed as YYYY-MM-01.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      readingDate: { type: 'string', description: 'YYYY-MM-DD — the day it was read. Today unless they said otherwise.' },
+      readingValue: { type: 'number', description: 'The number showing on the meter, not the difference.' },
+      billingCycleMonth: { type: 'string', description: 'YYYY-MM-01 — the cycle this reading bills.' },
+    },
+    required: ['meterId', 'readingDate', 'readingValue', 'billingCycleMonth'],
+    confirmFirst: true,
+  },
+  {
+    id: 'start_meter_reading_run',
+    audience: 'landlord', method: 'POST', path: '/api/utility/reading-runs',
+    pathParams: [],
+    description:
+      'Open a reading run for a property — the monthly round where every meter gets read before the ' +
+      'utilities are billed. Use for "start this month\u2019s readings at Sunset Palms". Leave ' +
+      'cycleMonth off for the current cycle.',
+    params: {
+      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      cycleMonth: { type: 'string', description: 'YYYY-MM-01. Omit for the current cycle.' },
+    },
+    required: ['propertyId'],
   },
 
   // ── TENANT ───────────────────────────────────────────────────────────
