@@ -40,12 +40,46 @@ export async function buildTestActors(): Promise<TestActors> {
     `SELECT id FROM properties
       WHERE booking_slug = 'sunset-palms' AND public_booking_enabled = true LIMIT 1`)
 
+  /**
+   * S628 — THE HARNESS ACTORS NEED CREDENTIALS, OR EVERY ACTION IS REFUSED.
+   *
+   * portalDispatch mints a short-lived token from `actor.auth` — the caller's
+   * own verified claims, forwarded by routes/agent.ts so an action runs through
+   * the real endpoint with the real authorization. Without that field it
+   * refuses with `no_credentials` before a request is even built.
+   *
+   * These actors had no `auth`, so all 207 allowlisted actions were unreachable
+   * from the harness. Every conversation testing one would have failed — and
+   * failed looking like an agent that would not act, which is the exact
+   * question the run exists to answer. A whole afternoon's validation would
+   * have measured a missing field.
+   *
+   * The claims mirror what routes/auth.ts actually signs. `permissions: null`
+   * is what an OWNER carries — owner roles bypass requirePerm — so this
+   * exercises the same authority a landlord has in their own portal, and no
+   * more. A staff-scoped harness actor would be a worthwhile addition later:
+   * requirePerm running against a real permission list is the half of the
+   * dispatcher's safety story that nothing currently drives.
+   */
+  const authFor = (userId: string, role: string, profileId: string, landlordId: string | null) => ({
+    userId, role, profileId,
+    landlordId,
+    landlordIds: landlordId ? [landlordId] : [],
+    permissions: null,
+  })
+
   const actorFor = (a: string): any => {
     switch (a) {
       case 'tenant':
-        return { userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id }
+        return {
+          userId: tenant.user_id, role: 'tenant', profileId: tenant.tenant_id,
+          auth: authFor(tenant.user_id, 'tenant', tenant.tenant_id, null),
+        }
       case 'landlord':
-        return { userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id }
+        return {
+          userId: lord.user_id, role: 'landlord', profileId: lord.landlord_id,
+          auth: authFor(lord.user_id, 'landlord', lord.landlord_id, lord.landlord_id),
+        }
       case 'prospect': {
         const id = randomUUID()
         return { userId: id, role: 'prospect', profileId: id }
