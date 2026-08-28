@@ -17,15 +17,35 @@ import { PORTAL_ACTIONS } from './portalActions'
 const API = join(__dirname, '../../')
 const ROUTES = join(API, 'routes')
 
-/** '/api/units' -> the router variable mounted there. */
+/**
+ * '/api/units' -> the router variable mounted there.
+ *
+ * S628: the path may have more than two segments. utilityServiceAgreementsRouter
+ * is mounted at '/api/utility/service-agreements', and while this only matched
+ * '/api/<one-segment>' the whole router was invisible here — an action pointing
+ * into it would have been resolved against utilityRouter, or against nothing,
+ * and the test would have passed or failed for the wrong reason.
+ */
 function mounts(): Record<string, string> {
   const src = readFileSync(join(API, 'index.ts'), 'utf8')
   const out: Record<string, string> = {}
-  for (const m of src.matchAll(/app\.use\(\s*'(\/api\/[a-z0-9-]+)'\s*,\s*([\s\S]{0,140}?)\)/g)) {
+  for (const m of src.matchAll(/app\.use\(\s*'(\/api\/[a-z0-9/-]+)'\s*,\s*([\s\S]{0,140}?)\)/g)) {
     const router = (m[2].match(/(\w+Router)/) || [])[1]
     if (router) out[m[1]] = router
   }
   return out
+}
+
+/** The LONGEST mount the action's path sits under — '/api/utility/service-agreements'
+ *  wins over '/api/utility' for a path under it. */
+function baseFor(path: string, MOUNTS: Record<string, string>): string | null {
+  let best: string | null = null
+  for (const base of Object.keys(MOUNTS)) {
+    if (path === base || path.startsWith(base + '/')) {
+      if (!best || base.length > best.length) best = base
+    }
+  }
+  return best
 }
 
 /** Every (METHOD, path) a router file declares. */
@@ -54,11 +74,12 @@ describe('every allowlisted action resolves to a real route', () => {
 
   it.each(PORTAL_ACTIONS.map((a) => [a.id, a.method, a.path] as const))(
     '%s → %s %s', (_id, method, path) => {
-      const base = '/api/' + path.split('/')[2]
-      const router = MOUNTS[base]
+      const base = baseFor(path, MOUNTS)
+      expect(base, `nothing in index.ts is mounted under ${path}`).toBeTruthy()
+      const router = MOUNTS[base!]
       expect(router, `nothing is mounted at ${base}`).toBeTruthy()
 
-      const sub = path.slice(base.length) || '/'
+      const sub = path.slice(base!.length) || '/'
       const want = `${method} ${normalise(sub)}`
       const have = [...(DECLARED[router!] ?? new Set<string>())].map((d) => {
         const [m, ...rest] = d.split(' ')
