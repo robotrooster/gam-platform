@@ -21,6 +21,7 @@ import { retrieve, type RetrievedChunk } from './knowledge'
 import { DateTime } from 'luxon'
 import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
+import { selectToolsForTurn } from './toolSelection'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
 import type { AgentActor } from './tools/types'
 import { routePlan } from './toolRouting'
@@ -1058,9 +1059,6 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const all = await retrieve(profile.knowledgeScopes, message, k)
   const retrieved = all.filter((c) => c.similarity >= minSimilarity)
 
-  // 2) Assemble the tool schemas this profile may use.
-  const tools = getToolsForProfile(profile)
-  const toolSchemas = tools.map(toToolSchema)
 
   // The platform's own timezone. GAM is Arizona-based and every other piece of
   // business logic defaults here; what matters for an agent is the DATE, which
@@ -1111,6 +1109,31 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   )
   const routedTools = plan.tools
   const routedTool = routedTools[0]
+
+  // 2) Assemble the tool schemas for THIS TURN.
+  //
+  // S628: this used to be every tool the profile holds, sent on every turn.
+  // After the action work that is 239 definitions for a landlord — 223 KB, some
+  // 57,000 tokens — before the system prompt or a word of conversation, and it
+  // took the KV cache from 5.5 GB per conversation to 18 GB. On this box that
+  // is two concurrent conversations before Metal refuses to allocate and the
+  // model server aborts; it did so four times in an hour.
+  //
+  // Every READ stays. Only actions are selected, because a missing lookup makes
+  // the agent invent a number and a missing action makes it say "let me check" —
+  // and those are not the same kind of wrong.
+  //
+  // The phrase table's own routing is pinned, so the deterministic layer is
+  // never overruled by the lexical one.
+  const selection = selectToolsForTurn(profile, getToolsForProfile(profile), message, {
+    alwaysInclude: routedTools,
+  })
+  const tools = selection.tools
+  const toolSchemas = tools.map(toToolSchema)
+  if (selection.droppedActions > 0) {
+    logger.debug({ profile: profile.id, offered: tools.length, dropped: selection.droppedActions },
+      'agent runner: tool payload narrowed to this turn')
+  }
 
   for (let step = 0; step < maxSteps; step++) {
     // S617: on the forced turn, take the escalation tools OFF the table. With
