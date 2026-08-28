@@ -22,6 +22,7 @@ import { DateTime } from 'luxon'
 import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
 import { selectToolsForTurn } from './toolSelection'
+import { buildDecisionPrompt, buildComposeInstruction } from './decisionPrompt'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
 import type { AgentActor } from './tools/types'
 import { routePlan } from './toolRouting'
@@ -1065,8 +1066,32 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   // only differs across US zones for a few hours around midnight.
   const now = DateTime.now().setZone(input.timezone || 'America/Phoenix')
 
+  /**
+   * S628 — TWO PASSES, BECAUSE THEY ARE TWO DIFFERENT JOBS.
+   *
+   * Choosing a tool and writing a warm reply were being done in one call under
+   * one 26 KB set of instructions, and the writing instructions were drowning
+   * the choosing. Measured, same question and same 67 tools, only the system
+   * prompt varying: 2/4/8 KB all call the tool; 16 KB and 26 KB call nothing
+   * and invent a figure. Production is 26 KB.
+   *
+   * So the deciding pass gets a 1 KB prompt and the tools, and the composing
+   * pass gets the full prompt and NO tools — nothing left to suppress. Proven
+   * end to end before this was written: phase one called the right tool, phase
+   * two answered "You owe $2,330" from the real result, in plain text, where
+   * the single-pass version had invented "$1,200".
+   *
+   * Behind a flag, default OFF. This file carries a decade of accumulated
+   * guards, several of which only the GPU eval exercises and the GPU eval
+   * cannot currently run — so this gets proven on real conversations before it
+   * becomes the default, not after.
+   */
+  const twoPass = process.env.AGENT_TWO_PASS === '1'
+  const composingPrompt = profile.systemPrompt
+  const decidingPrompt = twoPass ? buildDecisionPrompt(profile) : profile.systemPrompt
+
   const messages: ChatMessage[] = [
-    { role: 'system', content: profile.systemPrompt },
+    { role: 'system', content: decidingPrompt },
     { role: 'system', content: buildTemporalBlock(now) },
     { role: 'system', content: buildContextBlock(retrieved) },
     ...history,
@@ -1074,6 +1099,8 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   ]
 
   const toolInvocations: ToolInvocation[] = []
+  /** S628: the composing pass runs once, not once per guard-driven rewrite. */
+  let composed = false
   let nudgedForAccountData = false
   let nudgedForPadding = false
   let nudgedForRepeat = false
@@ -1179,6 +1206,34 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     // model gets every remaining step to comply rather than one.
     model = out.model
     addUsage(out.usage)
+
+    // S628 — THE COMPOSING PASS.
+    //
+    // The deciding pass has stopped asking for tools, so whatever it wrote was
+    // written under a 1 KB prompt that says nothing about voice, formatting,
+    // warmth, repetition or any of the rules that make a reply fit to send.
+    // Throw it away and write the reply properly: full instructions, every tool
+    // result in the conversation, and NO tools attached — there is nothing left
+    // to decide, and nothing left for a long prompt to suppress.
+    //
+    // Placed HERE, before every guard below, on purpose. The nudges all inspect
+    // out.content — repetition, padding, the waiver arithmetic, promised
+    // actions — and they must judge the reply the person would actually receive,
+    // not the draft from the deciding pass.
+    if (twoPass && out.toolCalls.length === 0 && !composed) {
+      composed = true
+      messages[0] = { role: 'system', content: composingPrompt }
+      messages.push({
+        role: 'system',
+        content: buildComposeInstruction(toolInvocations.length > 0),
+      })
+      const written = await chatCompletion(messages, { sampler: profile.sampler })
+      addUsage(written.usage)
+      model = written.model
+      if (written.content?.trim()) out.content = written.content
+      logger.debug({ profile: profile.id, tools: toolInvocations.length },
+        'agent runner: composed the reply under the full prompt')
+    }
 
     if (out.toolCalls.length === 0) {
       // S618: a handoff is only ever real for a money problem.
