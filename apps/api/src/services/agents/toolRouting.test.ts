@@ -26,7 +26,7 @@ const TENANT_TOOLS = [
   // audience-line check against a list that was simply out of date.
   'get_my_amenities', 'get_my_contacts', 'get_my_notifications',
   'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
-  'get_my_payment_status', 'get_my_termination_quote',
+  'get_my_payment_status', 'get_my_termination_quote', 'get_my_surveys',
 ]
 const LANDLORD_TOOLS = [
   'lookup_tenant_payment_status', 'get_delinquent_tenants', 'get_unit_lease',

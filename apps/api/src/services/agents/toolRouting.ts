@@ -497,6 +497,25 @@ const TENANT_ROUTES: PhraseRoute[] = [
   // the tenant routes so every lease, balance and complaint route above keeps
   // first refusal on ambiguous wording.
   {
+    // S626: the renewal-intent questionnaire is the classic use of this, and a
+    // tenant does not call it "a survey" — they call it "the thing about
+    // whether I'm staying". Sits ABOVE the renewal route deliberately: if there
+    // is an actual form waiting for them, answering it IS the action, and
+    // telling them about their landlord's renewal tendency instead would be
+    // answering a question they did not ask.
+    tools: ['get_my_surveys'],
+    audience: 'tenant',
+    means: 'a questionnaire their landlord sent them',
+    patterns: [
+      /\bsurveys?\b/i,
+      /\bquestionnaires?\b/i,
+      /\b(fill|filling|filled)\b[^?]{0,15}\b(out|in)\b[^?]{0,20}\b(form|survey)\b/i,
+      /\b(form|questions)\b[^?]{0,25}\b(my )?landlord (sent|asked)\b/i,
+      /\bdid i (need|have) to (answer|respond|fill)\b/i,
+      /\b(am i|are we) supposed to (say|tell|answer)\b[^?]{0,25}\b(staying|renewing|leaving)\b/i,
+    ],
+  },
+  {
     tools: ['get_my_documents'],
     audience: 'tenant',
     means: 'the files on their tenancy — signed lease, notices, paperwork',

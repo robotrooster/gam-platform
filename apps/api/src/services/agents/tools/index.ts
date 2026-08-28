@@ -26,6 +26,8 @@ import { getMyDocuments } from './getMyDocuments'
 import { getMyInspections } from './getMyInspections'
 import { getMyEntryRequests } from './getMyEntryRequests'
 import { respondToEntryRequest } from './respondToEntryRequest'
+import { getMySurveys, submitSurveyResponse } from './tenantSurveyTools'
+import { logExpense } from './logExpense'
 import { getMyTerminationQuote } from './getMyTerminationQuote'
 import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
 import { getMyAmenities, requestAmenityReservation } from './amenityTools'
@@ -117,6 +119,9 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyInspections,
   getMyEntryRequests,
   respondToEntryRequest,
+  getMySurveys,
+  submitSurveyResponse,
+  logExpense,
   getMyTerminationQuote,
   getMyBalanceBreakdown,
   getMyAmenities,
