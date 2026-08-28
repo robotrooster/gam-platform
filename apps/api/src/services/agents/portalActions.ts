@@ -307,6 +307,29 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: ['propertyId'],
   },
 
+  // ── LANDLORD · work trade ────────────────────────────────────────────
+  {
+    id: 'create_work_trade_agreement',
+    audience: 'landlord', method: 'POST', path: '/api/work-trade',
+    pathParams: [],
+    description:
+      'Set up a work-trade agreement — a tenant works off part of their rent. Use for "Dan\u2019s going ' +
+      'to do the grounds for $200 off". Work trade pays for the month they are living in, so the ' +
+      'agreement starts when the work does.\n' +
+      'This is money against somebody\u2019s rent: read back the tenant, the unit, the duties, the start ' +
+      'date and the monthly hours before creating it.',
+    params: {
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      tenantId: { type: 'string', description: 'The tenant id, from a lookup.' },
+      startDate: { type: 'string', description: 'YYYY-MM-DD — when the arrangement begins.' },
+      endDate: { type: 'string', description: 'YYYY-MM-DD, if it is for a fixed period.' },
+      duties: { type: 'string', description: 'What they will actually do, in the landlord\u2019s words.' },
+      monthlyHoursTarget: { type: 'integer', description: 'Hours a month the agreement expects.' },
+    },
+    required: ['unitId', 'tenantId', 'startDate'],
+    confirmFirst: true,
+  },
+
   // ── TENANT ───────────────────────────────────────────────────────────
   {
     id: 'log_work_trade_hours',
@@ -335,6 +358,48 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'is a record that they were told.',
     params: { noticeId: { type: 'string', description: 'The notice id.' } },
     required: ['noticeId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'report_bank_deposit',
+    audience: 'tenant', method: 'POST', path: '/api/declared-deposits',
+    pathParams: [],
+    description:
+      'Report that the tenant paid at the bank — walked in and deposited cash, or handed over a ' +
+      'check or money order. Use when they say "I already paid it in at the bank on Tuesday".\n' +
+      'This does NOT settle the charge on its own. It tells their landlord what they say they paid ' +
+      'and when, and it is matched against the bank record when the money shows up. Say that plainly: ' +
+      'they should not walk away thinking the balance is cleared. Take the reference number if the ' +
+      'deposit or the money order has one — it is what makes the match work.\n' +
+      'declaredDate is the day THEY went to the bank, in their own timezone, which can legitimately ' +
+      'be later than the date at the property. Never tell them a date they give you is in the future.',
+    params: {
+      leaseId: { type: 'string', description: 'Their lease id, from get_my_lease.' },
+      amount: { type: 'number', description: 'How much they paid in.' },
+      declaredDate: { type: 'string', description: 'YYYY-MM-DD — the day they went to the bank.' },
+      method: { type: 'string', description: 'cash, check, or money_order.' },
+      reference: { type: 'string', description: 'Deposit slip, check or money-order number, if there is one.' },
+    },
+    required: ['leaseId', 'amount', 'declaredDate', 'method'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_up_autopay',
+    audience: 'tenant', method: 'PUT', path: '/api/autopay',
+    pathParams: [],
+    description:
+      'Turn autopay on or off for the tenant\u2019s lease, and choose which day it pulls. Use for "just ' +
+      'take it automatically" or "turn that off, I want to pay manually".\n' +
+      'CONFIRM CLEARLY when switching it ON: money will leave their account without them doing ' +
+      'anything, on the day chosen, for the full rent. Read back the day and that it is the whole ' +
+      'balance, not part of it. Leave pullDay out to charge on the day rent is due, which is the ' +
+      'ordinary case; 1-28 otherwise, because a 29th does not exist every month.',
+    params: {
+      leaseId: { type: 'string', description: 'Their lease id, from get_my_lease.' },
+      enabled: { type: 'boolean', description: 'true to turn autopay on, false to turn it off.' },
+      pullDay: { type: 'integer', description: '1-28. Omit to charge on the rent due date.' },
+    },
+    required: ['leaseId', 'enabled'],
     confirmFirst: true,
   },
 ]
