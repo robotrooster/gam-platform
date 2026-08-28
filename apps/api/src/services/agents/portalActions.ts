@@ -1103,19 +1103,34 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     description:
       'Add an employee to their payroll records — the maintenance tech, the office manager. Use for ' +
       '"put Danny on payroll at $22 an hour".\n' +
+      'A payroll record needs ALL of this and the system refuses without it: name, email, phone, ' +
+      'address, the last four of their SSN, how and how often they are paid, their filing status and ' +
+      'federal allowances from their W-4, their state withholding percentage, their title, their ' +
+      'department, and their start date. That is a lot to ask for in a chat, so if the landlord does ' +
+      'not have it all to hand, say what is still needed rather than sending a half-filled record — ' +
+      'and NEVER fill a gap yourself. A guessed withholding percentage is a wrong paycheque.\n' +
       'This is a PAYROLL RECORD. It does not give anybody a login or any access to the portal; that ' +
       'is a separate thing entirely and not something you do. Say so if they seem to expect it.',
     params: {
       firstName: { type: 'string', description: 'First name.' },
       lastName: { type: 'string', description: 'Last name.' },
       email: { type: 'string', description: 'Their email.' },
-      title: { type: 'string', description: 'Their job title.' },
+      phone: { type: 'string', description: 'Their phone number.' },
+      address: { type: 'string', description: 'Their home address.' },
+      ssnLast4: { type: 'string', description: 'The last four digits of their SSN — exactly four digits. Never guess these.' },
       payType: { type: 'string', description: 'hourly or salary.' },
       payRate: { type: 'number', description: 'Hourly rate, or annual salary for a salaried employee.' },
-      hireDate: { type: 'string', description: 'When they started, YYYY-MM-DD.' },
-      phone: { type: 'string', description: 'Phone number.' },
+      payFrequency: { type: 'string', description: 'weekly, biweekly, semimonthly, or monthly.' },
+      filingStatus: { type: 'string', description: 'single, married, or head_of_household — from their W-4.' },
+      federalAllowances: { type: 'integer', description: 'Federal allowances from their W-4.' },
+      stateWithholdingPct: { type: 'number', description: 'State withholding as a percentage. Their figure, never estimated.' },
+      title: { type: 'string', description: 'Their job title.' },
+      department: { type: 'string', description: 'Which department they are in.' },
+      startDate: { type: 'string', description: 'When they started, YYYY-MM-DD.' },
     },
-    required: ['firstName', 'lastName'],
+    required: ['firstName', 'lastName', 'email', 'phone', 'address', 'ssnLast4', 'payType',
+               'payRate', 'payFrequency', 'filingStatus', 'federalAllowances',
+               'stateWithholdingPct', 'title', 'department', 'startDate'],
     confirmFirst: true,
   },
   {
