@@ -1110,8 +1110,16 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   ]
 
   const toolInvocations: ToolInvocation[] = []
-  /** S628: what this conversation has already done — see repeatedAction.ts. */
-  const priorToolCalls = input.priorToolCalls ?? []
+  /**
+   * S628: what this conversation has already done — see repeatedAction.ts.
+   *
+   * MUTABLE, and appended to as this turn's calls land. The stored log only
+   * covers PREVIOUS turns, so without that the model could still call the same
+   * action twice inside one turn — which is the likelier shape when a nudge
+   * forces a rewrite and the model re-issues its whole plan rather than the
+   * part that was missing.
+   */
+  const priorToolCalls: { name: string; args: unknown }[] = [...(input.priorToolCalls ?? [])]
   /** S628: the composing pass runs once, not once per guard-driven rewrite. */
   let composed = false
   let nudgedForAccountData = false
@@ -1434,6 +1442,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'agent runner: refused a repeat of an action already taken this conversation'),
            { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
         : await executeToolCall(call, profile, actor, args)
+      if (!repeat) priorToolCalls.push({ name: call.function.name, args })
             toolInvocations.push({ name: call.function.name, args, result })
             messages.push({
               role: 'tool',
@@ -1845,6 +1854,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'agent runner: refused a repeat of an action already taken this conversation'),
            { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
         : await executeToolCall(call, profile, actor, args)
+      if (!repeat) priorToolCalls.push({ name: call.function.name, args })
       turnCache.set(cacheKey, result)
 
       // An escalation tool is a CONTROL signal, not a data/action tool —
