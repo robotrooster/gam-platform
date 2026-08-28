@@ -202,7 +202,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     id: 'resume_lease',
     audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/resume',
     pathParams: ['leaseId'],
-    description: 'Bring a hibernating lease back into billing. Use for "put lot 12 back on".',
+    description:
+      'Bring a hibernating lease back into billing, when a seasonal tenant returns or a unit comes ' +
+      'back into use. Use for "put lot 12 back on" or "the Hendersons are back for the winter".\n' +
+      'Rent starts being charged again from the resume date, so say which date that is — a lease ' +
+      'resumed a week early bills a week nobody was living there.',
     params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
     required: ['leaseId'],
     confirmFirst: true,
@@ -1179,8 +1183,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/books/contractors/:contractorId',
     pathParams: ['contractorId'],
     description:
-      'Update a contractor on their books — new number, new address, or mark them inactive. Only ' +
-      'send what changed.',
+      'Update a 1099 contractor on their books — a new phone number, a new address, a different ' +
+      'category of work, or marking them inactive when they stop using them. Use for "Jose has a ' +
+      'new number" or "we do not use that landscaper any more".\n' +
+      'Only send what changed. Marking somebody inactive does not remove them: what they were paid ' +
+      'stays on the books, which is what their 1099 is built from.',
     params: {
       contractorId: { type: 'string', description: 'The contractor id, from a lookup.' },
       name: { type: 'string', description: 'Name.' },
@@ -1349,7 +1356,10 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     audience: 'landlord', method: 'PATCH', path: '/api/maint-portal/tasks/:taskId/complete',
     pathParams: ['taskId'],
     description:
-      'Mark a crew task done, and record who finished it. Use for "the pool is done".',
+      'Mark a task on the maintenance crew\u2019s board as done, and record who finished it. Use for ' +
+      '"the pool is done" or "Danny finished the gutters".\n' +
+      'This is the crew\u2019s own task list, not a tenant\u2019s maintenance request — a tenant has ' +
+      'somebody waiting on an answer, and completing one of those is a different action.',
     params: { taskId: { type: 'string', description: 'The task id, from a lookup.' } },
     required: ['taskId'],
   },
