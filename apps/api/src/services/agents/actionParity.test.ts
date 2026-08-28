@@ -100,8 +100,8 @@ describe('action parity — what a person can do, the agent should be able to do
       if (p.audience !== 'landlord' && p.audience !== 'tenant') continue
       for (const n of p.toolNames ?? []) if (WRITE.test(n)) writes.add(n)
     }
-    // S626 baseline: 341 reachable actions, 26 distinct write tools across the
-    // two audiences. Raise this as capability lands; never lower it.
-    expect(writes.size).toBeGreaterThanOrEqual(26)
+    // S626: 26 when the audit was written, 41 after the dispatch landed and the
+    // manifest was expanded. Raise as capability lands; never lower.
+    expect(writes.size).toBeGreaterThanOrEqual(41)
   })
 })

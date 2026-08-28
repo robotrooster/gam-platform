@@ -151,6 +151,90 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
 
+  // ── LANDLORD · the lease clock ───────────────────────────────────────
+  {
+    id: 'offer_renewal',
+    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/offer-renewal',
+    pathParams: ['leaseId'],
+    description:
+      'Tell a tenant their landlord is willing to renew, which opens the renewal conversation and ' +
+      'lets the tenant answer. Use for "let apt 204 know I\u2019ll renew them". It does NOT set the new ' +
+      'rent or the new term — the landlord offers those separately, so do not quote a figure here ' +
+      'and do not imply one has been agreed.',
+    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    required: ['leaseId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'serve_non_renewal_notice',
+    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/non-renewal',
+    pathParams: ['leaseId'],
+    description:
+      'Serve written notice that a lease will NOT be renewed and ends on its end date. This is a ' +
+      'legal notice with a clock attached, not a note — read back the tenant, the unit and the end ' +
+      'date, say plainly that it is formal notice of non-renewal, and get an unambiguous yes. If the ' +
+      'landlord is only thinking about it, do not call this.',
+    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    required: ['leaseId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'hibernate_lease',
+    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/hibernate',
+    pathParams: ['leaseId'],
+    description:
+      'Pause an active lease — a seasonal site nobody is on over winter, a tenant away for months. ' +
+      'Billing stops while it is hibernating and the lease is still theirs. Use resume_lease to ' +
+      'start it again.',
+    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    required: ['leaseId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'resume_lease',
+    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/resume',
+    pathParams: ['leaseId'],
+    description: 'Bring a hibernating lease back into billing. Use for "put lot 12 back on".',
+    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    required: ['leaseId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · unit lifecycle ────────────────────────────────────────
+  {
+    id: 'set_unit_status',
+    audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId/status',
+    pathParams: ['unitId'],
+    description:
+      'Change what a unit is doing: vacant, available, active, delinquent, suspended, or owner_use. ' +
+      'Use owner_use for a unit the owner or their family lives in — it carries no lease and no rent ' +
+      'and is not advertised. Use for "take lot 7 off the market" or "I\u2019m moving into 12".',
+    params: {
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      status: { type: 'string', description: 'vacant, available, active, delinquent, suspended, owner_use' },
+    },
+    required: ['unitId', 'status'],
+    confirmFirst: true,
+  },
+  {
+    id: 'retire_unit',
+    audience: 'landlord', method: 'POST', path: '/api/units/:unitId/retire',
+    pathParams: ['unitId'],
+    description:
+      'Retire a unit that no longer exists or can no longer be rented — a lot that was sold, a ' +
+      'building pulled down. It keeps all its history and stops being billable or bookable, and it ' +
+      'can never hold a lease again. GAM does not delete; this is the correct way to remove one. ' +
+      'Confirm hard: this is not how you make a unit temporarily unavailable — that is ' +
+      'set_unit_status.',
+    params: {
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitNumber: { type: 'string', description: 'The unit number, typed back as confirmation that this is the right one.' },
+      reason: { type: 'string', description: 'Why it is being retired, in their words.' },
+    },
+    required: ['unitId', 'unitNumber'],
+    confirmFirst: true,
+  },
+
   // ── TENANT ───────────────────────────────────────────────────────────
   {
     id: 'log_work_trade_hours',
