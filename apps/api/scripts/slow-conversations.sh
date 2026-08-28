@@ -53,7 +53,8 @@ for ID in $IDS; do
   echo "───────── [$N/$TOTAL] $ID  $(date '+%H:%M:%S') ─────────" >> "$LOG"
   # AGENT_EVAL_PAUSE_MS=0: there is only one conversation in this process, so
   # the harness's own inter-case pause has nothing to pace.
-  AGENT_EVAL_PAUSE_MS=0 DB_NAME=gam npx ts-node src/services/agents/agentConversations.ts "$ID" \
+  AGENT_EVAL_PAUSE_MS=0 DB_NAME=gam AGENT_TWO_PASS="${AGENT_TWO_PASS:-0}" \
+    npx ts-node src/services/agents/agentConversations.ts "$ID" \
     >> "$LOG" 2>&1
   # Was the machine still alive? A panic takes the whole box, so this line not
   # appearing is itself the signal.
@@ -74,7 +75,7 @@ for ID in $IDS; do
   # moment, and no conversation is lost to an outage mid-generation. Patching
   # mlx-lm is the real fix and is not something to do in the middle of a test
   # run.
-  if [ $((N % 5)) -eq 0 ] && [ "$N" -lt "$TOTAL" ]; then
+  if [ $((N % 10)) -eq 0 ] && [ "$N" -lt "$TOTAL" ]; then
     echo "[cache] bouncing the model after $N conversations" >> "$LOG"
     launchctl bootout "gui/$(id -u)/com.gam.model" 2>/dev/null
     sleep 3
