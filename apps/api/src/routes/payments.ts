@@ -917,7 +917,9 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 // while the weekly batch (services/landlordPassthrough.ts) SKIPS it because that
 // path requires platform_held=TRUE — so the landlord, who already physically
 // holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
-// so the $10 fee below stays GAM revenue (same as RETURNFEE).
+// so the fee below stays GAM revenue (same as RETURNFEE). The amount is
+// MANUAL_PAYMENT_FEE — $6, matching ACH exactly since S607. This comment said
+// $10 until S628; read the constant, not the prose.
 //
 // Each manual payment carries a flat fee (a tenant-owed 'fee' row,
 // entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the

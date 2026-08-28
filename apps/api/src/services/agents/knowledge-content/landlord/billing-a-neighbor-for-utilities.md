@@ -4,7 +4,7 @@ title: Billing a neighbor you supply utilities to
 ---
 Sometimes you supply a utility to a space you don't rent out. Three trash cans serving the building next door, a submetered apartment on your electric, a neighbor on your water. You've probably been collecting for it in cash for years. GAM can bill it properly instead.
 
-Go to **Utilities → Neighbor utilities → Add a space**. You name the space, say who pays for it, and set a billing day. It is not a rental unit: it doesn't count toward your occupancy, doesn't appear on your rent roll, is never bookable, and never shows as vacant. It exists so the utility charge has somewhere to live and so the person paying it has a way to log in and pay you.
+You can set one up by describing it to the assistant, or go to **Utilities → Neighbor utilities → Add a space**. Either way you name the space, say who pays for it, and set a billing day. It is not a rental unit: it doesn't count toward your occupancy, doesn't appear on your rent roll, is never bookable, and never shows as vacant. It exists so the utility charge has somewhere to live and so the person paying it has a way to log in and pay you.
 
 **Nobody gets billed without agreeing.** Either the payer accepts an emailed invite, or — if you've had the arrangement for years and there's nothing to sign — you tick the box saying they've already agreed to pay for this. Until one of those is true, the charges pile up but no bill is issued. If you add a space and no invoice ever goes out, that box is almost always why.
 
