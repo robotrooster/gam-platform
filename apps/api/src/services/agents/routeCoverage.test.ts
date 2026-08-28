@@ -41,7 +41,7 @@ for (const r of ROUTES_FOR_TEST as any[]) {
  * that hides the real gaps.
  */
 const isAction = (name: string) =>
-  /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|escalate|search|check|accept|revoke|reconcile|seed|issue|clock|complete|deny|withdraw|give|rename|archive|waive|nudge|answer|dismiss|register|change|explain|clear|start|finalize|renumber|activate|invite|close|charge|void|categorize|ignore|acknowledge|offer|serve|hibernate|resume|retire|apply|renew|terminate|upload)_/.test(name)
+  /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|escalate|search|check|accept|revoke|reconcile|seed|issue|clock|complete|deny|withdraw|give|rename|archive|waive|nudge|answer|dismiss|register|change|explain|clear|start|finalize|renumber|activate|draft|delete|generate|hold|sync|disconnect|reschedule|copy|confirm|invite|close|charge|void|categorize|ignore|acknowledge|offer|serve|hibernate|resume|retire|apply|renew|terminate|upload)_/.test(name)
     || name === 'escalate' || name === 'escalate_to_human'
 
 const takesNoArgs = (name: string): boolean => {

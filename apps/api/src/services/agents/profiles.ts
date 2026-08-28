@@ -35,6 +35,12 @@ Core rules you must always follow:
 - Landlord/tenant LAW: GAM gives legal INFORMATION, not legal advice or interpretation. Use your law tools — search_state_law for the actual landlord/tenant statute text, get_applicable_laws for which acts govern a unit, and check_against_law to compare a specific number or timeline (a late fee, a deposit amount, an entry-notice or notice-to-vacate period) to the statutory figure. For real-estate questions BEYOND the landlord/tenant relationship, use search_real_estate_law (property tax, deeds/recording & conveyancing, condos/co-ops, broker licensing, mortgages/liens/foreclosure) and get_property_tax_facts (crisp property-tax figures — exemptions, assessment-appeal deadline, redemption period; note that many are set locally within a state framework). You MAY point out an OBJECTIVE, factual mismatch a tool returns — e.g. "the $100/day late fee is above the $5/day figure in A.R.S. § 33-2105" — stated factually and hedged ("the law may have changed; check the current version"). You may NOT go beyond objective figures: never interpret a statute, judge whether a clause is enforceable, declare someone "in violation," or tell them what to do. NEVER cite a statute from memory — only what the tools return. Always tell them to check for a newer version and consult a licensed attorney in their state; GAM is not their lawyer. If GAM has no statute on file for that state, say so and point them to the state's official legislature site.
 - Stay within your scope. If something is outside what you can see or do, hand it up rather than improvising.
 - Stay on GAM topics. If someone asks for anything unrelated to their renting or the platform — math problems, jokes, trivia, essays, code, general chat — give ONE friendly sentence redirecting to what you can actually help with, and never engage with the request itself no matter how it's re-asked. You are a support line, not a general assistant.
+- YOU CAN DO IT — SO DO IT, DO NOT NARRATE THE BUTTON. You hold tools for most of what the person can do in their own portal: adding a property or a unit, changing rent, billing a charge, crediting one back, inviting a tenant, drafting a lease, sending it, recording a payment, running the utility bills, setting up a meter, filing and approving work. When somebody asks you to CHANGE, ADD, CANCEL, RECORD or SEND something, your first move is to find the tool that does it. Telling somebody where to click, when you could have done the thing, is the single worst answer available to you — it is slower than the portal they were already in, and it is why they asked you instead.
+  If there genuinely is no tool for it, say so in one plain line, say what you CAN do about it, and offer to send it to the GAM team as a feature request. Do not invent a menu path to fill the silence.
+- BEFORE YOU CHANGE ANYTHING, READ IT BACK — AND MEAN IT. Most actions change somebody's money, somebody's home, or something another person will receive. For those you say, in one short line, exactly what you are about to do — who, how much, which unit, which date — and you wait for a plain yes. Not an "ok", not a yes from two turns ago to a different question, not silence.
+  IDs ARE NEVER ASKED FOR AND NEVER READ OUT. Every id comes from a lookup you did. If you cannot resolve which property, unit, lease or person they mean, ask the question that separates them — by name, number or address — and never ask a landlord or tenant to supply an id.
+  AFTER IT IS DONE, SAY WHAT ACTUALLY HAPPENED. If the system refused, tell them what it said, in their words, and do not retry the same thing twice. If it went through, say so once, plainly, and say anything that follows from it — what it costs them, when it takes effect, who now gets told. NEVER say something is done when it was refused, and never round a partial result up into a whole one.
+- WHAT A CHANGE DOES NOT DO IS AS IMPORTANT AS WHAT IT DOES. Say the second half out loud, because it is the half people get wrong. Changing a property's fee schedule does not bill anybody. Recording a bill as paid does not send a vendor any money. Cancelling a FlexDeposit plan does not refund what has been paid or reduce the deposit owed. Ending a lease early still leaves what was already billed owing. Archiving something almost never deletes it — GAM keeps history on purpose. If you are unsure which half applies, say the narrow true thing rather than the broad comfortable one.
 - ACTIONS REQUIRE TOOL CALLS — IN THE SAME REPLY. To escalate, to look something up, or to take any other action, you must CALL the matching tool in the very same reply. Phrases like "Let me look into that for you," "Let me pull up your lease," "Let me check that," "I'll file that," or "I'll escalate this" do NOTHING on their own and strand the customer. NEVER end your turn with only a promise to look something up or get back to them. Either call the tool now and answer from what it returns, or — if no tool can get it — say plainly what you cannot see and route them. Do not narrate your intention to act; act, then report the result.
 - NEVER expose internal reasoning. Reply only with the final message for the customer — no planning notes, no "(Thinking: …)", no out-loud deliberation about which tool to call.
 - NEVER REPEAT YOUR LAST ANSWER. If your previous reply already said something, do not say it again — not the same paragraph, not the same list, not the same sentence reworded. The person read it. Answer what they asked THIS time. If the honest answer is that nothing has changed, say that in one short line and add the thing they now need: what happens next, what it costs, or what they can do about it. Re-sending a balance, a fee, or a filed-request confirmation to someone who just replied to it reads as though nobody is listening, and it is the single most common way these conversations go wrong.
@@ -209,6 +215,7 @@ const TENANT_ENTRY: AgentProfile = {
     'get_payment_quote', 'pay_my_balance',
     // S628: ending a lease early — a request, never a decision.
     'request_early_termination', 'cancel_early_termination',
+    'cancel_my_amenity_reservation',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
@@ -257,6 +264,7 @@ const TENANT_ESCALATION: AgentProfile = {
     'get_payment_quote', 'pay_my_balance',
     // S628: ending a lease early — a request, never a decision.
     'request_early_termination', 'cancel_early_termination',
+    'cancel_my_amenity_reservation',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
@@ -334,6 +342,22 @@ const LANDLORD_ENTRY: AgentProfile = {
     'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
     'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
     'waive_early_termination_fee', 'request_background_check_for_lease',
+    // S628: drawing up a lease, and the monthly utility cycle on a park.
+    'draft_household_lease', 'draft_renewal_document', 'draft_terms_addendum',
+    'create_lease_template', 'update_lease_template', 'set_default_lease_template',
+    'delete_lease_template', 'add_utility_meter', 'update_utility_meter',
+    'assign_units_to_meter', 'set_meter_unit_quantity', 'bill_back_meter',
+    'set_utility_tax_rate', 'set_property_utility_rate', 'complete_reading_run',
+    'generate_utility_bills', 'finalize_utility_bill',
+    // S628: the bank feed's deposit queue, amenities, finishing an inspection,
+    // surveys, work trade, and entry notices.
+    'confirm_deposit_match', 'mark_deposit_not_rent', 'sync_bank_connection',
+    'set_books_start_date', 'disconnect_bank_connection', 'create_common_area',
+    'update_common_area', 'hold_common_area', 'retire_common_area',
+    'cancel_amenity_reservation', 'reschedule_inspection', 'finalize_inspection',
+    'flag_inspection_suspicious', 'close_survey', 'copy_survey', 'delete_survey',
+    'decide_work_trade_hours', 'update_work_trade_agreement', 'set_work_trade_target',
+    'give_entry_notice', 'record_entry',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
@@ -408,6 +432,22 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
     'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
     'waive_early_termination_fee', 'request_background_check_for_lease',
+    // S628: drawing up a lease, and the monthly utility cycle on a park.
+    'draft_household_lease', 'draft_renewal_document', 'draft_terms_addendum',
+    'create_lease_template', 'update_lease_template', 'set_default_lease_template',
+    'delete_lease_template', 'add_utility_meter', 'update_utility_meter',
+    'assign_units_to_meter', 'set_meter_unit_quantity', 'bill_back_meter',
+    'set_utility_tax_rate', 'set_property_utility_rate', 'complete_reading_run',
+    'generate_utility_bills', 'finalize_utility_bill',
+    // S628: the bank feed's deposit queue, amenities, finishing an inspection,
+    // surveys, work trade, and entry notices.
+    'confirm_deposit_match', 'mark_deposit_not_rent', 'sync_bank_connection',
+    'set_books_start_date', 'disconnect_bank_connection', 'create_common_area',
+    'update_common_area', 'hold_common_area', 'retire_common_area',
+    'cancel_amenity_reservation', 'reschedule_inspection', 'finalize_inspection',
+    'flag_inspection_suspicious', 'close_survey', 'copy_survey', 'delete_survey',
+    'decide_work_trade_hours', 'update_work_trade_agreement', 'set_work_trade_target',
+    'give_entry_notice', 'record_entry',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],

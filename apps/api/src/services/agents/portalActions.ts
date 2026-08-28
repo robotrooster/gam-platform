@@ -2398,6 +2398,742 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: ['leaseId'],
     confirmFirst: true,
   },
+  // ── LANDLORD · e-sign (S628) ─────────────────────────────────────────
+  //
+  // Sending an existing document and voiding one already worked. What was
+  // missing is DRAWING ONE UP — the agent could talk about a lease it had no
+  // way to produce. The raw document builder is deliberately left out: it takes
+  // a hand-assembled signer list with resolved user ids, and a wrong signer on
+  // a lease is worse than no tool. draft_household_lease does the same job from
+  // a unit and a list of emails, which is what a landlord actually has.
+  {
+    id: 'draft_household_lease',
+    audience: 'landlord', method: 'POST', path: '/api/esign/draft-household',
+    description:
+      'Draw up the lease for everybody moving into a unit, off that unit type\u2019s default template. ' +
+      'Use straight after inviting a household — "now get their lease ready".\n' +
+      'ORDER MATTERS: the first email is the primary resident, the one who holds the lease. The rest ' +
+      'ride as co-tenants. Get that from the landlord rather than guessing from who was mentioned ' +
+      'first.\n' +
+      'Everybody has to have a tenant account already — invite them first. If none of them do, it ' +
+      'comes back saying so and nothing is drafted; say that rather than reporting a lease that does ' +
+      'not exist. This DRAFTS. Nothing is sent to anybody until send_document_for_signature.',
+    params: {
+      unitId: { type: 'string', description: 'The unit they are moving into, from a lookup.' },
+      emails: { type: 'array', description: 'Their email addresses, PRIMARY RESIDENT FIRST. One to eight.' },
+    },
+    required: ['unitId', 'emails'],
+    confirmFirst: true,
+  },
+  {
+    id: 'draft_renewal_document',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/renewal',
+    description:
+      'Draw up the renewal lease for a tenant staying on. Use for "get the Alvarez renewal ready".\n' +
+      'This collects NO TERMS — not the new rent, not the new dates. That is deliberate and it is the ' +
+      'GAM standard: THE LEASE IS THE DOCUMENT, so the landlord types the new figures into the ' +
+      'drafted lease itself during their signing pass. Do NOT ask them for a rent here and do not ' +
+      'quote one; tell them the draft is ready and the numbers go in when they sign it.\n' +
+      'A second open renewal draft on the same lease is a mistake and the system refuses it — void ' +
+      'the first or send it.',
+    params: {
+      leaseId: { type: 'string', description: 'The lease being renewed, from a lookup.' },
+      templateId: { type: 'string', description: 'Which lease template to draft from, from a lookup. Required.' },
+    },
+    required: ['leaseId', 'templateId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'draft_terms_addendum',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/addendum-terms',
+    description:
+      'Draw up an addendum that changes the money on a live lease — a rent change, or a new recurring ' +
+      'charge like parking or a garage. Use for "put their space rent up to $520 from March" or "they ' +
+      'are taking the carport, $40 a month".\n' +
+      'Each change carries its own EFFECTIVE DATE, and on completion the nightly job applies it to ' +
+      'billing on that date. So the date is not decoration: get it from the landlord and read it back ' +
+      'with the amount.\n' +
+      'mode is the landlord\u2019s call and it turns on their local law, never on anything you decide. ' +
+      '"agreement" means the tenant signs it. "notice" means the landlord issues it and the tenant ' +
+      'does not sign. If they have not said which, ASK — do not default to one. You do not tell them ' +
+      'which their state allows; that is a legal question and it escalates.\n' +
+      'The signers work themselves out from the lease. This DRAFTS; nothing goes to anybody until it ' +
+      'is sent.',
+    params: {
+      leaseId: { type: 'string', description: 'The lease being amended, from a lookup.' },
+      title: { type: 'string', description: 'What the addendum is called. Both sides read this.' },
+      templateId: { type: 'string', description: 'The template to draft from, from a lookup.' },
+      mode: { type: 'string', description: 'agreement (the tenant signs) or notice (the landlord issues it). The landlord decides; ask.' },
+      scheduledChanges: { type: 'array', description: 'The money changes. A rent change has changeType rent, an effectiveDate and a newRentAmount; a recurring charge has changeType recurring_fee, an effectiveDate, a feeType, a feeAmount and an optional feeDescription.' },
+    },
+    required: ['leaseId', 'title'],
+    confirmFirst: true,
+  },
+  {
+    id: 'create_lease_template',
+    audience: 'landlord', method: 'POST', path: '/api/esign/templates',
+    description:
+      'Create a lease template from a PDF the landlord has already uploaded. Use for "set up the ' +
+      'template for the mobile-home lots".\n' +
+      'You cannot upload the PDF for them — that is a file, and it is theirs to put in. If they have ' +
+      'not uploaded one yet, say that is the first step.\n' +
+      'depositMonths is the deposit as MONTHS OF RENT, and it is what every lease from this template ' +
+      'charges, so confirm the number. defaultTermMonths left out means month-to-month. Setting the ' +
+      'unit type is what lets this become that type\u2019s default later.',
+    params: {
+      name: { type: 'string', description: 'What the template is called.' },
+      basePdfUrl: { type: 'string', description: 'The uploaded PDF, from a lookup. The landlord uploads it themselves.' },
+      unitType: { type: 'string', description: 'Which kind of unit it is for — apartment, mobile_home, rv_spot, and so on.' },
+      propertyId: { type: 'string', description: 'Limit it to one property, if they want that.' },
+      description: { type: 'string', description: 'What it is for, in their words.' },
+      depositMonths: { type: 'number', description: 'The deposit as months of rent, 0 to 12. Leave out to fill the deposit in by hand each time.' },
+      defaultTermMonths: { type: 'integer', description: 'Default term in months, 1 to 120. Leave out for month-to-month.' },
+      pageCount: { type: 'integer', description: 'How many pages the PDF has.' },
+      purpose: { type: 'string', description: 'lease, or work_trade_addendum for their own work-trade form.' },
+    },
+    required: ['name'],
+    confirmFirst: true,
+  },
+  {
+    id: 'update_lease_template',
+    audience: 'landlord', method: 'PATCH', path: '/api/esign/templates/:templateId',
+    pathParams: ['templateId'],
+    description:
+      'Change a lease template — its name, which unit type it is for, the deposit months, the default ' +
+      'term. Use for "the deposit on the lot template should be one month, not two".\n' +
+      'This changes what NEW leases drawn from it say. Leases already signed keep their own terms, ' +
+      'and leases already drafted keep what they were drafted with. Say that.',
+    params: {
+      templateId: { type: 'string', description: 'The template id, from a lookup.' },
+      name: { type: 'string', description: 'New name.' },
+      description: { type: 'string', description: 'What it is for.' },
+      unitType: { type: 'string', description: 'Which kind of unit it is for.' },
+      propertyId: { type: 'string', description: 'Limit it to one property.' },
+      depositMonths: { type: 'number', description: 'Deposit as months of rent, 0 to 12.' },
+      defaultTermMonths: { type: 'integer', description: 'Default term in months.' },
+    },
+    required: ['templateId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_default_lease_template',
+    audience: 'landlord', method: 'POST', path: '/api/esign/templates/:templateId/set-default',
+    pathParams: ['templateId'],
+    description:
+      'Make a template the default for its unit type, so leases draft from it automatically. Use for ' +
+      '"use that one for all the RV spots from now on".\n' +
+      'A default is PER UNIT TYPE, so the template has to have a unit type set first — if it does ' +
+      'not, the system says so and that is the thing to fix. Setting this one clears whichever was ' +
+      'the default before, so name the one being replaced.\n' +
+      'This is worth offering unprompted: a unit with no default template is a unit whose lease never ' +
+      'drafts, and a landlord waiting on a draft that will never come has no way to know why.',
+    params: {
+      templateId: { type: 'string', description: 'The template id, from a lookup.' },
+      isDefault: { type: 'boolean', description: 'true to make it the default, false to clear it. Defaults to true.' },
+    },
+    required: ['templateId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'delete_lease_template',
+    audience: 'landlord', method: 'DELETE', path: '/api/esign/templates/:templateId',
+    pathParams: ['templateId'],
+    description:
+      'Remove a lease template they no longer use. Documents already drawn from it are untouched — ' +
+      'this only stops new ones being drafted from it. If it was a unit type\u2019s default, that unit ' +
+      'type is left with NO default and its leases will stop drafting; say that first and offer to ' +
+      'set another one.',
+    params: { templateId: { type: 'string', description: 'The template id, from a lookup.' } },
+    required: ['templateId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · the utility cycle (S628) ──────────────────────────────
+  //
+  // Recording a reading and starting a run already worked. The rest of the
+  // month — the meters themselves, what they serve, the rates, and turning
+  // readings into bills — did not.
+  {
+    id: 'add_utility_meter',
+    audience: 'landlord', method: 'POST', path: '/api/utility/meters',
+    description:
+      'Add a utility meter at a property. Use for "there is a water master on the north half" or ' +
+      '"spot 12 has its own electric submeter".\n' +
+      'billingMethod is the decision that matters. A SUBMETER measures exactly one unit and bills what ' +
+      'that unit used. A RUBS MASTER measures a pool of units and splits one bill between them by a ' +
+      'rule. Ask which it is rather than inferring it from the word they used.\n' +
+      'digits is how many digits are on the physical meter FACE, and readingMultiplier is what one ' +
+      'turn of the last digit is worth — a water register that counts per hundred gallons is 100, so ' +
+      '413 on the dial is 41,300 gallons. Both are properties of the hardware; ask, do not assume, ' +
+      'because getting them wrong misprices every bill from it.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      utilityType: { type: 'string', description: 'water, electric, gas, sewer, trash, and so on.' },
+      label: { type: 'string', description: 'What the landlord calls it — "north water master".' },
+      billingMethod: { type: 'string', description: 'submeter (one unit) or a RUBS master (a pool split by a rule).' },
+      ratePerUnit: { type: 'number', description: 'What one unit of usage costs.' },
+      baseFee: { type: 'number', description: 'A flat fee on top of usage.' },
+      rubsAllocationMethod: { type: 'string', description: 'How a RUBS pool is split between its units.' },
+      rubsBasis: { type: 'string', description: 'Whether the pool is priced by usage times rate, or by dividing the provider\u2019s actual bill.' },
+      digits: { type: 'integer', description: 'How many digits are on the meter face.' },
+      readingMultiplier: { type: 'number', description: 'What one turn of the last digit is worth. 100 for a register counting per hundred gallons.' },
+    },
+    required: ['propertyId', 'utilityType', 'label', 'billingMethod'],
+    confirmFirst: true,
+  },
+  {
+    id: 'update_utility_meter',
+    audience: 'landlord', method: 'PATCH', path: '/api/utility/meters/:meterId',
+    pathParams: ['meterId'],
+    description:
+      'Change a meter — its label, its rate, its base fee, its face digits, or mark it broken or ' +
+      'repaired. Use for "water went to $0.006 a gallon" or "the meter on 12 is dead".\n' +
+      'How a reading is INTERPRETED and how a bill is CALCULATED — the utility type, the billing ' +
+      'method, the digits, the multiplier — can be changed freely until the meter has actually ' +
+      'measured or billed something, and are frozen after that. That is deliberate: changing them ' +
+      'later would silently re-interpret readings already taken and bills already sent. If the system ' +
+      'refuses on those grounds, read that back; it is not a bug to work around.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      label: { type: 'string', description: 'What it is called.' },
+      utilityType: { type: 'string', description: 'What it measures. Frozen once it has history.' },
+      billingMethod: { type: 'string', description: 'How it bills. Frozen once it has history.' },
+      ratePerUnit: { type: 'number', description: 'What one unit of usage costs.' },
+      baseFee: { type: 'number', description: 'Flat fee on top of usage.' },
+      digits: { type: 'integer', description: 'Digits on the meter face. Frozen once it has history.' },
+      readingMultiplier: { type: 'number', description: 'What one turn of the last digit is worth. Frozen once it has history.' },
+      rubsAllocationMethod: { type: 'string', description: 'How a RUBS pool is split.' },
+      rubsBasis: { type: 'string', description: 'How the pool is priced.' },
+    },
+    required: ['meterId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'assign_units_to_meter',
+    audience: 'landlord', method: 'POST', path: '/api/utility/meters/:meterId/units',
+    pathParams: ['meterId'],
+    description:
+      'Say which units a meter serves. Use for "the north master covers spots 1 through 14".\n' +
+      'A SUBMETER serves exactly one unit — sending several against one is refused, and rightly, ' +
+      'because it means the landlord has the wrong meter in mind. A RUBS master is the one that takes ' +
+      'a list.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      unitIds: { type: 'array', description: 'The unit ids it serves. One only for a submeter.' },
+      unitId: { type: 'string', description: 'A single unit id, for a submeter.' },
+    },
+    required: ['meterId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_meter_unit_quantity',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/utility/meters/:meterId/units/:unitId',
+    pathParams: ['meterId', 'unitId'],
+    description:
+      'Say how many of a service one unit takes — the household with a second trash can pays for two. ' +
+      'Use for "spot 12 has two cans".\n' +
+      'Quantity ONLY, never price. The rate stays the property\u2019s and is the same for everyone; what ' +
+      'changes is how many of it this unit is billed for. Do not use this to charge somebody a ' +
+      'different rate.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      quantity: { type: 'integer', description: 'How many of the service this unit takes, 1 to 99.' },
+    },
+    required: ['meterId', 'unitId', 'quantity'],
+    confirmFirst: true,
+  },
+  {
+    id: 'bill_back_meter',
+    audience: 'landlord', method: 'POST', path: '/api/utility/meters/:meterId/bill-back',
+    pathParams: ['meterId'],
+    description:
+      'Start billing a utility back to every unit on a meter that is not already carrying it — the ' +
+      'park that never charged for trash and now does. Use for "we are charging for water at Sunset ' +
+      'Palms from now on".\n' +
+      'This touches EVERY unit on that meter at once, which is the point: doing it one at a time ' +
+      'across twenty-seven spaces is how half get missed. A responsibility that came from a SIGNED ' +
+      'LEASE is never touched — this only fills the silences. Say how many units it will affect ' +
+      'before you send it.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      note: { type: 'string', description: 'Why, for the record.' },
+    },
+    required: ['meterId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_utility_tax_rate',
+    audience: 'landlord', method: 'POST', path: '/api/utility/tax-rates',
+    description:
+      'Set the tax rate applied to a utility at a property. Use for "water is taxed at 4.5% here".\n' +
+      'This is a rate their local authority sets, not one they choose — take the figure from them and ' +
+      'do not work it out. It is a percentage: 4.5 means 4.5%, not 450%.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      utilityType: { type: 'string', description: 'Which utility is taxed.' },
+      taxRatePct: { type: 'number', description: 'The rate as a percentage — 4.5 means 4.5%.' },
+      label: { type: 'string', description: 'What the tax is called locally.' },
+    },
+    required: ['propertyId', 'utilityType', 'taxRatePct'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_property_utility_rate',
+    audience: 'landlord', method: 'POST', path: '/api/utility/property-rates',
+    description:
+      'Set the property-wide rate for a utility — what everybody there pays per unit of usage, plus ' +
+      'any flat fee. Use for "trash is $18 a month at the park".\n' +
+      'This is the standing price at that property and it changes what every unit on it is billed ' +
+      'next cycle. Read back the utility, the rate and the property together.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      utilityType: { type: 'string', description: 'Which utility.' },
+      ratePerUnit: { type: 'number', description: 'What one unit of usage costs.' },
+      baseFee: { type: 'number', description: 'A flat monthly fee.' },
+      sewerRatePerUnit: { type: 'number', description: 'The sewer rate, where sewer is billed off water usage.' },
+      prevailingResidentialRate: { type: 'number', description: 'The prevailing residential rate, where the state caps what a park may charge.' },
+    },
+    required: ['propertyId', 'utilityType'],
+    confirmFirst: true,
+  },
+  {
+    id: 'complete_reading_run',
+    audience: 'landlord', method: 'POST', path: '/api/utility/reading-runs/:runId/complete',
+    pathParams: ['runId'],
+    description:
+      'Close a meter-reading run once every meter has been read. Use for "that is all the meters ' +
+      'done".\n' +
+      'Completing it is what makes those readings billable. If any reading is still waiting on a ' +
+      'double-check, deal with that first — a run closed over an unresolved read bills a number ' +
+      'nobody confirmed.',
+    params: { runId: { type: 'string', description: 'The reading run id, from a lookup.' } },
+    required: ['runId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'generate_utility_bills',
+    audience: 'landlord', method: 'POST', path: '/api/utility/generate-bills',
+    description:
+      'Turn a completed month of readings into utility bills. Use for "run the water bills for March".\n' +
+      'cycleMonth is the FIRST of the month, as YYYY-MM-01. Re-running the same cycle does not ' +
+      'duplicate anything, so a second run after fixing one meter is safe and worth saying — a ' +
+      'landlord who thinks they will double-bill will not re-run it.\n' +
+      'Scope it to a meter or a property when they name one; without either it runs the whole ' +
+      'portfolio, which is rarely what somebody asking about one park meant. Generating is not ' +
+      'sending: the bills land unbilled and are finalised one by one.',
+    params: {
+      cycleMonth: { type: 'string', description: 'The first of the month being billed, as YYYY-MM-01.' },
+      meterId: { type: 'string', description: 'Just this meter, from a lookup.' },
+      propertyId: { type: 'string', description: 'Just this property, from a lookup.' },
+    },
+    required: ['cycleMonth'],
+    confirmFirst: true,
+  },
+  {
+    id: 'finalize_utility_bill',
+    audience: 'landlord', method: 'POST', path: '/api/utility/bills/:billId/finalize',
+    pathParams: ['billId'],
+    description:
+      'Finalise a utility bill so it goes to the tenant and can be paid. Use for "send that one out".\n' +
+      'THIS is the moment the tenant owes it — until now the bill existed but was not theirs. Read ' +
+      'back the unit, the usage and the amount before you do it. Only an unbilled bill can be ' +
+      'finalised; if the system says it is already billed, it has already gone.',
+    params: { billId: { type: 'string', description: 'The bill id, from a lookup.' } },
+    required: ['billId'],
+    confirmFirst: true,
+  },
+  // ── LANDLORD · the bank feed (S628) ──────────────────────────────────
+  //
+  // Categorising and ignoring a transaction already worked. Matching a DEPOSIT
+  // to the charges it paid did not, and that is the one that matters: in a park
+  // where every lot pays the same rent, an amount identifies nobody.
+  {
+    id: 'confirm_deposit_match',
+    audience: 'landlord', method: 'POST', path: '/api/bank-feed/deposits/:depositId/confirm',
+    pathParams: ['depositId'],
+    description:
+      'Say which charges a bank deposit paid off. Use for "that $1,300 on the 4th was spot 12 and ' +
+      'spot 19".\n' +
+      'The LANDLORD confirms this, never you. In a park where every lot pays the same rent an amount ' +
+      'identifies nobody, and a confident wrong answer books one tenant\u2019s money onto another\u2019s ' +
+      'ledger — and from there onto their credit file. Read back the deposit, the date, and every ' +
+      'charge you are about to mark paid, by tenant and unit, and get a yes to that list.\n' +
+      'If the landlord is not sure who it was, mark_deposit_not_rent is the honest way out. Never ' +
+      'pick the most likely tenant to close the loop.',
+    params: {
+      depositId: { type: 'string', description: 'The bank deposit id, from the unmatched-deposit queue.' },
+      chargeIds: { type: 'array', description: 'The charge ids this deposit paid, 1 to 20. From the candidate shortlist on that deposit.' },
+      method: { type: 'string', description: 'cash, check or money_order — how it reached the bank.' },
+      declarationId: { type: 'string', description: 'The tenant\u2019s own declaration of this payment, when one lines up.' },
+    },
+    required: ['depositId', 'chargeIds', 'method'],
+    confirmFirst: true,
+  },
+  {
+    id: 'mark_deposit_not_rent',
+    audience: 'landlord', method: 'POST', path: '/api/bank-feed/deposits/:depositId/not-rent',
+    pathParams: ['depositId'],
+    description:
+      'Say a deposit was not a tenant payment at all — an owner contribution, an insurance cheque, a ' +
+      'refund. It goes back to the ordinary categorising flow as other income.\n' +
+      'Offer this whenever the landlord is unsure. Without it, somebody staring at a shortlist of ' +
+      'tenants who did NOT pay this deposit has no honest way out except to pick one, and that is the ' +
+      'outcome this exists to prevent.',
+    params: { depositId: { type: 'string', description: 'The bank deposit id, from the queue.' } },
+    required: ['depositId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'sync_bank_connection',
+    audience: 'landlord', method: 'POST', path: '/api/bank-feed/connections/:connectionId/sync',
+    pathParams: ['connectionId'],
+    description:
+      'Pull the latest transactions from a connected bank account now, instead of waiting for the ' +
+      'nightly run. Use for "I deposited it this morning, is it showing yet?".\n' +
+      'Banks post on their own schedule — a deposit made today may genuinely not be there yet, and a ' +
+      'sync that finds nothing is not a fault. Say that rather than syncing twice.',
+    params: { connectionId: { type: 'string', description: 'The bank connection id, from a lookup.' } },
+    required: ['connectionId'],
+  },
+  {
+    id: 'set_books_start_date',
+    audience: 'landlord', method: 'PUT', path: '/api/bank-feed/books-start-date',
+    description:
+      'Set the date the landlord\u2019s books begin — bank transactions before it are left alone rather ' +
+      'than pulled in for categorising. Use for "we moved over on the first of June, do not bother ' +
+      'with anything before that".\n' +
+      'Send null to clear it and take everything the connection offers. Moving it FORWARD leaves ' +
+      'earlier transactions out of the books; say that before you change it on somebody who has ' +
+      'already been categorising.',
+    params: { date: { type: 'string', description: 'The first day the books cover, YYYY-MM-DD, or null for no start date.' } },
+    required: ['date'],
+    confirmFirst: true,
+  },
+  {
+    id: 'disconnect_bank_connection',
+    audience: 'landlord', method: 'POST', path: '/api/bank-feed/connections/:connectionId/disconnect',
+    pathParams: ['connectionId'],
+    description:
+      'Disconnect a bank account from the feed. Use for "we closed that account".\n' +
+      'New transactions stop arriving. Everything already pulled in stays on the books — this does ' +
+      'not erase history. The bank feed is how a landlord reconciles what they were actually paid, so ' +
+      'if they have no other account connected, say what they lose before you do it.',
+    params: { connectionId: { type: 'string', description: 'The bank connection id, from a lookup.' } },
+    required: ['connectionId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · amenities (S628) ──────────────────────────────────────
+  {
+    id: 'create_common_area',
+    audience: 'landlord', method: 'POST', path: '/api/common-areas',
+    description:
+      'Add a shared amenity residents can use or book — a clubhouse, a laundry, a pool, a pickleball ' +
+      'court. Use for "put the clubhouse on so people can reserve it".\n' +
+      'reservable false makes it something residents can see but not book. requiresApproval true ' +
+      'means the landlord decides each request rather than it going through on its own — that is a ' +
+      'real workload difference, so ask which they want. A reservation fee is money a resident pays, ' +
+      'so read it back.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      name: { type: 'string', description: 'What residents call it.' },
+      description: { type: 'string', description: 'What it is and any rules, in their words.' },
+      reservable: { type: 'boolean', description: 'Whether residents can book it at all.' },
+      requiresApproval: { type: 'boolean', description: 'true if the landlord approves each request.' },
+      capacity: { type: 'integer', description: 'How many people it holds.' },
+      reservationFee: { type: 'number', description: 'What a booking costs.' },
+      weekendFee: { type: 'number', description: 'A different fee at weekends.' },
+      openTime: { type: 'string', description: 'Earliest bookable time, as HH:MM.' },
+      closeTime: { type: 'string', description: 'Latest bookable time, as HH:MM.' },
+      maxReservationHours: { type: 'integer', description: 'Longest single booking, in hours.' },
+      advanceBookingDays: { type: 'integer', description: 'How far ahead residents may book.' },
+      monthlyReservationLimit: { type: 'integer', description: 'How many bookings one person gets a month. Leave out for unlimited.' },
+      eventsEnabled: { type: 'boolean', description: 'Whether residents may book it for a private event.' },
+      eventDepositAmount: { type: 'number', description: 'Deposit for a private event.' },
+    },
+    required: ['propertyId', 'name'],
+    confirmFirst: true,
+  },
+  {
+    id: 'update_common_area',
+    audience: 'landlord', method: 'PATCH', path: '/api/common-areas/:areaId',
+    pathParams: ['areaId'],
+    description:
+      'Change an amenity — its hours, its fee, its booking rules, or take it out of service with ' +
+      'active false. Use for "the pool closes at nine now" or "clubhouse is shut for the remodel".\n' +
+      'Taking it out of service stops new bookings. It does NOT tell the people who have already ' +
+      'booked it — offer to message them, because a resident turning up to a locked clubhouse is the ' +
+      'outcome to avoid.',
+    params: {
+      areaId: { type: 'string', description: 'The amenity id, from a lookup.' },
+      name: { type: 'string', description: 'What it is called.' },
+      description: { type: 'string', description: 'What it is and its rules.' },
+      active: { type: 'boolean', description: 'false takes it out of service.' },
+      reservable: { type: 'boolean', description: 'Whether residents can book it.' },
+      requiresApproval: { type: 'boolean', description: 'Whether the landlord approves each request.' },
+      capacity: { type: 'integer', description: 'How many people it holds.' },
+      reservationFee: { type: 'number', description: 'What a booking costs.' },
+      weekendFee: { type: 'number', description: 'Weekend fee.' },
+      openTime: { type: 'string', description: 'Earliest bookable time, HH:MM.' },
+      closeTime: { type: 'string', description: 'Latest bookable time, HH:MM.' },
+      maxReservationHours: { type: 'integer', description: 'Longest single booking, in hours.' },
+      advanceBookingDays: { type: 'integer', description: 'How far ahead residents may book.' },
+      monthlyReservationLimit: { type: 'integer', description: 'Bookings per person per month.' },
+    },
+    required: ['areaId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'hold_common_area',
+    audience: 'landlord', method: 'POST', path: '/api/common-areas/:areaId/reservations',
+    pathParams: ['areaId'],
+    description:
+      'Block out an amenity for the landlord\u2019s own use — a closure for maintenance, a park event, a ' +
+      'private rental. Use for "the clubhouse is booked for the potluck on the 14th".\n' +
+      'This goes live immediately and takes those hours off residents. If it clashes with a booking ' +
+      'somebody already has, the system says so — that resident planned around it, so take that ' +
+      'seriously rather than moving them. notifyResidents true tells everyone at the property.',
+    params: {
+      areaId: { type: 'string', description: 'The amenity id, from a lookup.' },
+      kind: { type: 'string', description: 'What kind of hold it is — a closure, an event, a private rental.' },
+      startsAt: { type: 'string', description: 'When it starts, in full ISO form.' },
+      endsAt: { type: 'string', description: 'When it ends, in full ISO form.' },
+      title: { type: 'string', description: 'What to call it. Residents see this.' },
+      notes: { type: 'string', description: 'Anything else about it.' },
+      guestCount: { type: 'integer', description: 'How many people are expected.' },
+      notifyResidents: { type: 'boolean', description: 'true to tell everyone at the property.' },
+    },
+    required: ['areaId', 'kind', 'startsAt', 'endsAt'],
+    confirmFirst: true,
+  },
+  {
+    id: 'retire_common_area',
+    audience: 'landlord', method: 'DELETE', path: '/api/common-areas/:areaId',
+    pathParams: ['areaId'],
+    description:
+      'Remove an amenity that no longer exists. If they are only closing it for a while, ' +
+      'update_common_area with active false is the better answer and keeps its history — offer that ' +
+      'first. Bookings people already hold on it need telling about either way.',
+    params: { areaId: { type: 'string', description: 'The amenity id, from a lookup.' } },
+    required: ['areaId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'cancel_amenity_reservation',
+    audience: 'landlord', method: 'POST', path: '/api/common-areas/reservations/:reservationId/cancel',
+    pathParams: ['reservationId'],
+    description:
+      'Cancel a booking on an amenity. Use for "cancel the clubhouse on Saturday".\n' +
+      'Somebody was counting on this. If a fee was paid on it, cancelling here does not on its own ' +
+      'put that money back — say so, and if they want it refunded that is a money question and it ' +
+      'escalates. Offer to message the resident about it.',
+    params: { reservationId: { type: 'string', description: 'The reservation id, from a lookup.' } },
+    required: ['reservationId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'cancel_my_amenity_reservation',
+    audience: 'tenant', method: 'POST', path: '/api/common-areas/reservations/:reservationId/cancel',
+    pathParams: ['reservationId'],
+    description:
+      'Cancel a booking the tenant made on an amenity. Use for "I do not need the clubhouse on ' +
+      'Saturday any more".\n' +
+      'If they paid a fee on it, do not promise it back — cancelling frees the slot, and anything ' +
+      'about the money is for their landlord. Say what you did and what you cannot say.',
+    params: { reservationId: { type: 'string', description: 'Their reservation id, from get_my_amenities.' } },
+    required: ['reservationId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · inspections and surveys (S628) ────────────────────────
+  {
+    id: 'reschedule_inspection',
+    audience: 'landlord', method: 'PATCH', path: '/api/inspections/:inspectionId',
+    pathParams: ['inspectionId'],
+    description:
+      'Move an inspection to a different time, or add notes to it. Use for "push the move-out ' +
+      'walkthrough at 204 to Thursday".\n' +
+      'Only an inspection that has not been submitted can be edited — once it is in, the record is ' +
+      'the record. Somebody is expecting you at the old time, so offer to tell them.',
+    params: {
+      inspectionId: { type: 'string', description: 'The inspection id, from a lookup.' },
+      scheduledFor: { type: 'string', description: 'The new date and time, in full ISO form. null to unschedule it.' },
+      notes: { type: 'string', description: 'Notes on the inspection.' },
+    },
+    required: ['inspectionId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'finalize_inspection',
+    audience: 'landlord', method: 'POST', path: '/api/inspections/:inspectionId/finalize',
+    pathParams: ['inspectionId'],
+    description:
+      'Finalise an inspection. This CLOSES the record: it is what a deposit deduction later rests on, ' +
+      'and a move-out walkthrough has to be finalised before the deposit return can even start.\n' +
+      'It needs both signatures and every item filled in. If the system refuses, it says exactly what ' +
+      'is missing — read that back rather than trying again. Nothing about it can be changed ' +
+      'afterwards, so say that first.',
+    params: { inspectionId: { type: 'string', description: 'The inspection id, from a lookup.' } },
+    required: ['inspectionId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'flag_inspection_suspicious',
+    audience: 'landlord', method: 'POST', path: '/api/inspections/:inspectionId/flag-suspicious',
+    pathParams: ['inspectionId'],
+    description:
+      'Flag a tenant-submitted periodic inspection that does not look right — photographs that do not ' +
+      'match the unit, an obviously copied form. Use for "those pictures are from last year".\n' +
+      'This is an accusation on somebody\u2019s record, so it needs a real reason in the landlord\u2019s own ' +
+      'words and their explicit go-ahead. Only a tenant-submitted periodic inspection can be flagged. ' +
+      'Do not suggest flagging one; that is theirs to raise.',
+    params: {
+      inspectionId: { type: 'string', description: 'The inspection id, from a lookup.' },
+      reason: { type: 'string', description: 'What is wrong with it, in the landlord\u2019s words.' },
+    },
+    required: ['inspectionId', 'reason'],
+    confirmFirst: true,
+  },
+  {
+    id: 'close_survey',
+    audience: 'landlord', method: 'POST', path: '/api/surveys/:surveyId/close',
+    pathParams: ['surveyId'],
+    description:
+      'Close a survey so no more responses come in. Use for "that is enough, close the pool survey".\n' +
+      'Only a survey that has been sent can be closed. Say how many responses they got before you do ' +
+      'it — closing at four responses out of forty is usually not what somebody meant.',
+    params: { surveyId: { type: 'string', description: 'The survey id, from a lookup.' } },
+    required: ['surveyId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'copy_survey',
+    audience: 'landlord', method: 'POST', path: '/api/surveys/:surveyId/copy',
+    pathParams: ['surveyId'],
+    description:
+      'Copy a survey to another property, so the same questions can be asked there. Use for "run that ' +
+      'same one at Oak Street". The copy arrives as a DRAFT — it is not sent to anybody until they ' +
+      'send it.',
+    params: {
+      surveyId: { type: 'string', description: 'The survey to copy, from a lookup.' },
+      targetPropertyId: { type: 'string', description: 'The property to copy it to, from a lookup.' },
+    },
+    required: ['surveyId', 'targetPropertyId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'delete_survey',
+    audience: 'landlord', method: 'DELETE', path: '/api/surveys/:surveyId',
+    pathParams: ['surveyId'],
+    description:
+      'Delete a survey. If anybody has answered it, those answers go with it — people took the time ' +
+      'to reply, so say what is being lost and get a yes to that specifically. If they only want it ' +
+      'to stop, close_survey keeps the answers and is almost always what they meant.',
+    params: { surveyId: { type: 'string', description: 'The survey id, from a lookup.' } },
+    required: ['surveyId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · work trade (S628) ─────────────────────────────────────
+  {
+    id: 'decide_work_trade_hours',
+    audience: 'landlord', method: 'PATCH', path: '/api/work-trade/logs/:logId',
+    pathParams: ['logId'],
+    description:
+      'Approve or reject hours a tenant logged against their work-trade agreement. Use for "yes, ' +
+      'those eight hours are right" or "he was not here Tuesday".\n' +
+      'Approved hours come off what that tenant owes, so this IS money. A rejection needs a reason ' +
+      'the tenant can read and understand — they worked, or believe they did, and "rejected" with ' +
+      'nothing after it is how this goes wrong.',
+    params: {
+      logId: { type: 'string', description: 'The logged-hours id, from get_work_trade_status.' },
+      action: { type: 'string', description: 'approve or reject.' },
+      rejectionReason: { type: 'string', description: 'Why, in the landlord\u2019s words. The tenant reads this.' },
+    },
+    required: ['logId', 'action'],
+    confirmFirst: true,
+  },
+  {
+    id: 'update_work_trade_agreement',
+    audience: 'landlord', method: 'PATCH', path: '/api/work-trade/:agreementId',
+    pathParams: ['agreementId'],
+    description:
+      'Change a work-trade agreement — the monthly hours, which charges the work offsets, whether ' +
+      'unused hours carry forward, or pause or end it. Use for "make it twenty hours a month" or ' +
+      '"pause Danny\u2019s trade while he is away".\n' +
+      'This changes what somebody owes each month. Read back the hours, what they cover, and from ' +
+      'when. Ending it means their rent goes back to being paid in full — say that in those words, ' +
+      'because it is the part that gets missed.',
+    params: {
+      agreementId: { type: 'string', description: 'The agreement id, from get_work_trade_status.' },
+      status: { type: 'string', description: 'active, paused or ended.' },
+      endDate: { type: 'string', description: 'When it ends, YYYY-MM-DD.' },
+      monthlyHoursTarget: { type: 'integer', description: 'Hours a month the work is worth.' },
+      coveredCharges: { type: 'array', description: 'Which kinds of charge the work offsets.' },
+      carryForwardMonths: { type: 'integer', description: 'How many months unused hours carry forward, 0 to 24.' },
+    },
+    required: ['agreementId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_work_trade_target',
+    audience: 'landlord', method: 'PATCH', path: '/api/work-trade/property/:propertyId/target',
+    pathParams: ['propertyId'],
+    description:
+      'Set the default monthly work-trade hours at a property, which new agreements start from. Use ' +
+      'for "trade at the park is fifteen hours a month".\n' +
+      'This is the DEFAULT for new agreements. Agreements already running keep their own hours — it ' +
+      'does not change what anybody currently owes.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      target: { type: 'integer', description: 'Default hours a month for new agreements.' },
+    },
+    required: ['propertyId', 'target'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · entry notices (S628) ──────────────────────────────────
+  {
+    id: 'give_entry_notice',
+    audience: 'landlord', method: 'POST', path: '/api/entry-requests',
+    description:
+      'Give a tenant notice that somebody needs to come into their home. Use for "tell 204 the ' +
+      'plumber is coming Thursday morning".\n' +
+      'A notice ANCHORS to the thing it is for — either an open maintenance call or a scheduled ' +
+      'inspection — and exactly one of the two. That is what supplies the unit, the tenant and the ' +
+      'reason, so there is no free-text reason to write and none to invent. If there is no ' +
+      'maintenance request or inspection yet, that is the first step, not this.\n' +
+      'This is a LEGAL NOTICE. Every state sets a minimum notice period and most set permitted hours; ' +
+      'check the figure with your law tools and say what you found rather than assuming twenty-four ' +
+      'hours. Read the window back before you send it — somebody plans their day around it.',
+    params: {
+      maintenanceRequestId: { type: 'string', description: 'The maintenance call this entry is for, from a lookup. Send this OR an inspection, never both.' },
+      inspectionId: { type: 'string', description: 'The scheduled inspection this entry is for, from a lookup. Send this OR a maintenance call, never both.' },
+      proposedEntryWindowStart: { type: 'string', description: 'Start of the arrival window, in full ISO form.' },
+      proposedEntryWindowEnd: { type: 'string', description: 'End of the arrival window, in full ISO form.' },
+    },
+    required: ['proposedEntryWindowStart', 'proposedEntryWindowEnd'],
+    confirmFirst: true,
+  },
+  {
+    id: 'record_entry',
+    audience: 'landlord', method: 'POST', path: '/api/entry-requests/:entryRequestId/record-entry',
+    pathParams: ['entryRequestId'],
+    description:
+      'Record that the entry actually happened — when somebody went in, and what was done. Use for ' +
+      '"the plumber was in at ten, fixed the valve".\n' +
+      'This is the record that a notice was honoured as given, which is exactly what gets asked about ' +
+      'later. Put down what they tell you and nothing you assume.',
+    params: {
+      entryRequestId: { type: 'string', description: 'The entry request id, from a lookup.' },
+      enteredAt: { type: 'string', description: 'When they actually went in, in full ISO form.' },
+      notes: { type: 'string', description: 'Who went in and what was done, in their words.' },
+    },
+    required: ['entryRequestId', 'enteredAt'],
+    confirmFirst: true,
+  },
 ]
 
 const BY_ID = new Map(PORTAL_ACTIONS.map((a) => [a.id, a]))

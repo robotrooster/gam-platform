@@ -76,6 +76,21 @@ describe('agent profile registry', () => {
     }
   })
 
+  it('tells every CS agent to ACT rather than describe the button (S628)', () => {
+    // 200-odd portal actions do nothing if the agent still answers "you'd go to
+    // Settings and click…". These four rules are the difference between holding
+    // a tool and using it, and between using it and saying honestly what it did.
+    for (const p of CS) {
+      expect(p.systemPrompt).toContain('YOU CAN DO IT — SO DO IT')
+      expect(p.systemPrompt).toContain('BEFORE YOU CHANGE ANYTHING, READ IT BACK')
+      // Ids come from lookups. Asking a landlord for a uuid is the tell that the
+      // agent has given up on resolving what they meant.
+      expect(p.systemPrompt).toContain('IDs ARE NEVER ASKED FOR AND NEVER READ OUT')
+      // The half people get wrong: what a change does NOT do.
+      expect(p.systemPrompt).toContain('WHAT A CHANGE DOES NOT DO')
+    }
+  })
+
   it('gives each agent its name and uses it in the system prompt', () => {
     expect(requireProfile('tenant_entry').name).toBe('Ava')
     expect(requireProfile('tenant_escalation').name).toBe('Samantha')
