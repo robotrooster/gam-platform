@@ -94,7 +94,10 @@ describe('action parity — what a person can do, the agent should be able to do
 
   it('the write gap does not grow — a ratchet, lower it as tools land', async () => {
     const { AGENT_PROFILES } = await import('./profiles')
-    const WRITE = /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|invite|close|apply|renew|terminate|upload)_/
+    // Keep this in step with new action verbs — a write tool the regex does not
+    // recognise silently lowers the count and weakens the ratchet, which is how
+    // this test would quietly stop protecting anything.
+    const WRITE = /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|invite|close|apply|renew|terminate|upload|charge|void|categorize|ignore|acknowledge|offer|serve|hibernate|resume|retire)_/
     const writes = new Set<string>()
     for (const p of AGENT_PROFILES as any[]) {
       if (p.audience !== 'landlord' && p.audience !== 'tenant') continue
