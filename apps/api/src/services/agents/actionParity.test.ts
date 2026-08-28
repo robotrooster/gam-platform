@@ -97,14 +97,19 @@ describe('action parity — what a person can do, the agent should be able to do
     // Keep this in step with new action verbs — a write tool the regex does not
     // recognise silently lowers the count and weakens the ratchet, which is how
     // this test would quietly stop protecting anything.
-    const WRITE = /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|invite|close|apply|renew|terminate|upload|charge|void|categorize|ignore|acknowledge|offer|serve|hibernate|resume|retire)_/
+    const WRITE = /^(file|log|submit|request|respond|draft|book|capture|create|update|set|record|report|send|cancel|pay|add|remove|approve|assign|decide|flag|mark|message|post|reject|schedule|decline|resolve|bill|invite|close|apply|renew|terminate|upload|charge|void|categorize|ignore|acknowledge|offer|serve|hibernate|resume|retire|accept|revoke|reconcile|seed|issue|clock|complete|deny|withdraw|give|rename|archive|waive|nudge|answer|dismiss|register|change|explain|clear|start|finalize|renumber|activate)_/
     const writes = new Set<string>()
     for (const p of AGENT_PROFILES as any[]) {
       if (p.audience !== 'landlord' && p.audience !== 'tenant') continue
       for (const n of p.toolNames ?? []) if (WRITE.test(n)) writes.add(n)
     }
     // S626: 26 when the audit was written, 41 after the dispatch landed and the
-    // manifest was expanded. Raise as capability lands; never lower.
-    expect(writes.size).toBeGreaterThanOrEqual(41)
+    // manifest was expanded. S628: 159 — landlord settings and entities, PM
+    // delegation, properties with their fee and late-fee policy, the books,
+    // one-off charges and credits, the maintenance side of the business,
+    // inviting a tenant, what a unit actually is, the lease and its deposit
+    // return, and the tenant paying their rent.
+    // Raise as capability lands; never lower.
+    expect(writes.size).toBeGreaterThanOrEqual(159)
   })
 })

@@ -196,6 +196,19 @@ const TENANT_ENTRY: AgentProfile = {
     // S624: a tenant's own work-trade hours are account data, so the runner
     // demands a tool for them — and without one it refused to answer at all.
     'get_work_trade_standing',
+    // S628: their own screening, the renter pool, the utility they pay for,
+    // and telling the GAM team what the app cannot do.
+    'cancel_my_screening', 'withdraw_from_renter_pool', 'give_utility_moveout_notice',
+    'send_feature_request',
+    // S628: their own details, and the products offered to them.
+    'update_my_profile', 'nudge_landlord_banking', 'answer_income_questionnaire',
+    'dismiss_questionnaire', 'register_flexpay_interest', 'change_flexpay_pull_day',
+    'cancel_flexpay', 'cancel_flexdeposit', 'register_flexcredit_interest',
+    // S628 (Nic): the agent may take the payment, after quoting the real
+    // total and hearing a plain yes.
+    'get_payment_quote', 'pay_my_balance',
+    // S628: ending a lease early — a request, never a decision.
+    'request_early_termination', 'cancel_early_termination',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
@@ -231,6 +244,19 @@ const TENANT_ESCALATION: AgentProfile = {
     // S624: a tenant's own work-trade hours are account data, so the runner
     // demands a tool for them — and without one it refused to answer at all.
     'get_work_trade_standing',
+    // S628: their own screening, the renter pool, the utility they pay for,
+    // and telling the GAM team what the app cannot do.
+    'cancel_my_screening', 'withdraw_from_renter_pool', 'give_utility_moveout_notice',
+    'send_feature_request',
+    // S628: their own details, and the products offered to them.
+    'update_my_profile', 'nudge_landlord_banking', 'answer_income_questionnaire',
+    'dismiss_questionnaire', 'register_flexpay_interest', 'change_flexpay_pull_day',
+    'cancel_flexpay', 'cancel_flexdeposit', 'register_flexcredit_interest',
+    // S628 (Nic): the agent may take the payment, after quoting the real
+    // total and hearing a plain yes.
+    'get_payment_quote', 'pay_my_balance',
+    // S628: ending a lease early — a request, never a decision.
+    'request_early_termination', 'cancel_early_termination',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
@@ -267,7 +293,48 @@ const LANDLORD_ENTRY: AgentProfile = {
     // S624: cash that arrived but is unattributed, cash collected but never
     // banked, and who is behind on work-trade hours.
     'get_unreconciled_cash', 'get_work_trade_status', 'get_money_in_flight',
-    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'log_expense', 'create_and_send_survey', 'get_survey_results', 'record_cash_payment', 'add_units', 'update_unit', 'charge_a_fee', 'void_expense', 'categorize_bank_transaction', 'ignore_bank_transaction', 'cancel_entry_request', 'offer_renewal', 'serve_non_renewal_notice', 'hibernate_lease', 'resume_lease', 'set_unit_status', 'retire_unit', 'send_document_for_signature', 'void_document', 'record_meter_reading', 'start_meter_reading_run', 'create_work_trade_agreement', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
+    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'log_expense', 'create_and_send_survey', 'get_survey_results', 'record_cash_payment', 'add_units', 'update_unit', 'charge_a_fee', 'void_expense', 'categorize_bank_transaction', 'ignore_bank_transaction', 'cancel_entry_request', 'offer_renewal', 'serve_non_renewal_notice', 'hibernate_lease', 'resume_lease', 'set_unit_status', 'retire_unit', 'send_document_for_signature', 'void_document', 'record_meter_reading', 'start_meter_reading_run', 'create_work_trade_agreement',
+    // S628: the landlord's own business, and handing a property to a manager.
+    'update_business_settings', 'create_entity', 'set_deposit_interest_rate', 'remove_deposit_interest_rate',
+    'invite_property_manager', 'accept_pm_invitation', 'reject_pm_invitation', 'revoke_pm_invitation', 'set_default_pm_company',
+    // S628: properties — adding one, its fee schedule, its late-fee policy,
+    // its unit classes, its listings, and who runs it.
+    'add_property', 'update_property', 'set_property_fee', 'remove_property_fee',
+    'set_late_fee_policy', 'remove_late_fee_policy', 'add_unit_subtype', 'assign_units_to_subtype',
+    'remove_unit_subtype', 'update_unit_listing', 'set_fee_payers', 'assign_property_manager',
+    'close_property_onboarding',
+    // S628: the books — vendors, bills, the ledger, payroll records.
+    'add_vendor', 'update_vendor', 'record_bill', 'pay_bill', 'record_book_transaction',
+    'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
+    'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
+    'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
+    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    // S628: charging and forgiving, and the maintenance side of the business.
+    'add_one_off_charge', 'cancel_one_off_charge', 'issue_tenant_credit', 'void_tenant_credit',
+    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    'update_inventory_item', 'remove_inventory_item', 'request_purchase',
+    'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
+    'complete_scheduled_maintenance',
+    // S628: the smaller surfaces that had no action at all, and the request
+    // that goes to the GAM team when the software cannot do the thing.
+    'submit_feature_request', 'resolve_booking_change_request', 'set_home_owner',
+    'cancel_home_sale_contract', 'record_bank_reconciliation', 'rename_bank_account',
+    'archive_bank_account', 'create_utility_service_agreement', 'update_utility_service_agreement',
+    // S628: getting a tenant onto the platform — the highest-traffic thing a
+    // landlord does, and the last big action with no tool behind it.
+    'invite_tenant', 'waive_screening',
+    // S628: what a unit actually is — its number, type and rates, how it is
+    // occupied, which utilities the tenant carries, and its lifecycle.
+    'renumber_unit', 'set_unit_type_and_rates', 'set_unit_occupancy_mode', 'set_unit_subtype',
+    'set_utility_responsibility', 'mark_unit_available', 'mark_unit_vacant', 'activate_unit',
+    'cancel_scheduled_activation', 'set_eviction_mode',
+    // S628: the lease — its money and term, the deposit return, and letting
+    // somebody out early.
+    'update_lease', 'set_rent_components', 'explain_fee_override', 'bill_one_off_charge_to_lease',
+    'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
+    'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
+    'waive_early_termination_fee', 'request_background_check_for_lease',
+    'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'David',
@@ -300,7 +367,48 @@ const LANDLORD_ESCALATION: AgentProfile = {
     // S624: cash that arrived but is unattributed, cash collected but never
     // banked, and who is behind on work-trade hours.
     'get_unreconciled_cash', 'get_work_trade_status', 'get_money_in_flight',
-    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'log_expense', 'create_and_send_survey', 'get_survey_results', 'record_cash_payment', 'add_units', 'update_unit', 'charge_a_fee', 'void_expense', 'categorize_bank_transaction', 'ignore_bank_transaction', 'cancel_entry_request', 'offer_renewal', 'serve_non_renewal_notice', 'hibernate_lease', 'resume_lease', 'set_unit_status', 'retire_unit', 'send_document_for_signature', 'void_document', 'record_meter_reading', 'start_meter_reading_run', 'create_work_trade_agreement', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
+    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'log_expense', 'create_and_send_survey', 'get_survey_results', 'record_cash_payment', 'add_units', 'update_unit', 'charge_a_fee', 'void_expense', 'categorize_bank_transaction', 'ignore_bank_transaction', 'cancel_entry_request', 'offer_renewal', 'serve_non_renewal_notice', 'hibernate_lease', 'resume_lease', 'set_unit_status', 'retire_unit', 'send_document_for_signature', 'void_document', 'record_meter_reading', 'start_meter_reading_run', 'create_work_trade_agreement',
+    // S628: the landlord's own business, and handing a property to a manager.
+    'update_business_settings', 'create_entity', 'set_deposit_interest_rate', 'remove_deposit_interest_rate',
+    'invite_property_manager', 'accept_pm_invitation', 'reject_pm_invitation', 'revoke_pm_invitation', 'set_default_pm_company',
+    // S628: properties — adding one, its fee schedule, its late-fee policy,
+    // its unit classes, its listings, and who runs it.
+    'add_property', 'update_property', 'set_property_fee', 'remove_property_fee',
+    'set_late_fee_policy', 'remove_late_fee_policy', 'add_unit_subtype', 'assign_units_to_subtype',
+    'remove_unit_subtype', 'update_unit_listing', 'set_fee_payers', 'assign_property_manager',
+    'close_property_onboarding',
+    // S628: the books — vendors, bills, the ledger, payroll records.
+    'add_vendor', 'update_vendor', 'record_bill', 'pay_bill', 'record_book_transaction',
+    'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
+    'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
+    'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
+    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    // S628: charging and forgiving, and the maintenance side of the business.
+    'add_one_off_charge', 'cancel_one_off_charge', 'issue_tenant_credit', 'void_tenant_credit',
+    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    'update_inventory_item', 'remove_inventory_item', 'request_purchase',
+    'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
+    'complete_scheduled_maintenance',
+    // S628: the smaller surfaces that had no action at all, and the request
+    // that goes to the GAM team when the software cannot do the thing.
+    'submit_feature_request', 'resolve_booking_change_request', 'set_home_owner',
+    'cancel_home_sale_contract', 'record_bank_reconciliation', 'rename_bank_account',
+    'archive_bank_account', 'create_utility_service_agreement', 'update_utility_service_agreement',
+    // S628: getting a tenant onto the platform — the highest-traffic thing a
+    // landlord does, and the last big action with no tool behind it.
+    'invite_tenant', 'waive_screening',
+    // S628: what a unit actually is — its number, type and rates, how it is
+    // occupied, which utilities the tenant carries, and its lifecycle.
+    'renumber_unit', 'set_unit_type_and_rates', 'set_unit_occupancy_mode', 'set_unit_subtype',
+    'set_utility_responsibility', 'mark_unit_available', 'mark_unit_vacant', 'activate_unit',
+    'cancel_scheduled_activation', 'set_eviction_mode',
+    // S628: the lease — its money and term, the deposit return, and letting
+    // somebody out early.
+    'update_lease', 'set_rent_components', 'explain_fee_override', 'bill_one_off_charge_to_lease',
+    'add_carried_balance', 'set_seasonal_tenancy', 'clear_seasonal_tenancy',
+    'start_deposit_return', 'add_deposit_deductions', 'finalize_deposit_return',
+    'waive_early_termination_fee', 'request_background_check_for_lease',
+    'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Sonny',

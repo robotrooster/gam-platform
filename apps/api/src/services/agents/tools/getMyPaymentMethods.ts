@@ -25,7 +25,8 @@ export const getMyPaymentMethods: AgentTool = {
     'and each one’s status. Use for “is my bank set up?”, “is my bank verified yet?”, “which card do I have ' +
     'on file?”, or “why can’t I pay?”. A bank pending micro-deposit verification is connected but not yet ' +
     'chargeable (pay by card meanwhile). Returns only the last 4 digits / card brand, never full account ' +
-    'numbers. Read-only.',
+    'numbers. Read-only.\n' +
+    'Each method comes back with an id — that is what pay_my_balance charges. Use it; never say it out loud.',
   parameters: { type: 'object', properties: {} },
   audiences: ['tenant'],
 
@@ -53,6 +54,12 @@ export const getMyPaymentMethods: AgentTool = {
       ])
       const methods = [
         ...achList.data.map((pm) => ({
+          // S628: the id is what pay_my_balance charges. It is a
+          // customer-scoped Stripe token — Stripe refuses a PaymentIntent whose
+          // payment_method belongs to a different customer, and the charge path
+          // always supplies THIS tenant's customer id — so it cannot be used
+          // against anyone else's account. Never read it out to the tenant.
+          id:                  pm.id,
           type:                'ach' as const,
           bankName:            pm.us_bank_account?.bank_name ?? null,
           last4:               pm.us_bank_account?.last4 ?? null,
@@ -60,6 +67,7 @@ export const getMyPaymentMethods: AgentTool = {
           verificationPending: !tenant.ach_verified,
         })),
         ...cardList.data.map((pm) => ({
+          id:                  pm.id,
           type:                'card' as const,
           brand:               pm.card?.brand ?? null,
           last4:               pm.card?.last4 ?? null,
