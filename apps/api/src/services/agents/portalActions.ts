@@ -3134,6 +3134,779 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: ['entryRequestId', 'enteredAt'],
     confirmFirst: true,
   },
+  // ── LANDLORD · the reading round (S628) ──────────────────────────────
+  //
+  // BLIND ENTRY IS THE POINT. Nic's directive: staff field-entry shows no prior
+  // values and no error giveaways, and a bad entry goes to a double-check queue
+  // instead of being bounced back with a hint. So none of these descriptions
+  // let the agent read the previous number out — that would defeat the control
+  // by conversation rather than by code.
+  {
+    id: 'record_reading_in_run',
+    audience: 'landlord', method: 'POST',
+    path: '/api/utility/reading-runs/:runId/meters/:meterId/reading',
+    pathParams: ['runId', 'meterId'],
+    description:
+      'Record a meter reading inside an open reading run — the monthly round, meter by meter. Use for ' +
+      '"lot 14 water reads 89,120".\n' +
+      'readingValue is the number ON THE DIAL, not the usage since last time. GAM works usage out ' +
+      'from the previous reading.\n' +
+      'DO NOT TELL THEM WHAT THE LAST READING WAS, and do not tell them whether the number they gave ' +
+      'looks high or low. Readings are entered blind on purpose: somebody who knows the expected ' +
+      'figure produces it. If the number is out of line the system routes it to a double-check ' +
+      'quietly, and that is the whole control.\n' +
+      'billAmount only matters on a RUBS master priced from the provider\u2019s actual dollar bill; it is ' +
+      'ignored everywhere else. Reading the last meter closes the run and bills the cycle, so say ' +
+      'that when it happens.',
+    params: {
+      runId: { type: 'string', description: 'The open reading run, from a lookup.' },
+      meterId: { type: 'string', description: 'The meter being read, from a lookup.' },
+      readingValue: { type: 'integer', description: 'The number showing on the dial. Not the usage.' },
+      billAmount: { type: 'number', description: 'The provider\u2019s dollar charge for the cycle. Only for a RUBS master priced from the actual bill.' },
+    },
+    required: ['runId', 'meterId', 'readingValue'],
+    confirmFirst: true,
+  },
+  {
+    id: 'submit_meter_double_check',
+    audience: 'landlord', method: 'POST',
+    path: '/api/utility/reading-runs/:runId/double-checks/:meterId',
+    pathParams: ['runId', 'meterId'],
+    description:
+      'Submit a second, independent reading for a meter the system asked to have checked. Use when ' +
+      'somebody has gone back out and read it again.\n' +
+      'Take the number they give you and send it. Do NOT tell them the first reading, do not tell ' +
+      'them what would resolve the flag, and do not suggest a value — a second read that was told ' +
+      'what to say is not a second read. If they ask what the first one was, say you cannot give ' +
+      'them that and explain why in one line: the point is two independent looks.',
+    params: {
+      runId: { type: 'string', description: 'The reading run, from a lookup.' },
+      meterId: { type: 'string', description: 'The meter being re-read, from a lookup.' },
+      readingValue: { type: 'integer', description: 'The number on the dial, read again.' },
+      billAmount: { type: 'number', description: 'The provider\u2019s dollar charge, for a RUBS master priced from the actual bill.' },
+    },
+    required: ['runId', 'meterId', 'readingValue'],
+    confirmFirst: true,
+  },
+  {
+    id: 'record_special_meter_read',
+    audience: 'landlord', method: 'POST', path: '/api/utility/meters/:meterId/reads',
+    pathParams: ['meterId'],
+    description:
+      'Record a read taken OUTSIDE the monthly round — a move-in or move-out baseline, a check after ' +
+      'a repair, a reading taken because somebody disputes a bill. Use for "read the meter when the ' +
+      'Alvarez family pulled out".\n' +
+      'A move-out baseline is what keeps a departed guest\u2019s usage off the next arrival\u2019s bill, so ' +
+      'it is worth offering when somebody leaves. The monthly cycle read is NOT one of these — that ' +
+      'one only comes from the reading run, and the system refuses it here.\n' +
+      'Same rule as the round: the value is the dial, and you do not tell them what it was last time.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      readingValue: { type: 'integer', description: 'The number on the dial.' },
+      reason: { type: 'string', description: 'Why it was read now — move-in, move-out, a repair, a dispute. Not monthly_cycle.' },
+      reasonNote: { type: 'string', description: 'Any detail about it, in their words.' },
+    },
+    required: ['meterId', 'readingValue', 'reason'],
+    confirmFirst: true,
+  },
+  {
+    id: 'correct_meter_reading',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/utility/meters/:meterId/readings/:readingId',
+    pathParams: ['meterId', 'readingId'],
+    description:
+      'Correct a reading that was written down wrong — a transposed digit, the wrong date. Use for ' +
+      '"that was 89,120, not 89,210".\n' +
+      'Changing a reading changes what somebody was billed for that cycle, so read the old number and ' +
+      'the new one back together and get a yes. If a bill has already gone out on it, say that — the ' +
+      'tenant has seen a figure that is about to change.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      readingId: { type: 'string', description: 'The reading id, from a lookup.' },
+      readingValue: { type: 'number', description: 'The corrected number on the dial.' },
+      readingDate: { type: 'string', description: 'The corrected date, YYYY-MM-DD.' },
+      note: { type: 'string', description: 'Why it was corrected.' },
+    },
+    required: ['meterId', 'readingId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'resolve_reading_review',
+    audience: 'landlord', method: 'POST', path: '/api/utility/readings/:readingId/resolve-review',
+    pathParams: ['readingId'],
+    description:
+      'Settle a reading the system flagged for review, when the number went BACKWARDS. There are ' +
+      'exactly two explanations and they bill differently, so this is a question for the landlord, ' +
+      'not a guess:\n' +
+      '  rollover true — the odometer wrapped past its last digit. Real usage happened and it bills ' +
+      'the wrap-around: the rest of the dial plus the new number.\n' +
+      '  rollover false — the meter was swapped or reset. NOTHING bills that cycle, because nobody ' +
+      'knows what was used.\n' +
+      'Ask which it was in those terms — "did the dial roll over, or was the meter replaced?" — and ' +
+      'never pick for them. correctedValue is for when the reading itself was also written down ' +
+      'wrong. If the run already completed, billing re-runs for that meter on its own.',
+    params: {
+      readingId: { type: 'string', description: 'The flagged reading, from a lookup.' },
+      rollover: { type: 'boolean', description: 'true if the dial wrapped round, false if the meter was swapped or reset.' },
+      correctedValue: { type: 'integer', description: 'The right number, if the reading was also written down wrong.' },
+    },
+    required: ['readingId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'unassign_unit_from_meter',
+    audience: 'landlord', method: 'DELETE',
+    path: '/api/utility/meters/:meterId/units/:unitId',
+    pathParams: ['meterId', 'unitId'],
+    description:
+      'Stop a meter serving a unit. Use for "spot 12 is off the north master, it has its own now".\n' +
+      'From the next cycle that unit is not billed off this meter. Bills already issued stand. If ' +
+      'nothing else serves that unit, it stops being billed for that utility at all — say so, ' +
+      'because a unit quietly getting free water is exactly the kind of thing nobody notices.',
+    params: {
+      meterId: { type: 'string', description: 'The meter id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+    },
+    required: ['meterId', 'unitId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'remove_utility_meter',
+    audience: 'landlord', method: 'DELETE', path: '/api/utility/meters/:meterId',
+    pathParams: ['meterId'],
+    description:
+      'Remove a meter entirely. Use for "that meter was set up by mistake".\n' +
+      'If it has readings or bills behind it the system refuses, and that refusal is correct — a ' +
+      'meter with history is what the bills were calculated from. For one that is simply out of use, ' +
+      'the answer is to stop it serving units rather than to delete it. Say which of the two they ' +
+      'actually mean before you send this.',
+    params: { meterId: { type: 'string', description: 'The meter id, from a lookup.' } },
+    required: ['meterId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · addenda and the rest of e-sign (S628) ─────────────────
+  {
+    id: 'draft_add_tenant_addendum',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/addendum-add',
+    description:
+      'Draw up an addendum ADDING somebody to a live lease — a partner moving in, an adult child ' +
+      'coming onto it. Use for "put Maria on the lease at 204".\n' +
+      'Who is on a lease cannot be changed by editing the lease; it has to be signed by everybody, ' +
+      'and that is what this is for. The person being added needs a GAM account first — invite them ' +
+      'if they have none.\n' +
+      'This DRAFTS. Nothing goes to anybody until it is sent.',
+    params: {
+      leaseId: { type: 'string', description: 'The lease, from a lookup.' },
+      title: { type: 'string', description: 'What the addendum is called. Everybody signing reads this.' },
+      signers: { type: 'array', description: 'Everybody who signs: the landlord, the existing tenants and the person being added. Each needs their userId, role and name, from a lookup.' },
+      templateId: { type: 'string', description: 'The template to draft from, from a lookup.' },
+    },
+    required: ['leaseId', 'title', 'signers'],
+    confirmFirst: true,
+  },
+  {
+    id: 'draft_remove_tenant_addendum',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/addendum-remove',
+    description:
+      'Draw up an addendum REMOVING somebody from a live lease — a roommate moving out while the ' +
+      'others stay. Use for "take Chris off 204, the other two are staying".\n' +
+      'This is a serious document: the person coming off stops being liable for the rent, and if they ' +
+      'were the primary, somebody else has to take that on — that is promoteLeaseTenantId, and ' +
+      'leaving it out on a primary is the mistake to avoid. Name who is coming off and who is ' +
+      'becoming primary, out loud, before you draft it.\n' +
+      'It does not settle any deposit and it does not clear what they already owe.',
+    params: {
+      leaseId: { type: 'string', description: 'The lease, from a lookup.' },
+      targetLeaseTenantId: { type: 'string', description: 'The lease-tenant record of the person coming off, from a lookup.' },
+      promoteLeaseTenantId: { type: 'string', description: 'Who becomes primary, when the person leaving was the primary.' },
+      title: { type: 'string', description: 'What the addendum is called.' },
+      signers: { type: 'array', description: 'Everybody who signs. Each needs their userId, role and name, from a lookup.' },
+      templateId: { type: 'string', description: 'The template to draft from, from a lookup.' },
+    },
+    required: ['leaseId', 'targetLeaseTenantId', 'title', 'signers'],
+    confirmFirst: true,
+  },
+  {
+    id: 'draft_work_trade_addendum',
+    audience: 'landlord', method: 'POST', path: '/api/esign/documents/work-trade-addendum',
+    description:
+      'Draw up the addendum that puts a work-trade agreement in writing on the lease. Use after ' +
+      'setting one up: "get Danny\u2019s trade on paper".\n' +
+      'Work trade offsets rent, so having it signed is what makes it an agreement rather than an ' +
+      'understanding. Offer this whenever a work-trade agreement is created without one.',
+    params: {
+      workTradeAgreementId: { type: 'string', description: 'The work-trade agreement, from get_work_trade_status.' },
+      templateId: { type: 'string', description: 'The landlord\u2019s work-trade addendum template, from a lookup.' },
+    },
+    required: ['workTradeAgreementId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'auto_place_template_fields',
+    audience: 'landlord', method: 'POST', path: '/api/esign/templates/:templateId/auto-fields',
+    pathParams: ['templateId'],
+    description:
+      'Have the system work out where the signature and date fields go on a template\u2019s PDF, instead ' +
+      'of the landlord placing every one by hand. Use for "can you figure out where the fields go on ' +
+      'this one?".\n' +
+      'It runs in the background and takes a moment. Tell them it is running and that they should ' +
+      'check the placements before using the template — a field in the wrong place puts somebody\u2019s ' +
+      'signature in the wrong box on a lease.',
+    params: { templateId: { type: 'string', description: 'The template id, from a lookup.' } },
+    required: ['templateId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'add_witness',
+    audience: 'landlord', method: 'POST', path: '/api/esign/witnesses/provision',
+    description:
+      'Set up a witness so they can be added as a signer on a document. Use where the landlord says ' +
+      'a lease needs witnessing — some states and some document types require it.\n' +
+      'Whether a witness is REQUIRED is a legal question and not yours to answer. Set one up when ' +
+      'they ask for one; if they are asking whether they need one, that escalates.',
+    params: {
+      email: { type: 'string', description: 'The witness\u2019s email.' },
+      firstName: { type: 'string', description: 'Their first name.' },
+      lastName: { type: 'string', description: 'Their last name.' },
+    },
+    required: ['email', 'firstName'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · handing a property over (S628) ────────────────────────
+  {
+    id: 'set_property_pm_assignment',
+    audience: 'landlord', method: 'PATCH', path: '/api/properties/:propertyId/pm-assignment',
+    pathParams: ['propertyId'],
+    description:
+      'Put a property under a management company directly, or take it back with pmCompanyId null. ' +
+      'Use for "Desert Ridge runs Sunset Palms now, on the standard plan".\n' +
+      'This is a FINANCIAL decision — a fee plan attaches to it and the company gets paid out of the ' +
+      'property. A fee plan without a company makes no sense and is refused; so is a company with no ' +
+      'bank account set up, or one that is not active. Read those refusals back rather than retrying.\n' +
+      'Where the company has to AGREE first, invite_property_manager is the flow. This one assigns.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      pmCompanyId: { type: 'string', description: 'The management company, from a lookup. null takes the property back.' },
+      pmFeePlanId: { type: 'string', description: 'Their fee plan, from a lookup. Must belong to that company.' },
+    },
+    required: ['propertyId', 'pmCompanyId', 'pmFeePlanId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_lease_signer',
+    audience: 'landlord', method: 'PUT', path: '/api/properties/:propertyId/lease-signer',
+    pathParams: ['propertyId'],
+    description:
+      'Say who signs leases on the landlord\u2019s behalf at a property — a manager with authority to ' +
+      'sign, or the owner themselves with userId null. Use for "Maria signs the leases at Sunset ' +
+      'Palms".\n' +
+      'This puts somebody\u2019s name on binding agreements, so read back who it is and which property.',
+    params: {
+      propertyId: { type: 'string', description: 'The property, from a lookup.' },
+      userId: { type: 'string', description: 'The signer\u2019s user id, from a lookup, or null for the owner.' },
+    },
+    required: ['propertyId', 'userId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'onboard_applicant_to_unit',
+    audience: 'landlord', method: 'POST', path: '/api/properties/applications/:applicationId/onboard',
+    pathParams: ['applicationId'],
+    description:
+      'Turn an approved application into a tenant on the unit they applied for — this drafts their ' +
+      'lease. Use for "let us get the Reyes application moving".\n' +
+      'The application has to be tied to a specific unit; if it is not, a unit gets assigned first ' +
+      'and the system says so. Nothing here decides the application — approving or declining an ' +
+      'applicant is the landlord\u2019s to record, never yours.',
+    params: { applicationId: { type: 'string', description: 'The application id, from get_pending_applications.' } },
+    required: ['applicationId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'approve_property_transfer',
+    audience: 'landlord', method: 'POST',
+    path: '/api/properties/transfer-request/:requestId/approve',
+    pathParams: ['requestId'],
+    description:
+      'Accept a property somebody is transferring to this account. Use for "yes, take on the ' +
+      'duplex".\n' +
+      'This moves OWNERSHIP of a property, with its units, leases and tenants. Read back which ' +
+      'property and who it is coming from, and get an unambiguous yes — this is not something to do ' +
+      'off a "sure".',
+    params: { requestId: { type: 'string', description: 'The transfer request id, from a lookup.' } },
+    required: ['requestId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'decline_property_transfer',
+    audience: 'landlord', method: 'POST',
+    path: '/api/properties/transfer-request/:requestId/decline',
+    pathParams: ['requestId'],
+    description:
+      'Turn down a property somebody is trying to transfer to this account. The property stays with ' +
+      'whoever holds it now. Offer to say why on their behalf if they want that.',
+    params: { requestId: { type: 'string', description: 'The transfer request id, from a lookup.' } },
+    required: ['requestId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · the onboarding transition (S628) ──────────────────────
+  {
+    id: 'record_prior_arrangement',
+    audience: 'landlord', method: 'POST', path: '/api/payments/:paymentId/record-prior-arrangement',
+    pathParams: ['paymentId'],
+    description:
+      'Mark the FIRST rent charge on an IMPORTED lease as already settled off-platform, from before ' +
+      'the landlord came onto GAM. Use for "they paid me for June in cash before we moved over".\n' +
+      'It comes off the books, no money moves, and NO manual-payment fee is charged — unlike ' +
+      'record_cash_payment, which is money received NOW and does carry that fee where one applies. ' +
+      'Getting the two the wrong way round bills a tenant for something they should not pay, so ask ' +
+      'WHEN they paid rather than inferring it. Do not quote the fee amount; it is not the same for ' +
+      'every tenant and you have not been given it.\n' +
+      'It only works on an imported lease, only on the first rent charge, and only during the ' +
+      'onboarding window. If the system refuses on any of those, record_cash_payment is almost ' +
+      'certainly what they actually meant.',
+    params: { paymentId: { type: 'string', description: 'The rent charge, from a lookup.' } },
+    required: ['paymentId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'edit_survey',
+    audience: 'landlord', method: 'PATCH', path: '/api/surveys/:surveyId',
+    pathParams: ['surveyId'],
+    description:
+      'Change a survey while it is still a draft — its title, its questions. Use for "add a question ' +
+      'about the pool hours".\n' +
+      'Only a DRAFT can be edited. Once it has gone out the questions are fixed, because people have ' +
+      'already answered the ones that were asked — if they want different questions on a sent survey, ' +
+      'copying it to a new draft is the honest way.',
+    params: {
+      surveyId: { type: 'string', description: 'The survey id, from a lookup.' },
+      title: { type: 'string', description: 'The survey title.' },
+      description: { type: 'string', description: 'What it is about.' },
+      anonymous: { type: 'boolean', description: 'Whether answers are anonymous.' },
+      questions: { type: 'array', description: 'The questions. Each has a prompt, a question_type, options where it needs them, and whether it is required.' },
+    },
+    required: ['surveyId'],
+    confirmFirst: true,
+  },
+  // ── LANDLORD · getting sitting tenants onto the platform (S628) ──────
+  //
+  // Three routes, three different situations, and picking the wrong one is the
+  // mistake that matters — one MIGRATES a paper lease that already exists, one
+  // invites somebody to sign a NEW lease, and one parks a person with no lease
+  // information at all. The descriptions exist to make the agent ask which.
+  {
+    id: 'migrate_existing_tenant',
+    audience: 'landlord', method: 'POST', path: '/api/landlords/me/onboard-tenant',
+    description:
+      'Bring a tenant who is ALREADY LIVING THERE onto the platform, with the lease they already ' +
+      'signed on paper. Use for "the Alvarez family are in 12, their lease runs to next March, rent ' +
+      'is $650".\n' +
+      'This creates the tenant AND an imported lease from the terms they give you, and emails the ' +
+      'person an activation link. No background check and no application — they already live there.\n' +
+      'THE TERMS COME FROM THE PAPER LEASE, not from you. Rent, dates, deposit, late-fee terms: read ' +
+      'each one back as they give it, and if they do not know a figure, ask rather than filling in ' +
+      'something reasonable. This lease becomes what the tenant is billed on.\n' +
+      'If they are signing a NEW lease rather than moving one over, that is ' +
+      'invite_tenant_to_sign_lease. If the landlord does not have the lease terms to hand, ' +
+      'park_pending_tenant holds the person until they do.',
+    params: {
+      firstName: { type: 'string', description: 'Their first name.' },
+      lastName: { type: 'string', description: 'Their last name.' },
+      email: { type: 'string', description: 'Their email. Read it back — a typo goes to a stranger.' },
+      phone: { type: 'string', description: 'Their phone number.' },
+      unitId: { type: 'string', description: 'The unit they live in, from a lookup.' },
+      leaseStart: { type: 'string', description: 'When the existing lease started, YYYY-MM-DD.' },
+      leaseEnd: { type: 'string', description: 'When it ends, YYYY-MM-DD. Leave out for month-to-month.' },
+      monthlyRent: { type: 'number', description: 'The rent on the signed lease.' },
+      securityDeposit: { type: 'number', description: 'The deposit already held.' },
+      lateFeeAmount: { type: 'number', description: 'The late fee the signed lease states.' },
+      lateFeeGraceDays: { type: 'integer', description: 'The grace period the signed lease states. Ask — live leases run 0, 3 and 5 days, so there is no default worth guessing.' },
+      noticeDaysRequired: { type: 'integer', description: 'Notice either side must give, per the lease.' },
+      autoRenew: { type: 'boolean', description: 'Whether the paper lease renews on its own.' },
+    },
+    required: ['firstName', 'lastName', 'email', 'phone', 'unitId', 'leaseStart', 'monthlyRent'],
+    confirmFirst: true,
+  },
+  {
+    id: 'invite_tenant_to_sign_lease',
+    audience: 'landlord', method: 'POST', path: '/api/landlords/me/onboard-new-lease-tenant',
+    description:
+      'Invite somebody to a unit for a lease they are going to SIGN. Use for "the Reyes family are ' +
+      'taking 204, send them the paperwork".\n' +
+      'NO lease is created here — the signed document becomes the lease, which is the GAM standard. ' +
+      'The draft fills itself in from the unit and its default template when they accept, so the ' +
+      'unit needs a rent amount set first; the system refuses without one and that is the thing to ' +
+      'fix.\n' +
+      'For a household, call this again for the same unit before anybody signs. Adding somebody voids ' +
+      'the unsigned draft so the whole roster re-drafts together — that is correct, not a fault, and ' +
+      'worth saying if they see it happen.\n' +
+      'If the tenant is already living there on a paper lease, migrate_existing_tenant is the one.',
+    params: {
+      firstName: { type: 'string', description: 'Their first name.' },
+      lastName: { type: 'string', description: 'Their last name.' },
+      email: { type: 'string', description: 'Their email.' },
+      phone: { type: 'string', description: 'Their phone number.' },
+      unitId: { type: 'string', description: 'The unit they are moving into, from a lookup.' },
+    },
+    required: ['firstName', 'lastName', 'email', 'phone', 'unitId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'park_pending_tenant',
+    audience: 'landlord', method: 'POST', path: '/api/landlords/me/onboard-tenant-pending',
+    description:
+      'Put a tenant on the books with just their name, email and phone, when the landlord does not ' +
+      'have the lease to hand yet. Use for "I know they are in 14, I will have to dig the lease out".\n' +
+      'NOTHING is sent to the tenant. No account activation, no email — they sit in the pending pool ' +
+      'until the landlord uploads the lease and it becomes real, and only then does the tenant hear ' +
+      'anything. Say that, because "I added them" sounds like they were contacted.\n' +
+      'Naming the unit reserves it: that spot stops being offered for guest bookings while the ' +
+      'person is pending, which is what protects a permanent RV tenant mid-migration.',
+    params: {
+      firstName: { type: 'string', description: 'Their first name.' },
+      lastName: { type: 'string', description: 'Their last name.' },
+      email: { type: 'string', description: 'Their email.' },
+      phone: { type: 'string', description: 'Their phone number.' },
+      unitId: { type: 'string', description: 'The unit they already occupy, from a lookup.' },
+    },
+    required: ['firstName', 'lastName', 'email', 'phone'],
+    confirmFirst: true,
+  },
+  {
+    id: 'cancel_pending_tenant',
+    audience: 'landlord', method: 'DELETE', path: '/api/landlords/me/pending-tenants/:intentId',
+    pathParams: ['intentId'],
+    description:
+      'Take somebody out of the pending pool — entered twice, or they never moved in after all. Use ' +
+      'for "drop the pending one on 14, that never happened".\n' +
+      'If they named a unit, this releases it back to guest bookings. The person heard nothing when ' +
+      'they were added, so they hear nothing now either.',
+    params: { intentId: { type: 'string', description: 'The pending-tenant id, from a lookup.' } },
+    required: ['intentId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · odds and ends (S628) ──────────────────────────────────
+  {
+    id: 'respond_to_dispute',
+    audience: 'landlord', method: 'POST', path: '/api/landlords/me/disputes/:disputeId/respond',
+    pathParams: ['disputeId'],
+    description:
+      'Submit the landlord\u2019s evidence and response on a payment dispute. Use for "here is the signed ' +
+      'lease and the receipt for that chargeback".\n' +
+      'This is a formal response somebody adjudicates, and there is usually one shot at it. Write ' +
+      'response_notes in the landlord\u2019s own words and read it back before sending — do not tidy it ' +
+      'into something they did not say. Evidence has to be uploaded by them first; you have no file ' +
+      'to attach.\n' +
+      'You do not advise them on whether they will win. If they ask, that escalates.',
+    params: {
+      disputeId: { type: 'string', description: 'The dispute id, from a lookup.' },
+      evidence: { type: 'object', description: 'The evidence, as named fields pointing at what they uploaded.' },
+      response_notes: { type: 'string', description: 'Their account of it, in their own words.' },
+    },
+    required: ['disputeId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_portal_theme',
+    audience: 'landlord', method: 'PATCH', path: '/api/landlords/theme',
+    description:
+      'Change the accent colour and font their portal uses. Use for "make it green" — cosmetic, ' +
+      'nothing about the business changes.',
+    params: {
+      themeAccent: { type: 'string', description: 'The accent colour they want.' },
+      fontStyle: { type: 'string', description: 'The font style they want.' },
+    },
+    required: [],
+  },
+  {
+    id: 'set_unit_inspection_attributes',
+    audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId/inspection-attributes',
+    pathParams: ['unitId'],
+    description:
+      'Record the facts about a unit that change what an inspection checklist asks — whether it has ' +
+      'more than one level, whether it is ADA accessible. Use for "204 is a two-storey".\n' +
+      'These drive the checklist somebody works through on site, so a wrong one means a missing ' +
+      'question rather than a wrong label.',
+    params: {
+      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      isMultiLevel: { type: 'boolean', description: 'Whether it has more than one level.' },
+      isAdaAccessible: { type: 'boolean', description: 'Whether it is ADA accessible.' },
+    },
+    required: ['unitId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'cancel_service_interruption',
+    audience: 'landlord', method: 'POST', path: '/api/service-interruptions/:noticeId/cancel',
+    pathParams: ['noticeId'],
+    description:
+      'Call off an outage notice that went out and turned out not to be needed — the shut-off was ' +
+      'cancelled, the contractor rescheduled. Use for "water is not going off after all".\n' +
+      'Do it quickly. Residents have made arrangements around it, and this is different from ' +
+      'resolving one: resolved means it happened and is over, cancelled means it never happened.',
+    params: { noticeId: { type: 'string', description: 'The notice id, from get_service_interruptions.' } },
+    required: ['noticeId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'start_payroll_run',
+    audience: 'landlord', method: 'POST', path: '/api/books/payroll/runs',
+    description:
+      'Calculate a DRAFT payroll run for a pay period. Use for "work up payroll for the first half of ' +
+      'March".\n' +
+      'Nothing is posted and nobody is paid — this produces figures the landlord reads and then ' +
+      'approves, or does not. Hours and withholding are THEIR numbers: hoursMap is hours per ' +
+      'employee, taxMap is federal and state withholding per employee, and an employee left out of ' +
+      'taxMap withholds nothing beyond Social Security and Medicare. Never estimate either. If they ' +
+      'do not have the hours to hand, that is what is needed first.',
+    params: {
+      periodStart: { type: 'string', description: 'First day of the pay period, YYYY-MM-DD.' },
+      periodEnd: { type: 'string', description: 'Last day of the pay period, YYYY-MM-DD.' },
+      payDate: { type: 'string', description: 'The day people are paid, YYYY-MM-DD.' },
+      payFrequency: { type: 'string', description: 'weekly, biweekly, semimonthly or monthly.' },
+      employeeIds: { type: 'array', description: 'Which employees are on this run, from a lookup.' },
+      hoursMap: { type: 'object', description: 'Hours worked, keyed by employee id. Their figures, never estimated.' },
+      taxMap: { type: 'object', description: 'Federal and state withholding per employee, keyed by employee id. Their figures.' },
+    },
+    required: ['periodStart', 'periodEnd', 'payDate', 'payFrequency', 'employeeIds'],
+    confirmFirst: true,
+  },
+
+  // ── TENANT · taking something back (S628) ────────────────────────────
+  {
+    id: 'withdraw_deposit_report',
+    audience: 'tenant', method: 'DELETE', path: '/api/declared-deposits/:reportId',
+    pathParams: ['reportId'],
+    description:
+      'Withdraw a cash-or-cheque payment the tenant reported, when they got it wrong — the wrong ' +
+      'amount, the wrong date, or it turned out they had not paid yet. Use for "ignore that, I made ' +
+      'a mistake".\n' +
+      'Once the landlord has acted on the report it can no longer be withdrawn, and the system says ' +
+      'so. That is not a fault: tell them it has already been picked up and that the fix now goes ' +
+      'through their landlord.',
+    params: { reportId: { type: 'string', description: 'The report id, from their reported payments.' } },
+    required: ['reportId'],
+    confirmFirst: true,
+  },
+  // ── LANDLORD · guest bookings on a unit (S628) ───────────────────────
+  //
+  // An RV park's other half. These are STAYS rather than tenancies — a guest
+  // with no account, no lease and no portal, so nothing here notifies them and
+  // the host is the one who talks to them.
+  {
+    id: 'create_unit_booking',
+    audience: 'landlord', method: 'POST', path: '/api/units/:unitId/bookings',
+    pathParams: ['unitId'],
+    description:
+      'Book a unit for a guest — a nightly or weekly stay, or a hold on the spot. Use for "put the ' +
+      'Hendersons on spot 7, the 12th to the 19th".\n' +
+      'checkOut has to be after checkIn and the system says so. A stay that clashes with a lease or ' +
+      'another booking is refused; read that back rather than moving somebody.\n' +
+      'requiredSiteLayout and requiredAmpService are what the RIG needs — a 50-amp pull-through is ' +
+      'not a preference, it is whether they can plug in. Ask if they mentioned a rig at all.\n' +
+      'Nothing is emailed to the guest by this. Guest access is sent separately.',
+    params: {
+      unitId: { type: 'string', description: 'The unit or spot, from a lookup.' },
+      leaseType: { type: 'string', description: 'nightly, weekly, month_to_month, long_term, or lease_hold.' },
+      checkIn: { type: 'string', description: 'Arrival date, YYYY-MM-DD.' },
+      checkOut: { type: 'string', description: 'Departure date, YYYY-MM-DD. Must be after arrival.' },
+      guestName: { type: 'string', description: 'The guest\u2019s name.' },
+      guestEmail: { type: 'string', description: 'Their email, if the host has it.' },
+      guestPhone: { type: 'string', description: 'Their phone number.' },
+      nightlyRate: { type: 'number', description: 'The nightly rate for this stay.' },
+      weeklyRate: { type: 'number', description: 'The weekly rate for this stay.' },
+      totalAmount: { type: 'number', description: 'The total for the stay.' },
+      requiredSiteLayout: { type: 'string', description: 'none, back_in or pull_through — what the rig needs.' },
+      requiredAmpService: { type: 'string', description: 'none, 30, 50 or both — what the rig needs.' },
+      notes: { type: 'string', description: 'Anything about the stay.' },
+      source: { type: 'string', description: 'Where the booking came from — a phone call, a walk-up.' },
+      tenantId: { type: 'string', description: 'For a stay by somebody who already has an account.' },
+    },
+    required: ['unitId', 'leaseType', 'checkIn', 'checkOut'],
+    confirmFirst: true,
+  },
+  {
+    id: 'update_unit_booking',
+    audience: 'landlord', method: 'PATCH', path: '/api/units/:unitId/bookings/:bookingId',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Change a guest booking — its dates, its status, the guest\u2019s details, or move it to a ' +
+      'different spot. Use for "they are staying an extra two nights" or "move them to 9, the water ' +
+      'is off on 7".\n' +
+      'Moving the stay to a different unit is what unitId does here. Cancelling it is a status ' +
+      'change, and the guest is NOT told automatically — offer to draft the message, because a guest ' +
+      'arriving at a spot that is no longer theirs is the outcome to avoid.',
+    params: {
+      unitId: { type: 'string', description: 'The unit the booking is currently on, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+      status: { type: 'string', description: 'The booking status — confirmed, cancelled, and so on.' },
+      checkIn: { type: 'string', description: 'New arrival date, YYYY-MM-DD.' },
+      checkOut: { type: 'string', description: 'New departure date, YYYY-MM-DD.' },
+      guestName: { type: 'string', description: 'The guest\u2019s name.' },
+      guestEmail: { type: 'string', description: 'Their email.' },
+      guestPhone: { type: 'string', description: 'Their phone.' },
+      requiredSiteLayout: { type: 'string', description: 'What the rig needs.' },
+      requiredAmpService: { type: 'string', description: 'What the rig needs.' },
+      lockedToUnit: { type: 'boolean', description: 'true to stop the booking being moved to another spot automatically.' },
+      notes: { type: 'string', description: 'Notes on the stay.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'send_guest_access',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/bookings/:bookingId/guest-access',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Give a guest their access link for a booking — emailed to them, or as a QR code the host can ' +
+      'show or print. Use for "send the Hendersons their check-in details".\n' +
+      'A guest has no account, so this link IS their way in. Confirm the email address out loud ' +
+      'before sending: a typo means somebody who has paid for a stay arrives with nothing.',
+    params: {
+      unitId: { type: 'string', description: 'The unit, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+      delivery: { type: 'string', description: 'email or qr.' },
+      sendEmail: { type: 'boolean', description: 'Whether to email it to the guest.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'revoke_guest_access',
+    audience: 'landlord', method: 'DELETE',
+    path: '/api/units/:unitId/bookings/:bookingId/guest-access',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Revoke a guest\u2019s access link. Use for "kill the link for spot 7, that booking is off".\n' +
+      'The link stops working immediately, and the guest is not told — so if they are still expected, ' +
+      'this is not what the host meant. Ask which they want.',
+    params: {
+      unitId: { type: 'string', description: 'The unit, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'acknowledge_booking_rules',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/units/:unitId/bookings/:bookingId/acknowledge',
+    pathParams: ['unitId', 'bookingId'],
+    description:
+      'Record that the guest signed the property rules for their stay. Use for "the Hendersons signed ' +
+      'the park rules".\n' +
+      'This is the HOST confirming they saw it signed. Only mark it when the landlord says the guest ' +
+      'actually signed — it is a record of something that happened, not a box to tidy.',
+    params: {
+      unitId: { type: 'string', description: 'The unit, from a lookup.' },
+      bookingId: { type: 'string', description: 'The booking id, from a lookup.' },
+    },
+    required: ['unitId', 'bookingId'],
+    confirmFirst: true,
+  },
+
+  // ── LANDLORD · the last of onboarding, and the applicant pool ────────
+  {
+    id: 'resolve_pending_tenant',
+    audience: 'landlord', method: 'POST',
+    path: '/api/landlords/me/pending-tenants/:intentId/resolve',
+    pathParams: ['intentId'],
+    description:
+      'Turn a pending tenant into a real lease, once their lease document has been read. Use for "go ' +
+      'ahead and set up the Alvarez lease from that PDF".\n' +
+      'The terms come from the parsed document. landlordOverrides is for the fields the parser got ' +
+      'wrong or could not find — send only what the LANDLORD corrected, in their words, and read each ' +
+      'correction back. Do not override a figure because it looks odd to you.\n' +
+      'If the unit already has a sitting lease, resolving into it ENDS that lease, and the system ' +
+      'stops and asks. Never send confirmSupersede without saying whose tenancy ends and getting a ' +
+      'yes to that specific thing.',
+    params: {
+      intentId: { type: 'string', description: 'The pending-tenant id, from a lookup.' },
+      landlordOverrides: { type: 'object', description: 'Fields the landlord corrected on the parsed lease. Only what they actually corrected.' },
+      confirmSupersede: { type: 'boolean', description: 'Only after they have heard that the sitting lease on that unit will END, and said yes to it.' },
+    },
+    required: ['intentId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'reach_out_to_applicant',
+    audience: 'landlord', method: 'POST', path: '/api/background/pool/:poolId/reach-out',
+    pathParams: ['poolId'],
+    description:
+      'Contact somebody in the renter pool about a unit. Use for "get in touch with that applicant ' +
+      'about spot 9".\n' +
+      'This reaches a real person who is looking for somewhere to live, so the message is the ' +
+      'landlord\u2019s and it goes out in their words. Offer a unit only if they named one — the unit ' +
+      'has to be genuinely available, and the system refuses one with a lease or a booking on it.\n' +
+      'One approach per applicant: a second is refused, and that is correct rather than something to ' +
+      'retry. GAM is a conduit here and not a screening agency, so never characterise the person to ' +
+      'the landlord beyond what the pool entry says.',
+    params: {
+      poolId: { type: 'string', description: 'The pool entry id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit being offered, from a lookup. It must be available.' },
+      message: { type: 'string', description: 'What the landlord wants to say, in their words. The applicant reads this.' },
+    },
+    required: ['poolId'],
+    confirmFirst: true,
+  },
+
+  // ── TENANT · the pool, reapplying, and hardship ──────────────────────
+  {
+    id: 'respond_to_landlord_interest',
+    audience: 'tenant', method: 'PATCH', path: '/api/background/pool/match/:matchId/respond',
+    pathParams: ['matchId'],
+    description:
+      'Answer a landlord who reached out through the renter pool — interested, or not. Use for "yes, ' +
+      'tell them I want to see it" or "not that one".\n' +
+      'Saying no closes that one approach and nothing else; they stay in the pool for other ' +
+      'landlords. Saying yes passes their answer and their message on. Either way it can only be ' +
+      'answered once, so make sure it is what they meant.',
+    params: {
+      matchId: { type: 'string', description: 'The approach id, from their notifications.' },
+      interested: { type: 'boolean', description: 'true if they want to hear more, false if not.' },
+      message: { type: 'string', description: 'Anything they want to say back, in their words.' },
+    },
+    required: ['matchId', 'interested'],
+    confirmFirst: true,
+  },
+  {
+    id: 'reapply_after_denial',
+    audience: 'tenant', method: 'POST', path: '/api/background/reapply',
+    description:
+      'Start a fresh application after one was denied. Use for "can I try again?".\n' +
+      'There is a cooldown after a denial and it is not waivable. If they are still inside it the ' +
+      'system says how many days are left — give them that number plainly rather than a vague "not ' +
+      'yet", and do not speculate about whether a new application would go better.',
+    params: {},
+    required: [],
+    confirmFirst: true,
+  },
+  {
+    id: 'record_hardship_context',
+    audience: 'tenant', method: 'POST', path: '/api/credit/hardship-context',
+    description:
+      'Record a period of genuine hardship against the tenant\u2019s rent record — a job loss, a medical ' +
+      'event, a death in the family — so that a stretch of late payments has its reason attached ' +
+      'rather than standing bare. Use when they explain WHY they fell behind.\n' +
+      'Do not promise this changes an outcome, because you do not know that it will. What it does is ' +
+      'make sure the context travels with the record instead of being lost.\n' +
+      'Take the dates and the category from them. This is their account of their own life and it is ' +
+      'not yours to characterise or to tidy — if they say it started in March, it started in March.',
+    params: {
+      category: { type: 'string', description: 'What kind of hardship it was, as they describe it.' },
+      startDate: { type: 'string', description: 'When it began, YYYY-MM-DD.' },
+      endDate: { type: 'string', description: 'When it ended, YYYY-MM-DD. Leave out if it is ongoing.' },
+      note: { type: 'string', description: 'What happened, in their words.' },
+    },
+    required: ['category', 'startDate'],
+    confirmFirst: true,
+  },
 ]
 
 const BY_ID = new Map(PORTAL_ACTIONS.map((a) => [a.id, a]))

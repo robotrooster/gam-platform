@@ -215,7 +215,8 @@ const TENANT_ENTRY: AgentProfile = {
     'get_payment_quote', 'pay_my_balance',
     // S628: ending a lease early — a request, never a decision.
     'request_early_termination', 'cancel_early_termination',
-    'cancel_my_amenity_reservation',
+    'cancel_my_amenity_reservation', 'withdraw_deposit_report',
+    'respond_to_landlord_interest', 'reapply_after_denial', 'record_hardship_context',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
@@ -264,7 +265,8 @@ const TENANT_ESCALATION: AgentProfile = {
     'get_payment_quote', 'pay_my_balance',
     // S628: ending a lease early — a request, never a decision.
     'request_early_termination', 'cancel_early_termination',
-    'cancel_my_amenity_reservation',
+    'cancel_my_amenity_reservation', 'withdraw_deposit_report',
+    'respond_to_landlord_interest', 'reapply_after_denial', 'record_hardship_context',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
@@ -358,6 +360,24 @@ const LANDLORD_ENTRY: AgentProfile = {
     'flag_inspection_suspicious', 'close_survey', 'copy_survey', 'delete_survey',
     'decide_work_trade_hours', 'update_work_trade_agreement', 'set_work_trade_target',
     'give_entry_notice', 'record_entry',
+    // S628: the reading round, addenda, handing a property over, and the
+    // onboarding transition.
+    'record_reading_in_run', 'submit_meter_double_check', 'record_special_meter_read',
+    'correct_meter_reading', 'resolve_reading_review', 'unassign_unit_from_meter',
+    'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
+    'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
+    'set_property_pm_assignment', 'set_lease_signer', 'onboard_applicant_to_unit',
+    'approve_property_transfer', 'decline_property_transfer', 'record_prior_arrangement',
+    'edit_survey',
+    // S628: getting sitting tenants onto the platform — three routes, three
+    // different situations, and picking the wrong one is the mistake.
+    'migrate_existing_tenant', 'invite_tenant_to_sign_lease', 'park_pending_tenant',
+    'cancel_pending_tenant', 'respond_to_dispute', 'set_portal_theme',
+    'set_unit_inspection_attributes', 'cancel_service_interruption', 'start_payroll_run',
+    // S628: guest bookings — the RV park's other half — plus the last of
+    // onboarding and the applicant pool.
+    'create_unit_booking', 'update_unit_booking', 'send_guest_access', 'revoke_guest_access',
+    'acknowledge_booking_rules', 'resolve_pending_tenant', 'reach_out_to_applicant',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
@@ -448,6 +468,24 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'flag_inspection_suspicious', 'close_survey', 'copy_survey', 'delete_survey',
     'decide_work_trade_hours', 'update_work_trade_agreement', 'set_work_trade_target',
     'give_entry_notice', 'record_entry',
+    // S628: the reading round, addenda, handing a property over, and the
+    // onboarding transition.
+    'record_reading_in_run', 'submit_meter_double_check', 'record_special_meter_read',
+    'correct_meter_reading', 'resolve_reading_review', 'unassign_unit_from_meter',
+    'remove_utility_meter', 'draft_add_tenant_addendum', 'draft_remove_tenant_addendum',
+    'draft_work_trade_addendum', 'auto_place_template_fields', 'add_witness',
+    'set_property_pm_assignment', 'set_lease_signer', 'onboard_applicant_to_unit',
+    'approve_property_transfer', 'decline_property_transfer', 'record_prior_arrangement',
+    'edit_survey',
+    // S628: getting sitting tenants onto the platform — three routes, three
+    // different situations, and picking the wrong one is the mistake.
+    'migrate_existing_tenant', 'invite_tenant_to_sign_lease', 'park_pending_tenant',
+    'cancel_pending_tenant', 'respond_to_dispute', 'set_portal_theme',
+    'set_unit_inspection_attributes', 'cancel_service_interruption', 'start_payroll_run',
+    // S628: guest bookings — the RV park's other half — plus the last of
+    // onboarding and the applicant pool.
+    'create_unit_booking', 'update_unit_booking', 'send_guest_access', 'revoke_guest_access',
+    'acknowledge_booking_rules', 'resolve_pending_tenant', 'reach_out_to_applicant',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
