@@ -53,9 +53,17 @@ const takesNoArgs = (name: string): boolean => {
 
 /** S626 baseline. Only ever lower this. */
 // 29 when this audit was written, immediately after the eval caught three of
-// them. Four routed the same session (tenant contacts + notifications, landlord
-// payouts + applications) took it to 25.
-const BASELINE_GAPS = 25
+// them. Routing the backlog in the same session took it to 13: tenant contacts,
+// notifications, documents, inspections, entry requests, payment status and
+// termination quote; landlord payouts, applications, money-in-flight, team,
+// maintenance team, unreconciled cash, service interruptions, background checks
+// and work trade.
+//
+// What is LEFT is left on purpose. Each remaining one either needs an argument
+// the model must supply (the law lookups, property tax facts) or has vocabulary
+// too close to a route above it to separate safely without measuring — and
+// measuring needs the GPU, which is disabled.
+const BASELINE_GAPS = 13
 
 describe('phrase-table coverage', () => {
   const gaps: string[] = []

@@ -491,6 +491,63 @@ const TENANT_ROUTES: PhraseRoute[] = [
       /\bdo i have any (updates|alerts|notifications)\b/i,
     ],
   },
+  // ── S626: routing the backlog. See routeCoverage.test.ts — these lookups had
+  // no phrase route, so nothing forced them and nothing could force them. Each
+  // one worked only when the model happened to choose it. Placed at the END of
+  // the tenant routes so every lease, balance and complaint route above keeps
+  // first refusal on ambiguous wording.
+  {
+    tools: ['get_my_documents'],
+    audience: 'tenant',
+    means: 'the files on their tenancy — signed lease, notices, paperwork',
+    patterns: [
+      /\b(my )?(documents?|paperwork|files?)\b/i,
+      /\b(copy|download|see|get)\b[^?]{0,20}\b(of )?(my )?(signed )?(lease|agreement|notice)\b/i,
+      /\bwhat have i signed\b/i,
+    ],
+  },
+  {
+    tools: ['get_my_inspections'],
+    audience: 'tenant',
+    means: 'their move-in / move-out / routine inspections',
+    patterns: [
+      /\binspections?\b/i,
+      /\bwalk[- ]?through\b/i,
+    ],
+  },
+  {
+    tools: ['get_my_entry_requests'],
+    audience: 'tenant',
+    means: 'notices that someone wants to enter their unit',
+    patterns: [
+      /\bentry (requests?|notices?)\b/i,
+      /\b(coming|come|get) into my (unit|apartment|place|home|space)\b/i,
+      /\b(is|are) (anyone|somebody|someone|they)\b[^?]{0,25}\bcoming (in|by|over)\b/i,
+      /\bnotice to enter\b/i,
+    ],
+  },
+  {
+    tools: ['get_my_payment_status'],
+    audience: 'tenant',
+    means: 'whether a payment they made actually went through',
+    patterns: [
+      /\bdid my (payment|rent|ach|card)\b[^?]{0,20}\b(go through|clear|work|process|post)\b/i,
+      /\bhas my (payment|rent)\b[^?]{0,20}\b(posted|cleared|gone through|landed|processed)\b/i,
+      /\bpayment status\b/i,
+      /\bdid (it|that) (go through|clear)\b/i,
+    ],
+  },
+  {
+    tools: ['get_my_termination_quote'],
+    audience: 'tenant',
+    means: 'what it costs to end the lease early',
+    patterns: [
+      /\bearly termination\b/i,
+      /\b(break|breaking|end|ending|terminate|get out of)\b[^?]{0,15}\b(my |the )?lease\b/i,
+      /\bmove out early\b/i,
+      /\bleave before\b[^?]{0,20}\blease\b/i,
+    ],
+  },
 ]
 
 /**
@@ -794,6 +851,66 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
       /\bapplicants?\b/i,
       /\bwho('?s| has)\b[^?]{0,20}\bapplied\b/i,
       /\banyone (applied|applying)\b/i,
+    ],
+  },
+  // ── S626: the landlord half of the same backlog.
+  {
+    tools: ['get_team'],
+    audience: 'landlord',
+    means: 'the people with access to the landlord\'s account',
+    patterns: [
+      /\bmy (team|staff)\b/i,
+      /\bwho (has access|works for me|is on my team)\b/i,
+      /\b(team|staff) (members?|list)\b/i,
+    ],
+  },
+  {
+    tools: ['get_maintenance_team'],
+    audience: 'landlord',
+    means: 'who handles repairs',
+    patterns: [
+      /\bmaintenance (team|crew|staff|guys?|workers?|people)\b/i,
+      /\bwho (fixes|handles|does)\b[^?]{0,20}\b(repairs?|maintenance)\b/i,
+    ],
+  },
+  {
+    tools: ['get_unreconciled_cash'],
+    audience: 'landlord',
+    means: 'money in the bank feed that is not matched to a charge',
+    patterns: [
+      /\bunreconciled\b/i,
+      /\breconcil\w+\b/i,
+      /\bunmatched\b[^?]{0,20}\b(deposits?|cash|payments?)\b/i,
+      /\bdeposits?\b[^?]{0,20}\bnot matched\b/i,
+    ],
+  },
+  {
+    tools: ['get_service_interruptions'],
+    audience: 'landlord',
+    means: 'outages and shut-offs posted at the properties',
+    patterns: [
+      /\b(service )?interruptions?\b/i,
+      /\b(outages?|shut[- ]?offs?)\b/i,
+      /\b(water|power|gas|internet)\b[^?]{0,15}\b(off|down|out)\b/i,
+    ],
+  },
+  {
+    tools: ['get_background_check_status'],
+    audience: 'landlord',
+    means: 'where an applicant\'s screening has got to',
+    patterns: [
+      /\bbackground checks?\b/i,
+      /\bscreening\b[^?]{0,20}\b(status|back|done|result|complete)\b/i,
+      /\bhas\b[^?]{0,25}\bscreening\b/i,
+    ],
+  },
+  {
+    tools: ['get_work_trade_status'],
+    audience: 'landlord',
+    means: 'work-trade agreements and hours logged against them',
+    patterns: [
+      /\bwork[- ]trade\b/i,
+      /\bhours (logged|worked|submitted)\b/i,
     ],
   },
 ]

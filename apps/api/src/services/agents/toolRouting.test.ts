@@ -25,12 +25,15 @@ const TENANT_TOOLS = [
   // fixture had never listed it, so the first route to it failed the
   // audience-line check against a list that was simply out of date.
   'get_my_amenities', 'get_my_contacts', 'get_my_notifications',
+  'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
+  'get_my_payment_status', 'get_my_termination_quote',
 ]
 const LANDLORD_TOOLS = [
   'lookup_tenant_payment_status', 'get_delinquent_tenants', 'get_unit_lease',
   'get_late_payment_history', 'get_vacant_units', 'get_landlord_portfolio',
   'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_books_summary', 'get_my_payouts', 'get_pending_applications',
-  'get_money_in_flight',
+  'get_money_in_flight', 'get_team', 'get_maintenance_team', 'get_unreconciled_cash',
+  'get_service_interruptions', 'get_background_check_status', 'get_work_trade_status',
   'get_profit_and_loss',
   'get_lease_expirations', 'get_pending_maintenance', 'get_property_rent_roll',
 ]
