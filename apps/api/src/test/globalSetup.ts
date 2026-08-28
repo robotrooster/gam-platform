@@ -19,6 +19,7 @@
 import dotenv from 'dotenv'
 import fs from 'fs'
 import path from 'path'
+import os from 'os'
 import { Client } from 'pg'
 
 dotenv.config({ path: path.join(__dirname, '..', '..', '.env') })
@@ -40,7 +41,58 @@ const PG_CONFIG = {
 
 const SCHEMA_PATH = path.join(__dirname, '..', 'db', 'schema.sql')
 
+/**
+ * S628 — REFUSE TO START IF ANOTHER RUN IS ALREADY GOING.
+ *
+ * This setup DROPs and recreates the test database. A second vitest therefore
+ * pulls the database out from under the first, and what comes back is not an
+ * obvious error — it is a scatter of file-level load failures across unrelated
+ * suites that reads exactly like a real regression. It cost an hour in S626
+ * (224 phantom failures) and twice more on 2026-08-28: once diagnosing a
+ * foreign-key violation inside an agent tool that did not exist, and once
+ * reading 175 failures across six files as a regression in work that was fine.
+ *
+ * The handoff has said "never run two at once" since S626 and I did it anyway,
+ * twice in a day, because the fast agents-only loop (~4 s) does not feel like
+ * "a run" when a 30-minute suite is in the background. A note in a document
+ * cannot fix that. A lock can.
+ *
+ * The lock is a PID file, and it is checked for liveness rather than trusted —
+ * a killed run must not leave the suite unrunnable, which would be a worse
+ * failure than the one being prevented. Set VITEST_ALLOW_CONCURRENT=1 to
+ * override deliberately.
+ */
+const LOCK_PATH = path.join(os.tmpdir(), `gam-vitest-${TEST_DB_NAME}.lock`)
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+
+function claimLock(): void {
+  if (process.env.VITEST_ALLOW_CONCURRENT === '1') return
+  try {
+    const existing = Number(fs.readFileSync(LOCK_PATH, 'utf8').trim())
+    if (Number.isFinite(existing) && existing !== process.pid && alive(existing)) {
+      throw new Error(
+        `\n\n  ANOTHER VITEST RUN IS ALREADY GOING (pid ${existing}).\n\n` +
+        `  Starting this one would DROP and recreate ${TEST_DB_NAME} underneath it, and the\n` +
+        '  result is file-level failures scattered across unrelated suites that read like a\n' +
+        '  real regression. Wait for it, or kill it:\n\n' +
+        `      ps aux | grep [v]itest\n\n` +
+        '  If you are certain nothing else is running, remove the lock:\n\n' +
+        `      rm ${LOCK_PATH}\n`,
+      )
+    }
+  } catch (e: any) {
+    // A missing or unreadable lock file is the normal case; only re-throw the
+    // refusal above.
+    if (e?.message?.includes('ANOTHER VITEST RUN')) throw e
+  }
+  fs.writeFileSync(LOCK_PATH, String(process.pid))
+}
+
 export async function setup(): Promise<void> {
+  claimLock()
   if (!fs.existsSync(SCHEMA_PATH)) {
     throw new Error(`schema.sql not found at ${SCHEMA_PATH} — run npm run db:dump-schema`)
   }
@@ -85,4 +137,11 @@ export async function setup(): Promise<void> {
 export async function teardown(): Promise<void> {
   // Intentionally leave the test DB in place for post-run inspection.
   // The next run drops + recreates it. No cleanup needed.
+  //
+  // The lock DOES go, so a finished run never blocks the next one. Only this
+  // process's own lock — a crashed run leaves a stale file, and the liveness
+  // check in claimLock is what makes that harmless.
+  try {
+    if (Number(fs.readFileSync(LOCK_PATH, 'utf8').trim()) === process.pid) fs.unlinkSync(LOCK_PATH)
+  } catch { /* nothing to release */ }
 }
