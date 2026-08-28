@@ -31,6 +31,7 @@ import { logExpense } from './logExpense'
 import { messageMyLandlord } from './messageMyLandlord'
 import { createAndSendSurvey, getSurveyResults } from './landlordSurveyTools'
 import { submitRenewalIntent } from './submitRenewalIntent'
+import { recordCashPayment } from './recordCashPayment'
 import { getMyTerminationQuote } from './getMyTerminationQuote'
 import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
 import { getMyAmenities, requestAmenityReservation } from './amenityTools'
@@ -129,6 +130,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   createAndSendSurvey,
   getSurveyResults,
   submitRenewalIntent,
+  recordCashPayment,
   getMyTerminationQuote,
   getMyBalanceBreakdown,
   getMyAmenities,
