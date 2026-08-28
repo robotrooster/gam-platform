@@ -23,6 +23,7 @@ import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
 import { selectToolsForTurn } from './toolSelection'
 import { buildDecisionPrompt, buildComposeInstruction } from './decisionPrompt'
+import { alreadyDone } from './repeatedAction'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
 import type { AgentActor } from './tools/types'
 import { routePlan } from './toolRouting'
@@ -1022,6 +1023,9 @@ export interface RunWithToolsInput {
   /** IANA zone the agent should consider "today" in. Defaults to the platform's
    *  America/Phoenix — see buildTemporalBlock. */
   timezone?: string
+  /** S628: actions this conversation has already carried out, so an identical
+   *  one is refused rather than done twice. See repeatedAction.ts. */
+  priorToolCalls?: readonly { name: string; args: unknown }[]
 }
 
 export interface ToolInvocation {
@@ -1106,6 +1110,8 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   ]
 
   const toolInvocations: ToolInvocation[] = []
+  /** S628: what this conversation has already done — see repeatedAction.ts. */
+  const priorToolCalls = input.priorToolCalls ?? []
   /** S628: the composing pass runs once, not once per guard-driven rewrite. */
   let composed = false
   let nudgedForAccountData = false
@@ -1418,7 +1424,16 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
           messages.push({ role: 'assistant', content: null, tool_calls: calls })
           for (const call of calls) {
             const args = parseArgs(call.function.arguments)
-            const result = await executeToolCall(call, profile, actor, args)
+            // S628: refuse an action this conversation has ALREADY carried out with
+      // exactly these arguments. See repeatedAction.ts — the run caught the
+      // agent filing a second maintenance request for one leaking sink while
+      // correctly telling the tenant it was already logged.
+      const repeat = alreadyDone(call.function.name, args, priorToolCalls)
+      const result = repeat
+        ? (logger.warn({ profile: profile.id, tool: call.function.name },
+            'agent runner: refused a repeat of an action already taken this conversation'),
+           { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
+        : await executeToolCall(call, profile, actor, args)
             toolInvocations.push({ name: call.function.name, args, result })
             messages.push({
               role: 'tool',
@@ -1820,7 +1835,16 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         continue
       }
       executedThisTurn++
-      const result = await executeToolCall(call, profile, actor, args)
+      // S628: refuse an action this conversation has ALREADY carried out with
+      // exactly these arguments. See repeatedAction.ts — the run caught the
+      // agent filing a second maintenance request for one leaking sink while
+      // correctly telling the tenant it was already logged.
+      const repeat = alreadyDone(call.function.name, args, priorToolCalls)
+      const result = repeat
+        ? (logger.warn({ profile: profile.id, tool: call.function.name },
+            'agent runner: refused a repeat of an action already taken this conversation'),
+           { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
+        : await executeToolCall(call, profile, actor, args)
       turnCache.set(cacheKey, result)
 
       // An escalation tool is a CONTROL signal, not a data/action tool —

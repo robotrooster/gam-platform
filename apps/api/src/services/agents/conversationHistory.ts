@@ -113,3 +113,44 @@ export async function loadUserContext(
     lines.join('\n')
   )
 }
+
+/**
+ * S628 — WHAT THIS CONVERSATION HAS ALREADY DONE.
+ *
+ * A tenant said their sink was leaking, the agent filed a maintenance request,
+ * the tenant said "ok great, thanks — so that is definitely logged?", and the
+ * agent filed a SECOND one. The reply was right ("already logged"); only the
+ * side effect was wrong, which is the worst shape a bug can take — nothing in
+ * the conversation shows it, and somebody finds two work orders for one sink.
+ *
+ * The full prompt has carried the rule since S626 ("an acceptance of something
+ * already done is a confirmation, not an instruction to do it twice"). It was
+ * not enough on its own, and four failed rewrites of the waiver instruction on
+ * the same day are the argument against trying a fifth wording here. The
+ * conversation log already stores every tool call with its arguments, so this
+ * can be a fact rather than a request.
+ */
+export interface PriorToolCall { name: string; args: unknown }
+
+export async function loadConversationToolCalls(
+  conversationId: string,
+  actorUserId: string,
+  limit = historyTurns(),
+): Promise<PriorToolCall[]> {
+  const rows = await query<{ tool_invocations: unknown }>(
+    `SELECT tool_invocations
+       FROM agent_interaction_logs
+      WHERE conversation_id = $1 AND actor_user_id = $2 AND tool_invocations IS NOT NULL
+      ORDER BY turn_index DESC
+      LIMIT $3`,
+    [conversationId, actorUserId, limit],
+  )
+  const out: PriorToolCall[] = []
+  for (const r of rows.reverse()) {
+    const list = Array.isArray(r.tool_invocations) ? r.tool_invocations : []
+    for (const t of list as any[]) {
+      if (t && typeof t.name === 'string') out.push({ name: t.name, args: t.args ?? {} })
+    }
+  }
+  return out
+}

@@ -30,6 +30,7 @@ import type { HandoffSignal } from './tools/escalation'
 import { logger } from '../../lib/logger'
 import type { AgentAudience, AgentProfile, AgentTier, ChatMessage } from './types'
 import { withConcurrencySlot } from './concurrencyGate'
+import { loadConversationToolCalls } from './conversationHistory'
 
 export interface AgentSessionInput {
   audience: AgentAudience
@@ -384,7 +385,15 @@ async function runAgentSessionInner(input: AgentSessionInput): Promise<AgentSess
         ...baseHistory,
         ...(handoffNote ? [{ role: 'system' as const, content: handoffNote }] : []),
       ]
-      const res = await runAgentWithTools({ profile, actor, message, history })
+      // S628: what this conversation has already DONE, so an identical action
+      // is refused rather than carried out twice. Loaded from the interaction
+      // log, which already records every call with its arguments — the run
+      // caught the agent filing a second maintenance request for one sink while
+      // telling the tenant, correctly, that it was already logged.
+      const priorToolCalls = input.conversationId
+        ? await loadConversationToolCalls(input.conversationId, actor.userId).catch(() => [])
+        : []
+      const res = await runAgentWithTools({ profile, actor, message, history, priorToolCalls })
       accumulate(res)
       toolInvocations.push(...res.toolInvocations)
 
