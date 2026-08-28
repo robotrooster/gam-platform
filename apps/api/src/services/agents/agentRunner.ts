@@ -1090,10 +1090,17 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const composingPrompt = profile.systemPrompt
   const decidingPrompt = twoPass ? buildDecisionPrompt(profile) : profile.systemPrompt
 
+  // S628: the knowledge base is for COMPOSING, not for deciding. Retrieved
+  // articles explain how late fees work and what a deposit is for — none of
+  // which changes which tool answers "how much do I owe?". Carrying them into
+  // the deciding pass added 3.5 KB of prose to a 1 KB prompt, and that prose
+  // contains illustrative figures, which is one more place a number can be
+  // lifted from and served as fact. It joins the conversation for the composing
+  // pass, where it is exactly what is needed.
   const messages: ChatMessage[] = [
     { role: 'system', content: decidingPrompt },
     { role: 'system', content: buildTemporalBlock(now) },
-    { role: 'system', content: buildContextBlock(retrieved) },
+    ...(twoPass ? [] : [{ role: 'system' as const, content: buildContextBlock(retrieved) }]),
     ...history,
     { role: 'user', content: message },
   ]
@@ -1223,6 +1230,8 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     if (twoPass && out.toolCalls.length === 0 && !composed) {
       composed = true
       messages[0] = { role: 'system', content: composingPrompt }
+      // The knowledge base arrives now, for the pass that actually writes prose.
+      messages.push({ role: 'system', content: buildContextBlock(retrieved) })
       messages.push({
         role: 'system',
         content: buildComposeInstruction(toolInvocations.length > 0),

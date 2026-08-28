@@ -29,6 +29,7 @@ import type { AgentActor } from './tools/types'
 import type { HandoffSignal } from './tools/escalation'
 import { logger } from '../../lib/logger'
 import type { AgentAudience, AgentProfile, AgentTier, ChatMessage } from './types'
+import { withConcurrencySlot } from './concurrencyGate'
 
 export interface AgentSessionInput {
   audience: AgentAudience
@@ -102,7 +103,30 @@ const HIGH_VOLUME_REPLY =
   `couldn't get to your message this moment. Please try again in a few minutes — ` +
   `we'll be right with you.`
 
+/**
+ * S628 — every conversation goes through the concurrency gate.
+ *
+ * Nic: "too many people trying to have conversations at the same time would
+ * just slow them all down, not crash the computer. It should queue things up."
+ * It did not. Each conversation allocates a KV cache on the GPU, and when the
+ * allocation fails mlx_lm aborts the whole server out of a C++ destructor —
+ * taking every conversation in flight with it. Four times in an hour on
+ * 2026-08-28.
+ *
+ * Wrapped HERE rather than at the three call sites in routes/agent.ts, so the
+ * limit cannot be bypassed by a route added later — including the eval and
+ * conversation harnesses, which are exactly the workloads that found the crash.
+ *
+ * The slot is held for the whole session rather than for each generation. That
+ * is coarser than strictly necessary — a session also does database work — but
+ * a session IS the unit a person is waiting through, and the generation
+ * dominates it.
+ */
 export async function runAgentSession(input: AgentSessionInput): Promise<AgentSessionResult> {
+  return withConcurrencySlot(() => runAgentSessionInner(input))
+}
+
+async function runAgentSessionInner(input: AgentSessionInput): Promise<AgentSessionResult> {
   const { audience, actor, message } = input
   const baseHistory = input.history ?? []
   const startedAt = Date.now()
