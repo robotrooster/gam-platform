@@ -32,6 +32,7 @@ import { messageMyLandlord } from './messageMyLandlord'
 import { createAndSendSurvey, getSurveyResults } from './landlordSurveyTools'
 import { submitRenewalIntent } from './submitRenewalIntent'
 import { recordCashPayment } from './recordCashPayment'
+import { PORTAL_ACTION_TOOLS } from './portalActionTools'
 import { getMyTerminationQuote } from './getMyTerminationQuote'
 import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
 import { getMyAmenities, requestAmenityReservation } from './amenityTools'
@@ -131,6 +132,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getSurveyResults,
   submitRenewalIntent,
   recordCashPayment,
+  ...PORTAL_ACTION_TOOLS,
   getMyTerminationQuote,
   getMyBalanceBreakdown,
   getMyAmenities,

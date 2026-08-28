@@ -28,6 +28,24 @@ export interface AgentActor {
    *  role='visitor' (an unauthenticated property-website visitor); visitor
    *  tools read/write only this one property, never a neighboring one. */
   propertyId?: string
+  /**
+   * S626 — the caller's own verified JWT claims, forwarded from routes/agent.ts.
+   *
+   * Present ONLY for a signed-in human. It exists so an action tool can perform
+   * the action through the REAL endpoint, with the REAL authorization, instead
+   * of a second copy of the route's logic that drifts from it.
+   *
+   * Authentication is not being skipped: requireAuth already ran on the request
+   * that reached the agent, and this is the payload it produced. What this
+   * preserves is AUTHORIZATION — requirePerm reads req.user.permissions, and
+   * without these claims a staff member's agent would be denied everything
+   * their portal allows.
+   *
+   * NEVER shown to the model, never logged, and absent for anonymous audiences
+   * (prospect, visitor, token-scoped guest), which is why dispatch fails closed
+   * for them.
+   */
+  auth?: Record<string, unknown>
 }
 
 export interface AgentTool {

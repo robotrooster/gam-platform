@@ -66,7 +66,12 @@ describe('POST /api/agent/chat', () => {
 
     const arg = runAgentSessionMock.mock.calls[0][0]
     expect(arg.audience).toBe('tenant')
-    expect(arg.actor).toEqual({ userId: 'user-1', role: 'tenant', profileId: 'tenant-9' })
+    expect(arg.actor).toMatchObject({ userId: 'user-1', role: 'tenant', profileId: 'tenant-9' })
+    // S626: the actor also carries the caller's verified claims, so an action
+    // tool can perform the action through the real endpoint with the real
+    // authorization. They come from the VERIFIED token, never from the body —
+    // which is what this test has always been protecting.
+    expect(arg.actor.auth).toMatchObject({ userId: 'user-1', role: 'tenant', profileId: 'tenant-9' })
     expect(arg.message).toBe('when is rent due?')
     // response excludes the human-handoff package and tool internals
     expect(res.body.data).toMatchObject({ reply: 'Here to help.', handledBy: { name: 'Ava', tier: 'entry' }, escalations: [] })

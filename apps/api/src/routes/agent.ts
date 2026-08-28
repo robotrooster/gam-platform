@@ -103,7 +103,10 @@ agentRouter.post('/chat', async (req, res, next) => {
 
     const result = await runAgentSession({
       audience,
-      actor: { userId, role, profileId },
+      // S626: forward the caller's verified claims so an action tool can
+      // perform the action through the real endpoint with the real
+      // authorization. requireAuth already ran; this is its output.
+      actor: { userId, role, profileId, auth: req.user as any },
       message: body.message,
       conversationId,
       history,
