@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import { __waiverInternals } from './agentRunner'
 
-const { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults } = __waiverInternals
+const { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults, waiverArithmeticLine } = __waiverInternals
 
 describe('recognising a waiver request', () => {
   it.each([
@@ -63,5 +63,36 @@ describe('the arithmetic itself', () => {
     const grace = graceDaysFromResults([{ lease: { lateFeeGraceDays: 5 } }])!
     const claimed = claimedDaysLate('it was only two days late')!
     expect(grace + claimed).toBe(7)
+  })
+})
+
+describe('the sentence written when the model will not write it (S628)', () => {
+  // FOUR attempts at instructing it have failed: S624 put the rule in
+  // profiles.ts, S626 rewrote the forcing net twice, and the S628 conversation
+  // run caught it again with everything detected correctly — grace 5, claimed
+  // 2, nudge fired — and the regenerated reply was one more recital of the fee
+  // policy, which collapseRepetition then truncated mid-word. So the arithmetic
+  // is computed and put in front of the reply instead of asked for a fifth
+  // time, and what a tenant reads is pinned here like any other customer copy.
+  it('answers the argument they actually made, with their own number in it', () => {
+    const line = waiverArithmeticLine(5, 2)
+    // The whole point: 7, not 2. Saying 2 back to them concedes the argument.
+    expect(line).toContain('7 days past due')
+    expect(line).toContain('rather than 2')
+    expect(line).toContain('5-day grace period')
+  })
+
+  it('does not offer the waiver or hint the landlord might', () => {
+    // Nic, standing: the waiver is the landlord's call and not ours to float.
+    const line = waiverArithmeticLine(3, 4).toLowerCase()
+    expect(line).toContain("landlord's call")
+    expect(line).not.toMatch(/i can waive|i'll waive|they will probably|likely to waive/)
+  })
+
+  it('works for any grace period, including the zero-grace leases', () => {
+    // Live leases run 0, 3 and 5 days. At zero there is no arithmetic to do and
+    // the caller does not reach this — but the sentence must never claim a
+    // grace period that does not exist.
+    expect(waiverArithmeticLine(3, 1)).toContain('4 days past due')
   })
 })

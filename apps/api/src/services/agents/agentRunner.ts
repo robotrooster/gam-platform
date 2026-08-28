@@ -528,7 +528,24 @@ const OFFERS_A_MEETING_TIME = new RegExp([
 const SCHEDULING_TOOLS = new Set(['get_available_call_times', 'book_sales_call'])
 
 /** Exposed for waiverMath.test.ts — these are guard internals, not API. */
-export const __waiverInternals = { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults }
+/**
+ * S628 — the sentence written FOR the model when it will not write it itself.
+ *
+ * Four attempts at instructing it failed (S624 in profiles.ts, two rewrites in
+ * S626's net, and the S628 run). The arithmetic is not a judgement — it is a
+ * grace period from a real lease plus the number the person themselves said —
+ * so it is computed and placed in front of the reply rather than asked for a
+ * fifth time.
+ */
+export function waiverArithmeticLine(grace: number, claimed: number): string {
+  return (
+    `The fee only starts after your ${grace}-day grace period, so by the time it applied ` +
+    `you were ${grace + claimed} days past due rather than ${claimed}. That is what your lease ` +
+    `says, and it is your landlord's call whether to waive it — not mine.`
+  )
+}
+
+export const __waiverInternals = { WAIVER_REQUEST, claimedDaysLate, graceDaysFromResults, waiverArithmeticLine }
 /** Exposed for salesTimeGuard.test.ts — guard internals, not API. */
 export const __salesInternals = { OFFERS_A_MEETING_TIME }
 
@@ -572,7 +589,44 @@ export function repeatsPreviousReply(
   while (i < Math.min(a.length, b.length) && a[i] === b[i]) i++
   // Same bar the two-turn harness asserts at, so anything it would flag gets
   // one correction attempt before it reaches a person.
-  return i >= 60 || i >= Math.min(a.length, b.length) * 0.5
+  if (i >= 60 || i >= Math.min(a.length, b.length) * 0.5) return true
+
+  // S628: A SHARED OPENING IS NOT THE ONLY WAY TO REPEAT YOURSELF.
+  //
+  // The prefix test above compares from character zero, so it scores nothing
+  // when a reply recycles the MIDDLE of the last one. Caught in the S628 run,
+  // on a tenant asking for a late fee to be waived:
+  //
+  //   turn 1  "Your lease at Oak Street … charges a $15 flat late fee. This fee
+  //            is charged once when rent goes late — it is not per day and does
+  //            not accrue. You have a grace period of 5 days."
+  //   turn 2  "The $15 late fee is charged once when rent goes late — it is not
+  //            per day and does not accrue. You have a grace period of 5 days."
+  //
+  // Common prefix: zero characters, because one starts "Your" and the other
+  // "The". Reused content: almost all of it. The guard passed and the tenant
+  // got the mechanics of their late fee read at them a second time instead of
+  // an answer to the question they actually asked.
+  //
+  // Measured as PHRASE OVERLAP rather than whole sentences, because the reuse
+  // is rarely a clean copy. In the case above the recycled sentence had been
+  // re-opened — "This fee is charged once…" became "The $15 late fee is charged
+  // once…" — so sentence equality scores it a miss while a reader plainly sees
+  // the same sentence twice. Eight-word windows survive that kind of edit.
+  const shingles = (t: string): Set<string> => {
+    const w = t.toLowerCase().replace(/[^\p{L}\p{N}$%. ]/gu, ' ').split(/\s+/).filter(Boolean)
+    const out = new Set<string>()
+    for (let k = 0; k + 8 <= w.length; k++) out.add(w.slice(k, k + 8).join(' '))
+    return out
+  }
+  const priorPhrases = shingles(a)
+  const mine = [...shingles(b)]
+  // Too short to judge. Two brief replies sharing a phrase is a coincidence,
+  // not a repeat, and firing there costs a generation on ordinary conversation.
+  if (priorPhrases.size === 0 || mine.length < 4) return false
+  const overlap = mine.filter((x) => priorPhrases.has(x)).length / mine.length
+  // Half of what they are about to read, they have already read.
+  return overlap >= 0.5
 }
 
 export function assertsStoredFacts(text: string): boolean {
@@ -1508,11 +1562,17 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // real lookup and a figure the person themselves put forward. Where the
       // lease has no grace period there is no arithmetic to do and this stays
       // out of the way.
-      if (!nudgedForWaiverMath && WAIVER_REQUEST.test(message) && toolInvocations.length > 0) {
+      if (WAIVER_REQUEST.test(message) && toolInvocations.length > 0) {
         const grace = graceDaysFromResults(toolInvocations.map((t) => t.result))
         const claimed = claimedDaysLate(message)
         const total = grace != null && claimed != null ? grace + claimed : null
-        if (total != null && grace != null && grace > 0 && !new RegExp(`\\b${total}\\b`).test(out.content)) {
+        // S628: the guard used to sit on the OUTER condition, so once the nudge
+        // had fired this whole block was skipped and there was no second look.
+        // The deterministic fallback below needs that second look — it is the
+        // one that runs when the rewrite came back without the number again.
+        const missingArithmetic =
+          total != null && grace != null && grace > 0 && !new RegExp(`\\b${total}\\b`).test(out.content)
+        if (missingArithmetic && !nudgedForWaiverMath) {
           nudgedForWaiverMath = true
           logger.warn({ profile: profile.id, grace, claimed, total },
             'agent runner: waiver answered without the grace-period arithmetic — forcing one rewrite')
@@ -1552,6 +1612,32 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
               "suggest their landlord might; that is the landlord's call, not yours to float.",
           })
           continue
+        }
+        // S628: AND IF IT STILL WILL NOT SAY IT, SAY IT FOR IT.
+        //
+        // This instruction has now been rewritten four times — S624 put it in
+        // profiles.ts, S626 rewrote it twice inside this net — and the S628 run
+        // shows it failing again with everything detected correctly: grace 5,
+        // claimed 2, the nudge fired, and the regenerated reply was another
+        // recital of the fee policy. Then collapseRepetition truncated it
+        // mid-word and the tenant got half a sentence about accrual.
+        //
+        // Four attempts is enough to conclude the model will not contradict a
+        // customer's own count of their days, however the instruction is
+        // phrased. The rest of this file already knows what to do about that:
+        // when the phrase table needs a lookup the model will not make, it runs
+        // the lookup itself rather than asking again. Same principle. The
+        // arithmetic is not a judgement call — it is grace + claimed, from a
+        // real lease and their own words — so compute the sentence and put it
+        // in front of the reply.
+        //
+        // Placed FIRST because it is the one thing in the message they do not
+        // already know, and appended-to rather than replacing the reply so
+        // whatever else the model got right still reaches them.
+        if (missingArithmetic && nudgedForWaiverMath) {
+          logger.warn({ profile: profile.id, grace, claimed, total },
+            'agent runner: waiver arithmetic refused twice — prepending it deterministically')
+          out.content = `${waiverArithmeticLine(grace, claimed!)}\n\n${out.content}`
         }
       }
       // S626: the reply is fine on its own terms — but is it an answer to the

@@ -23,6 +23,37 @@ describe('repeatsPreviousReply', () => {
     expect(repeatsPreviousReply(h(BALANCE), BALANCE)).toBe(true)
   })
 
+  it('catches a reply that recycles the MIDDLE of the last one (S628)', () => {
+    // VERBATIM from the S628 conversation run. A tenant asked what their late
+    // fee was, then asked for it to be taken off. The second reply reissued the
+    // mechanics and never answered the question — and the prefix test scored
+    // ZERO on it, because one reply opens "Your lease" and the other "The $15".
+    const turn1 =
+      'Your lease at Oak Street Apartments, Apt 101, charges a $15 flat late fee. ' +
+      'This fee is charged once when rent goes late — it is not per day and does not accrue. ' +
+      'You have a grace period of 5 days.'
+    const turn2 =
+      'The $15 late fee is charged once when rent goes late — it is not per day and does not accrue. ' +
+      'You have a grace period of 5 days.'
+    expect(repeatsPreviousReply(h(turn1), turn2)).toBe(true)
+  })
+
+  it('does NOT fire when a figure is restated inside a real answer', () => {
+    // The bar has to leave room for the correct behaviour. Repeating the number
+    // while actually answering is what a person does; repeating the paragraph
+    // is not. This must stay false or the guard costs a generation on every
+    // good reply.
+    const turn1 =
+      'Your lease at Oak Street Apartments, Apt 101, charges a $15 flat late fee. ' +
+      'This fee is charged once when rent goes late — it is not per day and does not accrue. ' +
+      'You have a grace period of 5 days.'
+    const answer =
+      'Counting from the end of your five-day grace, that payment was seven days past due, ' +
+      'so the $15 stands. It is your landlord who decides on waiving it, not me — ' +
+      'want me to pass the request on to them?'
+    expect(repeatsPreviousReply(h(turn1), answer)).toBe(false)
+  })
+
   it('catches a repeat that trails off differently', () => {
     // The real ones were not byte-identical; they appended or dropped a clause.
     expect(repeatsPreviousReply(h(BALANCE), BALANCE.slice(0, 140) + ' until the balance is settled.')).toBe(true)
