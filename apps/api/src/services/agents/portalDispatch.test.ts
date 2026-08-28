@@ -101,7 +101,7 @@ describe('the internal token carries the caller and nothing more', () => {
 
   it('puts path params in the path and everything else in the body', async () => {
     await dispatchPortalAction('update_unit', { unitId: 'u9', rentAmount: 1250 }, LANDLORD)
-    expect(seen[0].url).toMatch(/\/api\/units\/u9$/)
+    expect(seen[0].url).toMatch(/\/api\/units\/u9\/details$/)
     expect(JSON.parse(seen[0].init.body)).toEqual({ rentAmount: 1250 })
     expect(seen[0].init.method).toBe('PATCH')
   })
