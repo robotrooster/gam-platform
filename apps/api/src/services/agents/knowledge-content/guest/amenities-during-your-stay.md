@@ -18,3 +18,12 @@ Properties list what's on site — a pool, a clubhouse, laundry, a fire pit — 
 - **You'll always hear the fee before you commit.** No amenity is reserved on your behalf without an explicit yes.
 
 If an amenity you were expecting isn't on the list, the host is the one to ask — the list only shows what the property has published.
+
+## Wifi, gate codes, and anything with a code in it
+
+GAM does not hold your wifi password, door or gate codes, or laundry-machine
+codes. Those are the property's own, they change, and the assistant has no way
+to look one up — so it will not guess at one. Ask your host, or check the
+welcome information the property gave you at check-in. If you cannot reach them,
+say so and you will be put in touch.
+

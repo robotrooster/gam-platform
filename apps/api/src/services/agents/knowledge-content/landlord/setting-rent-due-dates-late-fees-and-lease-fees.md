@@ -26,3 +26,21 @@ Lease fees by timing. Beyond rent, you can attach fees to a lease and tell GAM w
 You can also bill a one-off fee against a tenant mid-lease for things like an early-termination charge or a negotiated cost.
 
 Deposit amounts, refund rules, and anything legal-adjacent depend on your lease and your local laws — set them to fit your situation and check locally if you're unsure.
+
+## Waiving a late fee
+
+There is no toggle that un-charges a late fee. Once the grace period has run and
+the fee is applied, it is a charge on the tenant's ledger like any other, and
+clearing it is something you do deliberately from the **Payments** page by
+settling that charge — not by editing the lease after the fact.
+
+Whether to forgive one is entirely your call. GAM does not decide it and the
+assistant will not offer it on your behalf: a tenant who asks the assistant to
+waive a fee is told the arithmetic from their own lease and that the decision
+belongs to their landlord. It will not hint that you might say yes, because a
+tenant who hears that stops chasing the payment and starts waiting on you.
+
+If you want to change the rule rather than one instance, the amount, the grace
+period and any cap are lease terms — set them on the lease and they apply from
+then on, not retroactively.
+

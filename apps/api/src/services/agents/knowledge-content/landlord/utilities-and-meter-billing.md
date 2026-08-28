@@ -2,7 +2,7 @@
 scope: landlord
 title: Sub-Meters, Meter Reading Runs & Utility Billing
 ---
-The **Utilities** page runs monthly meter readings and per-unit utility billing for a property. Meters can be individual **sub-meters** (billed on the exact reading) or **RUBS master meters** (a usage total allocated across units); meters billed straight to you as the landlord don't generate tenant reading runs. Sewer has no meter of its own — it rides the water meter, so one water reading bills both at their own rates.
+The **Utilities** page runs monthly meter readings and per-unit utility billing for a property. Meters can be individual **sub-meters** (billed on the exact reading) or **RUBS master meters** (a usage total allocated across units). **RUBS** stands for *Ratio Utility Billing System* — one master meter for the building, and each unit's share worked out by a ratio rather than by its own reading. It is what you use when the units were never individually metered; meters billed straight to you as the landlord don't generate tenant reading runs. Sewer has no meter of its own — it rides the water meter, so one water reading bills both at their own rates.
 
 ## Reading runs
 

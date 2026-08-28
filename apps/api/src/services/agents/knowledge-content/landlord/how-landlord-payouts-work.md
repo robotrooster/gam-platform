@@ -21,3 +21,29 @@ Nightly and weekly stays work differently, because bookings arrive all month and
 Standard bank payouts are free and typically arrive in one to two business days after they're sent. If you'd rather not wait for the next scheduled run, you can also request an on-demand withdrawal of your available balance from your Disbursements page. An instant option is available where eligible — the instant transfer costs 2% ($5 minimum) for the faster rail, taken out of the transfer itself.
 
 A couple of things worth knowing. The platform fee is $2 per occupied unit each month, with a $10-per-property monthly minimum — you're billed whichever is higher; vacant units are never charged. When you first onboard, GAM doesn't start charging the platform fee until you go live — your first rent settles through the platform — so switching over from somewhere else doesn't mean paying two platforms at once. Whether the tenant or you cover the ACH fee is set per property; card fees are always the tenant's; GAM never absorbs that fee. Rent is collected electronically, but if a tenant pays you off-platform — cash, check, or money order — you or your staff can record that payment so their balance reflects it and it's marked settled. Recording an off-platform payment carries a **$6 manual-payment fee** — the same flat figure as the ACH fee, so a tenant never pays more for choosing cash, a check or a money order (there's no card or ACH processing fee on those, since nothing is run electronically, but the $6 recording fee still applies). It's waived on the tenant's first recorded payment during your property's onboarding window.
+
+## Money that is still clearing
+
+There is a gap between a tenant paying and the money being yours to spend. A
+bank payment sits in the banking system for days **after** the tenant's account
+was debited — they have paid, it has not landed.
+
+That money is **not** overdue and those tenants are **not** behind. GAM counts
+it as paid the moment it is sent, everywhere it matters: the tenant's own
+balance drops, the late-fee engine stops, and it is excluded from anyone's
+outstanding total. Ask what is still clearing, what is on its way, or what is in
+your next payout so far, and you will get the figure and who it is from.
+
+This is worth knowing because the two questions sound alike and are not. "Who
+owes me money?" is about people who have not paid. "What is still clearing?" is
+about people who have. Somebody mid-transfer belongs in the second answer and
+never in the first.
+
+## When a payment comes back
+
+An ACH can be returned after it appeared to go through — insufficient funds, a
+closed account, a stop payment. That money really is owed again, and it is
+tracked separately from a tenant who simply never paid: one of them has already
+tried. Ask who is behind and the two are reported apart, with the bank's reason
+where it gave one, because they need different conversations.
+
