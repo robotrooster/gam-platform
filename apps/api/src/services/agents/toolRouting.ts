@@ -630,6 +630,20 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
     ],
   },
   {
+    // S626: results of a survey they already sent. Above create_and_send_survey
+    // in effect because "what did people say" is a read and must never be
+    // answered by sending another one.
+    tools: ['get_survey_results'],
+    audience: 'landlord',
+    means: 'what tenants answered on a survey',
+    patterns: [
+      /\bsurvey\b[^?]{0,25}\b(results?|answers?|responses?|say|said|back)\b/i,
+      /\b(results?|answers?|responses?)\b[^?]{0,20}\bsurvey\b/i,
+      /\bwhat did (they|people|tenants|anyone)\b[^?]{0,20}\b(say|answer)\b/i,
+      /\bhow many\b[^?]{0,20}\b(responded|replied|answered)\b/i,
+    ],
+  },
+  {
     // S626: get_books_summary had NO route — the same hole as the tenant
     // amenities tool. It only ever fired when the model happened to pick it,
     // and the first prompt change of the day tipped it to calling nothing.

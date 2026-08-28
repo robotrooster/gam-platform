@@ -32,7 +32,7 @@ const LANDLORD_TOOLS = [
   'lookup_tenant_payment_status', 'get_delinquent_tenants', 'get_unit_lease',
   'get_late_payment_history', 'get_vacant_units', 'get_landlord_portfolio',
   'get_portfolio_stats', 'query_portfolio', 'get_open_complaints', 'get_books_summary', 'get_my_payouts', 'get_pending_applications',
-  'get_money_in_flight', 'get_team', 'get_maintenance_team', 'get_unreconciled_cash',
+  'get_money_in_flight', 'get_survey_results', 'get_team', 'get_maintenance_team', 'get_unreconciled_cash',
   'get_service_interruptions', 'get_background_check_status', 'get_work_trade_status',
   'get_profit_and_loss',
   'get_lease_expirations', 'get_pending_maintenance', 'get_property_rent_roll',

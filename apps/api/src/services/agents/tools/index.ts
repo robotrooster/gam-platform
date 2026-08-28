@@ -29,6 +29,7 @@ import { respondToEntryRequest } from './respondToEntryRequest'
 import { getMySurveys, submitSurveyResponse } from './tenantSurveyTools'
 import { logExpense } from './logExpense'
 import { messageMyLandlord } from './messageMyLandlord'
+import { createAndSendSurvey, getSurveyResults } from './landlordSurveyTools'
 import { getMyTerminationQuote } from './getMyTerminationQuote'
 import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
 import { getMyAmenities, requestAmenityReservation } from './amenityTools'
@@ -124,6 +125,8 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   submitSurveyResponse,
   logExpense,
   messageMyLandlord,
+  createAndSendSurvey,
+  getSurveyResults,
   getMyTerminationQuote,
   getMyBalanceBreakdown,
   getMyAmenities,

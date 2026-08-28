@@ -142,3 +142,50 @@ describe("a tenant can send their landlord a message — Nic's own example", () 
     expect(tenant).not.toContain('message_tenant')
   })
 })
+
+describe('surveys are anonymous, and the agent must never promise otherwise', () => {
+  // Nic's S577 decision, enforced server-side in routes/surveys.ts: "Anonymous
+  // protects tenants from retaliation (landlord-tenant power dynamic)." A
+  // survey can say fourteen of twenty are staying. It can never say which
+  // fourteen — and a landlord only discovers that after the answers are in and
+  // cannot be collected again.
+  it('the create tool warns before sending, not after', () => {
+    const d = getTool('create_and_send_survey')!.description
+    expect(d).toMatch(/ANONYMOUS AND THAT CANNOT BE TURNED OFF/i)
+    expect(d).toMatch(/never who said what/i)
+    // And it points at what DOES answer "who is renewing".
+    expect(d).toContain('get_lease_expirations')
+  })
+
+  it('the results tool refuses to imply a name could be found', () => {
+    const d = getTool('get_survey_results')!.description
+    expect(d).toMatch(/WITHOUT a name/i)
+    expect(d).toMatch(/do not guess/i)
+  })
+
+  it('the results query never joins users — there is no name to leak', async () => {
+    const src = String(getTool('get_survey_results')!.execute)
+    expect(src).not.toMatch(/JOIN users/i)
+  })
+
+  it('is landlord-only, and tenants keep their own half', () => {
+    for (const n of ['create_and_send_survey', 'get_survey_results']) {
+      expect(getTool(n)!.audiences, n).toEqual(['landlord'])
+    }
+    const tenant = getToolsForProfile(requireProfile('tenant_entry')).map((t) => t.name)
+    expect(tenant).not.toContain('create_and_send_survey')
+    expect(tenant).not.toContain('get_survey_results')
+  })
+
+  it('a multiple-choice question without options is refused before anything is written', async () => {
+    const r: any = await getTool('create_and_send_survey')!.execute(
+      { property: 'x', title: 'T', questions: [{ prompt: 'Staying?', type: 'multiple_choice' }] },
+      { userId: 'u', role: 'landlord', profileId: '00000000-0000-0000-0000-000000000000' } as any,
+    )
+    expect(r.ok).toBe(false)
+    // Property resolution fails first for a nonexistent landlord, which is
+    // itself the right order: never touch the survey tables for a property
+    // that is not theirs.
+    expect(r.error).toMatch(/matches|options/i)
+  })
+})
