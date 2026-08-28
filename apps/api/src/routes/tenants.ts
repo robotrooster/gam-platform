@@ -8,7 +8,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { emailLandlordBankingNudge } from '../services/email'
+import { emailLandlordBankingNudge, emailTenantInvite } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
@@ -1631,12 +1631,28 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         [email, tempHash, firstName, lastName || '', phone || null])
     }
 
-    // Create tenant record
-    const tenant = await queryOne<any>(`
-      INSERT INTO tenants (user_id) VALUES ($1)
-      ON CONFLICT DO NOTHING RETURNING id`, [user!.id])
-
-    const tenantId = tenant?.id || (await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [user!.id]))?.id
+    // Create the tenant record — but only if there is not one already.
+    //
+    // S628: this was `INSERT ... ON CONFLICT DO NOTHING`, and tenants.user_id
+    // carries a PLAIN index (idx_tenants_user_id), not a unique one. With no
+    // constraint to violate there was no conflict to do nothing about, so a
+    // second invite to the same address minted a SECOND tenants row for the
+    // same user. Everything downstream resolves a tenant by
+    // `SELECT id FROM tenants WHERE user_id = ...` and would then get whichever
+    // row came back first — the lease could attach to one and the payments to
+    // the other. A characterisation test caught it (tenantInvite.test.ts,
+    // "re-inviting the same address reuses the account"); nothing had
+    // re-invited the same address in the dev data, which is why it was quiet.
+    //
+    // Look up first, then insert. Every sibling onboarding route in
+    // routes/landlords.ts already does exactly this.
+    let tenantId: string | undefined =
+      (await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1 ORDER BY created_at ASC LIMIT 1',
+        [user!.id]))?.id
+    if (!tenantId) {
+      tenantId = (await queryOne<any>(
+        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [user!.id]))?.id
+    }
 
     // S579: for a PROPERTY-level screening invite (no unit yet), record a
     // property-bound intent so the background check the applicant completes
@@ -1685,8 +1701,48 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         WHERE id = $2`,
       [inviteToken, user!.id])
 
-    logger.info(`[INVITE] Tenant invite: ${email} — token: ${inviteToken}`)
-    logger.info(`[INVITE] Accept URL: ${process.env.TENANT_APP_URL}/accept-invite?token=${inviteToken}`)
+    const acceptUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/accept-invite?token=${inviteToken}`
+    logger.info(`[INVITE] Tenant invite: ${email}`)
+
+    // S628: SEND IT. The landlord's screen says "Invite Sent" and "they will
+    // receive an email to set up their account", and until now nothing was
+    // sent — the token was logged and the URL handed back for the landlord to
+    // copy. The reminder job (jobs/inviteNudge.ts) did not cover it either: it
+    // only walks unit-bound pending_tenant_intents, and this route creates a
+    // pending_lease_draft for those instead. So an invited resident heard
+    // nothing at all, and the invite lapsed after seven days in silence.
+    //
+    // Best-effort, exactly like the sibling onboarding route: the account and
+    // the token already exist, so failing the request would leave a half-made
+    // invite behind and tell the landlord to try again on something that had
+    // already worked. A property-level invite means a background check is
+    // still ahead of them; a unit-bound one does not.
+    try {
+      const ctxRow = await queryOne<any>(
+        `SELECT p.name AS property_name,
+                un.unit_number,
+                COALESCE(NULLIF(la.business_name, ''),
+                         NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
+                         'Your landlord') AS landlord_name
+           FROM landlords la
+           JOIN users lu ON lu.id = la.user_id
+           LEFT JOIN units un ON un.id = $2::uuid
+           LEFT JOIN properties p ON p.id = COALESCE(un.property_id, $3::uuid)
+          WHERE la.id = $1`,
+        [inviteLandlordId, unitId ?? null, inviterPropertyId])
+      await emailTenantInvite(
+        email,
+        firstName,
+        ctxRow?.landlord_name || 'Your landlord',
+        ctxRow?.property_name || 'their property',
+        ctxRow?.unit_number ? `Unit ${ctxRow.unit_number}` : null,
+        acceptUrl,
+        !unitId,
+        { landlordId: inviteLandlordId, tenantId },
+      )
+    } catch (emailErr) {
+      logger.error({ err: emailErr, ctx: email }, '[INVITE] invite email failed for')
+    }
 
     res.json({
       success: true,
@@ -1695,7 +1751,7 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         tenantId,
         email,
         inviteToken,
-        acceptUrl: `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/accept-invite?token=${inviteToken}`
+        acceptUrl,
       }
     })
   } catch (e) { next(e) }

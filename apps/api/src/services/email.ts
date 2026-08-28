@@ -967,6 +967,61 @@ export async function emailTenantOnboarded(
   )
 }
 
+/**
+ * S628 — the invite email that was never sent.
+ *
+ * POST /api/tenants/invite minted a seven-day activation token and returned
+ * the accept URL for the landlord to copy. Nothing was emailed — while the
+ * landlord's screen said "Invite Sent" and "they will receive an email to set
+ * up their account". Every resident invited from that modal was waiting on
+ * something nobody had sent, and the daily reminder job only covers unit-bound
+ * intents, which this flow does not create.
+ *
+ * It is a separate email from emailTenantOnboarded because the two say
+ * different true things. Onboarding tells somebody their landlord has already
+ * placed them and there is no application; an invite may be the opposite — a
+ * property-level invite is a PROSPECTIVE applicant who has a background check
+ * ahead of them, and telling them there is none would be a lie they discover
+ * at the worst moment. screeningRequired is what separates the two.
+ */
+export async function emailTenantInvite(
+  to: string,
+  tenantName: string,
+  landlordName: string,
+  propertyName: string,
+  unitLabel: string | null,
+  activationUrl: string,
+  screeningRequired: boolean,
+  ctx?: { landlordId?: string; tenantId?: string },
+) {
+  const place = unitLabel ? `${propertyName} — ${unitLabel}` : propertyName
+  const next = screeningRequired
+    ? p('Click below to set a password and finish your application. The next step is a background check; once it clears and your landlord approves, they will send you a lease to sign.')
+    : p('Click below to activate your account and set a password. Once you are in you can view your lease, set up rent payments, and send maintenance requests.')
+  await send(to, `${landlordName} invited you to GAM for ${place}`,
+    base(
+      h('You have been invited') +
+      p(`Hi ${tenantName},`) +
+      p(`<strong style="color:#eef1f8">${landlordName}</strong> uses GAM to manage their rentals, and has invited you.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${propertyName}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel ?? 'Unit assigned once your application is approved'}</div>
+      </div>` +
+      next +
+      btn('Activate Your Account', activationUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This link expires in 7 days. If it has, ask your landlord to send a new one. Questions about the place itself? Reach out to your landlord directly.</div>`
+    ),
+    {
+      category: 'tenant_invite',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { unit_label: unitLabel, screening_required: screeningRequired },
+    },
+    'support',
+  )
+}
+
 // S615 — the invite for someone who is NOT a tenant.
 //
 // The space next door is on this landlord's trash and power, and no lease
