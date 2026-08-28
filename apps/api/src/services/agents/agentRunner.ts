@@ -1244,14 +1244,27 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     // not the draft from the deciding pass.
     if (twoPass && out.toolCalls.length === 0 && !composed) {
       composed = true
-      messages[0] = { role: 'system', content: composingPrompt }
-      // The knowledge base arrives now, for the pass that actually writes prose.
-      messages.push({ role: 'system', content: buildContextBlock(retrieved) })
-      messages.push({
-        role: 'system',
-        content: buildComposeInstruction(toolInvocations.length > 0),
-      })
-      const written = await chatCompletion(messages, { sampler: profile.sampler })
+      // BUILT AS A COPY, not by mutating `messages`.
+      //
+      // Swapping the system message in place was wrong in a way that would have
+      // been very hard to find. Several guards below push a correction and
+      // `continue`, which re-enters the loop WITH tools attached — and one of
+      // them (the account-data net) forces tool_choice 'required'. If the full
+      // 26 KB prompt were still sitting in messages[0] at that point, that
+      // retry would run in exactly the configuration measured to suppress tool
+      // calls, so the net written to stop the model inventing a number would
+      // have been the thing making it invent one.
+      //
+      // The deciding prompt therefore stays in `messages` for the whole loop,
+      // and the full prompt exists only for the duration of this call.
+      const composeMessages: ChatMessage[] = [
+        { role: 'system', content: composingPrompt },
+        ...messages.slice(1),
+        // The knowledge base arrives now, for the pass that writes prose.
+        { role: 'system', content: buildContextBlock(retrieved) },
+        { role: 'system', content: buildComposeInstruction(toolInvocations.length > 0) },
+      ]
+      const written = await chatCompletion(composeMessages, { sampler: profile.sampler })
       addUsage(written.usage)
       model = written.model
       if (written.content?.trim()) out.content = written.content
