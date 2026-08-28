@@ -6,7 +6,7 @@
  * answer), the safety re-check, and the step ceiling. No model/DB.
  */
 
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 
 vi.mock('./engine', () => ({ chatCompletion: vi.fn() }))
 vi.mock('./knowledge', () => ({ retrieve: vi.fn().mockResolvedValue([]) }))
@@ -154,5 +154,55 @@ describe('runAgentWithTools', () => {
     // 2 loop steps + 1 final forced-text call = 3 chatCompletion calls
     expect((chatCompletion as any).mock.calls.length).toBe(3)
     expect(res.toolInvocations.length).toBe(2)
+  })
+})
+
+/**
+ * S628 — A GUARD-DRIVEN REWRITE MUST BE COMPOSED.
+ *
+ * Under two-pass the deciding pass writes a terse internal draft and the
+ * composing pass turns it into what a person reads. Every guard works by
+ * pushing a correction and re-entering the loop, so a corrected turn produces
+ * a SECOND draft — and if only the first one is composed, the corrected reply
+ * ships as raw internal draft: no voice, no knowledge base, and no benefit
+ * from the correction having been written under the full prompt.
+ *
+ * That is not a cosmetic loss. It is the guards being disarmed exactly on the
+ * turns that needed them, which is how a landlord asking "tell me more about
+ * the apt 204 one" got the previous turn's reply back verbatim AFTER the
+ * repetition guard had correctly fired and asked for a rewrite.
+ */
+describe('the composing pass under a guard-driven rewrite', () => {
+  const OLD_ENV = process.env.AGENT_TWO_PASS
+  beforeEach(() => { vi.clearAllMocks(); process.env.AGENT_TWO_PASS = '1' })
+  afterEach(() => {
+    if (OLD_ENV === undefined) delete process.env.AGENT_TWO_PASS
+    else process.env.AGENT_TWO_PASS = OLD_ENV
+  })
+
+  it('composes the corrected draft, not just the first one', async () => {
+    vi.spyOn(tools, 'getToolsForProfile').mockReturnValue([])
+    const REPEATED = 'The lease for Frank Williams in Apt 204 at Oak Street Apartments ends on October 4.'
+
+    ;(chatCompletion as any)
+      // draft 1 (deciding) -> composed into the repeat -> guard fires
+      .mockResolvedValueOnce(textTurn('draft one'))
+      .mockResolvedValueOnce(textTurn(REPEATED))
+      // draft 2 (deciding), after the correction -> MUST be composed too
+      .mockResolvedValueOnce(textTurn('draft two'))
+      // Deliberately free of stored facts: a figure here would (correctly) trip
+      // the account-data net and we would be measuring that guard instead.
+      .mockResolvedValueOnce(textTurn('Want me to check whether they have given notice yet?'))
+
+    const res = await runAgentWithTools({
+      profile: requireProfile('landlord_entry'),
+      actor: { userId: 'u1', role: 'landlord', profileId: 'l1' } as AgentActor,
+      message: 'tell me more about the apt 204 one',
+      history: [{ role: 'assistant', content: REPEATED }],
+    } as any)
+
+    // The bug returned 'draft two' — the uncomposed deciding-pass output.
+    expect(res.reply).toBe('Want me to check whether they have given notice yet?')
+    expect((chatCompletion as any).mock.calls.length).toBe(4)
   })
 })
