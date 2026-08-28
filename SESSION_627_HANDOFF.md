@@ -119,6 +119,12 @@ invisible and the ratchet silently stops measuring).
 286  endpoints still with no agent action
 ```
 
+Regenerate this list any time — it is a script, not a snapshot:
+
+```bash
+node apps/api/scripts/action-gap.js
+```
+
 Biggest first. Work top-down:
 
 ```
