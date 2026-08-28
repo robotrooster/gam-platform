@@ -89,3 +89,56 @@ describe('the silo holds', () => {
     expect(landlord).not.toContain('get_my_surveys')
   })
 })
+
+describe("a tenant can send their landlord a message — Nic's own example", () => {
+  it('exists, is tenant-only, and the profile carries it', () => {
+    const t = getTool('message_my_landlord')
+    expect(t).toBeTruthy()
+    expect(t!.audiences).toEqual(['tenant'])
+    expect(getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name))
+      .toContain('message_my_landlord')
+  })
+
+  it('refuses the things that have a real tool, and names it', async () => {
+    const t = getTool('message_my_landlord')!
+    const ACTOR = { userId: 'u', role: 'tenant', profileId: 't1' } as any
+    for (const [msg, expected] of [
+      ['the kitchen sink is leaking again', 'file_maintenance_request'],
+      ['my neighbour upstairs plays loud music every night', 'log_complaint'],
+      ['I want to renew for another year', 'request_lease_renewal'],
+    ] as const) {
+      const r: any = await t.execute({ message: msg }, ACTOR)
+      expect(r.ok, msg).toBe(false)
+      expect(r.useInstead, msg).toBe(expected)
+      // It must not quietly send anyway and claim success.
+      expect(r.sent).toBeUndefined()
+    }
+  })
+
+  it('lets through what genuinely has nowhere else to go', async () => {
+    // Nic's example verbatim. Reaches the DB lookup rather than being bounced,
+    // which is the branch under test — no lease in this context, so it stops
+    // there and must NOT claim it sent anything.
+    const t = getTool('message_my_landlord')!
+    const r: any = await t.execute(
+      { message: 'I want to upgrade to a three bedroom when you have one available' },
+      { userId: 'u', role: 'tenant', profileId: '00000000-0000-0000-0000-000000000000' } as any,
+    )
+    expect(r.wrongTool).toBeUndefined()
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/no active lease/i)
+    expect(r.error).toMatch(/do NOT tell them it was sent/i)
+  })
+
+  it('says plainly that it is one-way', () => {
+    expect(getTool('message_my_landlord')!.description).toMatch(/ONE-WAY/i)
+    expect(getTool('message_my_landlord')!.description).toMatch(/CONFIRM FIRST/)
+  })
+
+  it('the landlord cannot use it, and the tenant cannot use the landlord side', () => {
+    const landlord = getToolsForProfile(requireProfile('landlord_entry')).map((t) => t.name)
+    const tenant = getToolsForProfile(requireProfile('tenant_entry')).map((t) => t.name)
+    expect(landlord).not.toContain('message_my_landlord')
+    expect(tenant).not.toContain('message_tenant')
+  })
+})

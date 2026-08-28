@@ -192,7 +192,7 @@ const TENANT_ENTRY: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests', 'respond_to_entry_request', 'get_my_termination_quote', 'get_my_balance_breakdown', 'get_my_amenities', 'request_amenity_reservation',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_my_surveys', 'submit_survey_response', 'get_inspection_checklist', 'decline_guided_inspection',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_my_surveys', 'submit_survey_response', 'message_my_landlord', 'get_inspection_checklist', 'decline_guided_inspection',
     // S624: a tenant's own work-trade hours are account data, so the runner
     // demands a tool for them — and without one it refused to answer at all.
     'get_work_trade_standing',
@@ -227,7 +227,7 @@ const TENANT_ESCALATION: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests', 'respond_to_entry_request', 'get_my_termination_quote', 'get_my_balance_breakdown', 'get_my_amenities', 'request_amenity_reservation',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_my_surveys', 'submit_survey_response', 'get_inspection_checklist', 'decline_guided_inspection',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_lease_fees', 'get_my_full_lease', 'log_complaint', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_my_surveys', 'submit_survey_response', 'message_my_landlord', 'get_inspection_checklist', 'decline_guided_inspection',
     // S624: a tenant's own work-trade hours are account data, so the runner
     // demands a tool for them — and without one it refused to answer at all.
     'get_work_trade_standing',
