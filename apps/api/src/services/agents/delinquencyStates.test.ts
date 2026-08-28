@@ -26,7 +26,7 @@ const row = (over: Partial<any> = {}) => ({
   kind: 'never_attempted', return_reasons: null, last_attempt: null, ...over,
 })
 
-beforeEach(() => vi.restoreAllMocks())
+beforeEach(() => { vi.restoreAllMocks() })
 
 describe('the two groups are reported separately', () => {
   it('splits a returned payment from a tenant who never tried', async () => {
@@ -97,5 +97,53 @@ describe('asking what is coming does not return a list of debtors', () => {
   it('still routes the debtor question to the debtor lookup', () => {
     expect(t('who is behind on rent?')).toContain('get_delinquent_tenants')
     expect(t('who owes me money?')).toContain('get_delinquent_tenants')
+  })
+})
+
+/**
+ * S626 — the same collapse, two more places. Found by asking "where else does a
+ * tool read payments.status?" rather than by waiting for it to be reported.
+ */
+describe('the single-tenant lookup — "what is Chen\'s balance?"', () => {
+  it('does NOT count money already clearing as owed', async () => {
+    const { lookupTenantPaymentStatus } = await import('./tools/lookupTenantPaymentStatus')
+    const src = String(lookupTenantPaymentStatus.execute)
+    // S620 removed 'processing' from the LIST tool and left it here — the
+    // quieter path, and the one a landlord uses to ask about one person.
+    expect(src).toContain('IN_FLIGHT_STATUSES')
+    expect(src).toContain('inFlight')
+  })
+
+  it('separates what they never paid from what came back', async () => {
+    const { lookupTenantPaymentStatus } = await import('./tools/lookupTenantPaymentStatus')
+    const src = String(lookupTenantPaymentStatus.execute)
+    expect(src).toMatch(/ofWhichReturned/)
+    expect(src).toMatch(/FILTER \(WHERE status IN \('failed','returned'\)\)/)
+  })
+
+  it('tells the agent the three figures are not interchangeable', async () => {
+    const { lookupTenantPaymentStatus } = await import('./tools/lookupTenantPaymentStatus')
+    expect(lookupTenantPaymentStatus.description).toMatch(/NOT owed/i)
+    expect(lookupTenantPaymentStatus.description).toMatch(/returned/i)
+  })
+})
+
+describe("the tenant's own balance", () => {
+  it('counts a RETURNED payment as still owed', async () => {
+    // paymentReversal.ts sets status='returned' with the bank's code when an
+    // ACH comes back. It was missing from the tenant's balance, so a bounced
+    // payment dropped out as though it had settled — the tenant is told they
+    // owe less than they do and finds out when the late fee lands.
+    const { getMyBalanceBreakdown } = await import('./tools/getMyBalanceBreakdown')
+    const src = String(getMyBalanceBreakdown.execute)
+    expect(src).toContain("'returned'")
+  })
+
+  it("still treats money in flight as PAID from the tenant's side", async () => {
+    // The other direction, and it must not regress: the money has left their
+    // account, so their balance drops immediately (S620).
+    const { getMyBalanceBreakdown } = await import('./tools/getMyBalanceBreakdown')
+    const src = String(getMyBalanceBreakdown.execute)
+    expect(src).not.toMatch(/status IN \('pending', 'failed', 'returned', 'processing'\)/)
   })
 })

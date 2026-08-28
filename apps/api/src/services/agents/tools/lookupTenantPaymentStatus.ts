@@ -21,7 +21,18 @@ interface TenantMatch {
   property_name: string | null | null
 }
 
-const OUTSTANDING_STATUSES = ['pending', 'processing', 'failed', 'returned']
+// S626 (Nic): "The $8 ACH was not stuck. It was paid. Money was already out of
+// my bank account, and the agent still told the landlord that person hadn't paid
+// yet."
+//
+// S620 took 'processing' out of the LIST tool (get_delinquent_tenants) and left
+// it here, in the single-tenant lookup — so "what's Chen's balance?" answered
+// with a figure that included money Chen had already sent and which was
+// clearing the bank. Same bug, quieter path, and this is the tool the landlord
+// uses when they ask about one person by name.
+const OUTSTANDING_STATUSES = ['pending', 'failed', 'returned']
+/** Already paid, still clearing. Owed by nobody — reported separately. */
+const IN_FLIGHT_STATUSES = ['processing']
 
 /**
  * S624 — strip the question off a name before searching for it.
@@ -73,9 +84,15 @@ export function cleanNeedle(raw: unknown): string {
 export const lookupTenantPaymentStatus: AgentTool = {
   name: 'lookup_tenant_payment_status',
   description:
-    'Look up the payment status (current balance owed + recent payments) of one of the landlord’s ' +
-    'OWN tenants, by name or email. Use for “is Jane Doe paid up?” or “what does the tenant in unit ' +
-    '4 owe me?”. Only returns tenants on this landlord’s leases. Read-only.',
+    'One tenant\u2019s payment standing by name, email or unit \u2014 who they are, what they owe, and their ' +
+    'recent payments. Use for \u201cwhat\u2019s Chen\u2019s balance?\u201d or \u201cis Bob current?\u201d. Read-only.\n' +
+    'READ THE THREE FIGURES SEPARATELY, they are not interchangeable. outstandingBalance is money still ' +
+    'owed. ofWhichReturned is the part of it they DID pay and the bank sent back \u2014 say so plainly ' +
+    '(\u201cthey tried an ACH and it was returned\u201d), because that is a different problem from never ' +
+    'having paid. inFlight is already paid and still clearing: it is NOT owed, it is NOT overdue, and ' +
+    'the tenant is not behind on it \u2014 mention it whenever it is above zero so the landlord is not ' +
+    'told someone is short when the money is already on its way.',
+
   parameters: {
     type: 'object',
     properties: {
@@ -224,11 +241,19 @@ export const lookupTenantPaymentStatus: AgentTool = {
     const exact = needle.toLowerCase() === full || needle.toLowerCase() === (m.email ?? '').toLowerCase()
     const matchedOn = exact ? 'exact' : 'partial'
     // Payments are scoped to BOTH the tenant AND this landlord.
-    const owed = await query<{ outstanding: string | null; count: string }>(
-      `SELECT COALESCE(SUM(amount), 0) AS outstanding, COUNT(*) AS count
+    const owed = await query<{ outstanding: string | null; count: string; returned: string | null; returned_count: string }>(
+      `SELECT COALESCE(SUM(amount), 0) AS outstanding, COUNT(*) AS count,
+              COALESCE(SUM(amount) FILTER (WHERE status IN ('failed','returned')), 0) AS returned,
+              COUNT(*) FILTER (WHERE status IN ('failed','returned')) AS returned_count
          FROM payments
         WHERE tenant_id = $1 AND landlord_id = $2 AND status = ANY($3)`,
       [m.tenant_id, actor.profileId, OUTSTANDING_STATUSES]
+    )
+    const flight = await query<{ in_flight: string | null }>(
+      `SELECT COALESCE(SUM(amount), 0) AS in_flight
+         FROM payments
+        WHERE tenant_id = $1 AND landlord_id = $2 AND status = ANY($3)`,
+      [m.tenant_id, actor.profileId, IN_FLIGHT_STATUSES]
     )
     const recent = await query<{ type: string; amount: string; status: string; due_date: string | null }>(
       `SELECT type, amount, status, due_date
@@ -253,6 +278,12 @@ export const lookupTenantPaymentStatus: AgentTool = {
       },
       outstandingBalance: Number(owed[0]?.outstanding ?? 0),
       outstandingItemCount: Number(owed[0]?.count ?? 0),
+      // Of the outstanding total, how much is money they DID send that came
+      // back. "Behind" and "tried and it bounced" are different conversations.
+      ofWhichReturned: Number(owed[0]?.returned ?? 0),
+      returnedItemCount: Number(owed[0]?.returned_count ?? 0),
+      // Already paid, still clearing. NOT part of the balance above.
+      inFlight: Number(flight[0]?.in_flight ?? 0),
       recentPayments: recent.map((r) => ({ type: r.type, amount: Number(r.amount), status: r.status, dueDate: r.due_date })),
     }
   },

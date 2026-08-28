@@ -27,7 +27,14 @@ export const getMyBalanceBreakdown: AgentTool = {
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.entry_description, p.status
          FROM payments p
-        WHERE p.tenant_id = $1 AND p.status IN ('pending', 'failed')
+        -- S626: 'returned' was MISSING, and it is a live status —
+        -- paymentReversal.ts sets it with the bank's return code when an ACH
+        -- comes back. A tenant whose payment bounced had it drop out of their
+        -- own balance as though it were paid: they are told they owe LESS than
+        -- they do, believe they are square, and find out when the late fee
+        -- lands. 'processing' stays OUT on purpose — the money has left their
+        -- account, so from the tenant's side it is paid (S620).
+        WHERE p.tenant_id = $1 AND p.status IN ('pending', 'failed', 'returned')
         ORDER BY p.due_date ASC, p.created_at ASC
         LIMIT 40`,
       [actor.profileId]
