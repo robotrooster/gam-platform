@@ -1175,6 +1175,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   // never overruled by the lexical one.
   const selection = selectToolsForTurn(profile, getToolsForProfile(profile), message, {
     alwaysInclude: routedTools,
+    previousMessage: lastUserMessage ? String((lastUserMessage as any).content) : undefined,
   })
   const tools = selection.tools
   const toolSchemas = tools.map(toToolSchema)

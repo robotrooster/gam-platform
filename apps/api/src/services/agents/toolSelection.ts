@@ -106,7 +106,22 @@ export function selectToolsForTurn(
   profile: AgentProfile,
   all: readonly AgentTool[],
   message: string,
-  opts: { maxActions?: number; alwaysInclude?: readonly string[] } = {},
+  opts: {
+    maxActions?: number
+    alwaysInclude?: readonly string[]
+    /**
+     * What the person said on the turn BEFORE this one.
+     *
+     * S628: a follow-up is often all pronouns. Sweeping every action against
+     * the phrasing in its own description, 149 of 150 were reachable and the
+     * miss was finalize_utility_bill on "send that one out" — which names
+     * nothing, and after "run the water bills for March" plainly means the
+     * bill. Nic: "it should know from context of what was said." Scored at half
+     * weight, so it colours an ambiguous turn without letting the previous
+     * subject override a clear change of topic.
+     */
+    previousMessage?: string
+  } = {},
 ): Selection {
   const maxActions = opts.maxActions ?? 24
   const pinned = new Set(opts.alwaysInclude ?? [])
@@ -124,11 +139,15 @@ export function selectToolsForTurn(
   if (actions.length <= maxActions) return { tools: [...all], droppedActions: 0 }
 
   const want = new Set(tokens(message).map(stem))
+  // Carried context, at half weight — see previousMessage above.
+  const carried = new Set(
+    tokens(opts.previousMessage ?? '').map(stem).filter((w) => !want.has(w)))
   const scored = actions.map((t) => {
     if (pinned.has(t.name)) return { t, score: Number.POSITIVE_INFINITY }
     const hay = hayFor(t)
     let score = 0
     for (const w of want) if (hay.has(w)) score += 1
+    for (const w of carried) if (hay.has(w)) score += 0.5
     // A word in the NAME is worth more than one buried in prose: "renumber" in
     // renumber_unit is what the tool is, where the same word inside another
     // tool's description is likely a cross-reference to this one.

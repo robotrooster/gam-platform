@@ -84,6 +84,30 @@ describe('the tools for this turn', () => {
       expect.arrayContaining(['set_eviction_mode', 'record_bill']))
   })
 
+  it('carries the previous turn, because a follow-up is mostly pronouns', () => {
+    // Sweeping every landlord action against the phrasing in its own
+    // description, 149 of 150 were reachable from the latest sentence alone.
+    // The miss names nothing at all — and after "run the water bills for March"
+    // it plainly means the bill.
+    const alone = selectToolsForTurn(landlord, ALL, 'send that one out', {})
+    expect(alone.tools.map((t) => t.name)).not.toContain('finalize_utility_bill')
+
+    const inContext = selectToolsForTurn(landlord, ALL, 'send that one out', {
+      previousMessage: 'run the water bills for march',
+    })
+    expect(inContext.tools.map((t) => t.name)).toContain('finalize_utility_bill')
+  })
+
+  it('a clear change of subject is not overruled by what came before', () => {
+    // Carried context is scored at HALF weight for this reason. A landlord who
+    // was talking about utilities and then asks to waive a late fee must get
+    // the credit tool, not last turn's meters.
+    const sel = selectToolsForTurn(landlord, ALL, 'waive the late fee on 204', {
+      previousMessage: 'run the water bills for march',
+    })
+    expect(sel.tools.map((t) => t.name)).toContain('issue_tenant_credit')
+  })
+
   it('leaves a small profile completely alone', () => {
     // The tenant agent holds 67 tools and was never the problem. Selection must
     // be a no-op there rather than a second thing that can go wrong.
