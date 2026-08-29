@@ -254,6 +254,35 @@ const isDateSignedField = (f: any) =>
 
 export function SignPage() {
   const { token } = useParams<{ token:string }>()
+
+  /**
+   * S629 (Nic): "Phone cannot scroll at all."
+   *
+   * It could not, and the signature dialog was never the cause. globals.css
+   * LOCKS the document on purpose —
+   *
+   *     body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+   *
+   * — because inside the portal the shell fills the viewport and the only
+   * scroll region is .page-content, which lives in Layout. Signing from an
+   * emailed link is now PUBLIC and renders outside Layout, so there is no
+   * .page-content: the page inherits a body that cannot scroll and has nothing
+   * else that can. On a desktop everything fits, so it only showed up on a
+   * phone.
+   *
+   * Unlocked for as long as this standalone page is mounted, and restored on
+   * the way out so the portal's own scrolling is untouched.
+   */
+  const standalone = isSignerToken(token)
+  useEffect(() => {
+    if (!standalone) return
+    const b = document.body.style
+    const prev = { overflow: b.overflow, height: b.height, overscrollBehavior: b.overscrollBehavior }
+    b.overflow = 'auto'; b.height = 'auto'; b.overscrollBehavior = 'auto'
+    return () => {
+      b.overflow = prev.overflow; b.height = prev.height; b.overscrollBehavior = prev.overscrollBehavior
+    }
+  }, [standalone])
   const navigate = useNavigate()
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
