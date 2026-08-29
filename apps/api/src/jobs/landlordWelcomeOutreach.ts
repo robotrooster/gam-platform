@@ -129,6 +129,27 @@ export async function sendLandlordWelcomeOutreach(now: Date = new Date()): Promi
         AND u.email_verified = TRUE
         AND u.role = 'landlord'
         AND l.created_at <= $1::timestamptz - ($2 || ' minutes')::interval
+        -- S629 (Nic): "I got an onboarding email from GAM support to my email."
+        --
+        -- This selected ENTITIES, and every criterion above is true of a brand
+        -- new LLC created by a landlord who has been running for weeks. So
+        -- adding a second entity sent that landlord "Getting you set up on
+        -- GAM" — a first-contact onboarding-call note — as though they had
+        -- just discovered the product. It happened twice in one evening: a
+        -- landlord who signed up on the 24th got one for his second LLC, and
+        -- Nic got one for an entity created for him on the 28th.
+        --
+        -- The outreach is addressed to a PERSON, not to a company, so the
+        -- question is whether this human is new — not whether this row is.
+        -- Anyone with an older entity, or who has already been written to on
+        -- any of their entities, is not.
+        AND NOT EXISTS (
+          SELECT 1 FROM landlords prior
+           WHERE prior.user_id = u.id
+             AND prior.id <> l.id
+             AND (prior.created_at < l.created_at
+                  OR prior.welcome_outreach_sent_at IS NOT NULL)
+        )
       ORDER BY l.created_at`,
     [now.toISOString(), String(OUTREACH_DELAY_MINUTES)]
   )

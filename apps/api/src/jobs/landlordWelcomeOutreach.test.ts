@@ -3,7 +3,7 @@
  * send window. Email is mocked; this asserts WHO gets picked and WHEN.
  */
 import { vi, describe, it, expect, beforeEach } from 'vitest'
-import { db } from '../db'
+import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 
 vi.mock('../services/email', () => ({
@@ -176,5 +176,50 @@ describe('withinSendWindow', () => {
   it('10am Phoenix is inside the send window, 3am is not', () => {
     expect(withinSendWindow(IN_WINDOW)).toBe(true)
     expect(withinSendWindow(NIGHT)).toBe(false)
+  })
+})
+
+/**
+ * S629 — the outreach is addressed to a PERSON, not to a company.
+ *
+ * The query selected ENTITIES, and every one of its criteria is true of a brand
+ * new LLC created by a landlord who has been running for weeks: no outreach
+ * stamp, verified email, older than the delay. So adding a second entity sent
+ * that landlord "Getting you set up on GAM" — a first-contact onboarding-call
+ * note — as though they had just found the product.
+ *
+ * It happened twice in one evening. A landlord who signed up on the 24th
+ * created his second LLC and was written to 98 minutes later; Nic had an entity
+ * created for him and was written to the next morning.
+ */
+describe('welcome outreach is per person, not per entity', () => {
+  it('does not write to a landlord who adds a second entity', async () => {
+    const c = await db.connect()
+    let userId = ''
+    try {
+      await c.query('BEGIN')
+      const seeded = await seedLandlord(c)
+      userId = seeded.userId
+      await c.query(`UPDATE users SET email_verified = TRUE WHERE id = $1`, [userId])
+      // Their original entity: signed up a fortnight ago, already written to.
+      await c.query(
+        `UPDATE landlords SET created_at = now() - INTERVAL '14 days',
+                              welcome_outreach_sent_at = now() - INTERVAL '13 days',
+                              portfolio_manager_id = NULL, referred_by_user_id = NULL
+          WHERE id = $1`, [seeded.landlordId])
+      // The second LLC, created today — new row, established customer.
+      await c.query(
+        `INSERT INTO landlords (user_id, business_name, created_at)
+         VALUES ($1, 'Second LLC', now() - INTERVAL '3 hours')`, [userId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const res = await sendLandlordWelcomeOutreach(new Date())
+    expect(res.sent, 'an established landlord must not be onboarded again').toBe(0)
+
+    const stamped = await query<any>(
+      `SELECT welcome_outreach_sent_at FROM landlords
+        WHERE user_id = $1 AND business_name = 'Second LLC'`, [userId])
+    expect(stamped[0].welcome_outreach_sent_at).toBeNull()
   })
 })
