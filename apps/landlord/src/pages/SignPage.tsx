@@ -287,7 +287,24 @@ export function SignPage() {
    * Unlocked for as long as this standalone page is mounted, and restored on
    * the way out so the portal's own scrolling is untouched.
    */
-  const standalone = isSignerToken(token)
+  // S629 (Nic): "when I follow the link from the reminder email, the scroll was
+  // locked again. So whatever you did was just on that email."
+  //
+  // He was right, and the first version of this was too clever: it unlocked only
+  // when the URL carried a signer token, so a link built any other way — the
+  // reminder job still used the document id — stayed locked.
+  //
+  // The real condition is not the URL, it is whether this page is inside the
+  // app shell. Layout provides .page-content, the only scrolling region; a
+  // standalone signing page has no such ancestor and must scroll the document
+  // itself. Asked of the DOM rather than inferred from the address, so every
+  // entry path gets the same answer.
+  // Layout renders .page-content and nothing else does, so its absence from the
+  // document IS "no shell". Checked this way rather than through a ref, because
+  // a ref is null on the first render (the page is still loading) and would
+  // report standalone inside the portal.
+  const [standalone, setStandalone] = useState(false)
+  useEffect(() => { setStandalone(!document.querySelector('.page-content')) }, [])
   useEffect(() => {
     if (!standalone) return
     const b = document.body.style

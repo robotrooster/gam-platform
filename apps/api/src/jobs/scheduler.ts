@@ -352,7 +352,7 @@ async function processEsignTimeouts() {
   try {
     // Pass 1: reminders
     const remind = await query<any>(`
-      SELECT s.id, s.email, s.name, s.role,
+      SELECT s.id, s.email, s.name, s.role, s.token,
              d.id as doc_id, d.title, d.landlord_id,
              u.unit_number, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
@@ -374,10 +374,21 @@ async function processEsignTimeouts() {
         const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
         // S536: landlords sign in the landlord portal — a tenant-portal
         // link would bounce off tenant auth for them.
+        //
+        // S629 (Nic): "when I follow the link from the reminder email, the
+        // scroll was locked again." Both reminders built /sign/<document id>,
+        // written before signer tokens existed and never updated — so a
+        // reminder link was not recognised as a token URL. It demanded a login,
+        // it did not unlock the standalone page's scrolling, and it sent an
+        // Authorization header the recipient did not have. The FIRST email
+        // worked and the reminder did not, from the same document.
+        //
+        // Same helper the send path uses, so there is one definition of what a
+        // signing link is.
         const appUrl = r.role === 'landlord'
           ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
           : (process.env.TENANT_APP_URL || 'http://localhost:3002')
-        const signingUrl = `${appUrl}/sign/${r.doc_id}`
+        const signingUrl = `${appUrl}/sign/${r.token || r.doc_id}`
         await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id })
         await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
       } catch(e) {
@@ -497,7 +508,7 @@ async function processEsignTimeouts() {
     if (hour === 8 || hour === 9 || hour === 16) {
       const landlordPass = hour === 8
       const renewalRemind = await query<any>(`
-        SELECT s.id, s.email, s.name, s.role,
+        SELECT s.id, s.email, s.name, s.role, s.token,
                d.id as doc_id, d.title, d.landlord_id,
                u.unit_number, p.name as property_name,
                lu.first_name || ' ' || lu.last_name as landlord_name
@@ -523,7 +534,8 @@ async function processEsignTimeouts() {
           const appUrl = r.role === 'landlord'
             ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
             : (process.env.TENANT_APP_URL || 'http://localhost:3002')
-          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, `${appUrl}/sign/${r.doc_id}`, { landlordId: r.landlord_id, documentId: r.doc_id })
+          // S629: the signer's token, not the document id — see the reminder above.
+          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, `${appUrl}/sign/${r.token || r.doc_id}`, { landlordId: r.landlord_id, documentId: r.doc_id })
           await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
         } catch(e) {
           logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] renewal reminder failed')
