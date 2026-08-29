@@ -196,7 +196,13 @@ export async function createDocumentRecord(client: any, opts: {
   // S604 (Nic): the landlord ALREADY holds this tenant's deposit — migration
   // onboarding. The lease still states the deposit; it just isn't billed.
   depositAlreadyHeld?: boolean,
-  signers: Array<{ userId: string, role: string, name: string, email: string, phone?: string | null, orderIndex?: number }>
+  signers: Array<{ userId: string, role: string, name: string, email: string, phone?: string | null, orderIndex?: number }>,
+  // S629: values stamped onto placed fields at draft time, keyed by
+  // lease_column. It was always read (see the late-fee and renewal prefills
+  // below, which write into it) but never declared, so a caller passing it —
+  // the home-sale purchase agreement — was a type error while the mechanism
+  // underneath worked perfectly well.
+  prefillValues?: Record<string, string>,
 }): Promise<any> {
   // INSERT lease_documents — includes document_type and addendum-specific FKs
   const doc = await client.query(`

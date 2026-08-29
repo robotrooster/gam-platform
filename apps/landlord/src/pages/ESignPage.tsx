@@ -1481,7 +1481,17 @@ export function ESignPage() {
   const [tmplUploadedName, setTmplUploadedName] = useState('')
   const [tmplPageCount, setTmplPageCount] = useState(1)
 
-  const { data: templates = [], isLoading: tmplLoading } = useQuery<any[]>('esign-templates', () => apiGet('/esign/templates'))
+  // S629 (Nic): "when I'm on the gold sign page and I click on templates, it
+  // shows me all the templates for all the different properties I have. It
+  // needs to filter by which property I'm planning on using."
+  //
+  // The endpoint has narrowed by ?propertyId since S535 — nothing on this tab
+  // ever asked it to. Templates with no property are portfolio-wide and stay
+  // visible at every property, which is what the server already does.
+  const [tmplPropertyId, setTmplPropertyId] = useState('')
+  const { data: templates = [], isLoading: tmplLoading } = useQuery<any[]>(
+    ['esign-templates', tmplPropertyId],
+    () => apiGet(`/esign/templates${tmplPropertyId ? `?propertyId=${tmplPropertyId}` : ''}`))
   const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',  () => apiGet('/esign/documents'))
 
   // S576: search + property dropdown over the Documents tab. Keys on
@@ -1623,6 +1633,21 @@ export function ESignPage() {
       {/* Templates */}
       {tab === 'templates' && (
         <div>
+          {(tmplProperties as any[]).length > 1 && (
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14, flexWrap:'wrap' }}>
+              <label className="form-label" style={{ margin:0, fontSize:'.72rem' }}>Property</label>
+              <select className="input" style={{ width:'auto', minWidth:240 }}
+                      value={tmplPropertyId} onChange={e => setTmplPropertyId(e.target.value)}>
+                <option value="">All properties</option>
+                {(tmplProperties as any[]).map(p => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+              <span style={{ fontSize:'.7rem', color:'var(--text-3)' }}>
+                Templates set to one property, plus any that apply everywhere.
+              </span>
+            </div>
+          )}
           {tmplLoading ? <div style={{ padding:32, textAlign:'center', color:'var(--text-3)' }}>Loading…</div> :
           (templates as any[]).length === 0 ? (
             <div className="empty-state" style={{ padding:48 }}>

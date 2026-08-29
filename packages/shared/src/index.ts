@@ -2680,6 +2680,13 @@ export const LEASE_COLUMNS = [
   // identity — unit + party identification
   'tenant_name', 'tenant_email', 'landlord_name',
   'unit_number', 'property_name', 'property_address',
+  // S629: financed HOME SALE terms, for a purchase agreement. Display-only
+  // ('identity'), because a purchase agreement is not a lease and none of
+  // these may ever write back to the leases table — the sale lives in
+  // home_sale_contracts and the signed document is what starts its billing.
+  'sale_price', 'sale_down_payment', 'sale_financed_amount',
+  'sale_monthly_payment', 'sale_term_months', 'sale_interest_rate',
+  'sale_first_payment_month',
   // signature — PDF display only
   'tenant_signature', 'landlord_signature',
   'tenant_initial', 'landlord_initial',
@@ -2723,6 +2730,14 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   unit_number:            'identity',
   property_name:          'identity',
   property_address:       'identity',
+  // S629: home-sale terms — display-only, never written back to leases.
+  sale_price:               'identity',
+  sale_down_payment:        'identity',
+  sale_financed_amount:     'identity',
+  sale_monthly_payment:     'identity',
+  sale_term_months:         'identity',
+  sale_interest_rate:       'identity',
+  sale_first_payment_month: 'identity',
   // signature
   tenant_signature:       'signature',
   landlord_signature:     'signature',
@@ -2842,6 +2857,13 @@ export function validateLeaseDocumentForSend(
 }
 
 export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
+  sale_price:               'Sale price',
+  sale_down_payment:        'Down payment',
+  sale_financed_amount:     'Amount financed',
+  sale_monthly_payment:     'Monthly payment',
+  sale_term_months:         'Number of payments',
+  sale_interest_rate:       'Interest rate (%)',
+  sale_first_payment_month: 'First payment month',
   tenant_name:            'Tenant name',
   tenant_email:           'Tenant email',
   landlord_name:          'Landlord name',
@@ -2907,6 +2929,16 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
 //   - 'implicit'      → bound via field type + signer role, never in dropdown
 export type LeaseColumnInput = 'text' | 'date' | 'implicit'
 export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
+  // S629: home-sale terms. 'text' so they appear in the template editor's
+  // Data label dropdown — a purchase agreement is built by placing these on
+  // the page, and the figures then arrive from the contract at send time.
+  sale_price:               'text',
+  sale_down_payment:        'text',
+  sale_financed_amount:     'text',
+  sale_monthly_payment:     'text',
+  sale_term_months:         'text',
+  sale_interest_rate:       'text',
+  sale_first_payment_month: 'text',
   tenant_name:            'text',
   tenant_email:           'text',
   landlord_name:          'text',

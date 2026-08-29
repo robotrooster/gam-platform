@@ -137,6 +137,18 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
         basePdfUrl: null, documentType: 'purchase_agreement',
         targetLeaseTenantId: null, promoteLeaseTenantId: null,
         signers: await purchaseSigners(client, unit.landlord_id, body.tenantId),
+        // S629: the terms just agreed, stamped onto the agreement so the
+        // document states the same numbers the billing will use. The contract
+        // is the source; the signed page is the proof.
+        prefillValues: {
+          sale_price:               Number(salePrice).toFixed(2),
+          sale_down_payment:        Number(downPayment).toFixed(2),
+          sale_financed_amount:     Number(contract.financed_amount).toFixed(2),
+          sale_monthly_payment:     Number(contract.monthly_payment).toFixed(2),
+          sale_term_months:         String(termMonths),
+          sale_interest_rate:       String(annualInterestRate),
+          sale_first_payment_month: String(body.startMonth),
+        },
       })
       await client.query(
         `UPDATE home_sale_contracts SET purchase_document_id=$2, updated_at=NOW() WHERE id=$1`,
