@@ -359,15 +359,42 @@ export async function createDocumentRecord(client: any, opts: {
       [doc.id]).then((r: any) => r.rows)
 
     const prefillValues: Record<string,string> = (opts as any).prefillValues || {}
+
+    // S629 (Nic): "link each one in order to the tenant that potentially got
+    // the invite. Have it be prefilled so nobody fills it out. I already
+    // spelled their name right once when I sent the invite, so I don't wanna
+    // have to do it again. And the boxes linked to cosigner three and four,
+    // those just don't even appear when there's no invites."
+    //
+    // The four tenant-name blanks on a lease form are the roster, in order.
+    // They were landlord-role text fields mapped to nothing and marked
+    // required, so a one-tenant lease asked the landlord to type three names
+    // that do not exist — or write N/A three times on somebody's lease.
+    //
+    // Filled from the signers, and OMITTED where there is no such tenant, the
+    // same way a co-tenant's signature field is already omitted. Nobody types a
+    // name that the system took at invite time.
+    const TENANT_NAME_COLUMNS = ['tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name']
+    const TENANT_ORDER = ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']
+    const rosterNames = TENANT_ORDER
+      .map(role => (docSigners as any[]).find((s: any) => s.role === role)?.name)
+      .filter(Boolean) as string[]
+
     for (const f of tmplFields as any[]) {
       if (f.signer_role && !filledRoles.has(f.signer_role)) continue
+      const nameSlot = f.lease_column ? TENANT_NAME_COLUMNS.indexOf(f.lease_column) : -1
+      // No tenant in that slot on this lease: the blank does not belong on this
+      // document at all. Skipped rather than left empty and required.
+      if (nameSlot >= 0 && !rosterNames[nameSlot]) continue
       const signer = (docSigners as any[]).find((s: any) => s.role === f.signer_role)
       // If this field is bound to a lease_column and the send form supplied a value,
       // persist it now so it auto-renders for signers. Signature/initial/date_signed
       // are filled by signers themselves and are never prefilled here.
-      const prefill = f.lease_column && prefillValues[f.lease_column] != null
-        ? String(prefillValues[f.lease_column])
-        : null
+      const prefill = nameSlot >= 0
+        ? rosterNames[nameSlot]
+        : f.lease_column && prefillValues[f.lease_column] != null
+          ? String(prefillValues[f.lease_column])
+          : null
       await client.query(`
         INSERT INTO lease_document_fields
           (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column,

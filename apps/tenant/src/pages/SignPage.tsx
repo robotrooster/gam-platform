@@ -244,6 +244,14 @@ type Stage = 'signing'|'review'|'done'|'declined'
 
 // S534: a 'date' field is auto-stampable only when it records WHEN the
 // signer signed. Term dates (lease start/end) are deliberate inputs.
+
+/** S629: the largest font that fits a value inside its box, both ways. */
+function fitFontSize(text: string, boxW: number, boxH: number): number {
+  const byHeight = boxH * 0.5
+  const byWidth = text.length ? (boxW - 4) / (text.length * 0.55) : byHeight
+  return Math.max(6, Math.min(byHeight, byWidth))
+}
+
 const isDateSignedField = (f: any) =>
   f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
 
@@ -392,6 +400,12 @@ export function SignPage() {
     data.fields
       .filter((f:any)=>f.fieldType==='date' && !updates[f.id] && isDateSignedField(f))
       .forEach((f:any)=>{ updates[f.id]=today })
+
+    // S629: the execution-date blanks are the LANDLORD's signing date and are
+    // stamped when he signs, before this ever reaches a tenant. Nothing is
+    // derived here — a tenant signing after midnight must not change the day
+    // the agreement was entered into.
+
     if (Object.keys(updates).length) setFieldValues(prev=>({...prev,...updates}))
   }, [data])
 
@@ -604,7 +618,11 @@ export function SignPage() {
                 {val ? (
                   (f.fieldType==='signature'||f.fieldType==='initials') && val.startsWith('data:')
                     ? <img src={val} style={{ width:'100%', height:'100%', objectFit:'contain' }}/>
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:Math.max(9,f.height*s*0.5), color:'#1a1a1a', padding:4, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    // S629: sized to fit BOTH dimensions — height alone clipped
+                    // wide values ("29" became "2", a full name became "Jon…"),
+                    // and the clipped text is what gets stamped into the
+                    // executed PDF.
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
                     {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}

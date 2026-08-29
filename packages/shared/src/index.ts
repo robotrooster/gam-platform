@@ -2684,6 +2684,18 @@ export const LEASE_COLUMNS = [
   // ('identity'), because a purchase agreement is not a lease and none of
   // these may ever write back to the leases table — the sale lives in
   // home_sale_contracts and the signed document is what starts its billing.
+  // S629 (Nic): "does this field indicate lease start or signing date, because
+  // there is a difference and it matters." It is the SIGNING date — "made and
+  // entered into on this __ day of __" is the execution clause, when the
+  // agreement is formed, which is not when the term begins. Split because the
+  // sentence has two blanks; the whole date already exists as date_signed.
+  'date_signed_day', 'date_signed_month',
+  // S629 (Nic): "this lease only has one tenant name. What's gonna happen to
+  // the other three boxes? Is it gonna expect me to type not applicable?" A
+  // form with four name lines and one tenant leaves three blank — normal on
+  // paper. Naming the slots lets the draft fill the ones that exist from the
+  // signer roster and stop REQUIRING the ones that do not.
+  'tenant_2_name', 'tenant_3_name', 'tenant_4_name',
   'sale_price', 'sale_down_payment', 'sale_financed_amount',
   'sale_monthly_payment', 'sale_term_months', 'sale_interest_rate',
   'sale_first_payment_month',
@@ -2730,6 +2742,12 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   unit_number:            'identity',
   property_name:          'identity',
   property_address:       'identity',
+  // S629: the execution-date blanks — display only, filled at signing.
+  date_signed_day:          'identity',
+  date_signed_month:        'identity',
+  tenant_2_name:            'identity',
+  tenant_3_name:            'identity',
+  tenant_4_name:            'identity',
   // S629: home-sale terms — display-only, never written back to leases.
   sale_price:               'identity',
   sale_down_payment:        'identity',
@@ -2857,6 +2875,11 @@ export function validateLeaseDocumentForSend(
 }
 
 export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
+  date_signed_day:          'Signing date — day',
+  date_signed_month:        'Signing date — month',
+  tenant_2_name:            'Co-tenant 2 name',
+  tenant_3_name:            'Co-tenant 3 name',
+  tenant_4_name:            'Co-tenant 4 name',
   sale_price:               'Sale price',
   sale_down_payment:        'Down payment',
   sale_financed_amount:     'Amount financed',
@@ -2929,6 +2952,11 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
 //   - 'implicit'      → bound via field type + signer role, never in dropdown
 export type LeaseColumnInput = 'text' | 'date' | 'implicit'
 export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
+  date_signed_day:          'text',
+  date_signed_month:        'text',
+  tenant_2_name:            'text',
+  tenant_3_name:            'text',
+  tenant_4_name:            'text',
   // S629: home-sale terms. 'text' so they appear in the template editor's
   // Data label dropdown — a purchase agreement is built by placing these on
   // the page, and the figures then arrive from the contract at send time.

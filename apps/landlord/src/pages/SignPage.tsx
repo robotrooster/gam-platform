@@ -249,6 +249,20 @@ type Stage = 'signing'|'review'|'done'
 
 // S534: a 'date' field is auto-stampable only when it records WHEN the
 // signer signed. Term dates (lease start/end) are deliberate inputs.
+
+/**
+ * S629: the largest font that fits a value inside its box, both ways.
+ *
+ * Height alone is not enough — a wide value in a short, narrow box (a day
+ * number, a full name on a signature line) overflowed and was clipped, and the
+ * clipped text is what gets stamped into the executed PDF.
+ */
+function fitFontSize(text: string, boxW: number, boxH: number): number {
+  const byHeight = boxH * 0.5
+  const byWidth = text.length ? (boxW - 4) / (text.length * 0.55) : byHeight
+  return Math.max(6, Math.min(byHeight, byWidth))
+}
+
 const isDateSignedField = (f: any) =>
   f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
 
@@ -369,6 +383,25 @@ export function SignPage() {
     data.fields
       .filter((f:any)=>f.fieldType==='date' && !updates[f.id] && isDateSignedField(f))
       .forEach((f:any)=>{ updates[f.id]=today })
+
+    // S629 (Nic): "entered into on this ___ day of ___" is the EXECUTION date —
+    // when the agreement is formed — not when the term starts. It had been
+    // mapped to start_date, so a full ISO date was stamped into a box the width
+    // of a day number and showed as a clipped "2".
+    //
+    // Tied to the LANDLORD's signing moment, in his words: "if the tenant waits
+    // to sign it till after midnight, that's not the day I signed it." These
+    // are landlord-role fields, the landlord signs first, and the value is
+    // stored — so it is stamped once, by him, and never re-derived for anybody
+    // who signs later.
+    const now = new Date()
+    const dayOfMonth = String(now.getDate())
+    const monthName = now.toLocaleString(undefined, { month: 'long' })
+    data.fields.forEach((f:any)=>{
+      if (updates[f.id]) return
+      if (f.leaseColumn === 'date_signed_day') updates[f.id] = dayOfMonth
+      if (f.leaseColumn === 'date_signed_month') updates[f.id] = monthName
+    })
     if (Object.keys(updates).length) setFieldValues(prev=>({...prev,...updates}))
   }, [data])
 
@@ -420,6 +453,10 @@ export function SignPage() {
   // child is neither shown nor required (S556).
   const activeFields = allFields.filter(isFieldActive)
   const requiredFields = activeFields.filter((f:any)=>f.required)
+  // Filled by the system rather than by this signer — lease data stamped at
+  // draft time, plus the signing date. Counted separately so the header can say
+  // what is actually left to do.
+  const prefilledCount = requiredFields.filter((f:any)=>f.value || /^(date_signed|tenant_|sale_)/.test(f.leaseColumn || '')).length
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
@@ -518,7 +555,21 @@ export function SignPage() {
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
-          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {requiredFields.length-unfilledRequired.length}/{requiredFields.length} required fields complete</div>
+          {/* S629 (Nic): "it said four out of twenty three required fields
+              complete without me completing anything." They were filled — by
+              the lease data and the signing date — but calling machine-filled
+              fields "complete" reads as though he had done them. What he needs
+              to know is how many are left FOR HIM. */}
+          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
+            Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong>
+            {' · '}
+            {unfilledRequired.length === 0
+              ? 'everything filled — ready to sign'
+              : `${unfilledRequired.length} left for you`}
+            {prefilledCount > 0 && (
+              <span> · {prefilledCount} prefilled from the lease</span>
+            )}
+          </div>
         </div>
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>
           {pdfPageCount>1 && <>
@@ -574,7 +625,18 @@ export function SignPage() {
                 {val ? (
                   (f.fieldType==='signature'||f.fieldType==='initials') && val.startsWith('data:')
                     ? <img src={val} style={{ width:'100%', height:'100%', objectFit:'contain' }}/>
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:Math.max(9,f.height*s*0.5), color:'#1a1a1a', padding:4, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    // S629 (Nic): the font was sized from the box HEIGHT alone,
+                    // so a value wider than its box was simply cut off. "29"
+                    // rendered as "2" in an 11px-wide day box, and "Jonathan
+                    // Busby" as "Jon…". On a lease that is not cosmetic: the
+                    // same sizing stamps the executed PDF, so the signed
+                    // document would have said "2 day of August".
+                    //
+                    // Sized to fit BOTH dimensions. 0.55em per character is the
+                    // usual average for proportional text and is deliberately
+                    // conservative — slightly small beats truncated, because a
+                    // number nobody can read is worse than a small one.
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
                     {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
@@ -587,7 +649,19 @@ export function SignPage() {
       </div>
 
       {!allFilled && <div style={{ padding:'9px 14px', background:'rgba(201,162,39,.06)', border:'1px solid rgba(201,162,39,.2)', borderRadius:10, fontSize:'.77rem', color:'var(--gold,#c9a227)', display:'flex', alignItems:'center', gap:8, marginBottom:12 }}>
-        <PenTool size={13}/> Click highlighted fields to sign. Use <strong>Next Field</strong> to jump to the next one.
+        <PenTool size={13}/>
+        <span>
+          Click highlighted fields to sign. Use <strong>Next Field</strong> to jump to the next one.
+          {/* S629 (Nic): "it's got some boxes highlighted different colors that
+              appear to belong to different signing roles." They are all his —
+              the API serves only this signer's fields — so the colours are
+              STATE, not people. Nothing said so. */}
+          <span style={{ display:'block', marginTop:4, color:'var(--text-3)', fontSize:'.72rem' }}>
+            <span style={{ color:'#22c55e', fontWeight:700 }}>Green</span> = done ·{' '}
+            <span style={{ color:'var(--gold,#c9a227)', fontWeight:700 }}>Glowing</span> = next up ·{' '}
+            <span style={{ fontWeight:700 }}>Grey</span> = still to do. All of them are yours.
+          </span>
+        </span>
       </div>}
 
       {activeField && (activeField.fieldType==='signature'||activeField.fieldType==='initials') && (

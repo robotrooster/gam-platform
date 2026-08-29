@@ -165,6 +165,31 @@ const VALID_FIELD_TYPES = new Set<FieldType>(['signature', 'initials', 'date', '
 // ── heuristic column tagging (fallback + prior to model refinement) ──
 function columnFor(ctx: string): string | null {
   const c = ctx.toLowerCase()
+
+  // S629 (Nic): "have those tenant names be a box mandatory on the lease
+  // template for any other landlord that prefills it the right way."
+  //
+  // A lease form's tenant-name blanks are the roster, in order, and they were
+  // being left unmapped — so the landlord was asked to type names the system
+  // already took at invite time, and on a one-tenant lease to fill three boxes
+  // for people who do not exist. Mapped here, so every template auto-placed
+  // from now on prefills them and omits the empty slots. Checked FIRST because
+  // "tenant name 2" also matches nothing else and would otherwise fall
+  // through to the generic name rules below.
+  const numbered = c.match(/tenant\s*(?:name|\(s\))?\s*#?\s*([2-4])\b/)
+  if (numbered) return `tenant_${numbered[1]}_name`
+
+  // S629: "made and entered into on this ___ day of ___" is the EXECUTION
+  // clause — when the agreement is formed, which is NOT when the term starts.
+  // One of these was tagged start_date, which stamped a full ISO date into a
+  // box the width of a day number. Split, and tied to the landlord's signature
+  // because he signs first: "if the tenant waits to sign it till after
+  // midnight, that's not the day I signed it."
+  if (/entered into on this|made (and entered )?on this|executed on this/.test(c)) {
+    if (/day of/.test(c) && /month|of\s*,?\s*20|of\s*_/.test(c)) return 'date_signed_month'
+    return 'date_signed_day'
+  }
+
   if (/apartment\s*#|apt\.?\s*#|space no\.?|unit\s*#|lot\s*#/.test(c)) return 'unit_number'
   if (/beginning on|commencing|commence/.test(c)) return 'start_date'
   if (/ending on|ending upon|ending|expir/.test(c)) return 'end_date'
