@@ -60,20 +60,32 @@ export function isPullDayToday(
   return todayDayOfMonth === target
 }
 
-/** Today's date in a timezone, as {ymd, day}. */
-export function localToday(tz: string): { ymd: string; day: number } {
+/**
+ * Today's date in a timezone, as {ymd, day}.
+ *
+ * S629: `now` is injectable, defaulting to the real clock. It was hard-wired to
+ * `new Date()`, which left the autopay tests unable to state what day the run
+ * happens on — they armed a tenant for "today" and, on the 29th, 30th or 31st,
+ * could not: tenant_autopay_pull_day_check caps pull_day at 28, because a pull
+ * day of 29 does not exist in every month. So the suite went red on three days
+ * of every month, at month end, on the runner that moves rent.
+ *
+ * Only the DAY varies with this; ymd feeds the billing cycle, which is the
+ * month, so a run pinned within the same month bills the same cycle.
+ */
+export function localToday(tz: string, now: Date = new Date()): { ymd: string; day: number } {
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
   })
-  const ymd = fmt.format(new Date())
+  const ymd = fmt.format(now)
   return { ymd, day: Number(ymd.slice(8, 10)) }
 }
 
 /**
  * Charge every scheduled autopay falling due today for properties in `tz`.
  */
-export async function runAutopayForTimezone(tz: string): Promise<AutopayRunResult> {
-  const { ymd, day } = localToday(tz)
+export async function runAutopayForTimezone(tz: string, now: Date = new Date()): Promise<AutopayRunResult> {
+  const { ymd, day } = localToday(tz, now)
   // The cycle key: one attempt per lease per calendar month.
   const cycle = `${ymd.slice(0, 7)}-01`
 

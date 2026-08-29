@@ -66,10 +66,29 @@ async function fixture(): Promise<Fixture> {
 }
 
 /** Today's day-of-month in the property's timezone — what the runner fires on. */
+/**
+ * S629: the run happens on a FIXED day of the current month, not on whatever
+ * day the suite is run.
+ *
+ * These tests arm a tenant for "today" and then run the job. On the 29th, 30th
+ * or 31st that is impossible — tenant_autopay_pull_day_check caps pull_day at
+ * 28, because a pull day of 29 does not exist in every month — so the suite
+ * went red on three days of every month, at month end, on the runner that
+ * moves rent. Nothing was wrong with the runner; the test simply could not say
+ * when it was pretending to run.
+ *
+ * The 15th of the CURRENT month: a legal pull day, and the same billing cycle
+ * as the charges the fixtures create, since the cycle is the month.
+ */
+const RUN_DAY = 15
+function runAt(): Date {
+  const d = new Date()
+  d.setDate(RUN_DAY)
+  d.setHours(12, 0, 0, 0)
+  return d
+}
 function todayDay(): number {
-  return Number(new Intl.DateTimeFormat('en-CA', {
-    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date()).slice(8, 10))
+  return RUN_DAY
 }
 
 /** Arm autopay for TODAY so the runner picks it up on this run. */
@@ -127,7 +146,7 @@ describe('S609 autopay runner', () => {
     await seedCharge(f, 1000)
     await seedCharge(f, 35, 'late_fee')           // a late fee that landed overnight
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.charged).toBe(1)
     // 1035, not the 1000 anyone could have forecast yesterday.
     expect(chargeMock.mock.calls[0][0]).toMatchObject({ amount: 1035, source: 'autopay' })
@@ -147,7 +166,7 @@ describe('S609 autopay runner', () => {
     await seedCharge(f, 800)
     await seedCarried(f, 1000)          // eight months older than the rent
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.charged).toBe(1)
     expect(chargeMock.mock.calls[0][0]).toMatchObject({ amount: 800, source: 'autopay' })
   })
@@ -156,7 +175,7 @@ describe('S609 autopay runner', () => {
     await armForToday(f)
     await seedCarried(f, 1000)
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.charged).toBe(0)
     expect(r.skipped).toBe(1)
     expect(chargeMock).not.toHaveBeenCalled()
@@ -166,16 +185,16 @@ describe('S609 autopay runner', () => {
     await armForToday(f)
     await seedCharge(f, 1000)
 
-    await runAutopayForTimezone(TZ)
-    await runAutopayForTimezone(TZ)
-    await runAutopayForTimezone(TZ)
+    await runAutopayForTimezone(TZ, runAt())
+    await runAutopayForTimezone(TZ, runAt())
+    await runAutopayForTimezone(TZ, runAt())
 
     expect(chargeMock).toHaveBeenCalledTimes(1)
   })
 
   it('a tenant already paid ahead is skipped, not failed', async () => {
     await armForToday(f)                          // nothing owed
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.charged).toBe(0)
     expect(r.failed).toBe(0)
     expect(chargeMock).not.toHaveBeenCalled()
@@ -190,7 +209,7 @@ describe('S609 autopay runner', () => {
     await seedCharge(f, 1000)
     chargeMock.mockImplementationOnce(async () => { throw new Error('bank declined') })
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.failed).toBe(1)
 
     const row = await autopayRow(f.leaseId)
@@ -206,7 +225,7 @@ describe('S609 autopay runner', () => {
       [f.leaseId, AUTOPAY_DISARM_AFTER_FAILURES - 1])
     chargeMock.mockImplementationOnce(async () => { throw new Error('account closed') })
 
-    await runAutopayForTimezone(TZ)
+    await runAutopayForTimezone(TZ, runAt())
 
     const row = await autopayRow(f.leaseId)
     expect(row.enabled).toBe(false)
@@ -220,7 +239,7 @@ describe('S609 autopay runner', () => {
     await db.query(`UPDATE tenant_autopay SET enabled = FALSE WHERE lease_id = $1`, [f.leaseId])
     await seedCharge(f, 1000)
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.charged).toBe(0)
     expect(chargeMock).not.toHaveBeenCalled()
   })
@@ -232,7 +251,7 @@ describe('S609 autopay runner', () => {
        VALUES ($1,$2,TRUE,$3)`, [f.tenantId, f.leaseId, other])
     await seedCharge(f, 1000)
 
-    const r = await runAutopayForTimezone(TZ)
+    const r = await runAutopayForTimezone(TZ, runAt())
     expect(r.considered).toBe(0)
     expect(chargeMock).not.toHaveBeenCalled()
   })
