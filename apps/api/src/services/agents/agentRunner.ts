@@ -833,8 +833,17 @@ export function promisesAnAction(text: string): boolean {
  * checks for the CLAIM, not the topic — "your landlord can see your complaints
  * in their portal" is information and survives; "I've logged it" does not.
  */
+// S628: the money and lease verbs, added after "I'll waive it" showed the
+// PROMISE detector had none of them either. Past tense is the worse half:
+// "I've waived it" makes the landlord stop chasing and tell their tenant.
+//
+// ACTIVE, FIRST PERSON ONLY — deliberately not added to the passive form
+// below. "Their application has been approved" and "the deposit has been
+// refunded" are usually the agent REPORTING what a lookup returned, and those
+// are true statements that must survive. "I have approved it" is a claim about
+// something the agent did, and that is the thing being checked.
 const CLAIMS_DONE =
-  /\b(?:i'?ve|i have|i)\s+(?:already\s+)?(?:logged|filed|recorded|submitted|reported|created|opened|sent|passed (?:it |this )?(?:on|along)|notified|flagged|scheduled|booked|cancelled|canceled|updated|added|removed|saved)\b/i
+  /\b(?:i'?ve|i have|i)\s+(?:already\s+)?(?:logged|filed|recorded|submitted|reported|created|opened|sent|passed (?:it |this )?(?:on|along)|notified|flagged|scheduled|booked|cancelled|canceled|updated|added|removed|saved|waived|refunded|reimbursed|credited|issued|applied|processed|adjusted|approved|denied|rejected|renewed|extended|terminated|released|transferred)\b/i
 const CLAIMS_DONE_PASSIVE =
   /\b(?:has|have|been)\s+(?:been\s+)?(?:logged|filed|recorded|submitted|reported|notified|created|sent|passed on|flagged|scheduled|booked|cancelled|canceled|updated)\b/i
 
@@ -1149,6 +1158,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForWaiverMath = false
   let nudgedForSalesTime = false
   let nudgedForPromisedAction = false
+  let nudgedForClaimedAction = false
   let refusedOneEscalation = false
   let forceToolThisTurn = false
   let nudgedForDispute = false
@@ -1666,6 +1676,41 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             'promise it in the hope it resolves itself.',
         })
         continue
+      }
+      // S628: the PAST-TENSE twin of the guard above, and the worse half.
+      //
+      // "I'll waive it" leaves the landlord waiting. "I've waived it" makes
+      // them stop — they tell their tenant it is handled, nobody follows up,
+      // and the fee is still sitting there when the next statement goes out.
+      //
+      // Gated on ACTIONS, not on tools, for the same reason: the turn that
+      // exposed this called lookup_tenant_payment_status and nothing else. A
+      // read is how you find out whether to act; it is never the acting.
+      if (
+        !toolInvocations.some((t) => isActionTool(t.name)) &&
+        claimsAnActionItNeverTook(out.content)
+      ) {
+        if (!nudgedForClaimedAction) {
+          nudgedForClaimedAction = true
+          logger.warn({ profile: profile.id, message },
+            'agent runner: reply claimed a completed action with no action behind it — forcing one retry')
+          messages.push({ role: 'assistant', content: out.content })
+          messages.push({
+            role: 'system',
+            content:
+              'STOP — you just told them you HAVE done something, and no action ran. Looking ' +
+              'something up is not doing it.\n' +
+              'Either call the tool that actually performs it now, or — if you are missing ' +
+              'something it requires — ask for exactly that and do not claim it is done.\n' +
+              'Never describe an action in the past tense until the tool has come back. They will ' +
+              'stop chasing it, and nobody will find out for weeks.',
+          })
+          continue
+        }
+        // Asked once, declined. This does not go out.
+        logger.error({ profile: profile.id, message },
+          'agent runner: claimed a completed action twice with no action behind it — suppressed')
+        return { reply: couldNotDoIt(), model, retrieved, grounded, toolInvocations, usage }
       }
       // S626: a sales turn that offered or confirmed a TIME without ever opening
       // the calendar. See OFFERS_A_MEETING_TIME. Prospect only — no other

@@ -110,7 +110,6 @@ describe('the promised-action nudge', () => {
  * are also nouns ("there is an issue", "a refund takes three days"), and a
  * guard that fires on those burns a generation on every ordinary explanation.
  */
-import { promisesAnAction } from './agentRunner'
 
 describe('promisesAnAction — money and lease verbs', () => {
   it.each([
