@@ -239,6 +239,13 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM unit_inspections`)
   // lease_documents FKs leases.id; its children (signers / fields)
   // cascade on parent delete.
+  // S629: home_sale_contracts.purchase_document_id FKs lease_documents — the
+  // signed purchase agreement a financed sale bills from. Contracts must go
+  // first or the document delete violates that reference. (It is deliberately
+  // RESTRICT, not SET NULL: losing the link between a billing schedule and the
+  // paper it came from is exactly what this column exists to prevent.)
+  await db.query(`DELETE FROM home_sale_installments`)
+  await db.query(`DELETE FROM home_sale_contracts`)
   await db.query(`DELETE FROM lease_documents`)
   await db.query(`DELETE FROM leases`)
   // Maintenance comments + media FK to maintenance_requests, which FKs units.

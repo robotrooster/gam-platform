@@ -481,11 +481,19 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                       ))}
                     </div>
                     <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                      {/* S629 (Nic): "I can't find that workflow anywhere in the
+                          user interface." The financed-sale panel only appears
+                          on a PARK-OWNED mobile home, and this control is
+                          pre-set to Tenant-owned — so it reads as already
+                          answered, and nothing said that the other option is
+                          what makes selling the home possible. A landlord who
+                          buys and sells park homes had no way to learn the
+                          question mattered. */}
                       {dwellingOwnership === 'tenant'
                         ? 'Space rent only — inspections cover the site/lot, never their dwelling.'
                         : isRv
                           ? 'Park-owned rental — inspections cover the site plus the RV itself.'
-                          : 'Park-owned rental home — inspections cover the full home interior.'}
+                          : 'Park-owned rental home — inspections cover the full home interior. Only a park-owned home can be sold to the tenant on a financed contract.'}
                     </div>
                   </div>
                 )}

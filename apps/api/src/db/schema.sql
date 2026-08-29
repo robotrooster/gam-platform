@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict eSHfCefsrqB0PnlbhQ1QQ6Ps08PSRNCKPYnGl6aSm7ZzYXbOoFC4ETOcVHYabsZ
+\restrict 6aB4t34TUfCASurz73mhXJhwfYaNYE4kf5nvbkTwiyAdGahmwW3THOGl4Atyebj
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3689,13 +3689,14 @@ CREATE TABLE public.home_sale_contracts (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     plan_type text DEFAULT 'amortized'::text NOT NULL,
+    purchase_document_id uuid,
     CONSTRAINT home_sale_contracts_annual_interest_rate_check CHECK ((annual_interest_rate >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_down_payment_check CHECK ((down_payment >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_financed_amount_check CHECK ((financed_amount >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_monthly_payment_check CHECK ((monthly_payment >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_plan_type_check CHECK ((plan_type = ANY (ARRAY['amortized'::text, 'flat'::text]))),
     CONSTRAINT home_sale_contracts_sale_price_check CHECK ((sale_price > (0)::numeric)),
-    CONSTRAINT home_sale_contracts_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paid_off'::text, 'cancelled'::text]))),
+    CONSTRAINT home_sale_contracts_status_check CHECK ((status = ANY (ARRAY['pending_signature'::text, 'active'::text, 'paid_off'::text, 'cancelled'::text]))),
     CONSTRAINT home_sale_contracts_term_months_check CHECK (((term_months > 0) AND (term_months <= 600)))
 );
 
@@ -3712,6 +3713,13 @@ COMMENT ON TABLE public.home_sale_contracts IS 'S568: financed sale of a landlor
 --
 
 COMMENT ON COLUMN public.home_sale_contracts.plan_type IS 'S594: amortized (price+interest+term) or flat ($X × N, no interest). Flat is stored as 0% amortization so downstream billing/payoff is identical.';
+
+
+--
+-- Name: COLUMN home_sale_contracts.purchase_document_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.home_sale_contracts.purchase_document_id IS 'S629: the signed purchase agreement this billing comes from. Set when the contract is drafted for signature; the contract stays pending_signature (no installments, nothing billed) until that document completes.';
 
 
 --
@@ -13077,6 +13085,20 @@ CREATE UNIQUE INDEX float_account_state_singleton ON public.float_account_state 
 
 
 --
+-- Name: home_sale_contracts_one_live_per_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX home_sale_contracts_one_live_per_unit ON public.home_sale_contracts USING btree (unit_id) WHERE (status = ANY (ARRAY['pending_signature'::text, 'active'::text]));
+
+
+--
+-- Name: home_sale_contracts_purchase_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX home_sale_contracts_purchase_document ON public.home_sale_contracts USING btree (purchase_document_id) WHERE (purchase_document_id IS NOT NULL);
+
+
+--
 -- Name: idx_admin_action_log_action; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20701,6 +20723,14 @@ ALTER TABLE ONLY public.home_sale_contracts
 
 
 --
+-- Name: home_sale_contracts home_sale_contracts_purchase_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_contracts
+    ADD CONSTRAINT home_sale_contracts_purchase_document_id_fkey FOREIGN KEY (purchase_document_id) REFERENCES public.lease_documents(id);
+
+
+--
 -- Name: home_sale_contracts home_sale_contracts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24640,5 +24670,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict eSHfCefsrqB0PnlbhQ1QQ6Ps08PSRNCKPYnGl6aSm7ZzYXbOoFC4ETOcVHYabsZ
+\unrestrict 6aB4t34TUfCASurz73mhXJhwfYaNYE4kf5nvbkTwiyAdGahmwW3THOGl4Atyebj
 

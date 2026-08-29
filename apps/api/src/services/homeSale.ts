@@ -11,11 +11,14 @@
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { logger } from '../lib/logger'
 import { computeAmortization } from '@gam/shared'
 
 type Client = PoolClient
 
 export interface CreateHomeSaleInput {
+  /** S629: hold the terms unsigned — no schedule, nothing billed, until the agreement completes. */
+  pendingSignature?: boolean
   unitId: string
   leaseId: string          // the tenant's space-rent lease — the billing anchor
   tenantId: string
@@ -38,20 +41,39 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
   if (input.termMonths <= 0 || input.termMonths > 600) throw new AppError(400, 'Term must be between 1 and 600 months.')
 
   const existing = await client.query(
-    `SELECT id FROM home_sale_contracts WHERE unit_id=$1 AND status='active' LIMIT 1`, [input.unitId])
-  if (existing.rows.length) throw new AppError(409, 'This unit already has an active home-sale contract.')
+    `SELECT id, status FROM home_sale_contracts
+      WHERE unit_id=$1 AND status IN ('active','pending_signature') LIMIT 1`, [input.unitId])
+  if (existing.rows.length) {
+    throw new AppError(409, existing.rows[0].status === 'pending_signature'
+      ? 'This unit already has a purchase agreement out for signature. Cancel it before starting another.'
+      : 'This unit already has an active home-sale contract.')
+  }
 
   const { monthlyPayment, schedule } = computeAmortization(financed, input.annualInterestRate, input.termMonths)
+
+  // S629: `pendingSignature` holds the agreed terms WITHOUT generating a
+  // schedule, so nothing bills until the purchase agreement comes back signed.
+  // Same rule the leases follow: the signed document is the authority, and
+  // money only moves behind one.
+  const status = input.pendingSignature ? 'pending_signature' : 'active'
 
   const contract = (await client.query<any>(
     `INSERT INTO home_sale_contracts
        (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
-        annual_interest_rate, term_months, monthly_payment, start_month, installments_total, plan_type)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        annual_interest_rate, term_months, monthly_payment, start_month, installments_total, plan_type,
+        status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      RETURNING *`,
     [input.unitId, input.leaseId, input.tenantId, input.landlordId, input.salePrice.toFixed(2),
      input.downPayment.toFixed(2), financed.toFixed(2), input.annualInterestRate, input.termMonths,
-     monthlyPayment.toFixed(2), input.startMonth, schedule.length, input.planType ?? 'amortized'])).rows[0]
+     monthlyPayment.toFixed(2), input.startMonth, schedule.length, input.planType ?? 'amortized',
+     status])).rows[0]
+
+  // A contract awaiting signature has agreed terms and no schedule. The
+  // schedule is written by activateHomeSaleContract when the document
+  // completes — writing it now would mean a tenant who never signs still has
+  // installments sitting in the billing tables.
+  if (status === 'pending_signature') return contract
 
   // Precompute the billing month per installment (start_month + (n-1) months).
   for (const row of schedule) {
@@ -64,6 +86,51 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
        row.remainingBalance.toFixed(2)])
   }
   return contract
+}
+
+/**
+ * S629 — SIGNATURE IS WHAT STARTS THE BILLING.
+ *
+ * Called when a purchase agreement completes. Generates the amortization
+ * schedule and flips the contract to active, so the months a tenant is billed
+ * are the months of the contract they actually signed.
+ *
+ * Idempotent: the e-sign completion path is best-effort and post-commit, so it
+ * can be retried, and a contract already active must not have a second
+ * schedule written under it.
+ */
+export async function activateHomeSaleContract(documentId: string): Promise<{ activated: boolean }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const c = (await client.query<any>(
+      `SELECT * FROM home_sale_contracts
+        WHERE purchase_document_id = $1 AND status = 'pending_signature'
+        FOR UPDATE`, [documentId])).rows[0]
+    if (!c) { await client.query('ROLLBACK'); return { activated: false } }
+
+    const financed = Number(c.financed_amount)
+    const { schedule } = computeAmortization(financed, Number(c.annual_interest_rate), c.term_months)
+
+    for (const row of schedule) {
+      await client.query(
+        `INSERT INTO home_sale_installments
+           (contract_id, installment_number, billing_month, amount, principal_portion, interest_portion, remaining_balance)
+         VALUES ($1,$2, ($3::date + ($4::int || ' months')::interval)::date, $5,$6,$7,$8)`,
+        [c.id, row.installmentNumber, c.start_month, row.installmentNumber - 1,
+         row.amount.toFixed(2), row.principalPortion.toFixed(2), row.interestPortion.toFixed(2),
+         row.remainingBalance.toFixed(2)])
+    }
+    await client.query(
+      `UPDATE home_sale_contracts SET status='active', updated_at=NOW() WHERE id=$1`, [c.id])
+    await client.query('COMMIT')
+    logger.info({ contractId: c.id, documentId, installments: schedule.length },
+      'home sale: purchase agreement signed — billing schedule created')
+    return { activated: true }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
 }
 
 /**

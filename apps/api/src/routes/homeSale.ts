@@ -15,6 +15,27 @@ homeSaleRouter.use(requireAuth)
 // planType defaults to 'amortized' so existing callers (no planType) are
 // unchanged. 'flat' takes monthlyAmount + numberOfPayments instead of
 // price/interest/term; the handler derives the 0%-amortization inputs from them.
+
+/**
+ * S629: who signs a purchase agreement — the selling landlord and the buying
+ * tenant. Deliberately NOT the whole lease roster: a lease can have four
+ * signers, and the person buying the home is the one named on this contract.
+ */
+async function purchaseSigners(client: any, landlordId: string, tenantId: string) {
+  const l = (await client.query(
+    `SELECT u.id, u.first_name, u.last_name, u.email FROM landlords l
+       JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])).rows[0]
+  const t = (await client.query(
+    `SELECT u.id, u.first_name, u.last_name, u.email FROM tenants t
+       JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])).rows[0]
+  if (!l || !t) throw new AppError(404, 'Could not resolve both parties to the sale.')
+  const name = (r: any) => `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || r.email
+  return [
+    { userId: l.id, role: 'landlord', name: name(l), email: l.email },
+    { userId: t.id, role: 'primary',  name: name(t), email: t.email },
+  ]
+}
+
 const createSchema = z.object({
   unitId:             z.string().uuid(),
   leaseId:            z.string().uuid(),
@@ -29,6 +50,11 @@ const createSchema = z.object({
   // flat inputs
   monthlyAmount:      z.number().positive().optional(),
   numberOfPayments:   z.number().int().positive().max(600).optional(),
+  // S629 (Nic): send the purchase agreement for signature and let the SIGNATURE
+  // start the billing. The contract is created holding the agreed terms with no
+  // schedule and nothing billed until that document completes. Optional so the
+  // existing direct-create path (a sale papered outside GAM) still works.
+  templateId:         z.string().uuid().optional(),
 })
 
 // POST /api/home-sales — create a financing contract + amortization schedule.
@@ -40,7 +66,7 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     // landlord-owned (you can only finance-sell a home the park owns; it flips
     // to tenant-owned on payoff).
     const unit = await queryOne<any>(
-      `SELECT u.id, u.landlord_id, u.dwelling_ownership, u.unit_type
+      `SELECT u.id, u.landlord_id, u.dwelling_ownership, u.unit_type, u.unit_number
          FROM units u WHERE u.id = $1`, [body.unitId])
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
@@ -93,7 +119,30 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
       unitId: body.unitId, leaseId: body.leaseId, tenantId: body.tenantId, landlordId: unit.landlord_id,
       salePrice, downPayment, annualInterestRate, termMonths, startMonth: body.startMonth,
       planType: body.planType,
+      pendingSignature: !!body.templateId,
     })
+
+    // S629: draft the purchase agreement from the terms just agreed and bind
+    // it to the contract. The document is the authority — the contract stays
+    // pending_signature, with no installments, until it comes back signed.
+    if (body.templateId) {
+      // Imported here rather than at module scope: esign.ts imports
+      // activateHomeSaleContract from services/homeSale, and a static import
+      // back the other way closes the cycle.
+      const { createDocumentRecord } = await import('./esign')
+      const doc = await createDocumentRecord(client, {
+        landlordId: unit.landlord_id, templateId: body.templateId,
+        unitId: body.unitId, leaseId: body.leaseId,
+        title: `Purchase agreement — Unit ${unit.unit_number}`,
+        basePdfUrl: null, documentType: 'purchase_agreement',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: await purchaseSigners(client, unit.landlord_id, body.tenantId),
+      })
+      await client.query(
+        `UPDATE home_sale_contracts SET purchase_document_id=$2, updated_at=NOW() WHERE id=$1`,
+        [contract.id, doc.id])
+      contract.purchase_document_id = doc.id
+    }
     await client.query('COMMIT')
 
     const schedule = await query<any>(

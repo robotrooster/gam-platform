@@ -40,6 +40,7 @@ import path from 'path'
 import fs from 'fs'
 import { logger } from '../lib/logger'
 import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType } from '../services/householdLeaseDraft'
+import { activateHomeSaleContract } from '../services/homeSale'
 
 export const esignRouter = Router()
 
@@ -3902,6 +3903,30 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       }
 
       await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+
+      // S629 (Nic): a signed PURCHASE AGREEMENT is what starts a financed home
+      // sale billing. The contract has been sitting in pending_signature with
+      // its terms and no schedule; this writes the installments and makes it
+      // active, so what gets billed is what was signed.
+      //
+      // Best-effort and post-commit like the neighbours here: the signature is
+      // already recorded and must not be rolled back if scheduling fails.
+      // activateHomeSaleContract is idempotent, and a failure leaves the
+      // contract pending — visible, and retryable — rather than half-billed.
+      if (doc.document_type === 'purchase_agreement') {
+        try {
+          await activateHomeSaleContract(doc.id)
+        } catch (e) {
+          logger.error({ err: e, documentId: doc.id }, '[HomeSale][activate-on-signature]')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'home_sale_activation_failed',
+            title:    `Home-sale billing not started for signed agreement ${doc.id}`,
+            body:     e instanceof Error ? e.message : String(e),
+            context:  { document_id: doc.id },
+          }).catch(() => {})
+        }
+      }
 
       // S576 (B-8): a completed RENEWAL means the new lease now exists — if the
       // tenant's work-trade agreement is still active, auto-draft a fresh

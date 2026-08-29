@@ -2,10 +2,10 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
-import { db } from '../db'
+import { db, query, queryOne, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 import { computeAmortization } from '@gam/shared'
-import { billDueHomeSaleInstallments, reconcileHomeSaleContract } from '../services/homeSale'
+import { billDueHomeSaleInstallments, reconcileHomeSaleContract, createHomeSaleContract, activateHomeSaleContract } from '../services/homeSale'
 import { homeSaleRouter } from './homeSale'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -223,5 +223,76 @@ describe('home-sale billing + payoff', () => {
     expect(contract.rows[0].status).toBe('paid_off')
     const unit = await db.query<any>(`SELECT dwelling_ownership FROM units WHERE id=$1`, [f.unitId])
     expect(unit.rows[0].dwelling_ownership).toBe('tenant')   // buyer now owns the home
+  })
+})
+
+/**
+ * S629 — the signed purchase agreement is what starts the billing.
+ *
+ * Nic: "we need to be able to have a separate purchase contract sent through
+ * the esignature flow that's separate from the lease, but still read for the
+ * monthly billing."
+ *
+ * Before this, a home-sale contract was hand-created and billed from the
+ * moment it existed. Any purchase agreement was an unrelated document, so the
+ * terms a tenant signed and the terms GAM billed were two independent facts
+ * nothing reconciled — over a multi-year financed sale, that is the gap that
+ * matters.
+ */
+describe('purchase agreement gates the billing', () => {
+  it('a contract awaiting signature has NO installments', async () => {
+    const { unitId, leaseId, tenantId, landlordId } = await seed()
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const c = await createHomeSaleContract(client, {
+        unitId, leaseId, tenantId, landlordId,
+        salePrice: 24000, downPayment: 0, annualInterestRate: 0,
+        termMonths: 24, startMonth: '2026-09-01', planType: 'flat',
+        pendingSignature: true,
+      })
+      await client.query('COMMIT')
+      expect(c.status).toBe('pending_signature')
+      const rows = await query<any>(
+        `SELECT 1 FROM home_sale_installments WHERE contract_id=$1`, [c.id])
+      expect(rows).toHaveLength(0)
+    } finally { client.release() }
+  })
+
+  it('activating on signature writes the schedule exactly once', async () => {
+    const { unitId, leaseId, tenantId, landlordId } = await seed()
+    const docId = (await db.query(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1,$2,'Purchase agreement','purchase_agreement','sent') RETURNING id`,
+      [landlordId, unitId])).rows[0].id
+    const client = await getClient()
+    let contractId = ''
+    try {
+      await client.query('BEGIN')
+      const c = await createHomeSaleContract(client, {
+        unitId, leaseId, tenantId, landlordId,
+        salePrice: 24000, downPayment: 0, annualInterestRate: 0,
+        termMonths: 24, startMonth: '2026-09-01', planType: 'flat',
+        pendingSignature: true,
+      })
+      contractId = c.id
+      await client.query(
+        `UPDATE home_sale_contracts SET purchase_document_id=$2 WHERE id=$1`, [c.id, docId])
+      await client.query('COMMIT')
+    } finally { client.release() }
+
+    expect((await activateHomeSaleContract(docId)).activated).toBe(true)
+    const after = await queryOne<any>(`SELECT status FROM home_sale_contracts WHERE id=$1`, [contractId])
+    expect(after.status).toBe('active')
+    const rows = await query<any>(
+      `SELECT 1 FROM home_sale_installments WHERE contract_id=$1`, [contractId])
+    expect(rows).toHaveLength(24)
+
+    // Idempotent: the e-sign completion path is best-effort and retryable, so a
+    // second call must not write a second schedule under an active contract.
+    expect((await activateHomeSaleContract(docId)).activated).toBe(false)
+    const again = await query<any>(
+      `SELECT 1 FROM home_sale_installments WHERE contract_id=$1`, [contractId])
+    expect(again).toHaveLength(24)
   })
 })
