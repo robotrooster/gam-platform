@@ -114,35 +114,44 @@ describe('unit ↔ subtype linking (S613)', () => {
 
   // The behaviour Nic expected and did not have: raise the class, every unit
   // in it follows. Enforced by DB trigger, so it holds whichever door edits it.
-  it('editing a class price moves every unit in it, and nothing else', async () => {
+  // S629 (Nic, DIRECTIVE — supersedes S613): "pricing should not necessarily be
+  // linked to subtypes... the subtype is more just for classification,
+  // reporting type things — how many people wanted 30 amp versus 50 amp spots.
+  // It's more of a reporting metric and portfolio statistic gauge than a
+  // pricing gauge. Pricing should be per individual unit."
+  //
+  // These three tests asserted the S613 model — class owns the price, per-unit
+  // pricing refused with a 400 — and are inverted rather than deleted, because
+  // the behaviour they describe is exactly what must NOT happen now.
+  it('editing a class price leaves the units in it alone', async () => {
     const app = buildApp(); const f = await seed()
     const s = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 440 })
-    const other = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 30 amp', rentAmount: 400 })
     await request(app).put(`/api/properties/${f.propertyId}/unit-subtypes/${s.id}/units`)
       .set('Authorization', `Bearer ${f.token}`).send({ unitIds: [f.rvA] })
-    await request(app).put(`/api/properties/${f.propertyId}/unit-subtypes/${other.id}/units`)
-      .set('Authorization', `Bearer ${f.token}`).send({ unitIds: [f.rvB] })
 
     await request(app).post(`/api/properties/${f.propertyId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.token}`)
       .send({ id: s.id, unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 480 })
 
-    const rows = (await db.query(`SELECT id, rent_amount FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
-    expect(Number(rows.find((r: any) => r.id === f.rvA).rent_amount)).toBe(480)
-    expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(400)
+    // The class price is a DEFAULT for units created after it, never a
+    // retroactive reprice: a spot already quoted at 440 stays at 440.
+    const row = (await db.query(`SELECT rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
+    expect(Number(row.rent_amount)).toBe(440)
   })
 
-  it('a unit IN a subtype cannot be priced on its own', async () => {
+  it('a unit IN a subtype can be priced on its own', async () => {
     const app = buildApp(); const f = await seed()
     const s = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 440 })
     await request(app).patch(`/api/units/${f.rvA}/subtype`)
       .set('Authorization', `Bearer ${f.token}`).send({ subtypeId: s.id })
     const res = await request(app).patch(`/api/units/${f.rvA}/details`)
       .set('Authorization', `Bearer ${f.token}`).send({ rentAmount: 700 })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Back-in 50 amp/)
-    const row = (await db.query(`SELECT rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
-    expect(Number(row.rent_amount)).toBe(440)
+    expect(res.status).toBe(200)
+    const row = (await db.query(`SELECT rent_amount, subtype_id FROM units WHERE id=$1`, [f.rvA])).rows[0]
+    expect(Number(row.rent_amount)).toBe(700)
+    // Still classified — the label survives the price change, which is the
+    // whole point of it being a label.
+    expect(row.subtype_id).toBe(s.id)
   })
 
   // Subtypes are OPTIONAL (Nic). A landlord adding one unit types a rent and
@@ -230,17 +239,23 @@ describe('unit ↔ subtype linking (S613)', () => {
     expect(Number(edit.body.data.rent_amount)).toBe(600)
   })
 
-  // And a unit still inside a class must never drift from its neighbours.
-  it('two units in one class cannot be priced apart', async () => {
+  // S629 (Nic): two units in one class MAY be priced apart — a corner spot and
+  // a roadside one are both "Back-in 50 amp" and are not worth the same. The
+  // class answers how many of each we have, not what they cost.
+  it('two units in one class can be priced apart', async () => {
     const app = buildApp(); const f = await seed()
     const s = await makeSubtype(app, f, { unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 440 })
     await request(app).put(`/api/properties/${f.propertyId}/unit-subtypes/${s.id}/units`)
       .set('Authorization', `Bearer ${f.token}`).send({ unitIds: [f.rvA, f.rvB] })
     const res = await request(app).patch(`/api/units/${f.rvA}/details`)
       .set('Authorization', `Bearer ${f.token}`).send({ rentAmount: 700 })
-    expect(res.status).toBe(400)
-    const rows = (await db.query(`SELECT rent_amount FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
-    expect(rows.every((r: any) => Number(r.rent_amount) === 440)).toBe(true)
+    expect(res.status).toBe(200)
+    const rows = (await db.query(
+      `SELECT id, rent_amount, subtype_id FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
+    expect(Number(rows.find((r: any) => r.id === f.rvA).rent_amount)).toBe(700)
+    // The neighbour is untouched, and both keep the classification.
+    expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(440)
+    expect(rows.every((r: any) => r.subtype_id === s.id)).toBe(true)
   })
 })
 

@@ -66,45 +66,16 @@ export function UnitDetailPage() {
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState<any>(null)
   const [detailsErr, setDetailsErr] = useState('')
-  // S629 (Nic): "when there's no lease, it needs to be changeable from the unit
-  // overview page." The price still belongs to the CLASS — his S613 rule that a
-  // subtype's units share one price stands — so the unit page edits the
-  // subtype, and the field says how many units that moves. Locked while a lease
-  // is running: the signed lease sets the rent.
-  const hasActiveLease = !!unit?.hasActiveLease
-  const { data: subtypeUnits = [] } = useQuery<any[]>(
-    ['subtype-units', unit?.propertyId, unit?.subtypeId],
-    () => apiGet(`/properties/${unit!.propertyId}/unit-subtypes/${unit!.subtypeId}/units`),
-    { enabled: !!unit?.subtypeId && !!unit?.propertyId })
-  const subtypeUnitCount = (subtypeUnits as any[]).length || 1
-  const classPriceEditable = editing && !!unit?.subtypeId && !hasActiveLease
+  // S629 (Nic, DIRECTIVE): every unit owns its price. The lease-lock on the
+  // Edit button is what protects a price that is actually in force — a unit
+  // under an active lease is not editable at all.
 
   const detailsMut = useMutation(
-    async (body: any) => {
-      // A classed unit's price is written to the subtype, in the same save, so
-      // one Save button still means one action to the person pressing it.
-      if (unit?.subtypeId && !hasActiveLease && editForm.rentAmount !== '') {
-        const next = Number(editForm.rentAmount)
-        if (Number.isFinite(next) && next !== Number(unit.rentAmount)) {
-          // The subtype endpoint takes the WHOLE row (unitType and name are
-          // required, the rest overwrite), so the current one is read back and
-          // merged. Posting just the price would blank the class's layout, amp
-          // service and bed/bath — silently, and for every unit in it.
-          const all = await apiGet<any[]>(`/properties/${unit.propertyId}/unit-subtypes`)
-          const current = (all as any[]).find(x => x.id === unit.subtypeId)
-          if (!current) throw new Error('Could not load this unit class to update its price.')
-          await apiPost(`/properties/${unit.propertyId}/unit-subtypes`, {
-            ...current, id: unit.subtypeId, rentAmount: next,
-          })
-        }
-      }
-      return apiPatch('/units/' + id + '/details', body)
-    },
+    (body: any) => apiPatch('/units/' + id + '/details', body),
     {
       onSuccess: () => {
         setDetailsErr(''); setEditing(false)
         qc.invalidateQueries(['unit', id]); qc.invalidateQueries('units')
-        qc.invalidateQueries(['subtype-units', unit?.propertyId, unit?.subtypeId])
       },
       onError: (e: any) => setDetailsErr(e?.response?.data?.error || e?.response?.data?.message || 'Could not save unit settings'),
     },
@@ -142,18 +113,11 @@ export function UnitDetailPage() {
       bedrooms: num(f.bedrooms),
       bathrooms: num(f.bathrooms),
       sqft: f.sqft === '' ? null : Number(f.sqft),
-      // S613: only a unit outside a subtype owns its price. Sending these for a
-      // classed unit is refused by the API rather than silently ignored.
-      //
-      // S629 (Nic): "it needs to be changeable from the unit overview page."
-      // For a CLASSED unit the price still belongs to the class — his S613 rule
-      // stands, all units of a subtype share one price — so the edit is routed
-      // to the subtype below rather than blocked. The unit page is simply where
-      // he is standing when he wants to change it.
-      ...(unit.subtypeId ? {} : {
-        rentAmount: num(f.rentAmount),
-        securityDeposit: num(f.securityDeposit),
-      }),
+      // S629 (Nic, DIRECTIVE): every unit owns its price, classed or not. The
+      // subtype is a label for reporting — 30 amp versus 50 amp, back-in versus
+      // pull-through — and two units wearing it can be worth different money.
+      rentAmount: num(f.rentAmount),
+      securityDeposit: num(f.securityDeposit),
       dwellingOwnership: f.dwellingOwnership,
       ownerHouseholdSize: Math.max(1, Number(f.ownerHouseholdSize) || 1),
       isMultiLevel: f.isMultiLevel,
@@ -344,28 +308,20 @@ export function UnitDetailPage() {
                       that belongs to a class. */}
                   {unit.subtypeId ? (
                     <>
-                      {/* S629 (Nic): editable here, but it is still the CLASS
-                          price — changing it moves every unit of that subtype,
-                          and the label says so with the count. Locked while a
-                          lease is running: the signed lease sets the rent, and
-                          this field must never look like it can change one. */}
+                      {/* S629 (Nic, DIRECTIVE): this unit's own price. The
+                          subtype is shown as the label it now is — what the
+                          unit IS, for reporting — not what it costs. */}
                       <div className="data-row"><span className="data-key">Rent (/mo)</span>
-                        {classPriceEditable ? (
+                        {editing ? (
                           <span className="data-val mono" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <input {...inpS} type="number" min={0} step={1} value={editForm.rentAmount}
                                    onChange={e => set('rentAmount', e.target.value)} />
                             <span style={{ color: 'var(--text-3)', fontSize: '.68rem', fontFamily: 'inherit' }}>
-                              {subtypeUnitCount > 1
-                                ? `changes all ${subtypeUnitCount} ${unit.subtypeName} units`
-                                : `${unit.subtypeName} — the only unit in this class`}
+                              this unit only · {unit.subtypeName} is a classification
                             </span>
                           </span>
                         ) : (
-                          <span className="data-val mono">{fmt(unit.rentAmount)}
-                            <span style={{ color: 'var(--text-3)', fontSize: '.7rem', marginLeft: 6, fontFamily: 'inherit' }}>
-                              set by {unit.subtypeName}{hasActiveLease ? ' · locked while a lease is active' : ''}
-                            </span>
-                          </span>
+                          <span className="data-val mono">{fmt(unit.rentAmount)}</span>
                         )}
                       </div>
                       <div className="data-row"><span className="data-key">Deposit</span>

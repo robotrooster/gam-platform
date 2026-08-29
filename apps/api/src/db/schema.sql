@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SNf3Nn3miBxRkPpBsa0XDqIpbBndoiqOY2su9rxuTkwIJQUsJv6CaGnhiH7B2Gr
+\restrict kgYWvMhBzfE45vytPUshTWKzQWQ0ejeJHV0MPrg4OUkrzDk5sdtOf5848eekGub
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -137,35 +137,6 @@ BEGIN
     RETURN OLD;
   END IF;
   RETURN NULL;
-END;
-$$;
-
-
---
--- Name: enforce_subtype_pricing(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.enforce_subtype_pricing() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-DECLARE s RECORD;
-BEGIN
-  IF NEW.subtype_id IS NULL OR NEW.retired_at IS NOT NULL THEN
-    RETURN NEW;
-  END IF;
-  SELECT rent_amount, security_deposit, nightly_rate, weekly_rate, monthly_rate
-    INTO s FROM property_unit_subtypes WHERE id = NEW.subtype_id;
-  IF NOT FOUND THEN
-    RETURN NEW;
-  END IF;
-  -- rent_amount is NOT NULL on units: a class with no rent set leaves the unit's
-  -- own number rather than failing the write.
-  NEW.rent_amount      := COALESCE(s.rent_amount, NEW.rent_amount);
-  NEW.security_deposit := COALESCE(s.security_deposit, 0);
-  NEW.nightly_rate     := s.nightly_rate;
-  NEW.weekly_rate      := s.weekly_rate;
-  NEW.monthly_rate     := s.monthly_rate;
-  RETURN NEW;
 END;
 $$;
 
@@ -367,35 +338,6 @@ BEGIN
      AND status IN ('vacant', 'available')
      AND retired_at IS NULL;
 
-  RETURN NEW;
-END;
-$$;
-
-
---
--- Name: propagate_subtype_pricing(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.propagate_subtype_pricing() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-  IF NEW.rent_amount      IS DISTINCT FROM OLD.rent_amount
-  OR NEW.security_deposit IS DISTINCT FROM OLD.security_deposit
-  OR NEW.nightly_rate     IS DISTINCT FROM OLD.nightly_rate
-  OR NEW.weekly_rate      IS DISTINCT FROM OLD.weekly_rate
-  OR NEW.monthly_rate     IS DISTINCT FROM OLD.monthly_rate THEN
-    UPDATE units u SET
-      -- rent_amount is NOT NULL on units; a class that clears its rent leaves
-      -- the last known number rather than failing the landlord's save.
-      rent_amount      = COALESCE(NEW.rent_amount, u.rent_amount),
-      security_deposit = COALESCE(NEW.security_deposit, 0),
-      nightly_rate     = NEW.nightly_rate,
-      weekly_rate      = NEW.weekly_rate,
-      monthly_rate     = NEW.monthly_rate,
-      updated_at       = NOW()
-     WHERE u.subtype_id = NEW.id AND u.retired_at IS NULL;
-  END IF;
   RETURN NEW;
 END;
 $$;
@@ -6946,6 +6888,13 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
 );
+
+
+--
+-- Name: COLUMN property_unit_subtypes.rent_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_unit_subtypes.rent_amount IS 'S629: a DEFAULT applied when a unit is created in this class, not a live link. Each unit owns its price after that; the subtype is a classification for reporting.';
 
 
 --
@@ -18568,13 +18517,6 @@ CREATE TRIGGER trg_emergency_contacts_updated_at BEFORE UPDATE ON public.emergen
 
 
 --
--- Name: units trg_enforce_subtype_pricing; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_enforce_subtype_pricing BEFORE INSERT OR UPDATE ON public.units FOR EACH ROW EXECUTE FUNCTION public.enforce_subtype_pricing();
-
-
---
 -- Name: generated_routes trg_generated_routes_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -18684,13 +18626,6 @@ CREATE TRIGGER trg_payments_invoice_status_rollup AFTER INSERT OR DELETE OR UPDA
 --
 
 CREATE TRIGGER trg_pool_match_requests_updated_at BEFORE UPDATE ON public.pool_match_requests FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
---
--- Name: property_unit_subtypes trg_propagate_subtype_pricing; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_propagate_subtype_pricing AFTER UPDATE ON public.property_unit_subtypes FOR EACH ROW EXECUTE FUNCTION public.propagate_subtype_pricing();
 
 
 --
@@ -24774,5 +24709,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SNf3Nn3miBxRkPpBsa0XDqIpbBndoiqOY2su9rxuTkwIJQUsJv6CaGnhiH7B2Gr
+\unrestrict kgYWvMhBzfE45vytPUshTWKzQWQ0ejeJHV0MPrg4OUkrzDk5sdtOf5848eekGub
 

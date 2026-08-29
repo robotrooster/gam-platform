@@ -118,6 +118,23 @@ export async function setSubtypeUnits(
     const result: ApplySubtypeResult = { linked: targets.length, detailsApplied: 0 }
     for (const u of targets) {
       await client.query(`UPDATE units SET subtype_id=$1, updated_at=NOW() WHERE id=$2`, [subtype.id, u.id])
+      // S629 (Nic): the class's prices are a DEFAULT, applied once, and only
+      // where the unit has none of its own. The trigger that used to force them
+      // on every write is gone — pricing is per unit now — but a short-stay
+      // unit joining a class with no nightly rate of its own should still pick
+      // one up, which is the "default a bunch of things for quickness" half of
+      // the directive. COALESCE, never an overwrite: a rate somebody set is a
+      // decision, and joining a class is not a reason to undo it.
+      await client.query(
+        `UPDATE units SET
+           security_deposit = COALESCE(security_deposit, $2::numeric),
+           nightly_rate     = COALESCE(nightly_rate,     $3::numeric),
+           weekly_rate      = COALESCE(weekly_rate,      $4::numeric),
+           monthly_rate     = COALESCE(monthly_rate,     $5::numeric),
+           updated_at = NOW()
+         WHERE id = $1`,
+        [u.id, subtype.security_deposit, subtype.nightly_rate,
+         subtype.weekly_rate, subtype.monthly_rate])
       await applyPricingToUnit(client, subtype, u)
       if (!opts.applyDetails) continue
       await applyDetailsToUnit(client, subtype, u)

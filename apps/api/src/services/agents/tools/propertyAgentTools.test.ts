@@ -43,15 +43,22 @@ async function seedBookableProperty(opts: { slug: string; backInNightly?: number
     }
     const backInId = await subtype('Back-in 30A', 'back_in', '30', opts.backInNightly ?? 45, 270)
     const pullThruId = await subtype('Pull-through 50A', 'pull_through', '50', opts.pullThruNightly ?? 65, 390)
-    const mkUnit = async (subtypeId: string) => {
+    // S629 (Nic, DIRECTIVE): the UNIT owns its rates now — a subtype is a
+    // classification for reporting (30 amp vs 50 amp, back-in vs pull-through),
+    // not a price list. This fixture used to set only subtype_id and let a
+    // database trigger copy the rates down; that trigger is gone, so the rates
+    // are seeded where they actually live.
+    const mkUnit = async (subtypeId: string, nightly: number, weekly: number) => {
       const unitId = await seedUnit(client, { propertyId, landlordId, unitType: 'rv_spot' })
       await client.query(
-        `UPDATE units SET is_bookable=TRUE, lease_types_allowed=ARRAY['nightly','weekly'], subtype_id=$2 WHERE id=$1`,
-        [unitId, subtypeId])
+        `UPDATE units SET is_bookable=TRUE, lease_types_allowed=ARRAY['nightly','weekly'],
+                          subtype_id=$2, nightly_rate=$3, weekly_rate=$4
+          WHERE id=$1`,
+        [unitId, subtypeId, nightly, weekly])
       return unitId
     }
-    await mkUnit(backInId)
-    await mkUnit(pullThruId)
+    await mkUnit(backInId, opts.backInNightly ?? 45, 270)
+    await mkUnit(pullThruId, opts.pullThruNightly ?? 65, 390)
     await client.query('COMMIT')
     return { propertyId, landlordId, backInId, pullThruId }
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }

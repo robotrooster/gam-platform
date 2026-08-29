@@ -1055,26 +1055,23 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
 
-    // S613 (Nic, DIRECTIVE): "when there is a subtype set, all units with that
-    // subtype have to be the same price because it's set at the subtype level.
-    // If one doesn't exist, then it can be a different price."
+    // S629 (Nic, DIRECTIVE — supersedes S613): "pricing should not necessarily
+    // be linked to subtypes, as things that have different subtypes may be
+    // differently priced. The subtype is more just for classification,
+    // reporting type things — how many people wanted 30 amp versus 50 amp
+    // spots, back-in versus pull-through. It's more of a reporting metric and
+    // portfolio statistic gauge than a pricing gauge. Pricing should be per
+    // individual unit."
     //
-    // So the price fields live here for an unclassed unit and are refused for a
-    // classed one — accepting them there would let two units of one class drift
-    // apart, which is the whole thing a class prevents. Refusing out loud beats
-    // ignoring: a save that reports success and changes nothing is how the
-    // subtype overwrite went unnoticed for a session.
-    const priceFields = ['rentAmount', 'securityDeposit', 'nightlyRate', 'weeklyRate', 'monthlyRate'] as const
-    const sentPrice = priceFields.filter(k => (body as any)[k] !== undefined)
-    const classOwnsPrice = !!unit.subtype_id
-    if (sentPrice.length && classOwnsPrice) {
-      const sub = await queryOne<any>(
-        `SELECT name FROM property_unit_subtypes WHERE id=$1`, [unit.subtype_id])
-      throw new AppError(400,
-        `This unit is a "${sub?.name ?? 'subtype'}", and that subtype sets the price for every unit ` +
-        'in it. Change it on the subtype and they all follow — or take this unit out of the subtype ' +
-        'to price it on its own.')
-    }
+    // S613 read the class as owning the price, and refused a price on any unit
+    // inside one. That is now the wrong model: a class is a LABEL, and two
+    // units wearing the same label can be worth different money. The subtype's
+    // price survives as a DEFAULT at creation — bulk-adding twenty spots at one
+    // price is still one action — but it stops being a live link, so changing a
+    // class never silently reprices units that were already sold at a figure.
+    //
+    // Every unit owns its price now, classed or not. The lease-lock below is
+    // what protects a price that is actually in force.
 
     // Lease-lock — the whole point of this workflow (Nic): no edits while a
     // lease is active/pending; everything is editable only between leases.
@@ -1120,14 +1117,14 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
     const bedrooms   = body.bedrooms ?? unit.bedrooms
     const bathrooms  = body.bathrooms ?? unit.bathrooms
     const sqft       = body.sqft === undefined ? unit.sqft : body.sqft
-    // S613: a CLASSED unit carries these through untouched — its subtype writes
-    // them, via the trigger when the class is edited and via the link when the
-    // unit moves class. An unclassed unit owns them, as it always did.
-    const rentAmount = classOwnsPrice ? Number(unit.rent_amount) : (body.rentAmount ?? Number(unit.rent_amount))
-    const securityDeposit = classOwnsPrice ? Number(unit.security_deposit) : (body.securityDeposit ?? Number(unit.security_deposit))
-    const nightlyRate = classOwnsPrice || body.nightlyRate === undefined ? unit.nightly_rate : body.nightlyRate
-    const weeklyRate  = classOwnsPrice || body.weeklyRate  === undefined ? unit.weekly_rate  : body.weeklyRate
-    const monthlyRate = classOwnsPrice || body.monthlyRate === undefined ? unit.monthly_rate : body.monthlyRate
+    // S629 (Nic): every unit owns its own price, classed or not. The subtype is
+    // a label for reporting — 30 amp versus 50 amp, back-in versus
+    // pull-through — not a price list.
+    const rentAmount = body.rentAmount ?? Number(unit.rent_amount)
+    const securityDeposit = body.securityDeposit ?? Number(unit.security_deposit)
+    const nightlyRate = body.nightlyRate === undefined ? unit.nightly_rate : body.nightlyRate
+    const weeklyRate  = body.weeklyRate  === undefined ? unit.weekly_rate  : body.weeklyRate
+    const monthlyRate = body.monthlyRate === undefined ? unit.monthly_rate : body.monthlyRate
     const lotRentAmount = body.lotRentAmount ?? Number(unit.lot_rent_amount ?? 0)
     const occupancyMode = body.occupancyMode ?? unit.occupancy_mode
     // S573: living-area count (bedroom types only) + feature map (only keys the
