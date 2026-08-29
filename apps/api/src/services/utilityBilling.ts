@@ -1192,6 +1192,42 @@ async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promis
   }
 }
 
+/**
+ * Does the tenant owe this utility?
+ *
+ * S629 DIRECTIVE (Nic): "the lease can't be the only source of charges in the
+ * system... bill it off of the fact that we set our different submeters and
+ * utilities per unit. And when there's an active lease on that unit, you bill
+ * at the rate from that unit or from that property."
+ *
+ * The unit's utility configuration governs, because the printed lease goes
+ * stale and the physical arrangement does not. Oak Park's apartment lease §10
+ * still reads "Landlord shall pay for water and sewer and for trash pickup",
+ * written when trash was a shared RUBS dumpster; people from around town began
+ * dumping furniture in it, so the park moved to per-can billing and the
+ * apartment now pays for water and trash. The meter setup is current, the
+ * clause is not.
+ *
+ * A tagged utility field on a lease still wins where one exists, because that
+ * is somebody deliberately saying otherwise about that specific lease. No Oak
+ * Park template tags one, so configuration decides there — which is the point.
+ * Before this, the absent row was read as "landlord pays" and silently zeroed
+ * out utility billing for the entire property.
+ */
+async function tenantOwesUtility(
+  leaseId: string | null, utilityType: string, meterId: string,
+): Promise<boolean> {
+  if (leaseId) {
+    const resp = await queryOne<{ tenant_responsible: boolean }>(`
+      SELECT tenant_responsible FROM lease_utility_responsibilities
+       WHERE lease_id = $1 AND utility_type = $2`, [leaseId, utilityType])
+    if (resp) return !!resp.tenant_responsible   // the lease spoke
+  }
+  const m = await queryOne<{ billing_method: string }>(
+    `SELECT billing_method FROM utility_meters WHERE id = $1`, [meterId])
+  return !!m && m.billing_method !== 'master_bill_to_landlord'
+}
+
 interface InsertBillArgs {
   meterId: string
   unitId: string
@@ -1375,11 +1411,7 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     lt = { lease_id: null as any, tenant_id: sa.tenant_id }
   } else {
     // Tenant responsibility gate — leases only. See the S610 handoff §1a.
-    const resp = await queryOne<{ tenant_responsible: boolean }>(`
-      SELECT tenant_responsible FROM lease_utility_responsibilities
-       WHERE lease_id = $1 AND utility_type = $2
-    `, [lt.lease_id, args.utilityType])
-    if (!resp || !resp.tenant_responsible) return false
+    if (!await tenantOwesUtility(lt.lease_id, args.utilityType, args.meterId)) return false
   }
 
   try {
@@ -1568,19 +1600,16 @@ export async function releaseSuspendedChargesForLease(args: {
       // so this is the first moment the terms can be applied — and if the
       // signed lease does not pass this utility through, the tenant never owed
       // it. Cancel the hold (kept, with a reason) instead of billing it.
-      const resp = await queryOne<{ tenant_responsible: boolean }>(`
-        SELECT tenant_responsible FROM lease_utility_responsibilities
-         WHERE lease_id = $1 AND utility_type = $2`, [args.leaseId, h.utility_type])
-      if (!resp || !resp.tenant_responsible) {
+      if (!await tenantOwesUtility(args.leaseId, h.utility_type, h.meter_id)) {
         await query(`
           UPDATE suspended_utility_charges
              SET cancelled_at = now(), updated_at = now(),
                  notes = COALESCE(notes,'') ||
-                   ' — not billed: the signed lease does not make the tenant responsible for '
+                   ' — not billed: neither the lease nor the meter makes the tenant responsible for '
                    || $2
            WHERE id = $1`, [h.id, h.utility_type])
         logger.info({ suspendedId: h.id, unitId: args.unitId, utility: h.utility_type },
-          'utility billing: held share dropped — the lease does not pass this utility through')
+          'utility billing: held share dropped — this utility is not passed through to the tenant')
         continue
       }
       const bill = await queryOne<{ id: string }>(`

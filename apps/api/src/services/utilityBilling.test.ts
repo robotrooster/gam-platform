@@ -2074,7 +2074,61 @@ describe('suspended utility charges for units mid-onboarding', () => {
     const held = await db.query<any>(
       `SELECT cancelled_at, notes FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
     expect(held.rows[0].cancelled_at).not.toBeNull()
-    expect(held.rows[0].notes).toContain('does not make the tenant responsible')
+    expect(held.rows[0].notes).toContain('makes the tenant responsible')
+  })
+
+  // S629 (Nic): every Oak Park template has ZERO utility clauses tagged, so no
+  // responsibility row is ever written. Reading that silence as "landlord pays"
+  // zeroed out utility billing for the whole property. The meter's own setup is
+  // the landlord's standing decision and answers when the lease does not.
+  it('a lease with no utility clause still bills — the meter configuration decides', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)           // rubs = passed through
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    await db.query(`DELETE FROM lease_utility_responsibilities WHERE lease_id=$1`, [signed.leaseId])
+    await attachMeterToUnit(meterId, signed.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const bill = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
+    expect(bill.rows).toHaveLength(1)
+    expect(Number(bill.rows[0].charge_amount)).toBe(100)
+  })
+
+  it('a master-billed-to-landlord meter still bills nobody when the lease is silent', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    // rubs_allocation_method must be cleared alongside — a non-rubs meter has
+    // nothing to allocate (utility_meters_check).
+    await db.query(
+      `UPDATE utility_meters
+          SET billing_method='master_bill_to_landlord', rubs_allocation_method=NULL
+        WHERE id=$1`, [meterId])
+    const signed = await seedUnitWithActiveTenant(base)
+    await db.query(`DELETE FROM lease_utility_responsibilities WHERE lease_id=$1`, [signed.leaseId])
+    await attachMeterToUnit(meterId, signed.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const bill = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
+    expect(bill.rows).toHaveLength(0)
+  })
+
+  // The lease still wins when it actually says something.
+  it('an explicit landlord-pays clause beats a passed-through meter', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base, { tenantResponsible: false })
+    await attachMeterToUnit(meterId, signed.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const bill = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
+    expect(bill.rows).toHaveLength(0)
   })
 
   it('holds nothing against a genuinely vacant unit', async () => {
