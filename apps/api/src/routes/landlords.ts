@@ -1441,7 +1441,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     const intentRows = await query<any>(`
       SELECT pti.id, pti.accepted_at, pti.draft_document_id, pti.parser_status,
              pti.unit_id, usr.tenant_invite_expires_at,
-             un.unit_number, p.name AS property_name,
+             un.unit_number, un.occupancy_mode, p.name AS property_name,
              usr.first_name, usr.last_name
         FROM pending_tenant_intents pti
         JOIN tenants t ON t.id = pti.tenant_id
@@ -1453,6 +1453,21 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
          AND pti.cancelled_at IS NULL
        ORDER BY pti.created_at ASC
     `, [scopeIds])
+
+    // A whole_unit lease is ONE document for the whole roster, so
+    // leaseOnboarding deliberately withholds the draft until every invited
+    // person has accepted. Without knowing that, the dashboard read a
+    // half-accepted roster as a failed auto-draft and told the landlord to go
+    // draft it — which would have produced a lease missing the co-tenant.
+    // Group by unit so a partly-accepted roster reports as waiting, not stuck.
+    const rosterByUnit = new Map<string, any[]>()
+    for (const it of intentRows as any[]) {
+      if (!it.unit_id) continue
+      const list = rosterByUnit.get(it.unit_id) || []
+      list.push(it)
+      rosterByUnit.set(it.unit_id, list)
+    }
+    const waitingUnits = new Set<string>()
 
     for (const it of intentRows as any[]) {
       const who = [it.first_name, it.last_name].filter(Boolean).join(' ') || 'Tenant'
@@ -1472,6 +1487,30 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       }
       // Invite flow (no PDF). Only surface states the LANDLORD must act on.
       if (it.unit_id && it.accepted_at && !it.draft_document_id) {
+        const roster = rosterByUnit.get(it.unit_id) || []
+        const outstanding = it.occupancy_mode === 'by_room'
+          ? []
+          : roster.filter(r => !r.accepted_at)
+        if (outstanding.length > 0) {
+          // One row per unit, not per person who's already accepted.
+          if (waitingUnits.has(it.unit_id)) continue
+          waitingUnits.add(it.unit_id)
+          const accepted = roster.filter(r => r.accepted_at)
+          const names = (rows: any[]) => rows
+            .map(r => [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Tenant')
+            .join(', ')
+          onboarding.push({
+            id: 'intent-waiting-' + it.unit_id,
+            type: 'awaiting_co_tenants',
+            title: 'Waiting on ' + outstanding.length + ' of ' + roster.length +
+                   ' to accept' + where,
+            subtitle: names(accepted) + ' accepted. The lease drafts on its own once ' +
+                      names(outstanding) + ' accepts too — everyone on this unit signs one lease. ' +
+                      'Nothing for you to do unless you want to resend the invite.',
+            href: '/tenant-onboarding/pending',
+          })
+          continue
+        }
         onboarding.push({
           id: 'intent-draft-' + it.id,
           type: 'lease_not_drafted',

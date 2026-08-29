@@ -365,6 +365,71 @@ describe('GET /api/landlords/me/todos — onboarding control tower', () => {
     expect(types(res)).toContain('lease_not_drafted')
   })
 
+  // A whole_unit lease is one document for the whole roster, so leaseOnboarding
+  // holds the draft until everyone accepts. The dashboard used to read that as a
+  // failed auto-draft and tell the landlord to draft it — which would have
+  // produced a lease missing the co-tenant.
+  it('whole_unit, one of two accepted → awaiting_co_tenants, NOT lease_not_drafted', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    let coTenantId: string
+    try { coTenantId = await seedTenant(client) } finally { client.release() }
+    await db.query(`UPDATE units SET occupancy_mode='whole_unit' WHERE id=$1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+       VALUES ($1,$2,'not_uploaded',$3, NOW())`,
+      [f.landlordId, f.tenantId, f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+       VALUES ($1,$2,'not_uploaded',$3, NULL)`,
+      [f.landlordId, coTenantId!, f.unitId])
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('awaiting_co_tenants')
+    expect(types(res)).not.toContain('lease_not_drafted')
+    // one row for the unit, not one per person who already accepted
+    expect(types(res).filter((t: string) => t === 'awaiting_co_tenants')).toHaveLength(1)
+    const row = res.body.data.onboarding.find((o: any) => o.type === 'awaiting_co_tenants')
+    expect(row.title).toContain('1 of 2')
+  })
+
+  it('whole_unit, BOTH accepted, no draft → still lease_not_drafted', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    let coTenantId: string
+    try { coTenantId = await seedTenant(client) } finally { client.release() }
+    await db.query(`UPDATE units SET occupancy_mode='whole_unit' WHERE id=$1`, [f.unitId])
+    for (const t of [f.tenantId, coTenantId!]) {
+      await db.query(
+        `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+         VALUES ($1,$2,'not_uploaded',$3, NOW())`,
+        [f.landlordId, t, f.unitId])
+    }
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('lease_not_drafted')
+    expect(types(res)).not.toContain('awaiting_co_tenants')
+  })
+
+  // by_room means each person gets their OWN lease, so one person not having
+  // accepted must not hold up the person who did.
+  it('by_room, one of two accepted → lease_not_drafted for the one who accepted', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    let coTenantId: string
+    try { coTenantId = await seedTenant(client) } finally { client.release() }
+    await db.query(`UPDATE units SET occupancy_mode='by_room' WHERE id=$1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+       VALUES ($1,$2,'not_uploaded',$3, NOW())`,
+      [f.landlordId, f.tenantId, f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+       VALUES ($1,$2,'not_uploaded',$3, NULL)`,
+      [f.landlordId, coTenantId!, f.unitId])
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('lease_not_drafted')
+    expect(types(res)).not.toContain('awaiting_co_tenants')
+  })
+
   it('invite lapsed unaccepted → invite_expired item', async () => {
     const f = await seedTFixture()
     await db.query(
