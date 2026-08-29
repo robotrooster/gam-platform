@@ -238,6 +238,7 @@ export function TenantOnboardingPage() {
 // Unit-linked invite → the lease auto-drafts from the unit's default template
 // on accept. Co-tenants: keep the same unit and invite again before anyone signs.
 function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
+  const navigate = useNavigate()
   // S629 (Nic): "you need to be able to add multiple people to the same
   // document. Otherwise it's not gonna flow."
   //
@@ -273,9 +274,37 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
   const windowOpen = !!obWindow?.open
   const [attestExisting, setAttestExisting] = useState(true)
 
-  const complete = (p: Person) => !!(p.firstName && p.lastName && p.email && p.phone)
-  const ready = people.filter(complete)
-  const canSubmit = !!unitId && ready.length > 0 && ready.length === people.length
+  // S629 (Nic): "I don't have everybody's phone number, just emails." The
+  // invite and the signature both travel by email, so the phone is not needed
+  // to onboard anyone — the tenant fills it in on their own contact details
+  // once they accept. Requiring it here blocked a landlord who had every
+  // address he needed.
+  const complete = (p: Person) => !!(p.firstName && p.lastName && p.email)
+  // S629 (Nic): "it still won't fucking send the invites."
+  //
+  // The button was disabled whenever ANY row was incomplete, and said nothing
+  // about which one or why. Add a person row, leave it untouched, and the form
+  // goes dead with no explanation — there is no way to work out what it wants.
+  //
+  // A row nobody typed in is not an error, it is an empty row: dropped. A row
+  // that is half-filled IS an error, and it gets named. Either way the reason
+  // is on screen, because a disabled button that will not say why is worse
+  // than an error message.
+  const untouched = (p: Person) => !p.firstName && !p.lastName && !p.email && !p.phone
+  const typedIn = people.filter(p => !untouched(p))
+  const ready = typedIn.filter(complete)
+  const halfDone = typedIn.filter(p => !complete(p))
+
+  const blockedBecause =
+    !unitId ? 'Pick the unit first.'
+    : ready.length === 0 ? 'Add at least one person — first name, last name and email.'
+    : halfDone.length > 0
+      ? `${halfDone.length === 1 ? 'One person is' : `${halfDone.length} people are`} missing ` +
+        [...new Set(halfDone.flatMap(p => [
+          !p.firstName && 'a first name', !p.lastName && 'a last name', !p.email && 'an email',
+        ].filter(Boolean) as string[]))].join(', ') + '. Phone is optional.'
+      : null
+  const canSubmit = !blockedBecause
 
   // Sent one at a time on purpose: each is a real invite email, and a failure
   // half way through must leave the people already invited invited — not roll
@@ -284,20 +313,32 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
   const sendAll = async () => {
     setSending(true); setError(null)
     const failed: Person[] = []
+    const sentNow: string[] = []
     let lastErr = ''
-    for (const p of people) {
+    for (const p of ready) {
       try {
         await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
           { ...p, unitId, existingResident: windowOpen && attestExisting })
-        setInvited(prev => [...prev, `${p.firstName} ${p.lastName}`.trim() || p.email])
+        const who = `${p.firstName} ${p.lastName}`.trim() || p.email
+        sentNow.push(who)
+        setInvited(prev => [...prev, who])
       } catch (e: any) {
         failed.push(p)
         lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
       }
     }
     setPeople(failed.length ? failed : [blank()])
-    setError(failed.length ? `${failed.length} of ${people.length} could not be invited: ${lastErr}` : null)
+    setError(failed.length ? `${failed.length} of ${ready.length} could not be invited: ${lastErr}` : null)
     setSending(false)
+    // S629 (Nic): onboarding a park is one unit after another, and this form had
+    // no way back — properties, then the property, then units, to reach the next
+    // one. On a clean send, return to that property's units with the property
+    // already filtered and the confirmation carried along.
+    if (!failed.length) {
+      const propertyId = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
+      navigate(propertyId ? `/units?property=${propertyId}` : '/units',
+        { state: { invited: sentNow } })
+    }
   }
 
   const selectedUnit = (allUnits as any[]).find(u => u.id === unitId)
@@ -367,7 +408,7 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
                 <input className="input" placeholder="Last name" value={p.lastName} onChange={e => setField(i, 'lastName', e.target.value)} />
               </div>
               <input className="input" placeholder="Email" type="email" value={p.email} onChange={e => setField(i, 'email', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
-              <input className="input" placeholder="Phone" value={p.phone} onChange={e => setField(i, 'phone', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
+              <input className="input" placeholder="Phone (optional)" value={p.phone} onChange={e => setField(i, 'phone', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
             </div>
           ))}
 
@@ -378,8 +419,13 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
           {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginTop: 10 }}>{error}</div>}
           <button type="submit" disabled={!canSubmit || sending} className="btn btn-primary" style={{ width: '100%', marginTop: 14 }}>
             {sending ? 'Sending…'
-              : people.length > 1 ? `Send ${people.length} invites` : 'Send invite'}
+              : ready.length > 1 ? `Send ${ready.length} invites` : 'Send invite'}
           </button>
+          {blockedBecause && !sending && (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>
+              {blockedBecause}
+            </div>
+          )}
         </form>
       </div>
     </div>

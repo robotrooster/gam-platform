@@ -1,7 +1,7 @@
 import { AddUnitModal } from './AddUnitModal'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useNavigate, Link, useSearchParams } from 'react-router-dom'
+import { useNavigate, Link, useSearchParams, useLocation } from 'react-router-dom'
 import { humanize, UNIT_STATUS_LABEL, type UnitStatus } from '@gam/shared'
 import { apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
@@ -34,10 +34,19 @@ export function UnitsPage() {
     if (s === 'eviction') return 'suspended'
     return s && s in STATUS_COLORS ? s : 'all'
   })
-  const [propertyId, setPropertyId] = useState('')
+  // S629 (Nic): "it needs to just revert back to the unit page on submission of
+  // invites... there's no back button, so I have to click properties, then click
+  // into a specific property, and then click into units." Onboarding a park is
+  // one unit after another, so the invite flow returns here with the property
+  // already selected.
+  const [propertyId, setPropertyId] = useState(() => params.get('property') ?? '')
   // S605: retired units are excluded by the API unless asked for, so the working
   // list stays the live units. Turning this on shows the history alongside.
   const [showRetired, setShowRetired] = useState(false)
+  // Carried on navigation state so the confirmation is not lost by leaving the
+  // invite form — sending and then landing on a page with no acknowledgement
+  // reads as though nothing happened.
+  const invitedJustNow = (useLocation().state as any)?.invited as string[] | undefined
   const { data: units = [], isLoading } = useQuery<any[]>(
     ['units', showRetired],
     () => apiGet(showRetired ? '/units?includeRetired=true' : '/units'))
@@ -129,6 +138,14 @@ export function UnitsPage() {
           <div><strong>{evictionUnits.length} unit(s) in Eviction Mode.</strong> All tenant ACH hard-blocked. Warning: in many jurisdictions, accepting rent while pursuing eviction may waive your right to proceed. Check your local laws before accepting any payment.</div>
         </div>
       )}
+
+      {invitedJustNow?.length ? (
+        <div style={{ background:'rgba(38,167,90,.08)', border:'1px solid rgba(38,167,90,.3)', borderRadius:8,
+                      padding:'10px 14px', marginBottom:14, fontSize:'.82rem', color:'var(--text-1)' }}>
+          <strong style={{ color:'var(--green)' }}>Invited:</strong> {invitedJustNow.join(', ')}. They each get a
+          portal invite by email; the lease drafts once everyone on that unit accepts. Pick the next unit below.
+        </div>
+      ) : null}
 
       <div className="filter-bar">
         <div className="search-wrap">

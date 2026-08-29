@@ -1841,7 +1841,16 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
   const client = await getClient()
   try {
     const { firstName, lastName, email, phone, unitId } = req.body
-    if (!firstName || !lastName || !email || !phone) throw new AppError(400, 'firstName, lastName, email, phone required')
+    // S629 (Nic): "I don't have everybody's phone number, just emails. Email has
+    // to be mandatory for the invite to work, I get that, and the electronic
+    // signature. Phone number, the tenant can update it on their contact
+    // information when they accept the portal invite."
+    //
+    // The invite and the signature both travel by EMAIL, so a phone number is
+    // not needed to onboard anyone — it was required here and nowhere else
+    // (users.phone has always been nullable). Demanding it blocked a landlord
+    // who had every address he needed from inviting a single tenant.
+    if (!firstName || !lastName || !email) throw new AppError(400, 'firstName, lastName and email are required')
     if (!unitId) throw new AppError(400, 'unitId required')
     const emailNorm = String(email).trim().toLowerCase()
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) throw new AppError(400, 'Invalid email format')
@@ -1903,7 +1912,10 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       const u = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
          VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', $2, $3, $4) RETURNING id`,
-        [emailNorm, firstName, lastName, phone])
+        // S629: an empty string is not a phone number. Store NULL so the
+        // tenant's own contact form shows it as blank and asks for it, rather
+        // than looking like they already gave one.
+        [emailNorm, firstName, lastName, (phone ?? '').trim() || null])
       userId = u.rows[0].id
     }
 
