@@ -687,11 +687,22 @@ export const UNIT_CLONE_RESET: Record<string, string> = {
   on_time_pay_active:      'an enrollment belongs to the old unit/tenancy',
 }
 
-// POST /api/units/:id/retire — retire this unit, create its replacement.
+// POST /api/units/:id/retire — retire this unit; optionally create its replacement.
+//
+// S629 (Nic): "RV 21 actually needs to be deleted — that is not an actual site
+// anymore, it's been removed. So it skips from 20 to 22."
+//
+// Retiring REQUIRED a replacement number, which covers a renumbering but not a
+// space that is simply gone. A removed site could then be neither retired (no
+// replacement exists) nor deleted (DELETE refuses the moment there is history),
+// leaving a phantom space listed as vacant and bookable forever. Omit
+// `unitNumber` and the unit retires on its own: retired_at is what makes "never
+// billed" structural, so a decommissioned site stops being billable either way.
 unitsRouter.post('/:id/retire', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const { unitNumber, reason } = z.object({
-      unitNumber: z.string().min(1).max(40),
+      // Omitted → the space is gone, not renumbered. No replacement is made.
+      unitNumber: z.string().min(1).max(40).optional(),
       reason:     z.string().trim().max(500).optional(),
     }).parse(req.body)
 
@@ -700,14 +711,16 @@ unitsRouter.post('/:id/retire', requirePerm('units.edit'), async (req, res, next
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
     if (unit.retired_at) throw new AppError(409, 'This unit is already retired.')
 
-    const newNumber = formatUnitNumber(unitNumber)
-    if (newNumber.toLowerCase() === String(unit.unit_number).toLowerCase()) {
-      throw new AppError(400, 'The replacement needs a different number — retiring a unit to the same number would leave two records claiming it.')
+    const newNumber = unitNumber ? formatUnitNumber(unitNumber) : null
+    if (newNumber) {
+      if (newNumber.toLowerCase() === String(unit.unit_number).toLowerCase()) {
+        throw new AppError(400, 'The replacement needs a different number — retiring a unit to the same number would leave two records claiming it.')
+      }
+      const clash = await queryOne<{ id: string }>(
+        `SELECT id FROM units WHERE property_id = $1 AND lower(btrim(unit_number)) = lower(btrim($2))`,
+        [unit.property_id, newNumber])
+      if (clash) throw new AppError(409, `"${newNumber}" is already used by another unit on this property.`)
     }
-    const clash = await queryOne<{ id: string }>(
-      `SELECT id FROM units WHERE property_id = $1 AND lower(btrim(unit_number)) = lower(btrim($2))`,
-      [unit.property_id, newNumber])
-    if (clash) throw new AppError(409, `"${newNumber}" is already used by another unit on this property.`)
 
     // The unit must be FREE before it retires. This is what makes "a retired
     // unit is never billed" structural rather than a filter we have to remember:
@@ -734,26 +747,40 @@ unitsRouter.post('/:id/retire', requirePerm('units.edit'), async (req, res, next
     try {
       await client.query('BEGIN')
       const cols = UNIT_CLONE_COPIED.join(', ')
-      const [replacement] = await client.query<any>(
-        `INSERT INTO units (unit_number, status, replaces_unit_id, ${cols})
-         SELECT $2, 'vacant', $1, ${cols} FROM units WHERE id = $1
-         RETURNING *`,
-        [req.params.id, newNumber]
-      ).then((r: any) => r.rows)
+      let replacement: any = null
+      if (newNumber) {
+        ;[replacement] = await client.query<any>(
+          `INSERT INTO units (unit_number, status, replaces_unit_id, ${cols})
+           SELECT $2, 'vacant', $1, ${cols} FROM units WHERE id = $1
+           RETURNING *`,
+          [req.params.id, newNumber]
+        ).then((r: any) => r.rows)
+      }
 
       const [retired] = await client.query<any>(
         `UPDATE units
-            SET retired_at = now(), superseded_by_unit_id = $2, updated_at = now()
+            SET retired_at = now(), superseded_by_unit_id = $2,
+                listed_vacant = FALSE, is_bookable = FALSE, updated_at = now()
           WHERE id = $1 RETURNING *`,
-        [req.params.id, replacement.id]
+        [req.params.id, replacement?.id ?? null]
       ).then((r: any) => r.rows)
+
+      // A space that is gone must stop appearing on the meters it shared, or it
+      // keeps showing on reading runs and rosters as a site somebody has to go
+      // and read. Only safe because a meter LINK is setup, not history — the
+      // readings and bills themselves reference the meter, not this link.
+      if (!newNumber) {
+        await client.query(`DELETE FROM utility_meter_units WHERE unit_id = $1`, [req.params.id])
+      }
 
       await client.query(
         `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
          VALUES ($1, 'unit_retired', 'unit', $2, $3::jsonb, $4::jsonb)`,
         [req.user!.userId, req.params.id,
          JSON.stringify({ unit_number: unit.unit_number }),
-         JSON.stringify({ replacement_unit_id: replacement.id, unit_number: newNumber, reason: reason ?? null })]
+         JSON.stringify({ replacement_unit_id: replacement?.id ?? null,
+                          unit_number: newNumber, decommissioned: !newNumber,
+                          reason: reason ?? null })]
       ).catch(() => {})
 
       await client.query('COMMIT')

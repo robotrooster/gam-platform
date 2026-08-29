@@ -82,6 +82,53 @@ describe('POST /api/units/:id/retire', () => {
     })
   })
 
+  // S629 (Nic): "RV 21 actually needs to be deleted — that is not an actual site
+  // anymore, it's been removed. So it skips from 20 to 22." A space that is gone
+  // is not a renumbering, and DELETE refuses the moment there is any history.
+  it('retires with NO replacement when the space is simply gone', async () => {
+    const res = await request(buildApp())
+      .post(`/api/units/${ctx.unitId}/retire`).set('Authorization', `Bearer ${token()}`)
+      .send({ reason: 'site removed' }).expect(201)
+
+    expect(res.body.data.replacement).toBeNull()
+    expect(res.body.data.retired.retired_at).not.toBeNull()
+    expect(res.body.data.retired.superseded_by_unit_id).toBeNull()
+    // Gone means gone: it stops being offered or booked.
+    expect(res.body.data.retired.listed_vacant).toBe(false)
+    expect(res.body.data.retired.is_bookable).toBe(false)
+
+    // No stray replacement was created on the property.
+    const all = await db.query<any>(
+      `SELECT unit_number FROM units WHERE property_id=$1 AND retired_at IS NULL`,
+      [ctx.propertyId])
+    expect(all.rows).toHaveLength(0)
+  })
+
+  it('a decommissioned unit drops off the meters it shared', async () => {
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      const m = await c.query<any>(
+        `INSERT INTO utility_meters (property_id, utility_type, billing_method, label)
+         VALUES ($1,'water','submeter','shared') RETURNING id`, [ctx.propertyId])
+      meterId = m.rows[0].id
+      await c.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+        [meterId, ctx.unitId])
+    } finally { c.release() }
+
+    await request(buildApp())
+      .post(`/api/units/${ctx.unitId}/retire`).set('Authorization', `Bearer ${token()}`)
+      .send({ reason: 'site removed' }).expect(201)
+
+    const links = await db.query<any>(
+      `SELECT 1 FROM utility_meter_units WHERE unit_id=$1`, [ctx.unitId])
+    expect(links.rows).toHaveLength(0)
+    // The meter itself survives — other units still read off it.
+    const meter = await db.query<any>(`SELECT 1 FROM utility_meters WHERE id=$1`, [meterId])
+    expect(meter.rows).toHaveLength(1)
+  })
+
   it('refuses to reuse the same number, and refuses a number already taken', async () => {
     await request(asLandlord())
       .post(`/api/units/${ctx.unitId}/retire`).set('Authorization', `Bearer ${token()}`).send({ unitNumber: 'RV 05' }).expect(400)
