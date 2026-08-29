@@ -41,6 +41,7 @@ import fs from 'fs'
 import { logger } from '../lib/logger'
 import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType } from '../services/householdLeaseDraft'
 import { activateHomeSaleContract } from '../services/homeSale'
+import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 
 export const esignRouter = Router()
 
@@ -3909,6 +3910,38 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       }
 
       await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+
+      // S629 (Nic): "a pending unit should have the amount of water show as
+      // temporary suspension back end and be billed with the first invoice as
+      // soon as acceptance happens."
+      //
+      // While they were invited but unsigned, their utility share was counted
+      // into the RUBS split — so their neighbours were charged correctly — and
+      // held with no invoice behind it. Signing is what gives it somewhere to
+      // go, so it lands on their first invoice now.
+      //
+      // Post-commit and best-effort, like the neighbours here: the signature is
+      // recorded and must never be rolled back over a utility charge. A row
+      // that fails stays HELD rather than vanishing, so nothing is silently
+      // written off.
+      if (leaseResult?.leaseId && doc.unit_id) {
+        try {
+          const lease = await queryOne<{ landlord_id: string }>(
+            `SELECT landlord_id FROM leases WHERE id = $1`, [leaseResult.leaseId])
+          const primary = await queryOne<{ tenant_id: string }>(
+            `SELECT tenant_id FROM lease_tenants WHERE lease_id = $1 AND role = 'primary' LIMIT 1`,
+            [leaseResult.leaseId])
+          if (lease && primary) {
+            await releaseSuspendedChargesForLease({
+              unitId: doc.unit_id, leaseId: leaseResult.leaseId,
+              tenantId: primary.tenant_id, landlordId: lease.landlord_id,
+            })
+          }
+        } catch (e) {
+          logger.error({ err: e, leaseId: leaseResult.leaseId },
+            '[utility] releasing held shares failed — they stay held')
+        }
+      }
 
       // S629 (Nic): a signed PURCHASE AGREEMENT is what starts a financed home
       // sale billing. The contract has been sitting in pending_signature with

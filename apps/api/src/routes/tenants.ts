@@ -123,12 +123,17 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     // auto-draft the lease(s) if the unit's roster is now ready. Best-effort in
     // its own transaction — a draft failure never blocks the tenant's login.
     try {
-      const intent = await queryOne<{ id: string; unit_id: string | null }>(
+      // S629 (Nic): a person can hold invites to SEVERAL units — two spots, two
+      // leases, one login. This took LIMIT 1, so accepting drafted a lease for
+      // the newest invite and left the other sitting there for ever, with the
+      // tenant given no way to reach it. Every open invite is accepted and
+      // drafted on the way in.
+      const intents = await query<{ id: string; unit_id: string }>(
         `SELECT pti.id, pti.unit_id
            FROM pending_tenant_intents pti JOIN tenants t ON t.id = pti.tenant_id
           WHERE t.user_id = $1 AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL AND pti.unit_id IS NOT NULL
-          ORDER BY pti.created_at DESC LIMIT 1`, [user.id])
-      if (intent?.unit_id) {
+          ORDER BY pti.created_at`, [user.id])
+      for (const intent of intents) {
         const draftClient = await getClient()
         try {
           await draftClient.query('BEGIN')

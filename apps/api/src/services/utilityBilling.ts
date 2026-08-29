@@ -318,7 +318,20 @@ async function allocationBases(
 ): Promise<Array<{ unitId: string; basis: number }>> {
   const w = weights || {}
 
-  /** Active-lease headcount on a unit. */
+  /**
+   * Headcount on a unit: active-lease tenants, or — when there is no lease yet
+   * — the people INVITED to it.
+   *
+   * S629 (Nic): mid-onboarding a resident has been invited and has not signed,
+   * so there is no lease, so an occupant_count split scored the unit zero and
+   * dropped it from the pool. With 6 of 30 signed, those 6 split the water for
+   * all 30. The people are living there and using the water; the paperwork is
+   * what is outstanding, and the divisor should reflect the former.
+   *
+   * The invite roster gives the real number — this is not an assumed occupancy.
+   * Their share is HELD rather than billed (see suspended_utility_charges) and
+   * released onto their first invoice when they sign.
+   */
   const occupants = async (unitId: string): Promise<number> => {
     const c = await queryOne<{ count: string }>(`
       SELECT COUNT(*)::text AS count
@@ -327,7 +340,14 @@ async function allocationBases(
          SELECT 1 FROM leases l
           WHERE l.id = v_lease_active_tenants.lease_id
             AND l.unit_id = $1 AND l.status = 'active')`, [unitId])
-    return Number(c?.count || 0)
+    const signed = Number(c?.count || 0)
+    if (signed > 0) return signed
+    const pending = await queryOne<{ count: string }>(`
+      SELECT COUNT(*)::text AS count
+        FROM pending_tenant_intents pti
+       WHERE pti.unit_id = $1
+         AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL`, [unitId])
+    return Number(pending?.count || 0)
   }
 
   /** Is this space rented for the cycle? Measured the same way tryInsertBill
@@ -1205,6 +1225,53 @@ interface InsertBillArgs {
 
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
 // tenant not responsible for this utility type, or bill already exists).
+
+/**
+ * S629: hold a utility share for a unit whose residents are invited but have
+ * not signed. Returns true when the share was held, false when the unit is
+ * genuinely unoccupied and the landlord absorbs it as before.
+ *
+ * Idempotent through the partial unique index — the billing engine is
+ * re-runnable by design, so a second run for the same cycle must not hold the
+ * same share twice.
+ */
+async function holdChargeForPendingUnit(args: InsertBillArgs): Promise<boolean> {
+  const pending = await queryOne<{ n: string; landlord_id: string }>(`
+    SELECT COUNT(pti.id)::text AS n, u.landlord_id
+      FROM units u
+      LEFT JOIN pending_tenant_intents pti
+        ON pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+     WHERE u.id = $1
+     GROUP BY u.landlord_id`, [args.unitId])
+  if (!pending || Number(pending.n) === 0) return false
+
+  try {
+    await query(`
+      INSERT INTO suspended_utility_charges
+        (meter_id, unit_id, landlord_id, billing_cycle_month, utility_type,
+         usage_amount, allocation_method, allocation_basis, rate_per_unit,
+         base_fee_share, charge_amount, tax_rate_pct, tax_amount,
+         sewer_rate_per_unit, reading_start, reading_end,
+         reading_start_date, reading_end_date, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      ON CONFLICT DO NOTHING`,
+      [args.meterId, args.unitId, pending.landlord_id, args.cycleMonth, args.utilityType,
+       args.usageAmount ?? null, args.allocationMethod ?? null, args.allocationBasis ?? null,
+       args.ratePerUnit ?? null, args.baseFeeShare ?? 0, args.chargeAmount,
+       args.taxRatePct ?? null, args.taxAmount ?? null, args.sewerRatePerUnit ?? null,
+       args.readingStart ?? null, args.readingEnd ?? null,
+       args.readingStartDate ?? null, args.readingEndDate ?? null,
+       'Held: invited, lease not signed yet. Bills with their first invoice.'])
+    logger.info({ unitId: args.unitId, meterId: args.meterId, cycle: args.cycleMonth,
+                  amount: args.chargeAmount },
+      'utility billing: share held for a unit whose residents have not signed yet')
+    return true
+  } catch (e) {
+    logger.error({ err: e, unitId: args.unitId }, 'utility billing: could not hold pending share')
+    return false
+  }
+}
+
 export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
   // S548 (Nic — fast turnover): the cycle's usage belongs to the lease that
   // covered the START of the cycle month, NOT whoever is active when the
@@ -1257,7 +1324,23 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
          AND start_date <= ($2::date + interval '1 month' - interval '1 day')
          AND (end_date IS NULL OR end_date >= $2::date)
        LIMIT 1`, [args.unitId, args.cycleMonth])
-    if (!sa) return false  // no attributable payer — landlord absorbs
+    if (!sa) {
+      // S629: no lease and no service agreement. If the unit has people INVITED
+      // to it, this is onboarding rather than a vacancy — they are living there
+      // and using the utility, and their share was counted into the split by
+      // `occupants`. Hold it; the release runs when their lease is signed.
+      //
+      // Held rather than billed because there is no invoice to carry it: no due
+      // date, no late fee, and no debt recorded against somebody who has not
+      // signed anything. Anything genuinely vacant still falls through to the
+      // landlord absorbing it, exactly as before.
+      // Held, then reported as NOT billed: the caller counts a `true` as a bill
+      // created, and a held share is precisely the absence of one. It shows up
+      // in unitsSkipped, which is accurate — the unit was skipped for billing
+      // and its share is waiting on a signature.
+      await holdChargeForPendingUnit(args)
+      return false
+    }
     serviceAgreementId = sa.id
     lt = { lease_id: null as any, tenant_id: sa.tenant_id }
   } else {
@@ -1419,4 +1502,73 @@ export async function generateBillsForLandlord(
     results.push(await generateBillsForMeter(m.id, cycleMonth))
   }
   return results
+}
+
+
+/** YYYY-MM for a cycle, whether it arrives as a Date or a string. */
+function cycleLabel(cycle: unknown): string {
+  if (cycle instanceof Date) return cycle.toISOString().slice(0, 7)
+  return String(cycle).slice(0, 7)
+}
+
+/**
+ * S629: release every held utility share for a unit onto the tenant who has
+ * just signed.
+ *
+ * The counterpart to holdChargeForPendingUnit. Their share was counted into the
+ * RUBS split at the time — so the other residents were charged correctly — and
+ * parked with no invoice behind it. Signing is what gives it somewhere to go.
+ *
+ * Called after a lease is created from a signed document. Best-effort and
+ * idempotent: a held row becomes exactly one bill, and a row that fails stays
+ * held rather than vanishing, so nothing is silently written off.
+ */
+export async function releaseSuspendedChargesForLease(args: {
+  unitId: string; leaseId: string; tenantId: string; landlordId: string
+}): Promise<{ released: number; amount: number }> {
+  const held = await query<any>(`
+    SELECT * FROM suspended_utility_charges
+     WHERE unit_id = $1 AND released_at IS NULL AND cancelled_at IS NULL
+     ORDER BY billing_cycle_month`, [args.unitId])
+  let released = 0
+  let amount = 0
+  for (const h of held) {
+    try {
+      const bill = await queryOne<{ id: string }>(`
+        INSERT INTO utility_bills
+          (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+           usage_amount, allocation_method, allocation_basis, rate_per_unit,
+           base_fee_share, charge_amount, tax_rate_pct, tax_amount, utility_type,
+           sewer_rate_per_unit, reading_start, reading_end,
+           reading_start_date, reading_end_date, notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+        ON CONFLICT DO NOTHING
+        RETURNING id`,
+        [h.meter_id, h.unit_id, args.tenantId, args.leaseId, args.landlordId,
+         h.billing_cycle_month, h.usage_amount, h.allocation_method, h.allocation_basis,
+         h.rate_per_unit, h.base_fee_share, h.charge_amount,
+         // utility_bills requires both tax columns; a held row may carry
+         // neither (an untaxed utility), and 0 is the honest value for "no tax
+         // was charged" — NULL would fail the constraint and strand the share.
+         h.tax_rate_pct ?? 0, h.tax_amount ?? 0,
+         h.utility_type, h.sewer_rate_per_unit, h.reading_start, h.reading_end,
+         h.reading_start_date, h.reading_end_date,
+         `Utility used before the lease was signed (${cycleLabel(h.billing_cycle_month)}).`])
+      // A conflict means the cycle already has a bill for this unit — the share
+      // is accounted for, so stop holding it rather than leaving it to re-run.
+      await query(
+        `UPDATE suspended_utility_charges
+            SET released_at = now(), released_bill_id = $2, updated_at = now()
+          WHERE id = $1`, [h.id, bill?.id ?? null])
+      if (bill?.id) { released++; amount += Number(h.charge_amount) }
+    } catch (e) {
+      logger.error({ err: e, suspendedId: h.id, unitId: args.unitId },
+        'utility billing: could not release a held share — left held')
+    }
+  }
+  if (released > 0) {
+    logger.info({ unitId: args.unitId, leaseId: args.leaseId, released, amount },
+      'utility billing: held shares released onto the new lease')
+  }
+  return { released, amount }
 }

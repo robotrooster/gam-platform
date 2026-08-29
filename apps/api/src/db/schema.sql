@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 6aB4t34TUfCASurz73mhXJhwfYaNYE4kf5nvbkTwiyAdGahmwW3THOGl4Atyebj
+\restrict SNf3Nn3miBxRkPpBsa0XDqIpbBndoiqOY2su9rxuTkwIJQUsJv6CaGnhiH7B2Gr
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8171,6 +8171,49 @@ CREATE TABLE public.surveys (
 
 
 --
+-- Name: suspended_utility_charges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.suspended_utility_charges (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    billing_cycle_month date NOT NULL,
+    utility_type text NOT NULL,
+    usage_amount numeric(14,4),
+    allocation_method text,
+    allocation_basis numeric(14,4),
+    rate_per_unit numeric(12,6),
+    base_fee_share numeric(12,2) DEFAULT 0 NOT NULL,
+    charge_amount numeric(12,2) NOT NULL,
+    tax_rate_pct numeric(6,3),
+    tax_amount numeric(12,2),
+    sewer_rate_per_unit numeric(12,6),
+    reading_start numeric(14,4),
+    reading_end numeric(14,4),
+    reading_start_date date,
+    reading_end_date date,
+    notes text,
+    released_at timestamp with time zone,
+    released_bill_id uuid,
+    cancelled_at timestamp with time zone,
+    cancelled_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT suspended_utility_charges_amount_check CHECK ((charge_amount >= (0)::numeric)),
+    CONSTRAINT suspended_utility_charges_outcome_check CHECK ((NOT ((released_at IS NOT NULL) AND (cancelled_at IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE suspended_utility_charges; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.suspended_utility_charges IS 'S629: a utility share for a unit whose resident has been invited but has not signed yet. Held (never invoiced, no due date, no late fee) so the RUBS split is correct for everyone from the first cycle, and released onto the tenant''s first invoice when their lease is signed.';
+
+
+--
 -- Name: system_features; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12491,6 +12534,14 @@ ALTER TABLE ONLY public.survey_responses
 
 ALTER TABLE ONLY public.surveys
     ADD CONSTRAINT surveys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: suspended_utility_charges suspended_utility_charges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.suspended_utility_charges
+    ADD CONSTRAINT suspended_utility_charges_pkey PRIMARY KEY (id);
 
 
 --
@@ -17047,10 +17098,17 @@ CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id
 
 
 --
--- Name: pending_tenant_intents_tenant_id_live_key; Type: INDEX; Schema: public; Owner: -
+-- Name: pending_tenant_intents_tenant_nounit_live_key; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX pending_tenant_intents_tenant_id_live_key ON public.pending_tenant_intents USING btree (tenant_id) WHERE (cancelled_at IS NULL);
+CREATE UNIQUE INDEX pending_tenant_intents_tenant_nounit_live_key ON public.pending_tenant_intents USING btree (tenant_id) WHERE ((cancelled_at IS NULL) AND (unit_id IS NULL));
+
+
+--
+-- Name: pending_tenant_intents_tenant_unit_live_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pending_tenant_intents_tenant_unit_live_key ON public.pending_tenant_intents USING btree (tenant_id, unit_id) WHERE ((cancelled_at IS NULL) AND (unit_id IS NOT NULL));
 
 
 --
@@ -17240,6 +17298,20 @@ CREATE UNIQUE INDEX shifts_one_open_per_user ON public.shifts USING btree (user_
 --
 
 CREATE UNIQUE INDEX sptp_unique ON public.state_property_tax_provisions USING btree (state_code, jurisdiction_level, topic, COALESCE(subtype, ''::text), effective_year);
+
+
+--
+-- Name: suspended_utility_held_by_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX suspended_utility_held_by_unit ON public.suspended_utility_charges USING btree (unit_id) WHERE ((released_at IS NULL) AND (cancelled_at IS NULL));
+
+
+--
+-- Name: suspended_utility_one_per_meter_unit_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX suspended_utility_one_per_meter_unit_cycle ON public.suspended_utility_charges USING btree (meter_id, unit_id, billing_cycle_month) WHERE ((released_at IS NULL) AND (cancelled_at IS NULL));
 
 
 --
@@ -23627,6 +23699,38 @@ ALTER TABLE ONLY public.surveys
 
 
 --
+-- Name: suspended_utility_charges suspended_utility_charges_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.suspended_utility_charges
+    ADD CONSTRAINT suspended_utility_charges_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: suspended_utility_charges suspended_utility_charges_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.suspended_utility_charges
+    ADD CONSTRAINT suspended_utility_charges_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: suspended_utility_charges suspended_utility_charges_released_bill_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.suspended_utility_charges
+    ADD CONSTRAINT suspended_utility_charges_released_bill_id_fkey FOREIGN KEY (released_bill_id) REFERENCES public.utility_bills(id);
+
+
+--
+-- Name: suspended_utility_charges suspended_utility_charges_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.suspended_utility_charges
+    ADD CONSTRAINT suspended_utility_charges_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: system_features system_features_updated_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24670,5 +24774,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 6aB4t34TUfCASurz73mhXJhwfYaNYE4kf5nvbkTwiyAdGahmwW3THOGl4Atyebj
+\unrestrict SNf3Nn3miBxRkPpBsa0XDqIpbBndoiqOY2su9rxuTkwIJQUsJv6CaGnhiH7B2Gr
 

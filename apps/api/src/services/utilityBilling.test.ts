@@ -27,7 +27,7 @@ import {
 } from '../test/dbHelpers'
 import {
   generateBillsForMeter, generateBillsForProperty, generateBillsForLandlord,
-  billMoveOutRead, ensureBillsForUnit,
+  billMoveOutRead, ensureBillsForUnit, releaseSuspendedChargesForLease,
 } from './utilityBilling'
 
 beforeEach(async () => {
@@ -1827,5 +1827,140 @@ describe('S616 a serviced space bills by every method', () => {
 
     const res = await generateBillsForMeter(meterId, new Date(2026, 3, 1))
     expect(res.billsCreated).toBe(0)
+  })
+})
+
+/**
+ * S629 — an invited-but-unsigned resident is in the split, and their share is
+ * held until they sign.
+ *
+ * Nic, mid-onboarding at Oak Park with the water bill in hand: "is the
+ * calculation to divide it for RUBS gonna be calculated based on only currently
+ * signed leases... because if they wait to accept until after the second or the
+ * third, that means they're not gonna get a water bill, and other people are
+ * gonna be billed incorrectly who did accept on time."
+ *
+ * They were. An occupant_count split scores a unit by its ACTIVE LEASE tenants,
+ * and a unit with only an invite has no lease, so it scored zero and was
+ * dropped from the pool. With 6 of 30 signed, those 6 split the water for all
+ * 30 — a 5x overcharge on the people who signed on time.
+ */
+describe('suspended utility charges for units mid-onboarding', () => {
+  async function rubsMeter(base: BaseCtx): Promise<string> {
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(meterId, 'occupant_count')
+    return meterId
+  }
+
+  /** A unit whose resident has been INVITED but has not signed: no lease. */
+  async function seedInvitedUnit(base: BaseCtx): Promise<{ unitId: string; tenantId: string }> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      const tenantId = await seedTenant(c)
+      await c.query(
+        `INSERT INTO pending_tenant_intents (unit_id, tenant_id, landlord_id, property_id)
+         VALUES ($1,$2,$3,$4)`, [unitId, tenantId, base.landlordId, base.propertyId])
+      await c.query('COMMIT')
+      return { unitId, tenantId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('counts invited residents in the divisor and holds their share', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // One occupant each → 50/50. The signed unit must NOT absorb all 100 just
+    // because its neighbour has not signed yet.
+    const bills = await db.query<any>(
+      `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(res.billsCreated).toBe(1)
+    expect(bills.rows).toHaveLength(1)
+    expect(bills.rows[0].unit_id).toBe(signed.unitId)
+    expect(Number(bills.rows[0].charge_amount)).toBe(50)
+
+    // The invited unit's share is HELD — not billed, not lost.
+    const held = await db.query<any>(
+      `SELECT charge_amount, released_at FROM suspended_utility_charges WHERE unit_id=$1`,
+      [invited.unitId])
+    expect(held.rows).toHaveLength(1)
+    expect(Number(held.rows[0].charge_amount)).toBe(50)
+    expect(held.rows[0].released_at).toBeNull()
+  })
+
+  it('releases the held share onto the lease when it is signed', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // They sign — a lease now exists for the unit.
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
+      await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const out = await releaseSuspendedChargesForLease({
+      unitId: invited.unitId, leaseId, tenantId: invited.tenantId, landlordId: base.landlordId })
+    expect(out.released).toBe(1)
+
+    const bill = await db.query<any>(
+      `SELECT charge_amount, lease_id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bill.rows).toHaveLength(1)
+    expect(Number(bill.rows[0].charge_amount)).toBe(50)
+    expect(bill.rows[0].lease_id).toBe(leaseId)
+
+    // Idempotent — the signature path is best-effort and retryable.
+    const again = await releaseSuspendedChargesForLease({
+      unitId: invited.unitId, leaseId, tenantId: invited.tenantId, landlordId: base.landlordId })
+    expect(again.released).toBe(0)
+    const still = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(still.rows).toHaveLength(1)
+  })
+
+  it('holds nothing against a genuinely vacant unit', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const c = await db.connect()
+    let vacant = ''
+    try {
+      await c.query('BEGIN')
+      vacant = await seedUnit(c, { propertyId: base.propertyId, landlordId: base.landlordId })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, vacant)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // Nobody lives there, so nothing is held against a person who does not exist.
+    const held = await db.query<any>(`SELECT id FROM suspended_utility_charges WHERE unit_id=$1`, [vacant])
+    expect(held.rows).toHaveLength(0)
   })
 })

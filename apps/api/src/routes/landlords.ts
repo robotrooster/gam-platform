@@ -1969,11 +1969,18 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // tenant whose only prior intent was cancelled inserts a FRESH row — the
     // cancelled one is retained as history and falls outside the arbiter; a
     // tenant with an existing live intent updates it back to open on this unit.
+    // S629 (Nic): conflicts on (tenant, UNIT), not on the tenant alone.
+    //
+    // It used to key on tenant_id and DO UPDATE SET unit_id = EXCLUDED.unit_id,
+    // so inviting somebody to a second spot MOVED their existing invite off the
+    // first one. A person with two spots ended up with one lease and no sign
+    // that an invite had been lost. Re-inviting to the SAME unit still reopens
+    // that invite, which is the behaviour this clause was written for.
     await client.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
        VALUES ($1, $2, 'not_uploaded', $3)
-       ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL DO UPDATE SET unit_id=EXCLUDED.unit_id, resolved_at=NULL,
-             accepted_at=NULL, draft_document_id=NULL, updated_at=NOW()`,
+       ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
+       DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL, updated_at=NOW()`,
       [landlordId, tenantId, unitId])
 
     await client.query('COMMIT')

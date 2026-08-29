@@ -101,6 +101,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // any test that creates a FlexPay advance traps the next file's
   // cleanupAllSchema on leases/users delete.
   await db.query(`DELETE FROM flexpay_advances`)
+  // S629: suspended_utility_charges.released_bill_id FKs utility_bills — the
+  // bill a held share became when the tenant signed. Held rows go first or the
+  // bill delete violates that reference. RESTRICT rather than SET NULL on
+  // purpose: the link from a bill back to the share it was holding is the
+  // audit trail for money that moved late.
+  await db.query(`DELETE FROM suspended_utility_charges`)
   await db.query(`DELETE FROM utility_bills`)
   // S614: a service agreement holds units + tenants with RESTRICT, and its bills
   // reference it, so it clears after the bills and before units/tenants below.
