@@ -4558,6 +4558,13 @@ function App() {
         <Route path="/accept-invite" element={<AcceptInvitePage />} />
         <Route path="/background-check" element={<BackgroundCheckPage />} />
         <Route path="/pos-customer-onboard/:token" element={<PosCustomerOnboardingPage />} />
+        {/* S629 (Nic): "the signing should almost be outside of logging in."
+            PUBLIC — the emailed link carries the signer's own 64-hex token,
+            which identifies them for that one document. A tenant invited to
+            sign should not have to set a password before they can read what
+            they are being asked to sign. The authenticated route below stays
+            for signing from inside the portal. */}
+        <Route path="/sign/:documentId" element={<SignPage />} />
         <Route path="/" element={token ? <Layout /> : <Navigate to="/login" replace />}>
           <Route index element={<DefaultPage />} />
           <Route path="notifications"    element={<TenantNotificationsPage />} />

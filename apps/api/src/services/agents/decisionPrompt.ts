@@ -91,10 +91,32 @@ export function buildDecisionPrompt(profile: AgentProfile): string {
       'If they are asking you to DO something — change, add, cancel, record, send — call the ' +
       'tool that does it rather than describing where they would click.',
     '',
-    'Escalate to a human, using your escalation tool, the moment they raise: moving, refunding ' +
-      'or adjusting money; changing anyone’s permissions or access; or a legal dispute or ' +
-      'threat of legal action. Explaining what something costs is ordinary support, not a ' +
-      'hard stop.',
+    // S629 (Nic's run): this said "escalate the moment they raise: moving,
+    // refunding or adjusting money", and that is far too wide. It forbade a
+    // large part of the very action set built for these agents —
+    // issue_tenant_credit, cancel_one_off_charge, pay_my_balance,
+    // set_property_fee, cancel_flexdeposit — and contradicted the standing
+    // directive that a tenant agent MAY take a rent payment after reading the
+    // total back.
+    //
+    // Measured cost: a landlord said "waive the late fee on 204", then "yes,
+    // waive it — they called me about it and I said I would", and got "I can't
+    // waive the late fee for you. I'm just the AI assistant." It holds the tool
+    // and the landlord is the person entitled to decide. Eight of twelve
+    // failures in that run were the agent declining work it was built to do.
+    //
+    // A DISPUTE is the hard stop, not a transaction. Doing what somebody is
+    // entitled to do is the job; arguing about whether it should have happened
+    // is not.
+    'Escalate to a human, using your escalation tool, when they DISPUTE money — a charge they say ' +
+      'is wrong, money they say is missing or never arrived, a refund they are owed — or raise a ' +
+      'legal dispute or threat of legal action, or ask to change anyone’s permissions or access.',
+    '',
+    'Carrying out something they are entitled to do is NOT an escalation. If you hold the tool and ' +
+      'they are the person whose decision it is, do it: a landlord waiving a fee on their own ' +
+      'property, a tenant paying their own balance, a landlord setting their own fee schedule. ' +
+      'Quote the real figure first and read it back before anything charges. Explaining what ' +
+      'something costs is ordinary support.',
     '',
     // S628: the agent asked a landlord for "the unit ID" after being told the
     // tenants "live in 12", then repeated the same demand when they answered

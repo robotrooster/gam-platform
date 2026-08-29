@@ -8,8 +8,24 @@ import { humanize } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_tenant_token')
+/**
+ * S629 (Nic): a signing link works WITHOUT a session. The path param is either
+ * a document id (signing from inside the portal) or the signer's own 64-hex
+ * token from the email, which identifies them by itself. A stale or absent
+ * Authorization header alongside a token is what turned an emailed link into a
+ * login screen, so it is omitted entirely when a token is in play.
+ */
+const SIGNER_TOKEN_RE = /^[a-f0-9]{64}$/i
 function authFetch(path: string, opts: RequestInit = {}) {
-  return fetch(API + '/api' + path, { ...opts, headers: { Authorization: 'Bearer ' + tok(), ...(opts.headers||{}) } })
+  const byToken = SIGNER_TOKEN_RE.test(path.split('/').pop()?.split('?')[0] || '')
+  const t = tok()
+  return fetch(API + '/api' + path, {
+    ...opts,
+    headers: {
+      ...(byToken || !t ? {} : { Authorization: 'Bearer ' + t }),
+      ...(opts.headers || {}),
+    },
+  })
 }
 
 // S233: replaced movie-font signature options (Terminator / Matrix /

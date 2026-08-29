@@ -3595,19 +3595,64 @@ export async function autoSendDraftedDocument(documentId: string): Promise<boole
   }
 }
 
-export function signingUrlFor(signer: { role: string }, documentId: string,
+export function signingUrlFor(signer: { role: string; token?: string | null }, documentId: string,
                        user: { email_verified?: boolean; tenant_invite_token?: string | null } | null): string {
+  // S629: the TOKEN, not the document id — that is what makes the link work
+  // without a login. Falls back to the document id only if a signer somehow has
+  // no token, where the recipient at least reaches the document after signing in.
+  const ref = signer.token || documentId
   if (signer.role === 'landlord' || signer.role === 'witness') {
-    return `${LANDLORD_APP_URL}/sign/${documentId}`
+    return `${LANDLORD_APP_URL}/sign/${ref}`
   }
-  if (user && !user.email_verified && user.tenant_invite_token) {
-    return `${TENANT_APP_URL}/accept-invite?token=${user.tenant_invite_token}` +
-           `&next=${encodeURIComponent('/sign/' + documentId)}`
-  }
-  return `${TENANT_APP_URL}/sign/${documentId}`
+  // An unactivated tenant can now sign straight from the link too: the signing
+  // token is their identity for this document, so there is no reason to make
+  // them set a password before they can read what they are signing.
+  return `${TENANT_APP_URL}/sign/${ref}`
 }
 
-esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
+
+/**
+ * S629 (Nic): "the link in the email is not to the correct thing — it just has
+ * me sign in to the landlord portal. The signing should almost be outside of
+ * logging in. When I click the link in the email it needs to take me right to
+ * select my font, my initials, and sign it."
+ *
+ * He is describing how every e-sign product works, and the schema was built for
+ * it: lease_document_signers.token is a 64-hex secret, UNIQUE, with its own
+ * index. No route ever used it — every signing route required a session, so an
+ * emailed link landed on a login page.
+ *
+ * The token IS the identity for these three routes. It arrives in the path
+ * where a document id would, and is told apart by shape (64 hex versus a UUID),
+ * so the handlers below are untouched: they look a signer up by
+ * (document_id, user_id) and this supplies both.
+ *
+ * Safe because these handlers use req.user for exactly two things — that signer
+ * lookup and a platform-block check, both keyed on the user id. There is no
+ * permission or landlord-scope check to widen. The token grants ONE signer
+ * access to ONE document, which is precisely what was emailed to them.
+ */
+const SIGNER_TOKEN_RE = /^[a-f0-9]{64}$/i
+async function authOrSignerToken(req: any, res: any, next: any) {
+  const supplied = String(req.params.documentId || '')
+  if (!SIGNER_TOKEN_RE.test(supplied)) return requireAuth(req, res, next)
+  try {
+    const signer = await queryOne<any>(
+      `SELECT s.*, d.status AS doc_status FROM lease_document_signers s
+         JOIN lease_documents d ON d.id = s.document_id
+        WHERE s.token = $1`, [supplied])
+    if (!signer) return res.status(404).json({ success: false, error: 'That signing link is not valid.' })
+    if (signer.doc_status === 'voided') {
+      return res.status(410).json({ success: false, error: 'This document was voided and can no longer be signed.' })
+    }
+    req.params.documentId = signer.document_id
+    req.user = { userId: signer.user_id, role: 'signer', email: signer.email, profileId: null }
+    req.signerToken = supplied
+    return next()
+  } catch (e) { return next(e) }
+}
+
+esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) => {
   try {
     const signer = await queryOne<any>(`
       SELECT * FROM lease_document_signers
@@ -3761,7 +3806,7 @@ esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
+esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) => {
   const client = await getClient()
   let txnDone = false
   try {
@@ -4187,7 +4232,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
 //   - Idempotent: re-clicking decline on an already-declined signer
 //     row returns the existing decline state without firing another
 //     notification.
-esignRouter.post('/sign/:documentId/decline', requireAuth, async (req, res, next) => {
+esignRouter.post('/sign/:documentId/decline', authOrSignerToken, async (req, res, next) => {
   const client = await getClient()
   try {
     const reason = req.body?.reason != null ? String(req.body.reason).trim().slice(0, 1000) : null

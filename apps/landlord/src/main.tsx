@@ -207,6 +207,15 @@ export default function App() {
                 yet, which is the entire point of the flow. */}
             <Route path="/accept-owner-invite/:token" element={<AcceptOwnerInvitePage />} />
             <Route path="/shelf/:id" element={<ShelfLabelPage />} />
+            {/* S629 (Nic): "the signing should almost be outside of logging in.
+                When I click the link in the email it needs to take me right to
+                select my font, my initials, and sign it."
+                PUBLIC. The emailed link carries the signer's own 64-hex token,
+                which IS their identity for that one document — the same way
+                every e-sign product works. It was nested under PrivateRoute, so
+                an emailed link landed on a login screen. The authenticated
+                route below stays for signing from inside the portal. */}
+            <Route path="/sign/:token" element={<SignPage />} />
             <Route path="/" element={<PrivateRoute><ErrorBoundary><Layout /></ErrorBoundary></PrivateRoute>}>
               <Route index element={<RoleRedirect />} />
               <Route path="welcome"        element={<NoAccessPage />} />

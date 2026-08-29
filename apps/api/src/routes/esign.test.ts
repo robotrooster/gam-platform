@@ -3526,27 +3526,38 @@ describe('POST /documents/addendum-terms — S582 money add-on', () => {
  */
 describe('signing links by signer role', () => {
   it('sends the landlord to the landlord app and a tenant to the tenant app', () => {
-    const landlord = signingUrlFor({ role: 'landlord' }, 'doc-1', null)
-    const tenant = signingUrlFor({ role: 'primary' }, 'doc-1', { email_verified: true })
-    expect(landlord).toContain('/sign/doc-1')
-    expect(tenant).toContain('/sign/doc-1')
+    const landlord = signingUrlFor({ role: 'landlord', token: 'c'.repeat(64) }, 'doc-1', null)
+    const tenant = signingUrlFor({ role: 'primary', token: 'd'.repeat(64) }, 'doc-1', { email_verified: true })
+    expect(landlord).toContain('/sign/')
+    expect(tenant).toContain('/sign/')
     expect(landlord).not.toBe(tenant)
     // The landlord must never be pointed at the tenant portal.
     expect(landlord).not.toContain('tenant')
   })
 
-  it('carries an unactivated tenant through accept-invite to the document', () => {
-    // Signing is the reason they were invited; the link must not dead-end at a
-    // password screen with no way back to the lease.
-    const url = signingUrlFor({ role: 'primary' }, 'doc-9',
+  it('sends an unactivated tenant straight to the document, not to a password screen', () => {
+    // S629 (Nic): "the signing should almost be outside of logging in." The
+    // signer's token IS their identity for this document, so there is no reason
+    // to make somebody set a password before they can read what they are
+    // signing. This previously detoured through /accept-invite.
+    const tok = 'a'.repeat(64)
+    const url = signingUrlFor({ role: 'primary', token: tok }, 'doc-9',
       { email_verified: false, tenant_invite_token: 'tok123' })
-    expect(url).toContain('/accept-invite?token=tok123')
-    expect(decodeURIComponent(url)).toContain('next=/sign/doc-9')
+    expect(url).toContain(`/sign/${tok}`)
+    expect(url).not.toContain('accept-invite')
+  })
+
+  it('puts the SIGNER TOKEN in the link, never the document id', () => {
+    // The document id would land on a login page: the handlers resolve a signer
+    // from the session unless a token is supplied in its place.
+    const tok = 'b'.repeat(64)
+    expect(signingUrlFor({ role: 'landlord', token: tok }, 'doc-1', null)).toContain(`/sign/${tok}`)
+    expect(signingUrlFor({ role: 'landlord', token: tok }, 'doc-1', null)).not.toContain('doc-1')
   })
 
   it('treats a witness like the landlord — they sign in the landlord app', () => {
-    expect(signingUrlFor({ role: 'witness' }, 'doc-2', null)).toContain('/sign/doc-2')
-    expect(signingUrlFor({ role: 'witness' }, 'doc-2', null))
-      .toBe(signingUrlFor({ role: 'landlord' }, 'doc-2', null))
+    const tok = 'e'.repeat(64)
+    expect(signingUrlFor({ role: 'witness', token: tok }, 'doc-2', null))
+      .toBe(signingUrlFor({ role: 'landlord', token: tok }, 'doc-2', null))
   })
 })
