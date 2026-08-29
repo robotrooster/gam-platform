@@ -29,7 +29,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision, seedTenant,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -639,4 +639,48 @@ it('S605: padWidth from a client is ignored — always two digits', async () => 
     `SELECT unit_number FROM units WHERE property_id=$1 AND unit_number LIKE 'RV %' ORDER BY unit_number`,
     [f.propertyId])
   expect(rows.map((r: any) => r.unit_number)).toEqual(['RV 08', 'RV 09'])   // not RV 8 / RV 9
+})
+
+/**
+ * S629 — a pending invite from EITHER door has to hide the unit.
+ *
+ * Nic's S613 rule stops one space being offered to two households. It was only
+ * half applied: pending_invite_count counted pending_lease_drafts (the Invite
+ * Tenant modal) and not pending_tenant_intents (New Lease — Invite to Sign).
+ *
+ * Live, APT 04 had two people invited through the second door and reported
+ * zero, so it stayed in the dropdown and could have been offered again.
+ */
+describe('pending_invite_count sees both invite flows', () => {
+  it('counts a pending_tenant_intents invite, not just a lease draft', async () => {
+    const c = await db.connect()
+    let unitId = ''
+    let token = ''
+    try {
+      await c.query('BEGIN')
+      const { userId: llUser, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      // Invited, not yet accepted — the live-invite case.
+      await c.query(
+        `UPDATE users SET tenant_invite_expires_at = NOW() + INTERVAL '7 days'
+          WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId])
+      await c.query(
+        `INSERT INTO pending_tenant_intents (unit_id, tenant_id, landlord_id, property_id)
+         VALUES ($1,$2,$3,$4)`, [unitId, tenantId, landlordId, propertyId])
+      await c.query('COMMIT')
+      token = jwt.sign(
+        { userId: llUser, role: 'landlord', email: 'll@t.dev', profileId: landlordId, permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const res = await request(buildApp()).get('/api/units').set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    const unit = res.body.data.find((u: any) => u.id === unitId)
+    expect(unit, 'the unit should be returned').toBeTruthy()
+    // This harness mounts the router without the camelize interceptor, so the
+    // response keeps the column's own name.
+    expect(unit.pending_invite_count ?? unit.pendingInviteCount).toBe(1)
+  })
 })

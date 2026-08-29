@@ -100,11 +100,35 @@ unitsRouter.get('/', async (req, res, next) => {
         --
         -- Without the last case an unaccepted invite would hold a space out of
         -- the list forever, which is worse than the double-invite it prevents.
-        (SELECT COUNT(*)::int FROM pending_lease_drafts pld
-           JOIN users pu ON pu.id = pld.tenant_user_id
-          WHERE pld.unit_id = u.id AND pld.resolved_at IS NULL
-            AND (pu.tenant_invite_expires_at IS NULL
-                 OR pu.tenant_invite_expires_at > NOW())) AS pending_invite_count
+        --
+        -- S629 (Nic): "I went into a different unit, and the apartment that I
+        -- just sent invites to is still showing from the drop down list."
+        --
+        -- It was, because this counted ONE of the two invite doors. The Invite
+        -- Tenant modal writes pending_lease_drafts; "New Lease — Invite to
+        -- Sign" writes pending_tenant_intents, and nothing here looked at
+        -- those. APT 04 had two people invited and still reported zero, so the
+        -- S613 rule that stops one space being offered to two households was
+        -- only ever half applied.
+        --
+        -- Both are counted, under the same three-state expiry test: a live
+        -- invite blocks, an accepted-but-unfinished one blocks (accepting
+        -- CLEARS the expiry, so NULL means mid-flow), and one that lapsed
+        -- releases the unit.
+        ((SELECT COUNT(*)::int FROM pending_lease_drafts pld
+            JOIN users pu ON pu.id = pld.tenant_user_id
+           WHERE pld.unit_id = u.id AND pld.resolved_at IS NULL
+             AND (pu.tenant_invite_expires_at IS NULL
+                  OR pu.tenant_invite_expires_at > NOW()))
+         +
+         (SELECT COUNT(*)::int FROM pending_tenant_intents pti
+            JOIN tenants pt2 ON pt2.id = pti.tenant_id
+            JOIN users pu2 ON pu2.id = pt2.user_id
+           WHERE pti.unit_id = u.id
+             AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+             AND (pu2.tenant_invite_expires_at IS NULL
+                  OR pu2.tenant_invite_expires_at > NOW()))
+        ) AS pending_invite_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id

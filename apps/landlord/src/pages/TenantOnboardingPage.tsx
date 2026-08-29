@@ -240,6 +240,7 @@ export function TenantOnboardingPage() {
 // on accept. Co-tenants: keep the same unit and invite again before anyone signs.
 function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
   const navigate = useNavigate()
+  const qc = useQueryClient()
   // S629 (Nic): "you need to be able to add multiple people to the same
   // document. Otherwise it's not gonna flow."
   //
@@ -349,6 +350,10 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
     // one. On a clean send, return to that property's units with the property
     // already filtered and the confirmation carried along.
     if (!failed.length) {
+      // S629: the unit just invited into must stop being offered. Without this
+      // the cached units list still reports it free, and the next unit's form
+      // — a fresh mount, same cache — happily lists it again.
+      qc.invalidateQueries('units')
       const propertyId = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
       navigate(propertyId ? `/units?property=${propertyId}` : '/units',
         { state: { invited: sentNow } })
