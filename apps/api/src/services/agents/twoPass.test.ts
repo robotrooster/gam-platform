@@ -90,3 +90,26 @@ describe('the deciding prompt', () => {
     expect(without).toMatch(/state no account-specific fact/i)
   })
 })
+
+/**
+ * S628 — never ask a person for an internal key.
+ *
+ * Two failures on consecutive turns of the validation run came from the same
+ * blank. Told "I'm starting an eviction on spot 7", the agent asked for a unit
+ * ID and then INVENTED one ('unit_12345') to fill it. Told the Alvarez family
+ * "live in 12", it asked for a unit ID again and repeated the demand verbatim
+ * when the landlord answered with something else.
+ *
+ * A landlord does not hold a UUID. Asking for one is a dead end they cannot
+ * get out of, and the model's two ways out of a dead end are both bad: invent
+ * the value, or ask again.
+ */
+describe('the deciding prompt — internal identifiers', () => {
+  it('tells every profile to look the record up rather than ask for a key', () => {
+    for (const p of AGENT_PROFILES) {
+      const built = buildDecisionPrompt(p)
+      expect(built, p.id).toMatch(/NEVER ask them for an ID/)
+      expect(built, p.id).toMatch(/what they called it/)
+    }
+  })
+})

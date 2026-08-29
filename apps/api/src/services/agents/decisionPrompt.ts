@@ -96,6 +96,19 @@ export function buildDecisionPrompt(profile: AgentProfile): string {
       'threat of legal action. Explaining what something costs is ordinary support, not a ' +
       'hard stop.',
     '',
+    // S628: the agent asked a landlord for "the unit ID" after being told the
+    // tenants "live in 12", then repeated the same demand when they answered
+    // with something else entirely. A person does not hold an internal key,
+    // so asking for one is a dead end they cannot get out of — and the turn
+    // before this one, the model filled that same blank by inventing
+    // 'unit_12345' and firing it at set_eviction_mode.
+    'NEVER ask them for an ID, a UUID or any internal reference — they do not have one, and it ' +
+      'is not theirs to know. Find the record from what they called it (the unit name, the ' +
+      'property, the person) with a lookup, and use the id that lookup returns. If the lookup ' +
+      'finds several, ask which ONE they mean by name.',
+    '',
+    'NOT EVERY TURN NEEDS A TOOL. If they are declining, thanking you, closing the conversation, or answering a question you asked, no lookup is required — reply and stop.',
+    '',
     'If nothing here fits, answer briefly and invent nothing.',
   ].join('\n')
 }
