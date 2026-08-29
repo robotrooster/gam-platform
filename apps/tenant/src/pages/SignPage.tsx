@@ -364,8 +364,17 @@ export function SignPage() {
 
   const loadPdf = useCallback(async (url:string) => {
     const pdfjsLib = await loadPdfjs()
-    const fullUrl = url.startsWith('http') ? url : API+url
-    const pdf = await pdfjsLib.getDocument({ url:fullUrl, httpHeaders:{ Authorization:'Bearer '+tok() } }).promise
+    // S629 (Nic): a tenant signing from an emailed link has no session, so
+    // `Authorization: Bearer null` 401'd the file and the page drew signature
+    // fields over a blank canvas. The signer's token goes on the query string
+    // instead; the file route's per-row check authorises it exactly as it does
+    // a landlord's session.
+    const base = url.startsWith('http') ? url : API+url
+    const byToken = SIGNER_TOKEN_RE.test(documentId || '')
+    const fullUrl = byToken ? `${base}${base.includes('?') ? '&' : '?'}t=${documentId}` : base
+    const pdf = await pdfjsLib.getDocument(
+      byToken ? { url: fullUrl } : { url: fullUrl, httpHeaders: { Authorization: 'Bearer ' + tok() } }
+    ).promise
     pdfRef.current = pdf
     setPdfPageCount(pdf.numPages)
     await renderPageImperative(pdf, 1)

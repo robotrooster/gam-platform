@@ -205,6 +205,24 @@ export async function createDocumentRecord(client: any, opts: {
   // underneath worked perfectly well.
   prefillValues?: Record<string, string>,
 }): Promise<any> {
+  // S629 (Nic): "it does not render the PDF to even see what you're signing."
+  //
+  // The document had NO base_pdf_url — its template had one and nothing copied
+  // it down. The manual create route takes the PDF from the request body
+  // because the UI supplies it; every programmatic caller passed null, so an
+  // auto-drafted lease was a set of signature fields floating over nothing.
+  //
+  // Inherited here rather than at each call site, because the same hole exists
+  // in all of them — the auto-draft on invite-accept, the renewal draft, and
+  // the home-sale purchase agreement. A document made FROM a template is made
+  // from that template's paper.
+  let basePdfUrl = opts.basePdfUrl
+  if (!basePdfUrl && opts.templateId) {
+    const t = await client.query(
+      `SELECT base_pdf_url FROM lease_templates WHERE id = $1`, [opts.templateId])
+    basePdfUrl = t.rows[0]?.base_pdf_url ?? null
+  }
+
   // INSERT lease_documents — includes document_type and addendum-specific FKs
   const doc = await client.query(`
     INSERT INTO lease_documents (
@@ -216,7 +234,7 @@ export async function createDocumentRecord(client: any, opts: {
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
-      opts.title, opts.basePdfUrl,
+      opts.title, basePdfUrl,
       opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId,
       opts.renewsLeaseId || null,
       opts.depositAlreadyHeld === true
@@ -4438,7 +4456,30 @@ esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.si
   } catch (e) { next(e) }
 })
 
-esignRouter.get('/files/:filename', requireAuth, async (req: any, res: any, next: any) => {
+
+/**
+ * S629: the same signer-token identity, for a file request.
+ *
+ * The signing page fetches the PDF it is asking somebody to sign, and that
+ * route authorises per row — the caller must be the landlord OR a signer on a
+ * document referencing the file. A signer arriving from an emailed link has no
+ * session, so the token comes on the query string instead and stands in for
+ * one. The per-row check below is untouched and still does the deciding: the
+ * token identifies WHO is asking, never WHAT they may see.
+ */
+async function authOrSignerTokenQuery(req: any, res: any, next: any) {
+  const t = String(req.query?.t || '')
+  if (!SIGNER_TOKEN_RE.test(t)) return requireAuth(req, res, next)
+  try {
+    const signer = await queryOne<any>(
+      `SELECT user_id, email FROM lease_document_signers WHERE token = $1`, [t])
+    if (!signer) return res.status(404).json({ success: false, error: 'That signing link is not valid.' })
+    req.user = { userId: signer.user_id, role: 'signer', email: signer.email, profileId: null }
+    return next()
+  } catch (e) { return next(e) }
+}
+
+esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res: any, next: any) => {
   try {
     // Files live in uploads/leases (uploads + executed PDFs) OR
     // uploads/subleases (generated sublease agreements — see

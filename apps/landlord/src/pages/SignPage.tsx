@@ -334,12 +334,24 @@ export function SignPage() {
 
   const loadPdf = useCallback(async (url:string) => {
     const pdfjsLib = await loadPdfjs()
-    const fullUrl = url.startsWith('http') ? url : API+url
-    const pdf = await pdfjsLib.getDocument({ url:fullUrl, httpHeaders:{ Authorization:'Bearer '+tok() } }).promise
+    // S629 (Nic): the PDF has to load for somebody signing from an emailed
+    // link, who has no session. It sent `Authorization: Bearer null` in that
+    // case — a header that identifies nobody — so the file 401'd and the page
+    // rendered signature fields over a blank canvas.
+    //
+    // The signer's token goes on the query string instead, and the file route's
+    // per-row check authorises it the same way it authorises the landlord: the
+    // token says who is asking, the document says what they may see.
+    const base = url.startsWith('http') ? url : API+url
+    const byToken = isSignerToken(token)
+    const fullUrl = byToken ? `${base}${base.includes('?') ? '&' : '?'}t=${token}` : base
+    const pdf = await pdfjsLib.getDocument(
+      byToken ? { url: fullUrl } : { url: fullUrl, httpHeaders: { Authorization: 'Bearer ' + tok() } }
+    ).promise
     pdfRef.current = pdf
     setPdfPageCount(pdf.numPages)
     await renderPageImperative(pdf, 1)
-  }, [renderPageImperative])
+  }, [renderPageImperative, token])
 
   useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
