@@ -3525,6 +3525,76 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
  * carried through to the document afterwards — signing is the reason they were
  * invited, so it should not dead-end at a password screen.
  */
+/**
+ * S629 (Nic): "why the hell would I log in, open the lease for unit 24 and press
+ * send? It needs to be auto sent."
+ *
+ * He is right — the decision was made when he invited the household. A drafted
+ * lease that waits for a button is a step that exists for nobody: the landlord
+ * has to notice a notification, find the document, and press Send before the
+ * email chain that does the actual work can start.
+ *
+ * This is the send route's body, minus the HTTP: mark the document sent, mark
+ * the first signer invited, and email them their link. Everything after that is
+ * unchanged — each signature emails the next signer in turn.
+ *
+ * Best-effort by contract: it returns false rather than throwing, because it
+ * runs inside the tenant's accept transaction. A lease that drafted but failed
+ * to send must still exist and still be sendable by hand; losing the draft
+ * because an email bounced would be worse than the button it replaces.
+ */
+export async function autoSendDraftedDocument(documentId: string): Promise<boolean> {
+  try {
+    const doc = await queryOne<any>(`
+      SELECT d.*, u.unit_number, p.name AS property_name,
+             TRIM(COALESCE(lu.first_name,'') || ' ' || COALESCE(lu.last_name,'')) AS landlord_name
+        FROM lease_documents d
+        LEFT JOIN units u ON u.id = d.unit_id
+        LEFT JOIN properties p ON p.id = u.property_id
+        LEFT JOIN landlords l ON l.id = d.landlord_id
+        LEFT JOIN users lu ON lu.id = l.user_id
+       WHERE d.id = $1`, [documentId])
+    if (!doc || doc.status !== 'pending') return false
+
+    const signers = await query<any>(
+      `SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index`, [documentId])
+    const firstSigner = signers.find(s => s.order_index === 1) || signers[0]
+    if (!firstSigner) return false
+
+    // The landlord-first rule the send route enforces. If a draft somehow comes
+    // out mis-ordered it stays pending for a human rather than going out wrong.
+    if (firstSigner.role !== 'landlord') {
+      logger.warn({ documentId, firstRole: firstSigner.role },
+        '[esign] auto-send skipped — landlord is not the first signer')
+      return false
+    }
+
+    const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : (doc.title || 'GAM Document')
+    const signerUser = await queryOne<any>(
+      'SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [firstSigner.user_id])
+    const url = signingUrlFor(firstSigner, doc.id, signerUser)
+
+    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel,
+      doc.landlord_name, url, { landlordId: doc.landlord_id, documentId: doc.id })
+    await createNotification({
+      userId: firstSigner.user_id,
+      type: 'esign_request',
+      title: 'Document ready to sign',
+      body: `${doc.landlord_name} sent you "${doc.title}" for ${unitLabel}.`,
+      data: { documentId: doc.id },
+      actionUrl: '/esign',
+    }).catch(() => {})
+    await query("UPDATE lease_documents SET status='sent', sent_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+    await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1",
+      [firstSigner.id])
+    logger.info({ documentId, to: firstSigner.email }, '[esign] drafted lease auto-sent to the first signer')
+    return true
+  } catch (e) {
+    logger.error({ err: e, documentId }, '[esign] auto-send failed — the draft stays pending and can be sent by hand')
+    return false
+  }
+}
+
 export function signingUrlFor(signer: { role: string }, documentId: string,
                        user: { email_verified?: boolean; tenant_invite_token?: string | null } | null): string {
   if (signer.role === 'landlord' || signer.role === 'witness') {

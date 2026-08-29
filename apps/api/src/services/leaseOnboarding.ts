@@ -180,10 +180,24 @@ export async function autoDraftLeasesForUnit(
         `UPDATE pending_tenant_intents SET draft_document_id=$1, updated_at=NOW() WHERE id = ANY($2)`,
         [doc.id, members.map(m => m.id)])
       await client.query('RELEASE SAVEPOINT draft_one', [])
+
+      // S629 (Nic): "why the hell would I log in, open the lease and press
+      // send? It needs to be auto sent." The decision was made when the
+      // household was invited — the lease goes out on its own, and the landlord
+      // gets the signing link in their email like every other signer.
+      //
+      // Deliberately AFTER the savepoint is released: a send failure must not
+      // roll back the draft. If the email cannot go, the lease still exists,
+      // still says pending, and can be sent by hand.
+      const { autoSendDraftedDocument } = await import('../routes/esign')
+      const sent = await autoSendDraftedDocument(doc.id)
+
       await createNotification({
         userId: landlord.userId, type: 'lease_ready_to_sign',
         title: 'Lease drafted — ready for your signature',
-        body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Sign in to GoldSign to review and sign it — it goes to the tenant(s) straight after.`,
+        body: sent
+          ? `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and sent — check your email for the signing link. It goes to the tenant(s) as soon as you sign.`
+          : `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Sign in to GoldSign to review and send it.`,
         data: { documentId: doc.id, unitId },
         actionUrl: '/esign',
         // S620 (Nic): "landlords may want email notification when a lease is
