@@ -132,10 +132,29 @@ export function TenantOnboardingPage() {
   // S629 (Nic): the unit detail page links straight here with the unit already
   // chosen. Landing on the mode chooser with an empty unit dropdown, after
   // clicking "Invite to sign a lease" ON a unit, is a step backwards.
-  const [sp] = useSearchParams()
-  const deepLinkUnit = sp.get('unit') ?? ''
+  const [sp, setSp] = useSearchParams()
+  // Read ONCE. ?unit= means "expand this one, I just came from it" — an
+  // instruction about this arrival, not a property of the page.
+  const [deepLinkUnit] = useState(() => sp.get('unit') ?? '')
   const deepLinkProperty = sp.get('property') ?? ''
   const [mode, setMode] = useState<Mode>(deepLinkUnit || deepLinkProperty ? 'new_lease' : 'choose')
+
+  // S629 (Nic): "when I click out and back into it, it wants to open with
+  // mobile home six selected and expanded already... I've cleared the whole
+  // list, I go back, I do a hard refresh, and it still keeps populating mobile
+  // home six."
+  //
+  // Because ?unit= stayed in the URL, so every reload replayed an arrival that
+  // happened once. Consumed after the first render: the card is already open
+  // for this visit, and a refresh now opens the page clean. ?property= is
+  // deliberately kept — the scope IS a property of the page, and losing it on
+  // refresh would dump the whole portfolio back.
+  useEffect(() => {
+    if (!sp.get('unit')) return
+    const next = new URLSearchParams(sp)
+    next.delete('unit')
+    setSp(next, { replace: true })
+  }, [])
   const navigate = useNavigate()
 
   // Static pending count for the third mode card. staleTime 30s — mode picker
