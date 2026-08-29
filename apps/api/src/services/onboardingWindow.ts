@@ -179,7 +179,9 @@ export async function applyScreeningWaive(opts: {
        (landlord_id, tenant_id, parser_status, property_id, unit_id,
         screening_waived, screening_waived_by, screening_waived_at, screening_attested, screening_waived_unit_id)
      VALUES ($1, $2, 'not_uploaded', $3, NULL, true, $4, NOW(), true, $5)
-     ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL DO UPDATE SET
+     -- S629: the NO-UNIT index (this inserts unit_id NULL). See the
+     -- intent_unique_per_unit migration.
+     ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL DO UPDATE SET
        property_id = COALESCE(public.pending_tenant_intents.property_id, EXCLUDED.property_id),
        screening_waived = true,
        screening_waived_by = EXCLUDED.screening_waived_by,

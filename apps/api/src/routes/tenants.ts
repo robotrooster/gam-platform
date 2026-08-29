@@ -1671,7 +1671,11 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
       await query(
         `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, property_id, unit_id)
          VALUES ($1, $2, 'not_uploaded', $3, NULL)
-         ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL
+         -- S629: targets the NO-UNIT index. Uniqueness moved to
+         -- (tenant, unit) so one person can hold invites to two spots; this
+         -- path invites to a PROPERTY with no unit yet, and there is still
+         -- only ever one of those per tenant.
+         ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL AND unit_id IS NULL
          DO UPDATE SET property_id = EXCLUDED.property_id, resolved_at = NULL, updated_at = NOW()`,
         [inviteLandlordId, tenantId, inviterPropertyId])
     }
