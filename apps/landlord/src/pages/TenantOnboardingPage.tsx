@@ -1,6 +1,6 @@
 import { useState, useRef, useMemo } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut } from '../lib/api'
 import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
@@ -128,7 +128,12 @@ function OnboardingWindowsBanner() {
 }
 
 export function TenantOnboardingPage() {
-  const [mode, setMode] = useState<Mode>('choose')
+  // S629 (Nic): the unit detail page links straight here with the unit already
+  // chosen. Landing on the mode chooser with an empty unit dropdown, after
+  // clicking "Invite to sign a lease" ON a unit, is a step backwards.
+  const [sp] = useSearchParams()
+  const deepLinkUnit = sp.get('unit') ?? ''
+  const [mode, setMode] = useState<Mode>(deepLinkUnit ? 'new_lease' : 'choose')
   const navigate = useNavigate()
 
   // Static pending count for the third mode card. staleTime 30s — mode picker
@@ -217,7 +222,7 @@ export function TenantOnboardingPage() {
 
       {mode === 'bulk' && <BulkCsvMode onBack={() => setMode('choose')} />}
 
-      {mode === 'new_lease' && <NewLeaseInviteMode onBack={() => setMode('choose')} />}
+      {mode === 'new_lease' && <NewLeaseInviteMode onBack={() => setMode('choose')} initialUnitId={deepLinkUnit} />}
 
       {mode === 'single' && (
         <SingleTenantMode
@@ -232,18 +237,34 @@ export function TenantOnboardingPage() {
 // S558 (Flow B): invite a tenant to a UNIT for a NEW lease they will sign.
 // Unit-linked invite → the lease auto-drafts from the unit's default template
 // on accept. Co-tenants: keep the same unit and invite again before anyone signs.
-function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
-  const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '' })
-  const [unitId, setUnitId] = useState('')
+function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
+  // S629 (Nic): "you need to be able to add multiple people to the same
+  // document. Otherwise it's not gonna flow."
+  //
+  // Co-tenants were always supported — the old version cleared the name fields
+  // on success and kept the unit, and the button relabelled itself "Invite
+  // another to this unit". But that only appeared AFTER the first invite went
+  // out, so the form you are looking at shows one person and gives you no
+  // reason to believe it takes more. You had to commit to an invite to
+  // discover the feature.
+  //
+  // A household roster is known up front, so it is entered up front. Every
+  // person is one invite to the same unit; the draft re-drafts with the whole
+  // roster as each is added, and nothing is sent until you press send.
+  type Person = { firstName: string; lastName: string; email: string; phone: string }
+  const blank = (): Person => ({ firstName: '', lastName: '', email: '', phone: '' })
+  const [people, setPeople] = useState<Person[]>([blank()])
+  const [unitId, setUnitId] = useState(initialUnitId)
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const [error, setError] = useState<string | null>(null)
   const [invited, setInvited] = useState<string[]>([])
-  const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
+  const [sending, setSending] = useState(false)
 
-  // S579: the onboarding-window grandfather. This page is explicitly for tenants
-  // who ALREADY live in the unit, so a sitting tenant may skip the background
-  // check — but only while the property's onboarding window is open, and only
-  // with the landlord's attestation. After the window closes, they screen.
+  const setField = (i: number, k: keyof Person, v: string) =>
+    setPeople(prev => prev.map((p, idx) => idx === i ? { ...p, [k]: v } : p))
+  const addPerson = () => setPeople(prev => [...prev, blank()])
+  const removePerson = (i: number) => setPeople(prev => prev.filter((_, idx) => idx !== i))
+
   const propertyIdForWindow = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
   const { data: obWindow } = useQuery<any>(
     ['ob-window', propertyIdForWindow],
@@ -252,19 +273,33 @@ function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
   const windowOpen = !!obWindow?.open
   const [attestExisting, setAttestExisting] = useState(true)
 
-  const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-new-lease-tenant', { ...form, unitId, existingResident: windowOpen && attestExisting }),
-    {
-      onSuccess: () => {
-        setInvited(prev => [...prev, `${form.firstName} ${form.lastName}`.trim() || form.email])
-        setForm({ firstName: '', lastName: '', email: '', phone: '' }) // keep unitId for co-tenants
-        setError(null)
-      },
-      onError: (e: any) => setError(e?.response?.data?.message || e?.message || 'Could not send the invite.'),
-    }
-  )
+  const complete = (p: Person) => !!(p.firstName && p.lastName && p.email && p.phone)
+  const ready = people.filter(complete)
+  const canSubmit = !!unitId && ready.length > 0 && ready.length === people.length
 
-  const canSubmit = form.firstName && form.lastName && form.email && form.phone && unitId
+  // Sent one at a time on purpose: each is a real invite email, and a failure
+  // half way through must leave the people already invited invited — not roll
+  // back an email that has landed in somebody's inbox. Whoever fails stays in
+  // the form with the reason.
+  const sendAll = async () => {
+    setSending(true); setError(null)
+    const failed: Person[] = []
+    let lastErr = ''
+    for (const p of people) {
+      try {
+        await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
+          { ...p, unitId, existingResident: windowOpen && attestExisting })
+        setInvited(prev => [...prev, `${p.firstName} ${p.lastName}`.trim() || p.email])
+      } catch (e: any) {
+        failed.push(p)
+        lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
+      }
+    }
+    setPeople(failed.length ? failed : [blank()])
+    setError(failed.length ? `${failed.length} of ${people.length} could not be invited: ${lastErr}` : null)
+    setSending(false)
+  }
+
   const selectedUnit = (allUnits as any[]).find(u => u.id === unitId)
 
   return (
@@ -273,20 +308,19 @@ function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
       <div className="card" style={{ padding: 24 }}>
         <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Invite to sign a new lease</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 0 }}>
-          Pick the unit and enter the tenant. They get an invite email; once everyone
-          invited to the unit accepts, the lease auto-drafts from the unit&apos;s default
-          template (rent, deposit, term all filled) for you to sign.
+          Pick the unit and add everyone who will sign. They each get an invite email; once
+          everyone accepts, one lease auto-drafts from the unit&apos;s default template
+          (rent, deposit, term all filled) for you to sign.
         </p>
 
         {invited.length > 0 && (
-          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: 12, marginBottom: 14 }}>
+          <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--green)', marginBottom: 4 }}>Invited to {selectedUnit ? `Unit ${selectedUnit.unitNumber}` : 'this unit'}:</div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>{invited.join(', ')}</div>
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Add a co-tenant below, or go back — the lease drafts once they all accept.</div>
           </div>
         )}
 
-        <form onSubmit={e => { e.preventDefault(); if (canSubmit) submitMut.mutate() }}>
+        <form onSubmit={e => { e.preventDefault(); if (canSubmit && !sending) sendAll() }}>
           <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Unit *</label>
           <select className="input" value={unitId} onChange={e => setUnitId(e.target.value)} style={{ width: '100%', marginBottom: 12 }}>
             <option value="">Select a unit…</option>
@@ -302,30 +336,49 @@ function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
                 <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
                 <div>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing resident — skip background check</div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing residents — skip background check</div>
                   <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
-                    I attest this person already lives in this unit. They&apos;ll sign the new lease without a background check.
+                    I attest these people already live in this unit. They&apos;ll sign the new lease without a background check.
                     {typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
                   </div>
-                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — this tenant will complete a background check before portal access.</div>}
+                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — they will complete a background check before portal access.</div>}
                 </div>
               </label>
             </div>
           ) : (
             <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-              This property&apos;s onboarding window has closed — this tenant will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access. Grandfathering existing residents is only available during onboarding.
+              This property&apos;s onboarding window has closed — they will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access. Grandfathering existing residents is only available during onboarding.
             </div>
           ))}
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <input className="input" placeholder="First name" value={form.firstName} onChange={e => set('firstName', e.target.value)} />
-            <input className="input" placeholder="Last name" value={form.lastName} onChange={e => set('lastName', e.target.value)} />
-          </div>
-          <input className="input" placeholder="Email" type="email" value={form.email} onChange={e => set('email', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
-          <input className="input" placeholder="Phone" value={form.phone} onChange={e => set('phone', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
+          {people.map((p, i) => (
+            <div key={i} style={{ border: '1px solid var(--border-0)', borderRadius: 8, padding: 12, marginBottom: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                  {i === 0 ? 'Tenant' : `Co-tenant ${i}`}
+                </div>
+                {people.length > 1 && (
+                  <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.7rem' }}
+                          onClick={() => removePerson(i)}>Remove</button>
+                )}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <input className="input" placeholder="First name" value={p.firstName} onChange={e => setField(i, 'firstName', e.target.value)} />
+                <input className="input" placeholder="Last name" value={p.lastName} onChange={e => setField(i, 'lastName', e.target.value)} />
+              </div>
+              <input className="input" placeholder="Email" type="email" value={p.email} onChange={e => setField(i, 'email', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
+              <input className="input" placeholder="Phone" value={p.phone} onChange={e => setField(i, 'phone', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
+            </div>
+          ))}
+
+          <button type="button" className="btn btn-ghost" style={{ width: '100%', fontSize: '.78rem' }} onClick={addPerson}>
+            + Add another person to this lease
+          </button>
+
           {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginTop: 10 }}>{error}</div>}
-          <button type="submit" disabled={!canSubmit || submitMut.isLoading} className="btn btn-primary" style={{ width: '100%', marginTop: 14 }}>
-            {submitMut.isLoading ? 'Sending…' : invited.length > 0 ? 'Invite another to this unit' : 'Send invite'}
+          <button type="submit" disabled={!canSubmit || sending} className="btn btn-primary" style={{ width: '100%', marginTop: 14 }}>
+            {sending ? 'Sending…'
+              : people.length > 1 ? `Send ${people.length} invites` : 'Send invite'}
           </button>
         </form>
       </div>

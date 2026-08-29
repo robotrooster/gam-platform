@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink, Lock, Pencil } from 'lucide-react'
+import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink, Lock, Pencil, UserPlus } from 'lucide-react'
 import { UTILITY_TYPE_LABEL, UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, listingMinPhotos, unitSubtypeFactsLabel, type PropertyUnitSubtype, type UnitType, type FloorLevel } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 
@@ -236,6 +236,19 @@ export function UnitDetailPage() {
           {unit.scheduledActivationAt && can('units.manage_lifecycle') && (
             <button className="btn btn-sm btn-ghost" onClick={() => cancelSchedMut.mutate()} disabled={cancelSchedMut.isLoading}>
               Cancel schedule
+            </button>
+          )}
+          {/* S629 (Nic): "how do I get to the invite flow?" — he was on the
+              unit, which is exactly where you think "get a tenant into this",
+              and the panel offered onboard-existing, mark-available and
+              eviction mode. The one action he wanted was missing, and the
+              button that sounded closest was the PAPER-LEASE path, which would
+              have kept the old lease instead of drafting a new one.
+              Deep-links with the unit already selected. */}
+          {unit.status !== 'occupied' && can('tenants.create') && (
+            <button className="btn btn-sm btn-primary"
+              onClick={() => navigate(`/tenant-onboarding?unit=${unit.id}`)}>
+              <UserPlus size={13} /> Invite to Sign a Lease
             </button>
           )}
           {can('units.eviction_mode') && (
