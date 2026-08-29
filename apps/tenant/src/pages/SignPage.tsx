@@ -72,8 +72,14 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   const currentFont = SIG_FONTS.find(f=>f.id===selectedFont)
 
   return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, overflow:'hidden', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+      {/* S629 (Nic): "the page is locked from scrolling. I cannot scroll down
+          far enough to confirm my selection." On a phone this card is taller
+          than the viewport; centred and overflow:hidden, it was clipped at both
+          ends with nothing scrollable, so the confirm button existed and could
+          not be reached. 100dvh rather than 100vh because mobile browser chrome
+          makes vh taller than what is actually visible. */}
+      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(100dvh - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a', marginBottom:4 }}>{type==='signature'?'Create Your Signature':'Create Your Initials'}</div>
           <p style={{ fontSize:'.8rem', color:'#999', margin:'0 0 14px' }}>{type==='initials'?'Initials are locked to your name on file.':'Applied to all signature fields.'}</p>
@@ -167,7 +173,8 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
         <p style={{ fontSize:'.83rem', color:'var(--text-3)', margin:0 }}>Choose your signature style once — it will be applied to all signature and initial fields.</p>
       </div>
 
-      <div style={{ background:'white', borderRadius:16, overflow:'hidden', boxShadow:'0 4px 24px rgba(0,0,0,.15)' }}>
+      {/* S629: inline card — hidden overflow clipped a tall font list on a phone. */}
+      <div style={{ background:'white', borderRadius:16, boxShadow:'0 4px 24px rgba(0,0,0,.15)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ display:'flex', borderBottom:'2px solid #f0f0f0' }}>
             {(['type','upload'] as const).map(t=>(
@@ -609,8 +616,8 @@ export function SignPage() {
       )}
 
       {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && (
-        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-          <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%' }}>
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+          <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%', margin:'auto' }}>
             <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.fieldType}</div>
             {activeField.fieldType==='checkbox' && (
               <label style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', padding:'11px', border:'1px solid #e5e7eb', borderRadius:8, marginBottom:14 }}>
@@ -645,7 +652,7 @@ export function SignPage() {
       )}
 
       {stage==='review' && (
-        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
           <div style={{ background:'white', borderRadius:20, maxWidth:460, width:'100%', padding:26, maxHeight:'90vh', overflowY:'auto' }}>
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
@@ -723,8 +730,8 @@ function DeclineModal({
   const [reason, setReason] = useState('')
 
   return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-      <div style={{ background:'white', borderRadius:14, width:'100%', maxWidth:460, padding:'22px 24px', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+      <div style={{ background:'white', borderRadius:14, width:'100%', margin:'auto', maxWidth:460, padding:'22px 24px', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
         <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
           <AlertCircle size={20} style={{ color:'#dc4c4c' }}/>
           <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a' }}>Decline this document?</div>

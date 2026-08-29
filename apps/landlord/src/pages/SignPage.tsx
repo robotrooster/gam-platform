@@ -72,8 +72,22 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   const currentFont = SIG_FONTS.find(f=>f.id===selectedFont)
 
   return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, overflow:'hidden', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+    /* S629 (Nic): "the page is locked from scrolling. I cannot scroll down far
+       enough to confirm my selection and proceed. If people sign on their
+       phones, it needs to be usable."
+       
+       The overlay was position:fixed with alignItems:'center' and the card
+       overflow:'hidden'. On a phone the card is taller than the viewport, so it
+       was clipped at BOTH ends with nothing scrollable — the confirm button
+       existed and could not be reached.
+       
+       The overlay scrolls, the card caps at the viewport and scrolls inside it,
+       and alignment starts at the top so a tall card grows downward instead of
+       off both edges. 100dvh, not 100vh: on mobile Safari and Chrome the URL bar
+       makes vh taller than what you can actually see, which is how a button ends
+       up permanently just below the fold. */
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(100dvh - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a', marginBottom:4 }}>{type==='signature'?'Create Your Signature':'Create Your Initials'}</div>
           <p style={{ fontSize:'.8rem', color:'#999', margin:'0 0 14px' }}>{type==='initials'?'Initials are locked to your name on file.':'Applied to all signature fields.'}</p>
@@ -163,7 +177,9 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
         <p style={{ fontSize:'.83rem', color:'var(--text-3)', margin:0 }}>Choose your signature style once — it will be applied to all signature and initial fields.</p>
       </div>
 
-      <div style={{ background:'white', borderRadius:16, overflow:'hidden', boxShadow:'0 4px 24px rgba(0,0,0,.15)' }}>
+      {/* S629: inline card — not a fixed overlay, so it scrolls with the page,
+          but hidden overflow still clipped a tall font list on a phone. */}
+      <div style={{ background:'white', borderRadius:16, boxShadow:'0 4px 24px rgba(0,0,0,.15)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ display:'flex', borderBottom:'2px solid #f0f0f0' }}>
             {(['type','upload'] as const).map(t=>(
@@ -548,8 +564,8 @@ export function SignPage() {
         // row on the property, never a hand-typed value here.
         if (plf.none) {
           return (
-            <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-              <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
+            <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+              <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%', margin:'auto' }}>
                 <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>No Late-Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${humanize(plf.unitType)} units` : ''}</div>
                 <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.8rem', color:'#78350f', lineHeight:1.55 }}>
                   No late-fee policy is set for this unit type, so this lease has <strong>no late fees</strong> ("N/A").
@@ -570,8 +586,8 @@ export function SignPage() {
           ? `${Number(plf.lateFeeInitialAmount)}% of rent`
           : `$${Number(plf.lateFeeInitialAmount).toFixed(2)}`
         return (
-          <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-            <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
+          <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+            <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%', margin:'auto' }}>
               <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>Late Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${humanize(plf.unitType)} units` : ''}</div>
               <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.78rem', color:'#78350f', lineHeight:1.55 }}>
                 Late fees are set per <strong>unit type</strong> at the property so every tenant of a
@@ -596,8 +612,8 @@ export function SignPage() {
       })()}
 
       {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && !(data.propertyLateFee && String(activeField.leaseColumn||'').startsWith('late_fee_') && !!fieldValues[activeField.id]) && (
-        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-          <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%' }}>
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+          <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%', margin:'auto' }}>
             <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.fieldType}</div>
             {/* S535 (Nic): renewal rent-increase quick presets — one click
                 recalculates from the current rent; the input below stays
@@ -684,8 +700,8 @@ export function SignPage() {
       )}
 
       {stage==='review' && (
-        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-          <div style={{ background:'white', borderRadius:20, maxWidth:460, width:'100%', padding:26 }}>
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+          <div style={{ background:'white', borderRadius:20, maxWidth:460, width:'100%', margin:'auto', padding:26 }}>
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
