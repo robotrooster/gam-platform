@@ -14,7 +14,7 @@ import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
-import { landlordScopeIds } from '../lib/landlordScope'
+import { landlordScopeIds, isEntityMember } from '../lib/landlordScope'
 import {
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
@@ -204,7 +204,16 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // inside somebody else's LLC, which is a far worse bug than the one this
     // feature fixes.
     const targetLandlordId = body.landlordId ?? req.user!.profileId
-    if (body.landlordId && !landlordScopeIds(req.user!).includes(body.landlordId)) {
+    // S629: checked against the DATABASE, not just the token. landlordIds is
+    // baked into the JWT at login, so an entity created after that login is
+    // invisible to a synchronous check — and the session that created the
+    // entity is the one session that cannot use it. A landlord who signed up
+    // on the 24th and created his LLC on the 28th could not save a property
+    // under it: the picker offered the entity (read from the DB) and the route
+    // refused it (read from the token), with nothing in the message to suggest
+    // that logging out and back in would fix it. See isEntityMember — the
+    // token stays the fast path, the DB is consulted only when it says no.
+    if (body.landlordId && !(await isEntityMember(req.user!, body.landlordId, query))) {
       throw new AppError(403, 'You are not a member of that entity')
     }
 

@@ -39,3 +39,38 @@ export function landlordScopeIds(user: AuthPayload): string[] {
   const single = user.landlordId ?? user.profileId
   return single ? [single] : []
 }
+
+/**
+ * S629 — MEMBERSHIP IS A FACT IN THE DATABASE, NOT A FACT IN THE TOKEN.
+ *
+ * `landlordIds` is baked into the JWT at login. An entity created AFTER that
+ * login therefore does not exist as far as any synchronous scope check is
+ * concerned, and the session that created it is the one session that cannot
+ * use it.
+ *
+ * Measured on a real landlord, and it cost him his whole evening: he signed up
+ * on Aug 24, created "TruBlu Management LLC" on Aug 28, and could not save a
+ * property under it. The Add Property form reads entities from the DATABASE,
+ * so the picker offered the new entity; the route checked the TOKEN, did not
+ * find it, and returned "You are not a member of that entity". Nothing in the
+ * message hinted that logging out and back in would fix it, so from his side
+ * the product simply refused to save, with no way forward.
+ *
+ * The token stays the fast path — it is right the overwhelming majority of the
+ * time and costs no query. The DB is consulted only when the token says no,
+ * which is exactly the case where the token may be out of date. That ordering
+ * matters: it cannot LOOSEN the check (a real membership row is required
+ * either way), it can only stop a stale token from denying a true one.
+ */
+export async function isEntityMember(
+  user: AuthPayload,
+  landlordId: string,
+  q: <T>(sql: string, params: unknown[]) => Promise<T[]>,
+): Promise<boolean> {
+  if (landlordScopeIds(user).includes(landlordId)) return true
+  const rows = await q<{ one: number }>(
+    `SELECT 1 AS one FROM landlord_members WHERE user_id = $1 AND landlord_id = $2 LIMIT 1`,
+    [user.userId, landlordId],
+  )
+  return rows.length > 0
+}
