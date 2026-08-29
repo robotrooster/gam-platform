@@ -1,6 +1,7 @@
 import { useState, useRef, useMemo } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut } from '../lib/api'
 import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
@@ -257,6 +258,19 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
   const [people, setPeople] = useState<Person[]>([blank()])
   const [unitId, setUnitId] = useState(initialUnitId)
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
+  // S629 (Nic): "we should not be able to select a unit from the drop down list
+  // that is either occupied or has pending invites sent." The rule already
+  // existed in InviteTenantModal; this form listed every unit, so the mistake
+  // it prevents — one space offered to two households — was reachable from the
+  // other door. Shared now, so the two cannot drift apart. See inviteEligibility.
+  const selectable = (allUnits as any[]).filter(canInviteToUnit)
+  const hiddenReasons = hiddenUnitReasons(allUnits as any[])
+  // A unit deep-linked from its own page stays selectable even if it now has an
+  // invite out: the landlord is standing on it and asked for this explicitly,
+  // and the backend still refuses anything genuinely unsafe.
+  const unitOptions = initialUnitId && !selectable.some(u => u.id === initialUnitId)
+    ? [...(allUnits as any[]).filter(u => u.id === initialUnitId), ...selectable]
+    : selectable
   const [error, setError] = useState<string | null>(null)
   const [invited, setInvited] = useState<string[]>([])
   const [sending, setSending] = useState(false)
@@ -365,10 +379,15 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
           <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Unit *</label>
           <select className="input" value={unitId} onChange={e => setUnitId(e.target.value)} style={{ width: '100%', marginBottom: 12 }}>
             <option value="">Select a unit…</option>
-            {(allUnits as any[]).map(u => (
+            {unitOptions.map((u: any) => (
               <option key={u.id} value={u.id}>Unit {u.unitNumber} — {u.propertyName}{u.occupancyMode === 'by_room' ? ' (by-room)' : ''}</option>
             ))}
           </select>
+          {hiddenReasons.length > 0 && (
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: -6, marginBottom: 12 }}>
+              Not listed: {hiddenReasons.join(', ')}.
+            </div>
+          )}
 
           {/* S579: onboarding-window grandfather. Open → attest existing
               resident to skip screening; closed → they must screen. */}

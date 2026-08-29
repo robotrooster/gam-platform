@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
+import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void }
@@ -63,17 +64,10 @@ export function InviteTenantModal({ onClose }: Props) {
   // looking for just the odd one or two"), with a count of what was hidden
   // underneath so nothing vanishes unexplained.
   const { data: allUnits = [] } = useQuery<any[]>('vacant-units', () => apiGet('/units'))
-  const hidden = (allUnits as any[]).filter(u =>
-    u.tenantId || u.status === 'owner_use' || Number(u.pendingInviteCount || 0) > 0)
-  const hiddenReasons = [
-    hidden.filter(u => u.tenantId).length && `${hidden.filter(u => u.tenantId).length} occupied`,
-    hidden.filter(u => !u.tenantId && Number(u.pendingInviteCount || 0) > 0).length
-      && `${hidden.filter(u => !u.tenantId && Number(u.pendingInviteCount || 0) > 0).length} already invited`,
-    hidden.filter(u => !u.tenantId && u.status === 'owner_use').length
-      && `${hidden.filter(u => !u.tenantId && u.status === 'owner_use').length} owner-occupied`,
-  ].filter(Boolean) as string[]
-  const units = (allUnits as any[]).filter(u =>
-    !u.tenantId && u.status !== 'owner_use' && !(Number(u.pendingInviteCount || 0) > 0))
+  // S629: the predicate moved to lib/inviteEligibility so the Tenant Onboarding
+  // roster form applies exactly the same rule. Behaviour here is unchanged.
+  const hiddenReasons = hiddenUnitReasons(allUnits as any[])
+  const units = (allUnits as any[]).filter(canInviteToUnit)
 
   const inviteMut = useMutation(
     async (payloads: any[]) => {
