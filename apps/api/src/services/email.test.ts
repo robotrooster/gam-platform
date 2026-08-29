@@ -472,3 +472,46 @@ describe('reserved-domain suppression (S605)', () => {
     expect(resendSendMock).toHaveBeenCalledTimes(1)
   })
 })
+
+/**
+ * S629 — every message goes out multipart.
+ *
+ * Nic: "for landlords it's going to the spam folder... it's gonna send every
+ * email to the spam. On Google, when I report something as not spam from that
+ * sender, it still sends the next thing from that sender to spam."
+ *
+ * SPF, DKIM and DMARC were all configured correctly, which is exactly why this
+ * was not obvious — the mail authenticates and still lands in spam. Every
+ * message was HTML with no text/plain alternative, which is one of the oldest
+ * spam signals there is: legitimate senders send multipart, bulk blasters
+ * often do not.
+ */
+const { htmlToPlainText } = email
+
+describe('htmlToPlainText', () => {
+  it('keeps the link, because the link is the point of the email', () => {
+    const out = htmlToPlainText('<p>Ready.</p><a href="https://x.test/sign/1">Review &amp; sign</a>')
+    expect(out).toContain('https://x.test/sign/1')
+    expect(out).toContain('Review & sign')
+  })
+
+  it('does not emit a URL twice when the label IS the URL', () => {
+    const out = htmlToPlainText('<a href="https://x.test/a">https://x.test/a</a>')
+    expect(out.match(/https:\/\/x\.test\/a/g)).toHaveLength(1)
+  })
+
+  it('strips markup, style and script rather than reading them aloud', () => {
+    const out = htmlToPlainText('<style>.a{color:red}</style><script>alert(1)</script><p>Hello</p>')
+    expect(out).toBe('Hello')
+  })
+
+  it('decodes entities so a plain-text reader sees real punctuation', () => {
+    expect(htmlToPlainText('<p>Rent &amp; fees &lt;due&gt; &quot;now&quot;</p>'))
+      .toBe('Rent & fees <due> "now"')
+  })
+
+  it('renders a list as lines, not a run-on', () => {
+    const out = htmlToPlainText('<ul><li>One</li><li>Two</li></ul>')
+    expect(out.split('\n').filter(Boolean)).toEqual(['- One', '- Two'])
+  })
+})

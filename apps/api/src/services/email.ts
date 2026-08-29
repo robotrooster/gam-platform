@@ -5,6 +5,47 @@ import { logger } from '../lib/logger'
 import { buildDemoBookingIcs } from './demoCalendar'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
+
+/**
+ * S629 (Nic): "for landlords it's going to the spam folder... it's gonna send
+ * every email to the spam. On Google, when I report something as not spam from
+ * that sender, it still sends the next thing from that sender to spam."
+ *
+ * Every message GAM sent was HTML with no plain-text alternative. A missing
+ * text/plain part is one of the oldest and strongest spam signals there is —
+ * Gmail and SpamAssassin both score HTML-only mail down, because legitimate
+ * senders send multipart and bulk blasters usually do not. SPF, DKIM and DMARC
+ * were all configured correctly, which is why this was not obvious: the mail
+ * authenticates and still lands in spam.
+ *
+ * Derived from the HTML rather than authored twice, so the two can never drift
+ * and no caller has to remember. Links are kept as "text (url)" because a
+ * signing link is the entire point of some of these messages and a plain-text
+ * reader must still be able to reach it.
+ */
+export function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi,
+      (_m, href, label) => {
+        const text = String(label).replace(/<[^>]+>/g, '').trim()
+        return text && !text.includes(href) ? `${text} (${href})` : href
+      })
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|h[1-6]|li)>/gi, '\n')
+    .replace(/<li\b[^>]*>/gi, '\n  - ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .split('\n').map(l => l.trim()).join('\n')
+    .trim()
+}
+
+
 // S288: two senders, picked per email kind. NOREPLY is the default
 // (system messages — password reset, verification, automated
 // reminders, signing flows, generic notifications). SUPPORT is the
@@ -96,7 +137,16 @@ async function send(
       // S322: optional attachments via Resend's documented attachments[]
       // field. Unset for the existing callers — only the new
       // emailFlexsuiteEnrollment path passes a PDF.
-      const sendArgs: any = { from: senderFor(from), to, subject, html }
+      // S629: multipart — html AND text. See htmlToPlainText.
+      //
+      // reply_to points at a monitored address even when the From is noreply@:
+      // a sender nobody can reply to is a bulk-mail signal, and a reply is one
+      // of the strongest positive signals a mailbox provider has.
+      const sendArgs: any = {
+        from: senderFor(from), to, subject, html,
+        text: htmlToPlainText(html),
+        reply_to: FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined,
+      }
       if (attachments && attachments.length > 0) sendArgs.attachments = attachments
       const result = await resend.emails.send(sendArgs)
       if (result.error) {
