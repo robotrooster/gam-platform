@@ -238,93 +238,150 @@ export function TenantOnboardingPage() {
 // S558 (Flow B): invite a tenant to a UNIT for a NEW lease they will sign.
 // Unit-linked invite → the lease auto-drafts from the unit's default template
 // on accept. Co-tenants: keep the same unit and invite again before anyone signs.
+type Person = { firstName: string; lastName: string; email: string; phone: string }
+const blankPerson = (): Person => ({ firstName: '', lastName: '', email: '', phone: '' })
+
+/**
+ * S629 (Nic): "we need a more efficient workflow for invites to units. Maybe
+ * have all units available on the same page for quick invite. When the invite
+ * is sent the unit should disappear from the page."
+ *
+ * Onboarding a park is not one invite, it is thirty. The single-unit form made
+ * that thirty round trips through a dropdown, and the dropdown was the slowest
+ * part: find the unit, fill the roster, send, come back, find the next one.
+ *
+ * One card per invitable unit instead. Each card carries its own roster and
+ * sends on its own, and a unit drops off the page the moment its invites go —
+ * so what is left on screen is exactly what is left to do.
+ */
 function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
-  const navigate = useNavigate()
   const qc = useQueryClient()
-  // S629 (Nic): "you need to be able to add multiple people to the same
-  // document. Otherwise it's not gonna flow."
-  //
-  // Co-tenants were always supported — the old version cleared the name fields
-  // on success and kept the unit, and the button relabelled itself "Invite
-  // another to this unit". But that only appeared AFTER the first invite went
-  // out, so the form you are looking at shows one person and gives you no
-  // reason to believe it takes more. You had to commit to an invite to
-  // discover the feature.
-  //
-  // A household roster is known up front, so it is entered up front. Every
-  // person is one invite to the same unit; the draft re-drafts with the whole
-  // roster as each is added, and nothing is sent until you press send.
-  type Person = { firstName: string; lastName: string; email: string; phone: string }
-  const blank = (): Person => ({ firstName: '', lastName: '', email: '', phone: '' })
-  const [people, setPeople] = useState<Person[]>([blank()])
-  const [unitId, setUnitId] = useState(initialUnitId)
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
-  // S629 (Nic): "we should not be able to select a unit from the drop down list
-  // that is either occupied or has pending invites sent." The rule already
-  // existed in InviteTenantModal; this form listed every unit, so the mistake
-  // it prevents — one space offered to two households — was reachable from the
-  // other door. Shared now, so the two cannot drift apart. See inviteEligibility.
+  // The eligibility rule lives in lib/inviteEligibility so this page and
+  // InviteTenantModal cannot drift: occupied, owner-occupied and already-
+  // invited units are not offered.
   const selectable = (allUnits as any[]).filter(canInviteToUnit)
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
-  // A unit deep-linked from its own page stays selectable even if it now has an
-  // invite out: the landlord is standing on it and asked for this explicitly,
-  // and the backend still refuses anything genuinely unsafe.
-  const unitOptions = initialUnitId && !selectable.some(u => u.id === initialUnitId)
-    ? [...(allUnits as any[]).filter(u => u.id === initialUnitId), ...selectable]
+
+  // Sent this session. The server also stops offering these (pendingInviteCount
+  // counts both invite flows), but that is a refetch away — dropping the card
+  // immediately is what makes the page a worklist rather than a form.
+  const [sentFor, setSentFor] = useState<Record<string, string[]>>({})
+
+  // Arriving from a unit's own page: just that unit, even if it now has an
+  // invite out — the landlord is standing on it and asked for it by name.
+  const scoped = initialUnitId
+    ? (allUnits as any[]).filter(u => u.id === initialUnitId)
     : selectable
+  const remaining = scoped.filter(u => !sentFor[u.id])
+
+  const byProperty = remaining.reduce((acc: Record<string, any[]>, u: any) => {
+    (acc[u.propertyName] ||= []).push(u); return acc
+  }, {})
+  const sentCount = Object.keys(sentFor).length
+
+  return (
+    <div style={{ maxWidth: 720 }}>
+      <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
+
+      <div style={{ marginBottom: 14 }}>
+        <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Invite to sign a new lease</h2>
+        <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, margin: 0 }}>
+          Every unit you can invite into, on one page. Add everyone who will sign that unit&apos;s lease and
+          send — the unit drops off the list, so what is left is what is left to do. Each person gets a
+          portal invite by email; the lease drafts once everyone on that unit accepts.
+        </p>
+      </div>
+
+      {sentCount > 0 && (
+        <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8,
+                      padding: '10px 14px', marginBottom: 14, fontSize: '.8rem', color: 'var(--text-1)' }}>
+          <strong style={{ color: 'var(--green)' }}>Sent for {sentCount} unit{sentCount === 1 ? '' : 's'}:</strong>{' '}
+          {Object.entries(sentFor).map(([id, names]) => {
+            const u = (allUnits as any[]).find(x => x.id === id)
+            return `${u ? `Unit ${u.unitNumber}` : 'unit'} (${names.join(', ')})`
+          }).join(' · ')}
+        </div>
+      )}
+
+      {remaining.length === 0 ? (
+        <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)', fontSize: '.85rem' }}>
+          {sentCount > 0
+            ? 'Every unit on this list has invites out. Nothing left to send.'
+            : 'No units are available to invite into right now.'}
+          {hiddenReasons.length > 0 && (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6 }}>
+              Not listed: {hiddenReasons.join(', ')}.
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+          {Object.entries(byProperty).map(([propertyName, units]) => (
+            <div key={propertyName} style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase',
+                            letterSpacing: '.07em', marginBottom: 8 }}>
+                {propertyName} — {(units as any[]).length} unit{(units as any[]).length === 1 ? '' : 's'}
+              </div>
+              {(units as any[]).map(u => (
+                <UnitInviteCard key={u.id} unit={u}
+                  onSent={names => {
+                    setSentFor(prev => ({ ...prev, [u.id]: names }))
+                    qc.invalidateQueries('units')
+                  }} />
+              ))}
+            </div>
+          ))}
+          {hiddenReasons.length > 0 && (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+              Not listed: {hiddenReasons.join(', ')}.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
+ * S629: one unit's roster, sending on its own. Collapsed until you start typing
+ * so thirty units are a scannable list rather than thirty open forms.
+ */
+function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[]) => void }) {
+  const [open, setOpen] = useState(false)
+  const [people, setPeople] = useState<Person[]>([blankPerson()])
   const [error, setError] = useState<string | null>(null)
-  const [invited, setInvited] = useState<string[]>([])
   const [sending, setSending] = useState(false)
+  const [attestExisting, setAttestExisting] = useState(true)
+
+  const { data: obWindow } = useQuery<any>(
+    ['ob-window', unit.propertyId],
+    () => apiGet(`/properties/${unit.propertyId}/onboarding-window`),
+    { enabled: open && !!unit.propertyId, staleTime: 60_000 })
+  const windowOpen = !!obWindow?.open
 
   const setField = (i: number, k: keyof Person, v: string) =>
     setPeople(prev => prev.map((p, idx) => idx === i ? { ...p, [k]: v } : p))
-  const addPerson = () => setPeople(prev => [...prev, blank()])
-  const removePerson = (i: number) => setPeople(prev => prev.filter((_, idx) => idx !== i))
 
-  const propertyIdForWindow = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
-  const { data: obWindow } = useQuery<any>(
-    ['ob-window', propertyIdForWindow],
-    () => apiGet(`/properties/${propertyIdForWindow}/onboarding-window`),
-    { enabled: !!propertyIdForWindow, staleTime: 60_000 })
-  const windowOpen = !!obWindow?.open
-  const [attestExisting, setAttestExisting] = useState(true)
-
-  // S629 (Nic): "I don't have everybody's phone number, just emails." The
-  // invite and the signature both travel by email, so the phone is not needed
-  // to onboard anyone — the tenant fills it in on their own contact details
-  // once they accept. Requiring it here blocked a landlord who had every
-  // address he needed.
+  // Phone is optional: the invite and the signature both travel by email, and
+  // the tenant fills their number in on their own contact details.
   const complete = (p: Person) => !!(p.firstName && p.lastName && p.email)
-  // S629 (Nic): "it still won't fucking send the invites."
-  //
-  // The button was disabled whenever ANY row was incomplete, and said nothing
-  // about which one or why. Add a person row, leave it untouched, and the form
-  // goes dead with no explanation — there is no way to work out what it wants.
-  //
-  // A row nobody typed in is not an error, it is an empty row: dropped. A row
-  // that is half-filled IS an error, and it gets named. Either way the reason
-  // is on screen, because a disabled button that will not say why is worse
-  // than an error message.
   const untouched = (p: Person) => !p.firstName && !p.lastName && !p.email && !p.phone
   const typedIn = people.filter(p => !untouched(p))
   const ready = typedIn.filter(complete)
   const halfDone = typedIn.filter(p => !complete(p))
 
   const blockedBecause =
-    !unitId ? 'Pick the unit first.'
-    : ready.length === 0 ? 'Add at least one person — first name, last name and email.'
+    ready.length === 0 ? 'Add at least one person — first name, last name and email.'
     : halfDone.length > 0
       ? `${halfDone.length === 1 ? 'One person is' : `${halfDone.length} people are`} missing ` +
         [...new Set(halfDone.flatMap(p => [
           !p.firstName && 'a first name', !p.lastName && 'a last name', !p.email && 'an email',
         ].filter(Boolean) as string[]))].join(', ') + '. Phone is optional.'
       : null
-  const canSubmit = !blockedBecause
 
-  // Sent one at a time on purpose: each is a real invite email, and a failure
-  // half way through must leave the people already invited invited — not roll
-  // back an email that has landed in somebody's inbox. Whoever fails stays in
-  // the form with the reason.
+  // One at a time: each is a real invite email, so a failure part way through
+  // must leave the people already invited invited.
   const sendAll = async () => {
     setSending(true); setError(null)
     const failed: Person[] = []
@@ -333,125 +390,93 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
     for (const p of ready) {
       try {
         await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
-          { ...p, unitId, existingResident: windowOpen && attestExisting })
-        const who = `${p.firstName} ${p.lastName}`.trim() || p.email
-        sentNow.push(who)
-        setInvited(prev => [...prev, who])
+          { ...p, unitId: unit.id, existingResident: windowOpen && attestExisting })
+        sentNow.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
       } catch (e: any) {
         failed.push(p)
         lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
       }
     }
-    setPeople(failed.length ? failed : [blank()])
-    setError(failed.length ? `${failed.length} of ${ready.length} could not be invited: ${lastErr}` : null)
     setSending(false)
-    // S629 (Nic): onboarding a park is one unit after another, and this form had
-    // no way back — properties, then the property, then units, to reach the next
-    // one. On a clean send, return to that property's units with the property
-    // already filtered and the confirmation carried along.
-    if (!failed.length) {
-      // S629: the unit just invited into must stop being offered. Without this
-      // the cached units list still reports it free, and the next unit's form
-      // — a fresh mount, same cache — happily lists it again.
-      qc.invalidateQueries('units')
-      const propertyId = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
-      navigate(propertyId ? `/units?property=${propertyId}` : '/units',
-        { state: { invited: sentNow } })
+    if (failed.length) {
+      setPeople(failed)
+      setError(`${failed.length} of ${ready.length} could not be invited: ${lastErr}`)
+      return
     }
+    onSent(sentNow)
   }
 
-  const selectedUnit = (allUnits as any[]).find(u => u.id === unitId)
+  if (!open) {
+    return (
+      <div className="card" style={{ padding: '10px 14px', marginBottom: 8, display: 'flex',
+                                     alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ fontSize: '.85rem', color: 'var(--text-1)' }}>
+          <strong>Unit {unit.unitNumber}</strong>
+          {unit.occupancyMode === 'by_room' && (
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · by-room</span>
+          )}
+        </div>
+        <button className="btn btn-sm btn-primary" onClick={() => setOpen(true)}>Invite</button>
+      </div>
+    )
+  }
 
   return (
-    <div style={{ maxWidth: 560 }}>
-      <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
-      <div className="card" style={{ padding: 24 }}>
-        <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Invite to sign a new lease</h2>
-        <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 0 }}>
-          Pick the unit and add everyone who will sign. They each get an invite email; once
-          everyone accepts, one lease auto-drafts from the unit&apos;s default template
-          (rent, deposit, term all filled) for you to sign.
-        </p>
-
-        {invited.length > 0 && (
-          <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
-            <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--green)', marginBottom: 4 }}>Invited to {selectedUnit ? `Unit ${selectedUnit.unitNumber}` : 'this unit'}:</div>
-            <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>{invited.join(', ')}</div>
-          </div>
-        )}
-
-        <form onSubmit={e => { e.preventDefault(); if (canSubmit && !sending) sendAll() }}>
-          <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Unit *</label>
-          <select className="input" value={unitId} onChange={e => setUnitId(e.target.value)} style={{ width: '100%', marginBottom: 12 }}>
-            <option value="">Select a unit…</option>
-            {unitOptions.map((u: any) => (
-              <option key={u.id} value={u.id}>Unit {u.unitNumber} — {u.propertyName}{u.occupancyMode === 'by_room' ? ' (by-room)' : ''}</option>
-            ))}
-          </select>
-          {hiddenReasons.length > 0 && (
-            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: -6, marginBottom: 12 }}>
-              Not listed: {hiddenReasons.join(', ')}.
-            </div>
-          )}
-
-          {/* S579: onboarding-window grandfather. Open → attest existing
-              resident to skip screening; closed → they must screen. */}
-          {unitId && obWindow && (windowOpen ? (
-            <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 8, padding: '12px 14px', marginBottom: 12 }}>
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-                <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
-                <div>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing residents — skip background check</div>
-                  <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
-                    I attest these people already live in this unit. They&apos;ll sign the new lease without a background check.
-                    {typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
-                  </div>
-                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — they will complete a background check before portal access.</div>}
-                </div>
-              </label>
-            </div>
-          ) : (
-            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-              This property&apos;s onboarding window has closed — they will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access. Grandfathering existing residents is only available during onboarding.
-            </div>
-          ))}
-
-          {people.map((p, i) => (
-            <div key={i} style={{ border: '1px solid var(--border-0)', borderRadius: 8, padding: 12, marginBottom: 10 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
-                  {i === 0 ? 'Tenant' : `Co-tenant ${i}`}
-                </div>
-                {people.length > 1 && (
-                  <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.7rem' }}
-                          onClick={() => removePerson(i)}>Remove</button>
-                )}
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                <input className="input" placeholder="First name" value={p.firstName} onChange={e => setField(i, 'firstName', e.target.value)} />
-                <input className="input" placeholder="Last name" value={p.lastName} onChange={e => setField(i, 'lastName', e.target.value)} />
-              </div>
-              <input className="input" placeholder="Email" type="email" value={p.email} onChange={e => setField(i, 'email', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
-              <input className="input" placeholder="Phone (optional)" value={p.phone} onChange={e => setField(i, 'phone', e.target.value)} style={{ width: '100%', marginTop: 10 }} />
-            </div>
-          ))}
-
-          <button type="button" className="btn btn-ghost" style={{ width: '100%', fontSize: '.78rem' }} onClick={addPerson}>
-            + Add another person to this lease
-          </button>
-
-          {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginTop: 10 }}>{error}</div>}
-          <button type="submit" disabled={!canSubmit || sending} className="btn btn-primary" style={{ width: '100%', marginTop: 14 }}>
-            {sending ? 'Sending…'
-              : ready.length > 1 ? `Send ${ready.length} invites` : 'Send invite'}
-          </button>
-          {blockedBecause && !sending && (
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>
-              {blockedBecause}
-            </div>
-          )}
-        </form>
+    <div className="card" style={{ padding: 14, marginBottom: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-0)' }}>Unit {unit.unitNumber}</div>
+        <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }}
+                onClick={() => { setOpen(false); setPeople([blankPerson()]); setError(null) }}>Cancel</button>
       </div>
+
+      {obWindow && (windowOpen ? (
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: 10 }}>
+          <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3 }} />
+          <span style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            <strong style={{ color: 'var(--text-1)' }}>Existing residents — skip background check.</strong>{' '}
+            They already live here and will sign the new lease without screening.
+            {typeof obWindow.daysRemaining === 'number' && <> Window closes in {obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}.</>}
+          </span>
+        </label>
+      ) : (
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+          Onboarding window closed — everyone invited here completes a background check before portal access.
+        </div>
+      ))}
+
+      {people.map((p, i) => (
+        <div key={i} style={{ marginBottom: 8 }}>
+          {i > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+              <span style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>Co-tenant {i}</span>
+              <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '1px 7px', fontSize: '.68rem' }}
+                      onClick={() => setPeople(prev => prev.filter((_, idx) => idx !== i))}>Remove</button>
+            </div>
+          )}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <input className="input" placeholder="First name" value={p.firstName} onChange={e => setField(i, 'firstName', e.target.value)} />
+            <input className="input" placeholder="Last name" value={p.lastName} onChange={e => setField(i, 'lastName', e.target.value)} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+            <input className="input" placeholder="Email" type="email" value={p.email} onChange={e => setField(i, 'email', e.target.value)} />
+            <input className="input" placeholder="Phone (optional)" value={p.phone} onChange={e => setField(i, 'phone', e.target.value)} />
+          </div>
+        </div>
+      ))}
+
+      <button type="button" className="btn btn-ghost" style={{ width: '100%', fontSize: '.74rem' }}
+              onClick={() => setPeople(prev => [...prev, blankPerson()])}>
+        + Add another person to this lease
+      </button>
+
+      {error && <div style={{ color: 'var(--red)', fontSize: '.76rem', marginTop: 8 }}>{error}</div>}
+      <button type="button" disabled={!!blockedBecause || sending} className="btn btn-primary"
+              style={{ width: '100%', marginTop: 10 }} onClick={sendAll}>
+        {sending ? 'Sending…' : ready.length > 1 ? `Send ${ready.length} invites` : 'Send invite'}
+      </button>
+      {blockedBecause && !sending && (
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 5, textAlign: 'center' }}>{blockedBecause}</div>
+      )}
     </div>
   )
 }
