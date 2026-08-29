@@ -603,7 +603,21 @@ export function SignPage() {
             // Only VALUED late-fee fields lock — a doc drafted before the
             // policy existed has empty ones the landlord must still fill.
             const isPolicyLateFee = !!data.propertyLateFee && !!f.leaseColumn && String(f.leaseColumn).startsWith('late_fee_') && !!val
-            const locked = !!val && f.leaseColumn && LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
+            // S629 (Nic): "I don't want something saying a year lease in the
+            // system when the document has month to month."
+            //
+            // lease_type is DERIVED — termPrefill turns the template's
+            // default_term_months into both the end date and the type, so they
+            // cannot disagree at draft time. Typing over it on the document is
+            // the only way to make them disagree, and it would put a term on
+            // signed paper that the record contradicts. Locked like a name: to
+            // change the term you change the template, and the document
+            // follows.
+            const DERIVED_LOCKED = new Set(['lease_type', 'end_date'])
+            const locked = !!val && !!f.leaseColumn && (
+              LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
+              || DERIVED_LOCKED.has(f.leaseColumn)
+            )
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'
             return (
@@ -613,7 +627,9 @@ export function SignPage() {
                 // S535: policy late-fee fields always open (the click shows
                 // the read-only policy explainer, not an editor).
                 onClick={()=>{ if (isPolicyLateFee) { setActiveField(f); return } if (!locked) handleFieldClick(f) }}
-                title={locked?'Linked to the unit/tenant record — edit the record, not the document':isPolicyLateFee?'Set by the property late-fee policy — click for details':undefined}
+                title={locked?(f.leaseColumn==='lease_type'||f.leaseColumn==='end_date'
+                    ? 'Set by the lease template’s term — change the template, not the document, so the record and the paper agree'
+                    : 'Linked to the unit/tenant record — edit the record, not the document'):isPolicyLateFee?'Set by the property late-fee policy — click for details':undefined}
                 style={{
                   position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
                   border:`2px solid ${val?'#22c55e':isNext?color:'#aaa'}`,
