@@ -29,6 +29,7 @@ import {
   ConnectAccountOnboarding, ConnectComponentsProvider,
 } from '@stripe/react-connect-js'
 import { appConfirm } from '../components/dialogs'
+import { EntityPicker } from '../components/EntityPicker'
 
 interface BankAccountRow {
   id: string
@@ -363,10 +364,14 @@ function StripeConnectSection() {
   // OWN user account (entity='user') — switching them would 403 on the live
   // membership check and break manager direct deposit.
   const isOwner = user?.role === 'landlord'
+  // S629 (Nic): this was pinned to profileId, so a landlord with two LLCs saw
+  // and onboarded exactly one of them — the other could never link a bank at
+  // all. Banking is per entity, so the entity is a choice on this page.
+  const [entityId, setEntityId] = useState<string>(isOwner ? (user?.profileId ?? '') : '')
   const connectEntity = isOwner ? 'landlord' : 'user'
-  const connectEntityQS = isOwner ? `entity=landlord&entityId=${user!.profileId}` : 'entity=user'
+  const connectEntityQS = isOwner ? `entity=landlord&entityId=${entityId}` : 'entity=user'
   const connectOnboardBody = isOwner
-    ? { entity: 'landlord', entityId: user!.profileId }
+    ? { entity: 'landlord', entityId }
     : { entity: 'user' }
 
   const statusQ = useQuery<{
@@ -378,7 +383,7 @@ function StripeConnectSection() {
     requirementsCurrentlyDue?: string[]
     payoutBank?: { bankName: string | null; last4: string | null } | null
   }>(
-    ['stripe-connect-status', connectEntity, user?.profileId],
+    ['stripe-connect-status', connectEntity, entityId],
     () => apiGet(`/stripe/connect/status?${connectEntityQS}`),
     {
       refetchInterval: (data) =>
@@ -422,6 +427,10 @@ function StripeConnectSection() {
 
   return (
     <div className="card" style={{ padding: 16, marginBottom: 18 }}>
+      {/* S629: which LLC is being verified and paid. Every figure and every
+          status below belongs to the entity selected here — and with one
+          entity it renders nothing, so the common case is unchanged. */}
+      {isOwner && <EntityPicker value={entityId} onChange={setEntityId} label="Paying out for" />}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
           {/* S605 (Nic): this said "Bank Account" / "Link your bank account",

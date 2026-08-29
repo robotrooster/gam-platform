@@ -43,7 +43,7 @@ declare global {
   }
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
+export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization
   if (!header?.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'No token provided' })
@@ -69,6 +69,32 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
       return res.status(403).json({ success: false, error: 'This action requires a full sign-in, not a register passcode.' })
     }
     req.user = payload
+    // S629 (CRITICAL) — ENTITY MEMBERSHIP IS REFRESHED FROM THE DATABASE.
+    //
+    // `landlordIds` is minted at login and then frozen for the life of the
+    // token. Create an entity after logging in and every one of the ~241
+    // synchronous scope checks denies it, because they all read the token.
+    //
+    // What that looked like in production: a landlord signed up on the 24th,
+    // created "TruBlu Management LLC" on the 28th, and could not save a
+    // property under it. When the create path was fixed, the property saved —
+    // and the very next request, the redirect to view it, came back 403. He
+    // retried, hit 409 duplicate, and reported that it "still would not save".
+    // From his side the product created something invisible and then told him
+    // it already existed.
+    //
+    // Fixing individual call sites cannot work: there are 241 of them and the
+    // next one is a bug waiting. The token is refreshed HERE instead, so every
+    // check downstream sees current membership without becoming async.
+    //
+    // Cached briefly per user — one indexed lookup per user per TTL, not per
+    // request. This can only ADD entities the user genuinely belongs to; the
+    // token's own claims are never widened by it.
+    if (payload.role === 'landlord' && payload.userId) {
+      try {
+        req.user = { ...payload, landlordIds: await currentLandlordIds(payload) }
+      } catch { /* the token's own list still stands */ }
+    }
     next()
   } catch {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' })
@@ -229,4 +255,36 @@ export function requireBooksWrite(req: Request, res: Response, next: NextFunctio
   if (req.user.role === 'bookkeeper' && perms.access_level === 'read_write') return next()
   if (req.user.role === 'property_manager' && perms['books.edit'] === true) return next()
   return res.status(403).json({ success: false, error: 'Insufficient permissions' })
+}
+
+/**
+ * S629: entity membership, read fresh and cached briefly.
+ *
+ * TTL is deliberately short. The failure it prevents is a person unable to use
+ * something they just made; the cost of being a few seconds stale is that they
+ * wait a few seconds. Removing an owner is the direction that matters for
+ * safety, and that is bounded by the same TTL.
+ */
+const MEMBERSHIP_TTL_MS = 15_000
+const membershipCache = new Map<string, { ids: string[]; at: number }>()
+
+export function _clearMembershipCache(): void { membershipCache.clear() }
+
+async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
+  const key = payload.userId
+  const hit = membershipCache.get(key)
+  const now = Date.now()
+  if (hit && now - hit.at < MEMBERSHIP_TTL_MS) return hit.ids
+  const rows = await query<{ landlord_id: string }>(
+    `SELECT landlord_id FROM landlord_members WHERE user_id = $1`, [payload.userId])
+  // The token's own profileId still counts — a landlord with no membership row
+  // (older accounts predating S553) must not lose their own book.
+  const ids = Array.from(new Set([
+    ...(payload.landlordIds ?? []),
+    ...(payload.profileId ? [payload.profileId] : []),
+    ...rows.map((r) => r.landlord_id),
+  ].filter(Boolean))) as string[]
+  membershipCache.set(key, { ids, at: now })
+  if (membershipCache.size > 5000) membershipCache.clear()
+  return ids
 }

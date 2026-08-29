@@ -7,6 +7,7 @@
 import { useMemo, useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe } from '@stripe/stripe-js'
+import { EntityPicker } from '../components/EntityPicker'
 import { apiGet, apiPost , apiPut } from '../lib/api'
 import { DepositMatchPanel, CashPositionPanel } from './DepositMatchPanel'
 import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, OTHER_INCOME_CATEGORIES, OTHER_INCOME_CATEGORY_LABEL } from '@gam/shared'
@@ -51,11 +52,20 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const [linkErr, setLinkErr] = useState<string | null>(null)
   const [view, setView] = useState<'needs_review' | 'categorized' | 'ignored'>('needs_review')
 
-  const { data: connections = [] } = useQuery<any[]>('bank-connections', () => apiGet('/bank-feed/connections'))
+  // S629 (Nic): "a property selector or entity selector, to view the
+  // transaction logs and stuff specific to that entity." The feed was pinned
+  // to the primary entity server-side, so a second LLC's transactions were
+  // unreachable — not empty, unreachable.
+  const [entityId, setEntityId] = useState<string>('')
+  const entityQS = entityId ? `entityId=${encodeURIComponent(entityId)}` : ''
+  const { data: connections = [] } = useQuery<any[]>(
+    ['bank-connections', entityId],
+    () => apiGet(`/bank-feed/connections${entityQS ? `?${entityQS}` : ''}`))
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const { data: txns = [], isLoading } = useQuery<any[]>(
-    ['bank-txns', view], () => apiGet(`/bank-feed/transactions?status=${view}`))
+    ['bank-txns', view, entityId],
+    () => apiGet(`/bank-feed/transactions?status=${view}${entityQS ? `&${entityQS}` : ''}`))
 
   const propOf = (u: any) => u.propertyId
   const unitsForProp = (pid: string) => (units as any[]).filter(u => propOf(u) === pid)
@@ -164,6 +174,9 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
 
   return (
     <div>
+      {/* S629: the feed, the connections and every categorization below belong
+          to the entity chosen here. Hidden for a one-entity portfolio. */}
+      <EntityPicker value={entityId} onChange={setEntityId} label="Transactions for" />
       {embedded ? (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, margin: '26px 0 12px' }}>
           <div>

@@ -1,5 +1,5 @@
 import { SUBLEASING_SHELVED } from '../components/layout/Layout'
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
@@ -163,20 +163,15 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   // entity gets created without leaving this form.
   const [newEntityName, setNewEntityName] = useState('')
   const [entityErr, setEntityErr] = useState<string | null>(null)
-  const newEntityMut = useMutation(
-    () => apiPost<any>('/landlords/me/entities', { businessName: newEntityName.trim() }),
-    {
-      onSuccess: (res: any) => {
-        const id = res?.data?.landlordId ?? res?.landlordId
-        qc.invalidateQueries('landlord-entities')
-        // Select what they just made — creating it and leaving the dropdown on
-        // something else would be its own small betrayal.
-        if (id) setForm(f => ({ ...f, landlordId: id }))
-        setNewEntityName(''); setEntityErr(null)
-      },
-      onError: (e: any) =>
-        setEntityErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not create that entity.'),
-    })
+  // S629: with no blank default, a one-entity portfolio would open on the
+  // placeholder and force a pointless choice. Preselect when there is nothing
+  // to choose between — and only then.
+  useEffect(() => {
+    if (isEdit) return
+    if (form.landlordId) return
+    if (entities.length === 1) setForm(f => ({ ...f, landlordId: entities[0].id }))
+  }, [entities, isEdit])
+
   const [form, setForm] = useState({
     landlordId:  '',
     name:        property?.name || '',
@@ -310,7 +305,35 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       // Blank means "my own entity" — the server default, so every existing
       // caller behaves exactly as before.
       const { landlordId, ...rest } = data
-      const realEntity = landlordId && landlordId !== '__new__' ? landlordId : null
+      // S629: a property with no owning entity is exactly the silent
+      // mis-filing this form used to allow. There is no default to fall back
+      // on any more, so an unanswered picker is an error, not a shrug.
+      if (!landlordId) throw new Error('Choose the entity that owns this property.')
+      // S629 (Nic): "separate my Mountain View property into the entity that I
+      // typed when onboarding the property." He typed one, and it was thrown
+      // away. This line used to map '__new__' to null, so somebody who chose
+      // "+ Add a new entity…", typed the LLC name and pressed Save — without
+      // noticing the separate Create button — had the name silently discarded
+      // and the property filed under their DEFAULT entity instead.
+      //
+      // Silent is the whole problem: the property saved, so nothing looked
+      // wrong, and the mistake only surfaced later as a property sitting in
+      // the wrong LLC — which for him meant a co-owner of the other entity
+      // could see it.
+      //
+      // Typing a name and pressing Save is not ambiguous. Create the entity
+      // and use it.
+      let realEntity = landlordId && landlordId !== '__new__' ? landlordId : null
+      if (landlordId === '__new__') {
+        const typed = newEntityName.trim()
+        if (!typed) {
+          throw new Error('Name the new entity, or pick one from the list.')
+        }
+        const made: any = await apiPost<any>('/landlords/me/entities', { businessName: typed })
+        realEntity = made?.data?.landlordId ?? made?.landlordId ?? null
+        if (!realEntity) throw new Error('Could not create that entity. Try creating it in Settings first.')
+        qc.invalidateQueries('landlord-entities')
+      }
       return apiPost('/properties', realEntity ? { ...rest, landlordId: realEntity } : rest)
     },
     {
@@ -408,16 +431,28 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         </div>
 
         <>
-          {/* S620: which entity owns this property. Only on create — moving a
-              property between LLCs is a different (and legally weightier)
-              operation than choosing where it starts. Hidden when there is only
-              one entity, so the common case gains no extra field. */}
+          {/* S629 (Nic): "there's no default blank spot that is just randomly
+              losing or adding properties or linking them the wrong way."
+              
+              THERE IS NO DEFAULT. The old version opened on "My own entity" —
+              a blank value that quietly meant the caller's own entity — so a
+              landlord who chose "+ Add a new entity…", typed his LLC name and
+              pressed Save got the name discarded and the property filed under
+              the wrong company. It saved, so nothing looked wrong. He found
+              out when a co-owner of the OTHER entity could see the property.
+
+              Now: pick one, or type a new one. Typing it creates it. The only
+              case that is pre-filled is a portfolio with exactly one entity,
+              where there is nothing to choose between. */}
           {!isEdit && (
             <div style={{ marginBottom: 12 }}>
               <label className="form-label">Entity</label>
               <select className="input" value={form.landlordId}
-                onChange={e => setForm(f => ({ ...f, landlordId: e.target.value }))}>
-                <option value="">My own entity</option>
+                onChange={e => { setForm(f => ({ ...f, landlordId: e.target.value })); setEntityErr(null) }}>
+                {/* Placeholder, not a value. Disabled so it cannot be chosen
+                    back into, and never submitted — a property without an
+                    owning entity is the bug this whole block exists to stop. */}
+                <option value="" disabled>Select the entity that owns it…</option>
                 {entities.map((en: any) => (
                   <option key={en.id} value={en.id}>
                     {en.businessName || 'Unnamed entity'}
@@ -427,24 +462,18 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 <option value="__new__">+ Add a new entity…</option>
               </select>
               {form.landlordId === '__new__' ? (
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                  <input className="input" style={{ flex: 1 }} autoFocus
-                    placeholder="New entity name (e.g. Haws Homes LLC)"
+                <>
+                  <input className="input" style={{ marginTop: 8 }} autoFocus
+                    placeholder="New entity name (e.g. Mountain View RV Park Ranch LLC)"
                     value={newEntityName}
-                    onChange={e => setNewEntityName(e.target.value)} />
-                  <button type="button" className="btn btn-primary" style={{ fontSize: '.75rem' }}
-                    disabled={!newEntityName.trim() || newEntityMut.isLoading}
-                    onClick={() => newEntityMut.mutate()}>
-                    {newEntityMut.isLoading ? 'Creating…' : 'Create'}
-                  </button>
-                  <button type="button" className="btn btn-ghost" style={{ fontSize: '.75rem' }}
-                    onClick={() => { setForm(f => ({ ...f, landlordId: '' })); setEntityErr(null) }}>
-                    Cancel
-                  </button>
-                </div>
+                    onChange={e => { setNewEntityName(e.target.value); setEntityErr(null) }} />
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                    Saving the property creates this entity and files it there.
+                  </div>
+                </>
               ) : (
                 <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
-                  Which LLC owns this property.
+                  Which LLC owns this property. Each entity keeps its own bank account.
                 </div>
               )}
               {entityErr && (

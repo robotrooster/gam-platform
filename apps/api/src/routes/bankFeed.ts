@@ -7,6 +7,7 @@ import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
 import { queryOne } from '../db'
+import { landlordScopeIds } from '../lib/landlordScope'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
@@ -16,7 +17,28 @@ export const bankFeedRouter = Router()
 bankFeedRouter.use(requireAuth)
 
 // A landlord acts as themselves; landlord-scoped staff act on their landlord.
+/**
+ * S629 (Nic): "a property selector or entity selector, to view the transaction
+ * logs and stuff specific to that entity."
+ *
+ * This used to be profileId and nothing else, so every bank page showed exactly
+ * one entity's feed — the primary — no matter how many the landlord owned. With
+ * banking anchored per entity (each LLC keeps its own account), that meant a
+ * second entity's transactions were simply unreachable.
+ *
+ * ?entityId= selects one, and it is checked against the caller's own scope:
+ * landlordScopeIds is refreshed from landlord_members on every request (see
+ * middleware/auth), so an entity created moments ago resolves, and one that
+ * belongs to somebody else does not.
+ */
 function scope(req: any): string {
+  const requested = typeof req.query?.entityId === 'string' ? req.query.entityId.trim() : ''
+  if (requested) {
+    if (!landlordScopeIds(req.user).includes(requested)) {
+      throw new AppError(403, 'You are not a member of that entity')
+    }
+    return requested
+  }
   const id = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
   if (!id) throw new AppError(403, 'A landlord context is required.')
   return id
