@@ -1921,6 +1921,10 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // The signed lease passes water through — release consults the terms.
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'water',true)`, [leaseId])
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
@@ -1940,6 +1944,137 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(again.released).toBe(0)
     const still = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
     expect(still.rows).toHaveLength(1)
+  })
+
+  // S629 ORDER HAZARD (Nic, launch): at Oak Park the residents already live
+  // there and are signing leases NOW, while August's meter reads are still
+  // being entered. If a resident signs BEFORE the cycle is billed, their intent
+  // is resolved, so there is no invite left to hold against — and the lease
+  // starts in September, so no lease covers the August cycle either. The month
+  // they actually used the water must still reach them.
+  it('bills the cycle to the tenant even when they signed BEFORE it was run', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    // They sign FIRST — lease starts the following month, intent resolved.
+    // The invite predates the end of the cycle: that is what says they were
+    // already living there in May rather than arriving fresh in June.
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, {
+        unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500,
+        startDate: '2026-06-01',
+      })
+      await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'water',true)`, [leaseId])
+      await c.query(
+        `UPDATE pending_tenant_intents
+            SET resolved_at = now(), created_at = '2026-05-10'
+          WHERE unit_id = $1`, [invited.unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    // ...and only THEN does May get billed.
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // Their neighbour must still be split 50/50, not handed the whole 100.
+    const neighbour = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [signed.unitId])
+    expect(Number(neighbour.rows[0].charge_amount)).toBe(50)
+
+    // And the 50 they used must land on them — as a bill or as a held share,
+    // but never silently absorbed by the landlord.
+    const bill = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    const held = await db.query<any>(
+      `SELECT charge_amount FROM suspended_utility_charges
+        WHERE unit_id=$1 AND cancelled_at IS NULL`, [invited.unitId])
+    expect(bill.rows.length + held.rows.length).toBe(1)
+    const amount = Number((bill.rows[0] || held.rows[0]).charge_amount)
+    expect(amount).toBe(50)
+  })
+
+  it('does NOT reach back and bill a new arrival for a month before they were invited', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, {
+        unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500,
+        startDate: '2026-07-01',
+      })
+      await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'water',true)`, [leaseId])
+      // Invited in June, well after the May cycle closed. May was not theirs.
+      await c.query(
+        `UPDATE pending_tenant_intents
+            SET resolved_at = now(), created_at = '2026-06-15'
+          WHERE unit_id = $1`, [invited.unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const bill = await db.query<any>(
+      `SELECT id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bill.rows).toHaveLength(0)
+  })
+
+  it('a held share is dropped, not billed, when the lease does not pass the utility through', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
+      await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // Their signed lease says the LANDLORD covers water.
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'water',false)`, [leaseId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const out = await releaseSuspendedChargesForLease({
+      unitId: invited.unitId, leaseId, tenantId: invited.tenantId, landlordId: base.landlordId })
+    expect(out.released).toBe(0)
+    const bill = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bill.rows).toHaveLength(0)
+    // Kept with a reason rather than deleted — GAM never erases.
+    const held = await db.query<any>(
+      `SELECT cancelled_at, notes FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
+    expect(held.rows[0].cancelled_at).not.toBeNull()
+    expect(held.rows[0].notes).toContain('does not make the tenant responsible')
   })
 
   it('holds nothing against a genuinely vacant unit', async () => {

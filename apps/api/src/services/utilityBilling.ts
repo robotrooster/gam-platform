@@ -1308,6 +1308,36 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
        LIMIT 1
     `, [args.unitId, args.cycleMonth])
   }
+  // S629 ORDER HAZARD (Nic, launch): the residents signed BEFORE this cycle was
+  // billed. Their lease starts next month, so nothing above covers the cycle,
+  // and their invite is resolved, so there is no longer an invite to hold
+  // against — the share would be silently absorbed by the landlord.
+  //
+  // They were living there and using it. `occupants` already counted them into
+  // the divisor on the strength of the invite, so their neighbours were split
+  // correctly against a share that has to land somewhere; this is where it
+  // lands. The invite is the evidence of residence, which is why the same
+  // "invited before the cycle ended" test used by `occupants` gates it here —
+  // it will not reach back and bill a genuinely new arrival for a month they
+  // had nothing to do with.
+  if (!lt) {
+    lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
+      SELECT l.id AS lease_id, lt2.tenant_id
+        FROM leases l
+        JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
+       WHERE l.unit_id = $1
+         AND l.status IN ('active', 'expired', 'terminated')
+         AND l.start_date >= ($2::date + interval '1 month')::date
+         AND EXISTS (
+           SELECT 1 FROM pending_tenant_intents pti
+            WHERE pti.unit_id = l.unit_id
+              AND pti.cancelled_at IS NULL
+              AND pti.created_at < ($2::date + interval '1 month')::date)
+       ORDER BY l.start_date ASC
+       LIMIT 1
+    `, [args.unitId, args.cycleMonth])
+  }
+
   // S614 (Nic, LAUNCH): a space this landlord SERVICES but does not lease — the
   // apartment and the three trash cans next door. No lease will ever exist for
   // it, so the payer comes from a utility service agreement instead.
@@ -1534,6 +1564,25 @@ export async function releaseSuspendedChargesForLease(args: {
   let amount = 0
   for (const h of held) {
     try {
+      // Lease is law. The share was held before there was a lease to consult,
+      // so this is the first moment the terms can be applied — and if the
+      // signed lease does not pass this utility through, the tenant never owed
+      // it. Cancel the hold (kept, with a reason) instead of billing it.
+      const resp = await queryOne<{ tenant_responsible: boolean }>(`
+        SELECT tenant_responsible FROM lease_utility_responsibilities
+         WHERE lease_id = $1 AND utility_type = $2`, [args.leaseId, h.utility_type])
+      if (!resp || !resp.tenant_responsible) {
+        await query(`
+          UPDATE suspended_utility_charges
+             SET cancelled_at = now(), updated_at = now(),
+                 notes = COALESCE(notes,'') ||
+                   ' — not billed: the signed lease does not make the tenant responsible for '
+                   || $2
+           WHERE id = $1`, [h.id, h.utility_type])
+        logger.info({ suspendedId: h.id, unitId: args.unitId, utility: h.utility_type },
+          'utility billing: held share dropped — the lease does not pass this utility through')
+        continue
+      }
       const bill = await queryOne<{ id: string }>(`
         INSERT INTO utility_bills
           (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
