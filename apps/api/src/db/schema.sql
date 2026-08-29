@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict XOOM16rq8I5akaGsfJoK28jraVOY71VbX5EYmhMAYaLWdIO3sVwvHyfR5ewIWpn
+\restrict 3jRdfIZezwlxjf0GlG6qc8NBH1NNYDIwweBdTPG7dXwdUN6ek5downNtxQLfXcy
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6487,6 +6487,8 @@ CREATE TABLE public.properties (
     lease_signer_user_id uuid,
     gam_debit_threshold numeric(12,2) DEFAULT 100.00 NOT NULL,
     timezone_source text DEFAULT 'derived'::text NOT NULL,
+    lease_signing_email text,
+    lease_signing_name text,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -6563,6 +6565,13 @@ COMMENT ON COLUMN public.properties.gam_debit_threshold IS 'Outstanding balance 
 --
 
 COMMENT ON COLUMN public.properties.timezone_source IS 'S624: derived = from the property state; manual = a human set it and no derivation may overwrite it.';
+
+
+--
+-- Name: COLUMN properties.lease_signing_email; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.lease_signing_email IS 'Where landlord lease-signature requests and lease notifications for THIS property go. Falls back to the account email. Never shown to guests — see office_email for that.';
 
 
 --
@@ -24709,5 +24718,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XOOM16rq8I5akaGsfJoK28jraVOY71VbX5EYmhMAYaLWdIO3sVwvHyfR5ewIWpn
+\unrestrict 3jRdfIZezwlxjf0GlG6qc8NBH1NNYDIwweBdTPG7dXwdUN6ek5downNtxQLfXcy
 

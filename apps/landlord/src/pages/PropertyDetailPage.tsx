@@ -12,6 +12,7 @@ import { usePerms } from '../lib/permissions'
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyLateFeeSection } from './PropertyLateFeeSection'
+import { PropertyLeaseSigningSection } from './PropertyLeaseSigningSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { UtilityMetersPage } from './UtilityMetersPage'
@@ -200,6 +201,7 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a
             property setting — the S556 property-level section was removed. */}

@@ -13,6 +13,7 @@
  *      by_room    → one INDEPENDENT single-tenant lease per accepted person.
  */
 import { AppError } from '../middleware/errorHandler'
+import { landlordSigningContact } from './landlordSigningContact'
 import { BY_ROOM_LEASES_PER_BEDROOM } from '@gam/shared'
 import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { createNotification } from './notifications'
@@ -92,12 +93,15 @@ async function loadRoster(client: Client, unitId: string): Promise<IntentRow[]> 
       ORDER BY pti.created_at ASC`, [unitId]).then(r => r.rows as IntentRow[])
 }
 
-async function landlordSigner(client: Client, landlordId: string) {
-  const l = await client.query(
-    `SELECT u.id AS user_id, u.first_name, u.last_name, u.email
-       FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId]).then(r => r.rows[0])
-  if (!l) throw new AppError(500, 'Landlord owner user not found')
-  return { userId: l.user_id, role: 'landlord', name: `${l.first_name} ${l.last_name}`.trim(), email: l.email }
+/**
+ * S630 (Nic): the signing request goes to the address that PROPERTY routes to,
+ * so an on-site manager can sign for their own property without the portfolio
+ * login or the other properties' mail. Falls back to the account email.
+ */
+async function landlordSigner(client: Client, landlordId: string, unitId: string) {
+  const c = await landlordSigningContact(landlordId, { unitId }, client)
+  if (!c) throw new AppError(500, 'Landlord owner user not found')
+  return { userId: c.userId, role: 'landlord', name: c.name, email: c.email }
 }
 
 /**
@@ -118,7 +122,7 @@ export async function autoDraftLeasesForUnit(
   if (!unit) throw new AppError(404, 'Unit not found')
 
   const tmpl = await resolveDefaultTemplateForUnit(unitId, client)
-  const landlord = await landlordSigner(client, unit.landlord_id)
+  const landlord = await landlordSigner(client, unit.landlord_id, unitId)
 
   const notifyNeedsTemplate = async () => {
     await createNotification({

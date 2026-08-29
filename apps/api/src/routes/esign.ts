@@ -42,6 +42,7 @@ import { logger } from '../lib/logger'
 import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType } from '../services/householdLeaseDraft'
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
+import { landlordSigningContact } from '../services/landlordSigningContact'
 
 export const esignRouter = Router()
 
@@ -2320,9 +2321,10 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     }
 
     // Signers = landlord + the current active roster, same roles.
-    const landlordUser = await queryOne<any>(`
-      SELECT u.id, u.first_name, u.last_name, u.email, u.phone
-      FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id=$1`, [lease.landlord_id])
+    // S630: signing routes per property, so an on-site manager signs for their
+    // own property without the portfolio login. Falls back to the account email.
+    const landlordUser = await landlordSigningContact(
+      lease.landlord_id, { propertyId: lease.property_id ?? null, unitId: lease.unit_id ?? null })
     if (!landlordUser) throw new AppError(500, 'Landlord user not found')
     const roster = await query<any>(`
       SELECT lt.role, u.id AS user_id, u.first_name, u.last_name, u.email, u.phone
@@ -2333,7 +2335,7 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [leaseId])
     if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to renew with')
     const signers = [
-      { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+      { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
       ...(roster as any[]).map((r: any, i: number) => ({
         userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
         email: r.email, phone: r.phone, orderIndex: i + 2,
@@ -2347,7 +2349,10 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     const prefillValues: Record<string, string> = {
       tenant_name:      `${primary.first_name} ${primary.last_name}`,
       tenant_email:     primary.email || '',
-      landlord_name:    `${landlordUser.first_name} ${landlordUser.last_name}`,
+      // The OWNER's legal name, deliberately not landlordUser.name: routing a
+      // signing request to an on-site manager does not change who the lease
+      // says the landlord is.
+      landlord_name:    `${landlordUser.firstName} ${landlordUser.lastName}`.trim(),
       unit_number:      lease.unit_number,
       property_name:    lease.property_name || '',
       property_address: [lease.street1, lease.city, lease.state, lease.zip].filter(Boolean).join(', '),
@@ -3188,9 +3193,8 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
     if (tmpl.purpose !== 'work_trade_addendum') throw new AppError(400, 'Pick a Work-Trade Addendum form (set Form Type = Work-Trade Addendum on the template)')
     if (!tmpl.base_pdf_url) throw new AppError(400, 'That addendum form has no PDF — add one in the template editor')
 
-    const landlordUser = await queryOne<any>(`
-      SELECT u.id, u.first_name, u.last_name, u.email, u.phone
-        FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id=$1`, [landlordId])
+    const landlordUser = await landlordSigningContact(
+      landlordId, { propertyId: lease.property_id ?? null, unitId: lease.unit_id ?? null })
     if (!landlordUser) throw new AppError(500, 'Landlord user not found')
     const roster = await query<any>(`
       SELECT u.id AS user_id, u.first_name, u.last_name, u.email, u.phone, lt.role
@@ -3199,7 +3203,7 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
        ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [lease.id])
     if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to sign the addendum')
     const signers = [
-      { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+      { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
       ...(roster as any[]).map((r: any, i: number) => ({
         userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
         email: r.email, phone: r.phone, orderIndex: i + 2,
@@ -3260,8 +3264,8 @@ export async function autoDraftWorkTradeAddendumForRenewal(newLeaseId: string): 
      ORDER BY (property_id=$3) DESC NULLS LAST, (unit_type=$2) DESC NULLS LAST, created_at DESC
      LIMIT 1`, [lease.landlord_id, lease.unit_type, lease.property_id])
   if (!tmpl) return
-  const landlordUser = await queryOne<any>(
-    `SELECT u.id, u.first_name, u.last_name, u.email, u.phone FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1`, [lease.landlord_id])
+  const landlordUser = await landlordSigningContact(
+    lease.landlord_id, { propertyId: lease.property_id ?? null, unitId: lease.unit_id ?? null })
   if (!landlordUser) return
   const roster = await query<any>(`
     SELECT u.id AS user_id, u.first_name, u.last_name, u.email, u.phone, lt.role
@@ -3270,7 +3274,7 @@ export async function autoDraftWorkTradeAddendumForRenewal(newLeaseId: string): 
      ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [newLeaseId])
   if ((roster as any[]).length === 0) return
   const signers = [
-    { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+    { userId: landlordUser.userId, role: 'landlord', name: landlordUser.name, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
     ...(roster as any[]).map((r: any, i: number) => ({ userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`, email: r.email, phone: r.phone, orderIndex: i + 2 })),
   ]
   const client = await getClient()

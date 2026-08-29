@@ -974,6 +974,20 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // into new leases at this property (LeaseFormModal default-pull is a
     // separate carry-forward; for now this surface stores the policy).
     // CHECK constraint allows late_fee_initial_type ∈ {flat, percent_of_rent}.
+    // S630 (Nic): where THIS property's lease-signing requests go, so an on-site
+    // manager can sign for their property without the portfolio login or the
+    // other properties' mail. Sent explicitly (even as '') to allow clearing it
+    // back to the account email, which COALESCE alone cannot express.
+    const signingEmailSent = raw.leaseSigningEmail !== undefined
+    const signingEmail = signingEmailSent
+      ? (String(raw.leaseSigningEmail).trim().toLowerCase() || null) : null
+    if (signingEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(signingEmail)) {
+      throw new AppError(400, 'That lease-signing address is not a valid email.')
+    }
+    const signingNameSent = raw.leaseSigningName !== undefined
+    const signingName = signingNameSent
+      ? (String(raw.leaseSigningName).trim().slice(0, 120) || null) : null
+
     const lateFeeEnabled =
       typeof raw.lateFeeEnabled === 'boolean' ? raw.lateFeeEnabled : undefined
     const lateFeeGraceDays =
@@ -1069,6 +1083,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
         default_occupancy_mode  = COALESCE($17, default_occupancy_mode),
         operator_owns_land      = COALESCE($18, operator_owns_land),
+        lease_signing_email = CASE WHEN $19::boolean THEN $20 ELSE lease_signing_email END,
+        lease_signing_name  = CASE WHEN $21::boolean THEN $22 ELSE lease_signing_name  END,
         updated_at  = NOW()
       WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
@@ -1083,7 +1099,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
        req.params.id,
        defaultOccupancyMode ?? null,
-       typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null]
+       typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
+       signingEmailSent, signingEmail, signingNameSent, signingName]
     )
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
