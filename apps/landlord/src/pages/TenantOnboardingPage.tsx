@@ -242,62 +242,133 @@ type Person = { firstName: string; lastName: string; email: string; phone: strin
 const blankPerson = (): Person => ({ firstName: '', lastName: '', email: '', phone: '' })
 
 /**
- * S629 (Nic): "we need a more efficient workflow for invites to units. Maybe
- * have all units available on the same page for quick invite. When the invite
- * is sent the unit should disappear from the page."
+ * S629 (Nic): "I want everything onto one page. I want to type in these emails
+ * for unit six and these emails for unit seven and these emails for unit eight
+ * all on one page at the same time and then send it."
  *
- * Onboarding a park is not one invite, it is thirty. The single-unit form made
- * that thirty round trips through a dropdown, and the dropdown was the slowest
- * part: find the unit, fill the roster, send, come back, find the next one.
+ * A bulk form, not a queue of single forms. Every invitable unit is on the
+ * page, every roster is open at once, and ONE button sends the lot.
  *
- * One card per invitable unit instead. Each card carries its own roster and
- * sends on its own, and a unit drops off the page the moment its invites go —
- * so what is left on screen is exactly what is left to do.
+ * Two earlier shapes were wrong and are gone. Arriving from a unit's page used
+ * to scope the page to that unit alone — you clicked unit six and could only
+ * see unit six, which is the opposite of a worklist. And each card had its own
+ * Send, which is thirty presses for thirty units. Now the deep-linked unit is
+ * simply the one that starts expanded, and the send button is at the bottom of
+ * the page.
+ *
+ * Rosters live HERE rather than inside each card, because one send button has
+ * to see all of them.
  */
 function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
   const qc = useQueryClient()
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
-  // The eligibility rule lives in lib/inviteEligibility so this page and
-  // InviteTenantModal cannot drift: occupied, owner-occupied and already-
-  // invited units are not offered.
   const selectable = (allUnits as any[]).filter(canInviteToUnit)
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
 
-  // Sent this session. The server also stops offering these (pendingInviteCount
-  // counts both invite flows), but that is a refetch away — dropping the card
-  // immediately is what makes the page a worklist rather than a form.
-  const [sentFor, setSentFor] = useState<Record<string, string[]>>({})
+  const [rosters, setRosters] = useState<Record<string, Person[]>>({})
+  const [attest, setAttest] = useState<Record<string, boolean>>({})
+  const [open, setOpen] = useState<Record<string, boolean>>(
+    initialUnitId ? { [initialUnitId]: true } : {})
+  const [sent, setSent] = useState<Record<string, string[]>>({})
+  const [sending, setSending] = useState(false)
+  const [errors, setErrors] = useState<Record<string, string>>({})
 
-  // Arriving from a unit's own page: just that unit, even if it now has an
-  // invite out — the landlord is standing on it and asked for it by name.
-  const scoped = initialUnitId
-    ? (allUnits as any[]).filter(u => u.id === initialUnitId)
-    : selectable
-  const remaining = scoped.filter(u => !sentFor[u.id])
+  const rosterFor = (id: string) => rosters[id] ?? [blankPerson()]
+  const setRoster = (id: string, next: Person[]) => setRosters(p => ({ ...p, [id]: next }))
 
+  const complete = (p: Person) => !!(p.firstName && p.lastName && p.email)
+  const untouched = (p: Person) => !p.firstName && !p.lastName && !p.email && !p.phone
+
+  // Every unit with at least one fully filled person, and no half-filled one.
+  const unitsReady = selectable.filter(u => {
+    if (sent[u.id]) return false
+    const typed = rosterFor(u.id).filter(p => !untouched(p))
+    return typed.length > 0 && typed.every(complete)
+  })
+  const unitsHalfDone = selectable.filter(u => {
+    if (sent[u.id]) return false
+    const typed = rosterFor(u.id).filter(p => !untouched(p))
+    return typed.length > 0 && !typed.every(complete)
+  })
+  const peopleReady = unitsReady.reduce(
+    (n, u) => n + rosterFor(u.id).filter(p => !untouched(p)).length, 0)
+
+  const blockedBecause =
+    unitsHalfDone.length > 0
+      ? `Unit${unitsHalfDone.length === 1 ? '' : 's'} ${unitsHalfDone.map(u => u.unitNumber).join(', ')}: ` +
+        'every person needs a first name, last name and email. Phone is optional.'
+      : unitsReady.length === 0 ? 'Fill in at least one unit.' : null
+
+  /**
+   * One press, every unit. Sent per person, one at a time, because each is a
+   * real invite email — a failure part way through must leave the people
+   * already invited invited, never roll back a message that has landed.
+   * Units that succeed drop off; units that fail stay on the page with the
+   * reason and the people who did not make it.
+   */
+  const sendEverything = async () => {
+    setSending(true); setErrors({})
+    const nextSent: Record<string, string[]> = {}
+    const nextErrors: Record<string, string> = {}
+    for (const u of unitsReady) {
+      const people = rosterFor(u.id).filter(p => !untouched(p))
+      const okNames: string[] = []
+      const failed: Person[] = []
+      let lastErr = ''
+      for (const p of people) {
+        try {
+          await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
+            { ...p, unitId: u.id, existingResident: attest[u.id] !== false })
+          okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
+        } catch (e: any) {
+          failed.push(p)
+          lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
+        }
+      }
+      if (failed.length) {
+        nextErrors[u.id] = `${failed.length} of ${people.length} failed: ${lastErr}`
+        setRoster(u.id, failed)
+      } else {
+        nextSent[u.id] = okNames
+      }
+    }
+    setSent(prev => ({ ...prev, ...nextSent }))
+    setErrors(nextErrors)
+    setSending(false)
+    qc.invalidateQueries('units')
+  }
+
+  // A unit deep-linked from its own page is always on the list, even if it has
+  // an invite out: clicking "Invite to Sign a Lease" on a unit and landing on a
+  // page that does not contain it is worse than showing it. Everything else
+  // obeys the eligibility rule.
+  const deepLinked = initialUnitId
+    ? (allUnits as any[]).filter(u => u.id === initialUnitId && !selectable.some(s => s.id === u.id))
+    : []
+  const remaining = [...deepLinked, ...selectable].filter(u => !sent[u.id])
   const byProperty = remaining.reduce((acc: Record<string, any[]>, u: any) => {
     (acc[u.propertyName] ||= []).push(u); return acc
   }, {})
-  const sentCount = Object.keys(sentFor).length
+  const sentUnitCount = Object.keys(sent).length
 
   return (
-    <div style={{ maxWidth: 720 }}>
+    <div style={{ maxWidth: 760, paddingBottom: 96 }}>
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
 
       <div style={{ marginBottom: 14 }}>
         <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-0)', margin: 0, marginBottom: 6 }}>Invite to sign a new lease</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5, margin: 0 }}>
-          Every unit you can invite into, on one page. Add everyone who will sign that unit&apos;s lease and
-          send — the unit drops off the list, so what is left is what is left to do. Each person gets a
-          portal invite by email; the lease drafts once everyone on that unit accepts.
+          Fill in as many units as you like, then send them all at once. Each person gets a portal
+          invite by email; a unit&apos;s lease drafts once everyone on it accepts. Units drop off the
+          list as their invites go.
         </p>
       </div>
 
-      {sentCount > 0 && (
+      {sentUnitCount > 0 && (
         <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8,
                       padding: '10px 14px', marginBottom: 14, fontSize: '.8rem', color: 'var(--text-1)' }}>
-          <strong style={{ color: 'var(--green)' }}>Sent for {sentCount} unit{sentCount === 1 ? '' : 's'}:</strong>{' '}
-          {Object.entries(sentFor).map(([id, names]) => {
+          <strong style={{ color: 'var(--green)' }}>Sent for {sentUnitCount} unit{sentUnitCount === 1 ? '' : 's'}:</strong>{' '}
+          {Object.entries(sent).map(([id, names]) => {
             const u = (allUnits as any[]).find(x => x.id === id)
             return `${u ? `Unit ${u.unitNumber}` : 'unit'} (${names.join(', ')})`
           }).join(' · ')}
@@ -306,54 +377,73 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
 
       {remaining.length === 0 ? (
         <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)', fontSize: '.85rem' }}>
-          {sentCount > 0
-            ? 'Every unit on this list has invites out. Nothing left to send.'
-            : 'No units are available to invite into right now.'}
+          {sentUnitCount > 0 ? 'Every unit on this list has invites out. Nothing left to send.'
+                             : 'No units are available to invite into right now.'}
           {hiddenReasons.length > 0 && (
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6 }}>
-              Not listed: {hiddenReasons.join(', ')}.
-            </div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6 }}>Not listed: {hiddenReasons.join(', ')}.</div>
           )}
         </div>
       ) : (
         <>
           {Object.entries(byProperty).map(([propertyName, units]) => (
             <div key={propertyName} style={{ marginBottom: 18 }}>
-              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase',
-                            letterSpacing: '.07em', marginBottom: 8 }}>
-                {propertyName} — {(units as any[]).length} unit{(units as any[]).length === 1 ? '' : 's'}
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
+                <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.07em' }}>
+                  {propertyName} — {(units as any[]).length} unit{(units as any[]).length === 1 ? '' : 's'}
+                </div>
+                <button type="button" className="btn btn-ghost btn-sm" style={{ fontSize: '.7rem' }}
+                  onClick={() => setOpen(prev => {
+                    const next = { ...prev }
+                    for (const u of units as any[]) next[u.id] = true
+                    return next
+                  })}>
+                  Open all
+                </button>
               </div>
               {(units as any[]).map(u => (
                 <UnitInviteCard key={u.id} unit={u}
-                  onSent={names => {
-                    setSentFor(prev => ({ ...prev, [u.id]: names }))
-                    qc.invalidateQueries('units')
-                  }} />
+                  open={!!open[u.id]}
+                  onOpen={() => setOpen(prev => ({ ...prev, [u.id]: true }))}
+                  onClose={() => { setOpen(prev => ({ ...prev, [u.id]: false })); setRoster(u.id, [blankPerson()]) }}
+                  people={rosterFor(u.id)}
+                  setPeople={next => setRoster(u.id, next)}
+                  attest={attest[u.id] !== false}
+                  setAttest={v => setAttest(prev => ({ ...prev, [u.id]: v }))}
+                  error={errors[u.id] ?? null} />
               ))}
             </div>
           ))}
           {hiddenReasons.length > 0 && (
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-              Not listed: {hiddenReasons.join(', ')}.
-            </div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12 }}>Not listed: {hiddenReasons.join(', ')}.</div>
           )}
+
+          {/* One send for the whole page. Sticky, because a bulk form whose
+              button is below thirty units is a button nobody finds. */}
+          <div style={{ position: 'sticky', bottom: 0, background: 'var(--bg-1)', borderTop: '1px solid var(--border-0)',
+                        padding: '12px 0', marginTop: 8 }}>
+            <button type="button" className="btn btn-primary" style={{ width: '100%' }}
+                    disabled={!!blockedBecause || sending} onClick={sendEverything}>
+              {sending ? 'Sending…'
+                : unitsReady.length === 0 ? 'Send invites'
+                : `Send ${peopleReady} invite${peopleReady === 1 ? '' : 's'} across ${unitsReady.length} unit${unitsReady.length === 1 ? '' : 's'}`}
+            </button>
+            {blockedBecause && !sending && (
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6, textAlign: 'center' }}>{blockedBecause}</div>
+            )}
+          </div>
         </>
       )}
     </div>
   )
 }
 
-/**
- * S629: one unit's roster, sending on its own. Collapsed until you start typing
- * so thirty units are a scannable list rather than thirty open forms.
- */
-function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[]) => void }) {
-  const [open, setOpen] = useState(false)
-  const [people, setPeople] = useState<Person[]>([blankPerson()])
-  const [error, setError] = useState<string | null>(null)
-  const [sending, setSending] = useState(false)
-  const [attestExisting, setAttestExisting] = useState(true)
-
+/** S629: one unit's roster. Presentational — the page owns the data so a
+ *  single send can see every unit at once. */
+function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, error }: {
+  unit: any; open: boolean; onOpen: () => void; onClose: () => void
+  people: Person[]; setPeople: (next: Person[]) => void
+  attest: boolean; setAttest: (v: boolean) => void; error: string | null
+}) {
   const { data: obWindow } = useQuery<any>(
     ['ob-window', unit.propertyId],
     () => apiGet(`/properties/${unit.propertyId}/onboarding-window`),
@@ -361,50 +451,9 @@ function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[])
   const windowOpen = !!obWindow?.open
 
   const setField = (i: number, k: keyof Person, v: string) =>
-    setPeople(prev => prev.map((p, idx) => idx === i ? { ...p, [k]: v } : p))
+    setPeople(people.map((p, idx) => idx === i ? { ...p, [k]: v } : p))
 
-  // Phone is optional: the invite and the signature both travel by email, and
-  // the tenant fills their number in on their own contact details.
-  const complete = (p: Person) => !!(p.firstName && p.lastName && p.email)
-  const untouched = (p: Person) => !p.firstName && !p.lastName && !p.email && !p.phone
-  const typedIn = people.filter(p => !untouched(p))
-  const ready = typedIn.filter(complete)
-  const halfDone = typedIn.filter(p => !complete(p))
-
-  const blockedBecause =
-    ready.length === 0 ? 'Add at least one person — first name, last name and email.'
-    : halfDone.length > 0
-      ? `${halfDone.length === 1 ? 'One person is' : `${halfDone.length} people are`} missing ` +
-        [...new Set(halfDone.flatMap(p => [
-          !p.firstName && 'a first name', !p.lastName && 'a last name', !p.email && 'an email',
-        ].filter(Boolean) as string[]))].join(', ') + '. Phone is optional.'
-      : null
-
-  // One at a time: each is a real invite email, so a failure part way through
-  // must leave the people already invited invited.
-  const sendAll = async () => {
-    setSending(true); setError(null)
-    const failed: Person[] = []
-    const sentNow: string[] = []
-    let lastErr = ''
-    for (const p of ready) {
-      try {
-        await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
-          { ...p, unitId: unit.id, existingResident: windowOpen && attestExisting })
-        sentNow.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
-      } catch (e: any) {
-        failed.push(p)
-        lastErr = e?.response?.data?.message || e?.message || 'Could not send the invite.'
-      }
-    }
-    setSending(false)
-    if (failed.length) {
-      setPeople(failed)
-      setError(`${failed.length} of ${ready.length} could not be invited: ${lastErr}`)
-      return
-    }
-    onSent(sentNow)
-  }
+  const filled = people.filter(p => p.firstName || p.lastName || p.email || p.phone).length
 
   if (!open) {
     return (
@@ -412,11 +461,10 @@ function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[])
                                      alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div style={{ fontSize: '.85rem', color: 'var(--text-1)' }}>
           <strong>Unit {unit.unitNumber}</strong>
-          {unit.occupancyMode === 'by_room' && (
-            <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · by-room</span>
-          )}
+          {unit.occupancyMode === 'by_room' && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · by-room</span>}
+          {filled > 0 && <span style={{ fontSize: '.72rem', color: 'var(--green)' }}> · {filled} added</span>}
         </div>
-        <button className="btn btn-sm btn-primary" onClick={() => setOpen(true)}>Invite</button>
+        <button className="btn btn-sm btn-primary" onClick={onOpen}>Add people</button>
       </div>
     )
   }
@@ -425,13 +473,12 @@ function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[])
     <div className="card" style={{ padding: 14, marginBottom: 10 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-0)' }}>Unit {unit.unitNumber}</div>
-        <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }}
-                onClick={() => { setOpen(false); setPeople([blankPerson()]); setError(null) }}>Cancel</button>
+        <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }} onClick={onClose}>Clear</button>
       </div>
 
       {obWindow && (windowOpen ? (
         <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: 10 }}>
-          <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3 }} />
+          <input type="checkbox" checked={attest} onChange={e => setAttest(e.target.checked)} style={{ marginTop: 3 }} />
           <span style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
             <strong style={{ color: 'var(--text-1)' }}>Existing residents — skip background check.</strong>{' '}
             They already live here and will sign the new lease without screening.
@@ -450,7 +497,7 @@ function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[])
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
               <span style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>Co-tenant {i}</span>
               <button type="button" className="btn btn-ghost btn-sm" style={{ padding: '1px 7px', fontSize: '.68rem' }}
-                      onClick={() => setPeople(prev => prev.filter((_, idx) => idx !== i))}>Remove</button>
+                      onClick={() => setPeople(people.filter((_, idx) => idx !== i))}>Remove</button>
             </div>
           )}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -465,18 +512,11 @@ function UnitInviteCard({ unit, onSent }: { unit: any; onSent: (names: string[])
       ))}
 
       <button type="button" className="btn btn-ghost" style={{ width: '100%', fontSize: '.74rem' }}
-              onClick={() => setPeople(prev => [...prev, blankPerson()])}>
+              onClick={() => setPeople([...people, blankPerson()])}>
         + Add another person to this lease
       </button>
 
       {error && <div style={{ color: 'var(--red)', fontSize: '.76rem', marginTop: 8 }}>{error}</div>}
-      <button type="button" disabled={!!blockedBecause || sending} className="btn btn-primary"
-              style={{ width: '100%', marginTop: 10 }} onClick={sendAll}>
-        {sending ? 'Sending…' : ready.length > 1 ? `Send ${ready.length} invites` : 'Send invite'}
-      </button>
-      {blockedBecause && !sending && (
-        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 5, textAlign: 'center' }}>{blockedBecause}</div>
-      )}
     </div>
   )
 }
