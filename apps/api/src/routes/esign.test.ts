@@ -107,7 +107,7 @@ vi.mock('../services/pdfStamp', async (importOriginal) => {
   return { ...actual, stampPdf: stampPdfMock }
 })
 
-import { esignRouter, buildLeaseFromDocument } from './esign'
+import { esignRouter, buildLeaseFromDocument, signingUrlFor } from './esign'
 import { WRITABLE_LEASE_COLUMN_SPECS } from '@gam/shared'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -3509,5 +3509,44 @@ describe('POST /documents/addendum-terms — S582 money add-on', () => {
     const sigs = await db.query<{ signer_role: string }>(
       `SELECT signer_role FROM lease_document_fields WHERE document_id = $1 AND field_type = 'signature'`, [docId])
     expect(sigs.rows.map(r => r.signer_role)).toEqual(['landlord'])
+  })
+})
+
+/**
+ * S629 — the signing link has to reach the signer's OWN portal.
+ *
+ * Nic: "I need to be able to sign from clicking a link in the email, because
+ * that is how other people are gonna also sign. Nobody's gonna log in and see
+ * 'oh, I've gotta sign my lease now.'"
+ *
+ * The URL was hard-coded to the tenant app for every signer. The first signer
+ * on a lease is the LANDLORD, so the landlord was emailed a link into the
+ * tenant portal — an app their account cannot sign in. LANDLORD_APP_URL existed
+ * the whole time and was never used here.
+ */
+describe('signing links by signer role', () => {
+  it('sends the landlord to the landlord app and a tenant to the tenant app', () => {
+    const landlord = signingUrlFor({ role: 'landlord' }, 'doc-1', null)
+    const tenant = signingUrlFor({ role: 'primary' }, 'doc-1', { email_verified: true })
+    expect(landlord).toContain('/sign/doc-1')
+    expect(tenant).toContain('/sign/doc-1')
+    expect(landlord).not.toBe(tenant)
+    // The landlord must never be pointed at the tenant portal.
+    expect(landlord).not.toContain('tenant')
+  })
+
+  it('carries an unactivated tenant through accept-invite to the document', () => {
+    // Signing is the reason they were invited; the link must not dead-end at a
+    // password screen with no way back to the lease.
+    const url = signingUrlFor({ role: 'primary' }, 'doc-9',
+      { email_verified: false, tenant_invite_token: 'tok123' })
+    expect(url).toContain('/accept-invite?token=tok123')
+    expect(decodeURIComponent(url)).toContain('next=/sign/doc-9')
+  })
+
+  it('treats a witness like the landlord — they sign in the landlord app', () => {
+    expect(signingUrlFor({ role: 'witness' }, 'doc-2', null)).toContain('/sign/doc-2')
+    expect(signingUrlFor({ role: 'witness' }, 'doc-2', null))
+      .toBe(signingUrlFor({ role: 'landlord' }, 'doc-2', null))
   })
 })

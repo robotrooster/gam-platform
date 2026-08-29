@@ -3429,9 +3429,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     // Branch signing URL: unactivated tenants land on /accept-invite first, then get redirected to /sign
     // S410 (S377): read tenant_invite_token (was email_verify_token).
     const firstSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [firstSigner.user_id])
-    const signingUrl = (firstSignerUser && !firstSignerUser.email_verified && firstSignerUser.tenant_invite_token)
-      ? `${TENANT_APP_URL}/accept-invite?token=${firstSignerUser.tenant_invite_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
-      : `${TENANT_APP_URL}/sign/${doc.id}`
+    const signingUrl = signingUrlFor(firstSigner, doc.id, firstSignerUser)
 
     await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
     await createNotification({
@@ -3511,6 +3509,33 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
 // ─────────────────────────────────────────────────────────────
 // SIGNING
 // ─────────────────────────────────────────────────────────────
+
+
+/**
+ * S629 (Nic): "I need to be able to sign from clicking a link in the email,
+ * because that is how other people are gonna also sign. Nobody's gonna log in
+ * and see 'oh, I've gotta sign my lease now.'"
+ *
+ * The signing link was hard-coded to the TENANT app for every signer — but the
+ * first signer on a lease is the LANDLORD, so the landlord was emailed a link
+ * into the tenant portal, which their account cannot sign in. LANDLORD_APP_URL
+ * has existed all along and was never used here.
+ *
+ * A tenant who has not activated yet still lands on /accept-invite first and is
+ * carried through to the document afterwards — signing is the reason they were
+ * invited, so it should not dead-end at a password screen.
+ */
+export function signingUrlFor(signer: { role: string }, documentId: string,
+                       user: { email_verified?: boolean; tenant_invite_token?: string | null } | null): string {
+  if (signer.role === 'landlord' || signer.role === 'witness') {
+    return `${LANDLORD_APP_URL}/sign/${documentId}`
+  }
+  if (user && !user.email_verified && user.tenant_invite_token) {
+    return `${TENANT_APP_URL}/accept-invite?token=${user.tenant_invite_token}` +
+           `&next=${encodeURIComponent('/sign/' + documentId)}`
+  }
+  return `${TENANT_APP_URL}/sign/${documentId}`
+}
 
 esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
   try {
@@ -4055,12 +4080,9 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
         ORDER BY order_index LIMIT 1`, [doc.id])
       if (nextSigner) {
         const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
-        const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
         // S410 (S377): read tenant_invite_token (was email_verify_token).
         const nextSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [nextSigner.user_id])
-        const nextSigningUrl = (nextSignerUser && !nextSignerUser.email_verified && nextSignerUser.tenant_invite_token)
-          ? `${TENANT_APP_URL}/accept-invite?token=${nextSignerUser.tenant_invite_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
-          : signingUrl
+        const nextSigningUrl = signingUrlFor(nextSigner, doc.id, nextSignerUser)
         await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id })
         await createNotification({
           userId: nextSigner.user_id,
