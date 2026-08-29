@@ -22,6 +22,7 @@ import { DateTime } from 'luxon'
 import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
 import { selectToolsForTurn, isActionTool } from './toolSelection'
+import { untraceableIdArgs, lookItUpFirst } from './idTraceability'
 import { buildDecisionPrompt, buildComposeInstruction } from './decisionPrompt'
 import { alreadyDone } from './repeatedAction'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
@@ -1130,6 +1131,18 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
    */
   const priorToolCalls: { name: string; args: unknown }[] = [...(input.priorToolCalls ?? [])]
   /**
+   * S628: everything the agent has legitimately SEEN, for checking that an id
+   * it is about to send was not invented. Tool results it received, plus the
+   * person's own words — a landlord who pastes a reference is quoting a real
+   * one. See idTraceability.ts.
+   */
+  const seenForIds = (): string[] => [
+    ...toolInvocations.map((t) => JSON.stringify(t.result ?? {})),
+    ...priorToolCalls.map((t) => JSON.stringify((t as any).result ?? {})),
+    message,
+    ...history.filter((h) => h.role === 'user').map((h) => String(h.content ?? '')),
+  ]
+  /**
    * S628: the composing pass runs ONCE PER DRAFT — including every draft a
    * guard forces.
    *
@@ -1485,12 +1498,23 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // agent filing a second maintenance request for one leaking sink while
       // correctly telling the tenant it was already logged.
       const repeat = alreadyDone(call.function.name, args, priorToolCalls)
+      // S628: and refuse an action carrying an id the agent never saw. See
+      // idTraceability.ts — the run caught set_eviction_mode being called with
+      // a made-up unit_12345. Reads are exempt: a wrong id there returns
+      // nothing, and lookups are how ids are found.
+      const invented = repeat || !isActionTool(call.function.name)
+        ? []
+        : untraceableIdArgs(args, seenForIds())
       const result = repeat
         ? (logger.warn({ profile: profile.id, tool: call.function.name },
             'agent runner: refused a repeat of an action already taken this conversation'),
            { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
+        : invented.length
+        ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
+            'agent runner: refused an action carrying an invented id'),
+           { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
         : await executeToolCall(call, profile, actor, args)
-      if (!repeat) priorToolCalls.push({ name: call.function.name, args })
+      if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
             toolInvocations.push({ name: call.function.name, args, result })
             messages.push({
               role: 'tool',
@@ -1967,12 +1991,23 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // agent filing a second maintenance request for one leaking sink while
       // correctly telling the tenant it was already logged.
       const repeat = alreadyDone(call.function.name, args, priorToolCalls)
+      // S628: and refuse an action carrying an id the agent never saw. See
+      // idTraceability.ts — the run caught set_eviction_mode being called with
+      // a made-up unit_12345. Reads are exempt: a wrong id there returns
+      // nothing, and lookups are how ids are found.
+      const invented = repeat || !isActionTool(call.function.name)
+        ? []
+        : untraceableIdArgs(args, seenForIds())
       const result = repeat
         ? (logger.warn({ profile: profile.id, tool: call.function.name },
             'agent runner: refused a repeat of an action already taken this conversation'),
            { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
+        : invented.length
+        ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
+            'agent runner: refused an action carrying an invented id'),
+           { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
         : await executeToolCall(call, profile, actor, args)
-      if (!repeat) priorToolCalls.push({ name: call.function.name, args })
+      if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
       turnCache.set(cacheKey, result)
 
       // An escalation tool is a CONTROL signal, not a data/action tool —

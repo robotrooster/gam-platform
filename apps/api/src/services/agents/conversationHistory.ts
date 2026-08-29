@@ -130,7 +130,14 @@ export async function loadUserContext(
  * conversation log already stores every tool call with its arguments, so this
  * can be a fact rather than a request.
  */
-export interface PriorToolCall { name: string; args: unknown }
+/**
+ * S628: `result` is carried as well as the call, because idTraceability needs
+ * it. An id the agent legitimately obtained in turn 1 and uses in turn 2 has
+ * to stay usable — without the stored result there is nothing to trace it to,
+ * and the guard would refuse the ordinary look-it-up-then-act flow it exists
+ * to protect. The column already holds it; only the mapping dropped it.
+ */
+export interface PriorToolCall { name: string; args: unknown; result?: unknown }
 
 export async function loadConversationToolCalls(
   conversationId: string,
@@ -149,7 +156,7 @@ export async function loadConversationToolCalls(
   for (const r of rows.reverse()) {
     const list = Array.isArray(r.tool_invocations) ? r.tool_invocations : []
     for (const t of list as any[]) {
-      if (t && typeof t.name === 'string') out.push({ name: t.name, args: t.args ?? {} })
+      if (t && typeof t.name === 'string') out.push({ name: t.name, args: t.args ?? {}, result: t.result })
     }
   }
   return out
