@@ -66,3 +66,46 @@ describe('what every action description must be', () => {
     }
   })
 })
+
+/**
+ * S628 — AN ACTION THAT NEEDS SOMEBODY'S IDENTITY MUST SAY SO.
+ *
+ * The model reads these descriptions to decide what it can do. When an action
+ * REQUIRES a person's name, email or phone and the description never mentions
+ * collecting them, the model is left holding a tool it cannot call — and the
+ * measured behaviour in that position is not to ask, it is to promise.
+ *
+ * A prospect picked a call time and was told "Great, I can book that. I'll send
+ * over a calendar invite." Nothing was booked: book_sales_call requires a name
+ * and an email and had neither. From the prospect's side there is a call on the
+ * calendar and a confirmation coming, and nobody finds out otherwise until the
+ * Strategist does not ring.
+ *
+ * The runner nudge now offers "ask for what is missing" as an explicit third
+ * option, but the description is the other half: it is what tells the model
+ * those fields have to come from the person in the first place.
+ *
+ * invite_tenant_to_sign_lease is why the bar is here rather than in review —
+ * it mails real paperwork, so a guessed address sends somebody's lease to a
+ * stranger and reports back to the landlord that it is done.
+ */
+describe('actions that require a person’s identity', () => {
+  const IDENTITY = /^(name|email|phone|firstName|lastName|fullName|contactEmail|contactPhone)$/i
+
+  const needsIdentity = (PORTAL_ACTIONS as any[]).filter((a) =>
+    (a.required ?? []).some((r: string) => IDENTITY.test(r)))
+
+  it('finds some — otherwise this test is guarding nothing', () => {
+    expect(needsIdentity.length).toBeGreaterThan(5)
+  })
+
+  it.each(needsIdentity.map((a) => [a.id, a] as const))(
+    '%s tells the model to ask for them', (_id, a: any) => {
+      const fields = (a.required ?? []).filter((r: string) => IDENTITY.test(r))
+      expect(String(a.description),
+        `${a.id} requires ${fields.join(', ')} — which only the person can supply — but its ` +
+        'description never says to ask for them. Add a line naming the required fields and ' +
+        'telling the model to ask rather than guess.',
+      ).toMatch(/ask|collect|get their|confirm/i)
+    })
+})

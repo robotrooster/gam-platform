@@ -21,7 +21,7 @@ import { retrieve, type RetrievedChunk } from './knowledge'
 import { DateTime } from 'luxon'
 import { buildContextBlock } from './groundedAgent'
 import { getTool, getToolsForProfile, toToolSchema } from './tools'
-import { selectToolsForTurn } from './toolSelection'
+import { selectToolsForTurn, isActionTool } from './toolSelection'
 import { buildDecisionPrompt, buildComposeInstruction } from './decisionPrompt'
 import { alreadyDone } from './repeatedAction'
 import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
@@ -802,7 +802,7 @@ const FIRST_PERSON =
  * net (synthesizeHandoff) and its own rules about when it is allowed.
  */
 const ACTION_VERB =
-  /\b(file|filing|submit(?:ting)?|open(?:ing)?|log(?:ging)?|report(?:ing)?|put(?:ting)?\s+(?:that|this|it|in)|send(?:ing)?|schedul\w+|book(?:ing)?|cancell?(?:ing|ed|s)?|creat\w+|rais(?:e|ing)|start(?:ing)?|set(?:ting)?\s+(?:that|this|it)?\s*up|arrang\w+|add(?:ing)?|remov\w+|updat\w+)\b/i
+  /\b(file|filing|submit(?:ting)?|open(?:ing)?|log(?:ging)?|report(?:ing)?|put(?:ting)?\s+(?:that|this|it|in)|send(?:ing)?|schedul\w+|book(?:ing)?|cancell?(?:ing|ed|s)?|creat\w+|rais(?:e|ing)|start(?:ing)?|set(?:ting)?\s+(?:that|this|it)?\s*up|arrang\w+|add(?:ing)?|remov\w+|updat\w+|waiv(?:e|ing)|refund(?:ing)?|reimburs\w+|credit(?:ing)?\s+(?:a|the|that|it|them|their)|issu(?:e|ing)\s+(?:a|the|that|it|them|their)|appl(?:y|ying)\s+(?:a|the|that|it|them|their)|process(?:ing)?\s+(?:a|the|that|it|them|their)|adjust(?:ing)?|approv(?:e|ing)|den(?:y|ying)|reject(?:ing)?|renew(?:ing)?|extend(?:ing)?|terminat\w+|evict(?:ing)?|releas(?:e|ing)|transferr?(?:ing)?)\b/i
 
 export function promisesAnAction(text: string): boolean {
   if (!text) return false
@@ -1600,12 +1600,26 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         }
       }
       // S626: the turn promised to DO something and did nothing. See
-      // promisesAnAction. Only when NO tool ran at all — if something ran, the
-      // promise has an action behind it and the padding/invention nets own the
-      // rest.
+      // promisesAnAction.
+      //
+      // S628 — GATED ON *ACTION* TOOLS, NOT ON ANY TOOL AT ALL.
+      //
+      // This read "only when NO tool ran", on the reasoning that if something
+      // ran, the promise has an action behind it. That is false when the thing
+      // that ran was a LOOKUP. One read was enough to disarm the guard.
+      //
+      // Measured: a landlord said "yes, waive it — they called me about it and
+      // I said I would" and got back "The $100 late fee on Apt 204 is still
+      // pending. I'll waive it." The only call was
+      // lookup_tenant_payment_status. Nothing was waived, the guard never
+      // looked, and the landlord has now told their tenant it is handled.
+      //
+      // A read is how the agent finds out WHETHER to act; it is never the
+      // acting. So the question is whether an ACTION ran, and isActionTool
+      // already draws that line for tool selection.
       if (
         !nudgedForPromisedAction &&
-        toolInvocations.length === 0 &&
+        !toolInvocations.some((t) => isActionTool(t.name)) &&
         promisesAnAction(out.content)
       ) {
         nudgedForPromisedAction = true
@@ -1623,10 +1637,31 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
             // S626: this is the specific stall that produced the bug. The
             // maintenance tool requires only a title and a description; the
             // model held the whole filing hostage to a priority it did not need.
-            'Do not wait on optional details first. If the tool only requires what you already have, ' +
+            'Do not wait on OPTIONAL details first. If the tool only requires what you already have, ' +
             'call it with that and use a sensible default for the rest — you can ask about urgency, ' +
             'category or extras AFTER it is filed, and then update it. Filing late is recoverable; ' +
             'not filing is not.\n' +
+            // S628: THE THIRD OPTION, and the one that was missing.
+            //
+            // The two branches above are "call it" and "no tool can do it".
+            // Neither fits the commonest stall of all: you HOLD the right tool
+            // and are short a REQUIRED argument. Told not to promise and unable
+            // to call, the model promised anyway — twice, through the retry.
+            //
+            // Caught on a prospect who asked to talk to someone and picked a
+            // time: "Great, I can book that. I'll send over a calendar invite."
+            // book_sales_call requires name and email, it had neither, and the
+            // call was never booked. From their side a call is on the calendar.
+            //
+            // Stated separately from the default-the-rest line above because
+            // that line must never reach a required field. Defaulting `email`
+            // on a booking tool sends a real confirmation to an address nobody
+            // owns, and books a Strategist against a person who does not exist.
+            'If you hold the right tool but are missing something it REQUIRES, do not promise and ' +
+            'do not guess. Ask for exactly the missing pieces, in one short question, and say what ' +
+            'happens once you have them. Never invent, assume or default a required value — ' +
+            'especially a name, an email or a phone number: a made-up one sends a real message to ' +
+            'a real stranger and books something nobody asked for.\n' +
             'If no tool you hold can actually do it, say so plainly and tell them who can — do not ' +
             'promise it in the hope it resolves itself.',
         })

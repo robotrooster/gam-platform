@@ -40,7 +40,11 @@ export const bookSalesCallTool: AgentTool = {
     'Book the prospect’s call with a Portfolio Strategist. CONFIRM FIRST: the exact time (startsAt from ' +
     'get_available_call_times), video or phone, their name, and their email — read the details back and get an ' +
     'explicit yes before calling, because booking sends a real confirmation email. On success, tell them the ' +
-    'confirmed time and that the confirmation is in their inbox.',
+    'confirmed time and that the confirmation is in their inbox.\n' +
+    'IF YOU DO NOT HAVE THEIR NAME AND EMAIL, ASK FOR THEM. That is the next thing to say — not a ' +
+    'promise to book. Somebody who has just picked a time has told you nothing about who they are, ' +
+    'and "I can book that, I will send the invite over" books nothing: they leave believing a call ' +
+    'is on the calendar. Ask for both in one short question, then book. Never invent an email.',
   parameters: {
     type: 'object',
     properties: {

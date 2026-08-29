@@ -586,7 +586,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'suite line it will be refused as a duplicate, and that refusal is usually right — read it out ' +
       'rather than trying a different name. Adding the property does NOT add units; that is add_units ' +
       'once this comes back with an id. landlordId only matters when they hold properties under more ' +
-      'than one entity, and then it is which company owns THIS one.',
+      'than one entity, and then it is which company owns THIS one.\n' +
+      'The whole address is required. If they name the building without one, ask for it \u2014 do not '  +
+      'invent a street, city or zip to get the call through.',
     params: {
       name: { type: 'string', description: 'What they call it — "Sunset Palms", "412 Roosevelt".' },
       street1: { type: 'string', description: 'Street address.' },
@@ -1166,7 +1168,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'for "add Jose, he does the yards, 1099".\n' +
       'The difference between a contractor and an employee is a tax question with real consequences, ' +
       'and it is theirs or their accountant\u2019s to answer, not yours. Record what they tell you; do ' +
-      'not advise them on which one somebody is.',
+      'not advise them on which one somebody is.\n' +
+      'A name is required. If they have not given one, ask.',
     params: {
       name: { type: 'string', description: 'Their name or business name.' },
       email: { type: 'string', description: 'Email.' },
@@ -3569,7 +3572,12 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'For a household, call this again for the same unit before anybody signs. Adding somebody voids ' +
       'the unsigned draft so the whole roster re-drafts together — that is correct, not a fault, and ' +
       'worth saying if they see it happen.\n' +
-      'If the tenant is already living there on a paper lease, migrate_existing_tenant is the one.',
+      'If the tenant is already living there on a paper lease, migrate_existing_tenant is the one.\n' +
+      'You need their first name, last name, email AND phone before you can send anything. A '  +
+      'landlord who says "the Reyes family are taking 204" has given you a surname and a unit and '  +
+      'nothing else \u2014 ask for the rest in one go, and never guess an email. This mails a real '  +
+      'person real paperwork: a guessed address sends somebody\u2019s lease to a stranger and reports '  +
+      'it back to the landlord as done.',
     params: {
       firstName: { type: 'string', description: 'Their first name.' },
       lastName: { type: 'string', description: 'Their last name.' },
@@ -3590,7 +3598,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'until the landlord uploads the lease and it becomes real, and only then does the tenant hear ' +
       'anything. Say that, because "I added them" sounds like they were contacted.\n' +
       'Naming the unit reserves it: that spot stops being offered for guest bookings while the ' +
-      'person is pending, which is what protects a permanent RV tenant mid-migration.',
+      'person is pending, which is what protects a permanent RV tenant mid-migration.\n' +
+      'All four \u2014 first name, last name, email, phone \u2014 are required. If the landlord has only '  +
+      'some of them, ask for the rest rather than parking a half-identified person on their books.',
     params: {
       firstName: { type: 'string', description: 'Their first name.' },
       lastName: { type: 'string', description: 'Their last name.' },
