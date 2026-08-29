@@ -190,7 +190,13 @@ function columnFor(ctx: string): string | null {
     return 'date_signed_day'
   }
 
-  if (/apartment\s*#|apt\.?\s*#|space no\.?|unit\s*#|lot\s*#/.test(c)) return 'unit_number'
+  // S629 (Nic): "it needs to be linked to the unit that I selected when the
+  // invite went out." The RV template's "RV Space No. ___" was missed and came
+  // out as an unmapped "Text Field", so the unit number stayed blank — and
+  // therefore editable, since the signing page locks an identity field only
+  // once it holds a value. Widened to the ways a lease actually writes it:
+  // "RV Space No.", "Space #", "Lot No.", "Unit No.".
+  if (/apartment\s*(#|no\.?|number)|apt\.?\s*(#|no\.?)|(rv\s*)?space\s*(#|no\.?|number)|unit\s*(#|no\.?|number)|lot\s*(#|no\.?|number)/.test(c)) return 'unit_number'
   if (/beginning on|commencing|commence/.test(c)) return 'start_date'
   if (/ending on|ending upon|ending|expir/.test(c)) return 'end_date'
   // S582: rent-due-day blank ("due on the ___ day of the month", "due date:").

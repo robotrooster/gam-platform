@@ -358,7 +358,42 @@ export async function createDocumentRecord(client: any, opts: {
       'SELECT * FROM lease_document_signers WHERE document_id=$1',
       [doc.id]).then((r: any) => r.rows)
 
-    const prefillValues: Record<string,string> = (opts as any).prefillValues || {}
+    const prefillValues: Record<string,string> = { ...((opts as any).prefillValues || {}) }
+
+    // S629 (Nic): "the unit number is editable still. It needs to be linked to
+    // the unit that I selected when the invite went out — it's where you got
+    // the name for this lease in the first place."
+    //
+    // unit_number has always been an IDENTITY column, and the signing page
+    // locks identity fields — but only once they hold a value. Nothing filled
+    // them, so they arrived empty and therefore typeable: a landlord could put
+    // any unit number on a lease drafted for a specific space.
+    //
+    // Every identity fact this document already knows is stamped here, for any
+    // landlord's template that has a box for it. Not overriding anything a
+    // caller passed explicitly — a renewal or a send form still wins.
+    if (opts.unitId) {
+      const ctx = await client.query(
+        `SELECT u.unit_number, p.name AS property_name,
+                CONCAT_WS(', ', p.street1, NULLIF(p.street2,''), p.city, p.state, p.zip) AS property_address,
+                TRIM(CONCAT_WS(' ', lu.first_name, lu.last_name)) AS landlord_name
+           FROM units u
+           JOIN properties p ON p.id = u.property_id
+           LEFT JOIN landlords l ON l.id = u.landlord_id
+           LEFT JOIN users lu ON lu.id = l.user_id
+          WHERE u.id = $1`, [opts.unitId]).then((r: any) => r.rows[0])
+      if (ctx) {
+        const identity: Record<string, string | null> = {
+          unit_number: ctx.unit_number,
+          property_name: ctx.property_name,
+          property_address: ctx.property_address,
+          landlord_name: ctx.landlord_name,
+        }
+        for (const [col, val] of Object.entries(identity)) {
+          if (val && prefillValues[col] == null) prefillValues[col] = String(val)
+        }
+      }
+    }
 
     // S629 (Nic): "link each one in order to the tenant that potentially got
     // the invite. Have it be prefilled so nobody fills it out. I already
@@ -379,6 +414,9 @@ export async function createDocumentRecord(client: any, opts: {
     const rosterNames = TENANT_ORDER
       .map(role => (docSigners as any[]).find((s: any) => s.role === role)?.name)
       .filter(Boolean) as string[]
+    // Taken at invite time, like the names — nobody retypes an address either.
+    const primaryEmail = (docSigners as any[]).find((s: any) => s.role === 'primary')?.email
+    if (primaryEmail && prefillValues.tenant_email == null) prefillValues.tenant_email = primaryEmail
 
     for (const f of tmplFields as any[]) {
       if (f.signer_role && !filledRoles.has(f.signer_role)) continue
