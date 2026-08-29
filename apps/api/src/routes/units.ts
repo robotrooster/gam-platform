@@ -208,7 +208,27 @@ unitsRouter.get('/:id', async (req, res, next) => {
            FROM lease_utility_responsibilities lur
            JOIN leases lz ON lz.id = lur.lease_id
           WHERE lz.unit_id = u.id AND lz.status = 'active'
-            AND lur.tenant_responsible) AS tenant_billed_utilities
+            AND lur.tenant_responsible) AS tenant_billed_utilities,
+        -- S629 (Nic): "when I click on unit 24 to see the unit details, it
+        -- doesn't show me anybody who's pending an invite. If I don't have my
+        -- list in front of me of who I invited to that unit, I wouldn't know."
+        --
+        -- Who was invited, whether they finished setting up their account, and
+        -- whether they have accepted — the three states that explain why a unit
+        -- with invites out still shows no tenant.
+        (SELECT COALESCE(json_agg(json_build_object(
+                  'name', TRIM(COALESCE(iu.first_name,'') || ' ' || COALESCE(iu.last_name,'')),
+                  'email', iu.email,
+                  'invitedAt', pti.created_at,
+                  'acceptedAt', pti.accepted_at,
+                  'accountActivated', iu.password_hash <> '$2b$10$placeholder_invite_pending',
+                  'drafted', pti.draft_document_id IS NOT NULL
+                ) ORDER BY pti.created_at), '[]'::json)
+           FROM pending_tenant_intents pti
+           JOIN tenants it ON it.id = pti.tenant_id
+           JOIN users iu ON iu.id = it.user_id
+          WHERE pti.unit_id = u.id
+            AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL) AS pending_invites
       FROM units u
       LEFT JOIN property_unit_subtypes st ON st.id = u.subtype_id
       JOIN properties p ON p.id = u.property_id

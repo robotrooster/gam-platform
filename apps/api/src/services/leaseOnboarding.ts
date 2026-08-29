@@ -140,11 +140,23 @@ export async function autoDraftLeasesForUnit(
   const drafted: string[] = []
 
   const draftFor = async (members: IntentRow[], title: string) => {
+    // S629 (Nic): ORDER INDEX, explicitly.
+    //
+    // These were left to default, and createDocumentRecord defaults to 1, so
+    // every auto-drafted lease came out with the landlord AND every tenant at
+    // order_index 1. That is the exact tie esign.ts warns about — "a tied
+    // order_index would let a tenant sign in parallel with the landlord" — and
+    // the send-time rule then REFUSES the document: "Landlord must be the first
+    // signer." So the first lease drafted this way could not be sent at all.
+    //
+    // Landlord 1, primary 2, co-tenants 3 upward: the order the document is
+    // actually meant to travel in.
     const tenantSigners = members.slice(0, 4).map((m, i) => ({
       userId: m.user_id,
       role: i === 0 ? 'primary' : CO_TENANT_ROLES[i - 1],
       name: `${m.first_name} ${m.last_name}`.trim(),
       email: m.email,
+      orderIndex: i + 2,
     }))
     // S582: contain a per-group draft failure inside a SAVEPOINT. This is
     // called on the tenant's accept transaction — if createDocumentRecord
@@ -161,7 +173,7 @@ export async function autoDraftLeasesForUnit(
         landlordId: unit.landlord_id, templateId: tmpl.id, unitId, leaseId: null,
         title, basePdfUrl: null, documentType: 'original_lease',
         targetLeaseTenantId: null, promoteLeaseTenantId: null,
-        signers: [landlord, ...tenantSigners],
+        signers: [{ ...landlord, orderIndex: 1 }, ...tenantSigners],
         prefillValues: { ...term },
       })
       await client.query(

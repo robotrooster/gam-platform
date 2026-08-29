@@ -202,13 +202,33 @@ export async function draftPendingForUnitType(args: {
   let scope = ''
   if (propertyId) { params.push(propertyId); scope = ` AND u.property_id = $${params.length}` }
 
+  // S629 (Nic): BOTH invite tables, not one.
+  //
+  // This read pending_lease_drafts only. "New Lease — Invite to Sign" writes
+  // pending_tenant_intents, so a unit invited through that door was invisible
+  // to the retry: Nic set a default template exactly as the notification told
+  // him to, the endpoint reported success, and RV 24 still had no lease
+  // because the retry had looked in the wrong place and found nothing.
+  //
+  // Third time tonight these two tables have diverged — the invite-eligibility
+  // filter and the pending-invite count were the others. Any code that asks
+  // "who is waiting on a lease here" has to ask both.
   const units = await query<{ unit_id: string }>(
-    `SELECT DISTINCT p.unit_id
-       FROM pending_lease_drafts p
-       JOIN units u ON u.id = p.unit_id
-      WHERE p.landlord_id = $1
-        AND p.resolved_at IS NULL
-        AND u.unit_type = $2${scope}`, params)
+    `SELECT DISTINCT unit_id FROM (
+       SELECT p.unit_id, p.landlord_id, u.unit_type, u.property_id
+         FROM pending_lease_drafts p
+         JOIN units u ON u.id = p.unit_id
+        WHERE p.resolved_at IS NULL
+       UNION
+       SELECT pti.unit_id, pti.landlord_id, u2.unit_type, u2.property_id
+         FROM pending_tenant_intents pti
+         JOIN units u2 ON u2.id = pti.unit_id
+        WHERE pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+          AND pti.accepted_at IS NOT NULL
+          AND pti.draft_document_id IS NULL
+     ) AS u
+     WHERE u.landlord_id = $1
+       AND u.unit_type = $2${scope}`, params)
 
   let drafted = 0, skipped = 0
   const skippedUnits: Array<{ unitId: string; unitNumber: string | null; reason: string }> = []
@@ -220,6 +240,33 @@ export async function draftPendingForUnitType(args: {
   }
 
   for (const { unit_id } of units) {
+    // S629: a unit invited through "New Lease — Invite to Sign" has its roster
+    // in pending_tenant_intents, and its drafting rules live in
+    // autoDraftLeasesForUnit — whole-unit waits for everyone to accept,
+    // by-room drafts per person. Re-deriving that here would be a second
+    // implementation of the rule that decides who is on a lease, so the retry
+    // delegates to the same function the accept path uses.
+    const intentWaiting = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
+        WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
+          AND accepted_at IS NOT NULL AND draft_document_id IS NULL`, [unit_id])
+    if (Number(intentWaiting?.n || 0) > 0) {
+      const client = await getClient()
+      try {
+        await client.query('BEGIN')
+        const { autoDraftLeasesForUnit } = await import('./leaseOnboarding')
+        const { createDocumentRecord } = await import('../routes/esign')
+        const out = await autoDraftLeasesForUnit(client as any, unit_id, createDocumentRecord)
+        await client.query('COMMIT')
+        if (out.draftedDocumentIds.length) drafted++
+        else await noteSkip(unit_id, 'Waiting on the rest of the household to accept')
+      } catch (e: any) {
+        await client.query('ROLLBACK').catch(() => {})
+        await noteSkip(unit_id, e?.message || 'Could not draft')
+      } finally { client.release() }
+      continue
+    }
+
     const residents = await query<any>(
       `SELECT us.id AS user_id, us.email, us.phone,
               TRIM(COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) AS name

@@ -539,6 +539,44 @@ export function UnitDetailPage() {
           ) : (
             <div style={{ color: 'var(--text-3)', fontSize: '.875rem', padding: '16px 0' }}>No tenant assigned.</div>
           )}
+
+          {/* S629 (Nic): "it doesn't show me anybody who's pending an invite...
+              if I don't have my list in front of me of who I invited to that
+              unit, I wouldn't know." The lower half of this panel, which is
+              otherwise mostly empty on a unit that has nobody in it yet.
+
+              Each person's state is spelled out because the three of them look
+              identical from here and explain very different things: invited and
+              not started, account made but lease not accepted, and accepted —
+              which is why a unit can have invites out and still say no tenant. */}
+          {(unit.pendingInvites?.length ?? 0) > 0 && (
+            <div style={{ marginTop: unit.tenantFirst ? 18 : 6, borderTop: '1px solid var(--border-0)', paddingTop: 14 }}>
+              <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase',
+                            letterSpacing: '.07em', marginBottom: 10 }}>
+                Invited — {unit.pendingInvites.length} {unit.pendingInvites.length === 1 ? 'person' : 'people'}
+              </div>
+              {unit.pendingInvites.map((p: any, i: number) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between',
+                                      gap: 10, padding: '6px 0' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: '.84rem', color: 'var(--text-1)' }}>{p.name || p.email}</div>
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.email}</div>
+                  </div>
+                  <span className={'badge ' + (p.drafted ? 'badge-green' : p.acceptedAt ? 'badge-green' : p.accountActivated ? 'badge-amber' : 'badge-gray')}
+                        style={{ flexShrink: 0 }}>
+                    {p.drafted ? 'Lease drafted'
+                      : p.acceptedAt ? 'Accepted'
+                      : p.accountActivated ? 'Account set up' : 'Invite sent'}
+                  </span>
+                </div>
+              ))}
+              {unit.pendingInvites.length > 1 && !unit.pendingInvites.every((p: any) => p.acceptedAt) && (
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+                  The lease drafts once everyone here has accepted — one person accepting is not a stall.
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {(unit.unitType === 'mobile_home' || unit.unitType === 'rv_spot') && (

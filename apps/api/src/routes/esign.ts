@@ -1534,7 +1534,36 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose])
-    res.status(201).json({ success: true, data: t })
+
+    // S629 (Nic): "when you add a template for a unit type and there is no
+    // default, it should automatically become the default."
+    //
+    // He invited a household, they accepted, and the lease did not draft —
+    // because a template existed for the unit type but nothing was marked
+    // default. A lone template that is not the default is never what anyone
+    // means: there is nothing for it to be second to. The FIRST one for a
+    // (unit type, property) becomes the default on its own; a later one does
+    // not steal the slot, which is the "ask if you want to supersede it" half
+    // and belongs to the person, not to us.
+    let autoDefaulted = false
+    if (unitType) {
+      const existingDefault = await queryOne<{ id: string }>(
+        `SELECT id FROM lease_templates
+          WHERE landlord_id=$1 AND unit_type=$2 AND property_id IS NOT DISTINCT FROM $3
+            AND is_unit_type_default = TRUE AND is_active <> FALSE AND id <> $4
+          LIMIT 1`,
+        [req.user!.profileId, unitType, propertyId || null, t.id])
+      if (!existingDefault) {
+        await query(`UPDATE lease_templates SET is_unit_type_default=TRUE, updated_at=NOW() WHERE id=$1`, [t.id])
+        t.is_unit_type_default = true
+        autoDefaulted = true
+        // And draft anything that was waiting on exactly this.
+        await draftPendingForUnitType({
+          landlordId: req.user!.profileId, unitType, propertyId: propertyId || null,
+        }).catch(() => null)
+      }
+    }
+    res.status(201).json({ success: true, data: { ...t, autoDefaulted } })
   } catch (e) { next(e) }
 })
 
