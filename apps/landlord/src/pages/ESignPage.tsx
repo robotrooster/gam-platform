@@ -799,6 +799,33 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           {sel && !isLockedLeaseColumn(sel.leaseColumn) && (
             <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
               <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
+              {/* S629 (Nic): "give me a button to just change the role from one
+                  person to the next."
+
+                  Role could only be chosen when a field was CREATED, from the
+                  tool palette. Auto-placement guesses it, and on the Oak Park
+                  RV lease it guessed landlord for everything the TENANT knows —
+                  RV make, model, license, length, width, state of registration,
+                  everyone staying in it. There was no way to correct that: the
+                  only route was delete the box and redraw it by hand, which
+                  defeats the point of auto-placing it.
+
+                  Placed first in the panel because on an auto-placed field it
+                  is the thing most likely to be wrong. */}
+              <div style={{ marginBottom:8 }}>
+                <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Who fills this in</label>
+                <select className="input" value={sel.signerRole || ''}
+                        onChange={e => updateSelected('signerRole', e.target.value)}
+                        style={{ width:'100%', fontSize:'.75rem' }}>
+                  {SIGNER_ROLES.map(role => (
+                    <option key={role} value={role}>{humanize(role)}</option>
+                  ))}
+                </select>
+                <div style={{ display:'flex', alignItems:'center', gap:6, fontSize:'.62rem', color:'var(--text-3)', marginTop:4 }}>
+                  <span style={{ width:9, height:9, borderRadius:3, background:ROLE_COLORS[sel.signerRole]||'#888', flexShrink:0, border:'1px solid rgba(0,0,0,.2)' }} />
+                  Changing this moves the box to that signer — it keeps its position, size and label.
+                </div>
+              </div>
               <div style={{ marginBottom:8 }}>
                 <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Label</label>
                 <input className="input" value={sel.label||''} onChange={e => updateSelected('label', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }} />

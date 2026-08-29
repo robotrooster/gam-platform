@@ -4,6 +4,7 @@ import { Clock, Trash2, Pencil } from 'lucide-react'
 import { apiDelete, apiGet, apiPatch, apiPut } from '../lib/api'
 import { lateFeeStartDate, nextAccrualDate, computeLateFeeAmount } from '@gam/shared'
 import { UNIT_TYPE_LABEL, humanize } from '@gam/shared'
+import { appConfirm } from '../components/dialogs'
 
 const UNIT_TYPE_LABELS: Record<string, string> = UNIT_TYPE_LABEL
 
@@ -68,9 +69,32 @@ export function PropertyLateFeeSection({ property, onSaved }: { property: any; o
         confirm it&apos;s allowed under your local laws.
       </div>
 
+      {/* S629 (Nic): "it appears to be accidentally getting clicked or checked
+          or unchecked at random."
+
+          It was. The whole label was a click target and onChange PATCHed
+          immediately — one stray click silently stopped late fees for every
+          unit type on the property, with no confirmation and no undo, and you
+          would only notice on a refresh some time later.
+
+          Turning it ON stays one click: that is the safe direction, and it
+          charges nobody anything by itself (the per-unit-type rows below still
+          decide the amounts). Turning it OFF now has to be meant — it stops
+          fees for every class of unit here, which is a money decision about
+          every tenant on the property. */}
       <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem', cursor: 'pointer', marginBottom: enabled ? 12 : 0 }}>
         <input type="checkbox" checked={enabled} disabled={toggleMut.isLoading}
-          onChange={e => { setEnabled(e.target.checked); toggleMut.mutate(e.target.checked) }} />
+          onChange={async e => {
+            const on = e.target.checked
+            if (on) { setEnabled(true); toggleMut.mutate(true); return }
+            const sure = await appConfirm(
+              `This stops late fees for EVERY unit type at ${property.name}. Tenants who pay late will ` +
+              'not be charged, on this property only, until you turn it back on. Existing leases keep ' +
+              'whatever their signed document says — this controls what GAM charges going forward.',
+              { title: 'Stop charging late fees here?', confirmLabel: 'Stop late fees', danger: true })
+            if (!sure) { setEnabled(true); return }
+            setEnabled(false); toggleMut.mutate(false)
+          }} />
         Charge late fees at this property
       </label>
       {toggleError && (
