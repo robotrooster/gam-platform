@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import {
   Check, Building2, CreditCard, FileText, User,
@@ -112,6 +112,27 @@ export function OnboardingPage() {
     if (bankReady) setCompleted(prev => new Set([...prev, 2]))
   }, [bankReady])
 
+  // S629: the entity gets its NAME here, at the first moment the landlord
+  // tells us what it is. Everything downstream — the property form's entity
+  // picker, the banking page's "paying out for", the co-owner invitations —
+  // names entities to a person, and a nameless one reads as a system artifact
+  // they did not create and cannot identify.
+  //
+  // Stripe also syncs the legal name back on Connect completion, but that can
+  // be days later or never, and until then the landlord is choosing between
+  // "Unnamed entity" and a property that quietly files itself somewhere.
+  const saveProfileMut = useMutation(
+    () => apiPatch('/landlords/me', { businessName: profile.businessName.trim() }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('landlord-entities')
+        setCompleted(prev => new Set([...prev, 0]))
+        setStep(1)
+      },
+      onError: (e: any) =>
+        setErrors({ businessName: e?.response?.data?.error?.message || 'Could not save that name.' }),
+    })
+
   const addPropertyMut = useMutation(
     (data: any) => apiPost('/properties', data),
     { onSuccess: (r: any) => {
@@ -171,6 +192,12 @@ export function OnboardingPage() {
   const validate = (stepIdx: number) => {
     const errs: Record<string, string> = {}
     if (stepIdx === 0) {
+      // S629 (Nic): "there's no default blank spot." This field was collected
+      // and then thrown away — never validated, never sent — which is where
+      // every blank entity on a self-serve signup came from. The landlord
+      // typed their LLC name on the first screen and the system kept a
+      // nameless one, then offered it back to them as "Unnamed entity".
+      if (!profile.businessName.trim()) errs.businessName = 'Entity name required'
       if (!profile.phone.trim()) errs.phone = 'Phone required'
     }
     if (stepIdx === 1) {
@@ -191,8 +218,7 @@ export function OnboardingPage() {
   const handleNext = () => {
     if (!validate(step)) return
     if (step === 0) {
-      setCompleted(prev => new Set([...prev, 0]))
-      setStep(1)
+      saveProfileMut.mutate()
     } else if (step === 1) {
       addPropertyMut.mutate(property)
     } else if (step === 2) {
@@ -308,10 +334,21 @@ export function OnboardingPage() {
               <div>
                 <div style={{ marginBottom: 14 }}>
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>
-                    Business / Company Name <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional)</span>
+                    Entity Name
                   </label>
                   <input className="input" placeholder="Smith Properties LLC" value={profile.businessName} onChange={e => setProfile(p => ({ ...p, businessName: e.target.value }))} style={{ width: '100%' }} />
-                  <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>If you own property as an LLC, partnership, or trust, enter that name here.</div>
+                  {/* S629: was "(optional)", so anyone operating in their own
+                      name left it blank and got a nameless entity they never
+                      asked for. Required now, and the copy says what to put
+                      when there is no LLC — the honest answer is their name. */}
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4 }}>
+                    The LLC, partnership, or trust that owns the property. If you own it in your own
+                    name, use your name — you can add more entities later, and each one keeps its own
+                    bank account.
+                  </div>
+                  {errors.businessName && (
+                    <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.businessName}</div>
+                  )}
                 </div>
 
                 <div style={{ marginBottom: 14 }}>
