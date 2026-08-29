@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
-import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
+import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 // S526: PropertyFeeScheduleSection RETIRED — fees are charged per tenant's
@@ -117,9 +117,17 @@ export function PropertyDetailPage() {
             </div>
           </div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAddUnit(true)}>
-          <Plus size={15} /> Add Unit
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {/* S629 (Nic): "when I click into a property and then click to invite
+              people, it should only be showing me this page but scoped to that
+              property." The bulk invite page opens filtered to this property. */}
+          <button className="btn btn-ghost" onClick={() => navigate(`/tenant-onboarding?property=${id}`)}>
+            <UserPlus size={15} /> Invite Tenants
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowAddUnit(true)}>
+            <Plus size={15} /> Add Unit
+          </button>
+        </div>
       </div>
 
       {/* S486: state-law warnings recomputed against the persisted

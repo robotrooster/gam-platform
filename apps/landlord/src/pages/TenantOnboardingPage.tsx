@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from 'react'
+import { useState, useRef, useMemo, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
@@ -134,7 +134,8 @@ export function TenantOnboardingPage() {
   // clicking "Invite to sign a lease" ON a unit, is a step backwards.
   const [sp] = useSearchParams()
   const deepLinkUnit = sp.get('unit') ?? ''
-  const [mode, setMode] = useState<Mode>(deepLinkUnit ? 'new_lease' : 'choose')
+  const deepLinkProperty = sp.get('property') ?? ''
+  const [mode, setMode] = useState<Mode>(deepLinkUnit || deepLinkProperty ? 'new_lease' : 'choose')
   const navigate = useNavigate()
 
   // Static pending count for the third mode card. staleTime 30s — mode picker
@@ -223,7 +224,7 @@ export function TenantOnboardingPage() {
 
       {mode === 'bulk' && <BulkCsvMode onBack={() => setMode('choose')} />}
 
-      {mode === 'new_lease' && <NewLeaseInviteMode onBack={() => setMode('choose')} initialUnitId={deepLinkUnit} />}
+      {mode === 'new_lease' && <NewLeaseInviteMode onBack={() => setMode('choose')} initialUnitId={deepLinkUnit} initialPropertyId={deepLinkProperty} />}
 
       {mode === 'single' && (
         <SingleTenantMode
@@ -259,11 +260,34 @@ const blankPerson = (): Person => ({ firstName: '', lastName: '', email: '', pho
  * Rosters live HERE rather than inside each card, because one send button has
  * to see all of them.
  */
-function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void; initialUnitId?: string }) {
+function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = '' }: {
+  onBack: () => void; initialUnitId?: string; initialPropertyId?: string
+}) {
   const qc = useQueryClient()
   const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
-  const selectable = (allUnits as any[]).filter(canInviteToUnit)
-  const hiddenReasons = hiddenUnitReasons(allUnits as any[])
+
+  // S629 (Nic): "it needs to be filtered per property... otherwise you're gonna
+  // be scrolling down forever when you are onboarding lots of properties."
+  //
+  // One property at a time. Coming from a property or from one of its units
+  // scopes it automatically; otherwise you pick, and a landlord with a single
+  // property never sees the question.
+  const properties = Array.from(
+    new Map((allUnits as any[]).map(u => [u.propertyId, u.propertyName])).entries())
+    .map(([id, name]) => ({ id, name: String(name) }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  const unitProperty = initialUnitId
+    ? (allUnits as any[]).find(u => u.id === initialUnitId)?.propertyId ?? ''
+    : ''
+  const [propertyId, setPropertyId] = useState(initialPropertyId || unitProperty)
+  useEffect(() => {
+    if (!propertyId && properties.length === 1) setPropertyId(properties[0].id)
+    else if (!propertyId && unitProperty) setPropertyId(unitProperty)
+  }, [properties.length, unitProperty])
+
+  const inProperty = (allUnits as any[]).filter(u => u.propertyId === propertyId)
+  const selectable = inProperty.filter(canInviteToUnit)
+  const hiddenReasons = hiddenUnitReasons(inProperty)
 
   const [rosters, setRosters] = useState<Record<string, Person[]>>({})
   const [attest, setAttest] = useState<Record<string, boolean>>({})
@@ -343,7 +367,7 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
   // page that does not contain it is worse than showing it. Everything else
   // obeys the eligibility rule.
   const deepLinked = initialUnitId
-    ? (allUnits as any[]).filter(u => u.id === initialUnitId && !selectable.some(s => s.id === u.id))
+    ? inProperty.filter(u => u.id === initialUnitId && !selectable.some(s => s.id === u.id))
     : []
   const remaining = [...deepLinked, ...selectable].filter(u => !sent[u.id])
   const byProperty = remaining.reduce((acc: Record<string, any[]>, u: any) => {
@@ -364,6 +388,24 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
         </p>
       </div>
 
+      {properties.length > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+          <label className="form-label" style={{ margin: 0, fontSize: '.72rem' }}>Property</label>
+          <select className="input" style={{ width: 'auto', minWidth: 260 }}
+                  value={propertyId} onChange={e => setPropertyId(e.target.value)}>
+            <option value="">Choose a property…</option>
+            {properties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>One property at a time.</span>
+        </div>
+      )}
+
+      {!propertyId ? (
+        <div className="card" style={{ padding: 28, textAlign: 'center', color: 'var(--text-2)', fontSize: '.85rem' }}>
+          Pick a property to see its units.
+        </div>
+      ) : (
+      <>
       {sentUnitCount > 0 && (
         <div style={{ background: 'rgba(38,167,90,.08)', border: '1px solid rgba(38,167,90,.3)', borderRadius: 8,
                       padding: '10px 14px', marginBottom: 14, fontSize: '.8rem', color: 'var(--text-1)' }}>
@@ -432,6 +474,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '' }: { onBack: () => void
             )}
           </div>
         </>
+      )}
+      </>
       )}
     </div>
   )
