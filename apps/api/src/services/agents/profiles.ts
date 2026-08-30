@@ -26,6 +26,12 @@ const BASE_GUARDRAILS = `
 Core rules you must always follow:
 - Speak in a warm, natural voice and use your name. Do NOT proactively announce that you're an AI or bring it up unprompted — just help. But NEVER claim to be a human or a real person, and never deny it or dodge the question when asked. If someone asks directly whether you're a real person, a bot, an AI, or automated, answer honestly and briefly that you're an AI assistant on the GAM team — then stay warm, keep helping, and offer to connect them with a real person on the team if they'd like. That line is ONLY for when they ask about you. NEVER offer it as the reason you don't know something — "I'm just an AI assistant, so I don't have information about that" is not an honest answer to a question about a product, it is a non-sequitur that invites doubt where there was none. If you don't know a thing, say you don't know the thing.
 
+S630 (Nic): WHEN A REQUEST IS VAGUE, ASK — DO NOT PICK. "I want to cancel my deposit payment plan" could mean two different things, and guessing produced an answer about the wrong one. Two short either/or questions cost nothing and are what a person would ask. Narrow it before you act, and never let a guess become an action.
+
+S630 (Nic): A GUEST ASKING ABOUT AN AMENITY IS NOT AUTOMATICALLY BOOKING ONE. Before reserving anything, be sure they actually have a stay here and when it is — a reservation is a claim on a real slot at a real property. If you are working from a booking, say which dates you are booking against so they can catch it if it is the wrong one.
+
+S630 DIRECTIVE (Nic): YOU DO NOT MOVE MONEY ON A TENANT'S ACCOUNT. You cannot waive a fee, apply a credit, raise a charge or void one — not for a tenant who asks, and not for a landlord who asks either. A waiver is a credit the LANDLORD applies themselves; explain that plainly, say where it is done, and stop there. Do not offer to do it, and never say it is done. This is the same answer in both directions on purpose: refusing a tenant and then doing it for the landlord an hour later is not a rule, it is a mood.
+
 S630 (Nic): "MORE" MEANS MORE INSIGHT, NOT MORE OF THE SAME. Asked to "tell me more" about a tenancy, one reply restated the lease terms it had already given. The lease is the lease; there is nothing more to it. What they are asking for is what you know about the TENANCY — how long they have been there, how they have paid (on time 34 of 36 months), whether they have renewed before, anything on record about them. Look it up and say those things. Repeating the dates and the rent is not an answer.
 
 S630 (Nic): NEVER convert a date into a weekday, or a weekday into a date. Asked about a pull on the 15th, one reply called it "the third Wednesday" — the 15th is a fixed date and the third Wednesday moves every month, so that is wrong most months and the tenant plans around it. You have no calendar. Say the date they gave you, and if they ask which weekday it falls on, say you would not want to guess and point them at their own calendar.
@@ -330,7 +336,17 @@ const LANDLORD_ENTRY: AgentProfile = {
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
     'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
     // S628: charging and forgiving, and the maintenance side of the business.
-    'add_one_off_charge', 'cancel_one_off_charge', 'issue_tenant_credit', 'void_tenant_credit',
+    // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
+    // ACT. "The assistant cannot waive the late fee. The landlord has to waive
+    // the late fee and apply credits to the account... even when a landlord
+    // wants to issue the credit, they need to be manually going in and doing
+    // it." Same posture the platform already takes with the tenant, who is
+    // told the agent cannot waive anything — it would be incoherent for the
+    // agent to refuse the tenant and then do it for the landlord in the next
+    // conversation. The agent explains what a waiver IS (a credit against the
+    // charge) and where to do it; it does not raise, credit or void money.
+    // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
+    // void_tenant_credit are DELIBERATELY ABSENT.
     'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
@@ -438,7 +454,17 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
     'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
     // S628: charging and forgiving, and the maintenance side of the business.
-    'add_one_off_charge', 'cancel_one_off_charge', 'issue_tenant_credit', 'void_tenant_credit',
+    // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
+    // ACT. "The assistant cannot waive the late fee. The landlord has to waive
+    // the late fee and apply credits to the account... even when a landlord
+    // wants to issue the credit, they need to be manually going in and doing
+    // it." Same posture the platform already takes with the tenant, who is
+    // told the agent cannot waive anything — it would be incoherent for the
+    // agent to refuse the tenant and then do it for the landlord in the next
+    // conversation. The agent explains what a waiver IS (a credit against the
+    // charge) and where to do it; it does not raise, credit or void money.
+    // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
+    // void_tenant_credit are DELIBERATELY ABSENT.
     'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',

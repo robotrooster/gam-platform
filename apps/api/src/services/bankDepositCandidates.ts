@@ -98,6 +98,59 @@ export async function candidatesForDeposit(
 }
 
 /**
+ * S630 (Nic): "it should first try to match Stripe deposits... if a deposit went
+ * into the landlord's bank account on a certain day, that means that money came
+ * from probably Stripe or a card payment, which means that there is a link to
+ * who supplied those monies."
+ *
+ * The shortlist above is built from what is still UNPAID, which is why an
+ * unplaceable $1,300 came back as "doesn't match any pending rent charges" — of
+ * course it doesn't. Money that has already landed in the bank came from
+ * payments that already SETTLED and were paid out, and those carry a Stripe
+ * reference and a payer.
+ *
+ * So this looks the other way: settled rent around the same date, who paid it,
+ * and whether any single one is the deposit exactly. It answers "who sent me
+ * this" rather than "what could I apply it to".
+ */
+export interface SettledPayer {
+  tenantName: string; unitNumber: string | null
+  amount: number; settledAt: string | null
+  viaStripe: boolean
+}
+
+export async function settledPayersAround(
+  landlordId: string, postedDate: string, amount: number, windowDays = 6,
+): Promise<{ exact: SettledPayer[]; nearby: SettledPayer[] }> {
+  const rows = await query<any>(
+    `SELECT p.amount::float AS amount,
+            to_char(p.settled_at,'YYYY-MM-DD') AS settled_at,
+            (p.stripe_payment_intent_id IS NOT NULL OR p.stripe_charge_id IS NOT NULL) AS via_stripe,
+            u.unit_number,
+            TRIM(COALESCE(usr.first_name,'') || ' ' || COALESCE(usr.last_name,'')) AS tenant_name
+       FROM payments p
+       JOIN units u ON u.id = p.unit_id
+       JOIN tenants t ON t.id = p.tenant_id
+       JOIN users usr ON usr.id = t.user_id
+      WHERE p.landlord_id = $1
+        AND p.status = 'settled'
+        AND p.settled_at IS NOT NULL
+        AND p.settled_at >= ($2::date - ($3 || ' days')::interval)
+        AND p.settled_at <= ($2::date + ($3 || ' days')::interval)
+      ORDER BY p.settled_at DESC`,
+    [landlordId, postedDate, windowDays])
+  const all: SettledPayer[] = rows.map((r: any) => ({
+    tenantName: r.tenant_name || 'Tenant', unitNumber: r.unit_number ?? null,
+    amount: Number(r.amount), settledAt: r.settled_at ?? null, viaStripe: !!r.via_stripe,
+  }))
+  const cents = (n: number) => Math.round(n * 100)
+  return {
+    exact: all.filter((p) => cents(p.amount) === cents(amount)),
+    nearby: all.filter((p) => cents(p.amount) !== cents(amount)).slice(0, 12),
+  }
+}
+
+/**
  * Every unmatched inbound deposit for a landlord, each with its shortlist.
  *
  * Bounded: a landlord returning after months away has a long feed, and building

@@ -21,7 +21,7 @@
 
 import { query } from '../../../db'
 import { cashBankingPosition } from '../../cashBankingControl'
-import { unmatchedDepositsWithCandidates } from '../../bankDepositCandidates'
+import { unmatchedDepositsWithCandidates, settledPayersAround } from '../../bankDepositCandidates'
 import type { AgentTool, AgentActor } from './types'
 
 export const getUnreconciledCash: AgentTool = {
@@ -67,15 +67,37 @@ export const getUnreconciledCash: AgentTool = {
       bankConnected: true,
       depositsAwaitingMatch: deposits.deposits.length,
       depositsNotListed: deposits.remaining,
-      deposits: deposits.deposits.slice(0, 10).map(d => ({
-        amount: d.amount,
-        postedDate: d.postedDate,
-        // The top candidates only — a shortlist is for a screen, not a sentence.
-        likelyFrom: d.candidates.slice(0, 3).map(c => ({
-          tenant: c.tenantName, unit: c.unitNumber, why: c.reason,
-        })),
-        needsAPersonToChoose: d.candidates.length > 1,
+      deposits: await Promise.all(deposits.deposits.slice(0, 10).map(async d => {
+        // S630 (Nic): the shortlist above is built from what is still UNPAID, so
+        // an unplaceable deposit came back as "doesn't match any pending rent
+        // charges" — of course it didn't. Money already in the bank came from
+        // payments that already SETTLED, and those name a payer.
+        const settled = await settledPayersAround(actor.profileId, d.postedDate, d.amount)
+        return {
+          amount: d.amount,
+          postedDate: d.postedDate,
+          // The top candidates only — a shortlist is for a screen, not a sentence.
+          likelyFrom: d.candidates.slice(0, 3).map(c => ({
+            tenant: c.tenantName, unit: c.unitNumber, why: c.reason,
+          })),
+          needsAPersonToChoose: d.candidates.length > 1,
+          // Who actually sent money around that date, which is a different
+          // question from what it could be applied to.
+          paidByExactly: settled.exact.map(p => ({
+            tenant: p.tenantName, unit: p.unitNumber, amount: p.amount,
+            settledOn: p.settledAt, throughStripe: p.viaStripe,
+          })),
+          otherSettledNearby: settled.nearby.slice(0, 6).map(p => ({
+            tenant: p.tenantName, unit: p.unitNumber, amount: p.amount, settledOn: p.settledAt,
+          })),
+        }
       })),
+      matchingNote:
+        'Look at paidByExactly FIRST — a settled payment for the same amount around the same date is ' +
+        'almost certainly this deposit, and it names who sent it. otherSettledNearby is who else paid ' +
+        'around then, in case one deposit covers several. Only fall back to likelyFrom (what is still ' +
+        'unpaid) when nothing settled fits. Never tell a landlord a deposit matches nothing without ' +
+        'having looked at who actually paid.',
       collectedNotBanked: {
         count: position.unbanked.length,
         total: position.unbankedTotal,

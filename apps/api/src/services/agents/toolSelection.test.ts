@@ -22,13 +22,11 @@ const ALL = getToolsForProfile(landlord)
 
 /** What the person said, and the action that has to survive selection. */
 const CASES: [string, string][] = [
-  ['can you waive the late fee on 204?',                'issue_tenant_credit'],
   ['add 12 RV spots to sunset palms',                   'add_units'],
   ['the roofer sent a $4,200 invoice due the 15th',     'record_bill'],
   ['run the water bills for march',                     'generate_utility_bills'],
   ["I'm starting an eviction on spot 7",                'set_eviction_mode'],
   ['send an invite to nadia for 204',                   'invite_tenant'],
-  ['charge apt 204 $120 for the screen door',           'add_one_off_charge'],
   ['put spot 12 up to $520 from march',                 'draft_terms_addendum'],
   ['the alvarez family have lived in 12 for years',     'migrate_existing_tenant'],
   ['pets are $300 at sunset palms',                     'set_property_fee'],
@@ -100,12 +98,33 @@ describe('the tools for this turn', () => {
 
   it('a clear change of subject is not overruled by what came before', () => {
     // Carried context is scored at HALF weight for this reason. A landlord who
-    // was talking about utilities and then asks to waive a late fee must get
-    // the credit tool, not last turn's meters.
-    const sel = selectToolsForTurn(landlord, ALL, 'waive the late fee on 204', {
+    // was talking about utilities and then asks about a late fee must get the
+    // late-fee surface, not last turn's meters.
+    const sel = selectToolsForTurn(landlord, ALL, 'what is the late fee on 204', {
       previousMessage: 'run the water bills for march',
     })
-    expect(sel.tools.map((t) => t.name)).toContain('issue_tenant_credit')
+    // Asserting what IS reached, not what is excluded — the selection keeps a
+    // wide pool, so absence is a weak signal and presence is the real one.
+    const names = sel.tools.map((t) => t.name)
+    expect(names.some((n) => /late_payment|payment_status|unit_lease/.test(n))).toBe(true)
+  })
+
+  // S630 DIRECTIVE (Nic): "The assistant cannot waive the late fee. The landlord
+  // has to waive the late fee and apply credits to the account... even when a
+  // landlord wants to issue the credit, they need to be manually going in and
+  // doing it." The agent explains what a waiver is and where; it does not do it.
+  // Refusing a tenant and then doing the same thing for the landlord an hour
+  // later is not a rule, so these must stay out of reach on BOTH sides.
+  it('never puts money-moving actions in reach, however it is asked', () => {
+    const banned = ['issue_tenant_credit', 'void_tenant_credit',
+                    'add_one_off_charge', 'cancel_one_off_charge']
+    for (const m of ['can you waive the late fee on 204?',
+                     'waive it, they called me about it',
+                     'charge apt 204 $120 for the screen door',
+                     'credit bob $50 for the hot water']) {
+      const names = selectToolsForTurn(landlord, ALL, m, {}).tools.map((t) => t.name)
+      for (const b of banned) expect(names, `${m} → ${b}`).not.toContain(b)
+    }
   })
 
   it('leaves a small profile completely alone', () => {

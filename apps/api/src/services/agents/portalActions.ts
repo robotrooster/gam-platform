@@ -3537,6 +3537,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Bring a tenant who is ALREADY LIVING THERE onto the platform, with the lease they already ' +
       'signed on paper. Use for "the Alvarez family are in 12, their lease runs to next March, rent ' +
       'is $650".\n' +
+      'S630 (Nic): DO NOT PROMISE THAT THE INVITE FINISHES THIS. It creates the account and the lease TERMS from what they tell you, and that is all — the signed lease DOCUMENT is not in GAM until the landlord uploads a scan of the one in their folder, or sends the tenant a digital one to sign (their existing template is fine, same terms). Say that plainly as the next step, in the same breath as the invite. Telling a landlord their four-year tenant is onboarded when no lease document exists is how they find out at the worst possible moment.' +
       'This creates the tenant AND an imported lease from the terms they give you, and emails the ' +
       'person an activation link. No background check and no application — they already live there.\n' +
       'THE TERMS COME FROM THE PAPER LEASE, not from you. Rent, dates, deposit, late-fee terms: read ' +
@@ -3550,7 +3551,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       lastName: { type: 'string', description: 'Their last name.' },
       email: { type: 'string', description: 'Their email. Read it back — a typo goes to a stranger.' },
       phone: { type: 'string', description: 'Their phone number.' },
-      unitId: { type: 'string', description: 'The unit they live in, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit they live in — the unit NUMBER is fine ("12", "RV 07"). Never ask the landlord for an id.' },
       leaseStart: { type: 'string', description: 'When the existing lease started, YYYY-MM-DD.' },
       leaseEnd: { type: 'string', description: 'When it ends, YYYY-MM-DD. Leave out for month-to-month.' },
       monthlyRent: { type: 'number', description: 'The rent on the signed lease.' },

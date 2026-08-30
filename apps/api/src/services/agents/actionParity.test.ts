@@ -109,6 +109,15 @@ describe('action parity — what a person can do, the agent should be able to do
     // reason it is not — a signature, a file, a credential, a permission, or
     // another product's surface.
     // Raise as capability lands; never lower.
-    expect(writes.size).toBeGreaterThanOrEqual(237)
+    // S630 DIRECTIVE (Nic): 237 → 233. FOUR actions were deliberately taken AWAY
+    // from the agent, not lost — add_one_off_charge, cancel_one_off_charge,
+    // issue_tenant_credit, void_tenant_credit. "The assistant cannot waive the
+    // late fee. The landlord has to waive the late fee and apply credits to the
+    // account... even when a landlord wants to issue the credit, they need to be
+    // manually going in and doing it."
+    //
+    // The ratchet is doing its job by making this visible: it must only ever move
+    // down for a stated reason, never because something quietly stopped working.
+    expect(writes.size).toBeGreaterThanOrEqual(233)
   })
 })

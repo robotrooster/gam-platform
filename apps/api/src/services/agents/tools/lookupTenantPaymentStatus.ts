@@ -285,6 +285,18 @@ export const lookupTenantPaymentStatus: AgentTool = {
       // Already paid, still clearing. NOT part of the balance above.
       inFlight: Number(flight[0]?.in_flight ?? 0),
       recentPayments: recent.map((r) => ({ type: r.type, amount: Number(r.amount), status: r.status, dueDate: r.due_date })),
+      // S630 (Nic): "in June, he tried to pay a $750 ACH, and it failed. Current
+      // attempt would need to be the full amount." A failed attempt is a
+      // historical figure — it was the whole balance on the day it was tried,
+      // and it is not what they would pay now. Reporting "$750 was returned"
+      // beside a $2,330 balance, with nothing to separate them, reads as though
+      // $750 is still the number, and rent is pay-in-full so it never is.
+      recentPaymentsNote:
+        'These are HISTORICAL attempts. Each amount was what was owed on that date, not what is ' +
+        'owed now. When you mention a failed or returned payment, say WHEN it was and that it was ' +
+        'the balance at the time — then give the CURRENT outstanding figure separately and say ' +
+        'that is what a payment today would have to cover. Rent is paid in full, so a fresh ' +
+        'attempt is always the whole outstanding amount, never the old one.',
     }
   },
 }
