@@ -136,7 +136,7 @@ describe('namesNotInToolResults — field labels are not invented records (S617)
 // firing on ordinary good service, and when it fires it REPLACES the reply with
 // escalation boilerplate — so a correct answer was being deleted.
 // ============================================================
-import { promisesHandoff } from './agentRunner'
+import { promisesHandoff, ACTION_REQUEST } from './agentRunner'
 
 describe('promisesHandoff — offers vs actual handoffs (S617)', () => {
   it('does NOT fire on the real reply that was being thrown away', () => {
@@ -490,5 +490,33 @@ describe('demandsAToolCall — per audience', () => {
       expect(demandsAToolCall('hi', a), a).toBe(false)
       expect(demandsAToolCall('thanks', a), a).toBe(false)
     }
+  })
+})
+
+// S630: both landlord action conversations failed into the "figure" fallback —
+// a landlord who said "yes, waive it" and "yes, turn it on" was answered with
+// "I don't want to give you a figure I haven't actually checked". Nobody asked
+// for a figure. A numbers reply to an action request reads as having lost the
+// thread, and the older action fallback told a LANDLORD it would pass the matter
+// "to your landlord".
+describe('S630 — the fallback matches what was actually asked', () => {
+  it('reads confirmations and imperatives as action requests', () => {
+    for (const m of [
+      'yes, waive it — they called me about it and I said I would',
+      'yes, turn it on',
+      'go ahead and cancel that charge',
+      'please do it',
+      'refund the deposit',
+      "I'm starting an eviction on spot 7",
+    ]) expect(ACTION_REQUEST.test(m)).toBe(true)
+  })
+
+  it('does not mistake a plain question for an action request', () => {
+    for (const m of [
+      'what do I owe right now?',
+      "how many units are vacant?",
+      'when does the lease end?',
+      'what is the late fee on 204?',
+    ]) expect(ACTION_REQUEST.test(m)).toBe(false)
   })
 })

@@ -903,8 +903,36 @@ function cannotSee(audience: string): string {
  * action did not happen and asks for the detail needed to take it — the
  * opposite of quietly closing the ticket with a lie.
  */
-function couldNotDoIt(): string {
+function couldNotDoIt(audience: string): string {
+  // S630: this told a LANDLORD "I'll pass it to your landlord". They are the
+  // landlord. The handoff only exists on the tenant side.
+  if (audience === 'landlord' || audience === 'pm_company') {
+    return "I haven't actually done that yet — I don't want to say it's done when it isn't. Tell me which unit or tenant you mean and I'll take care of it."
+  }
   return "I haven't got that written down yet — tell me a bit more about what's happening and who it involves, and I'll pass it to your landlord."
+}
+
+/**
+ * S630: what to say when the user asked for something to be DONE and no tool
+ * ran.
+ *
+ * Both landlord action conversations failed into cannotSee(), which answers
+ * "I don't want to give you a figure I haven't actually checked" — to a landlord
+ * who had just said "yes, waive it" and "yes, turn it on". Nobody asked for a
+ * figure. A reply about numbers, to a request for an action, reads as the
+ * assistant having lost the thread entirely.
+ *
+ * The honest thing is to say it did not happen and ask for the one detail that
+ * would let it happen. It must never imply the action was taken.
+ */
+export const ACTION_REQUEST =
+  /\b(waive|waiv(e|ing)|cancel|refund|credit|evict(ion|ing)?|approve|deny|assign|schedule|charge|enable|disable|terminate|renew|file|send)\b|\bturn\s+(it|that|this)?\s*(on|off)\b|\b(go ahead|do it|please do)\b|^\s*yes\b/i
+
+function couldNotAct(audience: string): string {
+  if (audience === 'landlord' || audience === 'pm_company') {
+    return "I haven't done that — I won't change anything until I'm certain which unit or tenant you mean. Say which one and I'll do it right now."
+  }
+  return "I haven't done that yet. Tell me which unit or which charge you mean and I'll get it moving."
 }
 
 /** Distinct tool executions allowed inside ONE model turn. See the loop below. */
@@ -1594,7 +1622,11 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         logger.error({ profile: profile.id, message, claimedAnAction: lied },
           'agent runner: no tool call after a retry — reply stated, promised or CLAIMED something it never did; suppressed')
         return {
-          reply: lied ? couldNotDoIt() : cannotSee(String((actor as any).role ?? '')),
+          reply: lied
+            ? couldNotDoIt(String((actor as any).role ?? ''))
+            : (ACTION_REQUEST.test(message)
+                ? couldNotAct(String((actor as any).role ?? ''))
+                : cannotSee(String((actor as any).role ?? ''))),
           model, retrieved, grounded, toolInvocations, usage,
         }
       }
@@ -1734,7 +1766,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         // Asked once, declined. This does not go out.
         logger.error({ profile: profile.id, message },
           'agent runner: claimed a completed action twice with no action behind it — suppressed')
-        return { reply: couldNotDoIt(), model, retrieved, grounded, toolInvocations, usage }
+        return { reply: couldNotDoIt(String((actor as any).role ?? '')), model, retrieved, grounded, toolInvocations, usage }
       }
       // S626: a sales turn that offered or confirmed a TIME without ever opening
       // the calendar. See OFFERS_A_MEETING_TIME. Prospect only — no other
@@ -2096,7 +2128,11 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     const lied = claimsAnActionItNeverTook(reply)
     logger.error({ profile: profile.id, message, claimedAnAction: lied },
       'agent runner: step ceiling produced figures, a promise, or a claim with nothing behind it — suppressed')
-    reply = lied ? couldNotDoIt() : cannotSee(String((actor as any).role ?? ''))
+    reply = lied
+      ? couldNotDoIt(String((actor as any).role ?? ''))
+      : (ACTION_REQUEST.test(message)
+          ? couldNotAct(String((actor as any).role ?? ''))
+          : cannotSee(String((actor as any).role ?? '')))
   }
 
   // S618: and the same at the ceiling. Where it is NOT a money problem, any
