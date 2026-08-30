@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict lqbWY7VdQQUOm14mtvPF2HgAdEe8NmtmtRQBIFPhylKb4v0NyHaYLvZANLf7PbM
+\restrict Un3yFBhusRBLhaATERdtxmjHhtcS27qodyOggbgbVL0pfT4pouaSx4zfdFiVtKn
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8856,6 +8856,17 @@ CREATE TABLE public.unit_photos (
 
 
 --
+-- Name: unit_subtype_links; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_subtype_links (
+    unit_id uuid NOT NULL,
+    subtype_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: units; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -8930,6 +8941,13 @@ CREATE TABLE public.units (
 --
 
 COMMENT ON COLUMN public.units.status IS 'S614: adds ''utility_service'' — a space this landlord bills utilities for but does not own or lease (next door, cross-property). Never rentable, never listed, never bookable; it exists to hold meter assignments and a payer.';
+
+
+--
+-- Name: COLUMN units.subtype_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.subtype_id IS 'LEGACY single subtype. Source of truth is unit_subtype_links (a unit holds many). Kept in step as the first link for readers not yet migrated.';
 
 
 --
@@ -12761,6 +12779,14 @@ ALTER TABLE ONLY public.unit_photos
 
 
 --
+-- Name: unit_subtype_links unit_subtype_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_subtype_links
+    ADD CONSTRAINT unit_subtype_links_pkey PRIMARY KEY (unit_id, subtype_id);
+
+
+--
 -- Name: units units_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16589,6 +16615,13 @@ CREATE INDEX idx_unit_inspections_unit ON public.unit_inspections USING btree (u
 --
 
 CREATE INDEX idx_unit_photos_unit ON public.unit_photos USING btree (unit_id);
+
+
+--
+-- Name: idx_unit_subtype_links_subtype; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_subtype_links_subtype ON public.unit_subtype_links USING btree (subtype_id);
 
 
 --
@@ -24324,6 +24357,22 @@ ALTER TABLE ONLY public.unit_photos
 
 
 --
+-- Name: unit_subtype_links unit_subtype_links_subtype_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_subtype_links
+    ADD CONSTRAINT unit_subtype_links_subtype_id_fkey FOREIGN KEY (subtype_id) REFERENCES public.property_unit_subtypes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_subtype_links unit_subtype_links_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_subtype_links
+    ADD CONSTRAINT unit_subtype_links_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: units units_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24751,5 +24800,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict lqbWY7VdQQUOm14mtvPF2HgAdEe8NmtmtRQBIFPhylKb4v0NyHaYLvZANLf7PbM
+\unrestrict Un3yFBhusRBLhaATERdtxmjHhtcS27qodyOggbgbVL0pfT4pouaSx4zfdFiVtKn
 

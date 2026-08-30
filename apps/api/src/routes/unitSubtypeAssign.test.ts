@@ -55,8 +55,57 @@ describe('POST /api/units/subtype', () => {
     const res = await post({ unitIds: [rvA, rvB], subtypeId: rvSub })
     expect(res.status).toBe(200)
     expect(res.body.data.updated).toBe(2)
-    const rows = await db.query<any>(`SELECT count(*)::int AS n FROM units WHERE subtype_id=$1`, [rvSub])
+    const rows = await db.query<any>(
+      `SELECT count(*)::int AS n FROM unit_subtype_links WHERE subtype_id=$1`, [rvSub])
     expect(rows.rows[0].n).toBe(2)
+  })
+
+  // S630 DIRECTIVE (Nic): "Units need to be able to handle multiple subtypes as a
+  // checkbox... it's not having back in fifty and back in thirty as two separate
+  // things. Each distinct categorization is selectable without being bundled."
+  it('holds several independent subtypes at once', async () => {
+    const c = await db.connect()
+    let amp50 = ''
+    try {
+      amp50 = (await c.query(
+        `INSERT INTO property_unit_subtypes (property_id, unit_type, name)
+         VALUES ($1,'rv_spot','50 Amp') RETURNING id`, [propId])).rows[0].id
+    } finally { c.release() }
+
+    const res = await post({ unitIds: [rvA], subtypeIds: [rvSub, amp50] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.subtypes.sort()).toEqual(['50 Amp', 'Pull-Through'])
+
+    const links = await db.query<any>(
+      `SELECT s.name FROM unit_subtype_links l
+         JOIN property_unit_subtypes s ON s.id=l.subtype_id
+        WHERE l.unit_id=$1 ORDER BY s.name`, [rvA])
+    expect(links.rows.map((r: any) => r.name)).toEqual(['50 Amp', 'Pull-Through'])
+  })
+
+  it('REPLACES the set — unchecking one is expressed by leaving it out', async () => {
+    const c = await db.connect()
+    let amp50 = ''
+    try {
+      amp50 = (await c.query(
+        `INSERT INTO property_unit_subtypes (property_id, unit_type, name)
+         VALUES ($1,'rv_spot','50 Amp') RETURNING id`, [propId])).rows[0].id
+    } finally { c.release() }
+
+    await post({ unitIds: [rvA], subtypeIds: [rvSub, amp50] })
+    await post({ unitIds: [rvA], subtypeIds: [amp50] })
+    const links = await db.query<any>(
+      `SELECT s.name FROM unit_subtype_links l
+         JOIN property_unit_subtypes s ON s.id=l.subtype_id WHERE l.unit_id=$1`, [rvA])
+    expect(links.rows.map((r: any) => r.name)).toEqual(['50 Amp'])
+  })
+
+  it('clears every subtype when passed an empty list', async () => {
+    await post({ unitIds: [rvA], subtypeIds: [rvSub] })
+    const res = await post({ unitIds: [rvA], subtypeIds: [] })
+    expect(res.status).toBe(200)
+    const links = await db.query(`SELECT 1 FROM unit_subtype_links WHERE unit_id=$1`, [rvA])
+    expect(links.rows).toHaveLength(0)
   })
 
   it('clears a subtype when passed null', async () => {
@@ -73,7 +122,7 @@ describe('POST /api/units/subtype', () => {
     const res = await post({ unitIds: [rvA, home], subtypeId: rvSub })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/Nothing was changed/i)
-    const rows = await db.query<any>(`SELECT count(*)::int AS n FROM units WHERE subtype_id IS NOT NULL`)
+    const rows = await db.query<any>(`SELECT count(*)::int AS n FROM unit_subtype_links`)
     expect(rows.rows[0].n).toBe(0)
   })
 

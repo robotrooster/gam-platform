@@ -37,7 +37,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     // RV 1-3, apartments 4-5, motel 6-12, apartments 13-19, then RV 20-36 — the
     // second RV block can't be made by "continue after the highest".
     unitType:         'apartment' as UnitType,
-    subtypeId:        '',
+    subtypeIds:       [] as string[],
     bedrooms:         '1',
     bathrooms:        '1',
     sqft:             '',
@@ -147,7 +147,13 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const ownershipRelevant = isRv || form.unitType === 'mobile_home'
   const dwellingOwnership = form.dwellingOwnership || 'tenant'
   const subtypesForType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === form.unitType)
-  const selectedSubtype = subtypesForType.find(s => s.id === form.subtypeId) || null
+  // S630 DIRECTIVE (Nic): "Units need to be able to handle multiple subtypes as a
+  // checkbox... 'fifty amp back in' should not be one subtype. It's two." Each
+  // categorisation toggles on its own, so a spot is "pull through" AND "50 amp"
+  // AND "facing west" without anyone pre-bundling a row for that combination.
+  const selectedSubtypes = subtypesForType.filter(s => s.id != null && form.subtypeIds.includes(s.id))
+  // The first is what prefills unit facts; the rest are classification.
+  const selectedSubtype = selectedSubtypes[0] || null
   // S630 (Nic): a subtype does NOT have to carry a price. Per S613 the subtype is
   // classification — "pricing should be per individual unit" — so most carry no
   // rent at all. This modal assumed otherwise: picking one HID the rent field and
@@ -155,8 +161,15 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   // server refused with "rentAmount required (directly or via the subtype)".
   // The only way past it was to clear the subtype, which is why 53 spaces were
   // created unlinked and every subtype showed zero units.
-  const subtypeSetsRent = selectedSubtype != null && selectedSubtype.rentAmount != null
+  const subtypeSetsRent = selectedSubtypes.some(s => s.rentAmount != null)
   const qty = Math.max(1, parseInt(form.quantity) || 1)
+
+  const toggleSubtype = (id: string) => setForm(f => ({
+    ...f,
+    subtypeIds: f.subtypeIds.includes(id)
+      ? f.subtypeIds.filter((x: string) => x !== id)
+      : [...f.subtypeIds, id],
+  }))
 
   const set = (key: string, val: any) => {
     setForm(f => ({ ...f, [key]: val }))
@@ -195,7 +208,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       propertyId:      form.propertyId,
       unitNumber:      form.unitNumber.trim(),
       quantity:        qty,
-      ...(s ? { subtypeId: s.id } : {}),
+      ...(selectedSubtypes.length ? { subtypeIds: selectedSubtypes.map(x => x.id!) } : {}),
       unitType:        form.unitType,
       bedrooms:        s ? undefined : (hasBeds ? Number(form.bedrooms) || 0 : 0),
       bathrooms:       s ? undefined : (hasBeds ? Number(form.bathrooms) || 0 : 0),
@@ -329,7 +342,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 {UNIT_TYPES.map(t => (
                   <div
                     key={t}
-                    onClick={() => { set('unitType', t); set('subtypeId', '') }}
+                    onClick={() => { set('unitType', t); set('subtypeIds', []) }}
                     style={{
                       padding: '10px 8px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', transition: 'all .12s',
                       border: `1px solid ${form.unitType === t ? 'var(--gold)' : 'var(--border-0)'}`,
@@ -350,23 +363,30 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 <label style={labelStyle}>Subtype</label>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                   {subtypesForType.map(s => (
-                    <div key={s.id} onClick={() => set('subtypeId', s.id)}
+                    <div key={s.id} role="checkbox" tabIndex={0}
+                      aria-checked={!!s.id && form.subtypeIds.includes(s.id)}
+                      onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); if (s.id) toggleSubtype(s.id) } }}
+                      onClick={() => { if (s.id) toggleSubtype(s.id) }}
                       style={{ padding: '8px 12px', borderRadius: 8, cursor: 'pointer', fontSize: '.75rem', fontWeight: 600,
-                        border: `1px solid ${form.subtypeId === s.id ? 'var(--gold)' : 'var(--border-0)'}`,
-                        background: form.subtypeId === s.id ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                        color: form.subtypeId === s.id ? 'var(--gold)' : 'var(--text-1)' }}>
+                        border: `1px solid ${!!s.id && form.subtypeIds.includes(s.id) ? 'var(--gold)' : 'var(--border-0)'}`,
+                        background: !!s.id && form.subtypeIds.includes(s.id) ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                        color: !!s.id && form.subtypeIds.includes(s.id) ? 'var(--gold)' : 'var(--text-1)' }}>
                       {s.name}
                       {unitSubtypeFactsLabel(s) && (
                         <span style={{ fontWeight: 400, color: 'var(--text-3)', marginLeft: 6 }}>{unitSubtypeFactsLabel(s)}</span>
                       )}
                     </div>
                   ))}
-                  <div onClick={() => set('subtypeId', '')}
+                  {/* S630: with checkboxes, "none selected" IS custom — so this
+                      clears the lot rather than being a mutually exclusive option. */}
+                  <div role="button" tabIndex={0}
+                    onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); set('subtypeIds', []) } }}
+                    onClick={() => set('subtypeIds', [])}
                     style={{ padding: '8px 12px', borderRadius: 8, cursor: 'pointer', fontSize: '.75rem', fontWeight: 600,
-                      border: `1px solid ${!form.subtypeId ? 'var(--gold)' : 'var(--border-0)'}`,
-                      background: !form.subtypeId ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
-                      color: !form.subtypeId ? 'var(--gold)' : 'var(--text-1)' }}>
-                    Custom
+                      border: `1px solid ${form.subtypeIds.length === 0 ? 'var(--gold)' : 'var(--border-0)'}`,
+                      background: form.subtypeIds.length === 0 ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                      color: form.subtypeIds.length === 0 ? 'var(--gold)' : 'var(--text-1)' }}>
+                    {form.subtypeIds.length === 0 ? 'Custom' : 'Clear all'}
                   </div>
                 </div>
               </div>
@@ -435,11 +455,14 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
 
 
             {/* Manual fact fields — only without a subtype (the subtype IS the facts). */}
-            {selectedSubtype ? (
+            {selectedSubtypes.length ? (
               <div style={{ fontSize: '.74rem', color: 'var(--text-3)', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '8px 12px', marginBottom: 14 }}>
-                {selectedSubtype.name}
-                {unitSubtypeFactsLabel(selectedSubtype) && <> — {unitSubtypeFactsLabel(selectedSubtype)}</>}
-                {' '}· details and pricing come from your subtype; you can adjust pricing next.
+                {/* S630: every subtype the space carries, not just the first. */}
+                {selectedSubtypes.map(x => x.name).join(' · ')}
+                {selectedSubtype && unitSubtypeFactsLabel(selectedSubtype) && <> — {unitSubtypeFactsLabel(selectedSubtype)}</>}
+                {subtypeSetsRent
+                  ? <>{' '}· details and pricing come from your subtype; you can adjust pricing next.</>
+                  : <>{' '}· these describe the space. Set its price below.</>}
               </div>
             ) : (
               <>

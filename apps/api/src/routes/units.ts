@@ -198,6 +198,14 @@ unitsRouter.get('/:id', async (req, res, next) => {
         -- S613: the unit's subtype, so the page can SHOW what class this space
         -- is. subtype_id has been stored since S527 and displayed nowhere.
         st.name AS subtype_name,
+        -- S630: a unit carries SEVERAL now — "pull through" AND "50 amp" AND
+        -- "facing west". subtype_name above is the first of these, kept for
+        -- readers not yet moved over.
+        COALESCE((
+          SELECT json_agg(json_build_object('id', s2.id, 'name', s2.name) ORDER BY s2.name)
+            FROM unit_subtype_links l JOIN property_unit_subtypes s2 ON s2.id = l.subtype_id
+           WHERE l.unit_id = u.id
+        ), '[]'::json) AS subtypes,
         -- S613: which utilities THIS unit's active lease actually makes the
         -- tenant responsible for. Nothing bills without it and it fails
         -- SILENTLY — the run just reports unitsSkipped — so the unit page has to
@@ -257,6 +265,9 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       propertyId:      z.string().uuid(),
       unitNumber:      z.string(),
       subtypeId:       z.string().uuid().nullable().optional(),
+      // S630: several, each toggled on its own. subtypeId stays for callers
+      // that send one; both funnel into the same list below.
+      subtypeIds:      z.array(z.string().uuid()).max(20).optional(),
       quantity:        z.number().int().min(1).max(200).default(1),
       // S604 (Nic): real parks have signage the software must match, not the
       // other way round. Oak Park runs RV 1-3, apartments 4-5, motel 6-12,
@@ -329,14 +340,27 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     }
 
     // Owner subtype (S527): the unit's defaults. Must belong to this property.
-    let sub: any = null
-    if (body.subtypeId) {
-      sub = await queryOne<any>(
-        `SELECT * FROM property_unit_subtypes WHERE id=$1 AND property_id=$2`,
-        [body.subtypeId, body.propertyId]
-      )
-      if (!sub) throw new AppError(404, 'Subtype not found on this property')
+    // S630: several subtypes, each an independent tag. `sub` is the first and
+    // supplies the creation prefill (unit type, and any facts it carries); the
+    // rest are classification. All of them get linked.
+    const wantedSubtypes = body.subtypeIds ?? (body.subtypeId ? [body.subtypeId] : [])
+    let subs: any[] = []
+    if (wantedSubtypes.length) {
+      subs = await query<any>(
+        `SELECT * FROM property_unit_subtypes WHERE id = ANY($1::uuid[]) AND property_id = $2
+         ORDER BY name`,
+        [wantedSubtypes, body.propertyId])
+      if (subs.length !== new Set(wantedSubtypes).size) {
+        throw new AppError(404, 'Subtype not found on this property')
+      }
+      const types = new Set(subs.map((x) => x.unit_type))
+      if (types.size > 1) {
+        throw new AppError(400,
+          `Those subtypes are for different kinds of unit (${[...types].map((t) => String(t).replace(/_/g, ' ')).join(', ')}). ` +
+          `Pick ones that belong to the same kind.`)
+      }
     }
+    const sub: any = subs[0] ?? null
 
     // S537 (Nic): a subtype LOCKS the unit type — "Back-in 30 amp" can
     // only ever mint an rv_spot. A conflicting explicit unitType in the
@@ -472,6 +496,15 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
          body.isBookable ?? isShortStayByNature(unitType), leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features),
          body.ownerHouseholdSize ?? 1]
       )
+      // S630: link EVERY selected subtype. units.subtype_id above holds the
+      // first one for readers not yet moved over; unit_subtype_links is the
+      // source of truth for what a space actually is.
+      if (subs.length) {
+        await query(
+          `INSERT INTO unit_subtype_links (unit_id, subtype_id)
+           SELECT $1, s FROM unnest($2::uuid[]) s ON CONFLICT DO NOTHING`,
+          [unit.id, subs.map((x: any) => x.id)])
+      }
       created.push(unit)
       } catch (err: any) {
         // Two guards can fire: the pre-existing exact-case
@@ -2022,10 +2055,19 @@ unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.manage_l
 // silently classifying 40 of 53 is worse than classifying none.
 unitsRouter.post('/subtype', requirePerm('units.edit'), async (req, res, next) => {
   try {
-    const { unitIds, subtypeId } = z.object({
-      unitIds:   z.array(z.string().uuid()).min(1).max(500),
-      subtypeId: z.string().uuid().nullable(),
+    // S630: a unit carries SEVERAL subtypes, each toggled on its own — "pull
+    // through" AND "50 amp" AND "facing west", not one pre-bundled row per
+    // combination. subtypeIds REPLACES the whole set on each unit, so unchecking
+    // is expressed by leaving it out; an empty array clears them.
+    const parsed = z.object({
+      unitIds:    z.array(z.string().uuid()).min(1).max(500),
+      subtypeIds: z.array(z.string().uuid()).max(20).optional(),
+      // Accepted so older callers keep working; folded into the array below.
+      subtypeId:  z.string().uuid().nullable().optional(),
     }).parse(req.body)
+    const { unitIds } = parsed
+    const subtypeIds = parsed.subtypeIds
+      ?? (parsed.subtypeId ? [parsed.subtypeId] : [])
 
     const units = await query<any>(
       `SELECT u.id, u.unit_number, u.unit_type, u.landlord_id, u.property_id
@@ -2039,24 +2081,51 @@ unitsRouter.post('/subtype', requirePerm('units.edit'), async (req, res, next) =
       throw new AppError(400, 'Those units are on different properties — a subtype belongs to one property.')
     }
 
-    let sub: any = null
-    if (subtypeId) {
-      sub = await queryOne<any>(
-        `SELECT * FROM property_unit_subtypes WHERE id=$1 AND property_id=$2`,
-        [subtypeId, units[0].property_id])
-      if (!sub) throw new AppError(404, 'That subtype does not belong to this property.')
-      const wrong = units.filter((u) => u.unit_type !== sub.unit_type)
-      if (wrong.length) {
-        throw new AppError(400,
-          `“${sub.name}” is a ${String(sub.unit_type).replace(/_/g, ' ')} subtype, but ` +
-          `${wrong.map((u) => u.unit_number).join(', ')} ${wrong.length === 1 ? 'is' : 'are'} not. ` +
-          `Nothing was changed.`)
+    let subs: any[] = []
+    if (subtypeIds.length) {
+      subs = await query<any>(
+        `SELECT * FROM property_unit_subtypes WHERE id = ANY($1::uuid[]) AND property_id = $2`,
+        [subtypeIds, units[0].property_id])
+      if (subs.length !== new Set(subtypeIds).size) {
+        throw new AppError(404, 'One or more of those subtypes does not belong to this property.')
+      }
+      // A subtype locks the unit type (S537). Refused BY NAME rather than applied
+      // to the units that happen to fit — classifying 40 of 53 quietly is worse
+      // than classifying none, because nobody would know which missed.
+      for (const sub of subs) {
+        const wrong = units.filter((u) => u.unit_type !== sub.unit_type)
+        if (wrong.length) {
+          throw new AppError(400,
+            `“${sub.name}” is a ${String(sub.unit_type).replace(/_/g, ' ')} subtype, but ` +
+            `${wrong.map((u) => u.unit_number).join(', ')} ${wrong.length === 1 ? 'is' : 'are'} not. ` +
+            `Nothing was changed.`)
+        }
       }
     }
 
-    const updated = await query<{ id: string }>(
-      `UPDATE units SET subtype_id = $1, updated_at = NOW() WHERE id = ANY($2::uuid[]) RETURNING id`,
-      [sub?.id ?? null, unitIds])
-    res.json({ success: true, data: { updated: updated.length, subtype: sub?.name ?? null } })
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(`DELETE FROM unit_subtype_links WHERE unit_id = ANY($1::uuid[])`, [unitIds])
+      if (subs.length) {
+        await client.query(
+          `INSERT INTO unit_subtype_links (unit_id, subtype_id)
+           SELECT u, s FROM unnest($1::uuid[]) u CROSS JOIN unnest($2::uuid[]) s
+           ON CONFLICT DO NOTHING`,
+          [unitIds, subs.map((x) => x.id)])
+      }
+      // Kept in step for readers still on the single column (booking quote,
+      // the retire-and-replace column list). unit_subtype_links is the truth.
+      await client.query(
+        `UPDATE units SET subtype_id = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
+        [subs[0]?.id ?? null, unitIds])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    res.json({ success: true, data: {
+      updated: unitIds.length,
+      subtypes: subs.map((x) => x.name),
+    } })
   } catch (e) { next(e) }
 })
