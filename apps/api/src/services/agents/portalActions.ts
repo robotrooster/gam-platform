@@ -222,7 +222,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Use owner_use for a unit the owner or their family lives in — it carries no lease and no rent ' +
       'and is not advertised. Use for "take lot 7 off the market" or "I\u2019m moving into 12".',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       status: { type: 'string', description: 'vacant, available, active, delinquent, suspended, owner_use' },
     },
     required: ['unitId', 'status'],
@@ -239,7 +239,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Confirm hard: this is not how you make a unit temporarily unavailable — that is ' +
       'set_unit_status.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       unitNumber: { type: 'string', description: 'The unit number, typed back as confirmation that this is the right one.' },
       reason: { type: 'string', description: 'Why it is being retired, in their words.' },
     },
@@ -323,7 +323,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'This is money against somebody\u2019s rent: read back the tenant, the unit, the duties, the start ' +
       'date and the monthly hours before creating it.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       tenantId: { type: 'string', description: 'The tenant id, from a lookup.' },
       startDate: { type: 'string', description: 'YYYY-MM-DD — when the arrangement begins.' },
       endDate: { type: 'string', description: 'YYYY-MM-DD, if it is for a fixed period.' },
@@ -794,7 +794,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Write the description in the landlord\u2019s voice about the unit they actually have. Never ' +
       'invent a feature — a listing is a representation somebody rents on.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       availableDate: { type: 'string', description: 'When it is available, as YYYY-MM-DD.' },
       listingDescription: { type: 'string', description: 'The listing text.' },
       listedVacant: { type: 'boolean', description: 'Whether it shows as available to rent.' },
@@ -1991,7 +1991,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'back the old one and the new one together. If another unit at that property already has the ' +
       'number, the system refuses it; that refusal is right and means they have two units in mind.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       unitNumber: { type: 'string', description: 'The new number or name, as it reads on the ground.' },
     },
     required: ['unitId', 'unitNumber'],
@@ -2011,7 +2011,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'isBookable false takes the unit off the booking site without changing anything else.\n' +
       'Only send what they actually told you.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       unitType: { type: 'string', description: 'apartment, single_family, rv_spot, campsite, mobile_home, hotel_room, storage, parking, boat_slip, land_lot, commercial' },
       nightlyRate: { type: 'number', description: 'Nightly rate.' },
       weeklyRate: { type: 'number', description: 'Weekly rate.' },
@@ -2043,7 +2043,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'unit that already carries more than one active lease cannot go back to whole_unit until all ' +
       'but one of those leases has ended — the system says so, and it is not something to work around.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       occupancyMode: { type: 'string', description: 'whole_unit or by_room.' },
     },
     required: ['unitId', 'occupancyMode'],
@@ -2060,7 +2060,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'subtype\u2019s rent, deposit and layout — say so and get a yes to that specific thing. A retired ' +
       'unit keeps the details it was retired with and cannot be changed.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       subtypeId: { type: 'string', description: 'The subtype id, or null to take it out of one.' },
       applyDetails: { type: 'boolean', description: 'true to overwrite the unit with the subtype\u2019s rent, deposit and layout.' },
     },
@@ -2078,7 +2078,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'per call and read back which one and which way round. If the system refuses because there is ' +
       'billing already running on it, that is the answer — say so rather than trying again.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       utilityType: { type: 'string', description: 'Which utility — water, electric, gas, trash, sewer, and so on.' },
       tenantResponsible: { type: 'boolean', description: 'true if the tenant carries it, false if the landlord does.' },
       note: { type: 'string', description: 'Anything about the arrangement.' },
@@ -2094,7 +2094,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Put a vacant unit on the market. Use for "204 is ready, list it". It only works from vacant — ' +
       'a unit that is still occupied or being turned has to get there first, and the system will say ' +
       'which state it is actually in.',
-    params: { unitId: { type: 'string', description: 'The unit id, from a lookup.' } },
+    params: { unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' } },
     required: ['unitId'],
     confirmFirst: true,
   },
@@ -2105,7 +2105,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     description:
       'Take a unit back OFF the market, from available to vacant. Use for "hold 204, I want to redo ' +
       'the floors first". It only works from available.',
-    params: { unitId: { type: 'string', description: 'The unit id, from a lookup.' } },
+    params: { unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' } },
     required: ['unitId'],
     confirmFirst: true,
   },
@@ -2121,7 +2121,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'which is missing. scheduledFor turns it on at a future moment instead of now — use it when the ' +
       'lease starts later, so nobody pays for a month nobody was living there.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       scheduledFor: { type: 'string', description: 'A future date and time to turn it on, in full ISO form. Must be in the future.' },
     },
     required: ['unitId'],
@@ -2135,7 +2135,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Call off an activation that was scheduled for later. Use for "the move-in fell through, do not ' +
       'turn 204 on". If nothing is scheduled the system says so, which usually means the unit is ' +
       'already live and they meant something else — ask.',
-    params: { unitId: { type: 'string', description: 'The unit id, from a lookup.' } },
+    params: { unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' } },
     required: ['unitId'],
     confirmFirst: true,
   },
@@ -2154,7 +2154,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'requires. That is their lawyer\u2019s. If they ask whether they can evict, that is a legal ' +
       'question and it escalates.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       enable: { type: 'boolean', description: 'true to start eviction mode, false to end it.' },
       confirm: { type: 'boolean', description: 'Must be true. Only after they have heard that payments to them stop, and said yes to that.' },
     },
@@ -2666,7 +2666,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'different rate.',
     params: {
       meterId: { type: 'string', description: 'The meter id, from a lookup.' },
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       quantity: { type: 'integer', description: 'How many of the service this unit takes, 1 to 99.' },
     },
     required: ['meterId', 'unitId', 'quantity'],
@@ -3293,7 +3293,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'because a unit quietly getting free water is exactly the kind of thing nobody notices.',
     params: {
       meterId: { type: 'string', description: 'The meter id, from a lookup.' },
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
     },
     required: ['meterId', 'unitId'],
     confirmFirst: true,
@@ -3668,7 +3668,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'These drive the checklist somebody works through on site, so a wrong one means a missing ' +
       'question rather than a wrong label.',
     params: {
-      unitId: { type: 'string', description: 'The unit id, from a lookup.' },
+      unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       isMultiLevel: { type: 'boolean', description: 'Whether it has more than one level.' },
       isAdaAccessible: { type: 'boolean', description: 'Whether it is ADA accessible.' },
     },

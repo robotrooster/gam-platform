@@ -12,8 +12,8 @@ import { dispatchPortalAction, __setTransport } from './portalDispatch'
 import { PORTAL_ACTIONS, getPortalAction } from './portalActions'
 
 const LANDLORD = {
-  userId: 'u1', role: 'landlord', profileId: 'll1',
-  auth: { userId: 'u1', role: 'landlord', profileId: 'll1', email: 'a@b.dev',
+  userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999',
+  auth: { userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999', email: 'a@b.dev',
           permissions: { 'leases.edit': true }, iat: 111, exp: 222 },
 } as any
 const ANON = { userId: 'c1', role: 'prospect', profileId: 'c1' } as any
@@ -69,7 +69,7 @@ describe('audience and credentials', () => {
   it('fails CLOSED for the right audience with no credentials', async () => {
     // The real case: a landlord session that somehow carries no claims. It must
     // do nothing and must not let the agent pretend it did.
-    const noAuth = { userId: 'u1', role: 'landlord', profileId: 'll1' } as any
+    const noAuth = { userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999' } as any
     const r = await dispatchPortalAction('add_units', { propertyId: 'p', unitNumber: '1' }, noAuth)
     expect(r.ok).toBe(false)
     expect(r.refused).toBe('no_credentials')
@@ -82,13 +82,15 @@ describe('audience and credentials', () => {
     expect(r.ok).toBe(false)
     expect(r.refused).toBe('missing_param')
     // A missing :unitId would otherwise produce a literal ":unitId" in the URL.
+    // S630: ids here are real uuids — a non-uuid unitId is now READ as a unit
+    // number and resolved against the landlord's own units before dispatch.
     expect(seen).toHaveLength(0)
   })
 })
 
 describe('the internal token carries the caller and nothing more', () => {
   it('mints from the caller’s own claims and cannot widen them', async () => {
-    await dispatchPortalAction('update_unit', { unitId: 'u9', rentAmount: 1250 }, LANDLORD)
+    await dispatchPortalAction('update_unit', { unitId: '88888888-8888-4888-8888-888888888888', rentAmount: 1250 }, LANDLORD)
     const auth = seen[0].init.headers.Authorization.replace('Bearer ', '')
     const decoded: any = jwt.verify(auth, process.env.JWT_SECRET!)
     expect(decoded.userId).toBe('u1')
@@ -100,14 +102,14 @@ describe('the internal token carries the caller and nothing more', () => {
   })
 
   it('puts path params in the path and everything else in the body', async () => {
-    await dispatchPortalAction('update_unit', { unitId: 'u9', rentAmount: 1250 }, LANDLORD)
-    expect(seen[0].url).toMatch(/\/api\/units\/u9\/details$/)
+    await dispatchPortalAction('update_unit', { unitId: '88888888-8888-4888-8888-888888888888', rentAmount: 1250 }, LANDLORD)
+    expect(seen[0].url).toMatch(/\/api\/units\/88888888-8888-4888-8888-888888888888\/details$/)
     expect(JSON.parse(seen[0].init.body)).toEqual({ rentAmount: 1250 })
     expect(seen[0].init.method).toBe('PATCH')
   })
 
   it('marks the call as coming from the assistant, for the audit trail', async () => {
-    await dispatchPortalAction('update_unit', { unitId: 'u9' }, LANDLORD)
+    await dispatchPortalAction('update_unit', { unitId: '88888888-8888-4888-8888-888888888888' }, LANDLORD)
     expect(seen[0].init.headers['X-GAM-Actor']).toBe('agent')
   })
 })
@@ -115,14 +117,14 @@ describe('the internal token carries the caller and nothing more', () => {
 describe('a refusal from the API is passed through honestly', () => {
   it('does not invent a reason, and does not report success', async () => {
     __setTransport(async () => ({ status: 409, json: { error: 'This unit is in eviction mode' } }))
-    const r = await dispatchPortalAction('update_unit', { unitId: 'u9' }, LANDLORD)
+    const r = await dispatchPortalAction('update_unit', { unitId: '88888888-8888-4888-8888-888888888888' }, LANDLORD)
     expect(r.ok).toBe(false)
     expect(r.error).toBe('This unit is in eviction mode')
   })
 
   it('an unreachable API is never reported as done', async () => {
     __setTransport(async () => { throw new Error('ECONNREFUSED') })
-    const r = await dispatchPortalAction('update_unit', { unitId: 'u9' }, LANDLORD)
+    const r = await dispatchPortalAction('update_unit', { unitId: '88888888-8888-4888-8888-888888888888' }, LANDLORD)
     expect(r.ok).toBe(false)
     expect(r.error).toMatch(/do NOT tell them it was done/i)
   })

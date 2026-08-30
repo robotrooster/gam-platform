@@ -8,7 +8,7 @@ GAM charges a platform fee for the service of managing your properties, tenants,
 
 - **$2 per occupied unit, per month.** You're charged only for units that are occupied.
 - **Vacant units are never charged.** If a unit has no tenant, it doesn't count toward the fee.
-- **$10 per property, per month minimum.** Each property has a floor of $10/month, even if it has few occupied units.
+- **$10 per month minimum, per payout account.** The floor is on the Stripe payout account, not on each property — properties that pay into the same account share one $10 minimum between them, however many there are.
 
 GAM compares your occupied-unit total against the $10 minimum for each property and bills whichever is higher — never both. For example: a property with 3 occupied units calculates to $6 ($2 × 3), so the $10 minimum applies instead; a property with 8 occupied units calculates to $16, which is above the floor, so you're billed $16.
 
@@ -18,7 +18,7 @@ When you onboard, GAM doesn't start charging the platform fee until you go live 
 
 ## Short-term stays
 
-For nightly or weekly bookings, the fee is counted a little differently and added to your occupied-unit total (under the same $10-per-property minimum): space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, while furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **3% of booking revenue**, pro-rated to the month.
+For nightly or weekly bookings, the fee is counted a little differently and added to your occupied-unit total (under the same per-payout-account minimum): space-only sites — RV spots, campsites, and boat slips — count at **$2 per 30 booked nights**, while furnished short stays — apartments, condos, motel/hotel rooms, and similar — are billed **3% of booking revenue**, pro-rated to the month.
 
 ## Lowering your per-unit fee with FlexVault
 

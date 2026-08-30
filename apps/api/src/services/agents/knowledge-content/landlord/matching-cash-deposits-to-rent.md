@@ -32,7 +32,7 @@ Treat it as a prompt, not a finding. Cash sits in a drawer over a weekend, and o
 
 ## What recording a payment costs
 
-Recording an off-platform payment carries a flat **$6.00 manual-payment fee** — the same figure as the ACH fee, so a tenant never pays more for choosing cash. It is waived on a tenant's first recorded payment. Whether the tenant or you cover it is a per-property setting; if you cover it, GAM bills you and it comes out of your payout.
+Recording an off-platform payment is **free** — GAM charges neither you nor the tenant for it.
 
 This applies to any payment handed over instead of made in the app: cash, a personal, cashier's or certified check, a money order, or a bank draft.
 

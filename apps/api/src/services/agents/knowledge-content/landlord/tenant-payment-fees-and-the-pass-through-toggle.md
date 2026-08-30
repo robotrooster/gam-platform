@@ -17,7 +17,7 @@ The ACH pass-through choice works like this:
 
 The choice lives at the property level, so you can run different properties differently. A good way to think about it: "tenant pays" keeps your payout clean and predictable, while "landlord pays" makes the tenant's total simpler at the cost of a deduction on your side. Your account-wide default is set at onboarding and new properties inherit it; you can override any property later.
 
-This processing fee is completely separate from the monthly platform fee ($2 per occupied unit, $10 per-property minimum). One is per-payment, the other is monthly — and the platform fee has its own per-property payer setting (default: landlord).
+This processing fee is completely separate from the monthly platform fee ($2 per occupied unit, $10 minimum per payout account). One is per-payment, the other is monthly — and the platform fee has its own per-property payer setting (default: landlord).
 
 How payouts work alongside this: tenant payments are collected electronically, and once the funds clear, GAM sends your money to your connected bank through Stripe Connect on your payout schedule. You'll need to finish Stripe Connect onboarding (a quick identity and bank-verification step) before payouts can be sent.
 

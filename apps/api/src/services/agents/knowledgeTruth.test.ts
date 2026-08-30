@@ -42,10 +42,19 @@ describe('the knowledge base quotes the live fee schedule', () => {
   it('has articles to check', () => expect(ARTICLES.length).toBeGreaterThan(50))
 
   it('states the ACH fee as the constant, never a different flat figure', () => {
-    // Standing directive: $6 flat ACH is ironclad revenue, and the manual fee
-    // is deliberately identical so a tenant never pays more for paying by cash.
+    // Standing directive: $6 flat ACH is ironclad revenue.
     expect(PROCESSING_FEES.ACH_FLAT).toBe(6)
-    expect(MANUAL_PAYMENT_FEE).toBe(PROCESSING_FEES.ACH_FLAT)
+    // S630 (Nic): "we are gonna make that absolutely free to pay with cash."
+    // The manual fee used to be pinned to the ACH figure so cash never cost
+    // more; it is now zero, and cash is the CHEAPEST option rather than an
+    // equal one. The knowledge base must not still quote a figure for it —
+    // an agent telling a tenant cash costs $6 is quoting a price GAM does not
+    // charge.
+    expect(MANUAL_PAYMENT_FEE).toBe(0)
+    for (const line of CORPUS.split('\n')) {
+      if (!/manual[- ]payment fee|paying (this way|by cash)/i.test(line)) continue
+      expect(/\$\s?[1-9]/.test(line), `quotes a cash fee: ${line.trim().slice(0, 120)}`).toBe(false)
+    }
     // Exclude lines about the DECLINED-payment fee: it is its own constant,
     // legitimately $1, and shares a sentence with the bank/card wording. (A
     // lookahead was the first attempt and it silently backtracked "$1.00" down

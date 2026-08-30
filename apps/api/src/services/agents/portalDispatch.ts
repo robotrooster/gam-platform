@@ -33,6 +33,7 @@
  */
 import jwt from 'jsonwebtoken'
 import { logger } from '../../lib/logger'
+import { query } from '../../db'
 import { getPortalAction, type PortalAction } from './portalActions'
 import type { AgentActor } from './tools/types'
 
@@ -74,6 +75,72 @@ export interface DispatchResult {
   refused?: 'unknown_action' | 'wrong_audience' | 'no_credentials' | 'missing_param'
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const norm = (v: string) => v.toLowerCase().replace(/\s+/g, ' ').trim()
+
+/**
+ * A unit id from what the landlord actually said. See the note at the call site.
+ *
+ * Resolution is deliberately conservative, because the actions behind it include
+ * eviction: an exact number match, or a unique numeric match, and otherwise a
+ * refusal listing the real candidates. It never guesses between two units.
+ */
+async function resolveUnitId(
+  raw: unknown, actor: AgentActor,
+): Promise<{ ok: true; unitId: string } | { ok: false; refusal: DispatchResult }> {
+  const given = String(raw ?? '').trim()
+  if (!given) {
+    return { ok: false, refusal: { ok: false, refused: 'missing_param',
+      error: 'Which unit? Ask them for the unit number — you do not need an id.' } }
+  }
+  // Already a real id from a lookup; S628's traceability guard has vetted it.
+  if (UUID_RE.test(given)) return { ok: true, unitId: given }
+
+  let rows: Array<{ id: string; unit_number: string }> = []
+  try {
+    rows = await query<{ id: string; unit_number: string }>(
+      `SELECT un.id, un.unit_number
+         FROM units un
+         JOIN properties p ON p.id = un.property_id
+        WHERE p.landlord_id = $1 AND un.retired_at IS NULL`,
+      [actor.profileId])
+  } catch (e) {
+    // Fail CLOSED. If the unit list cannot be read there is no safe way to turn
+    // a spoken number into an id, and guessing is the one thing this must not
+    // do — the actions behind it include eviction.
+    logger.error({ err: e, landlordId: actor.profileId },
+      'agent dispatch: could not resolve a unit number — refusing rather than guessing')
+    return { ok: false, refusal: { ok: false, refused: 'missing_param',
+      error: 'I could not confirm which unit that is. Ask them for the unit number and try again.' } }
+  }
+
+  const exact = rows.filter((r) => norm(r.unit_number) === norm(given))
+  if (exact.length === 1) return { ok: true, unitId: exact[0].id }
+
+  // "spot 7" against "RV 07" — the number is the part a landlord means. Only
+  // when it lands on exactly one unit; two matches is a question, not a guess.
+  const digits = given.match(/\d+/)
+  if (digits) {
+    const n = parseInt(digits[0], 10)
+    const byNumber = rows.filter((r) => {
+      const d = String(r.unit_number).match(/\d+/)
+      return d != null && parseInt(d[0], 10) === n
+    })
+    if (byNumber.length === 1) return { ok: true, unitId: byNumber[0].id }
+    if (byNumber.length > 1) {
+      return { ok: false, refusal: { ok: false, refused: 'missing_param',
+        error: `"${given}" matches more than one unit — ${byNumber.map((r) => r.unit_number).join(', ')}. ` +
+               'Ask which one they mean and use that number. Do NOT pick one.' } }
+    }
+  }
+
+  const known = rows.map((r) => r.unit_number).filter(Boolean).sort()
+  return { ok: false, refusal: { ok: false, refused: 'missing_param',
+    error: `There is no unit "${given}" on this account. ` +
+           (known.length ? `Their units are: ${known.join(', ')}. ` : '') +
+           'Ask which one they mean. Never invent an id.' } }
+}
+
 export async function dispatchPortalAction(
   actionId: string, args: Record<string, unknown>, actor: AgentActor,
 ): Promise<DispatchResult> {
@@ -111,6 +178,32 @@ export async function dispatchPortalAction(
       ok: false, refused: 'no_credentials',
       error: 'This conversation is not signed in, so nothing can be done on the account. Say so plainly and do not claim it was done.',
     }
+  }
+
+  // S630 — RESOLVE THE LANDLORD'S OWN WORDS INTO A UNIT ID.
+  //
+  // S628 stopped an invented id from reaching a mutating endpoint, which was
+  // right, but left the landlord no way through. The measured transcript, twice:
+  //
+  //   ▸ I'm starting an eviction on spot 7
+  //     "I need the unit ID to enable eviction mode..."
+  //   ▸ yes, turn it on
+  //     → set_eviction_mode({ unitId: 'unit_12345' })   ← invented, refused
+  //
+  // The unit id is an internal uuid. A landlord does not have one and never
+  // will; they have "spot 7". The model was being asked to chain a lookup it
+  // does not reliably chain, and when it failed it either asked the landlord for
+  // a uuid or made one up. Every S628 action case in the two-turn run died here.
+  //
+  // So a non-uuid unitId is read as what it plainly is — a unit NUMBER — and
+  // resolved here, against this landlord's own units only. Scoped by
+  // landlord_id, so it cannot reach a neighbour's unit no matter what the model
+  // passes. An ambiguous or unknown number is REFUSED with the real list, which
+  // turns a dead end into a question the landlord can answer.
+  if (actor.role === 'landlord' && (action.pathParams ?? []).includes('unitId')) {
+    const resolved = await resolveUnitId(args.unitId, actor)
+    if (!resolved.ok) return resolved.refusal
+    args = { ...args, unitId: resolved.unitId }
   }
 
   // Path params are substituted; everything else becomes the body. A missing

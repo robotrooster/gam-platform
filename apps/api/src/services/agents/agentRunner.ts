@@ -29,6 +29,7 @@ import { HANDOFF_MARKER, type HandoffSignal } from './tools/escalation'
 import type { AgentActor } from './tools/types'
 import { routePlan } from './toolRouting'
 import { needsARealPerson, stripPromiseOfAPerson, LEGAL_ACTION_INTENT } from './escalationPolicy'
+import { getPortalAction } from './portalActions'
 export { needsARealPerson, stripPromiseOfAPerson } from './escalationPolicy'
 import { logger } from '../../lib/logger'
 import type { AgentProfile, ChatMessage, ToolCall } from './types'
@@ -1541,7 +1542,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
             'agent runner: refused an action carrying an invented id'),
            { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
-        : await executeToolCall(call, profile, actor, args)
+        : await executeToolCall(call, profile, actor, args, { message, history })
       if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
             toolInvocations.push({ name: call.function.name, args, result })
             messages.push({
@@ -2038,7 +2039,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
         ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
             'agent runner: refused an action carrying an invented id'),
            { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
-        : await executeToolCall(call, profile, actor, args)
+        : await executeToolCall(call, profile, actor, args, { message, history })
       if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
       turnCache.set(cacheKey, result)
 
@@ -2167,11 +2168,42 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
 const STEP_CEILING_FALLBACK =
   "I'm sorry — I wasn't able to finish that just now. Please try rephrasing, or ask to be connected with a person."
 
+/**
+ * S630 — A CONFIRM-FIRST ACTION MUST ACTUALLY HAVE BEEN CONFIRMED.
+ *
+ * confirmFirst was a sentence in the tool description and a `confirm` boolean
+ * the MODEL fills in. Both are instructions, neither is a control, and the model
+ * cheerfully set confirm:true on the opening turn.
+ *
+ * Measured: "I'm starting an eviction on spot 7" — one turn, no confirmation
+ * asked, no consequence stated — and the unit came back suspended with
+ * payment_block set. Eviction mode pauses every payment from that unit, which in
+ * many states resets the eviction clock; that is not something to switch on
+ * because a sentence sounded decisive.
+ *
+ * Structural rule: a confirm-first action runs only when the person has actually
+ * had the chance to say yes — the turn carries prior conversation AND this
+ * message reads as agreement. The opening mention of an intent never executes;
+ * it gets sent back with instructions to state the consequence and ask.
+ */
+const AFFIRMS =
+  /^\s*(yes|yeah|yep|yup|ok|okay|sure|correct|confirmed?|affirmative|do it|go ahead|please do|that's right|thats right|proceed|turn it on|turn it off|send it|go for it)\b/i
+
+export function confirmFirstSatisfied(
+  message: string,
+  history: ReadonlyArray<{ role: string; content?: string | null }>,
+): boolean {
+  const priorAssistant = history.some((m) => m.role === 'assistant' && String(m.content ?? '').trim())
+  if (!priorAssistant) return false          // nothing was ever put to them
+  return AFFIRMS.test(String(message ?? '').trim())
+}
+
 async function executeToolCall(
   call: ToolCall,
   profile: AgentProfile,
   actor: AgentActor,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  turn?: { message: string; history: ReadonlyArray<{ role: string; content?: string | null }> },
 ): Promise<unknown> {
   const name = call.function.name
   // Re-check the allowlist at execution time — never run a tool the
@@ -2180,6 +2212,20 @@ async function executeToolCall(
   const tool = getTool(name)
   if (!permitted || !tool) {
     return { ok: false, error: `Tool "${name}" is not available.` }
+  }
+  // S630: the confirm-first gate. See confirmFirstSatisfied.
+  const portal = getPortalAction(name)
+  if (portal?.confirmFirst && turn && !confirmFirstSatisfied(turn.message, turn.history)) {
+    logger.warn({ tool: name, profile: profile.id },
+      'agent runner: confirm-first action blocked — nothing has been confirmed yet')
+    return {
+      ok: false,
+      error: 'NOT DONE — nothing has been changed.',
+      tellThem:
+        'This changes their account and they have not agreed to it yet. Say plainly what it will do ' +
+        'and what it costs them, in their own words, then ask for an explicit yes. Do NOT say it is ' +
+        'done, and do NOT say you are doing it.',
+    }
   }
   try {
     return await tool.execute(args, actor)

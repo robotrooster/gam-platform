@@ -15,14 +15,14 @@ You can pay three ways:
 A processing fee may apply depending on how you pay:
 
 - **ACH (bank account):** a flat $6.00 per payment, whatever the amount.
-- **Cash, check or money order:** a flat $6.00 manual-payment fee — the same as ACH, so paying this way never costs you more than paying through the app.
+- **Cash, check or money order: free.** There is no fee for handing your rent to the office — it is the cheapest way to pay.
 - **Card:** 3.5% of the payment plus $0.55 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 - **Declined card attempt:** a flat $1.00 declined-payment fee.
 
 Because ACH and cash both cost a flat $6.00, either is usually the lowest-cost way to pay a larger amount; for a small payment, a card can be cheaper.
 
-The manual-payment fee is **waived on your first recorded payment** on a lease, and some landlords choose to cover it for their tenants entirely — your payments screen shows which applies to you before you decide how to pay. The fee applies per payment recorded, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft.
+There is no charge for paying this way, on any payment, whatever the instrument: cash, a personal, cashier's or certified check, a money order, or a bank draft. Not all landlords accept off-platform payment, so ask yours first.
 
 ## If you deposit rent at the bank yourself
 

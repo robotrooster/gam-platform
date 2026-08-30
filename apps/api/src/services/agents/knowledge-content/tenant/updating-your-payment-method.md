@@ -15,7 +15,7 @@ You can change how you pay rent in GAM at any time. The methods you can save and
 A processing fee may apply based on how you pay, and your payment screen shows it before you confirm:
 
 - **ACH (bank account):** a flat $6.00 per payment.
-- **Cash, check or money order:** a flat $6.00 manual-payment fee — the same as ACH, so no payment method costs you more than another.
+- **Cash, check or money order: free.** No fee at all — it is the cheapest of the options.
 - **Card:** 3.5% plus $0.55 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 
