@@ -87,9 +87,15 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
 
   // Pull every active property + its landlord. Properties with no
   // owner_user_id (orphan rows) are skipped.
+  // S630: skip GAM's OWN landlords. `pool-intake@gam.internal` — the renter-pool
+  // conduit — is flagged is_system precisely "so it stays out of" billing, but
+  // this job never checked it, so GAM invoiced itself $10 a month and wrote it
+  // into platform_revenue_ledger as revenue that does not exist.
   const properties = await query<{ id: string; landlord_id: string }>(`
-    SELECT id, landlord_id FROM properties
-     WHERE landlord_id IS NOT NULL
+    SELECT p.id, p.landlord_id FROM properties p
+      JOIN landlords l ON l.id = p.landlord_id
+     WHERE p.landlord_id IS NOT NULL
+       AND l.is_system = FALSE
   `)
 
   for (const prop of properties) {
@@ -156,6 +162,7 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
                ON o.landlord_id = l.id AND o.effective_until IS NULL
        WHERE l.billing_starts_at IS NOT NULL
          AND l.billing_starts_at <= $1::date
+         AND l.is_system = FALSE
     ),
     joined AS (
       SELECT live.*, a.id AS accrual_id, COALESCE(a.total_amount, 0) AS amount

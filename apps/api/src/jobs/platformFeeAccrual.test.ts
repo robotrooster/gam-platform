@@ -179,6 +179,24 @@ describe('processPlatformFeeAccrual', () => {
     expect(topups).toBe(6)
   })
 
+  // S630: GAM's own renter-pool landlord is flagged is_system "so it stays out
+  // of" billing — but this job never checked, so GAM invoiced ITSELF $10 a month
+  // and booked it as platform revenue.
+  it('never bills a system landlord — GAM does not invoice itself', async () => {
+    const stack = await buildPlatformStack({ unitCount: 3, platformFeePayer: 'landlord' })
+    await db.query(`UPDATE landlords SET is_system = TRUE WHERE id = $1`, [stack.landlordId])
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.errors).toHaveLength(0)
+
+    const accrual = await db.query<any>(
+      `SELECT id FROM platform_fee_accruals WHERE landlord_id=$1`, [stack.landlordId])
+    expect(accrual.rows).toHaveLength(0)
+    const ledger = await db.query<any>(
+      `SELECT id FROM platform_revenue_ledger WHERE property_id=$1`, [stack.propertyId])
+    expect(ledger.rows).toHaveLength(0)
+  })
+
   it('above-min: 6 LT units × $2 = $12 (clears the $10 min, exact rate × count applies)', async () => {
     const stack = await buildPlatformStack({
       unitCount: 6, platformFeePayer: 'landlord',
