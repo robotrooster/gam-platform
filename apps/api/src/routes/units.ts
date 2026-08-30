@@ -2004,3 +2004,59 @@ unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.manage_l
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
+
+// POST /api/units/subtype — set (or clear) the subtype on units, in bulk.
+//
+// S630 (Nic): "Setting that subtype on the bulk creation does not actually link
+// it... my subtypes are showing zero units in each, and there needs to be some
+// sort of link there because otherwise what the hell is it even on the creation
+// page for?"
+//
+// The creation bug is fixed separately, but that does nothing for units already
+// on the platform — 53 RV spaces at Mountain View were created unlinked, and
+// properties are permanent, so re-making them is not an option. This is how they
+// get classified without touching anything else about them.
+//
+// A subtype LOCKS the unit type (S537), so a subtype may only be applied to units
+// of its own type; mismatches are refused by name rather than skipped, because
+// silently classifying 40 of 53 is worse than classifying none.
+unitsRouter.post('/subtype', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const { unitIds, subtypeId } = z.object({
+      unitIds:   z.array(z.string().uuid()).min(1).max(500),
+      subtypeId: z.string().uuid().nullable(),
+    }).parse(req.body)
+
+    const units = await query<any>(
+      `SELECT u.id, u.unit_number, u.unit_type, u.landlord_id, u.property_id
+         FROM units u WHERE u.id = ANY($1::uuid[])`, [unitIds])
+    if (units.length !== unitIds.length) throw new AppError(404, 'One or more units were not found.')
+    for (const u of units) {
+      if (!canManageLandlordResource(req.user, u.landlord_id)) throw new AppError(403, 'Forbidden')
+    }
+    const properties = new Set(units.map((u) => u.property_id))
+    if (properties.size > 1) {
+      throw new AppError(400, 'Those units are on different properties — a subtype belongs to one property.')
+    }
+
+    let sub: any = null
+    if (subtypeId) {
+      sub = await queryOne<any>(
+        `SELECT * FROM property_unit_subtypes WHERE id=$1 AND property_id=$2`,
+        [subtypeId, units[0].property_id])
+      if (!sub) throw new AppError(404, 'That subtype does not belong to this property.')
+      const wrong = units.filter((u) => u.unit_type !== sub.unit_type)
+      if (wrong.length) {
+        throw new AppError(400,
+          `“${sub.name}” is a ${String(sub.unit_type).replace(/_/g, ' ')} subtype, but ` +
+          `${wrong.map((u) => u.unit_number).join(', ')} ${wrong.length === 1 ? 'is' : 'are'} not. ` +
+          `Nothing was changed.`)
+      }
+    }
+
+    const updated = await query<{ id: string }>(
+      `UPDATE units SET subtype_id = $1, updated_at = NOW() WHERE id = ANY($2::uuid[]) RETURNING id`,
+      [sub?.id ?? null, unitIds])
+    res.json({ success: true, data: { updated: updated.length, subtype: sub?.name ?? null } })
+  } catch (e) { next(e) }
+})

@@ -148,6 +148,14 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const dwellingOwnership = form.dwellingOwnership || 'tenant'
   const subtypesForType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === form.unitType)
   const selectedSubtype = subtypesForType.find(s => s.id === form.subtypeId) || null
+  // S630 (Nic): a subtype does NOT have to carry a price. Per S613 the subtype is
+  // classification — "pricing should be per individual unit" — so most carry no
+  // rent at all. This modal assumed otherwise: picking one HID the rent field and
+  // skipped its validation, then omitted rentAmount from the payload, and the
+  // server refused with "rentAmount required (directly or via the subtype)".
+  // The only way past it was to clear the subtype, which is why 53 spaces were
+  // created unlinked and every subtype showed zero units.
+  const subtypeSetsRent = selectedSubtype != null && selectedSubtype.rentAmount != null
   const qty = Math.max(1, parseInt(form.quantity) || 1)
 
   const set = (key: string, val: any) => {
@@ -163,9 +171,9 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       const q = parseInt(form.quantity)
       if (form.quantity && (isNaN(q) || q < 1 || q > 200)) errs.quantity = '1–200'
     }
-    if (step === 2 && !selectedSubtype) {
-      // S613: with a subtype picked the rent comes from it — validating a field
-      // the landlord can no longer see would be a dead end.
+    if (step === 2 && !subtypeSetsRent) {
+      // Validated whenever the landlord can see the field — which is now whenever
+      // the subtype does not price it.
       if (!form.rentAmount || isNaN(Number(form.rentAmount)) || Number(form.rentAmount) <= 0)
         errs.rentAmount = 'Valid rent amount required'
       if (form.securityDeposit && isNaN(Number(form.securityDeposit)))
@@ -192,7 +200,9 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       bedrooms:        s ? undefined : (hasBeds ? Number(form.bedrooms) || 0 : 0),
       bathrooms:       s ? undefined : (hasBeds ? Number(form.bathrooms) || 0 : 0),
       sqft:            form.sqft ? Number(form.sqft) : null,
-      ...(s ? {} : {
+      // Sent whenever the subtype does not price the unit. A subtype that DOES
+      // carry a price still wins, exactly as before.
+      ...(subtypeSetsRent ? {} : {
         rentAmount:      Number(form.rentAmount),
         securityDeposit: Number(form.securityDeposit) || 0,
       }),
@@ -693,7 +703,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               </div>
             )}
 
-            <div style={{ marginBottom: 14, display: selectedSubtype ? 'none' : undefined }}>
+            <div style={{ marginBottom: 14, display: subtypeSetsRent ? 'none' : undefined }}>
               <label style={labelStyle}>Monthly Rent *</label>
               <div style={{ position: 'relative' }}>
                 <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />

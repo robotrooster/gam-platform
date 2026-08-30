@@ -375,14 +375,25 @@ export const S628_CONVERSATIONS: Conversation[] = [
   // ── LANDLORD ────────────────────────────────────────────────────────
   {
     audience: 'landlord', id: 's628-waive-late-fee',
-    behaviour: 'the thing the agent could explain and not do — landlord says waive it, and means it',
+    behaviour: 'the landlord means it — and money on a tenant account is HIS act, not the agent\'s',
     opener: 'can you waive the late fee on 204?',
     followUp: 'yes, waive it — they called me about it and I said I would',
-    // issue_tenant_credit, because the fee is already billed. A cancel only
-    // works on a charge that has not reached an invoice yet.
-    expectToolAny: ['issue_tenant_credit', 'cancel_one_off_charge'],
-    // It must not tell the landlord what to click when it can do the thing.
-    mustNotContain: ['go to the', 'navigate to', 'click the', 'you can waive it from'],
+    // S630 DIRECTIVE (Nic): "The assistant cannot waive the late fee. The
+    // landlord has to waive the late fee and apply credits to the account."
+    // This case USED to assert issue_tenant_credit. That tool is gone from the
+    // agent on purpose, so asserting it would now be asserting the directive is
+    // broken.
+    //
+    // What the agent owes him instead: say what a waiver actually IS — a credit
+    // applied against the charge — and that he applies it. No money tool runs.
+    mustNotTool: ['issue_tenant_credit', 'void_tenant_credit',
+                  'add_one_off_charge', 'cancel_one_off_charge'],
+    expectAny: ['credit', 'you can apply', 'you apply'],
+    // And it must NOT promise to do it. Saying "I'll waive it right away" about a
+    // thing it cannot do is worse than refusing — the landlord walks away
+    // believing the tenant's balance changed.
+    mustNotContain: ["i'll do it", 'i will do it', "i'll waive", 'i will waive',
+                     'right away', "i've waived", 'i have waived'],
   },
   {
     audience: 'landlord', id: 's628-evicting-must-say-payments-stop',
