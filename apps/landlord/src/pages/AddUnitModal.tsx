@@ -161,7 +161,11 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   // server refused with "rentAmount required (directly or via the subtype)".
   // The only way past it was to clear the subtype, which is why 53 spaces were
   // created unlinked and every subtype showed zero units.
-  const subtypeSetsRent = selectedSubtypes.some(s => s.rentAmount != null)
+  // S630 DIRECTIVE (Nic): a subtype NEVER prices a unit. Setting one price while
+  // adding ten pull-through spots looks like the subtype priced them; it did not.
+  // The price belongs to each unit from the moment it exists, so one awkward spot
+  // can be discounted without touching the other nine or the class itself. There
+  // is deliberately no "does the subtype set the rent" branch any more.
   const qty = Math.max(1, parseInt(form.quantity) || 1)
 
   const toggleSubtype = (id: string) => setForm(f => ({
@@ -184,7 +188,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       const q = parseInt(form.quantity)
       if (form.quantity && (isNaN(q) || q < 1 || q > 200)) errs.quantity = '1–200'
     }
-    if (step === 2 && !subtypeSetsRent) {
+    if (step === 2) {
       // Validated whenever the landlord can see the field — which is now whenever
       // the subtype does not price it.
       if (!form.rentAmount || isNaN(Number(form.rentAmount)) || Number(form.rentAmount) <= 0)
@@ -215,10 +219,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       sqft:            form.sqft ? Number(form.sqft) : null,
       // Sent whenever the subtype does not price the unit. A subtype that DOES
       // carry a price still wins, exactly as before.
-      ...(subtypeSetsRent ? {} : {
-        rentAmount:      Number(form.rentAmount),
-        securityDeposit: Number(form.securityDeposit) || 0,
-      }),
+      rentAmount:      Number(form.rentAmount),
+      securityDeposit: Number(form.securityDeposit) || 0,
       ...(isRv && !s ? {
         rvSiteLayout: form.rvSiteLayout,
         rvAmpService: form.rvAmpService,
@@ -460,9 +462,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 {/* S630: every subtype the space carries, not just the first. */}
                 {selectedSubtypes.map(x => x.name).join(' · ')}
                 {selectedSubtype && unitSubtypeFactsLabel(selectedSubtype) && <> — {unitSubtypeFactsLabel(selectedSubtype)}</>}
-                {subtypeSetsRent
-                  ? <>{' '}· details and pricing come from your subtype; you can adjust pricing next.</>
-                  : <>{' '}· these describe the space. Set its price below.</>}
+                {' '}· these describe the space. Its price is set below and belongs to the unit,
+                so you can change one spot later without touching the others.
               </div>
             ) : (
               <>
@@ -726,7 +727,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               </div>
             )}
 
-            <div style={{ marginBottom: 14, display: subtypeSetsRent ? 'none' : undefined }}>
+            <div style={{ marginBottom: 14 }}>
               <label style={labelStyle}>Monthly Rent *</label>
               <div style={{ position: 'relative' }}>
                 <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />

@@ -16,11 +16,6 @@ import { appConfirm, toast } from '../components/dialogs'
 // picks a subtype and prefills everything. Fees are NOT set here — each
 // tenant is charged per their own signed lease.
 
-const fmt = (n: any) => {
-  if (n == null || n === '') return '—'
-  const v = typeof n === 'string' ? parseFloat(n) : n
-  return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-}
 
 export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
@@ -72,11 +67,11 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
       bedrooms:          numMode(ofType.map(u => u.bedrooms)),
       bathrooms:         numMode(ofType.map(u => u.bathrooms)),
       storageSize:       mode(ofType.map(u => u.storageSize)) ?? '',
-      rentAmount:        numMode(ofType.map(u => u.rentAmount)),
-      securityDeposit:   numMode(ofType.map(u => u.securityDeposit)),
-      nightlyRate:       numMode(ofType.map(u => u.nightlyRate)),
-      weeklyRate:        numMode(ofType.map(u => u.weeklyRate)),
-      monthlyRate:       numMode(ofType.map(u => u.monthlyRate)),
+      // S630 DIRECTIVE (Nic): "Subtypes should not price the unit... maybe one
+      // spot's bigger and worth more, maybe one spot's tiny or inconvenient so
+      // they get a deal. It doesn't change the fact that it's a pull through or
+      // a fifty amp spot." A subtype describes a space; the price belongs to the
+      // space. Nothing about money is seeded, sent or shown here any more.
     }
   })()
 
@@ -134,11 +129,6 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
                   {[
                     UNIT_TYPE_LABEL[s.unitType],
                     unitSubtypeFactsLabel(s) || null,
-                    s.rentAmount != null ? `Rent ${fmt(s.rentAmount)}` : null,
-                    s.securityDeposit != null ? `Deposit ${fmt(s.securityDeposit)}` : null,
-                    s.nightlyRate != null ? `Nightly ${fmt(s.nightlyRate)}` : null,
-                    s.weeklyRate != null ? `Weekly ${fmt(s.weeklyRate)}` : null,
-                    s.monthlyRate != null ? `Monthly ${fmt(s.monthlyRate)}` : null,
                   ].filter(Boolean).join(' · ')}
                 </span>
               </div>
@@ -409,10 +399,9 @@ function SubtypeUnitsModal({ propertyId, subtype, onClose, onSaved }: {
       <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
         Tick every {UNIT_TYPE_LABEL[subtype.unitType].toLowerCase()} that is a{' '}
         <strong style={{ color: 'var(--text-1)' }}>{subtype.name}</strong>
-        {facts ? ` (${facts})` : ''}. Those units take this subtype&apos;s
-        {subtype.rentAmount != null ? ` rent of ${fmt(subtype.rentAmount)}` : ' pricing'} — one price
-        for every unit in it. Untick one and it prices on its own again, keeping the number it has.
-        A tenant already under a signed lease keeps paying what their lease says.
+        {facts ? ` (${facts})` : ''}. This describes the space — it does not change what the space
+        costs. Each unit keeps its own rent, so one that is bigger, or tight and awkward, can be
+        priced differently without leaving the class. A unit can carry several subtypes at once.
       </div>
 
       {err && (

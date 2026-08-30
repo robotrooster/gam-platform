@@ -73,9 +73,7 @@ export async function bookableUnits(propertyId: string) {
             u.min_stay_nights, u.max_stay_nights, u.check_in_time, u.check_out_time,
             u.lease_types_allowed, u.subtype_id,
             s.name AS subtype_name, s.unit_type AS subtype_unit_type, s.rv_site_layout AS subtype_layout,
-            s.rv_amp_service AS subtype_amp,
-            s.nightly_rate AS subtype_nightly, s.weekly_rate AS subtype_weekly,
-            s.monthly_rate AS subtype_monthly
+            s.rv_amp_service AS subtype_amp
        FROM units u
        LEFT JOIN property_unit_subtypes s ON s.id = u.subtype_id
       WHERE u.property_id = $1
@@ -163,12 +161,19 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
 
   // Auto-tiered pricing (guest does not pick a billing type — Nic 2026-06-27):
   // length decides nightly/weekly/monthly, prorated, with short-term lodging
-  // tax on stays under 30 nights. Rates: subtype, else unit, else property.
+  // tax on stays under 30 nights.
+  //
+  // S630 DIRECTIVE (Nic): rates come from the UNIT, else the property. NEVER the
+  // subtype — "subtypes should not price the unit... maybe one spot's bigger and
+  // worth more, maybe one spot's tiny or inconvenient so they get a deal. It
+  // doesn't change the fact that it's a pull through or a fifty amp spot."
+  // A guest quote priced off the class could not be discounted for one awkward
+  // site without repricing every site that shares the class.
   const rep = freeUnit ?? siteType.units[0]
   const rates = {
     nightly: rep.nightly_rate ?? prop.nightly_rate,
-    weekly:  rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate,
-    monthly: rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate,
+    weekly:  rep.weekly_rate  ?? prop.weekly_rate,
+    monthly: rep.monthly_rate ?? prop.monthly_rate,
   }
   const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
   // S547 (Nic): 30+ night stays bill like residents — prorated arrival month
@@ -260,8 +265,8 @@ export async function listSiteTypePricing(prop: PropertyRow) {
       layout: t.requiredLayout,               // 'back_in' | 'pull_through' | 'none' | null
       ampService: t.requiredAmp,              // 'none' | '30' | '50' | 'both' | null
       nightlyRate: num(rep.nightly_rate ?? prop.nightly_rate),
-      weeklyRate:  num(rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate),
-      monthlyRate: num(rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate),
+      weeklyRate:  num(rep.weekly_rate  ?? prop.weekly_rate),
+      monthlyRate: num(rep.monthly_rate ?? prop.monthly_rate),
       minStayNights: rep.min_stay_nights ?? null,
       maxStayNights: rep.max_stay_nights ?? null,
       checkInTime: rep.check_in_time ?? null,

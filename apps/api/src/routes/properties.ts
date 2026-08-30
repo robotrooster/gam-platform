@@ -527,6 +527,12 @@ const unitSubtypeSchema = z.object({
   rvSiteLayout: z.enum(['none', 'back_in', 'pull_through']).nullable().optional(),
   rvAmpService: z.enum(['none', '30', '50', 'both']).nullable().optional(),
   storageSize: z.string().trim().max(40).nullable().optional(),
+  // S630 DIRECTIVE (Nic): a subtype does NOT price a unit. These are still
+  // ACCEPTED so an older client does not start erroring, and they are still
+  // stored, but nothing reads them any more — creation, the guest booking quote
+  // and the subtype editor all take the price from the UNIT. Do not reintroduce a
+  // read; "one price for every unit in the class" is exactly what this directive
+  // removed, because one awkward spot has to be discountable on its own.
   rentAmount: z.number().min(0).nullable().optional(),
   securityDeposit: z.number().min(0).nullable().optional(),
   nightlyRate: z.number().min(0).nullable().optional(),

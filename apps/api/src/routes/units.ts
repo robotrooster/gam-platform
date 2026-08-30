@@ -375,20 +375,35 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     // "no late fee" — before this class can exist at the property.
     await assertLateFeeDecision(body.propertyId, unitType)
     const num = (v: any) => v == null ? null : Number(v)
-    const rentAmount = body.rentAmount ?? num(sub?.rent_amount)
+    // S630 DIRECTIVE (Nic): A SUBTYPE NEVER PRICES A UNIT.
+    //
+    // "Subtypes should not price the unit. People can bulk set a price when they
+    //  are adding new units, and it would look on the surface like the subtype is
+    //  pricing the unit... but it needs to not be linked to that subtype feature.
+    //  That way they can be independently adjusted. Maybe one spot's bigger and
+    //  worth more, maybe one spot's tiny or inconvenient so they get a deal — it
+    //  doesn't change the fact that it's a pull through or a fifty amp spot."
+    //
+    // A bulk create sets one price across the batch, which LOOKS like the subtype
+    // priced them; it did not. The price is the unit's from the moment it exists,
+    // and moving one spot's rent must never move another's or drag the class with
+    // it. So the price comes from the request and nowhere else.
+    const rentAmount = body.rentAmount ?? null
     if (rentAmount == null || rentAmount <= 0) {
-      throw new AppError(400, 'rentAmount required (directly or via the subtype)')
+      throw new AppError(400, 'A rent amount is required for each unit.')
     }
-    const securityDeposit = body.securityDeposit ?? num(sub?.security_deposit) ?? 0
+    const securityDeposit = body.securityDeposit ?? 0
     const bedrooms  = body.bedrooms ?? (sub?.bedrooms ?? 1)
     const bathrooms = body.bathrooms ?? num(sub?.bathrooms) ?? 1
     // RV sub-type fields only apply to rv_spot units; storage size to storage.
     const rvLayout = unitType === 'rv_spot' ? (body.rvSiteLayout ?? sub?.rv_site_layout ?? 'none') : 'none'
     const rvAmp    = unitType === 'rv_spot' ? (body.rvAmpService ?? sub?.rv_amp_service ?? 'none') : 'none'
     const storageSize = unitType === 'storage' ? (body.storageSize?.trim() || sub?.storage_size || null) : null
-    const nightlyRate = body.nightlyRate ?? num(sub?.nightly_rate)
-    const weeklyRate  = body.weeklyRate  ?? num(sub?.weekly_rate)
-    const monthlyRate = body.monthlyRate ?? num(sub?.monthly_rate)
+    // Same rule for short-stay rates — the subtype describes the space, it does
+    // not set what the space costs.
+    const nightlyRate = body.nightlyRate ?? null
+    const weeklyRate  = body.weeklyRate  ?? null
+    const monthlyRate = body.monthlyRate ?? null
     // S526 (Nic): every RV site is short- AND long-term capable by default —
     // bookable, all stay lengths allowed. Landlord can narrow later.
     const isRv = unitType === 'rv_spot'
