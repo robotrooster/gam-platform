@@ -119,7 +119,11 @@ import { financesRouter }      from './routes/finances'
 import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
 
-dotenv.config()
+// S630: one binary, two environments. GAM_ENV_FILE lets the demo/sales instance
+// boot from .env.demo (gam_demo database, no payment or email credentials) while
+// production keeps loading .env, so the two can never share a config file by
+// accident. validateEnv() then refuses the dangerous combinations outright.
+dotenv.config(process.env.GAM_ENV_FILE ? { path: process.env.GAM_ENV_FILE } : undefined)
 
 // S280: validate required env BEFORE building the app. Throws and
 // kills the process if a critical var (e.g. JWT_SECRET) is unset —

@@ -1,6 +1,20 @@
+import path from 'path'
 import dotenv from 'dotenv'
 import { logger } from '../lib/logger'
-dotenv.config({ path: '/Users/nicholasrhoades/gam/apps/api/.env' })
+
+// S630: this ran at IMPORT time with a hardcoded absolute path to production's
+// .env, which beat index.ts's own dotenv.config() — every import graph reaches
+// the pool before line 1 of index.ts executes. So the demo instance, launched
+// with GAM_ENV_FILE=.env.demo, still read DB_NAME=gam and would have connected
+// the sales-demo API to the PRODUCTION database. Caught by
+// validateEnv.assertDemoIsolation() refusing to boot, not by anything here.
+//
+// GAM_ENV_FILE is honoured first; the absolute default is kept because launchd
+// starts the service with a cwd that is not guaranteed to be apps/api.
+dotenv.config({
+  path: process.env.GAM_ENV_FILE
+    || path.join('/Users/nicholasrhoades/gam/apps/api', '.env'),
+})
 
 import { Pool, PoolClient } from 'pg'
 

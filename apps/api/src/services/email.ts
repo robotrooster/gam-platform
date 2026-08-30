@@ -4,7 +4,13 @@ import { query } from '../db'
 import { logger } from '../lib/logger'
 import { buildDemoBookingIcs } from './demoCalendar'
 
-const resend = new Resend(process.env.RESEND_API_KEY)
+// S630: no key, no sender. The Resend constructor throws on a missing key, at
+// IMPORT time, which took the whole API down rather than degrading — and the
+// demo/sales instance deliberately ships without one so a sales call can never
+// email a real person. An unconfigured environment now logs what it would have
+// sent and moves on; a configured one is unchanged.
+const EMAIL_ENABLED = !!process.env.RESEND_API_KEY
+const resend = EMAIL_ENABLED ? new Resend(process.env.RESEND_API_KEY) : null
 
 /**
  * S629 (Nic): "for landlords it's going to the spam folder... it's gonna send
@@ -148,6 +154,12 @@ async function send(
         reply_to: FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined,
       }
       if (attachments && attachments.length > 0) sendArgs.attachments = attachments
+      if (!resend) {
+        // Not an error: this environment is intentionally without mail.
+        logger.info({ to, subject },
+          'email suppressed — no RESEND_API_KEY configured in this environment')
+        return null
+      }
       const result = await resend.emails.send(sendArgs)
       if (result.error) {
         status = 'failed'
