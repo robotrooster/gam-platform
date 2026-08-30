@@ -4213,7 +4213,16 @@ function FlexPayRequests() {
   const fi = funnel?.inquiries ?? {}
   const qSent = (fq.pending ?? 0) + (fq.answered ?? 0) + (fq.dismissed ?? 0)
 
-  const Table = ({ list, title }: { list: FlexPayInquiryRow[]; title: string }) => (
+  // S630 (Nic): declared INSIDE this component, Table was a NEW component type
+  // on every render, so React unmounted and remounted the whole table each time
+  // parent state changed — including on every keystroke in the pull-day input
+  // below, which destroyed and recreated that input mid-typing. Same fault that
+  // made the reset-password page impossible to type into.
+  //
+  // A plain render FUNCTION rather than a component: it closes over the same
+  // state, but the JSX belongs to this component, so there is no second type to
+  // remount and the input keeps its identity and its caret.
+  const renderTable = (list: FlexPayInquiryRow[], title: string) => (
     <div className="card" style={{ padding: 0, overflowX: 'auto', marginBottom: 16 }}>
       <div style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--t0)', fontSize: '.85rem' }}>{title} ({list.length})</div>
       <table className="tbl" style={{ minWidth: 1020 }}>
@@ -4371,7 +4380,7 @@ function FlexPayRequests() {
         from their portal; total approved float is the bankroll commitment.
       </div>
       {isLoading ? <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div> : <>
-        <Table list={pending} title="Pending" />
+        {renderTable(pending, "Pending")}
 
         {/* S545c: verification holds — out of the queue, tenant sees
             NOTHING. Release restores their original spot (ordering is
@@ -4410,7 +4419,7 @@ function FlexPayRequests() {
           </div>
         )}
 
-        <Table list={decided} title="Decided" />
+        {renderTable(decided, "Decided")}
       </>}
 
       {review && (
