@@ -7,7 +7,8 @@ import { db, query, queryOne } from '../db'
 import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp } from '../services/email'
+import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
+         sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
@@ -526,6 +527,9 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
     const user = await queryOne<any>(
       `SELECT u.id, u.email, u.role, u.first_name, u.last_name, u.phone,
          u.totp_enabled, u.email_2fa_enabled,
+         -- S630: so the account screen can show a change awaiting confirmation
+         -- rather than looking like the request was lost.
+         u.pending_email,
          COALESCE(l.id, t.id, b.id) AS profile_id,
          l.business_name, l.onboarding_complete,
          b.id   AS business_id,
@@ -927,5 +931,137 @@ authRouter.post('/resend-verification', async (req, res, next) => {
       await mintAndSendVerifyEmail(user.id, email, user.first_name)
     }
     res.json({ success: true, data: { message: 'If an account exists for that email and is not yet verified, a verification email has been sent.' } })
+  } catch (e) { next(e) }
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// S630 (Nic): CHANGE THE SIGN-IN EMAIL.
+//
+// "I don't wanna sign in to my landlord account with the Oak Park email. We're
+//  gonna be selling Oak Park and potentially giving up control of that email
+//  address to the new buyer, and I need my sign in to be something that stays
+//  with me."
+//
+// There was no way to change a login email at all. Handing a buyer that mailbox
+// would have handed them password resets for the entire landlord account, and
+// with it every other property on it.
+//
+// The new address is held PENDING until proven. The account keeps working on the
+// old email the whole time and the swap happens only when the link sent to the
+// new address is opened, so a change that is merely REQUESTED can never lock the
+// owner out. The old address is told at both ends: if somebody else starts this,
+// the person still holding that mailbox hears about it while they can act.
+// ────────────────────────────────────────────────────────────────────────────
+
+const EMAIL_CHANGE_TTL_HOURS = 24
+
+/** Only ever echo back an origin we recognise — see forgot-password. */
+function portalBaseForRequest(req: any): string {
+  const APEX = 'goldassetmanagement.com'
+  const LABELS = ['landlord', 'tenant', 'admin', 'pm', 'business', 'pos']
+  const allowed = [
+    process.env.LANDLORD_APP_URL, process.env.TENANT_APP_URL,
+    process.env.ADMIN_APP_URL, process.env.POS_APP_URL,
+    ...LABELS.map((l) => `https://${l}.${APEX}`),
+  ].filter(Boolean).map((u) => String(u).replace(/\/$/, ''))
+  const origin = String(req.get('origin') || '').replace(/\/$/, '')
+  if (allowed.includes(origin)) return origin
+  return String(process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`).replace(/\/$/, '')
+}
+
+// POST /api/auth/change-email — request it. Password required: this is the
+// credential that recovers the account, so it is not a profile field edit.
+authRouter.post('/change-email', requireAuth, async (req, res, next) => {
+  try {
+    const { newEmail, password } = z.object({
+      newEmail: z.string().email().max(255),
+      password: z.string().min(1),
+    }).parse(req.body)
+
+    const wanted = newEmail.trim().toLowerCase()
+    const user = await queryOne<any>(
+      `SELECT id, email, first_name, password_hash FROM users WHERE id = $1`,
+      [req.user!.userId])
+    if (!user) throw new AppError(404, 'Account not found')
+
+    const ok = await bcrypt.compare(password, user.password_hash || '')
+    if (!ok) throw new AppError(401, 'That password is not correct.')
+
+    if (wanted === String(user.email).toLowerCase()) {
+      throw new AppError(400, 'That is already your sign-in email.')
+    }
+    if (isDisposableEmail(wanted)) {
+      throw new AppError(400, 'Please use a permanent email address for your sign-in.')
+    }
+    // users.email is globally unique, so a taken address can never be swapped in.
+    const taken = await queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE lower(email) = $1`, [wanted])
+    if (taken) throw new AppError(409, 'That email is already used by another GAM account.')
+
+    const token = crypto.randomBytes(32).toString('hex')
+    await query(
+      `UPDATE users
+          SET pending_email = $1, pending_email_token = $2,
+              pending_email_expires_at = NOW() + ($3 || ' hours')::interval
+        WHERE id = $4`,
+      [wanted, token, EMAIL_CHANGE_TTL_HOURS, user.id])
+
+    const confirmUrl = `${portalBaseForRequest(req)}/confirm-email-change?token=${encodeURIComponent(token)}`
+    void sendEmailChangeConfirmation(wanted, user.first_name, confirmUrl, user.email, { userId: user.id })
+    void sendEmailChangeNotice(user.email, user.first_name, wanted, 'requested', { userId: user.id })
+
+    res.json({ success: true, data: {
+      pendingEmail: wanted,
+      message: `Confirm it from the link sent to ${wanted}. Until then you keep signing in with ${user.email}.`,
+    } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/auth/change-email/confirm — opened from the new address. Public by
+// design: the person proving the mailbox may not have a session there.
+authRouter.post('/change-email/confirm', async (req, res, next) => {
+  try {
+    const { token } = z.object({ token: z.string().min(10).max(200) }).parse(req.body)
+    const user = await queryOne<any>(
+      `SELECT id, email, first_name, pending_email
+         FROM users
+        WHERE pending_email_token = $1
+          AND pending_email_expires_at IS NOT NULL
+          AND pending_email_expires_at > NOW()`, [token])
+    if (!user || !user.pending_email) {
+      throw new AppError(400, 'That link has expired or has already been used.')
+    }
+
+    // Re-checked here, not just at request time: another account could have
+    // claimed the address in between, and the unique index would then abort the
+    // swap with a constraint error instead of an explanation.
+    const taken = await queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE lower(email) = $1 AND id <> $2`,
+      [String(user.pending_email).toLowerCase(), user.id])
+    if (taken) throw new AppError(409, 'That email has since been taken by another GAM account.')
+
+    const oldEmail = user.email
+    await query(
+      `UPDATE users
+          SET email = pending_email,
+              email_verified = TRUE, email_verified_at = NOW(),
+              pending_email = NULL, pending_email_token = NULL,
+              pending_email_expires_at = NULL,
+              updated_at = NOW()
+        WHERE id = $1`, [user.id])
+
+    void sendEmailChangeNotice(oldEmail, user.first_name, user.pending_email, 'completed', { userId: user.id })
+    res.json({ success: true, data: { email: user.pending_email, previousEmail: oldEmail } })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/auth/change-email — call off a pending change.
+authRouter.delete('/change-email', requireAuth, async (req, res, next) => {
+  try {
+    await query(
+      `UPDATE users SET pending_email = NULL, pending_email_token = NULL,
+                        pending_email_expires_at = NULL
+        WHERE id = $1`, [req.user!.userId])
+    res.json({ success: true, data: { cancelled: true } })
   } catch (e) { next(e) }
 })

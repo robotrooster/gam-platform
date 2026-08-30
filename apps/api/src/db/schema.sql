@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3jRdfIZezwlxjf0GlG6qc8NBH1NNYDIwweBdTPG7dXwdUN6ek5downNtxQLfXcy
+\restrict 8G9Nn031i3FWoNCVJPQ3FvaOriiLMyeTad2jUpCcW6tQztRZx6MfIfnGsULTjoC
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9066,6 +9066,9 @@ CREATE TABLE public.users (
     referral_code text,
     referred_by_user_id uuid,
     active_landlord_id uuid,
+    pending_email text,
+    pending_email_token text,
+    pending_email_expires_at timestamp with time zone,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -9145,6 +9148,13 @@ COMMENT ON COLUMN public.users.referred_by_user_id IS 'S592: this person''s sing
 --
 
 COMMENT ON COLUMN public.users.active_landlord_id IS 'The landlord entity this user is currently operating in. NULL falls back to the entity they own (pre-S620 behaviour). Only ever set to an entity they are a member of — enforced in the route, since a FK cannot express it.';
+
+
+--
+-- Name: COLUMN users.pending_email; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.pending_email IS 'A requested new login email, not yet in effect. Becomes users.email only when the link mailed to it is opened.';
 
 
 --
@@ -17539,6 +17549,13 @@ CREATE UNIQUE INDEX ux_users_landlord_invite_token ON public.users USING btree (
 
 
 --
+-- Name: ux_users_pending_email_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_users_pending_email_token ON public.users USING btree (pending_email_token) WHERE (pending_email_token IS NOT NULL);
+
+
+--
 -- Name: ux_users_tenant_invite_token; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24718,5 +24735,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3jRdfIZezwlxjf0GlG6qc8NBH1NNYDIwweBdTPG7dXwdUN6ek5downNtxQLfXcy
+\unrestrict 8G9Nn031i3FWoNCVJPQ3FvaOriiLMyeTad2jUpCcW6tQztRZx6MfIfnGsULTjoC
 

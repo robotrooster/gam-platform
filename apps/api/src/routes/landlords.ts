@@ -571,6 +571,9 @@ landlordsRouter.get('/:id', async (req, res, next) => {
     }
     const landlord = await queryOne<any>(`
       SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
+        -- S630: a sign-in email change awaiting confirmation, so the account
+        -- card shows it is in flight rather than looking like it was lost.
+        u.pending_email,
         -- S620 (Nic): "the billing card, the bank account shows not
         -- configured. That is exactly where I'm looking."
         --

@@ -4,6 +4,7 @@ import { api, apiGet, apiPatch } from '../lib/api'
 import { Check, DollarSign, X } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
+import { ChangeSignInEmail } from '../components/ChangeSignInEmail'
 import { usePerms } from '../lib/permissions'
 import { NotificationPrefsSection } from './NotificationPrefsPage'
 
@@ -164,7 +165,7 @@ function OwnersSection() {
 
 export function SettingsPage() {
   const qc = useQueryClient()
-  const { data: me, isLoading } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
+  const { data: me, isLoading, refetch: refetchMe } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
 
   const [threshold, setThreshold] = useState<string>('')
   const [depThreshold, setDepThreshold] = useState<string>('')
@@ -308,6 +309,14 @@ export function SettingsPage() {
                 )}
               </div>
             )}
+
+            {/* S630: the sign-in email must be one the owner keeps, not one
+                that transfers with a property being sold. */}
+            <ChangeSignInEmail
+              currentEmail={me?.email || ''}
+              pendingEmail={me?.pendingEmail}
+              onChanged={() => refetchMe?.()}
+            />
           </div>
           )}
 

@@ -1205,6 +1205,64 @@ export async function sendEmailVerification(
 // S279 — password reset request. Single-use token-bearing URL.
 // Caller has already minted + persisted the token; this just
 // sends the email with the URL embedded.
+/**
+ * S630: confirm a NEW login email. Sent to the new address — opening this is
+ * what proves it is reachable and performs the swap.
+ */
+export async function sendEmailChangeConfirmation(
+  to: string,
+  firstName: string | null,
+  confirmUrl: string,
+  currentEmail: string,
+  ctx?: { userId?: string },
+): Promise<string | null> {
+  const greeting = firstName ? `Hi ${firstName},` : 'Hi,'
+  return send(
+    to,
+    'Confirm your new GAM sign-in email',
+    base(
+      h('Confirm your new sign-in email') +
+      p(greeting) +
+      p(`You asked to change the sign-in email on your GAM account from <strong style="color:#eef1f8">${currentEmail}</strong> to this address. Click below to confirm — the link expires in <strong style="color:#eef1f8">24 hours</strong>.`) +
+      btn('Confirm this email', confirmUrl) +
+      p(`Until you confirm, you keep signing in with ${currentEmail} and nothing about your account changes.`) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you weren't expecting this, ignore it — no change happens without this link.</div>`
+    ),
+    { category: 'email_change_confirm',
+      metadata: ctx?.userId ? { user_id: ctx.userId } : undefined },
+  )
+}
+
+/**
+ * S630: tell the OLD address a change was requested or completed. This is the
+ * safeguard that matters — if somebody else initiates the change, the person
+ * who still holds the old mailbox finds out while they can still act.
+ */
+export async function sendEmailChangeNotice(
+  to: string,
+  firstName: string | null,
+  newEmail: string,
+  stage: 'requested' | 'completed',
+  ctx?: { userId?: string },
+): Promise<string | null> {
+  const greeting = firstName ? `Hi ${firstName},` : 'Hi,'
+  const body = stage === 'requested'
+    ? p(`Someone asked to move the sign-in email on your GAM account to <strong style="color:#eef1f8">${newEmail}</strong>. Nothing has changed yet — it only takes effect if that address is confirmed.`) +
+      p(`If this wasn't you, change your password now and contact support. Your current password still works and this address is still your sign-in.`)
+    : p(`The sign-in email on your GAM account is now <strong style="color:#eef1f8">${newEmail}</strong>. This address can no longer be used to sign in or to reset the password.`) +
+      p(`If this wasn't you, contact support immediately.`)
+  return send(
+    to,
+    stage === 'requested'
+      ? 'A change to your GAM sign-in email was requested'
+      : 'Your GAM sign-in email was changed',
+    base(h(stage === 'requested' ? 'Sign-in email change requested' : 'Sign-in email changed') +
+         p(greeting) + body),
+    { category: 'email_change_notice',
+      metadata: ctx?.userId ? { user_id: ctx.userId } : undefined },
+  )
+}
+
 export async function sendPasswordResetEmail(
   to: string,
   firstName: string | null,

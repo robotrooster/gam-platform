@@ -63,6 +63,7 @@ import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
 import { ResetPasswordPage }  from './pages/ResetPasswordPage'
+import ConfirmEmailChangePage from './pages/ConfirmEmailChangePage'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { AcceptOwnerInvitePage } from './pages/AcceptOwnerInvitePage'
 import { DashboardPage }   from './pages/DashboardPage'
@@ -202,6 +203,8 @@ export default function App() {
                 since S289. A forgotten password meant permanent lockout. */}
             <Route path="/forgot-password" element={<ForgotPasswordPage />} />
             <Route path="/reset-password"  element={<ResetPasswordPage />} />
+            {/* S630: public — proving the new mailbox happens without a session. */}
+            <Route path="/confirm-email-change" element={<ConfirmEmailChangePage />} />
             <Route path="/invite/:token" element={<AcceptInvitePage />} />
             {/* S605: co-owner invite. PUBLIC — the invitee may have no account
                 yet, which is the entire point of the flow. */}
