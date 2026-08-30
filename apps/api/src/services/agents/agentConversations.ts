@@ -66,6 +66,7 @@ process.env.AGENT_SAMPLER_SEED ||= '424242'
 process.env.AGENT_EVAL_PAUSE_MS ||= '5000'
 
 
+import { ALL_TOOLS } from './tools'
 import { runAgentSession } from './agentSession'
 import { query, queryOne } from '../../db'
 import { buildTestActors } from './agentActors'
@@ -115,13 +116,53 @@ function repeatsTurnOne(turn1: string, turn2: string): boolean {
   return i >= 60 || i >= Math.min(a.length, b.length) * 0.5
 }
 
-interface Result { conv: Conversation; flags: string[]; turn1: string; turn2: string; tools2: string[] }
+interface Result {
+  conv: Conversation; flags: string[]; turn1: string; turn2: string
+  tools1: string[]; tools2: string[]; leaks1: string[]; leaks2: string[]
+}
+
+/**
+ * S630 — WHAT THE AGENT REVEALS.
+ *
+ * Nothing checked whether a reply exposed the machinery behind it. Nic asked
+ * for this after reading a transcript that appeared to end by naming a tool:
+ * that instance turned out to be a log-parsing fault, not the agent, but the
+ * question it raised had no answer in the run — if a reply HAD leaked a tool
+ * name, an internal id, or a column name, every assertion here would still have
+ * passed it.
+ *
+ * A person on the other end of this should never see the plumbing. Tool names,
+ * uuids, snake_case column names, JSON fragments and stack noise are all things
+ * only the system knows, and any of them in a reply is a failure whatever else
+ * the reply got right.
+ */
+const TOOL_NAMES = ALL_TOOLS.map((t) => t.name)
+function leaksInternals(reply: string): string[] {
+  const found: string[] = []
+  if (!reply) return found
+  for (const name of TOOL_NAMES) {
+    if (new RegExp(`\\b${name}\\b`).test(reply)) found.push(`tool:${name}`)
+  }
+  const uuid = reply.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i)
+  if (uuid) found.push(`uuid:${uuid[0].slice(0, 8)}…`)
+  // Internal identifiers the product never says out loud. Deliberately a named
+  // list, not a snake_case regex — "check-in" and "move-in" are English.
+  for (const col of ['unit_id', 'lease_id', 'tenant_id', 'landlord_id', 'property_id',
+                     'payment_method_id', 'charge_id', 'booking_id', 'user_id',
+                     'stripe_customer_id', 'profileId', 'unitId', 'leaseId', 'tenantId']) {
+    if (new RegExp(`\\b${col}\\b`).test(reply)) found.push(`field:${col}`)
+  }
+  if (/\{\s*"|"\s*:\s*"|\[\s*"/.test(reply)) found.push('json-fragment')
+  if (/\b(null|undefined|NaN)\b/.test(reply)) found.push('null-ish')
+  return found
+}
 
 async function runConversation(conv: Conversation, actor: any): Promise<Result> {
   const first: any = await runAgentSession({
     audience: conv.audience, actor, message: conv.opener,
   } as any)
   const turn1 = String(first.reply ?? '')
+  const tools1 = (first.toolInvocations ?? []).map((t: any) => t.name)
 
   const second: any = await runAgentSession({
     audience: conv.audience, actor, message: conv.followUp,
@@ -157,7 +198,15 @@ async function runConversation(conv: Conversation, actor: any): Promise<Result> 
   // previous question is a failure whatever else the reply got right.
   if (repeatsTurnOne(turn1, turn2)) flags.push('REPEATS_TURN_1')
 
-  return { conv, flags, turn1, turn2, tools2 }
+  // S630: applies to BOTH turns and to every conversation. Turn one was
+  // previously unaudited entirely — its tools were never recorded and its reply
+  // was judged only by what it said.
+  const leaks1 = leaksInternals(turn1)
+  const leaks2 = leaksInternals(turn2)
+  if (leaks1.length) flags.push(`LEAKED_TURN_1(${leaks1.join(', ')})`)
+  if (leaks2.length) flags.push(`LEAKED(${leaks2.join(', ')})`)
+
+  return { conv, flags, turn1, turn2, tools1, tools2, leaks1, leaks2 }
 }
 
 const wrap = (s: string, indent: string) =>
@@ -222,6 +271,7 @@ async function main() {
     console.log(wrap(r.turn1, '     '))
     console.log(`${Y}   ▸ ${conv.followUp}${O}`)
     console.log(wrap(r.turn2, '     '))
+    console.log(`${D}     tools(turn 1): ${r.tools1.length ? r.tools1.join(', ') : 'none'}${O}`)
     console.log(`${D}     tools(turn 2): ${r.tools2.length ? r.tools2.join(', ') : 'none'}${O}`)
     if (r.flags.length) console.log(`${R}     ${r.flags.join('  ')}${O}`)
   }
@@ -231,9 +281,43 @@ async function main() {
     await restoreBooking(bookingId, snap)
   }
 
+  // S630: the transcript is DATA, not console output. It was being recovered by
+  // scraping this log, and the scrape twice pulled neighbouring debug lines into
+  // a reply — once making it look as though the agent had named a tool out loud.
+  // Anything that needs the transcripts reads this file instead.
+  const jsonPath = process.env.AGENT_CONV_JSON
+  if (jsonPath) {
+    const fs = await import('fs')
+    fs.writeFileSync(jsonPath, JSON.stringify({
+      seed: process.env.AGENT_SAMPLER_SEED ?? null,
+      db: process.env.DB_NAME ?? null,
+      model: process.env.LLM_MODEL ?? null,
+      total: results.length,
+      passed: results.filter((r) => !r.flags.length).length,
+      conversations: results.map((r) => ({
+        id: r.conv.id, audience: r.conv.audience, behaviour: r.conv.behaviour,
+        pass: r.flags.length === 0, flags: r.flags,
+        turns: [
+          { user: r.conv.opener,   agent: r.turn1, tools: r.tools1, leaks: r.leaks1 },
+          { user: r.conv.followUp, agent: r.turn2, tools: r.tools2, leaks: r.leaks2 },
+        ],
+      })),
+    }, null, 2))
+    console.log(`\n${D}transcripts written to ${jsonPath}${O}`)
+  }
+
   const passed = results.filter((r) => !r.flags.length).length
   console.log(`\n${'═'.repeat(60)}`)
   console.log(`SCORE ${passed}/${results.length} conversations`)
+  const leaked = results.filter((r) => r.leaks1.length || r.leaks2.length)
+  if (leaked.length) {
+    console.log(`\nREVEALED INTERNALS in ${leaked.length} conversation(s):`)
+    for (const r of leaked) {
+      console.log(`  ${r.conv.audience}/${r.conv.id}  ${[...r.leaks1, ...r.leaks2].join(', ')}`)
+    }
+  } else {
+    console.log('no conversation revealed a tool name, id, or field name')
+  }
   const failed = results.filter((r) => r.flags.length)
   if (failed.length) {
     console.log('\nFAILING:')
