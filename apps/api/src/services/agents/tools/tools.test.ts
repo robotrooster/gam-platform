@@ -358,6 +358,36 @@ describe('file_maintenance_request.execute', () => {
     expect(res.message).toMatch(/do NOT file it again/i)
     expect(res.message).toMatch(/24-48 hours/i)
   })
+
+  // S630: the dedup was scoped to a 30-MINUTE window, so "did that ever get
+  // logged?" an hour later fell through it and filed a duplicate. The SQL must
+  // not bound this by time — an unresolved request with the same title on the
+  // same unit is the same problem whatever the clock says. Recurrence is still
+  // handled: completed and cancelled are excluded, so a genuinely new
+  // occurrence files normally.
+  it('dedups on OPEN status alone, with no time window', async () => {
+    let seenSql = ''
+    ;(query as any).mockImplementation((sql: string) => {
+      if (String(sql).includes('maintenance_requests')) {
+        seenSql = String(sql)
+        return Promise.resolve([{ id: 'req-old', status: 'open',
+                                  created_at: '2020-01-01T00:00:00Z' }])
+      }
+      return Promise.resolve([{ unit_id: 'unit-9', unit_number: '12', property_name: 'Maple Court' }])
+    })
+
+    const res: any = await fileMaintenanceRequest.execute(
+      { title: 'Leaking sink', description: 'Kitchen sink drips constantly' },
+      TENANT_ACTOR
+    )
+
+    expect(seenSql).not.toMatch(/INTERVAL/i)
+    expect(seenSql).toMatch(/status NOT IN/i)
+    // Years old, still open — still not filed again.
+    expect(createMaintenanceRequest).not.toHaveBeenCalled()
+    expect(res.alreadyFiled).toBe(true)
+    expect(res.requestId).toBe('req-old')
+  })
 })
 
 describe('read tools scope to the actor', () => {
