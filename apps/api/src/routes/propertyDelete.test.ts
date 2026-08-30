@@ -1,9 +1,13 @@
 /**
- * S630 (Nic): "there's no possible way to delete a property that I can see."
+ * S630 DIRECTIVE (Nic): "Properties are not allowed to be deleted... landlords
+ * are not allowed to delete properties as we need to check the full history of
+ * stuff on the platform. Landlords can transfer property to another landlord,
+ * they can be non-charged for a property if all the units become vacant. That is
+ * it. Once the property is on the platform, it's on there forever."
  *
- * There wasn't. Units had a delete path and properties never did, so a test
- * property left behind by an earlier session's application-fee work sat in his
- * portfolio with no way to remove it.
+ * I had briefly given landlords a delete button. That was wrong. What remains is
+ * an operator-only path for a record that was never a real property — and these
+ * tests hold the line: a landlord is refused however clean the property is.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -48,12 +52,26 @@ describe('DELETE /api/properties/:id', () => {
   const del = (id = propId) => request(buildApp()).delete(`/api/properties/${id}`)
     .set('Authorization', `Bearer ${token}`)
 
-  it('deletes a property that never had a tenancy, and its units with it', async () => {
+  /** The platform operator — the only role that may remove a never-real record. */
+  const adminDel = (id = propId) => request(buildApp()).delete(`/api/properties/${id}`)
+    .set('Authorization', `Bearer ${jwt.sign(
+      { userId, role: 'super_admin', email: 'nic@golddoor.io', permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })}`)
+
+  it('REFUSES a landlord outright — a property is never theirs to delete', async () => {
+    const res = await del()
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/cannot be deleted/i)
+    expect(res.body.error).toMatch(/transfer/i)
+    expect((await db.query('SELECT 1 FROM properties WHERE id=$1', [propId])).rows).toHaveLength(1)
+  })
+
+  it('the operator deletes a property that never had a tenancy, and its units with it', async () => {
     const c = await db.connect()
     try { await c.query('BEGIN'); await seedUnit(c, { propertyId: propId, landlordId }); await c.query('COMMIT') }
     finally { c.release() }
 
-    const res = await del()
+    const res = await adminDel()
     expect(res.status).toBe(200)
     const rows = await db.query('SELECT 1 FROM properties WHERE id=$1', [propId])
     expect(rows.rows).toHaveLength(0)
@@ -72,7 +90,7 @@ describe('DELETE /api/properties/:id', () => {
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
-    const res = await del()
+    const res = await adminDel()
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/lease on record/i)
     expect((await db.query('SELECT 1 FROM properties WHERE id=$1', [propId])).rows).toHaveLength(1)
@@ -91,7 +109,7 @@ describe('DELETE /api/properties/:id', () => {
           total_amount, payer)
        VALUES ($1,$2,'2026-08-01',0,0,0,0,2,10,10,'landlord')`, [landlordId, propId])
 
-    expect((await del()).status).toBe(200)
+    expect((await adminDel()).status).toBe(200)
 
     const ledger = await db.query<any>(
       `SELECT amount::float AS amount, property_id, notes FROM platform_revenue_ledger WHERE notes='test fee'`)
@@ -103,7 +121,7 @@ describe('DELETE /api/properties/:id', () => {
     expect(accr.rows).toHaveLength(0)
   })
 
-  it('another landlord cannot delete it', async () => {
+  it('another landlord cannot delete it either', async () => {
     const c = await db.connect()
     let otherToken = ''
     try {

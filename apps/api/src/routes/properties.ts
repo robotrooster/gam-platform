@@ -2195,20 +2195,38 @@ async function propertyHistoryBlocker(propertyId: string): Promise<string | null
   return null
 }
 
-// DELETE /api/properties/:id — remove a property that never had a tenancy.
+// DELETE /api/properties/:id — PLATFORM OPERATOR ONLY.
 //
-// GAM never erases history, so this refuses the moment anyone lived there, paid,
-// or booked. What it DOES clear is GAM's own bookkeeping about the property:
-// the monthly platform-fee accrual (a working calculation) and the growth
-// snapshots (analytics, recomputed nightly). The platform_revenue_ledger entry
-// is NEVER deleted — it is the book of record and carries a running balance that
+// S630 DIRECTIVE (Nic): "Properties are not allowed to be deleted... landlords
+// are not allowed to delete properties as we need to check the full history of
+// stuff on the platform. Landlords can transfer property to another landlord,
+// they can be non-charged for a property if all the units become vacant. That is
+// it. Once the property is on the platform, it's on there forever."
+//
+// I had briefly put a delete control on the property page. That was wrong and it
+// is gone. A landlord's route out of a property is TRANSFER, or letting it go
+// vacant and stop being billable — never removal, because the platform has to be
+// able to look back at what happened at an address.
+//
+// This survives for one narrow case: a record that was never a real property, of
+// the kind an operator creates while testing. Restricted to super_admin, and it
+// still refuses the moment any tenancy exists.
+//
+// GAM never erases history. What this clears is GAM's own bookkeeping about the
+// property: the monthly platform-fee accrual (a working calculation) and the
+// growth snapshots (analytics, recomputed nightly). The platform_revenue_ledger
+// entry is NEVER deleted — it is the book of record and carries a running balance
 // every later row is computed from; its property_id is nulled instead, so the
 // money survives with its note and only the pointer goes.
-propertiesRouter.delete('/:id', requirePerm('properties.edit'), async (req, res, next) => {
+propertiesRouter.delete('/:id', async (req, res, next) => {
   try {
+    if (req.user!.role !== 'super_admin') {
+      throw new AppError(403,
+        'Properties cannot be deleted. A property stays on the platform so its history stays with ' +
+        'it — transfer it to another landlord instead, or let it go vacant so it stops being billable.')
+    }
     const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
 
     const blocker = await propertyHistoryBlocker(req.params.id)
     if (blocker) {
