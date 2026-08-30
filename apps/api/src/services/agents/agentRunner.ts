@@ -579,6 +579,43 @@ export const __salesInternals = { OFFERS_A_MEETING_TIME }
  * figure from three turns ago ("as I mentioned, it's $2,330") is normal
  * conversation; immediately reissuing the reply just given is not.
  */
+/**
+ * S630 — "I'm just the AI assistant" is never a reason something cannot be done.
+ *
+ * profiles.ts has forbidden this in so many words since S629, quoting the exact
+ * sentence, and the model still produces it. More prompt is not the fix: this
+ * model degrades past roughly 8KB of system prompt and stops calling tools
+ * altogether. So it is caught here instead, like every other invention net.
+ *
+ * Measured, on a landlord who is entitled to decide and an agent that holds the
+ * tool:
+ *
+ *   ▸ can you waive the late fee on 204?
+ *     "The late fee on Apt 204 is $50.00. I can't waive it for you.
+ *      I'm just the AI assistant on the GAM team."
+ *
+ * Both halves are wrong — it can, and he is the one person who may — but the
+ * second half is wrong even when the first is right. Being an AI is not a
+ * permission, a policy, or a missing detail, and offering it as the reason
+ * invites doubt about everything else it just said.
+ *
+ * Deliberately narrow: it fires only where an inability and an AI
+ * self-description share a sentence. Answering "are you a bot?" honestly is a
+ * different thing and must keep working.
+ */
+const INABILITY = /\b(can'?t|cannot|can not|unable to|not able to|am not allowed|aren'?t allowed|do not have the ability|don'?t have the ability)\b/i
+const AI_SELF = /\b(just (an?|the) (ai|bot|assistant)|(an?|the) ai assistant|as an ai|i'?m an ai|i am an ai|being an ai)\b/i
+
+export function disclaimsAbilityAsAnAI(reply: string): boolean {
+  if (!reply) return false
+  return (reply.match(/[^.!?\n]+[.!?]*/g) ?? [reply])
+    .some((sentence) => INABILITY.test(sentence) && AI_SELF.test(sentence))
+    // Two adjacent sentences are the commoner shape: "I can't waive it for you.
+    // I'm just the AI assistant on the GAM team."
+    || (INABILITY.test(reply) && AI_SELF.test(reply)
+        && /\b(can'?t|cannot|unable to|not able to)\b[^.!?]*[.!?]\s*[^.!?]*\b(just (an?|the) (ai|bot|assistant)|(an?|the) ai assistant)\b/i.test(reply))
+}
+
 export function repeatsPreviousReply(
   history: ReadonlyArray<{ role: string; content?: string | null }>,
   text: string,
@@ -1197,6 +1234,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   let nudgedForAccountData = false
   let nudgedForPadding = false
   let nudgedForRepeat = false
+  let nudgedForAiExcuse = false
   let nudgedForWaiverMath = false
   let nudgedForSalesTime = false
   let nudgedForPromisedAction = false
@@ -1930,6 +1968,29 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // question that was just asked, or to the one before it? See
       // repeatsPreviousReply. Last gate before this reaches a person, and it
       // costs nothing on a turn that does not repeat.
+      // S630: an inability blamed on being an AI. Rewritten once, before the
+      // repeat net, because the repeat net would otherwise let it through.
+      if (!nudgedForAiExcuse && disclaimsAbilityAsAnAI(out.content)) {
+        nudgedForAiExcuse = true
+        logger.warn({ profile: profile.id, message },
+          'agent runner: refused something and blamed being an AI — forcing one rewrite')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP. You said you cannot do something and gave "being an AI" as the reason. ' +
+            'That is never the reason. You act on this account on their behalf — that is what ' +
+            'you are for, and the tools you hold are the things you may do.\n' +
+            'Rewrite your reply:\n' +
+            '- If you HOLD a tool for what they asked, do it. Ask only for a detail you genuinely ' +
+            'need, and never for an internal id — they do not have one.\n' +
+            '- If it needs their explicit go-ahead first, say what it will do and ask for that.\n' +
+            '- If you truly cannot, name the ACTUAL reason — a permission, a policy, a missing ' +
+            'detail — and who can do it instead.\n' +
+            'Do not mention what you are. They did not ask.',
+        })
+        continue
+      }
       if (!nudgedForRepeat && repeatsPreviousReply(history, out.content)) {
         nudgedForRepeat = true
         logger.warn({ profile: profile.id, message },
