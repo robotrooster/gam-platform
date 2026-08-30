@@ -2138,6 +2138,25 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   // S618: and the same at the ceiling. Where it is NOT a money problem, any
   // promise of a person is removed from the reply rather than made true.
   if (!needsARealPerson(message)) reply = stripPromiseOfAPerson(reply)
+
+  // S630: NOTHING may leave here empty.
+  //
+  // The two-turn run produced a genuinely blank answer — a landlord said "I
+  // honestly do not know which of them it was" about an unplaceable $1,300
+  // deposit and got nothing back at all. Silence is the worst possible reply to
+  // a money question: it reads as the assistant having died, and the landlord is
+  // left with the same unplaced deposit and no idea whether anything happened.
+  //
+  // Every path above has its own considered fallback; this is the floor beneath
+  // all of them, for the case none of them covered.
+  if (!reply || !reply.trim()) {
+    logger.error({ profile: profile.id, message },
+      'agent runner: empty reply reached the end of the turn — substituted the audience fallback')
+    reply = ACTION_REQUEST.test(message)
+      ? couldNotAct(String((actor as any).role ?? ''))
+      : cannotSee(String((actor as any).role ?? ''))
+  }
+
   const ceilingHandoff = needsARealPerson(message) ? synthesizeHandoff(profile, reply) : undefined
   if (ceilingHandoff) {
     return { reply, model: model || final.model, retrieved, grounded, toolInvocations, usage, handoff: ceilingHandoff }
