@@ -18,8 +18,8 @@ const LANDLORD = {
 } as any
 
 const UNITS = [
-  { id: '11111111-1111-4111-8111-111111111111', unit_number: 'RV 07' },
-  { id: '22222222-2222-4222-8222-222222222222', unit_number: 'Apt 204' },
+  { id: '11111111-1111-4111-8111-111111111111', label: 'RV 07' },
+  { id: '22222222-2222-4222-8222-222222222222', label: 'Apt 204' },
 ]
 
 let sent: any = null
@@ -59,7 +59,7 @@ describe('dispatchPortalAction — unit id from what the landlord said', () => {
       'set_eviction_mode', { unitId: 'unit_12345', enable: true, confirm: true }, LANDLORD)
     expect(res.ok).toBe(false)
     expect(sent).toBeNull()                       // nothing was dispatched
-    expect(res.error).toMatch(/no unit "unit_12345"/i)
+    expect(res.error).toMatch(/nothing on this account matches "unit_12345"/i)
     expect(res.error).toMatch(/RV 07/)            // tells the agent what IS there
     expect(res.error).toMatch(/never invent an id/i)
   })
@@ -67,14 +67,14 @@ describe('dispatchPortalAction — unit id from what the landlord said', () => {
   // Eviction is not a thing to guess at.
   it('refuses rather than choosing between two units with the same number', async () => {
     ;(query as any).mockResolvedValue([
-      { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', unit_number: 'RV 07' },
-      { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', unit_number: 'Lot 7' },
+      { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', label: 'RV 07' },
+      { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', label: 'Lot 7' },
     ])
     const res: any = await dispatchPortalAction(
       'set_eviction_mode', { unitId: '7', enable: true, confirm: true }, LANDLORD)
     expect(res.ok).toBe(false)
     expect(sent).toBeNull()
-    expect(res.error).toMatch(/more than one unit/i)
+    expect(res.error).toMatch(/matches more than one/i)
     expect(res.error).toMatch(/RV 07, Lot 7/)
     expect(res.error).toMatch(/Do NOT pick one/i)
   })
@@ -88,6 +88,40 @@ describe('dispatchPortalAction — unit id from what the landlord said', () => {
     const params = (query as any).mock.calls[0][1]
     expect(sql).toMatch(/p\.landlord_id = \$1/)
     expect(params).toEqual(['ll-1'])
+  })
+
+  // S630: leases and properties are named in words, not numbers — "the Alvarez
+  // lease", "Oak Park" — and 18 lease actions and 10 property actions carried
+  // the same "from a lookup" id the landlord does not have.
+  it('resolves a lease by the tenant name the landlord used', async () => {
+    ;(query as any).mockResolvedValue([
+      { id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', label: 'Apt 204 — Maria Alvarez' },
+      { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', label: 'RV 07 — Bob Chen' },
+    ])
+    await dispatchPortalAction('update_lease', { leaseId: 'Alvarez', rentAmount: 1050 }, LANDLORD)
+    expect(sent.url).toContain('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+  })
+
+  it('resolves a lease by its unit number too', async () => {
+    ;(query as any).mockResolvedValue([
+      { id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', label: 'Apt 204 — Maria Alvarez' },
+      { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', label: 'RV 07 — Bob Chen' },
+    ])
+    await dispatchPortalAction('update_lease', { leaseId: '204', rentAmount: 1050 }, LANDLORD)
+    expect(sent.url).toContain('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+  })
+
+  it('refuses a name that matches two leases rather than picking one', async () => {
+    ;(query as any).mockResolvedValue([
+      { id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', label: 'Apt 204 — Sam Chen' },
+      { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', label: 'RV 07 — Bob Chen' },
+    ])
+    const res: any = await dispatchPortalAction(
+      'update_lease', { leaseId: 'Chen', rentAmount: 1050 }, LANDLORD)
+    expect(res.ok).toBe(false)
+    expect(sent).toBeNull()
+    expect(res.error).toMatch(/matches more than one/i)
+    expect(res.error).toMatch(/Do NOT pick one/i)
   })
 
   it('asks for the number when none was given', async () => {

@@ -99,7 +99,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'This puts a real charge on somebody’s ledger, so read back who, how much and what for, and ' +
       'get an explicit yes. It is not for rent and not for a utility bill.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       amount: { type: 'number', description: 'How much, in dollars.' },
       description: { type: 'string', description: 'What the charge is for, in their words — the tenant sees this.' },
     },
@@ -169,7 +169,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'lets the tenant answer. Use for "let apt 204 know I\u2019ll renew them". It does NOT set the new ' +
       'rent or the new term — the landlord offers those separately, so do not quote a figure here ' +
       'and do not imply one has been agreed.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -182,7 +182,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'legal notice with a clock attached, not a note — read back the tenant, the unit and the end ' +
       'date, say plainly that it is formal notice of non-renewal, and get an unambiguous yes. If the ' +
       'landlord is only thinking about it, do not call this.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -194,7 +194,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Pause an active lease — a seasonal site nobody is on over winter, a tenant away for months. ' +
       'Billing stops while it is hibernating and the lease is still theirs. Use resume_lease to ' +
       'start it again.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -207,7 +207,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'back into use. Use for "put lot 12 back on" or "the Hendersons are back for the winter".\n' +
       'Rent starts being charged again from the resume date, so say which date that is — a lease ' +
       'resumed a week early bills a week nobody was living there.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -305,7 +305,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'utilities are billed. Use for "start this month\u2019s readings at Sunset Palms". Leave ' +
       'cycleMonth off for the current cycle.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       cycleMonth: { type: 'string', description: 'YYYY-MM-01. Omit for the current cycle.' },
     },
     required: ['propertyId'],
@@ -502,7 +502,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'plan; the narrower scopes do not. They can revoke an invitation that has not been accepted.',
     params: {
       pmCompanyId: { type: 'string', description: 'The management company id, from a lookup — never asked of the landlord.' },
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       invitedEmail: { type: 'string', description: 'The email address at the management company to send it to.' },
       proposedScope: { type: 'string', description: 'What the company would be taking on. Defaults to manage, which is full day-to-day management.' },
       proposedFeePlanId: { type: 'string', description: 'The fee plan being proposed, if there is one. Only applies to the manage scope.' },
@@ -615,7 +615,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'and saying otherwise would be wrong. For a policy that differs by unit type at the same ' +
       'property, use set_late_fee_policy instead.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       name: { type: 'string', description: 'New name.' },
       street1: { type: 'string', description: 'Street address.' },
       street2: { type: 'string', description: 'Suite or building line.' },
@@ -643,7 +643,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'isRefundable separates a deposit from a fee, and dueTiming says when it lands — move_in, ' +
       'monthly_ongoing, move_out or other. Both change what the tenant owes, so ask rather than guess.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       feeType: { type: 'string', description: 'pet_deposit, key_deposit, cleaning_deposit, move_in_fee, cleaning_fee, pet_fee, application_fee, amenity_fee, hoa_transfer_fee, lease_prep_fee, pet_rent, parking_rent, storage_rent, amenity_fee_monthly, trash_fee, pest_control_fee, technology_fee, last_month_rent, early_termination_fee, other_fee' },
       amount: { type: 'number', description: 'How much, in dollars.' },
       isRefundable: { type: 'boolean', description: 'true for a deposit they get back, false for a fee they do not.' },
@@ -684,7 +684,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'accrualPeriod are one decision — send all three or none. capAmount and capType likewise.\n' +
       'Leases already signed keep their own stamped terms; this changes new ones.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       unitType: { type: 'string', description: 'apartment, single_family, rv_spot, campsite, mobile_home, hotel_room, storage, parking, boat_slip, land_lot, commercial' },
       noLateFee: { type: 'boolean', description: 'true means this kind of unit has no late fee at all. Send nothing else with it.' },
       graceDays: { type: 'integer', description: 'Days past due before a fee applies. 0 to 60.' },
@@ -729,7 +729,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'homes, dwellingOwnership is the difference between renting them the LOT and renting them the ' +
       'home on it, so ask which rather than assuming.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       unitType: { type: 'string', description: 'apartment, single_family, rv_spot, campsite, mobile_home, hotel_room, storage, parking, boat_slip, land_lot, commercial' },
       name: { type: 'string', description: 'What they call this class, in their words.' },
       bedrooms: { type: 'integer', description: 'Bedrooms, for a dwelling.' },
@@ -817,7 +817,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'plainly rather than sending it and reporting a change that did not happen. The manual fee is ' +
       'the cash, check and money-order handling fee and it defaults to the tenant.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       achFeePayer: { type: 'string', description: 'landlord or tenant — who covers the bank-transfer fee.' },
       manualFeePayer: { type: 'string', description: 'landlord or tenant — who covers the cash, check and money-order fee.' },
       ownerBankAccountId: { type: 'string', description: 'The bank account this property pays out to, from a lookup. It must belong to the owner and be active.' },
@@ -837,7 +837,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'and the property must not be assigned to a management company. If either is not true the ' +
       'system says so; read that back rather than working around it.',
     params: {
-      propertyId: { type: 'string', description: 'The property id, from a lookup.' },
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
       userId: { type: 'string', description: 'The team member\u2019s user id, or null to return the property to the owner.' },
     },
     required: ['propertyId', 'userId'],
@@ -853,7 +853,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'This has a consequence worth saying out loud: while the window is open, tenants who were ' +
       'already living there can be brought on without a background check. After it closes, EVERY new ' +
       'tenant at that property has to screen. Do not close it if they still have people to enter.',
-    params: { propertyId: { type: 'string', description: 'The property id, from a lookup.' } },
+    params: { propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' } },
     required: ['propertyId'],
     confirmFirst: true,
   },
@@ -1290,7 +1290,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'This is the landlord\u2019s decision to make and yours to carry out — never suggest a waiver to a ' +
       'tenant and never imply one is coming. Read back who, how much and what for.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       amount: { type: 'number', description: 'How much to credit, in dollars.' },
       category: { type: 'string', description: 'What kind of credit it is — how the landlord would categorise it.' },
       reason: { type: 'string', description: 'Why, in their words.' },
@@ -2177,7 +2177,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Setting status to terminated or expired ENDS the tenancy: every tenant comes off it and the ' +
       'unit goes vacant. Never do that as part of some other edit.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       rentAmount: { type: 'number', description: 'New monthly rent.' },
       securityDeposit: { type: 'number', description: 'New deposit amount.' },
       startDate: { type: 'string', description: 'Start date, YYYY-MM-DD.' },
@@ -2207,7 +2207,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'or the split is wrong, so read the numbers back rather than adjusting one to make it fit.\n' +
       'The list REPLACES whatever was there. Send an empty list to clear the split entirely.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       components: { type: 'array', description: 'The parts. Each has a kind, a label the tenant reads, and an amount. They must total the lease rent.' },
     },
     required: ['leaseId', 'components'],
@@ -2223,7 +2223,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'The reason is the record of a deal somebody made. Put down what the landlord actually said, ' +
       'not a tidied version — this is what gets read back in a year when nobody remembers.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       feeId: { type: 'string', description: 'The fee id on that lease, from a lookup.' },
       override_reason: { type: 'string', description: 'Why this lease\u2019s fee is different, in their words.' },
     },
@@ -2242,7 +2242,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'is the better fit: it records the incident date and the kind of charge alongside the money, ' +
       'and this one does not.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       amount: { type: 'number', description: 'How much, in dollars.' },
       description: { type: 'string', description: 'What it is for. The tenant reads this.' },
       dueDate: { type: 'string', description: 'When it is due, YYYY-MM-DD.' },
@@ -2264,7 +2264,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'ONE carried balance per lease. A second is almost always somebody entering the same debt ' +
       'twice, and the system refuses it.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       amount: { type: 'number', description: 'What they already owed when the landlord moved over.' },
       description: { type: 'string', description: 'What it is, so the tenant recognises it.' },
       dueDate: { type: 'string', description: 'When it is due, YYYY-MM-DD.' },
@@ -2284,7 +2284,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'isPriority means they get first refusal on that spot for the next season. That is a promise to ' +
       'a person, so only set it if the landlord says so.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       seasonStartMonth: { type: 'integer', description: 'Month the season starts, 1-12.' },
       seasonStartDay: { type: 'integer', description: 'Day of that month, 1-31.' },
       seasonEndMonth: { type: 'integer', description: 'Month the season ends, 1-12.' },
@@ -2301,7 +2301,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     description:
       'Take the seasonal arrangement off a lease, when they are staying year-round now or are not ' +
       'coming back. This also drops any first-refusal they had on the spot — say so.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -2317,7 +2317,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'that reason, the answer is to do the walkthrough, not to try again. An RV spot is exempt, ' +
       'because the pull-out meter read IS its walkthrough.\n' +
       'This opens a draft. Nothing is refunded and nothing is deducted until it is finalised.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -2335,7 +2335,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'The list REPLACES the deductions on the draft; send all of them, not just the new one. Nothing ' +
       'is final until the return is finalised.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       damageLines: { type: 'array', description: 'The deductions. Each needs a description, an amount, and the document ids of its photos or receipts.' },
       notes: { type: 'string', description: 'Notes on the return, in the landlord\u2019s words.' },
     },
@@ -2356,7 +2356,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'A staff member may finalise up to the landlord\u2019s own approval threshold; above it, it parks ' +
       'and waits for the landlord. If it comes back parked, that is not a failure — tell them it is ' +
       'waiting on the owner.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },
@@ -2373,7 +2373,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'and the tenant has to ask first.\n' +
       'This is the landlord\u2019s call. Never offer it to a tenant and never hint that it might happen.',
     params: {
-      leaseId: { type: 'string', description: 'The lease id, from a lookup.' },
+      leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' },
       reason: { type: 'string', description: 'Why it is being waived, for the record.' },
     },
     required: ['leaseId'],
@@ -2389,7 +2389,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'This ASKS them to complete one; it does not run a check and it decides nothing. The screening ' +
       'decision itself is never yours to make — when the result comes back, the landlord records ' +
       'approve or decline themselves.',
-    params: { leaseId: { type: 'string', description: 'The lease id, from a lookup.' } },
+    params: { leaseId: { type: 'string', description: 'The lease as the landlord refers to it — the unit NUMBER ("204") or the tenant\'s name ("the Alvarez lease") is fine. You do NOT need to look up an id first, and you must never ask them for one. A lease id from a previous lookup also works.' } },
     required: ['leaseId'],
     confirmFirst: true,
   },

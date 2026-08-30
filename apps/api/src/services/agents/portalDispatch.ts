@@ -76,7 +76,7 @@ export interface DispatchResult {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const norm = (v: string) => v.toLowerCase().replace(/\s+/g, ' ').trim()
+const norm = (v: unknown) => String(v ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
 
 /**
  * A unit id from what the landlord actually said. See the note at the call site.
@@ -85,37 +85,68 @@ const norm = (v: string) => v.toLowerCase().replace(/\s+/g, ' ').trim()
  * eviction: an exact number match, or a unique numeric match, and otherwise a
  * refusal listing the real candidates. It never guesses between two units.
  */
-async function resolveUnitId(
-  raw: unknown, actor: AgentActor,
-): Promise<{ ok: true; unitId: string } | { ok: false; refusal: DispatchResult }> {
+const ASK: Record<string, string> = {
+  unitId:     'Which unit? Ask them for the unit number — you do not need an id.',
+  leaseId:    'Which lease? Ask which unit or which tenant — you do not need an id.',
+  propertyId: 'Which property? Ask them for its name — you do not need an id.',
+}
+
+/**
+ * SQL per id type. Each returns { id, label } where label is what the LANDLORD
+ * would call the thing, so a refusal can list real options back to them.
+ */
+const LOOKUP: Record<string, string> = {
+  unitId: `SELECT un.id, un.unit_number AS label
+             FROM units un
+             JOIN properties p ON p.id = un.property_id
+            WHERE p.landlord_id = $1 AND un.retired_at IS NULL`,
+  // A lease is named by the unit it is on, or by whoever signed it. Ended
+  // leases are excluded: "204's lease" means the live one.
+  leaseId: `SELECT l.id,
+                   un.unit_number || COALESCE(' — ' || NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), '') AS label
+              FROM leases l
+              JOIN units un ON un.id = l.unit_id
+              JOIN properties p ON p.id = un.property_id
+              LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role = 'primary'
+              LEFT JOIN tenants t ON t.id = lt.tenant_id
+              LEFT JOIN users u ON u.id = t.user_id
+             WHERE p.landlord_id = $1 AND l.status IN ('active', 'pending')`,
+  propertyId: `SELECT p.id, p.name AS label
+                 FROM properties p
+                WHERE p.landlord_id = $1`,
+}
+
+async function resolveHumanId(
+  key: 'unitId' | 'leaseId' | 'propertyId', raw: unknown, actor: AgentActor,
+): Promise<{ ok: true; id: string } | { ok: false; refusal: DispatchResult }> {
   const given = String(raw ?? '').trim()
   if (!given) {
-    return { ok: false, refusal: { ok: false, refused: 'missing_param',
-      error: 'Which unit? Ask them for the unit number — you do not need an id.' } }
+    return { ok: false, refusal: { ok: false, refused: 'missing_param', error: ASK[key] } }
   }
   // Already a real id from a lookup; S628's traceability guard has vetted it.
-  if (UUID_RE.test(given)) return { ok: true, unitId: given }
+  if (UUID_RE.test(given)) return { ok: true, id: given }
 
-  let rows: Array<{ id: string; unit_number: string }> = []
+  let rows: Array<{ id: string; label: string }> = []
   try {
-    rows = await query<{ id: string; unit_number: string }>(
-      `SELECT un.id, un.unit_number
-         FROM units un
-         JOIN properties p ON p.id = un.property_id
-        WHERE p.landlord_id = $1 AND un.retired_at IS NULL`,
-      [actor.profileId])
+    rows = await query<{ id: string; label: string }>(LOOKUP[key], [actor.profileId])
   } catch (e) {
     // Fail CLOSED. If the unit list cannot be read there is no safe way to turn
     // a spoken number into an id, and guessing is the one thing this must not
     // do — the actions behind it include eviction.
-    logger.error({ err: e, landlordId: actor.profileId },
-      'agent dispatch: could not resolve a unit number — refusing rather than guessing')
+    logger.error({ err: e, key, landlordId: actor.profileId },
+      'agent dispatch: could not resolve a spoken identifier — refusing rather than guessing')
     return { ok: false, refusal: { ok: false, refused: 'missing_param',
-      error: 'I could not confirm which unit that is. Ask them for the unit number and try again.' } }
+      error: 'I could not confirm which one that is. Ask them, and try again.' } }
   }
 
-  const exact = rows.filter((r) => norm(r.unit_number) === norm(given))
-  if (exact.length === 1) return { ok: true, unitId: exact[0].id }
+  const exact = rows.filter((r) => norm(r.label) === norm(given))
+  if (exact.length === 1) return { ok: true, id: exact[0].id }
+
+  // A lease or a property is named in words — "the Alvarez lease", "Oak Park".
+  // Containment either way, still unique-or-refuse.
+  const wordy = rows.filter((r) =>
+    norm(r.label).includes(norm(given)) || norm(given).includes(norm(r.label)))
+  if (wordy.length === 1) return { ok: true, id: wordy[0].id }
 
   // "spot 7" against "RV 07" — the number is the part a landlord means. Only
   // when it lands on exactly one unit; two matches is a question, not a guess.
@@ -123,21 +154,26 @@ async function resolveUnitId(
   if (digits) {
     const n = parseInt(digits[0], 10)
     const byNumber = rows.filter((r) => {
-      const d = String(r.unit_number).match(/\d+/)
+      const d = String(r.label).match(/\d+/)
       return d != null && parseInt(d[0], 10) === n
     })
-    if (byNumber.length === 1) return { ok: true, unitId: byNumber[0].id }
+    if (byNumber.length === 1) return { ok: true, id: byNumber[0].id }
     if (byNumber.length > 1) {
       return { ok: false, refusal: { ok: false, refused: 'missing_param',
-        error: `"${given}" matches more than one unit — ${byNumber.map((r) => r.unit_number).join(', ')}. ` +
-               'Ask which one they mean and use that number. Do NOT pick one.' } }
+        error: `"${given}" matches more than one — ${byNumber.map((r) => r.label).join(', ')}. ` +
+               'Ask which one they mean. Do NOT pick one.' } }
     }
   }
+  if (wordy.length > 1) {
+    return { ok: false, refusal: { ok: false, refused: 'missing_param',
+      error: `"${given}" matches more than one — ${wordy.map((r) => r.label).join(', ')}. ` +
+             'Ask which one they mean. Do NOT pick one.' } }
+  }
 
-  const known = rows.map((r) => r.unit_number).filter(Boolean).sort()
+  const known = rows.map((r) => r.label).filter(Boolean).sort()
   return { ok: false, refusal: { ok: false, refused: 'missing_param',
-    error: `There is no unit "${given}" on this account. ` +
-           (known.length ? `Their units are: ${known.join(', ')}. ` : '') +
+    error: `Nothing on this account matches "${given}". ` +
+           (known.length ? `They have: ${known.slice(0, 25).join(', ')}. ` : '') +
            'Ask which one they mean. Never invent an id.' } }
 }
 
@@ -200,10 +236,13 @@ export async function dispatchPortalAction(
   // landlord_id, so it cannot reach a neighbour's unit no matter what the model
   // passes. An ambiguous or unknown number is REFUSED with the real list, which
   // turns a dead end into a question the landlord can answer.
-  if (actor.role === 'landlord' && (action.pathParams ?? []).includes('unitId')) {
-    const resolved = await resolveUnitId(args.unitId, actor)
-    if (!resolved.ok) return resolved.refusal
-    args = { ...args, unitId: resolved.unitId }
+  if (actor.role === 'landlord') {
+    for (const key of ['unitId', 'leaseId', 'propertyId'] as const) {
+      if (!(action.pathParams ?? []).includes(key)) continue
+      const resolved = await resolveHumanId(key, args[key], actor)
+      if (!resolved.ok) return resolved.refusal
+      args = { ...args, [key]: resolved.id }
+    }
   }
 
   // Path params are substituted; everything else becomes the body. A missing

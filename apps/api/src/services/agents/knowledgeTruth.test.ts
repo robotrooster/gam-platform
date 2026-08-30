@@ -41,6 +41,22 @@ const CORPUS = ARTICLES.map((a) => a.text).join('\n')
 describe('the knowledge base quotes the live fee schedule', () => {
   it('has articles to check', () => expect(ARTICLES.length).toBeGreaterThan(50))
 
+  // S630 DIRECTIVE (Nic): "It's ten dollars per Connect account. So if several
+  // properties deposit to the same Stripe account, it's only ten dollar minimum
+  // for that setup." Two SALES articles still said per-property after the code
+  // changed — Lucy would have quoted a prospect a price GAM does not charge.
+  it('never describes the platform minimum as per property', () => {
+    // Targeted at the phrasing, not mere co-occurrence: the same sentence
+    // legitimately says the ACH fee payer "is set per property".
+    const BAD = /(per[- ]propert\w*[^.]{0,30}minimum|minimum[^.]{0,30}per[- ]propert\w*|\$10\s*(a|per)\s*propert\w*)/i
+    const offenders = CORPUS.split('\n')
+      // "…per payout account — NOT per property" is the correction, not the
+      // error, and saying so plainly is the point.
+      .map((l) => l.replace(/not per[- ]propert\w*/gi, ''))
+      .filter((l) => BAD.test(l))
+    expect(offenders, offenders.join('\n')).toHaveLength(0)
+  })
+
   it('states the ACH fee as the constant, never a different flat figure', () => {
     // Standing directive: $6 flat ACH is ironclad revenue.
     expect(PROCESSING_FEES.ACH_FLAT).toBe(6)
