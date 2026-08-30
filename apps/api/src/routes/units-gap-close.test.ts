@@ -853,11 +853,62 @@ describe('DELETE /api/units/:id', () => {
     expect(res.status).toBe(409)
   })
 
-  it('cross-landlord → 403', async () => {
+  // S630 (Nic): a space with no history of its own must stay deletable even when
+  // it shares a RUBS master that HAS been read. The guard asked whether the METER
+  // had readings, so one master reading taken for a neighbour walled off every
+  // unit on the meter. Nic hit this retiring RV 21; it slipped through only
+  // because Oak Park's water masters were still unread.
+  it('deletes a unit on a SHARED read meter — the readings are its neighbours\' history', async () => {
     const f = await seed()
-    const res = await request(buildApp()).delete(`/api/units/${f.bUnitId}`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(res.status).toBe(403)
+    const app = buildApp()
+    const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'Shared 01', quantity: 1, unitType: 'rv_spot', rentAmount: 440 })
+    const id = made.body.data.id
+
+    const c = await db.connect()
+    try {
+      const m = await c.query<any>(
+        `INSERT INTO utility_meters (property_id, utility_type, billing_method, rubs_allocation_method, label)
+         VALUES ($1,'water','rubs','occupant_count','master') RETURNING id`, [f.aPropId])
+      const meterId = m.rows[0].id
+      // The master serves the new unit AND an existing neighbour.
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2),($1,$3)`,
+        [meterId, id, f.aUnitId])
+      await c.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_value, reading_date, billing_cycle_month, reason, created_by_user_id)
+         VALUES ($1, 1000, '2026-05-01', '2026-05-01', 'monthly_cycle', $2)`, [meterId, f.aUid])
+    } finally { c.release() }
+
+    const res = await request(app).delete(`/api/units/${id}`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    const { rows } = await db.query('SELECT 1 FROM units WHERE id=$1', [id])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('REFUSES a unit whose DEDICATED submeter has been read — that is its own history', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const made = await request(app).post('/api/units').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: 'Sub 01', quantity: 1, unitType: 'rv_spot', rentAmount: 440 })
+    const id = made.body.data.id
+
+    const c = await db.connect()
+    try {
+      const m = await c.query<any>(
+        `INSERT INTO utility_meters (property_id, utility_type, billing_method, label)
+         VALUES ($1,'electric','submeter','Sub 01 electric') RETURNING id`, [f.aPropId])
+      const meterId = m.rows[0].id
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [meterId, id])
+      await c.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_value, reading_date, billing_cycle_month, reason, created_by_user_id)
+         VALUES ($1, 500, '2026-05-01', '2026-05-01', 'monthly_cycle', $2)`, [meterId, f.aUid])
+    } finally { c.release() }
+
+    const res = await request(app).delete(`/api/units/${id}`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/meter/i)
   })
 })
 

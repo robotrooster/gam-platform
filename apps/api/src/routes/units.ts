@@ -527,11 +527,28 @@ async function unitHistoryBlocker(unitId: string): Promise<string | null> {
     // A meter blocks only once it carries something real: a READING or a BILL.
     // Until then the unit is still being set up, which is exactly the rule this
     // function was written to express.
+    // S630: this asked whether the METER had readings, not whether the UNIT did.
+    // A space on a shared RUBS master became undeletable the moment anyone read
+    // that master for any neighbour — history belonging to other units, blocking
+    // a unit that has none of its own. Nic hit it retiring RV 21, which slipped
+    // through only because Oak Park's water masters had not been read yet; the
+    // first master reading would have walled off every unit on the meter.
+    //
+    // What is genuinely this unit's history: a bill raised against it, or a
+    // reading on a meter that serves ONLY it (a dedicated submeter, where the
+    // meter's readings are the unit's readings).
     { label: 'a utility meter with readings',
       sql: `SELECT 1 FROM utility_meter_units mu
              WHERE mu.unit_id = $1
-               AND (EXISTS (SELECT 1 FROM utility_meter_readings r WHERE r.meter_id = mu.meter_id)
-                 OR EXISTS (SELECT 1 FROM utility_bills b WHERE b.meter_id = mu.meter_id))
+               AND (
+                 EXISTS (SELECT 1 FROM utility_bills b WHERE b.unit_id = $1)
+                 OR (
+                   EXISTS (SELECT 1 FROM utility_meter_readings r
+                            WHERE r.meter_id = mu.meter_id)
+                   AND (SELECT COUNT(*) FROM utility_meter_units mu2
+                         WHERE mu2.meter_id = mu.meter_id) = 1
+                 )
+               )
              LIMIT 1` },
     { label: 'a maintenance request', sql: 'SELECT 1 FROM maintenance_requests WHERE unit_id=$1 LIMIT 1' },
   ]
