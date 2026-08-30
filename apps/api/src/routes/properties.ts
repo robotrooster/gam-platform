@@ -2163,3 +2163,81 @@ propertiesRouter.post('/transfer-request/:requestId/decline', async (req, res, n
     res.json({ success: true, data: { cancelled: true } })
   } catch (e) { next(e) }
 })
+
+/**
+ * Whatever real history a property carries, in the landlord's words.
+ *
+ * S630 (Nic): "there's no possible way to delete a property that I can see."
+ * There wasn't — units had a delete path and properties never did, so a test
+ * property created during an earlier session's application-fee work sat in his
+ * portfolio with no way to remove it.
+ *
+ * TENANCY is what makes a property undeletable: somebody lived there, paid, or
+ * booked. GAM's own bookkeeping about the property — the monthly fee accrual and
+ * the analytics snapshots — is not the landlord's history and does not block;
+ * those are handled below.
+ */
+async function propertyHistoryBlocker(propertyId: string): Promise<string | null> {
+  const probes: Array<{ label: string; sql: string }> = [
+    { label: 'a lease',    sql: `SELECT 1 FROM leases l JOIN units u ON u.id=l.unit_id WHERE u.property_id=$1 LIMIT 1` },
+    { label: 'a payment',  sql: `SELECT 1 FROM payments p WHERE p.unit_id IN (SELECT id FROM units WHERE property_id=$1) LIMIT 1` },
+    { label: 'a booking',  sql: `SELECT 1 FROM unit_bookings b WHERE b.unit_id IN (SELECT id FROM units WHERE property_id=$1) LIMIT 1` },
+    { label: 'a security deposit', sql: `SELECT 1 FROM security_deposits d WHERE d.unit_id IN (SELECT id FROM units WHERE property_id=$1) LIMIT 1` },
+    { label: 'a maintenance request', sql: `SELECT 1 FROM maintenance_requests m WHERE m.unit_id IN (SELECT id FROM units WHERE property_id=$1) LIMIT 1` },
+    { label: 'a tenant invited to it', sql: `SELECT 1 FROM pending_tenant_intents i WHERE i.property_id=$1 AND i.cancelled_at IS NULL LIMIT 1` },
+    { label: 'a utility meter with readings',
+      sql: `SELECT 1 FROM utility_meters m JOIN utility_meter_readings r ON r.meter_id=m.id WHERE m.property_id=$1 LIMIT 1` },
+  ]
+  for (const p of probes) {
+    const hit = await queryOne<{ one: number }>(p.sql.replace('SELECT 1', 'SELECT 1 AS one'), [propertyId])
+    if (hit) return p.label
+  }
+  return null
+}
+
+// DELETE /api/properties/:id — remove a property that never had a tenancy.
+//
+// GAM never erases history, so this refuses the moment anyone lived there, paid,
+// or booked. What it DOES clear is GAM's own bookkeeping about the property:
+// the monthly platform-fee accrual (a working calculation) and the growth
+// snapshots (analytics, recomputed nightly). The platform_revenue_ledger entry
+// is NEVER deleted — it is the book of record and carries a running balance that
+// every later row is computed from; its property_id is nulled instead, so the
+// money survives with its note and only the pointer goes.
+propertiesRouter.delete('/:id', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const blocker = await propertyHistoryBlocker(req.params.id)
+    if (blocker) {
+      throw new AppError(409,
+        `“${prop.name}” has ${blocker} on record, so it can't be deleted — GAM keeps that history. ` +
+        `If it is no longer yours, transfer it instead.`)
+    }
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        `UPDATE platform_revenue_ledger SET property_id = NULL WHERE property_id = $1`, [req.params.id])
+      await client.query(`DELETE FROM platform_fee_accruals   WHERE property_id = $1`, [req.params.id])
+      await client.query(`DELETE FROM property_growth_snapshots WHERE property_id = $1`, [req.params.id])
+      await client.query(`DELETE FROM utility_meter_units WHERE meter_id IN (SELECT id FROM utility_meters WHERE property_id=$1)`, [req.params.id])
+      await client.query(`DELETE FROM utility_meters WHERE property_id = $1`, [req.params.id])
+      await client.query(`DELETE FROM units      WHERE property_id = $1`, [req.params.id])
+      await client.query(`DELETE FROM properties WHERE id = $1`, [req.params.id])
+      await client.query(
+        `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+         VALUES ($1,'property_deleted','property',$2,$3::jsonb,'{}'::jsonb)`,
+        [req.user!.userId, req.params.id,
+         JSON.stringify({ name: prop.name, street1: prop.street1, landlord_id: prop.landlord_id })]
+      ).catch(() => {})
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    res.json({ success: true, data: { deleted: true, name: prop.name } })
+  } catch (e) { next(e) }
+})

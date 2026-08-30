@@ -17,6 +17,33 @@ import { apiPost } from '../lib/api'
  * JWT — the landlord signs in fresh, which also means they walk back through
  * the mandatory email 2FA.
  */
+/**
+ * S630 (Nic): "every single character that I type, it will type one character on
+ * that line, and then the cursor gets moved up to the previous line."
+ *
+ * Shell was declared INSIDE ResetPasswordPage, so every keystroke re-rendered the
+ * page, produced a NEW component type, and React unmounted the whole subtree and
+ * mounted a fresh one. The inputs were destroyed and recreated on every letter —
+ * hence one character landing and the caret jumping back to the first field.
+ * Nobody could set a password through this.
+ *
+ * Declared at module scope it is one stable type for the life of the module, so
+ * the inputs are the same DOM nodes across renders and keep their focus.
+ */
+function Shell({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420}}>
+        <div style={{textAlign:'center',marginBottom:40}}>
+          <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+          <div style={{color:'var(--text-2)',fontSize:'.875rem'}}>Landlord Portal — Gold Asset Management</div>
+        </div>
+        <div className="card" style={{padding:28}}>{children}</div>
+      </div>
+    </div>
+  )
+}
+
 export function ResetPasswordPage() {
   const [params] = useSearchParams()
   const token = params.get('token') ?? ''
@@ -44,18 +71,6 @@ export function ResetPasswordPage() {
       setSubmitting(false)
     }
   }
-
-  const Shell = ({ children }: { children: React.ReactNode }) => (
-    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
-      <div style={{width:'100%',maxWidth:420}}>
-        <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-          <div style={{color:'var(--text-2)',fontSize:'.875rem'}}>Landlord Portal — Gold Asset Management</div>
-        </div>
-        <div className="card" style={{padding:28}}>{children}</div>
-      </div>
-    </div>
-  )
 
   if (!token) {
     return (
