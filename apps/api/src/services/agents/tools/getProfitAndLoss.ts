@@ -39,7 +39,10 @@ export const getProfitAndLoss: AgentTool = {
     'against expenses (GAM platform fee, maintenance, lot rent, their own entered expenses), and ' +
     'the net. Use for "what did I make", "show me my P&L", "what were my expenses", "how much did ' +
     'I bring in last year", "am I profitable". Defaults to the current year; pass month for one ' +
-    'month. Same figures as their reports page. Read-only.',
+    'month. Same figures as their reports page.\n' +
+    'S630: THIS is where profit, income and expenses come from — every landlord has them from their ' +
+    'property data. GAM Books is a separate optional module and is never the answer to a P&L ' +
+    'question. Read-only.',
   parameters: {
     type: 'object',
     properties: {

@@ -90,6 +90,13 @@ export const draftTenantNotice: AgentTool = {
         needsApproval: true,
         draft: { to: tenantName, subject, body },
         message: `Here’s the draft notice for ${tenantName}. Read it back to the landlord and get their explicit approval — only then send it (call again with confirmed: true). Nothing has been sent yet.`,
+        // S630 (Nic): "it should also recommend to the landlord that state law
+        // may require additional notice to be served either in person or via
+        // certified mail depending on local laws and to check local laws."
+        // A landlord who thinks GAM delivery IS service can lose a filing on it.
+        // Generic, never state-specific — GAM does not tell anyone what their
+        // state requires.
+        alsoTellThem: 'Delivering it here is a record in GAM, and that is not the same as legal service. Depending on where the property is, a notice that affects a tenancy may have to be handed over in person or sent by certified mail to count — tell them that and to check their local requirements. Do not tell them what their state requires; you do not know it.',
       }
     }
 
@@ -104,6 +111,10 @@ export const draftTenantNotice: AgentTool = {
       body,
       data: { kind: 'landlord_notice', subject, source: 'agent' },
     })
-    return { ok: true, sent: true, sentTo: tenantName, subject, message: `Notice “${subject}” delivered to ${tenantName}.` }
+    return {
+      ok: true, sent: true, sentTo: tenantName, subject,
+      message: `Notice “${subject}” delivered to ${tenantName}.`,
+      alsoTellThem: 'Delivering it here is a record in GAM, and that is not the same as legal service. Depending on where the property is, a notice that affects a tenancy may have to be handed over in person or sent by certified mail to count — tell them that and to check their local requirements. Do not tell them what their state requires; you do not know it.',
+    }
   },
 }

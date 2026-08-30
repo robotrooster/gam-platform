@@ -17,7 +17,13 @@ export const getMyTerminationQuote: AgentTool = {
   name: 'get_my_termination_quote',
   description:
     'Get the tenant’s early-termination quote for their active lease(s) — the fee they would pay to end the ' +
-    'lease early, plus the status of any termination request already in flight. If the tenant holds more than ' +
+    'lease early, plus the status of any termination request already in flight.\n' +
+    'S630 (Nic): LEAVING AT THE END OF THE LEASE IS NOT THIS. "my lease ends in March and I think I am ' +
+    'moving out" and "I am not renewing" mean they intend to see the term out — that is submit_renewal_intent ' +
+    'with "no", and it costs them nothing. Quoting an early-termination fee to someone who never asked to ' +
+    'break their lease puts a bill in front of a person who does not owe one. Use this ONLY when they want ' +
+    'OUT BEFORE the end date — "can I leave in January", "I need to break my lease".\n' +
+    'If the tenant holds more than ' +
     'one active lease (e.g. two units), a quote is returned for EACH. READ ONLY: you cannot terminate a ' +
     'lease; if they want to proceed, tell them the Lease section of their portal has the confirmation flow and ' +
     'that the fee is charged when they confirm there.',

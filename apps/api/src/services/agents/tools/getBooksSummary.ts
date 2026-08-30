@@ -40,9 +40,20 @@ interface AcctRow { code: string; name: string; period_amount: string }
 export const getBooksSummary: AgentTool = {
   name: 'get_books_summary',
   description:
-    'A profit-and-loss snapshot from GAM Books for the landlord’s own ledger — total income, total ' +
-    'expenses, net income, and the top income/expense categories for a period. Use for “how did I do ' +
-    'last month?”, “what are my biggest expenses this year?”, or “what’s my net income?”. Read-only.',
+    // S630 (Nic): "that is flat wrong. We do a bunch of property reporting
+    // already without having a separate books account." This tool described
+    // itself as "a profit-and-loss snapshot" and listed the same questions as
+    // get_profit_and_loss, so the model reached for it on "show me my profit and
+    // loss" — and answered a landlord who has full portfolio reporting with
+    // "there's nothing to summarize, set up GAM Books". GAM Books is the OPTIONAL
+    // deeper ledger (tax set-aside, payroll); it is not where P&L comes from.
+    'The landlord’s GAM BOOKS ledger only — the optional bookkeeping module they may not have set ' +
+    'up. Use ONLY when they name GAM Books, or ask about bookkeeping accounts, journal entries, ' +
+    'payroll or tax set-aside.\n' +
+    'DO NOT use this for profit and loss, income, expenses, or "how did I do" — every landlord has ' +
+    'those from their property data whether or not GAM Books exists, and get_profit_and_loss is ' +
+    'where they come from. Answering a P&L question from here tells a landlord to set up ' +
+    'bookkeeping they do not need. Read-only.',
   parameters: {
     type: 'object',
     properties: {

@@ -22,6 +22,8 @@ function leaks(reply: string): string[] {
   if (u) found.push('uuid')
   for (const c of ['unit_id','lease_id','tenant_id','landlord_id','property_id','unitId','leaseId'])
     if (new RegExp(`\\b${c}\\b`).test(reply)) found.push(`field:${c}`)
+  const sp = reply.match(/\b(unit|lease|tenant|landlord|property|booking|charge|payment method|customer)\s+ID\b/i)
+  if (sp) found.push(`spoken-id:${sp[0]}`)
   if (/\{\s*"|"\s*:\s*"|\[\s*"/.test(reply)) found.push('json-fragment')
   if (/\b(null|undefined|NaN)\b/.test(reply)) found.push('null-ish')
   return found
@@ -36,6 +38,16 @@ describe('what a reply is allowed to reveal', () => {
   it('catches an internal id or field name', () => {
     expect(leaks('Your unit_id is set correctly.')).toContain('field:unit_id')
     expect(leaks('Lease 3e60cb5e-93ee-43c6-9632-4385de789eaa is active.')).toContain('uuid')
+  })
+
+  // S630 (Nic) caught this one by reading a transcript: the waive conversation
+  // told a landlord "the system encountered an issue with the lease ID provided.
+  // Could you confirm the lease ID?" An internal key is still internal when it
+  // is written with a space and a capital.
+  it('catches an internal id spoken in words', () => {
+    expect(leaks('Could you please confirm the lease ID or provide the tenant name?')[0])
+      .toMatch(/spoken-id/)
+    expect(leaks('I need the unit ID to enable eviction mode.')[0]).toMatch(/spoken-id/)
   })
 
   it('catches raw machine output', () => {

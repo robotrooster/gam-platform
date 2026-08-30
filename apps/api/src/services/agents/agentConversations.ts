@@ -152,6 +152,12 @@ function leaksInternals(reply: string): string[] {
                      'stripe_customer_id', 'profileId', 'unitId', 'leaseId', 'tenantId']) {
     if (new RegExp(`\\b${col}\\b`).test(reply)) found.push(`field:${col}`)
   }
+  // S630 (Nic): the SPOKEN form is the one that actually reached a landlord —
+  // "the system encountered an issue with the lease ID provided. Could you
+  // confirm the lease ID?" An internal key does not stop being internal because
+  // it was written with a space and a capital.
+  const spoken = reply.match(/\b(unit|lease|tenant|landlord|property|booking|charge|payment method|customer)\s+ID\b/i)
+  if (spoken) found.push(`spoken-id:${spoken[0]}`)
   if (/\{\s*"|"\s*:\s*"|\[\s*"/.test(reply)) found.push('json-fragment')
   if (/\b(null|undefined|NaN)\b/.test(reply)) found.push('null-ish')
   return found

@@ -26,6 +26,10 @@ export const submitRenewalIntent: AgentTool = {
   description:
     'Record whether the tenant intends to renew their lease: "yes", "no", or "unsure". This is the ' +
     'formal answer on their lease — it is NOT anonymous, their landlord sees their name, and it is ' +
+    'S630: THIS is the tool for "I am moving out when the lease ends", "I am not renewing", "I ' +
+    'think I am leaving in March". They are seeing the term out, which costs them nothing — do NOT ' +
+    'reach for an early-termination quote, that is for breaking a lease BEFORE its end date and it ' +
+    'carries a fee.' +
     'how the two sides give each other notice before the lease ends.\\n' +
     'SAYING "no" IS WRITTEN NOTICE THAT THEY ARE LEAVING. The lease ends on its end date and nothing ' +
     'renews automatically. Say that back to them in plain words and get an explicit yes before you ' +

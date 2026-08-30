@@ -195,7 +195,9 @@ describe('guest tools scope to the actor.bookingId', () => {
       landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'P', unit_number: 'A3',
     })
     mockQuery.mockResolvedValueOnce([{ id: 'existing' }]) // open request already there
-    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    // S630: an extra night is quoted first and only books on the second call,
+    // so these booking assertions pass confirmed: true — the guest has said yes.
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night', confirmed: true }, GUEST_ACTOR)
     expect(r.alreadyRequested).toBe(true)
     expect(mockCreateNotification).not.toHaveBeenCalled()
   })
@@ -239,7 +241,7 @@ describe('guest tools scope to the actor.bookingId', () => {
       .mockResolvedValueOnce([])              // dedupe
       .mockResolvedValueOnce([])              // UPDATE unit_bookings
       .mockResolvedValueOnce([{ id: 'cr2' }]) // insert
-    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night', confirmed: true }, GUEST_ACTOR)
     expect(r.autoApproved).toBe(true)
     expect(r.newCheckOut).toBe('2026-07-06')
     const updateCall = mockQuery.mock.calls.find((c: any[]) => String(c[0]).includes('UPDATE unit_bookings'))
@@ -256,7 +258,7 @@ describe('guest tools scope to the actor.bookingId', () => {
     mockQuery
       .mockResolvedValueOnce([])              // dedupe
       .mockResolvedValueOnce([{ id: 'cr3' }]) // insert
-    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night', confirmed: true }, GUEST_ACTOR)
     expect(r.autoApproved).toBeUndefined()
     expect(r.note).toMatch(/sent to the host/i)
     const insertCall = mockQuery.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO booking_change_requests'))
@@ -1468,5 +1470,50 @@ describe('get_inspection_progress (landlord-run walkthrough)', () => {
     ;(mockQueryOne as any).mockResolvedValueOnce(null)
     const res: any = await getInspectionProgress.execute({ inspectionId: 'x' }, LANDLORD_ACTOR)
     expect(res.ok).toBe(false)
+  })
+})
+
+// S630 (Nic): "it skips that confirmation step, which is wrong... maybe it's out
+// of their price range." A guest asked whether one more night was available and
+// the agent booked and charged it. Being available is not being agreed to.
+describe('request_booking_change — a paid night is quoted before it is booked', () => {
+  const GUEST = { userId: 'u1', role: 'guest', profileId: 'b1', bookingId: 'b1' } as any
+
+  beforeEach(() => {
+    ;(query as any).mockReset()
+    ;(query as any).mockResolvedValue([])
+  })
+
+  it('quotes the nightly rate and books NOTHING on the first call', async () => {
+    const { requestBookingChange } = await import('./requestBookingChange')
+    const mod = await import('./getGuestBooking')
+    vi.spyOn(mod, 'loadGuestBookingContext').mockResolvedValue({
+      status: 'checked_in', nights: 4, total_amount: 320,
+    } as any)
+
+    const res: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST)
+    expect(res.quoteOnly).toBe(true)
+    expect(res.nightlyRate).toBe(80)
+    expect(res.message).toMatch(/\$80\.00/)
+    expect(res.message).toMatch(/NOT booked/i)
+    // Nothing was written.
+    const wrote = (query as any).mock.calls.some((c: any[]) => /INSERT|UPDATE/i.test(String(c[0])))
+    expect(wrote).toBe(false)
+  })
+
+  it('a free change is unaffected — there is nothing to agree to', async () => {
+    const { requestBookingChange } = await import('./requestBookingChange')
+    const mod = await import('./getGuestBooking')
+    vi.spyOn(mod, 'loadGuestBookingContext').mockResolvedValue({
+      status: 'checked_in', nights: 4, total_amount: 320,
+    } as any)
+    // Only the guard is under test — the full booking path needs more fixture
+    // than this mock provides, and whether it then succeeds is not the point.
+    let res: any
+    try {
+      res = await requestBookingChange.execute(
+        { request_type: 'late_checkout', details: '2pm' }, GUEST)
+    } catch { res = undefined }
+    expect(res?.quoteOnly).toBeUndefined()
   })
 })

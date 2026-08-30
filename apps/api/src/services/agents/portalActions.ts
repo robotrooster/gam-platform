@@ -2152,7 +2152,11 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'switches this on in passing. Turning it OFF lets payments through again.\n' +
       'You are not advising them on whether to evict, and you do not tell them what their state ' +
       'requires. That is their lawyer\u2019s. If they ask whether they can evict, that is a legal ' +
-      'question and it escalates.',
+      'question and it escalates.\n' +
+      'S630 (Nic): once it is on, ALSO tell them that turning it on in GAM is not legal service — ' +
+      'depending on where the property is, a notice affecting a tenancy may have to be handed over ' +
+      'in person or sent by certified mail to count, and they should check their local ' +
+      'requirements. Generic only; never name a state\u2019s rule.',
     params: {
       unitId: { type: 'string', description: 'The unit as the landlord refers to it — the unit NUMBER is fine ("spot 7", "Apt 204", "RV 28"). You do NOT need to look up an id first, and you must never ask them for one: they do not have it. A unit id from a previous lookup also works.' },
       enable: { type: 'boolean', description: 'true to start eviction mode, false to end it.' },

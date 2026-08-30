@@ -40,6 +40,9 @@ export const requestBookingChange: AgentTool = {
     'Change the guest’s stay — a late checkout, an early check-in, an extra night, or some other request. ' +
     'When the schedule has room, late checkout / early check-in / extra night are CONFIRMED automatically and ' +
     'the host is notified; if the schedule is tight (or for "other" requests) it goes to the host to decide. ' +
+    'An EXTRA NIGHT COSTS MONEY, so it is two steps: call once without `confirmed` and you get the price ' +
+    'back — tell them what it costs and ask if they want it — then call again with confirmed: true. Never ' +
+    'book a paid night off "is it available?"; being available is not being agreed to.\n' +
     'Confirm the specifics with the guest first (e.g. what time, which night), then call. request_type must be ' +
     'one of: late_checkout, early_checkin, extra_night, other. Put the detail (a time, a date, the ask in their ' +
     'words) in `details`. Relay the tool’s note to the guest — it says whether the change is confirmed or pending.',
@@ -48,6 +51,7 @@ export const requestBookingChange: AgentTool = {
     properties: {
       request_type: { type: 'string', description: 'One of: late_checkout, early_checkin, extra_night, other.' },
       details: { type: 'string', description: 'The specifics in plain language — e.g. "checkout at 2pm instead of 11am" or "one more night, through the 14th".' },
+      confirmed: { type: 'boolean', description: 'For an EXTRA NIGHT only: true once you have told them the price and they have said yes to it. Leave it out the first time — you will get the price back to quote.' },
     },
     required: ['request_type'],
   },
@@ -68,6 +72,26 @@ export const requestBookingChange: AgentTool = {
         ? bookedTotal / bookedNights
         : null
     if (!b) return { ok: false, error: 'That booking could not be found.' }
+
+    // S630 (Nic): "it skips that confirmation step... maybe it's out of their
+    // price range." A guest asking "is there room for one more night?" is asking
+    // about availability, and the reply booked and charged the night. Being
+    // available is not being agreed to.
+    //
+    // So a paid change quotes first and does nothing. The price comes back for
+    // the agent to say out loud; the second call, after the guest says yes,
+    // performs it. Free changes (late checkout, early check-in) are unaffected —
+    // there is nothing to agree to.
+    if (type === 'extra_night' && args.confirmed !== true) {
+      return {
+        ok: true,
+        quoteOnly: true,
+        nightlyRate: nightlyRate == null ? null : Math.round(nightlyRate * 100) / 100,
+        message: nightlyRate == null
+          ? 'NOT booked yet. Tell them you can add the night, that you will confirm what it costs, and ask if they want it. Call again with confirmed: true only after they say yes.'
+          : `NOT booked yet. Tell them one more night is $${(Math.round(nightlyRate * 100) / 100).toFixed(2)} — the same nightly rate they are already paying — and ask if they want it. Call again with confirmed: true only after they say yes. Do NOT say it is booked.`,
+      }
+    }
     if (['cancelled', 'checked_out', 'no_show'].includes(b.status)) {
       return { ok: false, error: `This stay is ${b.status.replace('_', ' ')}, so a change request can’t be submitted. The host can still be reached directly.` }
     }
