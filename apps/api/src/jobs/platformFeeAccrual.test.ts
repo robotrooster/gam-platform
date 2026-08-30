@@ -31,7 +31,7 @@ beforeEach(async () => {
   await db.query(`DELETE FROM platform_fee_config`)
   await db.query(`DELETE FROM landlord_platform_fee_overrides`)
   await db.query(
-    `INSERT INTO platform_fee_config (rate_per_unit, min_per_property, notes)
+    `INSERT INTO platform_fee_config (rate_per_unit, min_per_connect_account, notes)
      VALUES (2.00, 10.00, 'Test default')`
   )
 })
@@ -102,7 +102,7 @@ describe('processPlatformFeeAccrual', () => {
     expect(result.feesAccrued).toBe(1)
     expect(result.errors).toHaveLength(0)
 
-    // 1 unit × $2 = $2; min_per_property = $10; total = max(2, 10) = 10.
+    // 1 unit × $2 = $2; min_per_connect_account = $10; total = max(2, 10) = 10.
     const accrual = await db.query<{
       total_billable: number
       total_amount:   string
@@ -128,11 +128,55 @@ describe('processPlatformFeeAccrual', () => {
          FROM platform_revenue_ledger WHERE property_id=$1`,
       [stack.propertyId]
     )
-    expect(ledger.rows[0]).toMatchObject({
-      type:           'platform_fee_subscription',
-      amount:         '10.00',
-      reference_type: 'platform_fee_accrual',
+    // S630: the floor is no longer folded into the earned fee. The ledger now
+    // reads the two things separately — $2 earned, $8 to reach the payout
+    // account's monthly floor — so a $10 line can always be explained from the
+    // unit count. The total the landlord owes is unchanged.
+    const byType = new Map(ledger.rows.map(r => [r.reference_type, r]))
+    expect(byType.get('platform_fee_accrual')).toMatchObject({
+      type: 'platform_fee_subscription', amount: '2.00',
     })
+    expect(byType.get('platform_fee_min_topup')).toMatchObject({
+      type: 'platform_fee_subscription', amount: '8.00',
+    })
+    const total = ledger.rows.reduce((a, r) => a + parseFloat(r.amount), 0)
+    expect(total).toBe(10)
+  })
+
+  // S630 DIRECTIVE (Nic): "It's ten dollars per Connect account. So if several
+  // properties deposit to the same Stripe account, it's only ten dollar minimum
+  // for that setup." Two properties on ONE payout account owe ONE floor.
+  it('two properties on one Connect account share a single $10 minimum', async () => {
+    const a = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await db.query(
+      `UPDATE landlords SET stripe_connect_account_id = 'acct_shared_s630' WHERE id = $1`,
+      [a.landlordId])
+    // A second property under the SAME landlord, hence the same payout account.
+    const c = await db.connect()
+    let propB = ''
+    try {
+      await c.query('BEGIN')
+      propB = await seedProperty(c, {
+        landlordId: a.landlordId, ownerUserId: a.ownerUserId, managedByUserId: a.ownerUserId })
+      const unitB = await seedUnit(c, { propertyId: propB, landlordId: a.landlordId })
+      const tenantB = await seedTenant(c)
+      const leaseB = await seedLease(c, {
+        unitId: unitB, landlordId: a.landlordId, status: 'active', startDate: '2026-01-01' })
+      await seedLeaseTenant(c, { leaseId: leaseB, tenantId: tenantB, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.errors).toHaveLength(0)
+
+    const rows = await db.query<{ total_amount: string; connect_min_topup: string }>(
+      `SELECT a.total_amount::text, a.connect_min_topup::text
+         FROM platform_fee_accruals a WHERE a.landlord_id = $1`, [a.landlordId])
+    const grandTotal = rows.rows.reduce((n, r) => n + parseFloat(r.total_amount), 0)
+    // 1 unit + 1 unit = $4 earned, topped up to ONE $10 floor — not two.
+    expect(grandTotal).toBe(10)
+    const topups = rows.rows.reduce((n, r) => n + parseFloat(r.connect_min_topup), 0)
+    expect(topups).toBe(6)
   })
 
   it('above-min: 6 LT units × $2 = $12 (clears the $10 min, exact rate × count applies)', async () => {
@@ -191,7 +235,19 @@ describe('processPlatformFeeAccrual', () => {
         (SELECT COUNT(*)::text FROM platform_revenue_ledger    WHERE property_id=$1) AS ledger
     `, [stack.propertyId])
     expect(counts.rows[0].accrual).toBe('1')
-    expect(counts.rows[0].ledger).toBe('1')
+    // S630: two ledger lines now — the $2 earned and the $8 that brings the
+    // payout account to its floor. The point of this test is that a SECOND run
+    // adds neither.
+    expect(counts.rows[0].ledger).toBe('2')
+
+    const total = await db.query<{ sum: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS sum FROM platform_revenue_ledger WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(parseFloat(total.rows[0].sum)).toBe(10)
+    const accrued = await db.query<{ total_amount: string }>(
+      `SELECT total_amount::text FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(accrued.rows[0].total_amount).toBe('10.00')
   })
 
   it('short-stay nights: bookings clamped to the billing month, CEIL(nights/30) added to total_billable', async () => {
@@ -294,12 +350,18 @@ describe('processPlatformFeeAccrual', () => {
     }
 
     const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
-    expect(result.feesAccrued).toBe(1)
+    // S630: nothing was EARNED, so the per-property pass accrues nothing. The
+    // payout account is live, so its floor still applies and the group pass is
+    // what writes the row. Same $10 outcome, arrived at honestly.
+    expect(result.feesAccrued).toBe(0)
+    expect(result.connectMinimumsApplied).toBe(1)
 
     const accrual = await db.query<{
-      short_stay_nights: number; total_billable: number; total_amount: string
+      short_stay_nights: number; total_billable: number
+      total_amount: string; connect_min_topup: string
     }>(
-      `SELECT short_stay_nights, total_billable, total_amount::text
+      `SELECT short_stay_nights, total_billable,
+              total_amount::text, connect_min_topup::text
          FROM platform_fee_accruals WHERE property_id=$1`,
       [propertyId!]
     )
@@ -308,6 +370,8 @@ describe('processPlatformFeeAccrual', () => {
       total_billable:    0,
       total_amount:      '10.00',  // pure minimum, no usage
     })
+    // The whole $10 is the floor, not an unexplained fee against zero units.
+    expect(accrual.rows[0].connect_min_topup).toBe('10.00')
   })
 
   // ── S538 STR pricing: the nights/30 aggregation is ONLY for rv_spot

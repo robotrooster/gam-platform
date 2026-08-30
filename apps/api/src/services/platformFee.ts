@@ -71,7 +71,7 @@ export async function platformFeesByProperty(
   // the launch model ($2/billable unit, $10/property minimum).
   const cfg = await queryOne<any>(`
     SELECT COALESCE(o.rate_per_unit, pfc.rate_per_unit)       AS rate,
-           COALESCE(o.min_per_property, pfc.min_per_property) AS min,
+           COALESCE(o.min_per_connect_account, pfc.min_per_connect_account) AS min,
            COALESCE(o.str_fee_pct, pfc.str_fee_pct)           AS str_pct
       FROM platform_fee_config pfc
       LEFT JOIN landlord_platform_fee_overrides o
@@ -147,6 +147,11 @@ export async function platformFeesByProperty(
   // floored at the $10 property minimum — applied to every property for each
   // elapsed month it has been on the platform (the est query excludes
   // pre-onboarding months via created_at).
+  // S630: the floor is per Connect PAYOUT ACCOUNT, not per property, so it can
+  // only be applied once a whole month is in view — two properties earning $6
+  // and $2 owe $10 between them, not $10 each. Estimated rows are gathered per
+  // month first, then topped up to the floor exactly as the accrual job does.
+  const perMonth = new Map<string, { total: number; rows: Array<{ prop: string; fee: number }> }>()
   for (const r of est) {
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
@@ -154,11 +159,30 @@ export async function platformFeesByProperty(
     const billable = parseInt(r.long_term, 10)
       + parseInt(r.utility_service ?? '0', 10)
       + Math.ceil(parseInt(r.nights, 10) / 30)
-    // S538: short-stays on non-rv_spot types bill str_pct of pro-rated
-    // revenue instead of nights/30; the fee folds UNDER the property min.
+    // S538: short-stays on non-rv_spot types bill str_pct of pro-rated revenue
+    // instead of nights/30.
     const strFee = round2(strPct * parseFloat(r.str_revenue ?? '0'))
-    const fee = round2(Math.max(rate * billable + strFee, min))
-    fees.set(r.property_id, round2((fees.get(r.property_id) ?? 0) + fee))
+    const fee = round2(rate * billable + strFee)
+    const bucket = perMonth.get(r.m) ?? { total: 0, rows: [] }
+    bucket.total = round2(bucket.total + fee)
+    bucket.rows.push({ prop: r.property_id, fee })
+    perMonth.set(r.m, bucket)
+  }
+
+  for (const [m, bucket] of perMonth) {
+    // Months where something already accrued carry their own top-up already.
+    let monthBilled = 0
+    for (const [k, v] of billed) if (k.endsWith(`|${m}`)) monthBilled = round2(monthBilled + v)
+    const earned = round2(bucket.total + monthBilled)
+    const shortfall = round2(min - earned)
+    if (shortfall > 0 && bucket.rows.length > 0) {
+      // Largest earner carries it, same rule as applyConnectAccountMinimums.
+      const anchor = bucket.rows.reduce((a, b) => (b.fee > a.fee ? b : a), bucket.rows[0])
+      anchor.fee = round2(anchor.fee + shortfall)
+    }
+    for (const row of bucket.rows) {
+      fees.set(row.prop, round2((fees.get(row.prop) ?? 0) + row.fee))
+    }
   }
   return fees
 }

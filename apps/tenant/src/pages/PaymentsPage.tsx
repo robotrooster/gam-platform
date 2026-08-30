@@ -122,26 +122,12 @@ function WaysToPay({ lease, reports = [], onReportDeposit, onWithdrawn }: {
           </div>
         )
       })}
-      {covered && (
-        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
-          Your landlord is currently covering the {formatCurrency(absorbed)} handling fee on
-          {' '}{MANUAL_PAYMENT_FEE_SCOPE}. They can stop covering it at any time, and it would then
-          appear on your bill.
-        </div>
-      )}
-      {!covered && firstFree && (
-        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
-          The handling fee is waived on your <strong>first payment only</strong>. If you pay a
-          different way this time, later payments handed to the office will include it.
-          It applies to {MANUAL_PAYMENT_FEE_SCOPE}.
-        </div>
-      )}
-      {!covered && !firstFree && (
-        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
-          A {formatCurrency(costs.find(c => c.method === 'manual')?.fee || 0)} handling fee applies
-          to {MANUAL_PAYMENT_FEE_SCOPE}. It is waived on a first payment only.
-        </div>
-      )}
+      {/* S630 (Nic): cash is free. Every fee disclosure here is gone rather than
+          rewritten to say "$0.00" — telling a tenant a fee applies and is
+          currently zero still reads as a fee that could arrive next month. */}
+      <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+        There is no charge for {MANUAL_PAYMENT_FEE_SCOPE}.
+      </div>
 
       {/* S624: the entry point sits HERE, under the cash row, because this is
           where a tenant is already deciding to pay that way — not buried on a

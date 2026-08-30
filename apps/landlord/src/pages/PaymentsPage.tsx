@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
-         MANUAL_PAYMENT_FEE, type ManualPaymentMethod,
+         type ManualPaymentMethod,
          TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
@@ -70,7 +70,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
         const waived = res?.data?.feeWaived
         setRecordMsg(waived
           ? 'Recorded. First rent payment — no manual-payment fee charged.'
-          : `Recorded. A $${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee was billed to the tenant.`)
+          : 'Recorded. No fee — cash, checks and money orders are free.')
         onRecorded()
       },
     })
@@ -285,7 +285,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
                 </div>
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>
                   Marks this rent as paid. GAM disburses nothing — you already hold the funds. The tenant's
-                  first payment is fee-free; later manual payments bill a ${MANUAL_PAYMENT_FEE.toFixed(2)} fee to the tenant.
+                  free for the tenant — cash, checks and money orders carry no fee.
                 </div>
                 {recordMut.isError && (
                   <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 8 }}>

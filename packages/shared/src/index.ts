@@ -4565,7 +4565,23 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
 //
 // THE ACH FEE ITSELF IS UNTOUCHABLE (Nic, S624) — this moved toward ACH, never
 // the other way. See PROCESSING_FEES.ACH_FLAT.
-export const MANUAL_PAYMENT_FEE = 6.00
+//
+// S630 DIRECTIVE (Nic): "We need to remove the cash charge completely. I know we
+// reduced it from ten dollars to six dollars. We are gonna make that absolutely
+// free to pay with cash. It doesn't make sense to charge for it, especially when
+// most landlords aren't gonna offer it anyway."
+//
+// ZERO, not "cheap". The history above is kept because it explains how the
+// number got here and why the ACH fee did NOT follow it down, but the argument
+// it settles is over: handing rent to the office costs the tenant nothing.
+// Nothing may raise a fee row, a ledger line, or a landlord charge for a manual
+// payment — a $0.00 charge is still a charge on a statement.
+//
+// The first-payment waiver and the manual_fee_payer toggle are now inert. They
+// are left in place rather than ripped out, in the same way subleasing and
+// On-Time Pay are dormant, so nothing silently changes meaning if a fee ever
+// returns; every path that would bill checks this constant first.
+export const MANUAL_PAYMENT_FEE = 0
 
 /** S607 (Nic): the ONE description of what the manual-payment fee covers, so no
  *  surface can quietly disagree with another. Category first, examples second,

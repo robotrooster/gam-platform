@@ -26,9 +26,17 @@
  * LEAST(check_out, month_end+1d) - GREATEST(check_in, month_start).
  * EVERY night counts — no exclusion for units that also had a lease.
  *
- * Per-property fee = MAX(rate × total_billable, min_per_property)
- * where rate + min come from landlord_platform_fee_overrides if active,
- * else platform_fee_config (S114).
+ * Per-property fee = rate × total_billable + STR fee. NO per-property floor.
+ *
+ * S630 DIRECTIVE (Nic): "It's ten dollars per Connect account. So if several
+ * properties deposit to the same Stripe account, it's only ten dollar minimum
+ * for that setup." The floor is on the PAYOUT SETUP, not on each address — a
+ * landlord with four parks paying into one Connect account was billed four
+ * minimums for one setup. It is applied once per group, after every property
+ * in the month has been accrued, by applyConnectAccountMinimums().
+ *
+ * rate + min come from landlord_platform_fee_overrides if active, else
+ * platform_fee_config (S114).
  *
  * Per-property platform_fee_payer toggle (S114) determines what happens
  * with the fee:
@@ -56,6 +64,8 @@ interface AccrualResult {
   skippedZero: number
   skippedAlreadyAccrued: number
   skippedPreBilling: number
+  /** S630: payout groups that needed a top-up to reach the monthly floor. */
+  connectMinimumsApplied: number
   errors: { property_id: string; error: string }[]
 }
 
@@ -71,6 +81,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
     skippedZero: 0,
     skippedAlreadyAccrued: 0,
     skippedPreBilling: 0,
+    connectMinimumsApplied: 0,
     errors: [],
   }
 
@@ -94,7 +105,160 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
     }
   }
 
+  // S630: every property for the month is in; settle each payout setup's floor.
+  try {
+    result.connectMinimumsApplied = await applyConnectAccountMinimums(monthIso)
+  } catch (e: any) {
+    result.errors.push({ property_id: 'connect_minimums', error: e?.message ?? String(e) })
+  }
+
   return result
+}
+
+/**
+ * S630 DIRECTIVE (Nic): the monthly floor belongs to the Stripe Connect payout
+ * account, not to each property. "If several properties deposit to the same
+ * Stripe account, it's only ten dollar minimum for that setup."
+ *
+ * Runs once after every property has accrued, because a floor on a GROUP cannot
+ * be decided while looking at one member: two properties earning $6 and $2 owe
+ * $10 between them, not $10 each and not $20.
+ *
+ * The shortfall lands on the group's largest earner as its own column and its
+ * own ledger line, so the books read "fee $8, minimum top-up $2" instead of a
+ * $10 that no unit count explains. Properties with no Connect account of their
+ * own are grouped by entity, since without one they cannot share a payout.
+ *
+ * Only groups that ALREADY accrued something are topped up. A landlord still in
+ * onboarding grace has no accrual at all, and inventing one here would bill
+ * through the grace the accrual path just declined to bill through.
+ */
+export async function applyConnectAccountMinimums(monthIso: string): Promise<number> {
+  // Every payout group whose landlord is PAST GRACE, whether or not it earned
+  // anything this month — a live account with no occupied units still owes the
+  // floor, exactly as it did when the floor was per property. Landlords still in
+  // onboarding grace (billing_starts_at NULL or in the future) are absent, so
+  // this can never bill through the grace the accrual path just honoured.
+  const groups = await query<{
+    group_key: string; min_amount: string; earned: string
+    anchor_accrual_id: string | null; anchor_property_id: string; anchor_landlord_id: string
+  }>(`
+    WITH live AS (
+      SELECT p.id AS property_id, l.id AS landlord_id,
+             COALESCE(l.stripe_connect_account_id, 'entity:' || l.id::text) AS group_key,
+             COALESCE(o.min_per_connect_account, pfc.min_per_connect_account) AS min_amount
+        FROM properties p
+        JOIN landlords l ON l.id = p.landlord_id
+        CROSS JOIN LATERAL (
+          SELECT min_per_connect_account FROM platform_fee_config
+           WHERE effective_until IS NULL LIMIT 1) pfc
+        LEFT JOIN landlord_platform_fee_overrides o
+               ON o.landlord_id = l.id AND o.effective_until IS NULL
+       WHERE l.billing_starts_at IS NOT NULL
+         AND l.billing_starts_at <= $1::date
+    ),
+    joined AS (
+      SELECT live.*, a.id AS accrual_id, COALESCE(a.total_amount, 0) AS amount
+        FROM live
+        LEFT JOIN platform_fee_accruals a
+               ON a.property_id = live.property_id AND a.accrual_month = $1::date
+    )
+    SELECT group_key,
+           MIN(min_amount)::text AS min_amount,
+           -- total_amount ALREADY includes any top-up applied on a previous
+           -- run, so summing every row makes a re-run compute a shortfall of
+           -- zero and change nothing. Excluding topped-up rows here would let a
+           -- second run charge a multi-property group its floor twice.
+           SUM(amount)::text AS earned,
+           -- largest earner carries the shortfall; property id breaks ties so a
+           -- re-run lands it in the same place.
+           (ARRAY_AGG(accrual_id  ORDER BY amount DESC, property_id))[1]::text AS anchor_accrual_id,
+           (ARRAY_AGG(property_id ORDER BY amount DESC, property_id))[1]::text AS anchor_property_id,
+           (ARRAY_AGG(landlord_id ORDER BY amount DESC, property_id))[1]::text AS anchor_landlord_id
+      FROM joined
+     GROUP BY group_key`, [monthIso])
+
+  let applied = 0
+  for (const g of groups) {
+    const min = parseFloat(g.min_amount)
+    const earned = parseFloat(g.earned)
+    const shortfall = round2(min - earned)
+    // Stamp the group on every row for the month either way, so a past month can
+    // still explain which payout setup it was pooled under.
+    await query(
+      `UPDATE platform_fee_accruals SET connect_group_key = $1
+        WHERE accrual_month = $2::date AND landlord_id IN (
+          SELECT id FROM landlords
+           WHERE COALESCE(stripe_connect_account_id, 'entity:' || id::text) = $1)`,
+      [g.group_key, monthIso]).catch(() => {})
+    if (!(shortfall > 0)) continue
+
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      let accrualId = g.anchor_accrual_id
+      if (!accrualId) {
+        // The whole group earned nothing this month. The floor still applies, so
+        // it needs a row to hang off — created at zero, with the top-up carrying
+        // the entire amount, so the row states plainly that no unit was billed.
+        const payerRes = await client.query<{ platform_fee_payer: string | null }>(
+          `SELECT platform_fee_payer FROM property_allocation_rules WHERE property_id = $1`,
+          [g.anchor_property_id])
+        const created = await client.query<{ id: string }>(`
+          INSERT INTO platform_fee_accruals
+            (landlord_id, property_id, accrual_month,
+             long_term_unit_count, short_stay_nights, short_stay_equivalent,
+             total_billable, utility_service_unit_count,
+             rate_per_unit, min_per_connect_account, total_amount,
+             str_revenue, str_fee_amount, payer)
+          SELECT $1, $2, $3::date, 0, 0, 0, 0, 0,
+                 COALESCE(o.rate_per_unit, pfc.rate_per_unit), $4, 0, 0, 0, $5
+            FROM platform_fee_config pfc
+            LEFT JOIN landlord_platform_fee_overrides o
+                   ON o.landlord_id = $1 AND o.effective_until IS NULL
+           WHERE pfc.effective_until IS NULL
+           LIMIT 1
+          ON CONFLICT (landlord_id, property_id, accrual_month) DO NOTHING
+          RETURNING id`,
+          [g.anchor_landlord_id, g.anchor_property_id, monthIso, min,
+           payerRes.rows[0]?.platform_fee_payer ?? 'landlord'])
+        accrualId = created.rows[0]?.id ?? null
+        if (!accrualId) { await client.query('ROLLBACK'); continue }
+      }
+      await client.query(
+        `UPDATE platform_fee_accruals
+            SET connect_min_topup = $2, total_amount = total_amount + $2, updated_at = now()
+          WHERE id = $1`, [accrualId, shortfall])
+
+      const anchor = await client.query<{ payer: string; property_id: string }>(
+        `SELECT payer, property_id FROM platform_fee_accruals WHERE id = $1`,
+        [accrualId])
+      // Tenant-payer accruals are picked up by the next rent charge; only the
+      // landlord-payer case posts revenue now, exactly as the per-property path.
+      if (anchor.rows[0]?.payer === 'landlord') {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
+        await client.query(
+          `INSERT INTO platform_revenue_ledger
+             (type, amount, balance_after, reference_id, reference_type, property_id, notes)
+           SELECT 'platform_fee_subscription', $1,
+                  COALESCE((SELECT balance_after FROM platform_revenue_ledger
+                             ORDER BY created_at DESC, id DESC LIMIT 1), 0) + $1,
+                  -- Its own reference_type: the ledger's idempotency index is
+                  -- (reference_id, reference_type, type), so the top-up gets a
+                  -- distinct line beside the earned fee instead of colliding
+                  -- with it — and a re-run cannot double-post.
+                  $2, 'platform_fee_min_topup', $3,
+                  $4`,
+          [shortfall, accrualId, anchor.rows[0].property_id,
+           `Connect-account minimum top-up for ${monthIso} (group earned ${earned.toFixed(2)} of ${min.toFixed(2)})`])
+      }
+      await client.query('COMMIT')
+      applied++
+    } catch (e) {
+      await client.query('ROLLBACK'); throw e
+    } finally { client.release() }
+  }
+  return applied
 }
 
 /**
@@ -297,13 +461,14 @@ async function accrueOneProperty(
     // ── Rate + minimum (cascade through landlord override → platform default) ──
     const rateRes = await client.query<{
       rate_per_unit: string
-      min_per_property: string
+      min_per_connect_account: string
       str_fee_pct: string
     }>(`
       SELECT
-        COALESCE(o.rate_per_unit,    pfc.rate_per_unit)    AS rate_per_unit,
-        COALESCE(o.min_per_property, pfc.min_per_property) AS min_per_property,
-        COALESCE(o.str_fee_pct,      pfc.str_fee_pct)      AS str_fee_pct
+        COALESCE(o.rate_per_unit, pfc.rate_per_unit) AS rate_per_unit,
+        COALESCE(o.min_per_connect_account, pfc.min_per_connect_account)
+          AS min_per_connect_account,
+        COALESCE(o.str_fee_pct, pfc.str_fee_pct) AS str_fee_pct
       FROM platform_fee_config pfc
       LEFT JOIN landlord_platform_fee_overrides o
              ON o.landlord_id = $1
@@ -315,20 +480,20 @@ async function accrueOneProperty(
       await client.query('ROLLBACK')
       throw new Error(`No active platform_fee_config row found`)
     }
-    const ratePerUnit    = parseFloat(rateRes.rows[0].rate_per_unit)
-    const minPerProperty = parseFloat(rateRes.rows[0].min_per_property)
-    const strFeePct      = parseFloat(rateRes.rows[0].str_fee_pct)
-    const strFeeAmount   = round2(strFeePct * strRevenue)
+    const ratePerUnit  = parseFloat(rateRes.rows[0].rate_per_unit)
+    const minPerGroup   = parseFloat(rateRes.rows[0].min_per_connect_account)
+    const strFeePct    = parseFloat(rateRes.rows[0].str_fee_pct)
+    const strFeeAmount = round2(strFeePct * strRevenue)
 
-    // If nothing is billable AND the minimum is 0, nothing to bill.
-    if (totalBillable === 0 && strFeeAmount === 0 && minPerProperty === 0) {
+    // S630: no floor here. A property that earned nothing accrues nothing, and
+    // the Connect-account group's minimum is settled once, later, across all of
+    // them — so four properties on one payout setup no longer pay four floors.
+    if (totalBillable === 0 && strFeeAmount === 0) {
       await client.query('ROLLBACK')
       return 'zero'
     }
 
-    // STR fee folds UNDER the per-property minimum (it replaces those
-    // units' per-unit fee, it doesn't stack on top of the floor).
-    const totalAmount = round2(Math.max(ratePerUnit * totalBillable + strFeeAmount, minPerProperty))
+    const totalAmount = round2(ratePerUnit * totalBillable + strFeeAmount)
 
     // ── Resolve platform_fee_payer at accrual time ──────────────────────
     const payerRes = await client.query<{ platform_fee_payer: 'landlord' | 'tenant' | null }>(`
@@ -342,7 +507,7 @@ async function accrueOneProperty(
         (landlord_id, property_id, accrual_month,
          long_term_unit_count, short_stay_nights, short_stay_equivalent, total_billable,
          utility_service_unit_count,
-         rate_per_unit, min_per_property, total_amount,
+         rate_per_unit, min_per_connect_account, total_amount,
          str_revenue, str_fee_amount,
          payer)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13)
@@ -350,7 +515,7 @@ async function accrueOneProperty(
     `, [
       landlordId, propertyId, monthIso,
       longTermUnitCount, shortStayNights, shortStayEquivalent, totalBillable,
-      ratePerUnit, minPerProperty, totalAmount,
+      ratePerUnit, minPerGroup, totalAmount,
       strRevenue, strFeeAmount,
       payer,
       utilityServiceUnitCount,

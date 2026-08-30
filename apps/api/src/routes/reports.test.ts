@@ -649,7 +649,7 @@ describe('GET /api/reports/property-detail', () => {
     // A real accrual row (e.g. a landlord rate override) of $7.50 for the month.
     // The live estimate would say $10; the report must report the billed $7.50.
     await db.query(`INSERT INTO platform_fee_accruals
-      (landlord_id, property_id, accrual_month, rate_per_unit, min_per_property, total_amount, payer)
+      (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
       VALUES ($1,$2,'2025-04-01',2,10,7.50,'landlord')`, [f.aLid, f.aPropId])
     const res = await request(buildApp())
       .get(`/api/reports/property-detail?propertyId=${f.aPropId}&year=2025&month=4`)

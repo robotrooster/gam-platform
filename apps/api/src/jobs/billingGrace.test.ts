@@ -29,7 +29,7 @@ beforeEach(async () => {
   await db.query(`DELETE FROM platform_fee_config`)
   await db.query(`DELETE FROM landlord_platform_fee_overrides`)
   await db.query(
-    `INSERT INTO platform_fee_config (rate_per_unit, min_per_property, notes)
+    `INSERT INTO platform_fee_config (rate_per_unit, min_per_connect_account, notes)
      VALUES (2.00, 10.00, 'Test default')`
   )
 })

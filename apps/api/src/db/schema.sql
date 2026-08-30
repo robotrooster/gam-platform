@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8G9Nn031i3FWoNCVJPQ3FvaOriiLMyeTad2jUpCcW6tQztRZx6MfIfnGsULTjoC
+\restrict lqbWY7VdQQUOm14mtvPF2HgAdEe8NmtmtRQBIFPhylKb4v0NyHaYLvZANLf7PbM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4122,16 +4122,16 @@ CREATE TABLE public.landlord_platform_fee_overrides (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     landlord_id uuid NOT NULL,
     rate_per_unit numeric(10,2),
-    min_per_property numeric(10,2),
+    min_per_connect_account numeric(10,2),
     effective_from date DEFAULT CURRENT_DATE NOT NULL,
     effective_until date,
     set_by_user_id uuid,
     reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     str_fee_pct numeric(5,4),
-    CONSTRAINT landlord_pfo_at_least_one CHECK (((rate_per_unit IS NOT NULL) OR (min_per_property IS NOT NULL))),
+    CONSTRAINT landlord_pfo_at_least_one CHECK (((rate_per_unit IS NOT NULL) OR (min_per_connect_account IS NOT NULL))),
     CONSTRAINT landlord_pfo_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
-    CONSTRAINT landlord_pfo_min_nonneg CHECK (((min_per_property IS NULL) OR (min_per_property >= (0)::numeric))),
+    CONSTRAINT landlord_pfo_min_nonneg CHECK (((min_per_connect_account IS NULL) OR (min_per_connect_account >= (0)::numeric))),
     CONSTRAINT landlord_pfo_rate_nonneg CHECK (((rate_per_unit IS NULL) OR (rate_per_unit >= (0)::numeric)))
 );
 
@@ -5497,7 +5497,7 @@ CREATE TABLE public.platform_fee_accruals (
     short_stay_equivalent integer DEFAULT 0 NOT NULL,
     total_billable integer DEFAULT 0 NOT NULL,
     rate_per_unit numeric(10,2) NOT NULL,
-    min_per_property numeric(10,2) NOT NULL,
+    min_per_connect_account numeric(10,2) NOT NULL,
     total_amount numeric(10,2) NOT NULL,
     payer text NOT NULL,
     platform_revenue_ledger_id uuid,
@@ -5507,6 +5507,8 @@ CREATE TABLE public.platform_fee_accruals (
     str_revenue numeric(12,2) DEFAULT 0 NOT NULL,
     str_fee_amount numeric(10,2) DEFAULT 0 NOT NULL,
     utility_service_unit_count integer DEFAULT 0 NOT NULL,
+    connect_min_topup numeric(12,2) DEFAULT 0 NOT NULL,
+    connect_group_key text,
     CONSTRAINT platform_fee_accruals_payer_check CHECK ((payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
 );
 
@@ -5519,13 +5521,20 @@ COMMENT ON COLUMN public.platform_fee_accruals.utility_service_unit_count IS 'S6
 
 
 --
+-- Name: COLUMN platform_fee_accruals.connect_min_topup; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_fee_accruals.connect_min_topup IS 'Shortfall added to this row to bring its Connect-account group up to the monthly minimum. Zero when the group already cleared it.';
+
+
+--
 -- Name: platform_fee_config; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.platform_fee_config (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     rate_per_unit numeric(10,2) DEFAULT 2.00 NOT NULL,
-    min_per_property numeric(10,2) DEFAULT 10.00 NOT NULL,
+    min_per_connect_account numeric(10,2) DEFAULT 10.00 NOT NULL,
     effective_from date DEFAULT CURRENT_DATE NOT NULL,
     effective_until date,
     set_by_user_id uuid,
@@ -5533,9 +5542,16 @@ CREATE TABLE public.platform_fee_config (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     str_fee_pct numeric(5,4) DEFAULT 0.03 NOT NULL,
     CONSTRAINT platform_fee_config_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
-    CONSTRAINT platform_fee_config_min_nonneg CHECK ((min_per_property >= (0)::numeric)),
+    CONSTRAINT platform_fee_config_min_nonneg CHECK ((min_per_connect_account >= (0)::numeric)),
     CONSTRAINT platform_fee_config_rate_nonneg CHECK ((rate_per_unit >= (0)::numeric))
 );
+
+
+--
+-- Name: COLUMN platform_fee_config.min_per_connect_account; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_fee_config.min_per_connect_account IS 'Monthly floor per Stripe Connect payout account, NOT per property. Properties sharing one Connect account share one minimum.';
 
 
 --
@@ -24735,5 +24751,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8G9Nn031i3FWoNCVJPQ3FvaOriiLMyeTad2jUpCcW6tQztRZx6MfIfnGsULTjoC
+\unrestrict lqbWY7VdQQUOm14mtvPF2HgAdEe8NmtmtRQBIFPhylKb4v0NyHaYLvZANLf7PbM
 

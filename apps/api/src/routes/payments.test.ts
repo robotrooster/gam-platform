@@ -516,7 +516,7 @@ describe('POST /api/payments/:id/pay', () => {
     await setFeePayer(f.aPropId, 'landlord', 'tenant')
     await db.query(
       `INSERT INTO platform_fee_accruals
-         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_property, total_amount, payer)
+         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_connect_account, total_amount, payer)
        VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
       [f.aLid, f.aPropId])
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
@@ -697,25 +697,44 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(fees.length).toBe(0)
   })
 
-  it('second rent payment → MANUALPAY fee row created (GAM revenue)', async () => {
+  // S630 DIRECTIVE (Nic): "We need to remove the cash charge completely... We are
+  // gonna make that absolutely free to pay with cash." Not the first one — every
+  // one. Nothing may raise a fee row, a ledger line, or a landlord charge, because
+  // a $0.00 line on a statement still reads as being charged to hand over cash.
+  it('a SECOND manual payment is free too — no fee row, no ledger, no landlord charge', async () => {
     const f = await seed()
-    // prior satisfied rent = the tenant already made their first payment
+    // The tenant already made their first payment, so the old freebie is spent.
     await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: 1 })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'cash' })
     expect(res.status).toBe(200)
-    expect(res.body.data.feeWaived).toBe(false)
-    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
-    expect(res.body.data.feePaymentId).toBeTruthy()
-    const { rows: [fee] } = await db.query<any>(
-      `SELECT type, amount::float AS amount, status, entry_description FROM payments WHERE id=$1`,
-      [res.body.data.feePaymentId])
-    expect(fee.type).toBe('fee')
-    expect(fee.amount).toBe(MANUAL_PAYMENT_FEE)
-    expect(fee.status).toBe('pending')
-    expect(fee.entry_description).toBe('MANUALPAY')
+    expect(res.body.data.feeAmount).toBe(0)
+    expect(res.body.data.feePaymentId).toBeFalsy()
+    expect(res.body.data.feeBilledTo).toBe('none')
+
+    const fees = await db.query<any>(
+      `SELECT id FROM payments WHERE entry_description='MANUALPAY'`)
+    expect(fees.rows).toHaveLength(0)
+    const ledger = await db.query<any>(
+      `SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
+    expect(ledger.rows).toHaveLength(0)
+  })
+
+  it('is free even when the property says the TENANT pays the manual fee', async () => {
+    const f = await seed()
+    await db.query(
+      `UPDATE property_allocation_rules SET manual_fee_payer='tenant' WHERE property_id=$1`,
+      [f.aPropId])
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: 1 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeAmount).toBe(0)
+    expect(res.body.data.feePaymentId).toBeFalsy()
   })
 
   // S607 (Nic) — the S570 21-day property-creation gate is GONE. It counted from
@@ -752,7 +771,9 @@ describe('POST /api/payments/:id/record-manual', () => {
 
   // "If they pay card the first time, they lose that freebie." The waiver is the
   // first PAYMENT being manual, not the first MANUAL payment.
-  it('a card payment first burns the freebie — a later manual payment is charged', async () => {
+  // S630: paying by card first used to burn the freebie and make the next manual
+  // payment chargeable. There is nothing left to burn.
+  it('paying by card first no longer makes a later manual payment cost anything', async () => {
     const f = await seed()
     const paidByCard = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
     await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [paidByCard])
@@ -761,8 +782,8 @@ describe('POST /api/payments/:id/record-manual', () => {
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'cash' })
     expect(res.status).toBe(200)
-    expect(res.body.data.feeWaived).toBe(false)
-    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
+    expect(res.body.data.feeAmount).toBe(0)
+    expect(res.body.data.feePaymentId).toBeFalsy()
   })
 
   it('non-rent charge → 409', async () => {
@@ -891,76 +912,45 @@ describe('POST /api/payments/:id/record-prior-arrangement', () => {
 // S607 (Nic): the landlord may elect to absorb the manual-payment fee at the
 // property. "If they aren't covering it, it's still charged out of their collect
 // account, but the tenant gets invoiced. So the landlord isn't out any money."
-describe('POST /payments/:id/record-manual — landlord covers the manual fee', () => {
-  it('raises no tenant charge when the property has the landlord covering', async () => {
-    const f = await seed()
-    await db.query(
-      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
-       VALUES ($1,'tenant','tenant','landlord')
-       ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [f.aPropId])
-    // Burn the free first payment so the waiver cannot be what we are observing.
-    const first = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [first])
+// S630 DIRECTIVE (Nic): "We need to remove the cash charge completely... We are
+// gonna make that absolutely free to pay with cash. It doesn't make sense to
+// charge for it, especially when most landlords aren't gonna offer it anyway."
+//
+// The manual_fee_payer toggle and the absorb/passthrough machinery are now
+// inert. Left in place (like subleasing and On-Time Pay) rather than ripped out,
+// so nothing silently changes meaning if a fee ever returns — but nothing may
+// raise a charge on either side while the fee is zero.
+describe('POST /payments/:id/record-manual — cash is free on both sides', () => {
+  it('charges neither the tenant nor the landlord, whoever the property names', async () => {
+    for (const payer of ['tenant', 'landlord'] as const) {
+      const f = await seed()
+      await db.query(
+        `UPDATE property_allocation_rules SET manual_fee_payer=$2 WHERE property_id=$1`,
+        [f.aPropId, payer])
+      // Spend the old free-first-payment so nothing else explains a zero.
+      await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
+      const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: 1 })
 
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.coveredByLandlord).toBe(true)
-    expect(res.body.data.firstPayment).toBe(false)   // NOT the free-first reason
-    expect(res.body.data.feeBilledTo).toBe('landlord')
-    expect(res.body.data.feePaymentId).toBeFalsy()
+      const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+        .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+        .send({ method: 'cash' })
+      expect(res.status).toBe(200)
+      expect(res.body.data.feeAmount).toBe(0)
+      expect(res.body.data.feeBilledTo).toBe('none')
 
-    // No TENANT charge...
-    const fees = await db.query(
-      `SELECT id FROM payments WHERE entry_description='MANUALPAY' AND tenant_id=$1`, [f.tenant1Id])
-    expect(fees.rows).toHaveLength(0)
-
-    // ...but GAM is still paid. Nic: "if they use cash the second month and the
-    // landlord covers, that means the LANDLORD gets charged."
-    const rev = await db.query<{ amount: string }>(
-      `SELECT amount::text FROM platform_revenue_ledger
-        WHERE reference_type='manual_payment_fee'`)
-    expect(rev.rows).toHaveLength(1)
-    expect(Number(rev.rows[0].amount)).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
-  })
-
-  it('defaults to billing the tenant when the property says nothing', async () => {
-    const f = await seed()
-    const first = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [first])
-
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'check' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.coveredByLandlord).toBe(false)
-    expect(res.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
-    expect(res.body.data.feePaymentId).toBeTruthy()
-  })
-
-  // The two reasons must stay distinguishable: one expires, the other does not.
-  it('reports first-payment and landlord-covered as separate reasons', async () => {
-    const f = await seed()
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
-      .send({ method: 'cash' })
-    expect(res.body.data.firstPayment).toBe(true)
-    expect(res.body.data.coveredByLandlord).toBe(false)
+      // No tenant fee row, no GAM revenue, no landlord charge.
+      const tenantFee = await db.query<any>(
+        `SELECT id FROM payments WHERE entry_description='MANUALPAY'`)
+      expect(tenantFee.rows).toHaveLength(0)
+      const ledger = await db.query<any>(
+        `SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
+      expect(ledger.rows).toHaveLength(0)
+      const absorbed = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
+        .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      expect(absorbed.body.data.total).toBe(0)
+    }
   })
 })
-
-// S607 (Nic): the invoice shows every avenue and its price. "Here's your $450
-// rent. ACH makes that $456. $450 with a debit card is $466.30. $450 with cash
-// is $460. That way they see all the avenues and the price at the point the
-// invoice comes out."
-//
-// S624: the cash figure in that quote is now $456, not $460 — the manual fee
-// dropped to match ACH exactly. Nic's words are left as he said them; the
-// assertions below are bound to the constants, so they follow the price.
 describe('GET /payments/balance-context — per-method price breakdown', () => {
   it('prices bank, card and cash for the outstanding balance', async () => {
     const f = await seed()
@@ -976,11 +966,14 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
     const by = Object.fromEntries(lease.methodCosts.map((m: any) => [m.method, m]))
     expect(by.ach.total).toBeCloseTo(450 + PROCESSING_FEES.ACH_FLAT, 2)
     expect(by.card.total).toBeCloseTo(466.30, 2)
-    // S624: cash now costs the tenant EXACTLY what ACH does. This assertion is
-    // the whole repricing in one line — if it ever drifts apart again, the
-    // "it costs the same either way" promise on the invoice has quietly broken.
-    expect(by.manual.total).toBeCloseTo(450 + MANUAL_PAYMENT_FEE, 2)
-    expect(by.manual.total).toBeCloseTo(by.ach.total, 2)
+    // S630 (Nic): cash is FREE. It used to be priced at exactly the ACH fee so
+    // "it costs the same either way" ended the argument; the fee is gone, so the
+    // quote a tenant is shown must be the balance and nothing else.
+    expect(by.manual.total).toBeCloseTo(450, 2)
+    expect(by.manual.fee).toBe(0)
+    // And it must now be the CHEAPEST option on the invoice, not the equal one.
+    expect(by.manual.total).toBeLessThan(by.ach.total)
+    expect(by.manual.total).toBeLessThan(by.card.total)
   })
 
   it('shows cash at no extra cost while the first payment is still free', async () => {
@@ -1013,7 +1006,8 @@ describe('GET /payments/balance-context — per-method price breakdown', () => {
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
     const lease = res.body.data.leases[0]
     expect(lease.manualFeeCoveredByLandlord).toBe(true)
-    expect(lease.manualFeeAbsorbed).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
+    // S630: there is no longer anything to absorb — the toggle is inert.
+    expect(lease.manualFeeAbsorbed).toBe(0)
     const manual = lease.methodCosts.find((m: any) => m.method === 'manual')
     expect(manual.total).toBeCloseTo(450, 2)   // landlord covers it — no fee at all
   })
@@ -1048,8 +1042,10 @@ describe('POST /payments/:id/record-manual — the free first payment is spent o
       .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
     expect(r2.body.data.firstPayment).toBe(false)
     expect(r2.body.data.coveredByLandlord).toBe(false)
-    expect(r2.body.data.feeAmount).toBe(MANUAL_PAYMENT_FEE)
-    expect(r2.body.data.feePaymentId).toBeTruthy()
+    // S630: the freebie is still SPENT (firstPayment goes false, and that must
+    // keep working if a fee ever returns) — but spending it now costs nothing.
+    expect(r2.body.data.feeAmount).toBe(0)
+    expect(r2.body.data.feePaymentId).toBeFalsy()
   })
 
   it('the tenant quote agrees — no free-first once it has been spent', async () => {
@@ -1063,66 +1059,37 @@ describe('POST /payments/:id/record-manual — the free first payment is spent o
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
     const lease = res.body.data.leases[0]
     expect(lease.manualFeeFirstFree).toBe(false)
+    // S630: the freebie is spent, and it still costs the balance and nothing
+    // more — spelled out rather than written as 450 + MANUAL_PAYMENT_FEE, which
+    // would pass for the wrong reason now that the constant is zero.
     expect(lease.methodCosts.find((m: any) => m.method === 'manual').total)
-      .toBeCloseTo(450 + MANUAL_PAYMENT_FEE, 2)
+      .toBeCloseTo(450, 2)
   })
 })
 
-// S607 (Nic): "it's only free the first payment and only if they do cash."
-// The landlord's toggle MOVES the fee, it does not erase it.
-describe('POST /payments/:id/record-manual — landlord-covered fee still reaches GAM', () => {
-  const coverProperty = (propId: string) => db.query(
-    `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
-     VALUES ($1,'tenant','tenant','landlord')
-     ON CONFLICT (property_id) DO UPDATE SET manual_fee_payer='landlord'`, [propId])
-
-  it('a covered FIRST cash payment charges nobody — that one really is free', async () => {
+// S607 (Nic): "it's only free the first payment and only if they do cash." The
+// landlord's toggle MOVED the fee rather than erasing it.
+// S630 (Nic) SUPERSEDES the pricing: cash is free for everyone, every time. The
+// first-payment and payer machinery still runs — it is what would come back if a
+// fee ever did — but it can no longer produce a charge.
+// S630: the landlord-absorbed path is inert while the fee is zero — there is
+// nothing to reach GAM, and nothing to net out of a payout.
+describe('POST /payments/:id/record-manual — nothing reaches GAM while cash is free', () => {
+  it('posts no revenue and no landlord charge even when the landlord "covers" it', async () => {
     const f = await seed()
-    await coverProperty(f.aPropId)
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
-    expect(res.body.data.feeBilledTo).toBe('none')
-    const rev = await db.query(`SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
-    expect(rev.rows).toHaveLength(0)
-  })
-
-  it('a card first payment leaves nothing to cover, and burns the freebie', async () => {
-    const f = await seed()
-    await coverProperty(f.aPropId)
-    // First rent settled by card — no manual fee arises at all.
-    const byCard = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [byCard])
-    // Second month, cash, landlord covering → the LANDLORD is charged.
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
-    expect(res.body.data.feeBilledTo).toBe('landlord')
-    const rev = await db.query<{ amount: string }>(
-      `SELECT amount::text FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
-    expect(rev.rows).toHaveLength(1)
-    expect(Number(rev.rows[0].amount)).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
-  })
-
-  it('re-recording the same payment cannot post the fee twice', async () => {
-    const f = await seed()
-    await coverProperty(f.aPropId)
-    const prior = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
-    await db.query(`UPDATE payments SET status='settled', settled_at=NOW() WHERE id=$1`, [prior])
-    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    await db.query(
+      `UPDATE property_allocation_rules SET manual_fee_payer='landlord' WHERE property_id=$1`,
+      [f.aPropId])
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: 1 })
     await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
-    // Second attempt 409s (already settled), and must not double-post revenue.
-    await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
-      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
-    const rev = await db.query(`SELECT id FROM platform_revenue_ledger WHERE reference_type='manual_payment_fee'`)
-    expect(rev.rows).toHaveLength(1)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' }).expect(200)
+
+    const ledger = await db.query<any>(
+      `SELECT id FROM platform_revenue_ledger WHERE type='manual_withdrawal_fee'`)
+    expect(ledger.rows).toHaveLength(0)
   })
 })
-
-// S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
-// visible to them so they can track it. If the landlord is not covering the ten
-// dollars, it doesn't need to be visible to them."
 describe('GET /payments/absorbed-manual-fees', () => {
   const coverProperty = (propId: string) => db.query(
     `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer, manual_fee_payer)
@@ -1138,7 +1105,11 @@ describe('GET /payments/absorbed-manual-fees', () => {
       .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
   }
 
-  it('shows the landlord what they absorbed, with the property and unit', async () => {
+  // S630 (Nic): cash is free, so there is nothing left to absorb and this screen
+  // is empty by construction. Kept as a test rather than deleted: the report is
+  // what a landlord would look at to find out they were being charged, and it
+  // must not start showing $0.00 lines for every cash payment taken.
+  it('shows nothing to absorb, because cash costs the landlord nothing', async () => {
     const f = await seed()
     await coverProperty(f.aPropId)
     await absorbOne(f)
@@ -1146,14 +1117,9 @@ describe('GET /payments/absorbed-manual-fees', () => {
     const res = await request(buildApp()).get('/api/payments/absorbed-manual-fees')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.total).toBeCloseTo(MANUAL_PAYMENT_FEE, 2)
-    expect(res.body.data.count).toBe(1)
-    // NOTE: buildApp() mounts the router WITHOUT index.ts's camelize middleware,
-    // so DB-derived columns arrive snake_case here. In production the response is
-    // camelized (unitNumber / propertyName) — which is what the UI reads, and
-    // what wireContract.test.ts enforces.
-    expect(res.body.data.rows[0].unit_number).toBeTruthy()
-    expect(res.body.data.rows[0].property_name).toBeTruthy()
+    expect(res.body.data.total).toBe(0)
+    expect(res.body.data.count).toBe(0)
+    expect(res.body.data.rows).toHaveLength(0)
   })
 
   it('shows nothing when the tenant is the one reimbursing it', async () => {

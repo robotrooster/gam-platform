@@ -90,9 +90,13 @@ export async function settleManualRentPayment(
   // with it. 'not_started'/'waived'/null all mean nobody ran a check.
   const screened = !['not_started', 'waived', null, undefined]
     .includes(payment.background_check_status as any)
-  const feeWaived = firstPayment && !screened
-  const feeToLandlord = !feeWaived && landlordCovers
-  const feeToTenant = !feeWaived && !landlordCovers
+  // S630 (Nic): cash is free. With MANUAL_PAYMENT_FEE at 0 nothing may raise a
+  // fee row, a ledger line, or a landlord charge — a $0.00 line on a tenant's
+  // statement still reads as being charged for handing over cash.
+  const feeApplies = MANUAL_PAYMENT_FEE > 0
+  const feeWaived = !feeApplies || (firstPayment && !screened)
+  const feeToLandlord = feeApplies && !feeWaived && landlordCovers
+  const feeToTenant = feeApplies && !feeWaived && !landlordCovers
 
   const refNote = input.reference ? ` (ref ${input.reference})` : ''
   const provenance = input.provenance ? ` — ${input.provenance}` : ''

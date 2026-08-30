@@ -8,7 +8,7 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, MANUAL_PAYMENT_FEE, MANUAL_PAYMENT_FEE_SCOPE, type FeePayer } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, cardFeeLabel, achFeeLabel, MANUAL_PAYMENT_FEE_SCOPE, type FeePayer } from '@gam/shared'
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
@@ -761,7 +761,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 reimburse them. Every tenant's FIRST payment is free regardless. */}
             <FeePayerToggle
               label="Cash, check or money order"
-              hint={`$${MANUAL_PAYMENT_FEE.toFixed(2)} per payment: ${MANUAL_PAYMENT_FEE_SCOPE}. Waived on a tenant's FIRST payment only — and only if that first payment is one of these. Pay by card first and there is no waiver later.`}
+              hint={`No charge, to anyone: ${MANUAL_PAYMENT_FEE_SCOPE}. This setting has no effect while cash is free — it exists so the choice is already recorded if a handling fee ever returns.`}
               value={form.allocationRule.manualFeePayer}
               onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, manualFeePayer: v } }))}
             />

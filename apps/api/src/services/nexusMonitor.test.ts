@@ -170,7 +170,7 @@ describe('recomputeNexusTally aggregation', () => {
     )).rows[0].id
     await db.query(
       `INSERT INTO platform_fee_accruals
-         (landlord_id, property_id, accrual_month, total_billable, rate_per_unit, min_per_property, total_amount, payer)
+         (landlord_id, property_id, accrual_month, total_billable, rate_per_unit, min_per_connect_account, total_amount, payer)
        VALUES ($1,$2,'2026-06-01',5,2,10,250.00,'landlord')`,
       [landlordId, propId]
     )
