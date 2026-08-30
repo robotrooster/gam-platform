@@ -2176,7 +2176,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       '"push the end date to the 30th".\n' +
       'This is a SIGNED AGREEMENT. Changing what it says is not the same as agreeing it with the ' +
       'tenant, and a rent figure the tenant never agreed to is not enforceable however it reads in ' +
-      'the system. If the change is one both sides need to sign, that is an addendum — say so.\n' +
+      'the system. If the change is one both sides need to sign, that is an addendum — say so. S630 (Nic): A RENT INCREASE TAKES EFFECT AT RENEWAL, not whenever the landlord says — a fixed term holds the rent it was signed at until it ends. So before touching rent: work out WHICH unit they mean (a "12" can be an RV spot and an apartment at the same park), read the actual lease, and tell them the soonest the new figure could start, which is its end date. Sooner than that needs an addendum both sides sign.\n' +
       'Who is ON the lease cannot be changed here at all; that goes through the e-sign addendum flow. ' +
       'Setting status to terminated or expired ENDS the tenancy: every tenant comes off it and the ' +
       'unit goes vacant. Never do that as part of some other edit.',
