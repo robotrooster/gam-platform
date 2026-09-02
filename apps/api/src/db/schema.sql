@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict cNsOhZbFH7raNd4eqQH2ABks2vvGgfNnwr5csU8yKCYevn4ODZtgAMGarnxK28T
+\restrict 3rkZEUaavqwe0DzRPmvWlXBxQTvxrbtkSPfjk27Ac8wK41WrhdVxY3NUNIlsT2b
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4614,7 +4614,7 @@ CREATE TABLE public.lease_document_fields (
     options text,
     parent_field_id uuid,
     parent_option text,
-    CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'custom_text'::text]))))
+    CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'custom_text'::text]))))
 );
 
 
@@ -25372,5 +25372,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict cNsOhZbFH7raNd4eqQH2ABks2vvGgfNnwr5csU8yKCYevn4ODZtgAMGarnxK28T
+\unrestrict 3rkZEUaavqwe0DzRPmvWlXBxQTvxrbtkSPfjk27Ac8wK41WrhdVxY3NUNIlsT2b
 

@@ -723,9 +723,31 @@ export function leaseColumnDisplayValue(
   return LEASE_COLUMN_VALUE_LABEL[col]?.[v] ?? v
 }
 
+// S636: the set is EXPLICIT, not derived from LEASE_COLUMN_CATEGORY.
+//
+// 'identity' in that map means "display-only, never written back to a lease",
+// which is a different question. It also covers the home-sale terms (sale_price,
+// interest rate, monthly payment) — figures a landlord STATES on a purchase
+// agreement. Testing the category made those nobody's to fill, so a purchase
+// agreement would have gone out with its price blank and no one assigned to
+// enter it. Two different meanings behind one word; this one is named for what
+// it actually decides.
+const AUTO_FILLED_LEASE_COLUMNS = new Set<string>([
+  // who is on it — taken at invite time
+  'tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name',
+  'occupant_names', 'tenant_email',
+  // what and where — chosen when the invite named the space
+  'unit_number', 'property_name', 'property_address',
+  // who is renting it out
+  'landlord_name',
+  // when it was signed — stamped at completion
+  'date_signed_day', 'date_signed_month',
+])
+
 export function isAutoFilledLeaseColumn(col: string | null | undefined): boolean {
-  return !!col && LEASE_COLUMN_CATEGORY[col as LeaseColumn] === 'identity'
+  return !!col && AUTO_FILLED_LEASE_COLUMNS.has(col)
 }
+
 
 // Park-owned RV rented as a unit: the site areas PLUS the rig itself.
 // An RV never gets bedroom areas, no matter who owns it.

@@ -558,13 +558,38 @@ export function roleForLeaseColumn(col: string): SignerRole {
   return nonSigRole(col, null, '', 'none')
 }
 
+/** Test seams for the S636 classifier fixes — the exact resolution the placer
+ *  uses, so a guard cannot pass against a re-implementation of the rule. */
+export function columnForContext(leftCtx: string, aboveText: string): string | null {
+  return columnFor(leftCtx) ?? columnFor(aboveText || '')
+}
+export function tenantColumnForSlot(base: string | null, n: number): string | null {
+  return tenantColumnFor(base, n)
+}
+
 function heuristicClassify(t: RawTarget): Classification {
   const lo = t.leftCtx.toLowerCase()
   const sigNear =
     (/signature/.test(t.sigAboveText) || /signature/.test(lo)) && t.width > 100
   const dateNear =
     t.kind === 'slashdate' || /\bdate\b/.test(t.belowText) || /\bdate\b/.test(lo)
-  let leaseColumn = columnFor(t.leftCtx)
+  // S636 (Nic, DIRECTIVE): "The RV space should be derived from the actual unit
+  // invite. It shouldn't be typeable by the landlord. If it's auto-filled and
+  // the landlord invited to the wrong spot, they need to catch that and not just
+  // type something. Because the billing is gonna go off the invite spot anyway."
+  //
+  // S629 already widened columnFor to catch "RV Space No." and it STILL missed,
+  // because this only ever passed the text to the LEFT of the blank. On the real
+  // RV lease the label wraps: "...the following RV Space No." ends one line and
+  // the blank starts the next, so the matcher saw `_____ ("RV Space")` with the
+  // "No." out of reach. The blank came out unmapped and typeable — and a
+  // hand-typed space number that disagrees with the invite is worse than blank,
+  // because billing follows the invite and the signed lease then says something
+  // else.
+  //
+  // Falls back to the line ABOVE only when the left context yields nothing,
+  // which is the wrapped-label case by construction.
+  let leaseColumn = columnFor(t.leftCtx) ?? columnFor(t.aboveText || '')
 
   if (t.kind === 'slashdate') {
     return { keep: true, fieldType: 'date', leaseColumn: 'date_signed', signerRole: t.roleByX, label: 'Date', split: 'none' }
@@ -847,9 +872,22 @@ function findClearY(x: number, w: number, h: number, startY: number, pm: PageMet
   return null
 }
 
+const TENANT_NAME_SLOTS = ['tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name'] as const
+
 function tenantColumnFor(base: string | null, n: number): string | null {
-  // Only the primary box carries the machine column (e.g. tenant_name);
-  // co-tenant boxes are free-text so the send-time value map doesn't collide.
+  // S636 (Nic): A NAME SLOT HAS ITS OWN COLUMN — bind it.
+  //
+  // This returned null for every box after the first, so a lease's four name
+  // blanks came out as one bound field and three free-text boxes addressed to
+  // co-tenants. The reason given was that co-tenant boxes must not "collide" in
+  // the send-time value map — but tenant_2/3/4_name exist precisely so they
+  // don't, and the roster fills them at send time. Left unbound they are three
+  // blanks asking somebody to type names the invite already recorded, which is
+  // the defect Nic hit on the mobile home template and had to have patched by
+  // hand.
+  //
+  // Everything else keeps the old rule: only the primary box carries the column.
+  if (base === 'tenant_name') return TENANT_NAME_SLOTS[n] ?? null
   return n === 0 ? base : null
 }
 

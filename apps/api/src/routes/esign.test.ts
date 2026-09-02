@@ -3565,3 +3565,41 @@ describe('signing links by signer role', () => {
       .toBe(signingUrlFor({ role: 'landlord', token: tok }, 'doc-2', null))
   })
 })
+
+
+// ─── S636: the two vocabularies have to agree ────────────────────────────────
+//
+// 20260901234500 added `occupant_names` to the CHECK on lease_template_fields
+// and stopped there. lease_document_fields carries its OWN copy of the same
+// list, and that is the table a draft inserts into — so a template happily
+// stored a column the document could never accept, and every auto-draft off it
+// died with "violates check constraint lease_document_fields_lease_column_check".
+// Four Mountain View residents accepted and got no lease.
+//
+// Nothing caught it because no test drafted from a template carrying the new
+// column. This one does, and it fails for ANY future column added to one list
+// and not the other.
+describe('S636 lease_column vocabularies agree across both tables', () => {
+  it('every column lease_template_fields accepts, lease_document_fields accepts too', async () => {
+    const cols = async (table: string) => {
+      const { rows } = await db.query<{ def: string }>(
+        `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+          WHERE conname = $1`, [`${table}_lease_column_check`])
+      return new Set((rows[0]?.def ?? '').match(/'[a-z0-9_]+'::text/g)?.map(m => m.slice(1, -7)) ?? [])
+    }
+    const tmpl = await cols('lease_template_fields')
+    const doc = await cols('lease_document_fields')
+    expect(tmpl.size).toBeGreaterThan(50)
+    const onlyInTemplate = [...tmpl].filter(c => !doc.has(c))
+    expect(onlyInTemplate,
+      `a template can bind these but a DRAFT cannot store them — every draft off such a `
+      + `template fails at insert: ${onlyInTemplate}`).toEqual([])
+  })
+
+  it('occupant_names specifically — the column that broke Mountain View', async () => {
+    const { rows } = await db.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conname = 'lease_document_fields_lease_column_check'`)
+    expect(rows[0].def).toContain('occupant_names')
+  })
+})

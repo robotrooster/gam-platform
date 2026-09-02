@@ -259,7 +259,44 @@ export async function draftPendingForUnitType(args: {
         const out = await autoDraftLeasesForUnit(client as any, unit_id, createDocumentRecord)
         await client.query('COMMIT')
         if (out.draftedDocumentIds.length) drafted++
-        else await noteSkip(unit_id, 'Waiting on the rest of the household to accept')
+        else {
+          // S636: SAY WHICH REASON. This reported every non-draft as "waiting on
+          // the rest of the household", including the one cause the landlord can
+          // actually act on — no default template for the unit type. At Mountain
+          // View that pointed Nic at his residents when the answer was an
+          // unbuilt RV template, and a household genuinely waiting on a
+          // co-tenant looks identical to one blocked on setup.
+          const tmpl = await resolveDefaultTemplateForUnit(unit_id)
+          const waiting = await queryOne<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
+              WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
+                AND accepted_at IS NULL`, [unit_id])
+          const stillToAccept = Number(waiting?.n || 0)
+          const tmplFields = tmpl ? await queryOne<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM lease_template_fields WHERE template_id = $1`,
+            [tmpl.id]) : null
+          await noteSkip(unit_id,
+            !tmpl
+              ? 'No default lease template is set for this unit type. Set one under Leases → '
+                + 'Templates and this drafts automatically.'
+            : !tmpl.base_pdf_url
+              ? 'That unit type’s default template has no uploaded document yet.'
+            : Number(tmplFields?.n || 0) === 0
+              // The Mountain View case: the template was uploaded and its
+              // auto-placement finished, but the landlord has not opened it and
+              // SAVED the proposed fields, so it has none. Reported as "waiting
+              // on the household", which sent Nic looking at his residents.
+              ? 'That unit type’s default template has no fields saved yet — open it in the '
+                + 'template editor and save the auto-placed fields.'
+            : stillToAccept > 0
+              ? `Waiting on ${stillToAccept} more of the household to accept`
+              // Everyone accepted, the template looks complete, and drafting
+              // still refused — the reason is specific (e.g. the late-fee policy
+              // must appear in the document) and was sent as its own
+              // notification. Never guess at it here.
+              : 'The draft was refused — see the "Lease could not be drafted automatically" '
+                + 'notification for the reason.')
+        }
       } catch (e: any) {
         await client.query('ROLLBACK').catch(() => {})
         await noteSkip(unit_id, e?.message || 'Could not draft')
@@ -307,11 +344,35 @@ export async function draftPendingForUnitType(args: {
  * queue costs one indexed query and nothing else.
  */
 export async function draftAllPendingLeases(): Promise<{ drafted: number; skipped: number }> {
+  // S636 (bug): THE SWEEP ONLY SAW HALF THE RESIDENTS WAITING.
+  //
+  // It enumerated `pending_lease_drafts` alone. A resident invited through
+  // "New Lease — Invite to Sign" has their roster in `pending_tenant_intents`
+  // instead, and draftPendingForUnitType handles that shape perfectly well — it
+  // was simply never asked to, because nothing put those units in this list.
+  //
+  // So the retry that exists precisely to rescue a household stuck behind a
+  // missing template did not cover the invite path, which is the path every
+  // Mountain View resident came in through. Nine people accepted, every draft
+  // failed, and the net underneath them was empty. A stuck household is invisible
+  // by nature — the landlord sees "invite accepted" and assumes a lease followed
+  // — so the sweep is the only thing that would ever notice.
+  //
+  // UNION of both sources: a unit waiting in either place is a unit to retry.
   const groups = await query<{ landlord_id: string; unit_type: string }>(
     `SELECT DISTINCT p.landlord_id, u.unit_type
        FROM pending_lease_drafts p
        JOIN units u ON u.id = p.unit_id
-      WHERE p.resolved_at IS NULL AND u.unit_type IS NOT NULL`)
+      WHERE p.resolved_at IS NULL AND u.unit_type IS NOT NULL
+     UNION
+     SELECT DISTINCT pti.landlord_id, u.unit_type
+       FROM pending_tenant_intents pti
+       JOIN units u ON u.id = pti.unit_id
+      WHERE pti.accepted_at IS NOT NULL
+        AND pti.draft_document_id IS NULL
+        AND pti.resolved_at IS NULL
+        AND pti.cancelled_at IS NULL
+        AND u.unit_type IS NOT NULL`)
 
   let drafted = 0, skipped = 0
   for (const g of groups) {

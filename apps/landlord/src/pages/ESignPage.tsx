@@ -85,7 +85,16 @@ const DEPTH_RING = ['', '#4a9eff', '#a78bfa', '#f472b6']
 
 function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scale, parentLabel, depth = 0 }: any) {
   const ft = FIELD_TYPES.find(f => f.type === field.fieldType) || FIELD_TYPES[0]
-  const color = ROLE_COLORS[field.signerRole] || '#888'
+  // S636 (Nic): "unit number selection on template field leaves the box gold.
+  // Still looks like the landlord will need to input."
+  //
+  // An identity box is the SYSTEM'S — it is filled from the invite and nobody
+  // types it. Clearing the signer role alone left it falling through to the
+  // unassigned grey, which reads as a field somebody forgot to assign rather
+  // than one that is deliberately nobody's. It gets its own colour and says so
+  // on the canvas, so the difference is visible without selecting it.
+  const systemFilled = isAutoFilledLeaseColumn(field.leaseColumn)
+  const color = systemFilled ? '#64748b' : (ROLE_COLORS[field.signerRole] || '#888')
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
   // S558 (Nic): late-fee boxes are policy-controlled — locked from move / resize
   // / delete / edit so the landlord can't tamper with the stamped fee (anti-
@@ -179,7 +188,17 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
           pointerEvents:'none', opacity:.75, lineHeight:1,
         }}>↳</div>
       ))}
-      <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
+      {/* S636: a system-filled box announces itself on the canvas. Without this
+          the only signal was a colour nobody has a key for. */}
+      {systemFilled && (
+        <div style={{
+          position:'absolute', bottom:'100%', right:0, marginBottom:1,
+          fontSize: Math.max(6, 7 * scale), color, fontWeight:700,
+          whiteSpace:'nowrap' as const, pointerEvents:'none', opacity:.9,
+          background:'var(--bg-0)', padding:'0 3px', borderRadius:3, zIndex:30,
+        }}>auto</div>
+      )}
+      <div onMouseDown={onMouseDown} title={systemFilled ? 'Filled from the invite — nobody types this. If it is wrong, fix the invite.' : locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
         // Depth ring — drawn outside the box so it never eats the field's own
@@ -392,7 +411,19 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   }, [])
 
   const updateSelected = (key: string, value: any) => {
-    setFields(prev => prev.map(f => f.id === selectedField ? {...f, [key]: value} : f))
+    setFields(prev => prev.map(f => {
+      if (f.id !== selectedField) return f
+      const next = { ...f, [key]: value }
+      // S636 (Nic): tagging a box with an identity column hands it to the
+      // SYSTEM, so it must stop belonging to a person in the same move. Nic,
+      // trying to fix the RV space blank by hand: "I don't see any unit type or
+      // unit number box to select instead of having it be assigned to one person
+      // or another and instead of just having it assigned to the system." The
+      // column was in the list; what was missing was any way to say "nobody
+      // fills this". Picking the label now says it.
+      if (key === 'leaseColumn' && isAutoFilledLeaseColumn(value)) next.signerRole = null
+      return next
+    }))
   }
 
   const saveMut = useMutation(
@@ -869,7 +900,15 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                       <div style={{ fontSize:'.62rem', marginTop:3, lineHeight:1.4,
                         color: eff.billing ? 'var(--gold-1, #c9a227)' : 'var(--text-3)' }}>
                         {eff.billing ? '💵 ' : ''}{eff.text}
-                        {sel.leaseColumn ? ' Auto-filled from lease data at send time.' : ''}
+                        {sel.leaseColumn
+                          ? isAutoFilledLeaseColumn(sel.leaseColumn)
+                            // S636 (Nic): say plainly that this one is nobody's,
+                            // and WHY it is not a typo to fix here — the invite is
+                            // what billing follows, so a mismatch has to be
+                            // corrected at the source, not overwritten on the page.
+                            ? ' Taken from the invite — nobody fills this in. If it is wrong, fix the invite: billing follows the invited space, not this box.'
+                            : ' Auto-filled from lease data at send time.'
+                          : ''}
                       </div>
                     )
                   })()}
@@ -947,7 +986,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   style={{ display:'flex', alignItems:'center', gap:6, padding:'4px 6px', borderRadius:5, cursor:'pointer', background:selectedField===f.id?'var(--bg-3)':'transparent', fontSize:'.7rem', color:'var(--text-2)', marginBottom:2 }}>
                   <span>{ft?.icon}</span>
                   <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{f.label} · p{f.page}</span>
-                  <div style={{ width:8, height:8, borderRadius:'50%', background:ROLE_COLORS[f.signerRole]||'#888', flexShrink:0 }} />
+                  <div style={{ width:8, height:8, borderRadius:'50%', background: isAutoFilledLeaseColumn(f.leaseColumn) ? '#64748b' : (ROLE_COLORS[f.signerRole]||'#888'), flexShrink:0 }} />
                 </div>
               )
             })}

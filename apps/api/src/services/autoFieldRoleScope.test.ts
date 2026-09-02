@@ -16,7 +16,7 @@
  * assign rather than a spot check.
  */
 import { describe, it, expect } from 'vitest'
-import { roleForLeaseColumn } from './autoFieldPlacement'
+import { roleForLeaseColumn, columnForContext, tenantColumnForSlot } from './autoFieldPlacement'
 
 // S635 supersedes half of the S622 rule below. S622 said a bound column is
 // LANDLORD-filled, reasoning that a value GAM already holds is "wrong by
@@ -38,6 +38,12 @@ const NOBODY_TYPES = [
 const PROPERTY_AND_MONEY = [
   'start_date', 'end_date', 'rent_due_day',
   'rent_amount', 'security_deposit', 'pet_deposit', 'pet_fee', 'other_fee',
+  // S636: the home-sale terms live in the 'identity' CATEGORY, which there means
+  // "never written back to a lease" — a different question from "derived from
+  // the invite". Testing the category made these nobody's, so a purchase
+  // agreement would have gone out with its price blank and no one assigned to
+  // fill it. They are figures the landlord STATES; they stay landlord-filled.
+  'sale_price', 'sale_down_payment', 'sale_monthly_payment', 'sale_interest_rate',
 ]
 
 describe('auto-placed field role scoping', () => {
@@ -226,5 +232,63 @@ describe('columnFor money semantics', () => {
     // There is deliberately NO column for a proration or a grand total.
     expect((LEASE_COLUMN_CATEGORY as Record<string, string>).proration).toBeUndefined()
     expect((LEASE_COLUMN_CATEGORY as Record<string, string>).total_due).toBeUndefined()
+  })
+})
+
+
+// ─── S636: the space blank on a real RV lease ────────────────────────────────
+//
+// Nic: "The RV space should be derived from the actual unit invite. It shouldn't
+// be typeable by the landlord. If it's auto-filled and the landlord invited to
+// the wrong spot, they need to catch that and not just type something. Because
+// the billing is gonna go off the invite spot anyway."
+//
+// S629 widened columnFor to catch "RV Space No." and it still missed on the real
+// document, because the classifier only ever saw the text to the LEFT of the
+// blank and the label wraps:
+//
+//     ...the following RV Space No.
+//     _____ ("RV Space").
+//
+// The blank came out unmapped and landlord-typeable — worse than blank, because
+// a hand-typed number that disagrees with the invite puts the signed lease and
+// the billing on different spaces.
+describe('S636 a wrapped label still binds its column', () => {
+  it('reads the line ABOVE when the blank has no left context', () => {
+    // The exact shape from the Mountain View RV Spot Lease.
+    expect(columnForContext('', 'Landlord rents to Tenant the following RV Space No.'))
+      .toBe('unit_number')
+  })
+
+  it('still prefers the left context when there is one', () => {
+    expect(columnForContext('RV Space No.', 'something unrelated above')).toBe('unit_number')
+  })
+
+  it('and unit_number is nobody\'s, so it cannot be typed over', () => {
+    expect(roleForLeaseColumn('unit_number')).toBeNull()
+  })
+})
+
+// ─── S636: four name blanks, four columns ────────────────────────────────────
+//
+// tenantColumnFor returned null for every slot after the first, so a lease's
+// four name blanks came out as one bound field and three free-text boxes
+// addressed to co-tenants — three blanks asking somebody to type names the
+// invite already recorded. tenant_2/3/4_name exist precisely for these.
+describe('S636 per-tenant name slots each bind their own column', () => {
+  it.each([[0, 'tenant_name'], [1, 'tenant_2_name'], [2, 'tenant_3_name'], [3, 'tenant_4_name']])(
+    'slot %i binds %s', (n, col) => {
+      expect(tenantColumnForSlot('tenant_name', n as number)).toBe(col)
+    })
+
+  it('every one of them is nobody\'s', () => {
+    for (const c of ['tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name']) {
+      expect(roleForLeaseColumn(c)).toBeNull()
+    }
+  })
+
+  it('a non-name column keeps the old rule — only the first slot carries it', () => {
+    expect(tenantColumnForSlot('tenant_initial', 0)).toBe('tenant_initial')
+    expect(tenantColumnForSlot('tenant_initial', 1)).toBeNull()
   })
 })

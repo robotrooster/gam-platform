@@ -22,6 +22,7 @@ import {
   isValidSignerRole,
   MIGRATION_WINDOW_DAYS,
   leaseColumnDisplayValue,
+  isAutoFilledLeaseColumn,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -1883,8 +1884,18 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
       const row = await queryOne<{ id: string }>(`INSERT INTO lease_template_fields
         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css, options)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-        [template.id, f.fieldType, f.signerRole, f.label||null, f.leaseColumn||null,
-         f.page||1, f.x, f.y, f.width||200, f.height||50, f.required??true, f.sortOrder||0, f.fontCss||null,
+        // S636 (Nic): an IDENTITY column belongs to nobody, enforced on the way
+        // in. The editor clears the role when the label is picked, but a template
+        // saved before that shipped — or by any other client — would otherwise
+        // keep signer_role='landlord' on a box the landlord can never usefully
+        // fill. `required` goes too: the value arrives from the invite, so asking
+        // a signer to complete it is wrong.
+        [template.id, f.fieldType,
+         isAutoFilledLeaseColumn(f.leaseColumn) ? null : f.signerRole,
+         f.label||null, f.leaseColumn||null,
+         f.page||1, f.x, f.y, f.width||200, f.height||50,
+         isAutoFilledLeaseColumn(f.leaseColumn) ? false : (f.required??true),
+         f.sortOrder||0, f.fontCss||null,
          f.options||null])
       if (f.clientId != null) clientToDbId.set(String(f.clientId), row!.id)
       inserted.push({ f, dbId: row!.id })
