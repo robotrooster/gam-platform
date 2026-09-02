@@ -63,6 +63,8 @@ beforeEach(async () => {
   finally { c.release() }
 })
 
+// Exactly what Checkr's Tenant API needs to open an order — nothing more
+// is asked at the QR, because Checkr collects the rest on its own form.
 const APPLICANT = { firstName: 'Randall', lastName: 'Cox', email: 'r@cox.dev', phone: '555-0100' }
 
 describe('POST /api/public/property/:slug/apply', () => {
@@ -94,6 +96,16 @@ describe('POST /api/public/property/:slug/apply', () => {
     expect(row).toBeNull()
   })
 
+  it('hands the applicant straight on to screening, property bound', async () => {
+    const res = await request(buildApp())
+      .post(`/api/public/property/${fx.slug}/apply`).send(APPLICANT)
+    expect(res.status).toBe(201)
+    const url: string = res.body.data.screeningUrl
+    expect(url).toContain('/background-check')
+    expect(url).toContain(`propertyId=${fx.propertyId}`)
+    expect(url).toContain(`landlordId=${fx.landlordId}`)
+  })
+
   it('404s an unknown slug', async () => {
     const res = await request(buildApp())
       .post('/api/public/property/not-a-real-park/apply').send(APPLICANT)
@@ -102,13 +114,18 @@ describe('POST /api/public/property/:slug/apply', () => {
 })
 
 describe('GET /api/properties/:id/apply-link', () => {
-  it('returns the property link and a QR image', async () => {
+  it('encodes the SCREENING page with the property bound — not a GAM form', async () => {
     const res = await request(buildApp())
       .get(`/api/properties/${fx.propertyId}/apply-link`)
       .set('Authorization', `Bearer ${fx.token}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.url).toContain(fx.slug)
-    expect(res.body.data.url).toMatch(/\/apply$/)
+    const url: string = res.body.data.url
+    expect(url).toContain('/background-check')
+    expect(url).toContain(`propertyId=${fx.propertyId}`)
+    expect(url).toContain(`landlordId=${fx.landlordId}`)
+    // Nothing on the property's own site — the applicant should not be asked
+    // for anything the screening flow collects anyway.
+    expect(url).not.toContain('/apply')
     expect(res.body.data.qrDataUrl).toMatch(/^data:image\/png;base64,/)
   })
 

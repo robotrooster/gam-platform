@@ -23,7 +23,7 @@ import {
   seedLease, seedLeaseTenant, seedUtilityMeter,
 } from '../test/dbHelpers'
 import { generateMoveInInvoice } from './moveInBundle'
-import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
+import { releaseSuspendedChargesForLease, attachStrandedUtilityBill } from '../services/utilityBilling'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -160,5 +160,60 @@ describe('held utilities on the move-in invoice', () => {
     const rows = await db.query<any>(
       `SELECT status FROM utility_bills WHERE lease_id=$1`, [s.leaseId])
     expect(rows.rows[0].status).toBe('unbilled')
+  })
+})
+
+describe('attaching a bill stranded by the monthly run', () => {
+  it('puts it on the open invoice and marks it billed', async () => {
+    const s = await seedStack()
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      await generateMoveInInvoice({
+        lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
+        landlord_id: s.landlordId, rent_amount: 500, start_date: '2026-09-02',
+      } as any, client)
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // A bill the monthly run created AFTER that invoice was cut.
+    const bill = await db.query<{ id: string }>(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+          charge_amount, tax_rate_pct, tax_amount, utility_type)
+       VALUES ($1,$2,$3,$4,$5,'2026-09-01',25.20,0,0,'electric') RETURNING id`,
+      [s.meterId, s.unitId, s.tenantId, s.leaseId, s.landlordId])
+
+    expect(await attachStrandedUtilityBill(bill.rows[0].id)).toBe(true)
+    const inv = await invoiceFor(s.leaseId)
+    expect(Number(inv.subtotal_utilities)).toBe(25.20)
+    const row = await db.query<any>(
+      `SELECT status, payment_id FROM utility_bills WHERE id=$1`, [bill.rows[0].id])
+    expect(row.rows[0].status).toBe('billed')
+    expect(row.rows[0].payment_id).not.toBeNull()
+  })
+
+  it('is idempotent — a second call does not bill it twice', async () => {
+    const s = await seedStack()
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      await generateMoveInInvoice({
+        lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
+        landlord_id: s.landlordId, rent_amount: 500, start_date: '2026-09-02',
+      } as any, client)
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    const bill = await db.query<{ id: string }>(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+          charge_amount, tax_rate_pct, tax_amount, utility_type)
+       VALUES ($1,$2,$3,$4,$5,'2026-09-01',25.20,0,0,'electric') RETURNING id`,
+      [s.meterId, s.unitId, s.tenantId, s.leaseId, s.landlordId])
+
+    await attachStrandedUtilityBill(bill.rows[0].id)
+    expect(await attachStrandedUtilityBill(bill.rows[0].id)).toBe(false)
+    const inv = await invoiceFor(s.leaseId)
+    expect(Number(inv.subtotal_utilities)).toBe(25.20)
   })
 })

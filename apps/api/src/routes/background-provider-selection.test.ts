@@ -129,7 +129,7 @@ async function seedFixture(opts: { provider?: 'mock' | 'checkr' } = {}): Promise
   finally { c.release() }
 }
 
-const happyPayload = (opts: { landlordId?: string; unitId?: string } = {}) => ({
+const happyPayload = (opts: { landlordId?: string; unitId?: string; propertyId?: string } = {}) => ({
   firstName: 'App', lastName: 'Licant',
   dateOfBirth: '1990-05-15',
   ssn: '123-45-6789',
@@ -145,6 +145,7 @@ const happyPayload = (opts: { landlordId?: string; unitId?: string } = {}) => ({
   applicantPaymentIntentId: 'pi_intake_mock_' + randomUUID().replace(/-/g, ''),
   landlordId: opts.landlordId,
   unitId: opts.unitId,
+  propertyId: opts.propertyId,
 })
 
 describe('POST /api/background/submit — S423 per-landlord provider selection', () => {
@@ -452,5 +453,55 @@ describe('S561 landlord-owned adverse action', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ text: 'nope' })
     expect(res.status).toBe(400)
+  })
+})
+
+
+// ── S636: the property QR carries propertyId in the URL ──────────────
+//
+// Nic: "The only thing the QR code link does is link the application to a
+// specific property." A walk-up who scanned at the office has no unit and
+// no invite, so the scanned id is the only binding available — and it
+// arrives in a query string the applicant can edit, which is exactly why
+// it is checked against the landlord being screened for rather than
+// trusted.
+describe('S636 — property binding from a scanned QR', () => {
+  it('binds the check to the property the applicant scanned at', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId, propertyId: f.propertyId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBe(f.propertyId)
+  })
+
+  it("ignores a propertyId belonging to a DIFFERENT landlord", async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      // Hand-edited URL: this landlord's screen, someone else's park.
+      .send(happyPayload({ landlordId: f.landlordId, propertyId: other.propertyId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).not.toBe(other.propertyId)
+  })
+
+  it('still prefers the unit when one was chosen', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const other = await seedFixture({ provider: 'mock' })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId, unitId: f.unitId, propertyId: other.propertyId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT property_id FROM background_checks WHERE id=$1`, [res.body.data.id])
+    expect(row.property_id).toBe(f.propertyId)
   })
 })

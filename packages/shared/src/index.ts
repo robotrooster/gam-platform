@@ -6433,3 +6433,61 @@ export const COMPLAINT_STATUS_LABEL: Record<ComplaintStatus, string> = {
 // a login) had no way to honour it without re-declaring the number — the exact
 // drift the single-source rule exists to prevent.
 export const PASSWORD_MIN_LEN = 12
+
+
+// ── SIGNED-DOCUMENT DATE FORMAT (S636) ───────────────────────────────
+//
+// A date a signer types is stored as the literal string stamped onto the
+// PDF, and read back out of that same string to re-populate the field.
+// That round-trip used `toLocaleDateString()` on the way out and a
+// M/D/YYYY regex on the way in — so it only survived on a US-locale
+// device. A Spanish or en-GB phone wrote 31 March as "31/03/1962",
+// which came back as month 31, was rejected as impossible, and wiped a
+// birthday the signer had already entered (Nic: the Fierro household at
+// Mountain View MH 07, mid-signature).
+//
+// These are US leases on US forms. The format is M/D/YYYY by decision,
+// not by whichever phone is holding the document.
+
+/** ISO 'YYYY-MM-DD' → the M/D/YYYY string stamped on the document. */
+export function isoToDocumentDate(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((iso || '').trim())
+  return m ? `${Number(m[2])}/${Number(m[3])}/${m[1]}` : ''
+}
+
+/** The stored document string → ISO 'YYYY-MM-DD', or '' if unreadable. */
+export function documentDateToIso(stored: string | undefined): string {
+  const t = (stored || '').trim()
+  if (!t) return ''
+  const us = /^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/.exec(t)
+  if (us) {
+    const mo = Number(us[1]), d = Number(us[2])
+    // Guard the legacy rows written before this was pinned: a first
+    // component above 12 can only be a day, so the string came off a
+    // D/M/YYYY device and reading it as M/D would invent month 31.
+    if (mo > 12 && d <= 12) return `${us[3]}-${String(d).padStart(2, '0')}-${String(mo).padStart(2, '0')}`
+    return `${us[3]}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  }
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t)
+  return iso ? t : ''
+}
+
+
+/**
+ * Is a single typed digit already the whole month or day? (S636)
+ *
+ * No month starts with a digit above 1 — only 10, 11 and 12 have two
+ * digits. No day starts above 3. So the instant one of those is typed,
+ * the answer is known and the caret can move on.
+ *
+ * This is what stops the signer having to click between boxes mid-date,
+ * and clicking is what broke the Fierro household's birthday: a lone "3"
+ * left in the day box gets padded to "03" on blur, so reaching for the
+ * year turned the 31st into the 3rd.
+ */
+export function dateDigitSettles(which: 'mm' | 'dd', digits: string): boolean {
+  if (digits.length !== 1) return false
+  const n = Number(digits)
+  if (!Number.isFinite(n)) return false
+  return which === 'mm' ? n > 1 : n > 3
+}

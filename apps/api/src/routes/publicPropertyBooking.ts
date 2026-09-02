@@ -183,19 +183,23 @@ publicPropertyBookingRouter.post('/property/:slug/inquiry', publicWriteLimiter, 
 // token to mint, expire, or leak. The slug IS the property scope.
 publicPropertyBookingRouter.post('/property/:slug/apply', publicWriteLimiter, async (req, res, next) => {
   try {
+    // S636 (Nic): "Why the fuck is it trying to ask somebody for their name
+    // and email and stuff that Checkr's gonna collect anyway? ... The only
+    // thing the QR code link does is link the application to a specific
+    // property."
+    //
+    // First pass asked for move-in date, income, occupants, pets, a message —
+    // a full rental application in front of a screening flow that collects
+    // its own. Gone. What is left is the three fields CHECKR ITSELF requires
+    // to open an order (first name, last name, email); the property comes
+    // from the slug, and everything after this is Checkr's own hosted form.
     const b = z.object({
-      firstName:      z.string().trim().min(1).max(120),
-      lastName:       z.string().trim().min(1).max(120),
-      email:          z.string().email().max(200),
-      phone:          z.string().max(40).nullish(),
-      moveInDate:     z.string().max(40).nullish(),
-      monthlyIncome:  z.number().nonnegative().nullish(),
-      occupants:      z.number().int().positive().max(50).optional(),
-      hasPets:        z.boolean().optional(),
-      petDescription: z.string().max(2000).nullish(),
-      message:        z.string().max(5000).nullish(),
+      firstName: z.string().trim().min(1).max(120),
+      lastName:  z.string().trim().min(1).max(120),
+      email:     z.string().email().max(200),
+      phone:     z.string().max(40).nullish(),
       // Optional: the code can be printed per-space as well as per-park.
-      unitId:         z.string().uuid().optional(),
+      unitId:    z.string().uuid().optional(),
     }).parse(req.body)
     const prop = await resolveProperty(req.params.slug)
 
@@ -209,12 +213,10 @@ publicPropertyBookingRouter.post('/property/:slug/apply', publicWriteLimiter, as
 
     const row = await queryOne<{ id: string }>(
       `INSERT INTO unit_applications
-         (unit_id, property_id, landlord_id, first_name, last_name, email, phone,
-          move_in_date, monthly_income, occupants, has_pets, pet_description, message)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+         (unit_id, property_id, landlord_id, first_name, last_name, email, phone, message)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
       [b.unitId ?? null, prop.id, prop.landlord_id, b.firstName, b.lastName, b.email,
-       b.phone ?? null, b.moveInDate ?? null, b.monthlyIncome ?? null, b.occupants ?? 1,
-       b.hasPets ?? false, b.petDescription ?? null, b.message ?? null])
+       b.phone ?? null, 'Scanned the property application code.'])
 
     const landlord = await queryOne<{ user_id: string; email: string }>(
       `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
@@ -227,14 +229,26 @@ publicPropertyBookingRouter.post('/property/:slug/apply', publicWriteLimiter, as
         type: 'property_inquiry',
         title: `New rental application — ${prop.name}`,
         body: `${b.firstName} ${b.lastName} (${b.email}${b.phone ? `, ${b.phone}` : ''})`
-            + `${b.moveInDate ? ` · wants in ${b.moveInDate}` : ''}`,
+            + ' — sent into screening',
         data: { application_id: row!.id, property_id: prop.id },
         sendEmail: true,
         emailTo: landlord.email,
         emailSubject: `New rental application — ${prop.name}`,
       })
     }
-    res.status(201).json({ success: true, data: { received: true, applicationId: row!.id } })
+    // Hand them straight on to screening, bound to this property and this
+    // landlord. The applicant pays for their own screen and Checkr collects
+    // DOB/SSN/consent on its own hosted form — GAM's part of this is over.
+    const tenantApp = process.env.TENANT_APP_URL || 'http://localhost:3002'
+    const qs = new URLSearchParams({
+      landlordId: prop.landlord_id,
+      propertyId: prop.id,
+      first: b.firstName, last: b.lastName, email: b.email,
+    })
+    res.status(201).json({ success: true, data: {
+      received: true, applicationId: row!.id,
+      screeningUrl: `${tenantApp}/background-check?${qs.toString()}`,
+    } })
   } catch (e) { next(e) }
 })
 

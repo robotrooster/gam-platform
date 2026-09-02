@@ -174,6 +174,9 @@ export function BackgroundCheckPage() {
         consentPool:form.consentPool,
         landlordId:(me as any)?.landlordId||null,
         unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null,
+        // S636: carried in by the property's QR code, so a walk-up's check
+        // binds to the park they scanned at.
+        propertyId:new URLSearchParams(window.location.search).get('propertyId')||null,
         timeToComplete:Math.round((Date.now()-startTime)/1000),
         applicantPaymentIntentId:paymentIntentId,
       })
@@ -325,6 +328,7 @@ export function BackgroundCheckPage() {
           body: JSON.stringify({
             landlordId: (me as any)?.landlordId || params.get('landlordId') || null,
             unitId: (me as any)?.unitId || params.get('unitId') || null,
+            propertyId: params.get('propertyId') || null,
           }),
         }).then(r => r.json())
         if (cancelled) return

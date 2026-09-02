@@ -41,6 +41,7 @@
  * that one job and carries no picker, no shortcuts, and no modes.
  */
 import { useRef, useState, useEffect } from 'react'
+import { dateDigitSettles } from '@gam/shared'
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December']
@@ -166,11 +167,28 @@ export function TypedDateInput({
             }
           }}
           onChange={e => {
-            const digits = e.target.value.replace(/\D/g, '').slice(0, len)
+            let digits = e.target.value.replace(/\D/g, '').slice(0, len)
+            // ── S636 (Nic): ADVANCE AS SOON AS THE ANSWER IS UNAMBIGUOUS ──
+            //
+            // The Fierro household at Mountain View MH 07, mid-signature:
+            // "they're trying to put March thirty first, and every time they
+            // go to click on the year, it changes it back to March third."
+            //
+            // A single digit only advanced when the box was FULL, so a
+            // one-digit month or day left the signer to move boxes by hand —
+            // and every hand-move is a blur, where a lone "3" gets padded to
+            // "03". Reach for the year with a half-typed day and the 31st
+            // silently becomes the 3rd.
+            //
+            // No month starts with a digit above 1 (only 10, 11, 12 are two
+            // digits) and no day starts above 3. So the moment a digit rules
+            // out a second one, the answer is already known: pad it and move
+            // on. The whole date becomes one uninterrupted run of digits and
+            // there is nothing left to click mid-date.
+            const settled = which !== 'yyyy' && dateDigitSettles(which, digits)
+            if (settled) digits = digits.padStart(2, '0')
             set(digits)
-            // Move on once this box is full — the date becomes one run of
-            // digits rather than three separate reaches for the screen.
-            if (digits.length === len && next) next.current?.focus()
+            if ((digits.length === len || settled) && next) next.current?.focus()
           }}
           onKeyDown={e => {
             // Auto-advance without a way back is a trap: correcting a typo

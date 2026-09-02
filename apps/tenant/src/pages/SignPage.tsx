@@ -4,7 +4,7 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { humanize, unlockScrollIfStandalone } from '@gam/shared'
+import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso } from '@gam/shared'
 import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -19,13 +19,10 @@ const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
  * date had been entered — the signer could not tell whether it had taken, and
  * re-entering it was the only way to find out.
  */
-function isoFromStored(stored: string | undefined): string {
-  if (!stored) return ''
-  const m = /^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/.exec(stored.trim())
-  if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(stored.trim())
-  return iso ? stored.trim() : ''
-}
+// S636: one definition of the document-date format, shared with the API
+// suite that tests it. See @gam/shared — the round-trip used to depend on
+// the signer's device locale and corrupted any non-US date.
+const isoFromStored = documentDateToIso
 const tok = () => localStorage.getItem('gam_tenant_token')
 /**
  * S629 (Nic): a signing link works WITHOUT a session. The path param is either
@@ -756,10 +753,20 @@ export function SignPage() {
                   key={activeField.id}
                   value={isoFromStored(fieldValues[activeField.id])}
                   onChange={iso=>{
-                    // Stored in the signer's locale format, as before — it is
-                    // stamped onto the PDF as text.
-                    const v = iso ? new Date(iso + 'T12:00:00').toLocaleDateString() : ''
-                    setFieldValues(p=>({...p,[activeField.id]:v}))
+                    // ── S636: FORMAT EXPLICITLY, NEVER BY LOCALE ──
+                    //
+                    // This was `toLocaleDateString()`, whose output follows the
+                    // SIGNER'S DEVICE. isoFromStored above reads it back as
+                    // M/D/YYYY. On any device not set to a US locale — Spanish
+                    // and en-GB both give D/M/YYYY, and Mountain View has plenty
+                    // of both — 31 March was written "31/03/1962" and read back
+                    // as month 31. The component then rejected it as impossible
+                    // and emitted '', wiping a birthday the signer had entered.
+                    //
+                    // These are US leases stamped onto a US form, so the format
+                    // is M/D/YYYY by decision rather than by whatever phone
+                    // happens to be holding the document.
+                    setFieldValues(p=>({...p,[activeField.id]:isoToDocumentDate(iso)}))
                   }}
                   inputStyle={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, background:'white', color:'#1a1a1a' }}
                 />

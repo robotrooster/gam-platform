@@ -483,8 +483,22 @@ propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_st
       // applicant with no property at all — the exact miss this closes.
       return res.json({ success: true, data: { url: null, qrDataUrl: null, reason: 'no_booking_slug' } })
     }
-    const { storefrontUrl } = await import('../services/propertyBooking')
-    const url = storefrontUrl(prop.booking_slug, '/apply')
+    // S636 (Nic): "The only thing the QR code link does is link the
+    // application to a specific property, but nothing about that link should
+    // take them anywhere on the Gold Asset Management page. It should take
+    // them straight into the Checkr flow."
+    //
+    // It pointed at a form on the property's own site that asked for a name
+    // and email — which the screening page then asked for AGAIN, because it
+    // collects name, email, date of birth and address before Checkr is ever
+    // called. Three fields that bought nothing but a second typing.
+    //
+    // So the code encodes the screening page itself, with the property and
+    // landlord carried in the query string. The applicant scans and is in the
+    // flow; the binding rides along without them entering anything for it.
+    const tenantApp = process.env.TENANT_APP_URL || 'http://localhost:3002'
+    const url = `${tenantApp}/background-check`
+      + `?landlordId=${prop.landlord_id}&propertyId=${prop.id}`
     const QRCode = (await import('qrcode')).default
     const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 320 })
     res.json({ success: true, data: { url, qrDataUrl, propertyName: prop.name } })

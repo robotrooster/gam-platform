@@ -357,7 +357,10 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       idDocumentUrl, incomeDocUrls, consentCredit, consentCriminal, consentPool,
       timeToComplete, applicantPaymentIntentId,
     } = req.body
-    const { landlordId, unitId } = req.body
+    // S636: propertyId rides in from the property's QR code — see the
+    // resolution below, which verifies it belongs to this landlord before
+    // trusting it.
+    const { landlordId, unitId, propertyId: propertyIdFromScan } = req.body
     const isSpeculative = !landlordId
 
     if (!firstName || !lastName) throw new AppError(400, 'Required fields missing')
@@ -440,9 +443,15 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
               WHERE tenant_id=$1 AND cancelled_at IS NULL AND property_id IS NOT NULL
               ORDER BY created_at DESC LIMIT 1`, [tenant.id]))?.property_id : null)
       // S636: a walk-up who scanned the property's QR code has neither a
-      // unit nor an invite — they applied cold. Their application carries
-      // the property, so it is the third and last place to look. Matched
-      // on the account's own email, so it cannot pick up a stranger's row.
+      // unit nor an invite — the code carried the property in the query
+      // string and the page passes it through here. Verified against the
+      // landlord being screened for, so a hand-edited URL cannot bind a
+      // check to somebody else's park.
+      || (propertyIdFromScan ? (await queryOne<{ id: string }>(
+            `SELECT id FROM properties WHERE id = $1 AND landlord_id = $2`,
+            [propertyIdFromScan, effectiveLandlordId]))?.id ?? null : null)
+      // Older rows: an application filed before the code pointed straight at
+      // screening. Matched on the account's own email, never a stranger's.
       || (await queryOne<{ property_id: string }>(
             `SELECT a.property_id FROM unit_applications a
               WHERE a.property_id IS NOT NULL

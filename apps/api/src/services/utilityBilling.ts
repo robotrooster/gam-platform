@@ -1675,3 +1675,37 @@ async function attachBillToOpenInvoice(
       'utility billing: could not attach a released share to the open invoice — left unbilled')
   }
 }
+
+
+/**
+ * Attach an already-created utility bill that never made it onto an invoice
+ * (S636).
+ *
+ * The release path calls attachBillToOpenInvoice inline. This is the same
+ * operation for a bill that was created some OTHER way and stranded —
+ * chiefly the monthly run producing a cycle's bill after that period's
+ * invoice was already cut, which leaves real money sitting 'unbilled'
+ * until the following month's straggler sweep picks it up.
+ *
+ * Idempotent: a bill already linked to a payment is left alone, and a
+ * settled invoice is never grown.
+ */
+export async function attachStrandedUtilityBill(billId: string): Promise<boolean> {
+  const bill = await queryOne<any>(
+    `SELECT ub.*, l.unit_id AS lease_unit_id
+       FROM utility_bills ub
+       LEFT JOIN leases l ON l.id = ub.lease_id
+      WHERE ub.id = $1`, [billId])
+  if (!bill) return false
+  if (bill.payment_id) return false          // already on an invoice
+  if (!bill.lease_id || !bill.tenant_id) return false
+  const before = await queryOne<{ payment_id: string | null }>(
+    `SELECT payment_id FROM utility_bills WHERE id = $1`, [billId])
+  await attachBillToOpenInvoice(billId, bill, {
+    unitId: bill.unit_id, leaseId: bill.lease_id,
+    tenantId: bill.tenant_id, landlordId: bill.landlord_id,
+  }, query, queryOne)
+  const after = await queryOne<{ payment_id: string | null }>(
+    `SELECT payment_id FROM utility_bills WHERE id = $1`, [billId])
+  return !before?.payment_id && !!after?.payment_id
+}
