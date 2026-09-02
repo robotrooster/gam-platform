@@ -27,10 +27,27 @@ const HOLD_MINUTES = 30
  * customer-portal base for booking returns and claim links). The template's
  * {slug} token covers both hosting modes: path-slug in dev
  * (http://localhost:3015/{slug}) and subdomain in prod
- * (set STOREFRONT_URL_TEMPLATE=https://{slug}.gam.biz).
+ * ({slug}.gam.biz).
+ *
+ * S636 (Nic): "the QR code link is generated from localhost three thousand
+ * and fifteen. That means that's not gonna work at all."
+ *
+ * STOREFRONT_URL_TEMPLATE was never set in production, and the fallback was
+ * the DEV one — so every link this builds had been emitting
+ * http://localhost:3015/... on the live API: guest stay links emailed at
+ * booking, Stripe checkout success/cancel returns, and waitlist claim
+ * links. All of them dead for anyone who was not on this Mac.
+ *
+ * The env var is now set, but the default is what makes that mistake
+ * unrepeatable: in production the fallback is the PUBLIC template, so a
+ * missing variable can never again silently hand a guest a localhost URL.
+ * Dev keeps the path-slug form.
  */
 export function storefrontUrl(slug: string, path = ''): string {
-  const template = process.env.STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
+  const template = process.env.STOREFRONT_URL_TEMPLATE
+    || (process.env.NODE_ENV === 'production'
+          ? 'https://{slug}.gam.biz'
+          : 'http://localhost:3015/{slug}')
   return template.replace('{slug}', slug) + path
 }
 
