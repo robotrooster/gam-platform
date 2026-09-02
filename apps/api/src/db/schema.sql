@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3rkZEUaavqwe0DzRPmvWlXBxQTvxrbtkSPfjk27Ac8wK41WrhdVxY3NUNIlsT2b
+\restrict 613GOqf8eDCy4Qv9x9aAZ1WFvuKN8BdfJK9KAg7PVVZnEOdivHfoMrwLehC0ygj
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9695,7 +9695,7 @@ CREATE TABLE public.utility_meter_readings (
     reason text DEFAULT 'monthly_cycle'::text NOT NULL,
     reason_note text,
     bill_amount numeric(12,2),
-    CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'baseline'::text, 'other'::text])))
+    CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'baseline'::text, 'billed_off_platform'::text, 'other'::text])))
 );
 
 
@@ -25372,5 +25372,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3rkZEUaavqwe0DzRPmvWlXBxQTvxrbtkSPfjk27Ac8wK41WrhdVxY3NUNIlsT2b
+\unrestrict 613GOqf8eDCy4Qv9x9aAZ1WFvuKN8BdfJK9KAg7PVVZnEOdivHfoMrwLehC0ygj
 

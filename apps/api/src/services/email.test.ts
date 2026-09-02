@@ -515,3 +515,29 @@ describe('htmlToPlainText', () => {
     expect(out.split('\n').filter(Boolean)).toEqual(['- One', '- Two'])
   })
 })
+
+
+// ─── S636: an action email always carries its URL as text ────────────────────
+//
+// Nic: "Email for Robinson isn't clicking." The Robinsons are on Yahoo and
+// Hotmail, and every action email was a styled anchor and NOTHING else — the
+// destination appeared nowhere the recipient could copy. When a client refuses
+// to render that gold-on-dark button they are simply stuck, and the only person
+// who can rescue them is the landlord, who has to come and ask us for the URL.
+//
+// The token is 64 characters, so `word-break` is part of the fix, not polish: an
+// unbroken string overflows a phone and clips, losing the tail of the token
+// where nobody can see it went missing.
+describe('S636 invite and activation emails include a copyable link', () => {
+  it('the tenant invite shows the raw URL, not just a button', async () => {
+    const url = 'https://tenant.goldassetmanagement.com/accept-invite?token=' + 'a'.repeat(64)
+    await email.emailTenantInvite('bgr.85@yahoo.com', 'Bret', 'Mountain View RV Park Ranch LLC',
+      'Mountain View RV Ranch', 'Unit MH 20', url, false)
+    const html = String((resendSendMock.mock.calls[0] as any[])[0].html ?? '')
+    expect(html).toContain(`href="${url}"`)           // the button still works
+    expect(html).toContain('copy and paste')          // …and there is a fallback
+    // The URL itself, outside the href, is what someone can select.
+    expect(html.split(url).length - 1).toBeGreaterThan(1)
+    expect(html).toContain('word-break:break-all')    // a 64-char token must wrap
+  })
+})

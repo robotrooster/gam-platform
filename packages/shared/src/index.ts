@@ -5999,6 +5999,16 @@ export const METER_READ_REASONS = [
   // it never occupies the one-monthly_cycle-read-per-month slot — but it IS what
   // the first cycle subtracts from. Without it a submeter bills nothing, silently.
   'baseline',
+  // S636 (Nic): "Mark the system units where, when I bill them off platform, I
+  // can update the baseline read or take a new read. I need to be able to do
+  // that separately from a tenancy move out or a reservation ending."
+  //
+  // A spot whose occupant left before GAM knew about them — the usage is real
+  // and the landlord collects it outside the platform. Recording it here does
+  // two things nothing else did: it says on the record WHY that usage was not
+  // invoiced, and it becomes the next occupant's starting point, so they are not
+  // handed a departed stranger's kilowatt-hours. Reference only, NEVER bills.
+  'billed_off_platform',
   'other',
 ] as const
 export type MeterReadReason = typeof METER_READ_REASONS[number]
@@ -6016,6 +6026,8 @@ export const METER_READ_BILLING_REASONS: readonly MeterReadReason[] = [
 // the system from the calendar and never surface in the dropdown.
 export const METER_READ_MANUAL_REASONS: readonly MeterReadReason[] = [
   'meter_replaced',
+  // S636: the landlord's own re-baseline after collecting off-platform.
+  'billed_off_platform',
   'other',
 ] as const
 
@@ -6025,6 +6037,7 @@ export const METER_READ_REASON_LABEL: Record<MeterReadReason, string> = {
   move_out_final: 'Move-out (final read)',
   meter_replaced: 'Meter replaced',
   baseline:       'Opening read (baseline)',
+  billed_off_platform: 'Billed outside GAM — start fresh here',
   other:          'Other',
 }
 

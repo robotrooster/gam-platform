@@ -3,9 +3,9 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Upload, Eye, Trash2, AlertCircle, AlertTriangle, CheckCircle2,
-  Loader, Inbox, X,
+  Loader, Inbox, X, Mail,
 } from 'lucide-react'
-import { api, apiGet, apiDelete } from '../lib/api'
+import { api, apiGet, apiDelete, apiPatch } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
 import { ConfirmIntentModal } from './ConfirmIntentModal'
 import {
@@ -181,25 +181,85 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Remove pending tenant?</div>
+        <div className="modal-title">Cancel this invite?</div>
+        {/* S636: this said cancelling "deletes the pending intent and any
+            uploaded lease document". It does not, and has not since the
+            hard-delete path was removed on purpose — the person, their document
+            and this record all stay. What actually changes is the link, which is
+            the part the landlord needs to know. */}
         <div style={{ padding: 16, fontSize: '.88rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
           <p style={{ marginTop: 0 }}>
-            Removing <strong>{name}</strong> deletes the pending intent and any uploaded
-            lease document. The tenant has not been onboarded yet, so this is safe.
+            <strong>{name}</strong>'s invite link stops working immediately, and any space
+            being held for them is released.
           </p>
-          <p style={{ marginBottom: 0 }}>
-            If this person has other records with you, those records are not touched.
+          <p style={{ marginBottom: 0, color: 'var(--text-2)' }}>
+            Nothing is deleted — they and any document they sent stay on record. You can
+            invite them again at any time. If the address is simply wrong,
+            use <strong>Fix email</strong> instead: it keeps them on the same space and re-sends.
           </p>
         </div>
         <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Keep it</button>
           <button
             onClick={onConfirm}
             disabled={busy}
             className="btn"
             style={{ background: COLOR_DANGER, color: '#fff', borderColor: COLOR_DANGER }}
           >
-            {busy ? 'Removing...' : 'Remove'}
+            {busy ? 'Cancelling...' : 'Cancel invite'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S636 (Nic): "It has the wrong email and I need to restart it."
+//
+// The route behind this has existed since S632 and nothing ever called it, so
+// the only way to fix a mistyped address was to cancel and start over — losing
+// the held space and any work-trade or screening state along with it. Correcting
+// it in place keeps all of that and issues a fresh link.
+function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, onConfirm }: {
+  name: string
+  current: string
+  value: string
+  onChange: (v: string) => void
+  error: string | null
+  busy: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  const changed = value.trim().length > 0 && value.trim().toLowerCase() !== current.toLowerCase()
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Send {name}'s invite somewhere else</div>
+        <div style={{ padding: 16, fontSize: '.88rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
+          <p style={{ marginTop: 0, color: 'var(--text-2)' }}>
+            Currently going to <strong style={{ color: 'var(--text-1)' }}>{current}</strong>.
+          </p>
+          <label style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+            New email address
+          </label>
+          <input
+            className="input" type="email" value={value} autoFocus
+            onChange={e => onChange(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && changed && !busy) onConfirm() }}
+            style={{ width: '100%' }}
+          />
+          <p style={{ marginBottom: 0, marginTop: 12, fontSize: '.78rem', color: 'var(--text-3)' }}>
+            They keep their place in the queue and any space held for them. A fresh invite
+            goes to the new address and the old link stops working.
+          </p>
+          {error && (
+            <div style={{ marginTop: 10, color: COLOR_DANGER, fontSize: '.8rem' }}>{error}</div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button className="btn btn-primary" onClick={onConfirm} disabled={busy || !changed}>
+            {busy ? 'Sending...' : 'Save and re-send'}
           </button>
         </div>
       </div>
@@ -502,13 +562,14 @@ function ReviewIntentModal({ intent, onClose, onConfirm }: {
 
 // ========== Single intent row ==========
 function IntentCard({
-  intent, onToggle, onUpload, onView, onDelete, uploading,
+  intent, onToggle, onUpload, onView, onDelete, onFixEmail, uploading,
 }: {
   intent: PendingIntent
   onToggle: () => void
   onUpload: () => void
   onView: () => void
   onDelete: () => void
+  onFixEmail: () => void
   uploading: boolean
 }) {
   const fullName = `${intent.firstName} ${intent.lastName}`.trim() || '(no name)'
@@ -574,9 +635,26 @@ function IntentCard({
               Review
             </button>
           )}
+          {/* S636 (Nic): "I need to cancel an invite for mobile home 9. Can't
+              see where to cancel pending, but it has the wrong email and I need
+              to restart it."
+
+              Two endpoints existed for exactly this and NEITHER had a control.
+              Correcting the address is the better of the two — it keeps the same
+              person on the same space and re-sends, where cancelling means
+              re-inviting from scratch — so it goes first and says so. */}
           {!isBusy && (
-            <button onClick={onDelete} className="btn btn-ghost btn-sm" title="Remove from pending pool">
-              <Trash2 size={14} />
+            <button onClick={onFixEmail} className="btn btn-ghost btn-sm"
+                    title="Send to a different address — keeps this person on the same space">
+              <Mail size={14} style={{ marginRight: 4 }} />
+              Fix email
+            </button>
+          )}
+          {!isBusy && (
+            <button onClick={onDelete} className="btn btn-ghost btn-sm"
+                    title="Cancel this invite — their link stops working and the space is freed">
+              <Trash2 size={14} style={{ marginRight: 4 }} />
+              Cancel invite
             </button>
           )}
         </div>
@@ -605,6 +683,12 @@ export function PendingTenantsPage() {
   const [reviewIntentId, setReviewIntentId] = useState<string | null>(null)
   const [viewingPdf, setViewingPdf] = useState<{ intentId: string; name: string } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<PendingIntent | null>(null)
+  // S636: correct a mistyped invite address and re-send, without losing the
+  // person or the space they are held on.
+  const [fixTarget, setFixTarget] = useState<PendingIntent | null>(null)
+  const [fixEmail, setFixEmail] = useState('')
+  const [fixError, setFixError] = useState<string | null>(null)
+  const [fixDone, setFixDone] = useState<string | null>(null)
   const [uploadingId, setUploadingId] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [pendingUploadId, setPendingUploadId] = useState<string | null>(null)
@@ -638,6 +722,23 @@ export function PendingTenantsPage() {
       onError: (e: any) => {
         setUploadError(e?.response?.data?.message || 'Delete failed')
       },
+    }
+  )
+
+  const fixEmailMut = useMutation(
+    (v: { intentId: string; email: string }) =>
+      apiPatch(`/landlords/me/pending-intents/${v.intentId}/contact`,
+               { email: v.email, resend: true }),
+    {
+      onSuccess: (_d, v) => {
+        qc.invalidateQueries('pending-tenants')
+        qc.invalidateQueries('pending-tenants-count')
+        setFixDone(`Invite re-sent to ${v.email}`)
+        setFixTarget(null)
+        setTimeout(() => setFixDone(null), 6000)
+      },
+      onError: (e: any) => setFixError(
+        e?.response?.data?.error || 'Could not update the address'),
     }
   )
 
@@ -779,6 +880,7 @@ export function PendingTenantsPage() {
                 name: `${intent.firstName} ${intent.lastName}`.trim() || intent.email,
               })}
               onDelete={() => setDeleteTarget(intent)}
+              onFixEmail={() => { setFixTarget(intent); setFixEmail(intent.email); setFixError(null) }}
               uploading={uploadingId === intent.intentId}
             />
           ))}
@@ -829,6 +931,32 @@ export function PendingTenantsPage() {
           <CheckCircle2 size={16} style={{ color: COLOR_SUCCESS }} />
           {resolvedToast}
         </div>
+      )}
+      {fixDone && (
+        <div style={{
+          position: 'fixed', bottom: 24, right: 24, zIndex: 60,
+          background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+          borderRadius: 10, padding: '12px 16px', fontSize: '.85rem',
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <CheckCircle2 size={16} style={{ color: COLOR_SUCCESS }} />
+          {fixDone}
+        </div>
+      )}
+      {fixTarget && (
+        <FixEmailModal
+          name={`${fixTarget.firstName} ${fixTarget.lastName}`.trim() || fixTarget.email}
+          current={fixTarget.email}
+          value={fixEmail}
+          onChange={setFixEmail}
+          error={fixError}
+          busy={fixEmailMut.isLoading}
+          onCancel={() => { setFixTarget(null); setFixError(null) }}
+          onConfirm={() => {
+            setFixError(null)
+            fixEmailMut.mutate({ intentId: fixTarget.intentId, email: fixEmail.trim() })
+          }}
+        />
       )}
       {deleteTarget && (
         <DeleteConfirmModal

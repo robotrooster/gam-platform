@@ -221,6 +221,27 @@ function btn(text: string, url: string) {
   return `<a href="${url}" style="display:inline-block;margin-top:16px;padding:10px 22px;background:#c9a227;color:#060809;border-radius:8px;font-weight:700;font-size:.88rem;text-decoration:none">${text}</a>`
 }
 
+// S636 (Nic): "Email for Robinson isn't clicking."
+//
+// Every action email was a styled anchor and NOTHING else — the destination
+// appeared nowhere as text. When a client refuses to render that button the
+// recipient is left with no link and no address to copy, and the only person who
+// can rescue them is the landlord, who has to come and ask us for the URL. Both
+// Robinsons are on Yahoo/Hotmail, which are exactly the clients that strip a
+// gold-on-dark anchor.
+//
+// So the raw URL rides underneath, selectable. Standard practice in
+// transactional mail for precisely this failure, and it costs one line of copy.
+// `word-break` matters: a 64-character token in an unbroken string overflows a
+// phone and gets clipped, which loses the end of the token silently.
+function btnWithLink(text: string, url: string) {
+  return btn(text, url) +
+    `<div style="margin-top:14px;font-size:.72rem;color:#4a5568;line-height:1.5">
+       If the button does not work, copy and paste this into your browser:<br>
+       <span style="color:#8fb6d6;word-break:break-all">${url}</span>
+     </div>`
+}
+
 function p(text: string) {
   return `<p style="margin:0 0 12px;color:#b8c4d8;font-size:.9rem;line-height:1.6">${text}</p>`
 }
@@ -481,7 +502,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
       h("You've been invited") +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
-      btn('Accept Invitation', acceptUrl) +
+      btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
     {
@@ -539,7 +560,7 @@ export async function emailLandlordCoOwnerInvitation(
       p('Accepting also sets up <strong style="color:#eef1f8">your own account</strong>. Anything you add later that isn\'t part of ' +
         `${entityName} stays yours: your other properties, your own numbers, private to you. The two portfolios never mix.`) +
       p('This invitation expires in 7 days.') +
-      btn('Accept invitation', acceptUrl) +
+      btnWithLink('Accept invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you weren't expecting this, you can ignore this email.</div>`
     ),
     {
@@ -606,7 +627,7 @@ export async function emailPmInvitation(
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${companyName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${companyName} uses GAM (Gold Asset Management) to manage rental properties on behalf of property owners. As ${roleLabel.toLowerCase()}, you'll have access to the company's portfolio inside the GAM platform.`) +
       p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
-      btn('Accept Invitation', acceptUrl) +
+      btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
     {
@@ -651,7 +672,7 @@ export async function emailBusinessInvitation(
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
       p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
-      btn('Accept Invitation', acceptUrl) +
+      btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
     {
@@ -1014,7 +1035,7 @@ export async function emailTenantOnboarded(
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
       </div>` +
       p('Click below to activate your account and set a password. There is no application or background check required — your landlord has already onboarded you.') +
-      btn('Activate Your Account', activationUrl) +
+      btnWithLink('Activate Your Account', activationUrl) +
       p('Once activated, you can view your lease, set up rent payments, and submit maintenance requests through the GAM tenant portal.') +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you have questions, reach out to your landlord directly.</div>`
     ),
@@ -1070,7 +1091,7 @@ export async function emailTenantInvite(
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel ?? 'Unit assigned once your application is approved'}</div>
       </div>` +
       next +
-      btn('Activate Your Account', activationUrl) +
+      btnWithLink('Activate Your Account', activationUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">This link expires in 7 days. If it has, ask your landlord to send a new one. Questions about the place itself? Reach out to your landlord directly.</div>`
     ),
     {
@@ -1114,7 +1135,7 @@ export async function emailUtilityServiceInvite(
         <div style="font-size:.82rem;color:#b8c4d8">Utility service</div>
       </div>` +
       p('Click below to activate your account and set a password.') +
-      btn('Activate Your Account', activationUrl) +
+      btnWithLink('Activate Your Account', activationUrl) +
       p('You will see each bill with the meter readings and dates behind it, and can pay it from your account.') +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Questions about a charge? Contact ${providerName} directly.</div>`
     ),
@@ -1147,7 +1168,7 @@ export async function emailTenantInviteReminder(
       p(`Hi ${tenantName},`) +
       p(`Your landlord <strong style="color:#eef1f8">${landlordName}</strong> invited you to GAM for <strong style="color:#eef1f8">${unitLabel}</strong>, but your account isn’t activated yet.`) +
       p(`Your invite link expires <strong style="color:#eef1f8">${window}</strong>. Activate now to set your password, view your lease, and pay rent online.`) +
-      btn('Activate Your Account', activationUrl) +
+      btnWithLink('Activate Your Account', activationUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If the link has expired, ask your landlord to resend it. Questions? Reach out to your landlord directly.</div>`
     ),
     {
@@ -1289,7 +1310,7 @@ export async function sendPasswordResetEmail(
       h('Password reset request') +
       p(greeting) +
       p(`We got a request to reset the password on your GAM account. Click the button below to set a new one — the link expires in <strong style="color:#eef1f8">1 hour</strong>.`) +
-      btn('Reset password', resetUrl) +
+      btnWithLink('Reset password', resetUrl) +
       p(`If you didn't request this, you can ignore this email. Your current password stays active until someone uses the link.`) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">For security, this link only works once.</div>`
     ),
@@ -2006,7 +2027,7 @@ export async function emailAdminInvitation(
         'Accepting creates a new, separate login for you.') +
       p(`You'll set a password, and you'll be asked to turn on two-factor authentication before you can do anything. That step is required for every admin account.`) +
       p(`<strong style="color:#eef1f8">This invitation expires in ${expiresHours} hours.</strong>`) +
-      btn('Accept invitation', acceptUrl) +
+      btnWithLink('Accept invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you weren't expecting this, ignore this email and tell ${inviterName} — the invitation can be revoked.</div>`
     ),
     {
