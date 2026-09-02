@@ -11,18 +11,20 @@ import {
   AGENT_REVENUE_CAPABILITY_LABEL,
   type AgentRevenueCapability,
 } from '@gam/shared'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type PropRow = { id: string; name: string }
 
 /** The landlord's properties, optionally filtered by a name match. */
-async function landlordProperties(landlordId: string, nameFilter?: string): Promise<PropRow[]> {
+// S634: lists across every company the ACCOUNT owns — a landlord toggling an
+// agent capability sees all their properties, not one company's.
+async function landlordProperties(landlordIds: string[], nameFilter?: string): Promise<PropRow[]> {
   const filtered = nameFilter && nameFilter.trim() && nameFilter.trim().toLowerCase() !== 'all'
   return query<PropRow>(
     `SELECT id, name FROM properties
-      WHERE landlord_id = $1 ${filtered ? 'AND name ILIKE $2' : ''}
+      WHERE landlord_id = ANY($1::uuid[]) ${filtered ? 'AND name ILIKE $2' : ''}
       ORDER BY name`,
-    filtered ? [landlordId, `%${nameFilter!.trim()}%`] : [landlordId]
+    filtered ? [landlordIds, `%${nameFilter!.trim()}%`] : [landlordIds]
   )
 }
 
@@ -50,7 +52,7 @@ export const setAgentPermission: AgentTool = {
       return { ok: false, error: `Unknown capability. Valid options: ${AGENT_REVENUE_CAPABILITIES.join(', ')}.` }
     }
     const enabled = args.enabled === true
-    const props = await landlordProperties(actor.profileId, typeof args.property === 'string' ? args.property : undefined)
+    const props = await landlordProperties(actorLandlordIds(actor), typeof args.property === 'string' ? args.property : undefined)
     if (props.length === 0) {
       return { ok: false, error: 'No matching property found on your account.' }
     }
@@ -78,7 +80,7 @@ export const getAgentPermissions: AgentTool = {
   },
   audiences: ['landlord'],
   async execute(args, actor: AgentActor) {
-    const props = await landlordProperties(actor.profileId, typeof args.property === 'string' ? args.property : undefined)
+    const props = await landlordProperties(actorLandlordIds(actor), typeof args.property === 'string' ? args.property : undefined)
     if (props.length === 0) {
       return { ok: false, error: 'No matching property found on your account.' }
     }

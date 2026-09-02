@@ -19,7 +19,7 @@
 import { DateTime } from 'luxon'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
-import { generateMoveInInvoice, moveInRentAmount } from './moveInBundle'
+import { generateMoveInInvoice, moveInRentAmount, existingTenancyCycle } from './moveInBundle'
 import { generateInvoices, dueDatesInRange } from './invoiceGeneration'
 import { generateLateFeesForTimezone } from './lateFees'
 import {
@@ -125,6 +125,36 @@ async function buildLeaseStack(opts: {
 // ── Move-in invoice ─────────────────────────────────────────────────────────
 
 describe('moveInRentAmount — pure math', () => {
+  // S631 (Nic, DIRECTIVE): "For onboarding existing tenants, I don't want it to
+  // prorate the rent amount... It should bill new signups that move in at that
+  // point. But for the onboarding window and process, it shouldn't prorate."
+  it('existing tenancy is billed a FULL month whatever day it is signed', () => {
+    expect(moveInRentAmount(1000, '2026-01-15', true)).toBe(1000)
+    expect(moveInRentAmount(1000, '2026-09-02', true)).toBe(1000)
+    expect(moveInRentAmount(1000, '2026-01-01', true)).toBe(1000)
+  })
+
+  // The regression this replaced: billing zero for the partial month handed a
+  // free September to everyone who signed on 1-2 September, which is exactly
+  // the launch shape. Nic: "that needs to bill them for September."
+  it('existing tenancy signed 2 September is billed for September, not October', () => {
+    expect(existingTenancyCycle('2026-09-02', null)).toBe('2026-09-01')
+  })
+
+  it('the landlord can push the first cycle later, and only later', () => {
+    // "I'm a little bit late onboarding everybody" — signed in August, but the
+    // landlord already collected August, so GAM starts in September.
+    expect(existingTenancyCycle('2026-08-29', '2026-09-01')).toBe('2026-09-01')
+    // A declared cycle EARLIER than the lease cannot pull billing backwards
+    // into months before the tenancy existed on the platform.
+    expect(existingTenancyCycle('2026-11-04', '2026-09-01')).toBe('2026-11-01')
+  })
+
+  it('a NEW move-in mid-month still prorates — the flag changes only onboarding', () => {
+    expect(moveInRentAmount(1000, '2026-01-15', false)).toBe(moveInRentAmount(1000, '2026-01-15'))
+    expect(moveInRentAmount(1000, '2026-01-15', false)).toBeGreaterThan(0)
+  })
+
   it('returns full rent when start_date.day === 1', () => {
     expect(moveInRentAmount(1000, '2026-01-01')).toBe(1000)
   })
@@ -275,6 +305,47 @@ describe('generateMoveInInvoice', () => {
     })
   })
 
+  // S631 (Nic, DIRECTIVE): "It needs to be flagged as work trade BEFORE the
+  // invoice is generated. That way it's automatically in a suspended state."
+  //
+  // The monthly cron has exempted work-trade invoices since S623; the MOVE-IN
+  // invoice never did — so the first invoice of a work-trade tenancy, the one
+  // most certain to sit open while the hours are earned, was the only chargeable
+  // one in the whole arrangement.
+  it('move-in invoice is late-fee exempt when a work-trade agreement is in force', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-03-01' })
+    await db.query(
+      `INSERT INTO work_trade_agreements
+         (unit_id, tenant_id, landlord_id, start_date, monthly_hours_target)
+       VALUES ($1, $2, $3, '2026-03-01', 80)`,
+      [stack.unitId, stack.tenantId, stack.landlordId])
+
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-03-01',
+    })
+    expect(res.invoiceCreated).toBe(true)
+
+    const inv = await db.query<{ late_fee_exempt: boolean; work_trade_agreement_id: string | null }>(
+      `SELECT late_fee_exempt, work_trade_agreement_id FROM invoices WHERE id=$1`,
+      [res.invoiceId])
+    // Issued GROSS — the rent is still owed, it is worked off, not waived —
+    // but never fined while it is being worked off.
+    expect(inv.rows[0].late_fee_exempt).toBe(true)
+    expect(inv.rows[0].work_trade_agreement_id).not.toBeNull()
+  })
+
+  it('move-in invoice is NOT exempt without a work-trade agreement', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-04-01' })
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-04-01',
+    })
+    const inv = await db.query<{ late_fee_exempt: boolean }>(
+      `SELECT late_fee_exempt FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].late_fee_exempt).toBe(false)
+  })
+
   it('idempotent: re-firing on the same lease + start_date is a no-op', async () => {
     const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-01-01' })
     const inputs = {
@@ -300,6 +371,241 @@ describe('generateMoveInInvoice', () => {
 })
 
 // ── Monthly invoice generation ──────────────────────────────────────────────
+
+/**
+ * S634 — THE FIRST INVOICE CARRIES UTILITIES ALREADY METERED.
+ *
+ * Nic, on RV 02 the day its lease was signed: "the outstanding balance list is
+ * not showing anything with the utilities for RV two."
+ *
+ * The move-in invoice never looked at utility_bills, and the monthly run skips a
+ * lease's whole START MONTH because the prorated move-in invoice covers it. A
+ * lease starting 1 September therefore had its August utilities appear no
+ * earlier than October's invoice — released, correct in every table, and absent
+ * from the only document the tenant is asked to pay.
+ */
+/**
+ * S634 — A WORK-TRADE MONTH IS NOT MONEY OWED WHILE IT IS BEING WORKED.
+ *
+ * Nic (DIRECTIVE): "Nobody is gonna pay rent that month and then work hours for
+ * the following month. There's no arrears arrangement here. They work, and at
+ * the end of the month, if they don't hit their hours, the rent for that month
+ * is prorated to cover any lapse." And: "Have the work trade exist, but be
+ * suspended... and it creates only at the month close."
+ *
+ * The line EXISTS — the month's worth is what the hours are priced against, and
+ * the tenant should be able to see what the month was worth — but it is not
+ * owed, so it stays out of the invoice total and therefore out of every
+ * outstanding-balance surface. This is what put $14.19 against RV 03 on the
+ * landlord's dashboard during a month the tenant was working off.
+ */
+describe('S634 a work-trade month is suspended, not owed', () => {
+  async function withWorkTrade(stack: any, startDate: string) {
+    await db.query(
+      `INSERT INTO work_trade_agreements
+         (unit_id, tenant_id, landlord_id, start_date, status, monthly_hours_target)
+       VALUES ($1,$2,$3,$4::date,'active',40)`,
+      [stack.unitId, stack.tenantId, stack.landlordId, startDate])
+  }
+
+  it('writes the rent line but asks for nothing while the hours are worked', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-04-01' })
+    await withWorkTrade(stack, '2026-04-01')
+
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-04-01',
+    })
+    expect(res.invoiceCreated).toBe(true)
+
+    // The line is there, at what the month is worth.
+    const rent = await db.query<any>(
+      `SELECT amount::float AS amount, status, work_trade_suspended_at, notes
+         FROM payments WHERE invoice_id=$1 AND type='rent'`, [res.invoiceId])
+    expect(rent.rows).toHaveLength(1)
+    expect(rent.rows[0].amount).toBe(1000)
+    expect(rent.rows[0].work_trade_suspended_at).toBeTruthy()
+    expect(rent.rows[0].notes).toMatch(/suspended/i)
+
+    // ...and nothing is owed. This is the number the landlord's outstanding
+    // balances page reads.
+    const inv = await db.query<any>(
+      `SELECT subtotal_rent::float AS subtotal_rent, total_amount::float AS total,
+              late_fee_exempt, work_trade_agreement_id
+         FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].subtotal_rent).toBe(1000)   // what the month was worth
+    expect(inv.rows[0].total).toBe(0)              // what is owed today
+    expect(inv.rows[0].late_fee_exempt).toBe(true)
+    expect(inv.rows[0].work_trade_agreement_id).toBeTruthy()
+  })
+
+  it('opens the settlement period so month close has something to settle', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-04-01' })
+    await withWorkTrade(stack, '2026-04-01')
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-04-01',
+    })
+    // Without this the suspended line would stay suspended forever: the hours
+    // get logged, the invoice sits there, and nothing ever reconciles them.
+    const per = await db.query<any>(
+      `SELECT to_char(period_month,'YYYY-MM') AS m, status,
+              target_hours::float AS target, basis_amount::float AS basis
+         FROM work_trade_settlements WHERE invoice_id=$1`, [res.invoiceId])
+    expect(per.rows).toHaveLength(1)
+    expect(per.rows[0].m).toBe('2026-04')
+    expect(per.rows[0].status).toBe('open')
+    expect(per.rows[0].target).toBe(40)      // the agreement's full month
+    expect(per.rows[0].basis).toBe(1000)     // what the month is worth
+  })
+
+  /**
+   * S634 (Nic): "work trade should be including the utilities, or at least have
+   * utilities be toggleable in the work trade... Landlords are gonna want that
+   * per agreement with specific people."
+   *
+   * Which charges a trade covers is already a per-agreement choice
+   * (`covered_charges`, set on the Work Trade page). What the suspension did not
+   * do was read it — so a tenant whose trade covers electricity still had the
+   * electricity sitting as money owed while they worked it off.
+   */
+  it('suspends a utility the agreement covers, and bills one it does not', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-04-01' })
+    await db.query(
+      `INSERT INTO work_trade_agreements
+         (unit_id, tenant_id, landlord_id, start_date, status, monthly_hours_target, covered_charges)
+       VALUES ($1,$2,$3,'2026-04-01'::date,'active',40, ARRAY['rent','electric'])`,
+      [stack.unitId, stack.tenantId, stack.landlordId])
+
+    const meter = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+       VALUES ($1,'electric','E1','submeter',0,5) RETURNING id`, [stack.propertyId])
+    // A flat-rate meter has no dial, so it carries no digit count.
+    const trash = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee)
+       VALUES ($1,'trash','T1','flat_rate',25) RETURNING id`, [stack.propertyId])
+    for (const [m, type, amt] of [[meter.rows[0].id, 'electric', 120], [trash.rows[0].id, 'trash', 25]] as any[]) {
+      await db.query(
+        `INSERT INTO utility_bills
+           (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+            charge_amount, allocation_method, rate_per_unit, base_fee_share,
+            tax_rate_pct, tax_amount, utility_type, status)
+         VALUES ($1,$2,$3,$4,$5,'2026-03-01',$6,'submeter',1,0,0,0,$7,'unbilled')`,
+        [m, stack.unitId, stack.tenantId, stack.leaseId, stack.landlordId, amt, type])
+    }
+
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-04-01',
+    })
+
+    const lines = await db.query<any>(
+      `SELECT type, amount::float AS amount, work_trade_suspended_at, notes
+         FROM payments WHERE invoice_id=$1 ORDER BY type, amount`, [res.invoiceId])
+    const electric = lines.rows.find((l: any) => l.amount === 120)
+    const trashLine = lines.rows.find((l: any) => l.amount === 25)
+    expect(electric.work_trade_suspended_at).toBeTruthy()   // covered → worked off
+    expect(trashLine.work_trade_suspended_at).toBeNull()    // not covered → owed
+
+    const inv = await db.query<any>(
+      `SELECT subtotal_utilities::float AS util, total_amount::float AS total
+         FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].util).toBe(145)   // what the utilities were worth
+    expect(inv.rows[0].total).toBe(25)   // trash only — rent + electric are worked off
+
+    // The hours are priced against everything the trade covers, not rent alone.
+    const per = await db.query<any>(
+      `SELECT basis_amount::float AS basis FROM work_trade_settlements WHERE invoice_id=$1`,
+      [res.invoiceId])
+    expect(per.rows[0].basis).toBe(1120)
+  })
+
+  it('without a work-trade agreement the rent is owed as usual', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-04-01' })
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-04-01',
+    })
+    const rent = await db.query<any>(
+      `SELECT work_trade_suspended_at FROM payments WHERE invoice_id=$1 AND type='rent'`,
+      [res.invoiceId])
+    expect(rent.rows[0].work_trade_suspended_at).toBeNull()
+    const inv = await db.query<any>(
+      `SELECT total_amount::float AS total FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].total).toBe(1000)
+  })
+})
+
+describe('S634 move-in invoice sweeps utilities released onto the lease', () => {
+  it('bills an already-metered utility on the FIRST invoice, and stamps the bill', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-03-01' })
+    // A meter reading from BEFORE the lease was papered, released onto it.
+    const meter = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+       VALUES ($1,'electric','E1','submeter',0,5) RETURNING id`, [stack.propertyId])
+    await db.query(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+          charge_amount, allocation_method, rate_per_unit, base_fee_share,
+          tax_rate_pct, tax_amount, utility_type, status)
+       VALUES ($1,$2,$3,$4,$5,'2026-02-01',176.40,'submeter',0.14,0,0,0,'electric','unbilled')`,
+      [meter.rows[0].id, stack.unitId, stack.tenantId, stack.leaseId, stack.landlordId])
+
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-03-01',
+    })
+    expect(res.invoiceCreated).toBe(true)
+
+    const inv = await db.query<any>(
+      `SELECT subtotal_rent::text, subtotal_utilities::text, total_amount::text
+         FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].subtotal_rent).toBe('1000.00')
+    expect(inv.rows[0].subtotal_utilities).toBe('176.40')
+    expect(inv.rows[0].total_amount).toBe('1176.40')
+
+    // A payable line the tenant can actually see, on the invoice.
+    const line = await db.query<any>(
+      `SELECT amount::text, type, status, notes FROM payments
+        WHERE invoice_id=$1 AND type='utility'`, [res.invoiceId])
+    expect(line.rows).toHaveLength(1)
+    expect(line.rows[0].amount).toBe('176.40')
+    expect(line.rows[0].status).toBe('pending')
+    expect(line.rows[0].notes).toMatch(/Electric/)
+
+    // ...and the bill is claimed, so the monthly run cannot bill it twice.
+    const ub = await db.query<any>(
+      `SELECT status, payment_id FROM utility_bills WHERE lease_id=$1`, [stack.leaseId])
+    expect(ub.rows[0].status).toBe('billed')
+    expect(ub.rows[0].payment_id).toBeTruthy()
+  })
+
+  it('leaves a FUTURE cycle alone — it waits its turn', async () => {
+    const stack = await buildLeaseStack({ rentAmount: 1000, startDate: '2026-03-01' })
+    const meter = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+       VALUES ($1,'water','W1','submeter',0,5) RETURNING id`, [stack.propertyId])
+    await db.query(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
+          charge_amount, allocation_method, rate_per_unit, base_fee_share,
+          tax_rate_pct, tax_amount, utility_type, status)
+       VALUES ($1,$2,$3,$4,$5,'2026-06-01',50.00,'submeter',1,0,0,0,'water','unbilled')`,
+      [meter.rows[0].id, stack.unitId, stack.tenantId, stack.leaseId, stack.landlordId])
+
+    const res = await generateMoveInInvoice({
+      lease_id: stack.leaseId, unit_id: stack.unitId, tenant_id: stack.tenantId,
+      landlord_id: stack.landlordId, rent_amount: 1000, start_date: '2026-03-01',
+    })
+    const inv = await db.query<any>(
+      `SELECT subtotal_utilities::text, total_amount::text FROM invoices WHERE id=$1`, [res.invoiceId])
+    expect(inv.rows[0].subtotal_utilities).toBe('0.00')
+    expect(inv.rows[0].total_amount).toBe('1000.00')
+    const ub = await db.query<any>(
+      `SELECT status FROM utility_bills WHERE lease_id=$1`, [stack.leaseId])
+    expect(ub.rows[0].status).toBe('unbilled')
+  })
+})
 
 describe('dueDatesInRange — pure math', () => {
   it('emits one date per month at rent_due_day, capped to month length', () => {

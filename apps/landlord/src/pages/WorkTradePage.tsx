@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { ChevronDown, Plus, X } from 'lucide-react'
 import { toast } from '../components/dialogs'
+import { WORK_TRADE_COVERABLE, WORK_TRADE_COVERABLE_LABEL } from '@gam/shared'
 
 const STATUS_MAP: Record<string, string> = { active: 'badge-green', paused: 'badge-amber', ended: 'badge-muted' }
 const DOC_STATUS_LABEL: Record<string, string> = { pending: 'Draft', draft: 'Draft', sent: 'Awaiting signature', in_progress: 'Awaiting signature', completed: 'On file', voided: 'Voided', execution_failed: 'Needs attention' }
@@ -209,16 +210,9 @@ function AddendumCell({ agreement, templates }: { agreement: any; templates: any
 // An unticked charge is billed in FULL and takes no part in the credit at all —
 // it does not even help earn it, or the excluded bill would quietly discount
 // everything else.
-const COVERABLE: { key: string; label: string }[] = [
-  { key: 'rent',     label: 'Rent' },
-  { key: 'electric', label: 'Electric' },
-  { key: 'water',    label: 'Water' },
-  { key: 'sewer',    label: 'Sewer' },
-  { key: 'gas',      label: 'Natural gas' },
-  { key: 'trash',    label: 'Trash' },
-  { key: 'propane',  label: 'Propane' },
-  { key: 'fees',     label: 'Fees' },
-]
+// S635: the list is @gam/shared's, not a fourth copy of it.
+const COVERABLE: { key: string; label: string }[] =
+  WORK_TRADE_COVERABLE.map(k => ({ key: k, label: WORK_TRADE_COVERABLE_LABEL[k] }))
 
 function AgreementCoversCell({ agreement }: { agreement: any }) {
   const qc = useQueryClient()
@@ -226,7 +220,10 @@ function AgreementCoversCell({ agreement }: { agreement: any }) {
   const covered: string[] = agreement.coveredCharges ?? []
   const save = useMutation(
     (next: string[]) => apiPatch(`/work-trade/${agreement.id}`, { coveredCharges: next }),
-    { onSuccess: () => { qc.invalidateQueries('work-trade'); toast('Saved — it applies from the next invoice.') },
+    { onSuccess: () => { qc.invalidateQueries('work-trade'); // S634: it no longer waits for the next invoice. A covered charge on the
+      // CURRENT month is suspended — worked off, not owed — and settles at
+      // month close.
+      toast('Saved — covered charges are worked off, not billed, from this month on.') },
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that') },
   )
   const toggle = (key: string) => {

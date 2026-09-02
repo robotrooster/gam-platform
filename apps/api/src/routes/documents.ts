@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { DOCUMENT_CATEGORIES } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
-import { landlordScopeIds } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { streamStoredFile } from '../lib/fileServe'
 
@@ -105,13 +105,14 @@ documentsRouter.post('/', requirePerm('documents.upload'), docUpload.single('fil
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
     const meta = uploadMetaSchema.parse(req.body)
-    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
-    if (!landlordId) throw new AppError(403, 'Forbidden')
-    // A tagged unit must belong to the caller's landlord.
-    if (meta.unitId) {
-      const unit = await queryOne<any>('SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [meta.unitId, landlordId])
-      if (!unit) throw new AppError(404, 'Unit not found')
-    }
+    // S633: a document tagged to a unit belongs to the company that owns THAT
+    // unit — derived, and authorised by the same lookup that used to be a
+    // separate ownership check below. Untagged, the account names the company.
+    // Previously this read the session's entity and then required the unit to
+    // match it, so a document about the other company's unit was refused.
+    const landlordId = meta.unitId
+      ? await landlordIdForUnit(req.user!, meta.unitId, query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'document')
     const doc = await queryOne<any>(
       `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, type, name, url, file_size, mime_type)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,

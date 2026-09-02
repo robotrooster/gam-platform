@@ -9,7 +9,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface MemberRow {
   role: string
@@ -56,14 +56,14 @@ export const getTeam: AgentTool = {
              FROM bookkeeper_scopes
          ) s
          JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1
+        WHERE s.landlord_id = ANY($1::uuid[])
         ORDER BY s.role, u.first_name, u.last_name`,
-      [actor.profileId]
+      [actorLandlordIds(actor)]
     )
 
     const invites = await query<{ email: string; role: string }>(
-      `SELECT email, role FROM invitations WHERE landlord_id = $1 AND status = 'pending' ORDER BY created_at DESC`,
-      [actor.profileId]
+      `SELECT email, role FROM invitations WHERE landlord_id = ANY($1::uuid[]) AND status = 'pending' ORDER BY created_at DESC`,
+      [actorLandlordIds(actor)]
     )
 
     const coverage = (m: MemberRow): string => {

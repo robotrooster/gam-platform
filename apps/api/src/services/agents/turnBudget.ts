@@ -71,12 +71,16 @@ async function todayCounts(userId: string): Promise<{ total: number; unproductiv
   return { total: row?.total ?? 0, unproductive: row?.unproductive ?? 0 }
 }
 
-async function occupiedUnits(landlordId: string): Promise<number> {
+// S634: the per-unit turn allowance is earned by the whole ACCOUNT. Counting one
+// company's units gave a landlord who owns two a budget sized to half their
+// portfolio, and the symptom would have been the agent going quiet early.
+async function occupiedUnits(landlordIds: string[]): Promise<number> {
+  if (!landlordIds.length) return 0
   const row = await queryOne<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM units u
        JOIN properties p ON p.id = u.property_id
-      WHERE p.landlord_id = $1 AND u.status <> 'vacant'`,
-    [landlordId]
+      WHERE p.landlord_id = ANY($1::uuid[]) AND u.status <> 'vacant'`,
+    [landlordIds]
   )
   return row?.n ?? 0
 }
@@ -92,7 +96,10 @@ export interface BudgetCheck {
 export async function checkTurnBudget(
   audience: string,
   userId: string,
-  profileId: string
+  // S634: for a landlord this is every company the ACCOUNT owns — the allowance
+  // is earned by the whole portfolio. Tenants pass their own single id, unused
+  // below (their cap is flat).
+  landlordIds: string[]
 ): Promise<BudgetCheck> {
   if (audience !== 'tenant' && audience !== 'landlord') return { allowed: true }
   const cfg = getBudgetConfig()
@@ -103,7 +110,7 @@ export async function checkTurnBudget(
 
   let totalCap = cfg.tenantDaily
   if (audience === 'landlord') {
-    const units = await occupiedUnits(profileId)
+    const units = await occupiedUnits(landlordIds)
     totalCap = Math.max(cfg.tenantDaily, Math.ceil(cfg.landlordPerUnit * units))
   }
   if (total >= totalCap) return { allowed: false, reason: 'daily_total' }

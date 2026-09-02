@@ -35,6 +35,11 @@ database, the running services, and the Stripe live account on 2026-08-22.
   service agreements, and the owner-occupied units are still marked `vacant`.**
   Order that saves a pass: neighbour service points → lease templates → mark the
   owner-occupied units → invite tenants.
+  **Unblocked S633/S634:** inviting Mountain View tenants used to fail with
+  "unitId does not belong to this landlord" because a landlord session WAS one
+  entity. The account no longer names an entity — one login now reaches every
+  company it owns. Code green + tested; **API and landlord portal not yet
+  deployed** (see SESSION_634_HANDOFF.md).
 - **N4 — Connect KYC** ✅ `acct_1U5VpMDz9hhZGjwY` — charges, payouts and
   details-submitted all enabled.
 - **N5 — Vercel Pro** ⬜ Nic's click. Not blocking; the portals are live on the

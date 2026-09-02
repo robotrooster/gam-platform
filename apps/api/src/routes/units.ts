@@ -155,13 +155,12 @@ unitsRouter.get('/available', async (req, res, next) => {
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
       propertyId:         z.string().uuid().nullish(),
     }).parse(req.query)
-    const callerLandlordId = req.user!.role === 'landlord'
-      ? req.user!.profileId
-      : req.user!.landlordId
-    if (!callerLandlordId) throw new AppError(403, 'Forbidden')
+    // S633: the account's companies, not one. Availability spans the portfolio.
+    const callerLandlordIds = landlordScopeIds(req.user!)
+    if (!callerLandlordIds.length) throw new AppError(403, 'Forbidden')
     const scopedIds = await getScopedPropertyIds(req.user)
     const rows = await findAvailableUnits({
-      landlordId: callerLandlordId,
+      landlordIds: callerLandlordIds,
       window: {
         checkIn: q.checkIn || new Date().toISOString().slice(0, 10),
         checkOut: q.checkOut ?? null,
@@ -1136,8 +1135,7 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
       bedrooms:        z.number().int().min(0).max(30).optional(),
       bathrooms:       z.number().min(0).max(30).optional(),
       sqft:            z.number().int().min(0).nullable().optional(),
-      // S613 (Nic): accepted for a unit with NO subtype, refused for one in a
-      // subtype — the subtype sets the price for every unit in it.
+      // S629: every unit owns its price, classed or not — see the note below.
       rentAmount:      z.number().min(0).optional(),
       securityDeposit: z.number().min(0).optional(),
       dwellingOwnership: z.enum(DWELLING_OWNERSHIP_VALUES as unknown as [string, ...string[]]).optional(),
@@ -1882,9 +1880,8 @@ unitsRouter.get('/schedule/master', requirePerm(
     // maintenance_worker / onsite_manager) req.user.profileId is the user_id,
     // not the landlord_id, so the WHERE landlord_id=$1 filter returned an
     // empty schedule. Resolve to landlordId for team members.
-    const callerLandlordId = req.user!.role === 'landlord'
-      ? req.user!.profileId
-      : req.user!.landlordId
+    // S633: the account's companies, not one.
+    const callerLandlordIds = landlordScopeIds(req.user!)
     const scopedIds = await getScopedPropertyIds(req.user)
 
     const units = await query<any>(`
@@ -1900,11 +1897,11 @@ unitsRouter.get('/schedule/master', requirePerm(
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
-      WHERE u.landlord_id=$1
+      WHERE u.landlord_id = ANY($1::uuid[])
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
         ${unitType ? "AND u.unit_type=$3" : ""}
       ORDER BY u.unit_type, p.name, u.unit_number`,
-      unitType ? [callerLandlordId, scopedIds, unitType] : [callerLandlordId, scopedIds])
+      unitType ? [callerLandlordIds, scopedIds, unitType] : [callerLandlordIds, scopedIds])
 
     // Get all bookings in range. S200: include the property's
     // requires_booking_acknowledgment flag so the schedule tile can
@@ -1916,10 +1913,10 @@ unitsRouter.get('/schedule/master', requirePerm(
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id
-      WHERE b.landlord_id=$1 AND b.status NOT IN ('cancelled')
+      WHERE b.landlord_id = ANY($1::uuid[]) AND b.status NOT IN ('cancelled')
         AND b.check_out >= $2 AND b.check_in <= $3
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
-      ORDER BY b.check_in`, [callerLandlordId, fromDate, toDate, scopedIds])
+      ORDER BY b.check_in`, [callerLandlordIds, fromDate, toDate, scopedIds])
 
     // Get active leases in range
     const leases = await query<any>(`
@@ -1936,14 +1933,14 @@ unitsRouter.get('/schedule/master', requirePerm(
         WHERE lease_id = l.id AND role = 'primary'
         LIMIT 1
       ) vlat ON TRUE
-      WHERE u.landlord_id=$1 AND l.status='active'
+      WHERE u.landlord_id = ANY($1::uuid[]) AND l.status='active'
         -- S527 fix: NULL end_date = open-ended (month-to-month) lease. The
         -- old "end_date >= $2" dropped those rows, so occupied units looked
         -- EMPTY on the schedule (while the booking guard rightly blocked
         -- them — "conflict on an empty spot" reports).
         AND (l.end_date IS NULL OR l.end_date >= $2) AND l.start_date <= $3
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
-      ORDER BY l.start_date`, [callerLandlordId, fromDate, toDate, scopedIds])
+      ORDER BY l.start_date`, [callerLandlordIds, fromDate, toDate, scopedIds])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }
@@ -1956,7 +1953,8 @@ unitsRouter.get('/schedule/history', requirePerm(
   'guests.check_in', 'units.view_status', 'units.edit',
 ), async (req, res, next) => {
   try {
-    const callerLandlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    // S633: the account's companies, not one.
+    const callerLandlordIds = landlordScopeIds(req.user!)
     const scopedIds = await getScopedPropertyIds(req.user)
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100')) || 100))
     const events = await query<any>(`
@@ -1967,10 +1965,10 @@ unitsRouter.get('/schedule/history', requirePerm(
         JOIN units u ON u.id = e.unit_id
         JOIN properties p ON p.id = u.property_id
         LEFT JOIN users a ON a.id = e.actor_user_id
-       WHERE e.landlord_id = $1
+       WHERE e.landlord_id = ANY($1::uuid[])
          AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
        ORDER BY e.created_at DESC
-       LIMIT $2`, [callerLandlordId, limit, scopedIds])
+       LIMIT $2`, [callerLandlordIds, limit, scopedIds])
     res.json({ success: true, data: events })
   } catch (e) { next(e) }
 })
@@ -2068,7 +2066,11 @@ unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.manage_l
 // A subtype LOCKS the unit type (S537), so a subtype may only be applied to units
 // of its own type; mismatches are refused by name rather than skipped, because
 // silently classifying 40 of 53 is worse than classifying none.
-unitsRouter.post('/subtype', requirePerm('units.edit'), async (req, res, next) => {
+// S630: either gate. Classifying a unit is a "configure unit" action — that is
+// what PATCH /:id/subtype has always required, and it is what the unit page's
+// subtype toggles check before rendering. Requiring only units.edit here would
+// have shown an on-site manager toggles that 403 on click.
+unitsRouter.post('/subtype', requirePerm('units.edit', 'schedule.configure_unit'), async (req, res, next) => {
   try {
     // S630: a unit carries SEVERAL subtypes, each toggled on its own — "pull
     // through" AND "50 amp" AND "facing west", not one pre-bundled row per
@@ -2116,6 +2118,24 @@ unitsRouter.post('/subtype', requirePerm('units.edit'), async (req, res, next) =
             `Nothing was changed.`)
         }
       }
+    }
+
+    // S630 (Nic): amp tags stack — 30 AND 50 is a real pedestal. Layout tags do
+    // not: a site is back-in or pull-through. Refused here so the landlord reads
+    // a sentence instead of a database error; the trigger in
+    // 20260830233000_one_site_layout_per_unit is the backstop for every other
+    // writer. Only DECLARED layouts collide — a tag set to "Not specified" makes
+    // no claim about the site and never conflicts with one.
+    const layouts = [...new Set(subs
+      .map((x: any) => x.rv_site_layout)
+      .filter((v: any) => v && v !== 'none'))]
+    if (layouts.length > 1) {
+      const named = subs
+        .filter((x: any) => x.rv_site_layout && x.rv_site_layout !== 'none')
+        .map((x: any) => `“${x.name}”`).join(' and ')
+      throw new AppError(400,
+        `A site is back-in or pull-through, not both — ${named} can't both be true of the same space. ` +
+        `Untick one. Nothing was changed.`)
     }
 
     const client = await db.connect()

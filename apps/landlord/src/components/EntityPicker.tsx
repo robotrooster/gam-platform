@@ -22,10 +22,17 @@ export function useEntities() {
   return useQuery<EntityOption[]>('landlord-entities', () => apiGet('/landlords/me/entities'))
 }
 
-export function EntityPicker({ value, onChange, label = 'Entity' }: {
+export function EntityPicker({ value, onChange, label = 'Company', note }: {
   value: string
   onChange: (id: string) => void
   label?: string
+  /**
+   * S633: the trailing sentence explaining WHY the choice matters here. The
+   * default is about banking, which is where this control started; a CSV import
+   * or a tax statement needs a different reason, and a wrong reason is worse
+   * than none.
+   */
+  note?: string
 }) {
   const { data: entities = [] } = useEntities()
 
@@ -45,13 +52,13 @@ export function EntityPicker({ value, onChange, label = 'Entity' }: {
               value={value} onChange={e => onChange(e.target.value)}>
         {entities.map(en => (
           <option key={en.id} value={en.id}>
-            {en.businessName || 'Unnamed entity'}
+            {en.businessName || 'Unnamed company'}
             {en.propertyCount ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}
           </option>
         ))}
       </select>
       <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
-        Each entity has its own bank account and its own transactions.
+        {note ?? 'Each company has its own bank account and its own transactions.'}
       </span>
     </div>
   )

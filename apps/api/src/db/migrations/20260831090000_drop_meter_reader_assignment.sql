@@ -1,0 +1,13 @@
+-- S631 (Nic, DIRECTIVE — reverses the assignment column added an hour earlier):
+--
+-- "I don't wanna know who gets assigned to what. That's not the thing. It's more
+--  of a task list, and anybody that has access can jump on and complete some or
+--  all of it... so anybody could do any portion of the flow, and there's no
+--  blocking order and no assigning. It's whoever jumps on and does what."
+--
+-- Assignment answers "whose job is this", which is a question nobody at a park
+-- with two working owners is asking. The list is the coordination — you look at
+-- what is left and do some of it. A per-meter owner would add a field to
+-- maintain, a screen to maintain it on, and a way to be wrong, in exchange for
+-- nothing anybody wanted.
+ALTER TABLE utility_meters DROP COLUMN IF EXISTS default_reader_user_id;

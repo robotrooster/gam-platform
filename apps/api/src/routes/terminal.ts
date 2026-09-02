@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import Stripe from 'stripe'
 import { requireAuth, requirePerm } from '../middleware/auth'
-import { resolveLandlordIdForUser } from '../lib/scope'
+import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 
 // S94: Stripe Terminal card-present POS flow. Five steps end-to-end:
@@ -47,8 +47,10 @@ terminalRouter.post('/create-payment-intent', requirePerm('pos.ring_sale'), asyn
     //      Pre-fix a PM ringing a sale wrote their user_id into the
     //      Stripe metadata as "landlord_id" — garbled audit trail.
     //      Resolve to the actual landlord_id via the shared helper.
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a sale is rung under a NAMED company. An account with one register
+    // is unaffected; one that owns two must say which, because the company on
+    // the intent is the merchant of record for the money.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'sale')
     const intent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100), // cents
       currency,
@@ -75,13 +77,18 @@ terminalRouter.post('/create-payment-intent', requirePerm('pos.ring_sale'), asyn
 //
 // Cost: one extra Stripe round-trip per capture/cancel. Acceptable
 // given the security posture for POS card-present flows.
-async function assertPiBelongsToCaller(piId: string, callerLandlordId: string) {
+// S633: checked against every company the ACCOUNT owns, not the one the session
+// sat on. A cashier ringing at one park could otherwise not capture a sale they
+// had just authorised at the other. Still a real ownership check — the intent's
+// landlord_id must be a company this caller actually owns; a team role's scope
+// is still their single landlord.
+async function assertPiBelongsToCaller(piId: string, callerLandlordIds: string[]) {
   const intent = await stripe.paymentIntents.retrieve(piId)
   const piLandlordId = (intent.metadata as any)?.landlord_id
   if (!piLandlordId) {
     throw new AppError(404, 'PaymentIntent has no landlord_id metadata; cannot verify ownership')
   }
-  if (piLandlordId !== callerLandlordId) {
+  if (!callerLandlordIds.includes(piLandlordId)) {
     throw new AppError(403, 'PaymentIntent does not belong to this landlord')
   }
   return intent
@@ -92,9 +99,9 @@ async function assertPiBelongsToCaller(piId: string, callerLandlordId: string) {
 // the PI id straight into POST /api/pos/transactions for record-back.
 terminalRouter.post('/capture/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const callerLandlordId = resolveLandlordIdForUser(req.user!)
-    if (!callerLandlordId) throw new AppError(400, 'No landlord scope on this user')
-    await assertPiBelongsToCaller(req.params.id, callerLandlordId)
+    const callerLandlordIds = landlordScopeIds(req.user!)
+    if (!callerLandlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+    await assertPiBelongsToCaller(req.params.id, callerLandlordIds)
     const intent = await stripe.paymentIntents.capture(req.params.id)
     res.json({ success: true, data: { id: intent.id, status: intent.status, amount: intent.amount } })
   } catch (e) { next(e) }
@@ -103,9 +110,9 @@ terminalRouter.post('/capture/:id', requirePerm('pos.ring_sale'), async (req, re
 // POST /api/terminal/cancel-payment-intent
 terminalRouter.post('/cancel/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const callerLandlordId = resolveLandlordIdForUser(req.user!)
-    if (!callerLandlordId) throw new AppError(400, 'No landlord scope on this user')
-    await assertPiBelongsToCaller(req.params.id, callerLandlordId)
+    const callerLandlordIds = landlordScopeIds(req.user!)
+    if (!callerLandlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+    await assertPiBelongsToCaller(req.params.id, callerLandlordIds)
     await stripe.paymentIntents.cancel(req.params.id)
     res.json({ success: true })
   } catch (e) { next(e) }

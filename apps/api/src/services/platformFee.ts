@@ -48,6 +48,29 @@ export function periodMonths(year: number, month: number | null, now: Date = new
 // occupied. A property is NEVER charged for a month before it onboarded (a
 // landlord who joins July 1 sees fees July-forward, nothing before) nor for a
 // month that hasn't occurred yet (periodMonths excludes future months).
+/**
+ * S633: the same map, across every entity an ACCOUNT owns.
+ *
+ * NOT a matter of widening the landlord_id filter to ANY(). The fee cascade
+ * reads a PER-ENTITY override row (landlord_platform_fee_overrides) — two
+ * companies can be on different rates, and one flattened query would silently
+ * apply whichever override it happened to match to both. So this runs the real
+ * per-entity calculation once per company and merges the results, which is safe
+ * because the map is keyed by property and a property belongs to exactly one
+ * entity.
+ */
+export async function platformFeesByPropertyForEntities(
+  landlordIds: string[],
+  months: string[],
+  propertyId?: string,
+): Promise<Map<string, number>> {
+  const merged = new Map<string, number>()
+  for (const id of landlordIds) {
+    for (const [k, v] of await platformFeesByProperty(id, months, propertyId)) merged.set(k, v)
+  }
+  return merged
+}
+
 export async function platformFeesByProperty(
   landlordId: string,
   months: string[],

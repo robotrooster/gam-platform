@@ -68,10 +68,12 @@ beforeEach(async () => {
 afterAll(() => { __setTransport(null) })
 
 const ownerActor = () => ({
-  userId: ownerUserId, role: 'landlord', profileId: landlordId,
+  // S634: landlordIds IS a landlord actor's scope. profileId is empty for a
+  // landlord on both the actor and the forwarded auth payload.
+  userId: ownerUserId, role: 'landlord', profileId: '', landlordIds: [landlordId],
   // permissions: null is what an OWNER carries — owner roles bypass requirePerm.
-  auth: { userId: ownerUserId, role: 'landlord', profileId: landlordId,
-          landlordId, landlordIds: [landlordId], permissions: null },
+  auth: { userId: ownerUserId, role: 'landlord', profileId: null,
+          landlordId: null, landlordIds: [landlordId], permissions: null },
 })
 
 /**
@@ -85,9 +87,15 @@ const ownerActor = () => ({
  * from "shape wrong, denies everybody".
  */
 const staffActor = (keys: string[]) => ({
-  userId: ownerUserId, role: 'landlord', profileId: landlordId,
+  userId: ownerUserId, role: 'landlord', profileId: '', landlordIds: [landlordId],
   auth: {
-    userId: ownerUserId, role: 'maintenance_worker', profileId: landlordId,
+    // S633: 'maintenance_worker' IS NOT A ROLE. The canonical one is
+    // 'maintenance' (packages/shared USER_ROLES). The fixture only ever worked
+    // because the old scope helper fell back to profileId for any unrecognised
+    // role — the same fallback that let a tenant's profileId read as a company.
+    // With that gone, an invented role resolves to no scope, which is correct
+    // and is what surfaced this. Now it exercises a real team role.
+    userId: ownerUserId, role: 'maintenance', profileId: ownerUserId,
     landlordId, landlordIds: [landlordId],
     permissions: Object.fromEntries(keys.map((k) => [k, true])),
   },

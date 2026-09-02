@@ -22,7 +22,9 @@ export interface MaintenanceActor {
   /** caller role */
   role: string
   /** profile id: tenant uuid when role='tenant', else landlord id */
-  profileId: string
+  // S633: null for a landlord actor — an account names no entity. Only the
+  // tenant branches below read it, and there the role guard proves it is set.
+  profileId: string | null
 }
 
 export interface CreateMaintenanceRequestInput {
@@ -61,7 +63,7 @@ export async function createMaintenanceRequest(
       `SELECT 1 FROM v_lease_active_tenants vlat
          JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
         WHERE l.unit_id = $1 AND vlat.tenant_id = $2 LIMIT 1`,
-      [unitId, actor.profileId]
+      [unitId, actor.profileId!]
     )
     if (!onUnit) throw new AppError(403, 'You are not assigned to this unit')
   }
@@ -69,7 +71,7 @@ export async function createMaintenanceRequest(
   // Attribution: tenant filing → themselves; non-tenant → primary tenant.
   let tenantId: string | null
   if (actor.role === 'tenant') {
-    tenantId = actor.profileId
+    tenantId = actor.profileId!
   } else {
     const occ = await queryOne<any>(
       `SELECT primary_tenant_id FROM v_unit_occupancy WHERE unit_id = $1`,

@@ -18,47 +18,72 @@
 import { describe, it, expect } from 'vitest'
 import { roleForLeaseColumn } from './autoFieldPlacement'
 
-// Every column columnFor() can return, plus tenant_name from the personal path.
+// S635 supersedes half of the S622 rule below. S622 said a bound column is
+// LANDLORD-filled, reasoning that a value GAM already holds is "wrong by
+// construction" as a tenant-entry box. Nic drew the rest of that line in S635:
+// "the tenant names and the names of the occupants both are landlord boxes, and
+// those should be derived from all the invites that went out." If the system
+// holds the value, asking ANYONE to type it invites the very typo the rule
+// exists to prevent.
+//
+// So there are now two groups, and the invariant that matters is unchanged: no
+// bound column is ever the TENANT's.
+//
+// IDENTITY — who is on the lease, which unit, which property. Nobody types it.
+const NOBODY_TYPES = [
+  'tenant_name', 'tenant_email', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name',
+  'occupant_names', 'unit_number', 'property_address', 'property_name', 'landlord_name',
+]
+// MONEY AND TERM — figures the landlord STATES on this lease. Still theirs.
 const PROPERTY_AND_MONEY = [
-  'unit_number', 'property_address',
   'start_date', 'end_date', 'rent_due_day',
   'rent_amount', 'security_deposit', 'pet_deposit', 'pet_fee', 'other_fee',
 ]
-// S622: Nic extended the rule to names — "for accuracy, and that way if there
-// ever is a fault, the landlord can't blame it on the tenant." Every value GAM
-// already holds is the landlord's to state, so NO bound column is tenant-filled.
-const LANDLORD_TOO = ['tenant_name', 'tenant_email']
 
 describe('auto-placed field role scoping', () => {
   it.each(PROPERTY_AND_MONEY)('%s is landlord-filled — the tenant never types it', (col) => {
     expect(roleForLeaseColumn(col)).toBe('landlord')
   })
 
-  it.each(LANDLORD_TOO)('%s is landlord-filled — the landlord states it, not the tenant', (col) => {
-    expect(roleForLeaseColumn(col)).toBe('landlord')
+  it.each(NOBODY_TYPES)('%s belongs to nobody — it comes from the invite', (col) => {
+    expect(roleForLeaseColumn(col)).toBeNull()
   })
 
-  it('NO bound lease column is tenant-filled — the landlord owns every value GAM holds', () => {
-    const all = [...PROPERTY_AND_MONEY, ...LANDLORD_TOO]
-    const tenantScoped = all.filter(c => roleForLeaseColumn(c) !== 'landlord')
+  it('NO bound lease column is tenant-filled — the invariant S622 established', () => {
+    const all = [...PROPERTY_AND_MONEY, ...NOBODY_TYPES]
+    const tenantScoped = all.filter(c => {
+      const r = roleForLeaseColumn(c)
+      return r !== 'landlord' && r !== null
+    })
     expect(tenantScoped, `a tenant typing these is a lease defect the landlord caused: ${tenantScoped}`)
       .toEqual([])
   })
 
-  it('unit_number is landlord-scoped — the regression Nic found', () => {
-    expect(roleForLeaseColumn('unit_number')).toBe('landlord')
+  it('unit_number is nobody\'s — the regression Nic found, taken one step further', () => {
+    // S622 moved it off the tenant: "they're not gonna type in what apartment
+    // they're going into... that's gonna invalidate the whole thing if they type
+    // that wrong." The landlord mistyping it invalidates it identically, and GAM
+    // has known the unit since the invite.
+    expect(roleForLeaseColumn('unit_number')).toBeNull()
   })
 
-  it('property_address is landlord-scoped despite "address" being a personal-info word', () => {
-    // The latent half of the same bug: PERSONAL_RE contains \\baddress\\b, so
+  it('property_address is not tenant-scoped despite "address" being a personal-info word', () => {
+    // The latent half of the same bug: PERSONAL_RE contains \baddress\b, so
     // proximity would have handed the tenant the property's own address.
-    expect(roleForLeaseColumn('property_address')).toBe('landlord')
+    expect(roleForLeaseColumn('property_address')).toBeNull()
   })
 
   it('no money or term column is ever tenant-scoped', () => {
     const tenantScoped = PROPERTY_AND_MONEY.filter(c => roleForLeaseColumn(c) !== 'landlord')
     expect(tenantScoped, `these would let a tenant set their own lease terms: ${tenantScoped}`)
       .toEqual([])
+  })
+
+  it('a money column is still the landlord\'s — S635 moved identity only', () => {
+    // The failure this guards: widening "derived from the invite" to every bound
+    // column would leave the rent amount with no owner and no value.
+    expect(roleForLeaseColumn('rent_amount')).toBe('landlord')
+    expect(roleForLeaseColumn('security_deposit')).toBe('landlord')
   })
 })
 

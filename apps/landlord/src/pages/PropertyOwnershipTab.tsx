@@ -12,6 +12,7 @@
 // forwarded email is a signature anyone can apply.
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { toast, appConfirm } from '../components/dialogs'
 import { ArrowRightLeft, Check, X, AlertTriangle } from 'lucide-react'
@@ -27,6 +28,13 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
   const { data: request } = useQuery<any>(
     ['transfer-request', propertyId],
     () => apiGet(`/properties/${propertyId}/transfer-request`).then((r: any) => r?.data ?? r))
+
+  // S631 (Nic): "When I click on Oak Park and I click on Mountain View RV, no
+  // little window pops up to see who owns it, who does what." This tab went
+  // straight to SELLING the property without ever stating who currently holds
+  // it. Same query key the detail page uses, so this costs no extra request.
+  const { data: property } = useQuery<any>(['property', propertyId], () => apiGet(`/properties/${propertyId}`))
+  const ownership = property?.ownership
 
   const invalidate = () => qc.invalidateQueries(['transfer-request', propertyId])
 
@@ -56,6 +64,40 @@ export function PropertyOwnershipTab({ propertyId, propertyName }:
   if (request) {
     return (
       <div style={{ maxWidth: 640 }}>
+      {/* S631: who holds this property, before anything about moving it. */}
+      {ownership && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Ownership</div>
+          <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
+            {propertyName} belongs to <strong style={{ color: 'var(--text-1)' }}>{ownership.entityName}</strong>.
+            Everyone below can act on it. Co-owners are held by the entity, not the property, so
+            adding one here gives them every property {ownership.entityName} owns —{' '}
+            <Link to="/settings" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
+              manage owners in Settings
+            </Link>.
+          </div>
+          {(ownership.owners || []).map((o: any) => (
+            <div key={o.userId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '7px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
+              <div>
+                <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
+                  {o.name || o.email}
+                  {o.isFounding && <span style={{ marginLeft: 8, fontSize: '.62rem', color: 'var(--gold)', fontWeight: 700 }}>FOUNDING</span>}
+                </div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{o.email}</div>
+              </div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                {o.isFounding ? 'Cannot be removed' : 'Co-owner'}
+              </div>
+            </div>
+          ))}
+          {(ownership.owners || []).length > 1 && (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5 }}>
+              A sale needs every one of them to confirm — no single owner can move this property alone.
+            </div>
+          )}
+        </div>
+      )}
         <div className="card" style={{ padding: 18, borderLeft: '3px solid var(--gold)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
             <ArrowRightLeft size={17} style={{ color: 'var(--gold)' }} />

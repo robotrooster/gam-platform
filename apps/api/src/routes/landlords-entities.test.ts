@@ -59,9 +59,14 @@ describe('multi-entity ownership', () => {
     // leaving them wondering why the dashboard has not moved.
     expect(res.body.data.reloginRequired).toBe(true)
 
-    const u = await queryOne<{ active_landlord_id: string }>(
-      `SELECT active_landlord_id FROM users WHERE id = $1`, [a.userId])
-    expect(u!.active_landlord_id).toBe(newId)
+    // S634: there is no "active" entity to land on — the account owns the new
+    // company from the moment the membership row exists, and is signed into
+    // every company it owns at once. What the caller needs is that membership,
+    // not a pointer.
+    const member = await queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM landlord_members WHERE user_id = $1 AND landlord_id = $2`,
+      [a.userId, newId])
+    expect(member).toBeTruthy()
   })
 
   it('lists every entity the user can operate in, owned first', async () => {

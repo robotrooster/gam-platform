@@ -4,7 +4,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row { unit_number: string | null; property_name: string | null; status: string }
 
@@ -38,11 +38,11 @@ export const getVacantUnits: AgentTool = {
          FROM units u JOIN properties p ON p.id = u.property_id
         -- S605: retired units are never "vacant to fill" — they hold history
         -- only, and can't take a new lease or booking.
-        WHERE u.landlord_id = $1 AND u.status = ANY($2) AND u.retired_at IS NULL
+        WHERE u.landlord_id = ANY($1::uuid[]) AND u.status = ANY($2) AND u.retired_at IS NULL
           AND ($4::text IS NULL OR p.name ILIKE '%' || $4 || '%')
         ORDER BY p.name, u.unit_number
         LIMIT $3`,
-      [actor.profileId, VACANT, limit, property || null]
+      [actorLandlordIds(actor), VACANT, limit, property || null]
     )
     return {
       ok: true,

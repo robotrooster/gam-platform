@@ -1,5 +1,7 @@
 import { useState, useRef, useMemo } from 'react'
 import { useMutation } from 'react-query'
+// S633: an import lands in ONE company. The account names it.
+import { EntityPicker } from '../components/EntityPicker'
 import { useNavigate } from 'react-router-dom'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { api, apiPost } from '../lib/api'
@@ -63,6 +65,10 @@ const PLATFORM_OPTIONS = [
 export function PaymentHistoryOnboardingPage() {
   const navigate = useNavigate()
   const [source, setSource] = useState<string>('generic')
+  // S633: an import lands in ONE company. With a single company the picker
+  // renders nothing and this is that company; with several the account chooses,
+  // because a file imported into the wrong LLC is unwound by hand.
+  const [landlordId, setLandlordId] = useState<string>('')
   const [fileName, setFileName] = useState<string>('')
   const [csvText, setCsvText] = useState<string>('')
   const [punchListRows, setPunchListRows] = useState<PaymentCsvRow[] | null>(null)
@@ -91,7 +97,7 @@ export function PaymentHistoryOnboardingPage() {
 
   const validateMut = useMutation(
     (body: { csv: string; source: string; claimedPlatformName?: string }) =>
-      apiPost<ValidateResponse>('/landlords/me/onboard-payment-history-csv/validate', body),
+      apiPost<ValidateResponse>('/landlords/me/onboard-payment-history-csv/validate', { ...body, landlordId }),
     {
       onSuccess: (res: any) => {
         const data: ValidateResponse = res.data
@@ -110,7 +116,7 @@ export function PaymentHistoryOnboardingPage() {
   const commitMut = useMutation(
     (rows: PaymentCsvRow[]) =>
       apiPost<CommitResponse>('/landlords/me/onboard-payment-history-csv/commit', {
-        rows, source,
+        rows, source, landlordId,
         ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
       }),
     {
@@ -213,6 +219,8 @@ export function PaymentHistoryOnboardingPage() {
         <h1 style={{ fontSize: '1.6rem', fontWeight: 700, color: 'var(--text-0)', margin: 0 }}>
           Payment History Import
         </h1>
+        <EntityPicker value={landlordId} onChange={setLandlordId}
+          note="Imported payments are filed under this company's books." />
         <p style={{ fontSize: '.88rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
           Bring your historical payment records onto GAM so your tenants' account
           histories carry over. Each row resolves to an active tenant + lease in

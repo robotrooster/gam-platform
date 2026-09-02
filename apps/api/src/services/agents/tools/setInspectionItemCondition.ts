@@ -13,7 +13,7 @@
  */
 import { queryOne } from '../../../db'
 import { INSPECTION_ITEM_CONDITIONS, type InspectionItemCondition } from '@gam/shared'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const setInspectionItemCondition: AgentTool = {
   name: 'set_inspection_item_condition',
@@ -59,8 +59,8 @@ export const setInspectionItemCondition: AgentTool = {
 
     // Hard-scope to THIS landlord's inspection; conditions are draft-only.
     const insp = await queryOne<{ id: string; status: string }>(
-      `SELECT id, status FROM unit_inspections WHERE id = $1 AND landlord_id = $2`,
-      [inspectionId, actor.profileId],
+      `SELECT id, status FROM unit_inspections WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [inspectionId, actorLandlordIds(actor)],
     )
     if (!insp) return { ok: false, error: 'No such inspection on your account.' }
     if (insp.status !== 'draft') {

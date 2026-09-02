@@ -7,7 +7,7 @@
  */
 
 import { query, queryOne } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface ConnectRow {
   connect_details_submitted: boolean | null
@@ -39,11 +39,11 @@ export const getSetupProgress: AgentTool = {
     )
     const counts = await queryOne<CountsRow>(
       `SELECT
-         (SELECT COUNT(*) FROM properties WHERE landlord_id = $1) AS properties,
-         (SELECT COUNT(*) FROM units WHERE landlord_id = $1) AS units,
-         (SELECT COUNT(*) FROM leases WHERE landlord_id = $1 AND status = 'active') AS active_leases,
+         (SELECT COUNT(*) FROM properties WHERE landlord_id = ANY($1::uuid[])) AS properties,
+         (SELECT COUNT(*) FROM units WHERE landlord_id = ANY($1::uuid[])) AS units,
+         (SELECT COUNT(*) FROM leases WHERE landlord_id = ANY($1::uuid[]) AND status = 'active') AS active_leases,
          (SELECT onboarding_complete FROM landlords WHERE id = $1) AS onboarding_complete`,
-      [actor.profileId]
+      [actorLandlordIds(actor)]
     )
 
     const bankConnected = !!(connect?.connect_payouts_enabled || connect?.connect_details_submitted)

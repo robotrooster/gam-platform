@@ -299,10 +299,13 @@ describe('S537b subtype locks the unit type', () => {
     expect(conflict.status).toBe(400)
     expect(conflict.body.error).toMatch(/rv spot subtype/i)
 
+    // S630 (Nic, DIRECTIVE): a subtype classifies a space, it never prices one —
+    // so creation asks for the rent outright instead of inheriting the class's.
+    // The subtype still supplies the TYPE, which is what this test is about.
     const ok = await request(buildApp())
       .post('/api/units')
       .set('Authorization', `Bearer ${landlordToken(f.userId, f.landlordId)}`)
-      .send({ propertyId: f.propertyId, unitNumber: 'RV 01', subtypeId })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV 01', subtypeId, rentAmount: 850 })
     expect(ok.status).toBe(201)
     const created = await db.query<{ unit_type: string }>(
       `SELECT unit_type FROM units WHERE property_id=$1 AND unit_number='RV 01'`, [f.propertyId])

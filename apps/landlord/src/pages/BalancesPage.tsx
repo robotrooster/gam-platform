@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
 
@@ -27,8 +28,96 @@ function daysOverdue(due: string | null): number | null {
   return Math.floor((today.getTime() - d.getTime()) / 86400000)
 }
 
+/**
+ * S634 (Nic, DIRECTIVE): "these outstanding balances need to be clickable so I
+ * can get into the invoice and actually view it... as a landlord, you need to be
+ * able to explain that to a tenant."
+ *
+ * The list gave a number and nothing behind it. A resident at the counter asking
+ * "what's this $217?" left the landlord with no way to answer from the product,
+ * which is the one moment the number had to mean something.
+ *
+ * Every line, with its own note — the meter reads, the flat-rate multiplier, the
+ * cycle a late-arriving utility belongs to — because that note IS the sentence
+ * the landlord repeats back.
+ */
+function InvoiceBreakdown({ tenantId }: { tenantId: string }) {
+  const { data: invoices = [], isLoading } = useQuery<any[]>(
+    ['balance-invoices', tenantId], () => apiGet(`/balances/${tenantId}/invoices`))
+
+  if (isLoading) return <div style={{ padding: '10px 14px', fontSize: '.78rem', color: 'var(--text-3)' }}>Loading invoices…</div>
+  if (!invoices.length) return <div style={{ padding: '10px 14px', fontSize: '.78rem', color: 'var(--text-3)' }}>No open invoices.</div>
+
+  const LABEL: Record<string, string> = {
+    rent: 'Rent', utility: 'Utility', fee: 'Fee', deposit: 'Deposit',
+    late_fee: 'Late fee', subscription: 'Subscription',
+  }
+  return (
+    <div style={{ padding: '4px 14px 14px', display: 'grid', gap: 12 }}>
+      {invoices.map((inv: any) => (
+        <div key={inv.id} style={{ border: '1px solid var(--border-1, rgba(255,255,255,.08))', borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+                        padding: '8px 12px', background: 'rgba(255,255,255,.02)', flexWrap: 'wrap', gap: 8 }}>
+            <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-0)' }}>
+              {inv.invoiceNumber}
+              <span style={{ fontWeight: 400, color: 'var(--text-3)', marginLeft: 8 }}>
+                due {new Date(String(inv.dueDate).slice(0, 10) + 'T00:00:00').toLocaleDateString()}
+              </span>
+            </div>
+            <div style={{ fontSize: '.8rem', color: 'var(--gold)', fontWeight: 700 }}>
+              {fmt(Number(inv.balance))} owed
+              {Number(inv.amountPaid) > 0 && (
+                <span style={{ color: 'var(--text-3)', fontWeight: 400, marginLeft: 8 }}>
+                  ({fmt(Number(inv.amountPaid))} paid of {fmt(Number(inv.totalAmount))})
+                </span>
+              )}
+            </div>
+          </div>
+          <table className="data-table" style={{ width: '100%' }}>
+            <tbody>
+              {(inv.lines || []).map((l: any) => (
+                <tr key={l.id}>
+                  <td style={{ fontSize: '.78rem', width: 110, color: 'var(--text-2)' }}>
+                    {LABEL[l.type] || l.type}
+                  </td>
+                  <td style={{ fontSize: '.78rem' }}>
+                    {l.notes || l.entryDescription || '—'}
+                    {l.status && l.status !== 'pending' && (
+                      <span style={{ marginLeft: 8, fontSize: '.68rem', color: 'var(--text-3)' }}>· {l.status}</span>
+                    )}
+                  </td>
+                  <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                    {fmt(Number(l.amount))}
+                  </td>
+                </tr>
+              ))}
+              {(inv.lines || []).length === 0 && (
+                <tr><td colSpan={3} style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+                  No line detail on this invoice.
+                </td></tr>
+              )}
+              {Number(inv.workTradeCreditAmount) > 0 && (
+                <tr>
+                  <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>Work trade</td>
+                  <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Credit applied against rent</td>
+                  <td style={{ fontSize: '.78rem', textAlign: 'right', fontWeight: 600, color: 'var(--green, #22c55e)' }}>
+                    −{fmt(Number(inv.workTradeCreditAmount))}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function BalancesPage() {
   const { data: rows = [], isLoading } = useQuery<Owed[]>('outstanding-balances', () => apiGet('/balances'))
+  // S634: which row is open. One at a time — this is a look-it-up-and-answer
+  // surface, not a report.
+  const [openRow, setOpenRow] = useState<string | null>(null)
 
   const total = (rows as Owed[]).reduce((s, r) => s + Number(r.balance), 0)
 
@@ -37,7 +126,7 @@ export function BalancesPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Outstanding Balances</h1>
-          <p className="page-subtitle">Who owes and how to reach them</p>
+          <p className="page-subtitle">Who owes, how to reach them — click a row for the charge breakdown</p>
         </div>
         {rows.length > 0 && (
           <div style={{ textAlign: 'right' }}>
@@ -69,9 +158,18 @@ export function BalancesPage() {
               {(rows as Owed[]).map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
+                const rowKey = r.tenantId + (r.unitNumber || '')
+                const isOpen = openRow === rowKey
                 return (
-                  <tr key={r.tenantId + (r.unitNumber || '')}>
-                    <td style={{ fontWeight: 500 }}>{name}</td>
+                  <>
+                  <tr key={rowKey}
+                      onClick={() => setOpenRow(isOpen ? null : rowKey)}
+                      style={{ cursor: 'pointer' }}
+                      title="See what makes up this balance">
+                    <td style={{ fontWeight: 500 }}>
+                      <span style={{ color: 'var(--text-3)', marginRight: 6, fontSize: '.7rem' }}>{isOpen ? '▾' : '▸'}</span>
+                      {name}
+                    </td>
                     <td style={{ fontSize: '.85rem', color: 'var(--text-2)' }}>
                       {r.unitNumber ? `Unit ${r.unitNumber}` : '—'}
                       {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
@@ -91,11 +189,19 @@ export function BalancesPage() {
                       )}
                     </td>
                     <td style={{ fontSize: '.82rem' }}>
-                      {r.phone && <div><a href={`tel:${r.phone}`} style={{ color: 'var(--gold)' }}>{r.phone}</a></div>}
-                      {r.email && <div><a href={`mailto:${r.email}`} style={{ color: 'var(--text-2)' }}>{r.email}</a></div>}
+                      {r.phone && <div><a onClick={e => e.stopPropagation()} href={`tel:${r.phone}`} style={{ color: 'var(--gold)' }}>{r.phone}</a></div>}
+                      {r.email && <div><a onClick={e => e.stopPropagation()} href={`mailto:${r.email}`} style={{ color: 'var(--text-2)' }}>{r.email}</a></div>}
                       {!r.phone && !r.email && <span style={{ color: 'var(--text-3)' }}>—</span>}
                     </td>
                   </tr>
+                  {isOpen && (
+                    <tr key={rowKey + '-detail'}>
+                      <td colSpan={5} style={{ padding: 0, background: 'rgba(255,255,255,.015)' }}>
+                        <InvoiceBreakdown tenantId={r.tenantId} />
+                      </td>
+                    </tr>
+                  )}
+                  </>
                 )
               })}
             </tbody>

@@ -10,7 +10,7 @@
  * Directional market context, not an appraisal. Read-only.
  */
 import { getMarketRent, positionVsMarket } from '../../marketRent'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 const POSITION_PHRASE: Record<string, string> = {
   below: 'below the local market (under the bottom quartile)',
@@ -51,7 +51,9 @@ export const getMarketRentTool: AgentTool = {
     }
 
     // Exclude the asking landlord from the aggregate (market vs them).
-    const stat = await getMarketRent(unitType, city, state, actor.profileId)
+    // S634: the exclusion is "not this account's own units" — every company it
+// owns, so a landlord who owns two parks is not compared against himself.
+    const stat = await getMarketRent(unitType, city, state, actorLandlordIds(actor))
     if (!stat) {
       return {
         ok: true,

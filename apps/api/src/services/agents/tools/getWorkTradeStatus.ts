@@ -18,7 +18,7 @@
 
 import { query } from '../../../db'
 import { loadWorkTradeStanding } from '../../workTradeStanding'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const getWorkTradeStatus: AgentTool = {
   name: 'get_work_trade_status',
@@ -39,9 +39,9 @@ export const getWorkTradeStatus: AgentTool = {
          JOIN units u ON u.id = wta.unit_id
          JOIN tenants t ON t.id = wta.tenant_id
          JOIN users usr ON usr.id = t.user_id
-        WHERE wta.landlord_id = $1 AND wta.status = 'active'
+        WHERE wta.landlord_id = ANY($1::uuid[]) AND wta.status = 'active'
         ORDER BY u.unit_number`,
-      [actor.profileId])
+      [actorLandlordIds(actor)])
 
     if (rows.length === 0) {
       return { ok: true, count: 0, note: 'No active work-trade agreements.' }

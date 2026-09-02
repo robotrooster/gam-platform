@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
-import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus } from 'lucide-react'
+import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 // S526: PropertyFeeScheduleSection RETIRED — fees are charged per tenant's
@@ -137,6 +137,15 @@ export function PropertyDetailPage() {
           hedged factual notice here catches the landlord before the
           value propagates to new leases. Auto-hides when empty. */}
       <LawWarningBanner warnings={property.stateLawWarnings} />
+
+      {/* S632 (Nic, DIRECTIVE): "When I click properties and then click on
+          Mountain View specifically, that banner needs to be at the top of the
+          page sitting inside the specific property. It also should be on every
+          page inside that specific property, when it's an important item."
+          ABOVE the tab strip on purpose — a thing that stops the property
+          billing must not be findable only by opening the one tab that happens
+          to own it. */}
+      <PropertyAlerts propertyId={id!} onGoTab={goTab} />
 
       {/* S605: sub-tabs. Everything below is scoped to THIS property. */}
       <div style={{ display:'flex', gap:4, borderBottom:'1px solid var(--border-0)', marginBottom:20 }}>
@@ -645,6 +654,62 @@ function OccupancyDefaultCard({ property, onSaved }: { property: any; onSaved: (
         <option value="whole_unit">Whole unit — one lease (co-tenants share it)</option>
         <option value="by_room">By the room — separate lease per person</option>
       </select>
+    </div>
+  )
+}
+
+
+// ── PROPERTY-LEVEL ALERTS (S632) ─────────────────────────────────────
+//
+// Nic, on a property whose 53 meters had no opening read: "I reloaded GAM. I
+// refreshed. I've navigated pages. There's no opening reads anywhere. I don't
+// see any sort of notification still."
+//
+// The warning existed — on the Utilities tab, which is exactly one click he had
+// no reason to make. A condition that stops a property billing belongs where he
+// LANDS, not where the subsystem that produced it happens to live. This strip
+// sits above the tabs, so it is on every page of that property, and each alert
+// carries the tab that fixes it.
+//
+// Deliberately a LIST, not one banner: the next property-level condition worth
+// interrupting for (a lease-signing address that bounces, a payout account that
+// went stale) drops in beside this one rather than starting another pattern.
+function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: (t: TabKey) => void }) {
+  const { data: meters = [] } = useQuery<any[]>(
+    ['utility-meters', propertyId],
+    () => apiGet(`/utility/meters?propertyId=${propertyId}`),
+    { enabled: !!propertyId },
+  )
+  const alerts: { key: string; text: string; detail: string; tab: TabKey; cta: string }[] = []
+
+  // A submeter with no opening read records a walk and bills NOTHING, silently
+  // — usage is this read minus the last one, and there is no last one.
+  const noOpening = (meters as any[]).filter((m: any) => m.hasBaseline === false).length
+  if (noOpening > 0) {
+    alerts.push({
+      key: 'opening-reads',
+      text: `${noOpening} meter${noOpening === 1 ? '' : 's'} still need an opening read`,
+      detail: 'Usage is measured from the opening read. Until one exists the meter bills nothing — '
+        + 'and it does it quietly, so a whole cycle can pass before anyone notices.',
+      tab: 'utilities',
+      cta: 'Set opening reads',
+    })
+  }
+
+  if (!alerts.length) return null
+  return (
+    <div style={{ display:'grid', gap:10, marginBottom:16 }}>
+      {alerts.map(a => (
+        <div key={a.key} className="card" style={{ display:'flex', alignItems:'center', gap:14,
+          borderColor:'var(--red)', flexWrap:'wrap' }}>
+          <AlertTriangle size={24} style={{ color:'var(--red)', flexShrink:0 }} />
+          <div style={{ flex:1, minWidth:220 }}>
+            <div style={{ fontWeight:700 }}>{a.text}</div>
+            <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:2, lineHeight:1.5 }}>{a.detail}</div>
+          </div>
+          <button className="btn btn-primary" onClick={() => onGoTab(a.tab)}>{a.cta}</button>
+        </div>
+      ))}
     </div>
   )
 }

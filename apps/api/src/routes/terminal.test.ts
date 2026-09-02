@@ -99,8 +99,10 @@ const sign = (claims: any) =>
 
 function landlordTokenWithPerm(landlordId: string) {
   return sign({
+    // S633: a landlord session names no entity — it carries the ACCOUNT's
+    // companies in landlordIds. profileId is null for role='landlord'.
     userId: randomUUID(), role: 'landlord', email: 'll@t.dev',
-    profileId: landlordId, permissions: {},
+    profileId: null, landlordIds: [landlordId], permissions: {},
   })
 }
 function pmTokenWithPerm(userId: string, landlordId: string) {

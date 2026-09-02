@@ -153,7 +153,10 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
         leaseStart: '2026-01-01', monthlyRent: 1000,
       })
     expect(res.status).toBe(403)
-    expect(res.body.error).toMatch(/not owned by this landlord/)
+    // S633: same refusal, plainer words. The company is derived from the unit
+    // now, and the message says whose it is not — "not owned by this landlord"
+    // was confusing precisely when the caller DID own it under another company.
+    expect(res.body.error).toMatch(/not yours/i)
   })
 
   it('unit already occupied → 409', async () => {

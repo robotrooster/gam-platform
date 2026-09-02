@@ -99,7 +99,7 @@ describe('resolveIntent — supersede confirm gate', () => {
   it('unit already leased → needsSupersedeConfirm, and the sitting lease is NOT ended', async () => {
     const s = await setup()
     const intentId = await seedParsedIntent(s.landlordId, s.propertyName, s.unitNumber)
-    const res: any = await resolveIntent(intentId, s.landlordId, {})
+    const res: any = await resolveIntent(intentId, [s.landlordId], {})
     expect(res.needsSupersedeConfirm).toBe(true)
     expect(res.supersedeLeaseId).toBe(s.oldLeaseId)
     expect(res.supersedeTenantName).toMatch(/Test Tenant/)
@@ -113,7 +113,7 @@ describe('resolveIntent — supersede confirm gate', () => {
   it('confirmSupersede=true → builds the lease and ends the prior one', async () => {
     const s = await setup()
     const intentId = await seedParsedIntent(s.landlordId, s.propertyName, s.unitNumber)
-    const res: any = await resolveIntent(intentId, s.landlordId, {}, { confirmSupersede: true })
+    const res: any = await resolveIntent(intentId, [s.landlordId], {}, { confirmSupersede: true })
     expect(res.leaseId).toBeTruthy()
     expect(res.supersededLeaseId).toBe(s.oldLeaseId)
     const old = await db.query<{ status: string }>(`SELECT status FROM leases WHERE id=$1`, [s.oldLeaseId])

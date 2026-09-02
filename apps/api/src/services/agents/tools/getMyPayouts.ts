@@ -4,7 +4,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   amount: string
@@ -28,9 +28,9 @@ export const getMyPayouts: AgentTool = {
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 30) : 10
     const rows = await query<Row>(
       `SELECT amount, status, unit_count, target_date, settled_at, trigger_type
-         FROM disbursements WHERE landlord_id = $1
+         FROM disbursements WHERE landlord_id = ANY($1::uuid[])
         ORDER BY COALESCE(settled_at, target_date, created_at) DESC LIMIT $2`,
-      [actor.profileId, limit]
+      [actorLandlordIds(actor), limit]
     )
     return {
       ok: true,

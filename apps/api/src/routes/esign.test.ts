@@ -3157,14 +3157,18 @@ describe('S535 cross-template renewal', () => {
     expect(Number(byCol.rent_amount)).toBe(1000)          // current rent default
     expect(byCol.start_date).toBe('8/1/2026')             // day after old end
     expect(byCol.end_date).toBe('7/31/2027')              // same duration
-    expect(byCol.lease_type).toBe('fixed_term')
+    // S635 (Nic): "month to month printed raw on all the leases I just sent."
+    // A tagged value is written onto the SIGNED DOCUMENT, so an enum reaches the
+    // page as English. This asserted the wire value until the day a resident's
+    // lease said "month_to_month" in the rental-term blank.
+    expect(byCol.lease_type).toBe('Fixed term')
     expect(byCol.late_fee_initial_flat).toBe('N/A')  // S535: late fees never carry from the lease
     expect(byCol.late_fee_grace_days).toBe('N/A')
     expect(Number(byCol.security_deposit)).toBe(1000)     // carried, per type
     expect(Number(byCol.pet_deposit)).toBe(300)           // carried, per type
     expect(Number(byCol.pet_rent)).toBe(25)
-    expect(byCol.utility_electric_responsibility).toBe('tenant')
-    expect(byCol.utility_water_responsibility).toBe('landlord')
+    expect(byCol.utility_electric_responsibility).toBe('Tenant')
+    expect(byCol.utility_water_responsibility).toBe('Landlord')
     expect(byCol.tenant_name).toBeTruthy()
   })
 })

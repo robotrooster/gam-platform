@@ -16,7 +16,7 @@ import { query, queryOne, getClient } from '../../../db'
 import { lockArea, findApprovedConflict, billReservationFee } from '../../commonAreas'
 import { fireAmenityAlert } from '../../../routes/commonAreas'
 import { notifyReservationDecision } from '../../notifications'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const getPendingAmenityRequests: AgentTool = {
   name: 'get_pending_amenity_requests',
@@ -38,10 +38,10 @@ export const getPendingAmenityRequests: AgentTool = {
          JOIN properties p ON p.id = car.property_id
          LEFT JOIN tenants t ON t.id = car.reserved_by_tenant_id
          LEFT JOIN users tu ON tu.id = t.user_id
-        WHERE car.landlord_id = $1 AND car.status = 'pending'
+        WHERE car.landlord_id = ANY($1::uuid[]) AND car.status = 'pending'
         ORDER BY car.starts_at ASC
         LIMIT 30`,
-      [actor.profileId]
+      [actorLandlordIds(actor)]
     )
     return {
       ok: true,
@@ -76,8 +76,8 @@ export const decideAmenityReservation: AgentTool = {
     if (!rid) return { ok: false, error: 'A reservationId is required (from get_pending_amenity_requests).' }
 
     const r = await queryOne<any>(
-      `SELECT * FROM common_area_reservations WHERE id = $1 AND landlord_id = $2`,
-      [rid, actor.profileId]
+      `SELECT * FROM common_area_reservations WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [rid, actorLandlordIds(actor)]
     )
     if (!r) return { ok: false, error: 'No such reservation on this account.' }
     if (r.status !== 'pending') return { ok: false, error: `That reservation is already ${r.status}.` }

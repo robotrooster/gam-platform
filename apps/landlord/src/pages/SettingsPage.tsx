@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { api, apiGet, apiPatch } from '../lib/api'
+import { EntityPicker } from '../components/EntityPicker'
 import { Check, DollarSign, X } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
@@ -36,6 +37,7 @@ function EntitiesSection() {
   const [ein, setEin] = useState('')
   const [err, setErr] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [openEntity, setOpenEntity] = useState<string | null>(null)
 
   const fail = (e: any) =>
     setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Something went wrong.')
@@ -61,22 +63,16 @@ function EntitiesSection() {
         Your dashboard shows all of them together; choose the entity when you add a property.
       </div>
 
+      {/* S631 (Nic): "I see my different entities, and then I see owners, but I
+          don't see anything linking that window to a specific entity. It just
+          says add owner, and I don't know where it would be getting added at."
+          He was right — the standalone Owners card always acted on whichever
+          entity the session happened to be signed into, with nothing on screen
+          saying which that was. Owners belong to an entity, so they live inside
+          the entity. */}
       {entities.map((e: any) => (
-        <div key={e.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '8px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
-          <div>
-            <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
-              {e.businessName || 'Unnamed entity'}
-
-            </div>
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-              {e.propertyCount} {e.propertyCount === 1 ? 'property' : 'properties'}
-              {!e.isOwner && ' · co-owned'}
-              {!e.connectPayoutsEnabled && ' · payouts not set up'}
-            </div>
-          </div>
-
-        </div>
+        <EntityRow key={e.id} entity={e} expanded={openEntity === e.id}
+          onToggle={() => setOpenEntity(openEntity === e.id ? null : e.id)} />
       ))}
 
       {notice && (
@@ -108,29 +104,37 @@ function EntitiesSection() {
   )
 }
 
-// S553: owner-members of this landlord entity (multi-owner LLCs — Oak
-// Park). Any owner can add a co-owner by email (they must already have a
-// GAM landlord account); the founding owner can't be removed. Memberships
-// take effect at the co-owner's next sign-in.
-function OwnersSection() {
+// S553: owner-members of ONE landlord entity (multi-owner LLCs — Oak Park).
+// Any owner can add a co-owner by email; the founding owner can't be removed.
+// Memberships take effect at the co-owner's next sign-in.
+//
+// S631 (Nic): now always rendered for an explicit entity, and always passing
+// that entity's id. The endpoints have taken `landlordId` since S553 — the old
+// card never sent it, so every add silently landed on the session's active
+// entity. With one entity that is invisible; with three it is a co-owner
+// appearing on the wrong LLC.
+function OwnersSection({ landlordId, entityName }: { landlordId: string; entityName: string }) {
   const qc = useQueryClient()
-  const { data: members = [], isLoading } = useQuery<any[]>('landlord-members', () => apiGet('/landlords/members'))
+  const { data: members = [], isLoading } = useQuery<any[]>(
+    ['landlord-members', landlordId],
+    () => apiGet(`/landlords/members?landlordId=${landlordId}`))
   const [email, setEmail] = useState('')
   const [err, setErr] = useState<string | null>(null)
-  const addMut = useMutation(() => api.post('/landlords/members', { email: email.trim() }).then(r => r.data), {
-    onSuccess: () => { qc.invalidateQueries('landlord-members'); setEmail(''); setErr(null) },
+  const addMut = useMutation(
+    () => api.post('/landlords/members', { email: email.trim(), landlordId }).then(r => r.data), {
+    onSuccess: () => { qc.invalidateQueries(['landlord-members', landlordId]); setEmail(''); setErr(null) },
     onError: (e: any) => setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add owner.'),
   })
   const rmMut = useMutation((id: string) => api.delete(`/landlords/members/${id}`).then(r => r.data), {
-    onSuccess: () => qc.invalidateQueries('landlord-members'),
+    onSuccess: () => qc.invalidateQueries(['landlord-members', landlordId]),
   })
   if (isLoading) return null
   return (
-    <div className="card" style={{ marginBottom: 16 }}>
-      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Owners</div>
-      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
-        Co-owners see this entity's properties alongside their own portfolio. They need their own GAM landlord
-        account first; changes apply the next time they sign in.
+    <div style={{ padding: '4px 0 10px' }}>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 10 }}>
+        Owners of <strong style={{ color: 'var(--text-1)' }}>{entityName}</strong>. They see this
+        entity&apos;s properties alongside their own portfolio. If they have no GAM account yet we email
+        them an invite; changes apply the next time they sign in.
       </div>
       {members.map((m: any) => (
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
@@ -165,7 +169,26 @@ function OwnersSection() {
 
 export function SettingsPage() {
   const qc = useQueryClient()
-  const { data: me, isLoading, refetch: refetchMe } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
+
+  // ── S633: WHICH COMPANY ARE THESE SETTINGS FOR? ────────────────────────────
+  //
+  // Nic (DIRECTIVE): "Account ownership is no correlation to a specific entity.
+  // Entities own properties. The account owns the entities."
+  //
+  // Everything on this card — legal name, EIN, approval thresholds — belongs to
+  // a COMPANY, not to the account. It used to be read through whichever entity
+  // the session sat on, so a landlord who owns two saw one company's settings
+  // with nothing on screen saying which, and no way to reach the other's.
+  //
+  // The account picks. Owning exactly one, the picker is not rendered at all and
+  // nothing changes for the overwhelming majority of landlords.
+  // EntityPicker owns the list and lands on the first company itself.
+  const [companyId, setCompanyId] = useState<string>('')
+  const { data: me, isLoading, refetch: refetchMe } = useQuery<any>(
+    ['landlord-me', companyId],
+    () => apiGet(`/landlords/me?landlordId=${companyId}`),
+    { enabled: !!companyId },
+  )
 
   const [threshold, setThreshold] = useState<string>('')
   const [depThreshold, setDepThreshold] = useState<string>('')
@@ -179,6 +202,7 @@ export function SettingsPage() {
   const acctMut = useMutation(
     () => apiPatch('/landlords/me', {
       businessName: acctForm.businessName.trim() || undefined,
+      landlordId: companyId || undefined,
     }),
     {
       onSuccess: () => {
@@ -201,6 +225,7 @@ export function SettingsPage() {
     () => apiPatch('/landlords/me', {
       maintApprovalThreshold: Number(threshold),
       depositReturnApprovalThreshold: Number(depThreshold),
+      landlordId: companyId || undefined,
     }),
     {
       onSuccess: () => {
@@ -232,6 +257,11 @@ export function SettingsPage() {
       </div>
 
       <FeatureRequestCard />
+
+      {/* S633: the same picker every other per-company surface uses. It renders
+          nothing when the account owns one, which is nearly every landlord. */}
+      <EntityPicker value={companyId} onChange={setCompanyId} label="Company"
+        note="Legal name, EIN and approval thresholds belong to this company. Your properties, tenants and reports are unaffected — they always cover everything you own." />
 
       {isLoading ? (
         <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -322,6 +352,9 @@ export function SettingsPage() {
 
           {/* Security / 2FA */}
           <SecurityCard />
+
+          {/* S631: first billing cycle */}
+          {can('settings.billing_view') && <FirstBillingCycleCard />}
 
           {/* Billing */}
           {can('settings.billing_view') && (
@@ -459,9 +492,8 @@ export function SettingsPage() {
             />
           )}
 
-          {/* S553: entity owner-members (multi-owner LLCs). */}
+          {/* S553/S631: entities, each carrying its own owners. */}
           <EntitiesSection />
-          <OwnersSection />
 
           {/* W-53 (S531): Notification Prefs merged in as a real section —
               the standalone nav item is gone. The section renders its own
@@ -658,6 +690,149 @@ function FeatureRequestCard() {
             )}
           </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── First billing cycle (S631, moved to per-property in S633) ────────────────
+//
+// Nic (DIRECTIVE): "Maybe we just have a toggle for the landlord. Hey, when is
+// your first billing cycle on this platform? That way the landlord can manually
+// say, hey, I'm a little bit late onboarding everybody here, or I'm onboarding
+// early — bill October first kind of thing. That way it puts it on the landlord
+// to bill the tenants correctly."
+//
+// Only affects EXISTING tenants papered during onboarding. A new move-in is
+// billed from the day they move in and this never touches them, which is what
+// the copy below has to make obvious — otherwise it reads like a switch that
+// stops all billing.
+//
+// The alternative was inferring the month from the signing date, which was
+// tried and was wrong: it handed a free September to everyone signing on the
+// 1st or 2nd. Which month is owed depends on which months the landlord already
+// collected off-platform, and that is not in any date GAM holds.
+//
+// S633 — ONE ROW PER PROPERTY, NOT PER ENTITY. Nic: "if I onboard different
+// properties that I own next month, it's gonna bill them right away. This needs
+// to be a setting per property." Onboarding happens a property at a time, so the
+// answer does too. Two bugs died with the old card: it acted on whichever entity
+// the session sat on (Mountain View's answer was unreachable from Oak Park), and
+// it read `entity.firstBillingCycle`, which /landlords/me/entities never
+// returned — so every row rendered blank no matter what had been saved.
+//
+// GET /properties already spans every entity the account owns, so this list
+// needs no entity picker and no switcher: a property is named, and its company
+// is printed beside it.
+function FirstBillingCycleCard() {
+  const qc = useQueryClient()
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  return (
+    <div className="card">
+      <div className="card-header"><span className="card-title">First billing cycle</span></div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.6, marginTop: 8 }}>
+        The first month GAM invoices your <strong>existing</strong> tenants for — the ones you
+        papered during onboarding, who were already living on the property. Set it per property,
+        to the month you want GAM to take over, and no earlier than the last month you collected
+        yourself.
+      </div>
+      <div style={{ display: 'grid', gap: 14, marginTop: 16 }}>
+        {(properties as any[]).length === 0
+          ? <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+              No properties yet. Add one and its billing cycle will appear here.
+            </div>
+          : (properties as any[]).map(p => <PropertyBillingCycleRow key={p.id} property={p} qc={qc} />)}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 12, lineHeight: 1.6 }}>
+        New move-ins are unaffected: they are billed from their move-in date, prorated as usual.
+      </div>
+    </div>
+  )
+}
+
+function PropertyBillingCycleRow({ property, qc }: { property: any; qc: any }) {
+  const current = property.firstBillingCycle ? String(property.firstBillingCycle).slice(0, 7) : ''
+  const [month, setMonth] = useState(current)
+  const [saved, setSaved] = useState(false)
+  const saveMut = useMutation(
+    () => apiPatch(`/properties/${property.id}/first-billing-cycle`,
+      { firstBillingCycle: month || null }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('properties')
+        setSaved(true); setTimeout(() => setSaved(false), 2500)
+      },
+    },
+  )
+  const changed = month !== current
+
+  return (
+    <div style={{ borderTop: '1px solid var(--border-1, rgba(255,255,255,.06))', paddingTop: 12 }}>
+      <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>
+        {property.name || 'Unnamed property'}
+      </div>
+      {property.entityName && (
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>{property.entityName}</div>
+      )}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', marginTop: 8, flexWrap: 'wrap' }}>
+        <div>
+          <label style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+            Bill existing tenants from
+          </label>
+          <input className="input" type="month" value={month}
+            style={{ maxWidth: 190 }}
+            onChange={e => { setMonth(e.target.value); setSaved(false) }} />
+        </div>
+        <button className="btn btn-primary btn-sm" disabled={!changed || saveMut.isLoading}
+          onClick={() => saveMut.mutate()}>
+          {saveMut.isLoading ? 'Saving…' : 'Save'}
+        </button>
+        {saved && <span style={{ fontSize: '.74rem', color: 'var(--green, var(--gold))' }}>Saved</span>}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
+        {month
+          ? <>An existing tenant here who signs any time before {month} is first invoiced for {month},
+              at full rent — never a part month. Someone who signs later is invoiced for the month
+              they sign in.</>
+          : <>Not set — each existing tenant here is invoiced for the month their lease starts in, at
+              full rent. Set this if you already collected that month yourself.</>}
+        {' '}New move-ins are unaffected: they are billed from their move-in date, prorated as usual.
+      </div>
+    </div>
+  )
+}
+
+
+// S631 (Nic): "Maybe add owners from inside the entity details." One entity, its
+// properties, and the people who own it — in one place, so "add owner" can never
+// be ambiguous about where the owner is being added.
+function EntityRow({ entity, expanded, onToggle }: { entity: any; expanded: boolean; onToggle: () => void }) {
+  const { data: members = [] } = useQuery<any[]>(
+    ['landlord-members', entity.id],
+    () => apiGet(`/landlords/members?landlordId=${entity.id}`),
+  )
+  const ownerCount = members.length
+  return (
+    <div style={{ borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0' }}>
+        <div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
+            {entity.businessName || 'Unnamed entity'}
+          </div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            {entity.propertyCount} {entity.propertyCount === 1 ? 'property' : 'properties'}
+            {ownerCount > 0 && ` · ${ownerCount} ${ownerCount === 1 ? 'owner' : 'owners'}`}
+            {!entity.isOwner && ' · co-owned'}
+            {!entity.connectPayoutsEnabled && ' · payouts not set up'}
+          </div>
+        </div>
+        <button className="btn btn-ghost btn-sm" style={{ fontSize: '.72rem' }} onClick={onToggle}>
+          {expanded ? 'Hide owners' : 'Manage owners'}
+        </button>
+      </div>
+      {expanded && (
+        <OwnersSection landlordId={entity.id} entityName={entity.businessName || 'this entity'} />
       )}
     </div>
   )

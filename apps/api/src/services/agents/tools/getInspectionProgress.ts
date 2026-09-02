@@ -12,7 +12,7 @@
 
 import { query, queryOne } from '../../../db'
 import { checklistProgress, type InspectionUnitRow } from './inspectionChecklistShared'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const getInspectionProgress: AgentTool = {
   name: 'get_inspection_progress',
@@ -40,8 +40,8 @@ export const getInspectionProgress: AgentTool = {
       insp = await queryOne<InspectionUnitRow>(
         `SELECT i.id, i.inspection_type, i.status, u.unit_number, u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features
            FROM unit_inspections i JOIN units u ON u.id = i.unit_id
-          WHERE i.id = $1 AND i.landlord_id = $2`,
-        [inspectionId, actor.profileId]
+          WHERE i.id = $1 AND i.landlord_id = ANY($2::uuid[])`,
+        [inspectionId, actorLandlordIds(actor)]
       )
       if (!insp) return { ok: false, error: 'No such inspection on your account.' }
     } else if (unit) {
@@ -49,10 +49,10 @@ export const getInspectionProgress: AgentTool = {
         // The unit's most relevant inspection: prefer open, newest first.
         `SELECT i.id, i.inspection_type, i.status, u.unit_number, u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features
            FROM unit_inspections i JOIN units u ON u.id = i.unit_id
-          WHERE i.landlord_id = $1 AND u.unit_number ILIKE $2
+          WHERE i.landlord_id = ANY($1::uuid[]) AND u.unit_number ILIKE $2
           ORDER BY (i.status NOT IN ('finalized','cancelled')) DESC, COALESCE(i.scheduled_for, i.created_at) DESC
           LIMIT 1`,
-        [actor.profileId, unit]
+        [actorLandlordIds(actor), unit]
       )
       if (!insp) return { ok: false, error: `No inspection found for unit “${unit}”. Create one for that unit first, or check the unit number.` }
     } else {
@@ -62,9 +62,9 @@ export const getInspectionProgress: AgentTool = {
            FROM unit_inspections i
            JOIN units u ON u.id = i.unit_id
            JOIN properties p ON p.id = u.property_id
-          WHERE i.landlord_id = $1 AND i.status NOT IN ('finalized','cancelled')
+          WHERE i.landlord_id = ANY($1::uuid[]) AND i.status NOT IN ('finalized','cancelled')
           ORDER BY COALESCE(i.scheduled_for, i.created_at) DESC LIMIT 10`,
-        [actor.profileId]
+        [actorLandlordIds(actor)]
       )
       return {
         ok: false,

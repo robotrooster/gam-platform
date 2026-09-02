@@ -5,7 +5,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   first_name: string | null
@@ -76,12 +76,12 @@ export const getDelinquentTenants: AgentTool = {
          FROM payments p
          JOIN tenants t ON t.id = p.tenant_id
          JOIN users us ON us.id = t.user_id
-        WHERE p.landlord_id = $1 AND p.status = ANY($2) AND p.due_date < now()
+        WHERE p.landlord_id = ANY($1::uuid[]) AND p.status = ANY($2) AND p.due_date < now()
         GROUP BY us.first_name, us.last_name, us.email,
                  CASE WHEN p.status IN ('failed','returned') THEN 'returned' ELSE 'never_attempted' END
         ORDER BY overdue DESC
         LIMIT $3`,
-      [actor.profileId, UNPAID, limit]
+      [actorLandlordIds(actor), UNPAID, limit]
     )
 
     // S626 (Nic): "The $8 ACH was not stuck. It was paid. Money was already out
@@ -97,8 +97,8 @@ export const getDelinquentTenants: AgentTool = {
     const flight = await query<FlightRow>(
       `SELECT SUM(p.amount) AS in_flight, COUNT(DISTINCT p.tenant_id) AS payers
          FROM payments p
-        WHERE p.landlord_id = $1 AND p.status = 'processing'`,
-      [actor.profileId]
+        WHERE p.landlord_id = ANY($1::uuid[]) AND p.status = 'processing'`,
+      [actorLandlordIds(actor)]
     )
     const inFlight = Number(flight[0]?.in_flight ?? 0)
     const payers = Number(flight[0]?.payers ?? 0)

@@ -93,6 +93,18 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM connect_payouts`)
   // S364: email_send_log FK landlords (SET NULL) — same posture.
   await db.query(`DELETE FROM email_send_log`)
+  // S631: admin_invitations FKs users three ways (inviter, acceptor, revoker)
+  // with NO ACTION — that reference IS the audit trail for who granted console
+  // access, so it restricts rather than cascades. Clear it before users.
+  await db.query(`DELETE FROM admin_invitations`)
+  // S631: platform_owner FKs users and its own trigger refuses DELETE — drop the
+  // trigger for the duration of the wipe, not in any production path.
+  await db.query(`ALTER TABLE platform_owner DISABLE TRIGGER trg_protect_platform_owner_row`)
+  await db.query(`DELETE FROM platform_owner`)
+  await db.query(`ALTER TABLE platform_owner ENABLE TRIGGER trg_protect_platform_owner_row`)
+  // S631: membership history is written by trigger on every add/remove and FKs
+  // nothing, but it accumulates across files; clearing keeps assertions honest.
+  await db.query(`DELETE FROM landlord_member_history`)
   // S365: otp_advances FK landlords/tenants/units/leases/payments (NO ACTION).
   // Rows block parent deletes — clear before users/landlords/tenants/payments.
   await db.query(`DELETE FROM otp_advances`)

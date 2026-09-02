@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { sendBulkNotification } from '../services/notifications'
-import { resolveLandlordIdForUser } from '../lib/scope'
+import { resolveLandlordTarget, landlordIdForProperty } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 
 export const notificationsRouter = Router()
@@ -95,8 +95,14 @@ notificationsRouter.post('/bulk', requirePerm('notifications.send_bulk'), async 
         !/^[0-9a-f-]{36}$/i.test(String(propertyId))) {
       return res.status(400).json({ success: false, error: 'propertyId must be a uuid' })
     }
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a blast goes to one company's residents. When a property is named,
+    // that property's company IS the answer — nothing for the caller to get
+    // wrong. Otherwise the account must say which, because "every tenant" at the
+    // entity the session happened to sit on is the wrong set of people to
+    // message, and messages cannot be unsent.
+    const landlordId = propertyId
+      ? await landlordIdForProperty(req.user!, String(propertyId), query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'announcement')
     const result = await sendBulkNotification({
       landlordId, propertyId: propertyId || undefined, title, body, sendEmail
     })

@@ -8,6 +8,7 @@ import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { resolveLandlordTarget } from '../lib/landlordScope'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { queryOne } from '../db'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
@@ -36,9 +37,11 @@ const receiptUpload = multer({
 })
 
 function scope(req: any): string {
-  const id = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
-  if (!id) throw new AppError(403, 'A landlord context is required.')
-  return id
+  // S633: an account is not an entity. `?entityId=` names one; otherwise the
+  // account's only company is used, and an account that owns several is asked
+  // which rather than being silently put on whichever one the session sat on.
+  // resolveLandlordTarget does the ownership check either way.
+  return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
 }
 
 // GET /api/expenses?from=&to=&propertyId=&unitId=

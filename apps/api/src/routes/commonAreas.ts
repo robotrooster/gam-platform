@@ -368,7 +368,7 @@ commonAreasRouter.get('/mine', async (req, res, next) => {
   try {
     const u = req.user!
     if (u.role !== 'tenant') throw new AppError(403, 'Tenant only')
-    const propIds = await tenantPropertyIds(u.profileId)
+    const propIds = await tenantPropertyIds(u.profileId!)
     if (!propIds.length) { res.json({ success: true, data: [] }); return }
     const areas = await query(
       `SELECT id, property_id, name, description, reservable, requires_approval, capacity,
@@ -417,7 +417,7 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
     if (b.kind === 'event' && !area.events_enabled) {
       throw new AppError(400, `${area.name} does not host private events`)
     }
-    const propIds = await tenantPropertyIds(u.profileId)
+    const propIds = await tenantPropertyIds(u.profileId!)
     if (!propIds.includes(area.property_id)) throw new AppError(403, 'Not a resident of this property')
     validateWindow(area, b.startsAt, b.endsAt)
     // S547: per-person monthly cap (bad-actor guard) — residents included.

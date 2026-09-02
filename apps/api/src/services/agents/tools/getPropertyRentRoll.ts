@@ -6,7 +6,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   property_name: string | null
@@ -35,7 +35,7 @@ export const getPropertyRentRoll: AgentTool = {
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 300) : 100
     const propertyName = typeof args.propertyName === 'string' && args.propertyName.trim() ? args.propertyName.trim() : null
 
-    const params: any[] = [actor.profileId]
+    const params: any[] = [actorLandlordIds(actor)]
     let propFilter = ''
     if (propertyName) {
       params.push(`%${propertyName}%`)
@@ -50,7 +50,7 @@ export const getPropertyRentRoll: AgentTool = {
          FROM units u
          JOIN properties p ON p.id = u.property_id
          LEFT JOIN leases l ON l.unit_id = u.id AND l.status = 'active'
-        WHERE u.landlord_id = $1 ${propFilter}
+        WHERE u.landlord_id = ANY($1::uuid[]) ${propFilter}
         ORDER BY p.name, u.unit_number
         LIMIT $${params.length}`,
       params

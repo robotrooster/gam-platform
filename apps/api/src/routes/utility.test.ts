@@ -679,14 +679,20 @@ describe('POST /meters/:id/units — same-utility overlap', () => {
     expect(b.body.error).toMatch(/already on "Master A"/i)
   })
 
-  it('ALLOWS submeter + RUBS master on the same utility (S558 metered exclusion)', async () => {
-    // Oak Park's shape: mobile homes submetered for water AND in the shared
-    // master's group so their usage is subtracted before the RUBS split.
+  // S634 (Nic, DIRECTIVE) INVERTED THIS TEST. It used to assert that a unit
+  // could be on a submeter AND the shared master — S558's metered exclusion,
+  // Oak Park's original shape. The exclusion is gone (the RUBS units now divide
+  // the whole bill), so that pairing means nothing and is banned: "The same unit
+  // cannot have two meter types for the same utility. It can't be part of one
+  // RUBS system and one submeter system."
+  it('BLOCKS submeter + RUBS master on the same utility', async () => {
     const f = await seed()
     const master = await mkMeter(f.propertyAId, 'water', 'rubs', 'Shared Master')
     const sub    = await mkMeter(f.propertyAId, 'water', 'submeter', 'MH 01 submeter')
     expect((await attach(master, f, f.unitAId)).status).toBe(201)
-    expect((await attach(sub, f, f.unitAId)).status).toBe(201)
+    const b = await attach(sub, f, f.unitAId)
+    expect(b.status).toBe(400)
+    expect(b.body.error).toMatch(/only be on one water meter/i)
   })
 
   it('does not block a DIFFERENT utility on the same unit', async () => {
@@ -1103,7 +1109,7 @@ describe('S609 POST /meters/:id/units — many at once', () => {
     expect(res.body.data.added).toHaveLength(3)
     expect(res.body.data.skipped).toHaveLength(1)
     expect(res.body.data.skipped[0].unitId).toBe(ids[2])
-    expect(res.body.data.skipped[0].reason).toMatch(/billed twice/i)
+    expect(res.body.data.skipped[0].reason).toMatch(/only be on one water meter/i)
   })
 
   it('a submeter refuses a multi-select outright', async () => {
@@ -1195,5 +1201,142 @@ describe('PATCH /api/utility/meters/:id/readings/:readingId (S613)', () => {
     const res = await request(app).patch(`/api/utility/meters/${meterId}/readings/${created.body.data.id}`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 200 })
     expect(res.status).toBe(403)
+  })
+})
+
+// S632 (Nic): "I clicked the Mountain View property. There's no opening read
+// request anywhere." Nothing was wrong with the screens — this endpoint was
+// returning 404 for the landlord's OWN second entity, so every warning computed
+// from the meter list evaluated to zero on a truthfully empty array.
+describe('S632 a landlord reaches meters at every entity they own', () => {
+  it('returns meters for a second entity, not a 404, while still blocking a stranger', async () => {
+    const c = await db.connect()
+    let userId: string, entityA: string, entityB: string, propB: string, propStranger: string
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c); userId = a.userId; entityA = a.landlordId
+      // A SECOND entity the same person owns — the S553 multi-entity model.
+      const b = await seedLandlord(c); entityB = b.landlordId
+      await c.query(
+        `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1,$2,'owner')
+         ON CONFLICT DO NOTHING`, [entityB, userId])
+      propB = await seedProperty(c, { landlordId: entityB, ownerUserId: b.userId, managedByUserId: b.userId })
+      await c.query(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+         VALUES ($1,'electric','E1','submeter',0,5)`, [propB])
+      const stranger = await seedLandlord(c)
+      propStranger = await seedProperty(c, {
+        landlordId: stranger.landlordId, ownerUserId: stranger.userId, managedByUserId: stranger.userId })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    // Signed into entity A — exactly Nic's session shape.
+    const token = jwt.sign(
+      { userId: userId!, role: 'landlord', email: 'multi@t.dev', profileId: entityA!,
+        landlordIds: [entityA!, entityB!], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '10m' })
+    const app = buildApp()
+
+    const mine = await request(app).get(`/api/utility/meters?propertyId=${propB!}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data).toHaveLength(1)
+
+    // The S396 cross-tenant protection this replaced must still hold.
+    const theirs = await request(app).get(`/api/utility/meters?propertyId=${propStranger!}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(theirs.status).toBe(404)
+  })
+})
+
+// S632 (Nic): "I wanna choose a date for all the meters and type them all in and
+// save once at the end... on a hundred space park you're maybe looking at three
+// hundred freaking meters."
+describe('S632 POST /utility/opening-reads — one date, many meters, one save', () => {
+  async function propertyWithMeters(n: number) {
+    const c = await db.connect()
+    let userId: string, landlordId: string, propertyId: string
+    const meterIds: string[] = []
+    try {
+      await c.query('BEGIN')
+      const l = await seedLandlord(c); userId = l.userId; landlordId = l.landlordId
+      propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      for (let i = 0; i < n; i++) {
+        const m = await c.query(
+          `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+           VALUES ($1,'electric',$2,'submeter',0,5) RETURNING id`, [propertyId, `RV 0${i + 1} electric`])
+        meterIds.push(m.rows[0].id)
+      }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const token = jwt.sign(
+      { userId: userId!, role: 'landlord', email: 'or@t.dev', profileId: landlordId!,
+        landlordIds: [landlordId!], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '10m' })
+    return { propertyId: propertyId!, meterIds, token }
+  }
+
+  it('writes one date across every meter in a single call', async () => {
+    const { propertyId, meterIds, token } = await propertyWithMeters(4)
+    const res = await request(buildApp()).post('/api/utility/opening-reads')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, readingDate: '2026-08-01',
+              reads: meterIds.map((id, i) => ({ meterId: id, value: 1000 + i })) })
+    expect(res.status).toBe(200)
+    expect(res.body.data.saved).toBe(4)
+    expect(res.body.data.stillNeedAnOpeningRead).toBe(0)
+
+    const rows = await db.query<{ d: string; reason: string }>(
+      `SELECT reading_date::text AS d, reason FROM utility_meter_readings
+        WHERE meter_id = ANY($1::uuid[])`, [meterIds])
+    expect(rows.rows).toHaveLength(4)
+    expect(new Set(rows.rows.map(r => r.d))).toEqual(new Set(['2026-08-01']))
+    expect(new Set(rows.rows.map(r => r.reason))).toEqual(new Set(['baseline']))
+  })
+
+  it('keeps the good rows when one is too wide for its meter face', async () => {
+    const { propertyId, meterIds, token } = await propertyWithMeters(3)
+    const res = await request(buildApp()).post('/api/utility/opening-reads')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, readingDate: '2026-08-01', reads: [
+        { meterId: meterIds[0], value: 12345 },
+        // 6 digits on a 5-digit face — the 227200-instead-of-27200 mistake.
+        { meterId: meterIds[1], value: 227200 },
+        { meterId: meterIds[2], value: 500 },
+      ] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.saved).toBe(2)
+    expect(res.body.data.failed).toBe(1)
+    // A partial walk keeps its good work — 51 correct reads are not thrown away
+    // because two were mistyped.
+    expect(res.body.data.stillNeedAnOpeningRead).toBe(1)
+  })
+
+  it('re-running corrects rather than stacking a second opening read', async () => {
+    const { propertyId, meterIds, token } = await propertyWithMeters(1)
+    const app = buildApp()
+    const send = (value: number, date: string) => request(app).post('/api/utility/opening-reads')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ propertyId, readingDate: date, reads: [{ meterId: meterIds[0], value }] })
+    await send(1000, '2026-08-01').expect(200)
+    await send(2000, '2026-08-05').expect(200)
+    const rows = await db.query<{ v: string; d: string }>(
+      `SELECT reading_value::text AS v, reading_date::text AS d
+         FROM utility_meter_readings WHERE meter_id = $1`, [meterIds[0]])
+    expect(rows.rows).toHaveLength(1)          // one starting number, never two
+    expect(Number(rows.rows[0].v)).toBe(2000)
+    expect(rows.rows[0].d).toBe('2026-08-05')
+  })
+
+  it("refuses another landlord's property", async () => {
+    const a = await propertyWithMeters(1)
+    const b = await propertyWithMeters(1)
+    const res = await request(buildApp()).post('/api/utility/opening-reads')
+      .set('Authorization', `Bearer ${a.token}`)
+      .send({ propertyId: b.propertyId, readingDate: '2026-08-01',
+              reads: [{ meterId: b.meterIds[0], value: 100 }] })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    const rows = await db.query(`SELECT 1 FROM utility_meter_readings WHERE meter_id = $1`, [b.meterIds[0]])
+    expect(rows.rows).toHaveLength(0)
   })
 })

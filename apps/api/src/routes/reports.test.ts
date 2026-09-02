@@ -85,10 +85,12 @@ async function seed(): Promise<Fixture> {
       aUid, aLid, aPropId, aUnitId,
       bUid, bLid, bPropId, bUnitId,
       tenant1Id, lease1Id,
+      // S633: a landlord session names no entity — landlordIds carries the
+      // ACCOUNT's companies, and profileId is null for role='landlord'.
       tokenLandlordA: sign({ userId: aUid, role: 'landlord', email: 'a@t.dev',
-                              profileId: aLid, permissions: {} }),
+                              profileId: null, landlordIds: [aLid], permissions: {} }),
       tokenLandlordB: sign({ userId: bUid, role: 'landlord', email: 'b@t.dev',
-                              profileId: bLid, permissions: {} }),
+                              profileId: null, landlordIds: [bLid], permissions: {} }),
       tokenAdmin: sign({ userId: randomUUID(), role: 'admin', email: 'admin@t.dev',
                           profileId: randomUUID() }),
     }
@@ -341,7 +343,7 @@ describe('GET /api/reports/monthly-statement', () => {
 describe('GET /api/reports/tax-summary', () => {
   function ownerTokenWithBooks(uid: string, lid: string) {
     return sign({ userId: uid, role: 'landlord', email: 'a@t.dev',
-                   profileId: lid, permissions: { 'books.view': true } })
+                   profileId: null, landlordIds: [lid], permissions: { 'books.view': true } })
   }
 
   it('happy: returns year, landlord, income, deductions, deposits', async () => {
@@ -664,7 +666,7 @@ describe('GET /api/reports/property-detail', () => {
 describe('GET /api/reports/work-trade-1099', () => {
   function ownerTokenWithBooks(uid: string, lid: string) {
     return sign({ userId: uid, role: 'landlord', email: 'a@t.dev',
-                   profileId: lid, permissions: { 'books.view': true } })
+                   profileId: null, landlordIds: [lid], permissions: { 'books.view': true } })
   }
 
   it('happy: returns landlord, agreements, eligible, summary', async () => {

@@ -20,7 +20,7 @@
 import { query, queryOne } from '../../../db'
 import { createNotification } from '../../notifications'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 // Mirrors the decidable-state gate in routes/background.ts (PATCH
 // /:id/decision, ~L481). A check that is pending fraud-screening,
@@ -31,6 +31,8 @@ import type { AgentTool, AgentActor } from './types'
 const DECIDABLE_STATUSES = ['complete', 'submitted', 'processing'] as const
 
 interface CheckRow {
+  /** S634: the company that ran this screening — see the notify call below. */
+  landlord_id: string
   id: string
   first_name: string | null
   last_name: string | null
@@ -83,18 +85,18 @@ export const flagApplicantDecision: AgentTool = {
     if (checkId) {
       const row = await queryOne<CheckRow>(
         `SELECT id, first_name, last_name, status, created_at
-           FROM background_checks WHERE id = $1 AND landlord_id = $2`,
-        [checkId, actor.profileId]
+           FROM background_checks WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+        [checkId, actorLandlordIds(actor)]
       )
       matches = row ? [row] : []
     } else {
       matches = await query<CheckRow>(
         `SELECT id, first_name, last_name, status, created_at
            FROM background_checks
-          WHERE landlord_id = $1
+          WHERE landlord_id = ANY($1::uuid[])
             AND lower(coalesce(first_name,'') || ' ' || coalesce(last_name,'')) LIKE '%' || lower($2) || '%'
           ORDER BY created_at DESC LIMIT 5`,
-        [actor.profileId, applicant]
+        [actorLandlordIds(actor), applicant]
       )
     }
 
@@ -136,7 +138,8 @@ export const flagApplicantDecision: AgentTool = {
     try {
       await createNotification({
         userId: actor.userId,
-        landlordId: actor.profileId,
+        // S634: the company that ran the screening, taken from the check itself.
+        landlordId: check.landlord_id,
         type: 'applicant_decision',
         title: 'Applicant decision to finalize',
         body: `You asked me to ${decision} ${name}’s application. I’ve flagged it for you — open the Screening page to ` +

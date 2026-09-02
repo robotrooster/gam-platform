@@ -19,7 +19,7 @@
 import { MANUAL_PAYMENT_METHODS } from '@gam/shared'
 import { getClient } from '../../../db'
 import { settleManualRentPayment } from '../../manualPaymentSettle'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 const NOT_A_NAME = new Set([
   'what', "what's", 'whats', 'who', "who's", 'the', 'a', 'my', 'tenant', 'for',
@@ -84,13 +84,13 @@ export const recordCashPayment: AgentTool = {
            LEFT JOIN tenants t ON t.id = p.tenant_id
            LEFT JOIN users us ON us.id = t.user_id
            LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
-          WHERE p.landlord_id = $1 AND p.type = 'rent' AND p.status IN ('pending','failed')
+          WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.status IN ('pending','failed')
             AND ($2::uuid IS NULL OR p.id = $2::uuid)
             AND ($3 = '' OR us.first_name ILIKE '%'||$3||'%' OR us.last_name ILIKE '%'||$3||'%'
                  OR (us.first_name||' '||us.last_name) ILIKE '%'||$3||'%' OR u.unit_number ILIKE '%'||$3||'%')
           ORDER BY p.due_date
           FOR UPDATE OF p`,
-        [actor.profileId, args.paymentId ?? null, needle])).rows
+        [actorLandlordIds(actor), args.paymentId ?? null, needle])).rows
 
       if (open.length === 0) {
         await client.query('ROLLBACK')

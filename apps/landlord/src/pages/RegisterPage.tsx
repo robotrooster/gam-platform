@@ -130,7 +130,7 @@ export function RegisterPage() {
   // S578: step 2 — emailed 2FA code (mirrors LoginPage's email-OTP screen).
   if (emailOtpSession) {
     return (
-      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+      <div className="auth-center">
         <div style={{width:'100%',maxWidth:420}}>
           <div style={{textAlign:'center',marginBottom:40}}>
             <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
@@ -162,33 +162,58 @@ export function RegisterPage() {
   }
 
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--bg-0)', display: 'flex' }}>
+    // S631: classes, not inline styles — the split needs breakpoints, and an
+    // inline style cannot carry a media query. See .auth-split in globals.css.
+    <div className="auth-split">
 
-      {/* Left panel — branding */}
-      <div style={{ width: 420, flexShrink: 0, background: 'var(--bg-1)', borderRight: '1px solid var(--border-0)', padding: '48px 40px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+      {/* Left panel — branding. Hidden under 860px: on a phone this was a
+          420px column on a 390px screen, which is what read as "a sidebar you
+          can't close". */}
+      <div className="auth-aside">
         <div>
           <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.6rem', fontWeight: 800, color: 'var(--gold)', letterSpacing: '.04em', marginBottom: 40 }}>⚡ GAM</div>
-          <div style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-0)', lineHeight: 1.3, marginBottom: 16 }}>
-            The smarter way to manage property
-          </div>
-          <div style={{ fontSize: '.85rem', color: 'var(--text-3)', lineHeight: 1.8, marginBottom: 40 }}>
-            Automated ACH rent collection. Fast payouts. Full portfolio visibility.
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {[
-              { icon: '💸', title: 'Fast payouts', desc: 'Auto-payouts to your bank every Friday' },
-              { icon: '🏦', title: 'Automated ACH', desc: 'No checks, no chasing tenants' },
-              { icon: '📊', title: 'Full portfolio view', desc: 'Every unit, every payment, one dashboard' },
-            ].map(f => (
-              <div key={f.title} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1rem', flexShrink: 0 }}>{f.icon}</div>
-                <div>
-                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{f.title}</div>
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{f.desc}</div>
-                </div>
+          {/* S631 (Nic): "it's trying to offer some sort of sales pitch on a
+              screen where they're already in an invite flow."
+              Somebody who followed an invitation has already been sold — by the
+              person who invited them. Pitching ACH and payouts at that moment
+              answers a question they did not ask and buries the one thing they
+              came to do. They get the invitation restated instead, so the screen
+              confirms they are in the right place. */}
+          {pendingInvite ? (
+            <>
+              <div style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-0)', lineHeight: 1.3, marginBottom: 16 }}>
+                You&apos;ve been invited as an owner
               </div>
-            ))}
-          </div>
+              <div style={{ fontSize: '.85rem', color: 'var(--text-3)', lineHeight: 1.8 }}>
+                Create your account and the property you were invited to is waiting on the other side.
+                It takes a minute.
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-0)', lineHeight: 1.3, marginBottom: 16 }}>
+                The smarter way to manage property
+              </div>
+              <div style={{ fontSize: '.85rem', color: 'var(--text-3)', lineHeight: 1.8, marginBottom: 40 }}>
+                Automated ACH rent collection. Fast payouts. Full portfolio visibility.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {[
+                  { icon: '💸', title: 'Fast payouts', desc: 'Auto-payouts to your bank every Friday' },
+                  { icon: '🏦', title: 'Automated ACH', desc: 'No checks, no chasing tenants' },
+                  { icon: '📊', title: 'Full portfolio view', desc: 'Every unit, every payment, one dashboard' },
+                ].map(f => (
+                  <div key={f.title} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1rem', flexShrink: 0 }}>{f.icon}</div>
+                    <div>
+                      <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>{f.title}</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{f.desc}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
           © 2026 Gold Asset Management LLC
@@ -196,8 +221,8 @@ export function RegisterPage() {
       </div>
 
       {/* Right panel — form */}
-      <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 24px', overflowY: 'auto' }}>
-        <div style={{ width: '100%', maxWidth: 480 }}>
+      <div className="auth-main">
+        <div>
           <div style={{ marginBottom: 32 }}>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.3rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Create your account</div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>Already registered? <Link to="/login" style={{ color: 'var(--gold)' }}>Sign in</Link></div>

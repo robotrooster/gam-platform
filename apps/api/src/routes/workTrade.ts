@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordIdForUser } from '../lib/scope'
+import { landlordScopeIds, landlordIdForUnit, ownsLandlord } from '../lib/landlordScope'
 import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
@@ -124,11 +124,11 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
     }).parse(req.body)
 
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
-
-    // Verify unit belongs to landlord
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [body.unitId, landlordId])
+    // S633: the agreement belongs to the company that owns the unit it is
+    // written against — derived and authorised in one step, rather than assumed
+    // from whichever company the session sat on.
+    const landlordId = await landlordIdForUnit(req.user!, body.unitId, query)
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [body.unitId])
     if (!unit) throw new AppError(404, 'Unit not found or access denied')
 
     // S397 → S576 (B-8): work trade is rent-for-labor, so it can only ride on a
@@ -161,7 +161,44 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
        body.coveredCharges ?? null]
     )
 
-    res.json({ success: true, data: agreement })
+    // S631 (Nic): "I have no way to mark that person as a work trade person
+    // until they accept the invite and sign the lease. If they sign the lease
+    // after the due date and then the bill automatically goes out, does it just
+    // suspend an invoice that's already been sent?"
+    //
+    // It did not. A work-trade invoice issues GROSS and sits `late_fee_exempt`
+    // while the tenant works the month off (S624) — but that exemption was
+    // stamped at invoice GENERATION, from whether an agreement existed then. The
+    // agreement cannot exist then: it requires an active lease, and the lease is
+    // what the tenant is still signing. So the one ordering that actually
+    // happens — invoice on the 1st, sign on the 4th, agreement on the 4th — left
+    // the invoice chargeable, and the late-fee cron would fine a tenant for a
+    // month they are working off.
+    //
+    // Starting an agreement now exempts the invoices it covers. Only OPEN ones,
+    // and only cycles the agreement's own start date reaches — a debt from
+    // before the trade began is still a debt.
+    //
+    // Late fees ALREADY CHARGED are deliberately left alone. Reversing them is a
+    // credit, and a credit is the landlord's to issue (S630) — the settlement
+    // report shows what accrued so they can decide.
+    const exempted = await query<{ id: string }>(
+      `UPDATE invoices i
+          SET late_fee_exempt = true, updated_at = NOW()
+        FROM leases l
+       WHERE l.id = i.lease_id
+         AND i.tenant_id = $1 AND l.unit_id = $2
+         AND i.status IN ('pending', 'partial')
+         AND i.late_fee_exempt = false
+         AND i.due_date >= date_trunc('month', $3::date)
+       RETURNING i.id`,
+      [body.tenantId, body.unitId, body.startDate])
+    if (exempted.length) {
+      logger.info({ agreementId: agreement.id, invoices: exempted.length },
+        'work trade: open invoices exempted from late fees for the trade period')
+    }
+
+    res.json({ success: true, data: { ...agreement, invoicesExempted: exempted.length } })
   } catch (e) { next(e) }
 })
 
@@ -181,7 +218,9 @@ workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
     if (!unit) throw new AppError(404, 'Unit not found')
     const u = req.user!
     const isAdmin = u.role === 'admin' || u.role === 'super_admin'
-    const isOwnerLandlord = u.role === 'landlord' && u.profileId === unit.landlord_id
+    // S633: the ACCOUNT owns companies — ask whether this company is one of
+    // them, not whether it is the one the session sat on.
+    const isOwnerLandlord = u.role === 'landlord' && ownsLandlord(u, unit.landlord_id)
     const isTeam = !!u.landlordId && u.landlordId === unit.landlord_id
     const isOwnTenant = u.role === 'tenant' && u.profileId === unit.tenant_id
     if (!isAdmin && !isOwnerLandlord && !isTeam && !isOwnTenant) {
@@ -219,7 +258,8 @@ workTradeRouter.get('/:id', async (req, res, next) => {
     // S397: validate caller scope (owner landlord / team / own tenant / admin).
     const u = req.user!
     const isAdmin = u.role === 'admin' || u.role === 'super_admin'
-    const isOwnerLandlord = u.role === 'landlord' && u.profileId === agreement.landlord_id
+    // S633: any company the account owns.
+    const isOwnerLandlord = u.role === 'landlord' && ownsLandlord(u, agreement.landlord_id)
     const isTeam = !!u.landlordId && u.landlordId === agreement.landlord_id
     const isOwnTenant = u.role === 'tenant' && u.profileId === agreement.tenant_id
     if (!isAdmin && !isOwnerLandlord && !isTeam && !isOwnTenant) {
@@ -284,7 +324,8 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
     const u = req.user!
     const isOwnTenant = u.role === 'tenant' && u.profileId === agreement.tenant_id
     const isAdmin = u.role === 'admin' || u.role === 'super_admin'
-    const isOwnerLandlord = u.role === 'landlord' && u.profileId === agreement.landlord_id
+    // S633: any company the account owns.
+    const isOwnerLandlord = u.role === 'landlord' && ownsLandlord(u, agreement.landlord_id)
     const isTeam = !!u.landlordId && u.landlordId === agreement.landlord_id
     if (!isOwnTenant && !isAdmin && !isOwnerLandlord && !isTeam) {
       throw new AppError(403, 'Forbidden')
@@ -336,8 +377,9 @@ workTradeRouter.patch('/logs/:logId', requirePerm('work_trade.reconcile'), async
 
 workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a read — every company the account owns.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
     const agreements = await query<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last,
@@ -365,9 +407,9 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
       JOIN users u ON u.id = t.user_id
       JOIN units un ON un.id = wta.unit_id
       JOIN properties p ON p.id = un.property_id
-      WHERE wta.landlord_id=$1
+      WHERE wta.landlord_id = ANY($1::uuid[])
       ORDER BY wta.created_at DESC`,
-      [landlordId]
+      [landlordIds]
     )
     res.json({ success: true, data: agreements })
   } catch (e) { next(e) }

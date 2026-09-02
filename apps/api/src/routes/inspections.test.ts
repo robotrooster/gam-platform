@@ -1108,7 +1108,9 @@ describe('agent inspection tools', () => {
     const r = await db.query<{ unit_number: string }>('SELECT unit_number FROM units WHERE id=$1', [unitId])
     return r.rows[0].unit_number
   }
-  const landlordActor = (f: SeedFixture) => ({ userId: f.landlordUserId, role: 'landlord', profileId: f.landlordId })
+  // S634: a landlord agent actor's scope is landlordIds — profileId is empty.
+  const landlordActor = (f: SeedFixture) =>
+    ({ userId: f.landlordUserId, role: 'landlord', profileId: '', landlordIds: [f.landlordId] })
 
   it('create_inspection: creates a draft + seeds the checklist for the landlord’s own unit', async () => {
     const f = await seedFixture()

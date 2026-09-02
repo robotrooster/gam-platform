@@ -22,7 +22,7 @@
  * on the 6th paid on time; the lateness of the RAIL is not the tenant's.
  */
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface MonthRow {
   month: string
@@ -69,13 +69,13 @@ export const getLatePaymentHistory: AgentTool = {
               ), 1)::text AS avg_days_late
          FROM payments p
          JOIN leases l ON l.id = p.lease_id
-        WHERE p.landlord_id = $1
+        WHERE p.landlord_id = ANY($1::uuid[])
           AND p.type = 'rent'
           AND p.due_date >= date_trunc('month', CURRENT_DATE) - ($2 || ' months')::interval
           AND p.due_date <= CURRENT_DATE
         GROUP BY 1
         ORDER BY 1 DESC`,
-      [actor.profileId, months]
+      [actorLandlordIds(actor), months]
     )
 
     if (rows.length === 0) {

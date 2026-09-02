@@ -1983,3 +1983,38 @@ ${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
     'support',
   )
 }
+
+// S631 (Nic): "Let's make a way to invite other admins to admin portal."
+//
+// Deliberately the plainest invitation GAM sends. No product pitch, no feature
+// tour — the recipient either already knows this is coming or should not act on
+// it. The one thing it must do loudly is say who invited them, so an unexpected
+// one is obviously unexpected.
+export async function emailAdminInvitation(
+  to: string,
+  inviterName: string,
+  roleLabel: string,
+  acceptUrl: string,
+  expiresHours: number,
+  ctx?: { invitationId?: string },
+) {
+  await send(to, `${inviterName} invited you to the GAM admin console`,
+    base(
+      h('You\'ve been invited to the GAM admin console') +
+      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join GAM's internal operations console as <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
+      p('This is GAM staff access — platform operations, not a landlord or tenant account. ' +
+        'Accepting creates a new, separate login for you.') +
+      p(`You'll set a password, and you'll be asked to turn on two-factor authentication before you can do anything. That step is required for every admin account.`) +
+      p(`<strong style="color:#eef1f8">This invitation expires in ${expiresHours} hours.</strong>`) +
+      btn('Accept invitation', acceptUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you weren't expecting this, ignore this email and tell ${inviterName} — the invitation can be revoked.</div>`
+    ),
+    {
+      category: 'admin_invitation',
+      relatedEntityType: ctx?.invitationId ? 'admin_invitation' : null,
+      relatedEntityId: ctx?.invitationId ?? null,
+      metadata: { role: roleLabel },
+    },
+    'support',
+  )
+}

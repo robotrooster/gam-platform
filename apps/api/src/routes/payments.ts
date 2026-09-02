@@ -612,8 +612,9 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
 paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
   try {
     const role = req.user!.role
-    const landlordId = role === 'landlord' ? req.user!.profileId : req.user!.landlordId
-    if (!landlordId) throw new AppError(403, 'Landlord scope required')
+    // S633: every company the account owns.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
     const months = Math.min(24, Math.max(1, Number(req.query.months) || 6))
 
     const rows = await query<any>(`
@@ -625,10 +626,10 @@ paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
         LEFT JOIN payments pay ON pay.id = prl.reference_id
         LEFT JOIN units u ON u.id = pay.unit_id
        WHERE prl.reference_type = 'manual_payment_fee'
-         AND p.landlord_id = $1
+         AND p.landlord_id = ANY($1::uuid[])
          AND prl.created_at >= NOW() - ($2::int * INTERVAL '1 month')
        ORDER BY prl.created_at DESC
-       LIMIT 500`, [landlordId, months])
+       LIMIT 500`, [landlordIds, months])
 
     const total = Math.round(rows.reduce((s: number, r: any) => s + r.amount, 0) * 100) / 100
     res.json({ success: true, data: { total, count: rows.length, months, rows } })

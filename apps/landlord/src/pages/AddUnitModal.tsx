@@ -168,12 +168,24 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   // is deliberately no "does the subtype set the rent" branch any more.
   const qty = Math.max(1, parseInt(form.quantity) || 1)
 
-  const toggleSubtype = (id: string) => setForm(f => ({
-    ...f,
-    subtypeIds: f.subtypeIds.includes(id)
-      ? f.subtypeIds.filter((x: string) => x !== id)
-      : [...f.subtypeIds, id],
-  }))
+  // S630: ticking a subtype PREFILLS whatever facts it declares, so a class
+  // that knows it is 50 amp still saves the landlord the click. Untick does not
+  // undo it — a value on screen is a decision, and silently clearing fields
+  // underneath someone is how the last version lost every site layout.
+  const toggleSubtype = (id: string) => setForm(f => {
+    const on = f.subtypeIds.includes(id)
+    const next = { ...f, subtypeIds: on ? f.subtypeIds.filter((x: string) => x !== id) : [...f.subtypeIds, id] }
+    if (on) return next
+    const st = subtypesForType.find(x => x.id === id)
+    if (!st) return next
+    const declared = (v: any) => v != null && v !== '' && v !== 'none'
+    if (declared(st.rvSiteLayout)) next.rvSiteLayout = String(st.rvSiteLayout)
+    if (declared(st.rvAmpService) && st.rvAmpService !== 'both') next.rvAmpService = String(st.rvAmpService)
+    if (declared(st.bedrooms)) next.bedrooms = String(st.bedrooms)
+    if (declared(st.bathrooms)) next.bathrooms = String(st.bathrooms)
+    if (declared(st.storageSize)) next.storageSize = String(st.storageSize)
+    return next
+  })
 
   const set = (key: string, val: any) => {
     setForm(f => ({ ...f, [key]: val }))
@@ -207,21 +219,31 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
-    const s = selectedSubtype
+    // S630 (Nic): "I felt like I picked everything when creating the units, and
+    // then it still wanted me to go tick those subtypes."
+    //
+    // Two separate reasons it felt that way, both fixed. The first was that a
+    // bulk create never wrote unit_subtype_links at all. The second is here: a
+    // ticked subtype used to SUPPRESS the fact fields and omit them from this
+    // payload, on the theory that "the subtype IS the facts". Nic's subtypes are
+    // named "Pull-Through" and "Back In" but carry rv_site_layout='none' — the
+    // name says it, the machine-readable field does not — so a spot created that
+    // way stored no layout whatsoever. Every fact the landlord can see is now
+    // sent, whether or not a subtype is ticked. A subtype that declares a fact
+    // prefills the field; it never replaces or hides it.
     createMut.mutate({
       propertyId:      form.propertyId,
       unitNumber:      form.unitNumber.trim(),
       quantity:        qty,
       ...(selectedSubtypes.length ? { subtypeIds: selectedSubtypes.map(x => x.id!) } : {}),
       unitType:        form.unitType,
-      bedrooms:        s ? undefined : (hasBeds ? Number(form.bedrooms) || 0 : 0),
-      bathrooms:       s ? undefined : (hasBeds ? Number(form.bathrooms) || 0 : 0),
+      bedrooms:        hasBeds ? Number(form.bedrooms) || 0 : 0,
+      bathrooms:       hasBeds ? Number(form.bathrooms) || 0 : 0,
       sqft:            form.sqft ? Number(form.sqft) : null,
-      // Sent whenever the subtype does not price the unit. A subtype that DOES
-      // carry a price still wins, exactly as before.
+      // S629: the unit's own price, always. No subtype branch.
       rentAmount:      Number(form.rentAmount),
       securityDeposit: Number(form.securityDeposit) || 0,
-      ...(isRv && !s ? {
+      ...(isRv ? {
         rvSiteLayout: form.rvSiteLayout,
         rvAmpService: form.rvAmpService,
       } : {}),
@@ -229,8 +251,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
         nightlyRate:  form.nightlyRate ? Number(form.nightlyRate) : null,
         weeklyRate:   form.weeklyRate ? Number(form.weeklyRate) : null,
       } : {}),
-      ...(form.unitType === 'storage' && !s && form.storageSize.trim() ? { storageSize: form.storageSize.trim() } : {}),
-      ...(ownershipRelevant && !s ? { dwellingOwnership } : {}),
+      ...(form.unitType === 'storage' && form.storageSize.trim() ? { storageSize: form.storageSize.trim() } : {}),
+      ...(ownershipRelevant ? { dwellingOwnership } : {}),
       ...(hasBeds ? { isMultiLevel: form.isMultiLevel, isAdaAccessible: form.isAdaAccessible, ...(form.floorLevel ? { floorLevel: form.floorLevel } : {}) } : {}),
       // S568: lot rent the operator pays the external park (homes-only properties).
       ...(form.lotRentAmount !== '' ? { lotRentAmount: Number(form.lotRentAmount) } : {}),
@@ -456,16 +478,18 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
             </div>
 
 
-            {/* Manual fact fields — only without a subtype (the subtype IS the facts). */}
-            {selectedSubtypes.length ? (
+            {/* S630: the facts belong to the UNIT and are always asked for. A
+                ticked subtype prefills them and then gets out of the way — it
+                is a label for grouping and reporting, not a container the
+                unit's details live inside. */}
+            {selectedSubtypes.length > 0 && (
               <div style={{ fontSize: '.74rem', color: 'var(--text-3)', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '8px 12px', marginBottom: 14 }}>
-                {/* S630: every subtype the space carries, not just the first. */}
-                {selectedSubtypes.map(x => x.name).join(' · ')}
-                {selectedSubtype && unitSubtypeFactsLabel(selectedSubtype) && <> — {unitSubtypeFactsLabel(selectedSubtype)}</>}
-                {' '}· these describe the space. Its price is set below and belongs to the unit,
-                so you can change one spot later without touching the others.
+                Tagged {selectedSubtypes.map(x => x.name).join(' · ')} · these group the space for
+                reporting. Its details and price below belong to the unit, so you can change one
+                spot later without touching the others.
               </div>
-            ) : (
+            )}
+            {(
               <>
                 {isRv && (
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>

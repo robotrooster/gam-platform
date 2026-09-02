@@ -21,7 +21,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   first_name: string | null
@@ -72,9 +72,9 @@ export const getMoneyInFlight: AgentTool = {
             WHERE rapp.payment_id = p.id
             ORDER BY r.created_at DESC LIMIT 1
          ) ra ON TRUE
-        WHERE p.landlord_id = $1 AND p.status = 'processing'
+        WHERE p.landlord_id = ANY($1::uuid[]) AND p.status = 'processing'
         ORDER BY COALESCE(ra.paid_at, p.created_at)`,
-      [actor.profileId])
+      [actorLandlordIds(actor)])
 
     if (rows.length === 0) {
       return {

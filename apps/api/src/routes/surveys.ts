@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordIdForUser } from '../lib/scope'
+import { landlordScopeIds, landlordIdForProperty } from '../lib/landlordScope'
 import { canManageLandlordResource } from '../middleware/scope'
 import { createNotification } from '../services/notifications'
 import { SURVEY_QUESTION_TYPES } from '@gam/shared'
@@ -180,8 +180,9 @@ const requireSurveyPerm = requirePerm('notifications.send_bulk')
 // GET /api/surveys?propertyId= — landlord's surveys (with response counts).
 surveysRouter.get('/', requireSurveyPerm, async (req, res, next) => {
   try {
-    const landlordId = await resolveLandlordIdForUser(req.user)
-    if (!landlordId) throw new AppError(403, 'No landlord scope')
+    // S633: a read — spans every company the account owns.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'No landlord scope')
     const propertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId : null
     const rows = await query<any>(
       `SELECT s.id, s.title, s.description, s.property_id, p.name AS property_name,
@@ -190,10 +191,10 @@ surveysRouter.get('/', requireSurveyPerm, async (req, res, next) => {
               (SELECT COUNT(*) FROM survey_responses r WHERE r.survey_id=s.id)::int AS response_count
          FROM surveys s
          JOIN properties p ON p.id = s.property_id
-        WHERE s.landlord_id=$1 AND s.is_active=true
+        WHERE s.landlord_id = ANY($1::uuid[]) AND s.is_active=true
           AND ($2::uuid IS NULL OR s.property_id=$2)
         ORDER BY s.created_at DESC`,
-      [landlordId, propertyId]
+      [landlordIds, propertyId]
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -205,10 +206,10 @@ surveysRouter.post('/', requireSurveyPerm, async (req, res, next) => {
   try {
     const body = surveyBodySchema.parse(req.body)
     validateQuestions(body.questions)
-    const landlordId = await resolveLandlordIdForUser(req.user)
-    if (!landlordId) throw new AppError(403, 'No landlord scope')
-    const prop = await queryOne<any>('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [body.propertyId, landlordId])
-    if (!prop) throw new AppError(404, 'Property not found')
+    // S633: the survey belongs to the company that owns the property it is
+    // being sent to. Derived and authorised in one step — the ownership check
+    // the two lines below used to do is now inside landlordIdForProperty.
+    const landlordId = await landlordIdForProperty(req.user!, body.propertyId, query)
 
     await client.query('BEGIN')
     const s = await client.query(

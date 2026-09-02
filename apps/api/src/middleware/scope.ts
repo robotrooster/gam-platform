@@ -34,10 +34,17 @@ function isTeamRole(role: string): boolean {
   return (TEAM_ROLES as readonly string[]).includes(role)
 }
 
-// S553: a landlord matches an entity when it's their own (profileId) OR
-// they're an owner-member of it (landlordIds, resolved at login).
+// S633: a landlord matches an entity when it is one of the entities their
+// ACCOUNT owns. `landlordIds` is that whole set, refreshed from the database on
+// every request (see requireAuth), so it is current rather than frozen at login.
+//
+// This used to also accept `user.profileId === landlordId`. profileId named one
+// arbitrary entity — the session's "active" company — and an account is not an
+// entity, so that comparison is gone. It is not a loosening either way: the same
+// membership facts decide the answer, they are just no longer read through a
+// piece of session state that could name the wrong company.
 function landlordOwns(user: AuthPayload, landlordId: string): boolean {
-  return user.profileId === landlordId || (user.landlordIds ?? []).includes(landlordId)
+  return (user.landlordIds ?? []).includes(landlordId)
 }
 
 export function canAccessLandlordResource(

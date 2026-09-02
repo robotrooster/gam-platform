@@ -17,6 +17,7 @@
  * `gam-screening-grandfather-onboarding-window`.
  */
 import { query, queryOne } from '../db'
+import { MIGRATION_WINDOW_DAYS } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
 export const ONBOARDING_WINDOW_BASE_DAYS = 14
@@ -110,7 +111,11 @@ export async function closeOnboardingWindow(propertyId: string, client?: Runner)
 export interface PropertyOnboardingWindow extends OnboardingWindowState { propertyName: string }
 
 /** Window state for every property a landlord owns — powers the onboarding banner. */
-export async function listOnboardingWindowsForLandlord(landlordId: string): Promise<PropertyOnboardingWindow[]> {
+// S633: every company the ACCOUNT owns. Onboarding is per property, and an
+// account's properties span its companies — scoped to one, the onboarding list
+// showed half the portfolio with no sign the rest existed.
+export async function listOnboardingWindowsForLandlord(landlordIds: string[]): Promise<PropertyOnboardingWindow[]> {
+  if (!landlordIds.length) return []
   const rows = await query<{
     id: string; name: string
     onboarding_started_at: string | null
@@ -119,9 +124,9 @@ export async function listOnboardingWindowsForLandlord(landlordId: string): Prom
   }>(
     `SELECT p.id, p.name, p.onboarding_started_at, p.onboarding_completed_at,
             (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count
-       FROM properties p WHERE p.landlord_id = $1
+       FROM properties p WHERE p.landlord_id = ANY($1::uuid[])
        ORDER BY p.created_at DESC`,
-    [landlordId],
+    [landlordIds],
   )
   return rows.map((r) => {
     const unitCount = r.unit_count || 0
@@ -192,4 +197,44 @@ export async function applyScreeningWaive(opts: {
     [opts.landlordId, opts.tenantId, opts.propertyId, opts.byUserId, opts.unitId],
   )
   return { waived: true, reason: 'ok' }
+}
+
+/**
+ * S631 (Nic, DIRECTIVE): "When a landlord is in the onboarding window, any
+ * invites should be automatically flagged as existing tenancies. It takes a
+ * different path in the onboarding window, like that twenty-eight day grace
+ * period that we added."
+ *
+ * Whoever a landlord invites while they are still moving onto the platform is,
+ * by definition, somebody already living there — that is what the window is for.
+ * Making the landlord tick a box per resident to say so would get it wrong at
+ * exactly the moment it matters most: mid-onboarding, at volume, under time
+ * pressure. The 29 invites Nic sent for Oak Park went out before this flag
+ * existed and had to be backfilled by hand; that must not be the normal path.
+ *
+ * EITHER window counts. The per-property onboarding window is the one a landlord
+ * experiences (it opens when they start setting a property up); the landlord's
+ * own 28-day migration window is the platform-wide one the published terms cite.
+ * A landlord papering sitting tenants is inside at least one of them, and being
+ * inside either is enough.
+ *
+ * Fails CLOSED — an error or a missing property yields false, so the worst case
+ * is a landlord marking an existing tenancy by hand, never GAM silently deciding
+ * a genuine new move-in should skip proration.
+ */
+export async function isExistingTenancyInvite(
+  landlordId: string,
+  propertyId: string | null,
+): Promise<boolean> {
+  try {
+    if (propertyId && (await getOnboardingWindow(propertyId)).open) return true
+    const l = await queryOne<{ within: boolean }>(
+      `SELECT (now() < created_at + ($2::int * INTERVAL '1 day')) AS within
+         FROM landlords WHERE id = $1`,
+      [landlordId, MIGRATION_WINDOW_DAYS],
+    )
+    return !!l?.within
+  } catch {
+    return false
+  }
 }

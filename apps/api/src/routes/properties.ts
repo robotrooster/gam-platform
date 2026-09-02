@@ -14,7 +14,7 @@ import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
-import { landlordScopeIds, isEntityMember } from '../lib/landlordScope'
+import { landlordScopeIds, isEntityMember, resolveLandlordTarget, landlordIdForProperty, ownsLandlord } from '../lib/landlordScope'
 import {
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
@@ -203,7 +203,13 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // caller is actually a member of — otherwise anyone could create a property
     // inside somebody else's LLC, which is a far worse bug than the one this
     // feature fixes.
-    const targetLandlordId = body.landlordId ?? req.user!.profileId
+    // S633: a property is created under a NAMED company. Where the account owns
+    // exactly one, that one is used silently; where it owns several the request
+    // must say which, because a property filed under the wrong LLC is a record
+    // that has to be unwound by hand. This replaces `?? req.user!.profileId` —
+    // the session's "active" entity, which is precisely the arbitrary default
+    // this release removes.
+    const targetLandlordId = resolveLandlordTarget(req.user!, body.landlordId, 'property')
     // S629: checked against the DATABASE, not just the token. landlordIds is
     // baked into the JWT at login, so an entity created after that login is
     // invisible to a synchronous check — and the session that created the
@@ -342,7 +348,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         await import('../services/depositCustody')
       const ctx = {
         stateCode:    body.state,
-        landlordId:   req.user!.profileId,
+        landlordId:   targetLandlordId,
         propertyId:   prop.id,
         propertyName: prop.name,
       }
@@ -458,6 +464,33 @@ propertiesRouter.get('/:id', async (req, res, next) => {
     if (!p) throw new AppError(404,'Property not found')
     if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
 
+    // S631 (Nic): "When I click on Oak Park and I click on Mountain View RV, no
+    // little window pops up to see who owns it, who does what. We're just
+    // missing some information there."
+    //
+    // A property has always belonged to an entity, and an entity has always had
+    // owner-members, but neither fact reached this page — so on a portfolio with
+    // two LLCs there was nothing on screen saying which one a property sat under,
+    // let alone who could act on it.
+    const ownership = await queryOne<any>(
+      `SELECT l.id AS entity_id,
+              COALESCE(l.business_name, u.first_name || ' ' || u.last_name) AS entity_name,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                         'userId', us.id,
+                         'name', NULLIF(btrim(COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')), ''),
+                         'email', us.email,
+                         'isFounding', (lm.user_id = l.user_id))
+                       ORDER BY (lm.user_id = l.user_id) DESC, lm.created_at)
+                  FROM landlord_members lm
+                  JOIN users us ON us.id = lm.user_id
+                 WHERE lm.landlord_id = l.id
+              ), '[]'::json) AS owners
+         FROM landlords l
+         JOIN users u ON u.id = l.user_id
+        WHERE l.id = $1`,
+      [p.landlord_id])
+
     // S486: recompute state-law warnings against the persisted
     // property defaults so the detail page surfaces current-state
     // mismatches without waiting for a PATCH. Deposit check skips
@@ -478,7 +511,7 @@ propertiesRouter.get('/:id', async (req, res, next) => {
 
     res.json({
       success: true,
-      data: { ...p, state_law_warnings: stateLawWarnings },
+      data: { ...p, state_law_warnings: stateLawWarnings, ownership },
     })
   } catch (e) { next(e) }
 })
@@ -508,8 +541,15 @@ propertiesRouter.get('/:id/unit-subtypes', async (req, res, next) => {
               s.rv_amp_service, s.storage_size, s.dwelling_ownership,
               s.rent_amount, s.security_deposit,
               s.nightly_rate, s.weekly_rate, s.monthly_rate, s.created_at, s.updated_at,
-              (SELECT count(*) FROM units u
-                WHERE u.subtype_id = s.id AND u.retired_at IS NULL)::int AS unit_count
+              -- S631: count the LINKS, not the legacy single column. A unit
+              -- carries several subtypes now (S630) and units.subtype_id holds
+              -- only the first, so this counted "Pull-Through" correctly and
+              -- reported 0 units for the "30 Amp" tag on the same 19 spaces —
+              -- the very "my subtypes are showing zero units" symptom that
+              -- started this work, still live after the linking was fixed.
+              (SELECT count(*) FROM unit_subtype_links l
+                 JOIN units u ON u.id = l.unit_id
+                WHERE l.subtype_id = s.id AND u.retired_at IS NULL)::int AS unit_count
          FROM property_unit_subtypes s
         WHERE s.property_id = $1
         ORDER BY s.unit_type, s.name`,
@@ -647,12 +687,20 @@ propertiesRouter.get('/:id/unit-subtypes/:rowId/units', async (req, res, next) =
       `SELECT u.id, u.unit_number, u.subtype_id,
               EXISTS (SELECT 1 FROM leases l WHERE l.unit_id = u.id
                         AND l.status IN ('active','pending')) AS leased,
-              st.name AS current_subtype_name
+              -- S631: whether THIS subtype is on the unit, from the links —
+              -- the tick box beside each unit was reading the legacy column, so
+              -- a space genuinely carrying the tag showed unticked.
+              EXISTS (SELECT 1 FROM unit_subtype_links l
+                       WHERE l.unit_id = u.id AND l.subtype_id = $3) AS on_this_subtype,
+              -- Every tag the unit carries, for the "already in X" hint.
+              COALESCE((SELECT string_agg(s2.name, ' · ' ORDER BY s2.name)
+                          FROM unit_subtype_links l2
+                          JOIN property_unit_subtypes s2 ON s2.id = l2.subtype_id
+                         WHERE l2.unit_id = u.id), NULL) AS current_subtype_name
          FROM units u
-         LEFT JOIN property_unit_subtypes st ON st.id = u.subtype_id
         WHERE u.property_id = $1 AND u.unit_type = $2 AND u.retired_at IS NULL
         ORDER BY u.unit_number`,
-      [req.params.id, s.unit_type],
+      [req.params.id, s.unit_type, req.params.rowId],
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -970,6 +1018,41 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     const state   = raw.state   !== undefined ? formatState(raw.state)     : undefined
     const zip     = raw.zip     !== undefined ? formatZip(raw.zip)         : undefined
     const { type } = raw
+
+    // S631 (Nic, DIRECTIVE): "We should maybe lock the street address once it's
+    // set. That way it's not altering our future heat map that we're gonna
+    // build. So let's lock the address once it's set."
+    //
+    // An address is not a preference, it is WHERE the property is. Everything
+    // downstream keys off it: the duplicate-claim guard that stops two landlords
+    // claiming one park, the state-law engine that decides deposit and late-fee
+    // rules, the timezone every due date is computed in, and the geography any
+    // future heat map is built on. A typo fix and a move are indistinguishable
+    // through this endpoint, and the second one is not a thing that happens —
+    // land does not relocate. A property that genuinely needs a different
+    // address is a different property.
+    //
+    // super_admin can still correct one, which is the escape hatch for a real
+    // typo, and it leaves an audit row naming who changed it.
+    const addressFieldsSent = ['street1', 'street2', 'city', 'state', 'zip']
+      .filter(f => raw[f] !== undefined)
+    if (addressFieldsSent.length) {
+      const cur = await queryOne<any>(
+        `SELECT street1, street2, city, state, zip FROM properties WHERE id = $1`,
+        [req.params.id])
+      const proposed: Record<string, any> = { street1, street2, city, state, zip }
+      const norm = (v: any) => String(v ?? '').trim().toLowerCase()
+      const changed = addressFieldsSent.filter(f => norm(proposed[f]) !== norm(cur?.[f]))
+      // Only a real CHANGE is refused — the edit form posts the whole record
+      // back, so an unchanged address arrives on every save of the name.
+      if (changed.length && req.user!.role !== 'super_admin') {
+        throw new AppError(409,
+          'A property\'s address is fixed once it is set — it decides which state\'s laws apply, ' +
+          'which timezone rent is due in, and stops two landlords claiming the same place. ' +
+          'If this one is wrong, contact support and we will correct it.')
+      }
+    }
+
     // S179 / B3: per-property booking acknowledgment toggle. Sent only when
     // the form actually changed; preserves COALESCE semantics on the others.
     const reqAck =
@@ -1195,6 +1278,68 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
 // All body fields are optional — caller only sends what changed.
 // S131: stays requireLandlord. Routing payouts to a bank account is
 // financial-control authority — owner/admin only.
+// ── First billing cycle, per property (S633) ─────────────────────────────────
+//
+// Nic (DIRECTIVE, S632): "On the first billing cycle, that needs to be not a
+// platform wide feature. Because if I onboard different properties that I own
+// next month, it's gonna bill them right away. This needs to be a setting per
+// property, as onboarding is required."
+//
+// This setting says which month GAM's FIRST invoice to an already-living-there
+// tenant covers. Only the landlord knows which months they already collected
+// off-platform, and that is not derivable from any date GAM holds — inferring it
+// from the signing date was tried in S631 and handed a free September to
+// everyone who signed on the 1st or 2nd.
+//
+// It lived on the ENTITY until now, which was the wrong grain and the same
+// mistake the S633 account/entity split exists to correct. Onboarding happens
+// one property at a time: a park bought in November under the LLC that onboarded
+// another park in September would have inherited September and invoiced its
+// residents for two months they had already paid somebody else.
+//
+// There is deliberately NO fallback to the entity's retired value. An
+// unanswered property bills the month each lease starts in, which is the reading
+// that never double-bills.
+propertiesRouter.patch('/:id/first-billing-cycle', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({
+      // 'YYYY-MM' or a full date; null clears it (back to "bill the month each
+      // lease starts in").
+      firstBillingCycle: z.string().regex(/^\d{4}-\d{2}(-\d{2})?$/).nullable(),
+    }).parse(req.body)
+    const month = body.firstBillingCycle ? body.firstBillingCycle.slice(0, 7) + '-01' : null
+
+    const prop = await queryOne<{ id: string; landlord_id: string; name: string }>(
+      `SELECT id, landlord_id, name FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    // Moves money for every existing tenancy at the property at once — the
+    // landlord or an admin, never a team role.
+    if (!canManageLandlordResource(req.user, prop.landlord_id, [])) {
+      throw new AppError(403, 'That property is not yours to change.')
+    }
+
+    // Only affects tenancies not yet invoiced. Report how many are already out
+    // rather than silently reissuing invoices somebody has seen — those are the
+    // landlord's to credit if they were wrong.
+    const alreadyInvoiced = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM invoices i
+         JOIN leases l ON l.id = i.lease_id
+         JOIN units u ON u.id = l.unit_id
+        WHERE u.property_id = $1 AND l.is_existing_tenancy = true`,
+      [prop.id])
+
+    await query(
+      `UPDATE properties SET first_billing_cycle = $2::date, updated_at = NOW() WHERE id = $1`,
+      [prop.id, month])
+    res.json({ success: true, data: {
+      propertyId: prop.id,
+      firstBillingCycle: month,
+      existingTenancyInvoicesAlreadyIssued: Number(alreadyInvoiced?.n || 0),
+    } })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res, next) => {
   try {
     const body = z.object({

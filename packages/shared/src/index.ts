@@ -667,6 +667,66 @@ export function isLockedLeaseColumn(col: string | null | undefined): boolean {
   return isLateFeeColumn(col) || col === 'rent_due_day'
 }
 
+// S635 (Nic, DIRECTIVE): "the tenant names and the names of the occupants both
+// are landlord boxes, and those should be derived from all the invites that went
+// out. I thought we changed that at the system level."
+//
+// The VALUES were already derived — the roster fills them at send time. What was
+// not was the QUESTION: an identity field still carried a signer role, so the
+// template editor showed it as somebody's box to fill, and auto-placement
+// guessed "landlord" for all of them. A landlord setting up a template sees four
+// tenant-name blanks addressed to them and reasonably concludes they have to
+// type four names the system already took at invite time.
+//
+// Every 'identity' column is a fact GAM already holds: who is on the lease, the
+// unit, the property, the landlord, the date it was signed. None of it is
+// anybody's to fill in.
+//
+// Distinct from isLockedLeaseColumn: a locked field also cannot be moved,
+// resized or deleted, because its VALUE is policy. An auto-filled field is
+// ordinary furniture — the landlord places it, labels it, and deletes it if the
+// form has no such blank. They just never fill it.
+// S635 (Nic): "month to month printed raw on all the leases I just sent."
+//
+// A tagged field's value is written into the SIGNED DOCUMENT, so a lease_column
+// carrying an enum stamped the wire value onto the page: "month_to_month" in the
+// rental-term blank, "tenant"/"landlord" in the utility-responsibility blanks.
+// The no-raw-enums rule matters more here than anywhere in the product — this is
+// the one artifact a resident keeps, and a court reads.
+//
+// Returns the raw value untouched for everything that is not an enum, so a
+// caller can pass every prefill through it.
+const LEASE_COLUMN_VALUE_LABEL: Record<string, Record<string, string>> = {
+  lease_type: {
+    month_to_month: 'Month-to-month',
+    fixed_term:     'Fixed term',
+    nnn_commercial: 'NNN commercial',
+  },
+  auto_renew_mode: {
+    extend:           'Extends for another term',
+    convert_to_m2m:   'Converts to month-to-month',
+    expire:           'Expires',
+  },
+  utility_water_responsibility:    { tenant: 'Tenant', landlord: 'Landlord' },
+  utility_gas_responsibility:      { tenant: 'Tenant', landlord: 'Landlord' },
+  utility_electric_responsibility: { tenant: 'Tenant', landlord: 'Landlord' },
+  utility_sewer_responsibility:    { tenant: 'Tenant', landlord: 'Landlord' },
+  utility_trash_responsibility:    { tenant: 'Tenant', landlord: 'Landlord' },
+  auto_renew: { true: 'Yes', false: 'No' },
+}
+
+export function leaseColumnDisplayValue(
+  col: string | null | undefined, raw: unknown,
+): string {
+  const v = raw == null ? '' : String(raw)
+  if (!col) return v
+  return LEASE_COLUMN_VALUE_LABEL[col]?.[v] ?? v
+}
+
+export function isAutoFilledLeaseColumn(col: string | null | undefined): boolean {
+  return !!col && LEASE_COLUMN_CATEGORY[col as LeaseColumn] === 'identity'
+}
+
 // Park-owned RV rented as a unit: the site areas PLUS the rig itself.
 // An RV never gets bedroom areas, no matter who owns it.
 export const RV_UNIT_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
@@ -2695,7 +2755,7 @@ export const LEASE_COLUMNS = [
   // form with four name lines and one tenant leaves three blank — normal on
   // paper. Naming the slots lets the draft fill the ones that exist from the
   // signer roster and stop REQUIRING the ones that do not.
-  'tenant_2_name', 'tenant_3_name', 'tenant_4_name',
+  'tenant_2_name', 'tenant_3_name', 'tenant_4_name', 'occupant_names',
   'sale_price', 'sale_down_payment', 'sale_financed_amount',
   'sale_monthly_payment', 'sale_term_months', 'sale_interest_rate',
   'sale_first_payment_month',
@@ -2748,6 +2808,7 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   tenant_2_name:            'identity',
   tenant_3_name:            'identity',
   tenant_4_name:            'identity',
+  occupant_names:           'identity',
   // S629: home-sale terms — display-only, never written back to leases.
   sale_price:               'identity',
   sale_down_payment:        'identity',
@@ -2880,6 +2941,7 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   tenant_2_name:            'Co-tenant 2 name',
   tenant_3_name:            'Co-tenant 3 name',
   tenant_4_name:            'Co-tenant 4 name',
+  occupant_names:           'Everyone on the lease',
   sale_price:               'Sale price',
   sale_down_payment:        'Down payment',
   sale_financed_amount:     'Amount financed',
@@ -2957,6 +3019,7 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   tenant_2_name:            'text',
   tenant_3_name:            'text',
   tenant_4_name:            'text',
+  occupant_names:           'text',
   // S629: home-sale terms. 'text' so they appear in the template editor's
   // Data label dropdown — a purchase agreement is built by placing these on
   // the page, and the figures then arrive from the contract at send time.
@@ -4479,6 +4542,9 @@ export function formatCurrency(amount: number): string {
 
 // === S25: businessDay + paymentAllocation re-exports ===
 export * from './businessDay'
+// S633: the standalone-page scroll unlock, shared so it cannot be fixed in one
+// portal and left broken in the other — which is exactly what happened.
+export * from './standaloneScroll'
 // === S617: one definition of how fast an agent reads and types ===
 export * from './chatCadence'
 export * from './paymentAllocation'
@@ -5835,6 +5901,24 @@ export const MASTER_TOTAL_JUMP_FACTOR = 10
 export const RUBS_BASES = ['usage_rate', 'bill_amount'] as const
 export type RubsBasis = typeof RUBS_BASES[number]
 
+// S635: what a WORK TRADE can be set to cover. One vocabulary, three consumers
+// that used to each carry their own copy: the `work_trade_agreements`
+// covered_charges CHECK + column default, the same CHECK on
+// `pending_tenant_intents.work_trade_covered_charges`, and the landlord picker.
+// A value added here needs a fix-forward migration widening BOTH checks.
+//
+// Order is the picker's order — rent first because it is the one every trade is
+// asked about, then the utilities a park actually meters, then fees.
+export const WORK_TRADE_COVERABLE = [
+  'rent', 'electric', 'water', 'sewer', 'gas', 'trash', 'propane', 'fees',
+] as const
+export type WorkTradeCoverable = typeof WORK_TRADE_COVERABLE[number]
+
+export const WORK_TRADE_COVERABLE_LABEL: Record<WorkTradeCoverable, string> = {
+  rent: 'Rent', electric: 'Electric', water: 'Water', sewer: 'Sewer',
+  gas: 'Natural gas', trash: 'Trash', propane: 'Propane', fees: 'Fees',
+}
+
 // What rate a SUBMETERED unit on a RUBS master's line is billed at (S607).
 //   property_rate — the rate the landlord published (default). A predictable
 //                   figure the tenant can check, unchanged from how a submeter
@@ -5844,14 +5928,19 @@ export type RubsBasis = typeof RUBS_BASES[number]
 export const RUBS_SUBMETER_RATES = ['property_rate', 'blended'] as const
 export type RubsSubmeterRate = typeof RUBS_SUBMETER_RATES[number]
 
-// How a RUBS master removes its submetered units from the pool (S607).
-//   usage   — subtract their measured usage, then price the remainder. The
-//             classic carve-out, and the default: no master changes shape
-//             without the landlord asking for it.
-//   dollars — subtract what those units were actually invoiced, so the bill
-//             closes at any submeter rate.
-// The two agree whenever submeters bill at the blended rate; they diverge when
-// the landlord publishes a separate submeter rate.
+// SUPERSEDED BY S634 — DEAD CONFIG, READ BY NOTHING.
+//
+// This chose how a RUBS master removed its submetered units from the pool:
+// 'usage' (their measured usage off the top) or 'dollars' (what they were
+// actually invoiced). Nic ruled the carve-out itself out of existence: "The RUBS
+// system needs to bill off of the total dollar amount divided by occupancy off
+// the master bill. Submeters bill off of the gallons usage after. RUBS portion
+// is divided out first. The RUBS people eat the full bill. Submeter is extra."
+//
+// The column and this enum are KEPT so no existing master fails to load and no
+// stored value has to be rewritten — but nothing reads either, the landlord
+// picker is gone, and a new consumer of this is a bug. See the S634 block in
+// apps/api/src/services/utilityBilling.ts.
 export const RUBS_EXCLUSION_MODES = ['usage', 'dollars'] as const
 export type RubsExclusionMode = typeof RUBS_EXCLUSION_MODES[number]
 
@@ -6299,3 +6388,9 @@ export const COMPLAINT_STATUS_LABEL: Record<ComplaintStatus, string> = {
   resolved:  'Resolved',
   dismissed: 'Dismissed',
 }
+
+// S631: minimum password length, platform-wide. It lived as a local const in
+// routes/auth.ts, so the admin-invitation accept path (a second place that mints
+// a login) had no way to honour it without re-declaring the number — the exact
+// drift the single-source rule exists to prevent.
+export const PASSWORD_MIN_LEN = 12

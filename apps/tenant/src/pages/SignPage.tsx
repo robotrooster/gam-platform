@@ -4,9 +4,28 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { humanize } from '@gam/shared'
+import { humanize, unlockScrollIfStandalone } from '@gam/shared'
+import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+
+/**
+ * S633: field values are stored in the signer's locale format ("7/14/1962")
+ * because that string is stamped onto the PDF as text. TypedDateInput speaks
+ * ISO, so this converts back on the way IN.
+ *
+ * It also fixes a bug that predates the date-picker change: the old input had
+ * no defaultValue, so reopening a date field showed an empty box even though a
+ * date had been entered — the signer could not tell whether it had taken, and
+ * re-entering it was the only way to find out.
+ */
+function isoFromStored(stored: string | undefined): string {
+  if (!stored) return ''
+  const m = /^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/.exec(stored.trim())
+  if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(stored.trim())
+  return iso ? stored.trim() : ''
+}
 const tok = () => localStorage.getItem('gam_tenant_token')
 /**
  * S629 (Nic): a signing link works WITHOUT a session. The path param is either
@@ -258,6 +277,14 @@ const isDateSignedField = (f: any) =>
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
+  // S633 (Nic): a tenant on a phone could not scroll far enough to confirm their
+  // signature font. This portal locks the document on purpose — `.shell` is the
+  // scrolling region and body is overflow:hidden — but a lease opened from an
+  // emailed link renders OUTSIDE that shell, inheriting a body that cannot
+  // scroll. Fixed in the landlord portal in S629 and never here, which is the
+  // one-off Nic called out: the person the lease is actually sent to was the one
+  // still stuck. See packages/shared/src/standaloneScroll.ts.
+  useEffect(() => unlockScrollIfStandalone(), [])
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
   const [fieldFonts, setFieldFonts]   = useState<Record<string,string>>({})
@@ -666,9 +693,30 @@ export function SignPage() {
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
+            {/* S633 — THE DATE IS TYPED, NOT BROWSED.
+                Reported live by an applicant signing his lease on Chrome for
+                Android: the birthdate field opened the Material calendar, which
+                starts at today and pages by MONTH. Nic: "he's had to click on it
+                twelve times just to scroll back through a year. There was no way
+                to just type in a date."
+                Every GAM lease template carries "Birthdate 1..4" as a date
+                field, so this modal is where that happened — reaching 1962 from
+                here is hundreds of taps on a back-arrow.
+                Nobody browses to their own birthday. Three numeric boxes, the
+                Android number pad, done in eight keystrokes. */}
             {activeField.fieldType==='date' && (
-              <input type="date" onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
-                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
+              <div style={{ marginBottom:14 }}>
+                <TypedDateInput
+                  value={isoFromStored(fieldValues[activeField.id])}
+                  onChange={iso=>{
+                    // Stored in the signer's locale format, as before — it is
+                    // stamped onto the PDF as text.
+                    const v = iso ? new Date(iso + 'T12:00:00').toLocaleDateString() : ''
+                    setFieldValues(p=>({...p,[activeField.id]:v}))
+                  }}
+                  inputStyle={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, background:'white', color:'#1a1a1a' }}
+                />
+              </div>
             )}
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setActiveField(null)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', cursor:'pointer' }}>Cancel</button>

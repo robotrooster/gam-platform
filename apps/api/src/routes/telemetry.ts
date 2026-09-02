@@ -42,7 +42,11 @@ telemetryRouter.post('/telemetry/events', optionalAuth, async (req, res) => {
       const base = params.length
       params.push(e.portal, e.event, e.path ?? null,
         u?.userId ?? null, u?.role ?? null,
-        u?.role === 'landlord' ? u.profileId : (u as any)?.landlordId ?? null,
+        // S633: telemetry stamps ONE landlord id for grouping. A landlord
+        // session no longer names an entity, and picking one of several would
+        // be a made-up attribution — team sessions still carry their single
+        // landlordId, and a landlord's rows are attributable by user_id.
+        u?.role === 'landlord' ? null : (u as any)?.landlordId ?? null,
         e.meta ? JSON.stringify(e.meta) : null)
       values.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`)
     }

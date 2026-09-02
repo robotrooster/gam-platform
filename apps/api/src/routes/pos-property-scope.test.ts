@@ -55,11 +55,18 @@ async function seed(opts: { allProperties?: boolean } = {}): Promise<Fixture> {
       [cashier.rows[0].id, landlordId, opts.allProperties ? [] : [propAId], !!opts.allProperties])
     await client.query('COMMIT')
 
+    // S633: a landlord session names no entity — the ACCOUNT's companies ride in
+    // landlordIds. A TEAM session is genuinely scoped to one landlord and carries
+    // it in the `landlordId` claim (S82), which is what auth.ts has minted for
+    // worker roles all along; this fixture was still using the pre-S82 shape of
+    // stuffing it into profileId, and only got away with it because the old scope
+    // helper fell back to profileId — the same fallback that let a TENANT's
+    // profileId read as a company.
     const ownerToken = jwt.sign(
-      { userId: ownerUid, role: 'landlord', email: 'o@t.dev', profileId: landlordId, permissions: {} },
+      { userId: ownerUid, role: 'landlord', email: 'o@t.dev', profileId: null, landlordIds: [landlordId], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
     const cashierToken = jwt.sign(
-      { userId: cashier.rows[0].id, role: 'onsite_manager', email: 'c@t.dev', profileId: landlordId, permissions: { 'pos.ring_sale': true } },
+      { userId: cashier.rows[0].id, role: 'onsite_manager', email: 'c@t.dev', profileId: cashier.rows[0].id, landlordId, permissions: { 'pos.ring_sale': true } },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
     return { landlordId, ownerToken, cashierToken, propAId, propBId }
   } catch (e) { await client.query('ROLLBACK'); throw e }

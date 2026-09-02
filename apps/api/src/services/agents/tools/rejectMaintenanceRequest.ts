@@ -11,7 +11,7 @@
 import { query, queryOne } from '../../../db'
 import { notifyMaintenanceUpdated } from '../../notifications'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const rejectMaintenanceRequest: AgentTool = {
   name: 'reject_maintenance_request',
@@ -36,8 +36,8 @@ export const rejectMaintenanceRequest: AgentTool = {
     if (!requestId) return { ok: false, error: 'A requestId is required (get it from get_pending_maintenance).' }
 
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = $2',
-      [requestId, actor.profileId]
+      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = ANY($2::uuid[])',
+      [requestId, actorLandlordIds(actor)]
     )
     if (!request) return { ok: false, error: 'No such maintenance request for your account.' }
     if (request.status === 'completed' || request.status === 'cancelled') {
@@ -49,8 +49,8 @@ export const rejectMaintenanceRequest: AgentTool = {
     // and a concurrent close finds no matching row (no double comment/notify).
     const updated = await queryOne<any>(
       `UPDATE maintenance_requests SET status = 'cancelled', updated_at = NOW()
-        WHERE id = $1 AND landlord_id = $2 AND status NOT IN ('completed','cancelled') RETURNING *`,
-      [requestId, actor.profileId]
+        WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND status NOT IN ('completed','cancelled') RETURNING *`,
+      [requestId, actorLandlordIds(actor)]
     )
     if (!updated) return { ok: false, error: 'That request was just updated — please re-check its status first.' }
 

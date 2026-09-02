@@ -23,7 +23,9 @@ async function seedOverdue(status: string) {
     [landlordId, tenantId, status])
 }
 
-const run = () => getDelinquentTenants.execute({}, { profileId: landlordId } as any) as Promise<any>
+// S634: a landlord actor's scope is landlordIds — profileId is empty.
+const run = () => getDelinquentTenants.execute(
+  {}, { userId: 'u1', role: 'landlord', profileId: '', landlordIds: [landlordId] } as any) as Promise<any>
 
 describe('getDelinquentTenants — who is actually behind', () => {
   beforeAll(async () => {

@@ -10,9 +10,12 @@
 
 import { query } from '../../../db'
 import { createNotification } from '../../notifications'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
-interface TenantMatch { user_id: string; first_name: string | null; last_name: string | null; email: string | null }
+interface TenantMatch {
+  /** S634: the company the record belongs to — see the notify call below. */
+  landlord_id: string
+  user_id: string; first_name: string | null; last_name: string | null; email: string | null }
 
 export const messageTenant: AgentTool = {
   name: 'message_tenant',
@@ -39,13 +42,13 @@ export const messageTenant: AgentTool = {
 
     // Tenants on THIS landlord's leases matching the name/email.
     const matches = await query<TenantMatch>(
-      `SELECT DISTINCT t.user_id, us.first_name, us.last_name, us.email
+      `SELECT DISTINCT t.user_id, l.landlord_id, us.first_name, us.last_name, us.email
          FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1
+         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = ANY($1::uuid[])
          JOIN tenants t ON t.id = lt.tenant_id
          JOIN users us ON us.id = t.user_id
         WHERE us.email ILIKE $2 OR (COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) ILIKE $2`,
-      [actor.profileId, `%${needle}%`]
+      [actorLandlordIds(actor), `%${needle}%`]
     )
     if (matches.length === 0) return { ok: false, error: `No tenant on your leases matches “${needle}”.` }
     if (matches.length > 1) {
@@ -60,7 +63,8 @@ export const messageTenant: AgentTool = {
     const m = matches[0]
     await createNotification({
       userId: m.user_id,
-      landlordId: actor.profileId,
+      // S634: the company whose lease this tenant is on.
+      landlordId: m.landlord_id,
       type: 'landlord_message',
       title: 'Message from your landlord',
       body: message,

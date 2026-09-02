@@ -7,7 +7,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface RequestRow {
   id: string
@@ -46,10 +46,10 @@ export const getPendingMaintenance: AgentTool = {
          FROM maintenance_requests mr
          JOIN units u ON u.id = mr.unit_id
          JOIN properties p ON p.id = u.property_id
-        WHERE mr.landlord_id = $1 AND mr.status = ANY($2)
+        WHERE mr.landlord_id = ANY($1::uuid[]) AND mr.status = ANY($2)
         ORDER BY (mr.status = 'awaiting_approval') DESC, mr.created_at DESC
         LIMIT $3`,
-      [actor.profileId, OPEN_STATUSES, limit]
+      [actorLandlordIds(actor), OPEN_STATUSES, limit]
     )
 
     const awaitingApproval = rows.filter((r) => r.status === 'awaiting_approval').length

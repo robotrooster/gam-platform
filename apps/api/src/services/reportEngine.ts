@@ -25,7 +25,7 @@
 // with them or a landlord's reports will disagree with their own Books.
 // ============================================================
 import { query } from '../db'
-import { platformFeesByProperty } from './platformFee'
+import { platformFeesByProperty, platformFeesByPropertyForEntities } from './platformFee'
 
 /** Every month a range touches, as 'YYYY-MM-01' — the key format the
  *  platform-fee accrual lookup expects. A range landing mid-month still bills
@@ -49,7 +49,10 @@ export const REPORT_LEVELS:  readonly ReportLevel[]  = ['portfolio', 'property',
 export const REPORT_BUCKETS: readonly ReportBucket[] = ['total', 'monthly', 'daily'] as const
 
 export interface ReportQuery {
-  landlordId:   string
+  /** S633: every entity the ACCOUNT owns. A report is about the account, so it
+   *  spans them; scoped to one, every figure silently omitted the other
+   *  company's money. Team roles pass their single id as a one-element array. */
+  landlordIds:  string[]
   start:        string              // YYYY-MM-DD inclusive
   end:          string              // YYYY-MM-DD inclusive
   level:        ReportLevel
@@ -113,7 +116,7 @@ function emptyRow(period: string | null, propertyId: string | null, unitId: stri
 }
 
 export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; totals: ReportRow }> {
-  const { landlordId, start, end, level, bucket } = q
+  const { landlordIds, start, end, level, bucket } = q
   const scoped = q.propertyIds ?? null
   // A caller scoped to zero properties sees nothing — same lockdown posture as
   // the read guards elsewhere, rather than silently falling back to everything.
@@ -149,13 +152,13 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            ), 0)::float                                                                AS other
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
-     WHERE p.landlord_id = $1
+     WHERE p.landlord_id = ANY($1::uuid[])
        AND p.status = 'settled'
        AND p.settled_at >= $2::date
        AND p.settled_at < ($3::date + INTERVAL '1 day')
        AND ($4::uuid[] IS NULL OR u.property_id = ANY($4))
      GROUP BY 1, 2, 3`
-  for (const r of await query<any>(incomeSql, [landlordId, start, end, scoped])) {
+  for (const r of await query<any>(incomeSql, [landlordIds, start, end, scoped])) {
     const row = upsert(r.period, r.property_id, r.unit_id)
     row.income.rent      = round2(+r.rent)
     row.income.fees      = round2(+r.fees)
@@ -174,14 +177,14 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            COALESCE(SUM(mr.actual_cost), 0)::float AS maintenance
       FROM maintenance_requests mr
       JOIN units u ON u.id = mr.unit_id
-     WHERE mr.landlord_id = $1
+     WHERE mr.landlord_id = ANY($1::uuid[])
        AND mr.actual_cost IS NOT NULL
        AND mr.completed_at IS NOT NULL
        AND mr.completed_at >= $2::date
        AND mr.completed_at < ($3::date + INTERVAL '1 day')
        AND ($4::uuid[] IS NULL OR u.property_id = ANY($4))
      GROUP BY 1, 2, 3`
-  for (const r of await query<any>(maintSql, [landlordId, start, end, scoped])) {
+  for (const r of await query<any>(maintSql, [landlordIds, start, end, scoped])) {
     upsert(r.period, r.property_id, r.unit_id).expenses.maintenance = round2(+r.maintenance)
   }
 
@@ -213,9 +216,9 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            SUM(CASE WHEN e.unit_id = tgt.id THEN e.amount
                     ELSE e.amount / NULLIF(uc.n, 0) END)::float AS amount
       FROM landlord_expenses e
-      JOIN units tgt ON tgt.property_id = e.property_id AND tgt.landlord_id = $1
+      JOIN units tgt ON tgt.property_id = e.property_id AND tgt.landlord_id = ANY($1::uuid[])
       JOIN LATERAL (SELECT COUNT(*)::int AS n FROM units u2 WHERE u2.property_id = e.property_id) uc ON TRUE
-     WHERE e.landlord_id = $1
+     WHERE e.landlord_id = ANY($1::uuid[])
        AND e.status = 'active'
        AND e.expense_date >= $2::date AND e.expense_date <= $3::date
        AND ($4::uuid[] IS NULL OR e.property_id = ANY($4))
@@ -228,12 +231,12 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            e.category,
            SUM(e.amount)::float AS amount
       FROM landlord_expenses e
-     WHERE e.landlord_id = $1
+     WHERE e.landlord_id = ANY($1::uuid[])
        AND e.status = 'active'
        AND e.expense_date >= $2::date AND e.expense_date <= $3::date
        AND ($4::uuid[] IS NULL OR e.property_id = ANY($4))
      GROUP BY 1, 2, 3, 4`
-  for (const r of await query<any>(expenseSql, [landlordId, start, end, scoped])) {
+  for (const r of await query<any>(expenseSql, [landlordIds, start, end, scoped])) {
     const row = upsert(r.period, r.property_id, r.unit_id)
     const amt = round2(+r.amount)
     row.expenses.byCategory[r.category] = round2((row.expenses.byCategory[r.category] ?? 0) + amt)
@@ -257,7 +260,7 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
         : [{ period: null, months }]
 
     for (const b of batches) {
-      const byProperty = await platformFeesByProperty(landlordId, b.months)
+      const byProperty = await platformFeesByPropertyForEntities(landlordIds, b.months)
       for (const [propertyId, amount] of byProperty) {
         if (scoped && !scoped.includes(propertyId)) continue
         // At unit level this stays a PROPERTY-level charge (unitId null) rather
@@ -279,12 +282,12 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
            ${wantUnit ? 'u.id' : 'NULL::uuid'} AS unit_id,
            COUNT(*)::int AS occupied
       FROM units u
-     WHERE u.landlord_id = $1
+     WHERE u.landlord_id = ANY($1::uuid[])
        AND u.status IN ('active','delinquent','suspended')
        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2))
      GROUP BY 1, 2`
   const occupancy = new Map<string, number>()
-  for (const r of await query<any>(occSql, [landlordId, scoped])) {
+  for (const r of await query<any>(occSql, [landlordIds, scoped])) {
     occupancy.set(`${r.property_id ?? '-'}|${r.unit_id ?? '-'}`, r.occupied)
   }
 
@@ -292,7 +295,7 @@ export async function runReport(q: ReportQuery): Promise<{ rows: ReportRow[]; to
   const nameRows = await query<any>(
     `SELECT p.id AS property_id, p.name AS property_name, u.id AS unit_id, u.unit_number
        FROM properties p LEFT JOIN units u ON u.property_id = p.id
-      WHERE p.landlord_id = $1`, [landlordId])
+      WHERE p.landlord_id = ANY($1::uuid[])`, [landlordIds])
   const propName = new Map<string, string>()
   const unitName = new Map<string, string>()
   for (const n of nameRows) {

@@ -102,14 +102,54 @@ async function creditInvoice(
     }
   }
 
-  await client.query(
-    `UPDATE invoices
-        SET total_amount = GREATEST(0, total_amount - $2),
-            work_trade_credit_amount = work_trade_credit_amount + $2,
-            work_trade_credit_hours  = work_trade_credit_hours + $3,
-            updated_at = NOW()
-      WHERE id = $1`,
-    [invoiceId, round2(credit - remaining).toFixed(2), round2h(hours).toFixed(2)])
+  // ── S634: THE MONTH IS OVER, SO THE SUSPENSION ENDS ────────────────────────
+  //
+  // Nic (DIRECTIVE): "Have the work trade exist, but be suspended... and it
+  // creates only at the month close. They work, and at the end of the month, if
+  // they don't hit their hours, the rent for that month is prorated to cover any
+  // lapse."
+  //
+  // A suspended line was never in `total_amount` (see jobs/moveInBundle.ts), so
+  // subtracting the credit from the total would take money off a total that
+  // never had it — the invoice would go negative-by-omission and the lapse would
+  // vanish. Instead the flag is cleared and the total is REBUILT from the lines
+  // that are actually owed after the credit landed above: zero when the hours
+  // were met, the lapse when they were not.
+  const unsuspended = await client.query(
+    `UPDATE payments SET work_trade_suspended_at = NULL
+      WHERE invoice_id = $1 AND work_trade_suspended_at IS NOT NULL
+      RETURNING id`, [invoiceId])
+
+  if (unsuspended.rows.length > 0) {
+    // This invoice carried a suspended line, so its total never included it.
+    // Rebuild from what is actually owed now the credit has landed: zero when
+    // the hours were met, the lapse when they were not. Subtracting the credit
+    // instead would take money off a total that never had it.
+    await client.query(
+      `UPDATE invoices i
+          SET total_amount = COALESCE((
+                SELECT SUM(p.amount) FROM payments p
+                 WHERE p.invoice_id = i.id
+                   AND p.work_trade_suspended_at IS NULL
+                   AND p.status <> 'failed'
+              ), 0),
+              work_trade_credit_amount = i.work_trade_credit_amount + $2,
+              work_trade_credit_hours  = i.work_trade_credit_hours + $3,
+              updated_at = NOW()
+        WHERE i.id = $1`,
+      [invoiceId, round2(credit - remaining).toFixed(2), round2h(hours).toFixed(2)])
+  } else {
+    // Pre-S634 shape (and any invoice whose rent was never suspended): the total
+    // DID include the charge, so the credit comes off it.
+    await client.query(
+      `UPDATE invoices
+          SET total_amount = GREATEST(0, total_amount - $2),
+              work_trade_credit_amount = work_trade_credit_amount + $2,
+              work_trade_credit_hours  = work_trade_credit_hours + $3,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [invoiceId, round2(credit - remaining).toFixed(2), round2h(hours).toFixed(2)])
+  }
 }
 
 /**

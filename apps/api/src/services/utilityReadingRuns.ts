@@ -79,32 +79,44 @@ export function todayInPhoenix(): string {
  * property + cycle → returns the existing run). `openedBy` marks a
  * manual early open from the utilities page; scheduler opens pass null.
  */
-export async function openReadingRun(propertyId: string, cycleMonth: string, opts: { notify?: boolean } = {}) {
+export async function openReadingRun(
+  propertyId: string,
+  cycleMonth: string,
+  opts: { notify?: boolean; utilityType?: string | null } = {},
+) {
   const property = await queryOne<{ id: string; name: string; landlord_id: string }>(
     `SELECT id, name, landlord_id FROM properties WHERE id = $1`, [propertyId])
   if (!property) return null
 
+  // S631: a run may cover one utility or all of them. Counting the meters it
+  // will actually contain is what stops an empty electric run being opened on a
+  // water-only property.
+  const utility = opts.utilityType ?? null
   const readable = await queryOne<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM utility_meters
-      WHERE property_id = $1 AND billing_method IN ('submeter','rubs')`, [propertyId])
+      WHERE property_id = $1 AND billing_method IN ('submeter','rubs')
+        AND ($2::text IS NULL OR utility_type = $2)`, [propertyId, utility])
   if (!readable || readable.n === 0) return null
 
-  const existing = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE property_id = $1 AND billing_cycle_month = $2`,
-    [propertyId, cycleMonth])
+  const findRun = () => queryOne<any>(
+    `SELECT * FROM utility_reading_runs
+      WHERE property_id = $1 AND billing_cycle_month = $2
+        AND COALESCE(utility_type, 'all') = COALESCE($3::text, 'all')`,
+    [propertyId, cycleMonth, utility])
+
+  const existing = await findRun()
   if (existing) return existing
 
   const run = await queryOne<any>(
-    `INSERT INTO utility_reading_runs (property_id, landlord_id, billing_cycle_month, opened_on)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (property_id, billing_cycle_month) DO NOTHING
+    `INSERT INTO utility_reading_runs
+       (property_id, landlord_id, billing_cycle_month, opened_on, utility_type)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING
      RETURNING *`,
-    [propertyId, property.landlord_id, cycleMonth, todayInPhoenix()])
+    [propertyId, property.landlord_id, cycleMonth, todayInPhoenix(), utility])
   if (!run) {
     // Lost a concurrent-insert race — the other winner notifies.
-    return queryOne<any>(
-      `SELECT * FROM utility_reading_runs WHERE property_id = $1 AND billing_cycle_month = $2`,
-      [propertyId, cycleMonth])
+    return findRun()
   }
 
   if (opts.notify !== false) {
@@ -124,6 +136,21 @@ export async function openDueReadingRuns(): Promise<{ opened: number }> {
   if (today !== lastBusinessDayOfMonth(y, m)) return { opened: 0 }
 
   const cycleMonth = `${today.slice(0, 7)}-01`
+  // ONE run per property, covering every readable meter.
+  //
+  // S631 tried splitting this per utility so electric could finish without
+  // waiting on a water bill in the post. Nic rejected it, correctly: his own
+  // division runs down the middle of ONE utility — he holds the water MASTER
+  // bills, somebody else walks the water SUBMETERS. "Splitting it by electric
+  // and water doesn't work. It needs a better flow that would cover any
+  // situation."
+  //
+  // The flow that covers any situation is the list itself. Readings save one
+  // meter at a time, in any order, by anyone with the permission, and no meter
+  // waits on another — so two people simply do parts of the same list. Cutting
+  // it into runs adds a boundary that some real division will always straddle.
+  // Scoped runs remain possible (openReadingRun takes a utilityType) but nothing
+  // opens them automatically.
   const props = await query<{ property_id: string }>(
     `SELECT DISTINCT property_id FROM utility_meters
       WHERE billing_method IN ('submeter','rubs')`)
@@ -209,6 +236,10 @@ export async function getRunMeters(runId: string) {
   return query<any>(
     `SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits,
             m.rubs_basis,
+            -- S631: enough to render the list as a task list — what is done and
+            -- when. Deliberately NOT who did it: Nic, "I don't wanna know who
+            -- gets assigned to what... it's whoever jumps on and does what."
+            cur.reading_date AS read_on,
             -- S607: does this master have submetered units on it? Decides
             -- whether the walk must insist on a usage total (needed to carve
             -- those units out of the pool) or can take the bill alone.
@@ -224,6 +255,10 @@ export async function getRunMeters(runId: string) {
        FROM utility_reading_runs r
        JOIN utility_meters m ON m.property_id = r.property_id
                             AND m.billing_method IN ('submeter','rubs')
+                            -- S631: the walk shows only what this run covers,
+                            -- so the person reading electric is not handed a
+                            -- water list they have no numbers for.
+                            AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
        LEFT JOIN utility_meter_units mu ON mu.meter_id = m.id
        LEFT JOIN units u ON u.id = mu.unit_id
        LEFT JOIN utility_meter_readings cur
@@ -265,18 +300,20 @@ export async function startDoubleCheckPhase(runId: string) {
        FROM utility_meter_readings rd
        JOIN utility_meters m ON m.id = rd.meter_id
       WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND rd.needs_review`,
-    [run.property_id, run.billing_cycle_month])
+        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND rd.needs_review
+        AND ($3::text IS NULL OR m.utility_type = $3)`,
+    [run.property_id, run.billing_cycle_month, run.utility_type])
   const pads = await query<{ meter_id: string; reading_value: string }>(
     `SELECT rd.meter_id, rd.reading_value
        FROM utility_meter_readings rd
        JOIN utility_meters m ON m.id = rd.meter_id
       WHERE m.property_id = $1 AND m.billing_method = 'submeter'
         AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND NOT rd.needs_review
+        AND ($4::text IS NULL OR m.utility_type = $4)
       ORDER BY random()
       LIMIT $3`,
     [run.property_id, run.billing_cycle_month,
-     Math.max(0, METER_DOUBLE_CHECK_MIN - suspects.length)])
+     Math.max(0, METER_DOUBLE_CHECK_MIN - suspects.length), run.utility_type])
 
   for (const row of [...suspects.map(s => ({ ...s, sus: true })), ...pads.map(p => ({ ...p, sus: false }))]) {
     await query(
@@ -440,8 +477,11 @@ export async function completeReadingRun(runId: string, userId: string) {
         AND m.property_id = $1
         AND ub.billing_cycle_month = $2
         AND ub.status = 'unbilled'
+        -- S631: this run issues ITS utility's bills. A water run completing
+        -- later must not sweep up electric bills it never verified.
+        AND ($3::text IS NULL OR m.utility_type = $3)
       RETURNING ub.id, ub.charge_amount`,
-    [run.property_id, run.billing_cycle_month])
+    [run.property_id, run.billing_cycle_month, run.utility_type])
 
   const billsCreated = results.reduce((s, r) => s + (r.billsCreated || 0), 0)
   const billedTotal = billed.reduce((s, b) => s + Number(b.charge_amount), 0)
@@ -461,6 +501,10 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
        FROM utility_reading_runs r
        JOIN utility_meters m ON m.property_id = r.property_id
                             AND m.billing_method IN ('submeter','rubs')
+                            -- S631: a utility-scoped run is finished when ITS
+                            -- meters are read. An outstanding water bill must
+                            -- not hold back a completed electric walk.
+                            AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
        LEFT JOIN utility_meter_readings rd
               ON rd.meter_id = m.id AND rd.billing_cycle_month = r.billing_cycle_month
              AND rd.reason = 'monthly_cycle'

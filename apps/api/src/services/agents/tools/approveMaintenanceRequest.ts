@@ -11,7 +11,7 @@
 import { query, queryOne } from '../../../db'
 import { notifyMaintenanceUpdated } from '../../notifications'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const approveMaintenanceRequest: AgentTool = {
   name: 'approve_maintenance_request',
@@ -33,8 +33,8 @@ export const approveMaintenanceRequest: AgentTool = {
 
     // Scope: must be THIS landlord's request, and awaiting approval.
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = $2',
-      [requestId, actor.profileId]
+      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = ANY($2::uuid[])',
+      [requestId, actorLandlordIds(actor)]
     )
     if (!request) return { ok: false, error: 'No such maintenance request for your account.' }
     if (request.status !== 'awaiting_approval') {
@@ -49,8 +49,8 @@ export const approveMaintenanceRequest: AgentTool = {
     // no matching row (no double comment/notification).
     const updated = await queryOne<any>(
       `UPDATE maintenance_requests SET status = $1${nowAssigned}, updated_at = NOW()
-        WHERE id = $2 AND landlord_id = $3 AND status = 'awaiting_approval' RETURNING *`,
-      [nextStatus, requestId, actor.profileId]
+        WHERE id = $2 AND landlord_id = ANY($3::uuid[]) AND status = 'awaiting_approval' RETURNING *`,
+      [nextStatus, requestId, actorLandlordIds(actor)]
     )
     if (!updated) return { ok: false, error: 'That request was just updated — please re-check its status before approving.' }
     await query(

@@ -168,11 +168,11 @@ describe('S600 activateBillingForSettledRent', () => {
 
 describe('S600 applyBillingGraceCaps', () => {
   it('flips a landlord to billing once the explicit grace cap arrives', async () => {
-    const client = await getClient()
-    let landlordId: string
-    try {
-      ;({ landlordId } = await seedLandlord(client))
-    } finally { client.release() }
+    // S631: an OPERATING landlord — one holding an active lease. That is who the
+    // cap is for: someone using the platform who would otherwise sit in free
+    // grace forever by collecting rent off-platform. A landlord with nothing on
+    // the platform is never stamped (see the S631 describe below).
+    const { landlordId } = await buildOccupiedStack()
     // In grace, cap = last month (already arrived).
     await setBilling(landlordId!, null, `(date_trunc('month', now()) - INTERVAL '1 month')::date`)
 
@@ -204,11 +204,7 @@ describe('S600 applyBillingGraceCaps', () => {
   })
 
   it('falls back to created_at + 2 cycles when billing_grace_until is NULL', async () => {
-    const client = await getClient()
-    let landlordId: string
-    try {
-      ;({ landlordId } = await seedLandlord(client))
-    } finally { client.release() }
+    const { landlordId } = await buildOccupiedStack()   // S631: operating landlord
     // NULL start + NULL grace, created 3 months ago → cap (created+2mo) has passed.
     await db.query(
       `UPDATE landlords
@@ -225,5 +221,47 @@ describe('S600 applyBillingGraceCaps', () => {
          FROM landlords WHERE id=$1`, [landlordId!]
     )
     expect(r.rows[0].started).toBe(true)
+  })
+})
+
+// S631 (Nic): "Fix it so the data's clean." The cap used to stamp every account
+// whose grace window ran out, including one that never had a tenant — so
+// billing_starts_at claimed a landlord went live who never did.
+describe('S631 grace cap skips landlords who never started', () => {
+  it('does NOT flip an abandoned signup with no lease and no payment', async () => {
+    const client = await getClient()
+    let landlordId: string
+    try {
+      const { userId: ownerUserId, landlordId: lid } = await seedLandlord(client)
+      landlordId = lid
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      // A space, never leased — the "typed a property name and left" shape.
+      await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+      await client.query(
+        `UPDATE landlords SET billing_starts_at = NULL, billing_grace_until = '2026-01-01'
+          WHERE id = $1`, [landlordId])
+    } finally { client.release() }
+
+    await applyBillingGraceCaps(new Date('2026-06-15T08:00:00Z'))
+    const r = await db.query<{ starts: string | null }>(
+      `SELECT billing_starts_at::text AS starts FROM landlords WHERE id=$1`, [landlordId!])
+    expect(r.rows[0].starts).toBeNull()
+  })
+
+  it('DOES flip a landlord holding an active lease, even with no payment through GAM', async () => {
+    const { landlordId } = await buildOccupiedStack()
+    await setBilling(landlordId, null)
+    const client = await getClient()
+    try {
+      await client.query(
+        `UPDATE landlords SET billing_grace_until = '2026-01-01' WHERE id = $1`, [landlordId])
+    } finally { client.release() }
+
+    await applyBillingGraceCaps(new Date('2026-06-15T08:00:00Z'))
+    const r = await db.query<{ starts: string | null }>(
+      `SELECT billing_starts_at::text AS starts FROM landlords WHERE id=$1`, [landlordId])
+    expect(r.rows[0].starts).toBe('2026-01-01')
   })
 })

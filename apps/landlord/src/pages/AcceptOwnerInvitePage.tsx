@@ -65,9 +65,10 @@ export function AcceptOwnerInvitePage() {
     navigate(`${to}?invite=${encodeURIComponent(token)}&email=${encodeURIComponent(invite?.email ?? '')}`)
   }
 
+  // S631: .auth-center rather than a centred flex — a card taller than a
+  // landscape phone was clipping its own top into unreachable space.
   const shell = (children: React.ReactNode) => (
-    <div style={{ minHeight: '100vh', background: 'var(--bg-0)', display: 'flex',
-      alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+    <div className="auth-center">
       <div className="card" style={{ maxWidth: 460, width: '100%', padding: 28 }}>{children}</div>
     </div>
   )

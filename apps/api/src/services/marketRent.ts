@@ -37,7 +37,11 @@ export async function getMarketRent(
   unitType: string,
   city: string,
   state: string,
-  excludeLandlordId?: string | null
+  // S634: every company the asking ACCOUNT owns. A market comparison must not
+  // include the asker's own units — and an account that owns two parks would
+  // otherwise be compared against half of itself, quietly dragging the
+  // "market" toward its own asking prices.
+  excludeLandlordIds?: string[] | null
 ): Promise<MarketRentStat | null> {
   const ut = String(unitType || '').trim()
   const c = String(city || '').trim()
@@ -61,10 +65,10 @@ export async function getMarketRent(
         AND u.unit_type = $1
         AND lower(btrim(p.city)) = lower($2)
         AND upper(btrim(p.state)) = upper($3)
-        AND ($4::uuid IS NULL OR p.landlord_id <> $4::uuid)
+        AND (COALESCE(array_length($4::uuid[], 1), 0) = 0 OR p.landlord_id <> ALL($4::uuid[]))
       GROUP BY u.unit_type, btrim(p.city), upper(btrim(p.state))
      HAVING COUNT(DISTINCT p.landlord_id) >= $5`,
-    [ut, c, st, excludeLandlordId ?? null, MIN_DISTINCT_LANDLORDS]
+    [ut, c, st, excludeLandlordIds ?? null, MIN_DISTINCT_LANDLORDS]
   )
   const r = rows[0]
   if (!r) return null

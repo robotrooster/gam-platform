@@ -14,7 +14,7 @@
  * about which property — never a guess between two units.
  */
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   unit_number: string | null
@@ -95,7 +95,7 @@ export const getUnitLease: AgentTool = {
          LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active' AND lt.role = 'primary'
          LEFT JOIN tenants t ON t.id = lt.tenant_id
          LEFT JOIN users us ON us.id = t.user_id
-        WHERE p.landlord_id = $1
+        WHERE p.landlord_id = ANY($1::uuid[])
           AND (
                un.unit_number ILIKE $2
             OR ($3 ~ '[0-9]'
@@ -106,7 +106,7 @@ export const getUnitLease: AgentTool = {
           AND ($4::text[] IS NULL OR un.unit_type = ANY($4))
           AND ($5 = '' OR p.name ILIKE '%' || $5 || '%')
         ORDER BY p.name, un.unit_number`,
-      [actor.profileId, `%${unit}%`, unit, typeFilter, property]
+      [actorLandlordIds(actor), `%${unit}%`, unit, typeFilter, property]
     )
 
     // S617: "rv 1" also matched RV 10, because a substring search on "RV 1"

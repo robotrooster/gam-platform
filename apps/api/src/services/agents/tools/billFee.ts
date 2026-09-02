@@ -10,7 +10,7 @@
 import { query } from '../../../db'
 import { isAgentCapabilityEnabled } from '../../agentPermissions'
 import { createLeaseFeePayment } from '../../leaseFees'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Candidate = {
   lease_id: string
@@ -57,8 +57,8 @@ export const billFee: AgentTool = {
          JOIN v_lease_active_tenants vlat ON vlat.lease_id = l.id AND vlat.role = 'primary'
          JOIN tenants t     ON t.id = vlat.tenant_id
          JOIN users us      ON us.id = t.user_id
-        WHERE l.landlord_id = $1 AND l.status = 'active'`,
-      [actor.profileId]
+        WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'`,
+      [actorLandlordIds(actor)]
     )
 
     const tn = norm(args.tenant_name), un = norm(args.unit), pn = norm(args.property)

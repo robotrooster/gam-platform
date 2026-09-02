@@ -188,7 +188,8 @@ describe('a retired unit is structurally out of service', () => {
   it('never appears in the availability picker, but its replacement does', async () => {
     const replacementId = await retire()
     const avail = await findAvailableUnits({
-      landlordId: ctx.landlordId,
+      // S633: availability spans every company the ACCOUNT owns.
+      landlordIds: [ctx.landlordId],
       window: { checkIn: new Date().toISOString().slice(0, 10), checkOut: null, excludeBookingId: null } as any,
     })
     const ids = avail.map((u: any) => u.id)

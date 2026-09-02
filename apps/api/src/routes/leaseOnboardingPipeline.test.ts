@@ -170,7 +170,10 @@ describe('accept → auto-draft', () => {
     const vals = await fieldVals(drafts[0].id)
     expect(vals.rent_amount).toBe('1000.00')
     expect(vals.security_deposit).toBe('1500.00') // 1000 × 1.5, from the template
-    expect(vals.lease_type).toBe('fixed_term')
+    // S635 (Nic): a tagged value is written onto the SIGNED DOCUMENT, so an enum
+    // reaches the page as English. Was 'fixed_term' until a resident's lease
+    // printed "month_to_month" in the rental-term blank.
+    expect(vals.lease_type).toBe('Fixed term')
     expect(vals.start_date).toBeTruthy()
     expect(vals.end_date).toBeTruthy()
   })
@@ -188,7 +191,7 @@ describe('accept → auto-draft', () => {
       const roles = await signerRoles(d.id)
       expect(roles.filter(r => r === 'primary').length).toBe(1)
       expect(roles).not.toContain('co_tenant_1')
-      expect((await fieldVals(d.id)).lease_type).toBe('month_to_month')
+      expect((await fieldVals(d.id)).lease_type).toBe('Month-to-month')   // S635: humanised onto the page
     }
     // Third onboard exceeds the 2×bedrooms cap.
     const third = await onboard(f, `c-${randomUUID().slice(0, 6)}@x.dev`)

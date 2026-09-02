@@ -31,7 +31,7 @@ async function stack() {
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 850 })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 850 })
     await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
-    return { landlordId, tenantId, unitId, leaseId, actor: { userId, role: 'landlord' as const, profileId: landlordId } }
+    return { landlordId, tenantId, unitId, leaseId, actor: { userId, role: 'landlord' as const, profileId: '', landlordIds: [landlordId] } }
   } finally { client.release() }
 }
 

@@ -23,7 +23,7 @@
 import { query, queryOne } from '../../../db'
 import { createNotification, notifyMaintenanceUpdated } from '../../notifications'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface TeamWorker {
   user_id: string
@@ -67,8 +67,8 @@ export const assignMaintenanceRequest: AgentTool = {
 
     // 1) The request must be THIS landlord's, and still assignable.
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = $2',
-      [requestId, actor.profileId]
+      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = ANY($2::uuid[])',
+      [requestId, actorLandlordIds(actor)]
     )
     if (!request) return { ok: false, error: 'No such maintenance request for your account.' }
     if (request.status === 'completed' || request.status === 'cancelled') {
@@ -81,18 +81,18 @@ export const assignMaintenanceRequest: AgentTool = {
       worker = await queryOne<TeamWorker>(
         `SELECT DISTINCT s.user_id, u.first_name, u.last_name, u.email, u.phone
            FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id
-          WHERE s.landlord_id = $1 AND s.user_id = $2`,
-        [actor.profileId, workerId]
+          WHERE s.landlord_id = ANY($1::uuid[]) AND s.user_id = $2`,
+        [actorLandlordIds(actor), workerId]
       )
       if (!worker) return { ok: false, error: 'That worker isn’t on your maintenance team.' }
     } else {
       const matches = await query<TeamWorker>(
         `SELECT DISTINCT s.user_id, u.first_name, u.last_name, u.email, u.phone
            FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id
-          WHERE s.landlord_id = $1
+          WHERE s.landlord_id = ANY($1::uuid[])
             AND (u.first_name ILIKE $2 OR u.last_name ILIKE $2
                  OR (COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')) ILIKE $2)`,
-        [actor.profileId, `%${workerNameArg}%`]
+        [actorLandlordIds(actor), `%${workerNameArg}%`]
       )
       if (matches.length === 0) {
         return { ok: false, error: `No worker named “${workerNameArg}” is on your maintenance team. Use get_maintenance_team to see who’s available.` }
@@ -119,9 +119,9 @@ export const assignMaintenanceRequest: AgentTool = {
     const updated = await queryOne<any>(
       `UPDATE maintenance_requests
           SET assigned_to = $1, status = $2, assigned_at = NOW(), updated_at = NOW()
-        WHERE id = $3 AND landlord_id = $4 AND status NOT IN ('completed','cancelled')
+        WHERE id = $3 AND landlord_id = ANY($4::uuid[]) AND status NOT IN ('completed','cancelled')
         RETURNING *`,
-      [worker.user_id, newStatus, requestId, actor.profileId]
+      [worker.user_id, newStatus, requestId, actorLandlordIds(actor)]
     )
     if (!updated) return { ok: false, error: 'That request was just updated — please re-check its status before assigning.' }
 
@@ -139,7 +139,8 @@ export const assignMaintenanceRequest: AgentTool = {
     try {
       await createNotification({
         userId: worker.user_id,
-        landlordId: actor.profileId,
+        // S634: the request's own company, not the session's.
+        landlordId: request.landlord_id,
         type: 'maintenance_assigned',
         title: `New work order: ${request.title}`,
         body: `You’ve been assigned a ${request.priority} maintenance request${unitLabel}: ${request.title}.`,

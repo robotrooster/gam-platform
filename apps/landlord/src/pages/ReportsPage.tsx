@@ -5,6 +5,9 @@ import { humanize, EXPENSE_CATEGORY_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
+// S633: tax + statement documents belong to ONE company; the picker renders
+// nothing for an account that owns a single one.
+import { EntityPicker } from '../components/EntityPicker'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const fmt0 = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {maximumFractionDigits:0})}` : '—'
@@ -539,14 +542,25 @@ function AnnualTaxTab() {
   const now = new Date()
   const [year, setYear] = useState(now.getFullYear())
   const { can } = usePerms()
-  const { data: tax, isLoading } = useQuery<any>(['tax-summary', year], () => apiGet(`/reports/tax-summary?year=${year}`))
-  const { data: wt } = useQuery<any>(['wt-1099', year], () => apiGet(`/reports/work-trade-1099?year=${year}`))
+  // S633: a TAX document belongs to one company. Analytical rollups elsewhere on
+  // this page span the whole account; these two cannot, because summing two LLCs
+  // into one return is wrong on its face. Single-company accounts see no picker.
+  const [companyId, setCompanyId] = useState<string>('')
+  const q = companyId ? `&landlordId=${companyId}` : ''
+  const { data: tax, isLoading } = useQuery<any>(['tax-summary', year, companyId],
+    () => apiGet(`/reports/tax-summary?year=${year}${q}`), { enabled: !!companyId })
+  const { data: wt } = useQuery<any>(['wt-1099', year, companyId],
+    () => apiGet(`/reports/work-trade-1099?year=${year}${q}`), { enabled: !!companyId })
 
   const monthly: any[] = tax?.monthlyBreakdown ?? []
   const eligible: any[] = wt?.eligible ?? []
 
   return (
     <div style={{ display: 'grid', gap: 14 }}>
+      <div className="no-print">
+        <EntityPicker value={companyId} onChange={setCompanyId}
+          note="A tax statement belongs to one company — each LLC files its own return." />
+      </div>
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
         <PeriodPicker year={year} setYear={setYear} month={null} />
         {can('reports.export') && (
@@ -631,7 +645,12 @@ function OwnerStatementTab() {
   const [year, setYear]   = useState(now.getFullYear())
   const [month, setMonth] = useState<number | null>(now.getMonth() + 1)
   const { can } = usePerms()
-  const { data, isLoading } = useQuery<any>(['monthly-statement', year, month], () => apiGet(`/reports/monthly-statement?year=${year}&month=${month}`))
+  // S633: an owner statement is one company's statement — it prints that
+  // company's name at the top.
+  const [companyId, setCompanyId] = useState<string>('')
+  const { data, isLoading } = useQuery<any>(['monthly-statement', year, month, companyId],
+    () => apiGet(`/reports/monthly-statement?year=${year}&month=${month}` + (companyId ? `&landlordId=${companyId}` : '')),
+    { enabled: !!companyId })
 
   const s = data?.summary
   const payments: any[] = data?.payments ?? []
@@ -651,6 +670,10 @@ function OwnerStatementTab() {
 
   return (
     <div style={{ display: 'grid', gap: 14 }}>
+      <div className="no-print">
+        <EntityPicker value={companyId} onChange={setCompanyId}
+          note="An owner statement is one company's statement — it prints that company's name." />
+      </div>
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <PeriodPicker year={year} setYear={setYear} month={month} setMonth={m => setMonth(m ?? 1)} />
         {can('reports.export') && (

@@ -790,3 +790,42 @@ describe('POST /api/public/properties/apply — landlord resolution', () => {
     expect(res.body.data.unit_id).toBeNull()
   })
 })
+
+// S631 (Nic, DIRECTIVE): "We should maybe lock the street address once it's set.
+// That way it's not altering our future heat map that we're gonna build."
+describe('S631 property address is fixed once set', () => {
+  it('refuses a changed street address, but still allows a rename', async () => {
+    const app = buildApp()
+    const fx = await seedPropsFixture()
+    const client = await db.connect()
+    let propertyId: string
+    try {
+      propertyId = await seedProperty(client, {
+        landlordId: fx.landlordId,
+        ownerUserId: fx.landlordUserId,
+        managedByUserId: fx.landlordUserId,
+      })
+    } finally { client.release() }
+
+    const moved = await request(app)
+      .patch(`/api/properties/${propertyId!}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`)
+      .send({ street1: '999 Somewhere Else Rd' })
+    expect(moved.status).toBe(409)
+    expect(String(moved.body.error)).toMatch(/address is fixed/i)
+
+    // The edit form posts the whole record back on every save, so an UNCHANGED
+    // address must not be mistaken for an attempt to move the property.
+    const cur = await db.query<{ street1: string; city: string }>(
+      `SELECT street1, city FROM properties WHERE id=$1`, [propertyId!])
+    const renamed = await request(app)
+      .patch(`/api/properties/${propertyId!}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`)
+      .send({ name: 'Renamed Park', street1: cur.rows[0].street1, city: cur.rows[0].city })
+    expect(renamed.status).toBe(200)
+    const after = await db.query<{ name: string; street1: string }>(
+      `SELECT name, street1 FROM properties WHERE id=$1`, [propertyId!])
+    expect(after.rows[0].name).toBe('Renamed Park')
+    expect(after.rows[0].street1).toBe(cur.rows[0].street1)
+  })
+})

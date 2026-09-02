@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto'
 import { query } from '../../db'
 import { logger } from '../../lib/logger'
 import type { AgentSessionInput, AgentSessionResult } from './agentSession'
-import type { AgentActor } from './tools/types'
+import { actorLandlordIds, type AgentActor } from './tools/types'
 import type { AgentOutcome } from './types'
 
 export interface LogInteractionContext {
@@ -42,8 +42,16 @@ export async function resolveInteractionProperty(
   actor: AgentActor
 ): Promise<{ propertyId: string | null; landlordId: string | null }> {
   if (actor.role === 'landlord') {
-    // Portfolio-wide: no single property; the landlord IS the subject.
-    return { propertyId: null, landlordId: actor.profileId }
+    // Portfolio-wide: no single property; the ACCOUNT is the subject.
+    //
+    // S634: this stamped `actor.profileId` — the one company a session used to
+    // sit on — so every landlord interaction was filed under one company no
+    // matter which one it was actually about. Same shape as the tenant branch
+    // below: attribute it when there is exactly one honest answer, and null when
+    // the conversation genuinely spans several. A made-up attribution is worse
+    // than none, because it is what a later report would count.
+    const owned = actorLandlordIds(actor)
+    return { propertyId: null, landlordId: owned.length === 1 ? owned[0] : null }
   }
   if (actor.role === 'guest') {
     // Booking guest: attribute to the booking's landlord (+ its property).

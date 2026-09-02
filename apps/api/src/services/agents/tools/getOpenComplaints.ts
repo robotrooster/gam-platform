@@ -22,7 +22,7 @@
 
 import { COMPLAINT_CATEGORY_LABEL, type ComplaintCategory } from '@gam/shared'
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   id: string
@@ -69,11 +69,11 @@ export const getOpenComplaints: AgentTool = {
          LEFT JOIN units u  ON u.id = c.unit_id
          LEFT JOIN properties p ON p.id = c.property_id
          LEFT JOIN units au ON au.id = c.about_unit_id
-        WHERE c.landlord_id = $1
+        WHERE c.landlord_id = ANY($1::uuid[])
           ${includeResolved ? '' : "AND c.status IN ('open','reviewed')"}
         ORDER BY c.created_at DESC
         LIMIT $2`,
-      [actor.profileId, limit],
+      [actorLandlordIds(actor), limit],
     )
 
     if (rows.length === 0) {

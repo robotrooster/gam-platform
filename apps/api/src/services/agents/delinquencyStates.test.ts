@@ -18,7 +18,7 @@ import { getDelinquentTenants } from './tools/getDelinquentTenants'
 import { getMoneyInFlight } from './tools/getMoneyInFlight'
 import { routePlan } from './toolRouting'
 
-const ACTOR = { userId: 'u1', role: 'landlord', profileId: 'll1' } as any
+const ACTOR = { userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['ll1'] } as any
 
 const row = (over: Partial<any> = {}) => ({
   first_name: 'Frank', last_name: 'Williams', email: 'f@x.dev',

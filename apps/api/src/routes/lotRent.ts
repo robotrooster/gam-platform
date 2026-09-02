@@ -4,15 +4,18 @@ import { Router } from 'express'
 import { query } from '../db'
 import { requireAuth, requireLandlord, requireAdmin } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { resolveLandlordTarget } from '../lib/landlordScope'
 import { getInvestorPortfolio, recordLotRentPaid, accrueLotRentCharges } from '../services/lotRent'
 
 export const lotRentRouter = Router()
 lotRentRouter.use(requireAuth)
 
 function landlordScope(req: any): string {
-  const id = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
-  if (!id) throw new AppError(403, 'A landlord/operator context is required.')
-  return id
+  // S633: an account is not an entity. `?entityId=` names one; otherwise the
+  // account's only company is used, and an account that owns several is asked
+  // which rather than being silently put on whichever one the session sat on.
+  // resolveLandlordTarget does the ownership check either way.
+  return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
 }
 
 // GET /api/lot-rent/portfolio — investor net across their homes-only properties.

@@ -5,7 +5,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   end_date: string
@@ -54,11 +54,11 @@ export const getLeaseExpirations: AgentTool = {
          FROM leases l
          JOIN units u ON u.id = l.unit_id
          JOIN properties p ON p.id = u.property_id
-        WHERE l.landlord_id = $1 AND l.status = 'active' AND l.end_date IS NOT NULL
+        WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active' AND l.end_date IS NOT NULL
           AND l.end_date <= (now() + make_interval(days => $2::int))::date
         ORDER BY l.end_date
         LIMIT $3`,
-      [actor.profileId, days, limit]
+      [actorLandlordIds(actor), days, limit]
     )
     return {
       ok: true,

@@ -24,17 +24,20 @@ import { query, queryOne } from '../../../db'
 import {
   createServiceInterruption, resolveServiceInterruption,
 } from '../../serviceInterruptions'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 const label = (t: string) => SERVICE_INTERRUPTION_TYPE_LABELS[t as ServiceInterruptionType] ?? t
 
 /** Resolve a property NAME to exactly one property this landlord owns. */
-async function resolveOwnProperty(landlordId: string, propertyName: string) {
-  const rows = await query<{ id: string; name: string }>(
-    `SELECT id, name FROM properties WHERE landlord_id = $1 AND name ILIKE $2 ORDER BY name LIMIT 5`,
-    [landlordId, `%${propertyName.trim()}%`]
+// S634: resolves across every company the ACCOUNT owns, and returns the
+// property's OWN landlord_id — the interruption is filed under the company that
+// owns the property, never under whichever one the session sat on.
+async function resolveOwnProperty(landlordIds: string[], propertyName: string) {
+  const rows = await query<{ id: string; name: string; landlord_id: string }>(
+    `SELECT id, name, landlord_id FROM properties WHERE landlord_id = ANY($1::uuid[]) AND name ILIKE $2 ORDER BY name LIMIT 5`,
+    [landlordIds, `%${propertyName.trim()}%`]
   )
-  if (rows.length === 1) return { property: rows[0] as { id: string; name: string }, error: null }
+  if (rows.length === 1) return { property: rows[0] as { id: string; name: string; landlord_id: string }, error: null }
   if (rows.length === 0) return { property: null, error: `No property named "${propertyName}" on this account.` }
   return {
     property: null,
@@ -57,7 +60,7 @@ export const getServiceInterruptions: AgentTool = {
   audiences: ['landlord'],
 
   async execute(args, actor: AgentActor) {
-    const params: any[] = [actor.profileId]
+    const params: any[] = [actorLandlordIds(actor)]
     let propFilter = ''
     const propertyName = typeof args.propertyName === 'string' && args.propertyName.trim() ? args.propertyName.trim() : null
     if (propertyName) {
@@ -70,7 +73,7 @@ export const getServiceInterruptions: AgentTool = {
               cardinality(si.unit_ids) AS targeted_units
          FROM service_interruptions si
          JOIN properties p ON p.id = si.property_id
-        WHERE si.landlord_id = $1 ${propFilter}
+        WHERE si.landlord_id = ANY($1::uuid[]) ${propFilter}
         ORDER BY (si.status IN ('scheduled','active')) DESC, si.starts_at DESC
         LIMIT 25`,
       params
@@ -131,12 +134,12 @@ export const postServiceInterruption: AgentTool = {
     if (startsAt === 'bad') return { ok: false, error: 'startsAt is not a valid datetime.' }
     if (expectedRestoreAt === 'bad') return { ok: false, error: 'expectedRestoreAt is not a valid datetime.' }
 
-    const { property, error } = await resolveOwnProperty(actor.profileId, propertyName)
+    const { property, error } = await resolveOwnProperty(actorLandlordIds(actor), propertyName)
     if (!property) return { ok: false, error }
 
     try {
       const { row, residentsNotified, staffNotified } = await createServiceInterruption({
-        propertyId: property.id, landlordId: actor.profileId, unitIds: [],
+        propertyId: property.id, landlordId: property.landlord_id, unitIds: [],
         utilityType,
         title: typeof args.title === 'string' && args.title.trim() ? args.title.trim().slice(0, 160) : null,
         message: typeof args.message === 'string' && args.message.trim() ? args.message.trim().slice(0, 2000) : null,
@@ -179,8 +182,8 @@ export const resolveServiceInterruptionTool: AgentTool = {
     const id = String(args.noticeId ?? '').trim()
     if (!id) return { ok: false, error: 'A noticeId is required (from get_service_interruptions).' }
     const si = await queryOne<any>(
-      `SELECT * FROM service_interruptions WHERE id = $1 AND landlord_id = $2`,
-      [id, actor.profileId]
+      `SELECT * FROM service_interruptions WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+      [id, actorLandlordIds(actor)]
     )
     if (!si) return { ok: false, error: 'No such outage notice on this account.' }
     try {

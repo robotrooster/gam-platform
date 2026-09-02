@@ -20,36 +20,36 @@ describe('checkTurnBudget', () => {
   afterEach(() => { delete process.env.AGENT_ABUSE_AUTOHIDE })
 
   it('non-tenant/landlord audiences are never budgeted', async () => {
-    expect(await checkTurnBudget('prospect', 'u', 'p')).toEqual({ allowed: true })
-    expect(await checkTurnBudget('guest', 'u', 'p')).toEqual({ allowed: true })
+    expect(await checkTurnBudget('prospect', 'u', ['p'])).toEqual({ allowed: true })
+    expect(await checkTurnBudget('guest', 'u', ['p'])).toEqual({ allowed: true })
     expect(mockQueryOne).not.toHaveBeenCalled()
   })
 
   it('tenant under both caps is admitted', async () => {
     mockQueryOne.mockResolvedValueOnce({ total: 10, unproductive: 2 })
-    expect(await checkTurnBudget('tenant', 'u', 't')).toEqual({ allowed: true })
+    expect(await checkTurnBudget('tenant', 'u', ['t'])).toEqual({ allowed: true })
   })
 
   it('tenant at the off-topic cap is refused (default 5)', async () => {
     mockQueryOne.mockResolvedValueOnce({ total: 10, unproductive: 5 })
-    expect(await checkTurnBudget('tenant', 'u', 't')).toEqual({ allowed: false, reason: 'daily_unproductive' })
+    expect(await checkTurnBudget('tenant', 'u', ['t'])).toEqual({ allowed: false, reason: 'daily_unproductive' })
   })
 
   it('tenant at the daily total cap is refused (default 60)', async () => {
     mockQueryOne.mockResolvedValueOnce({ total: 60, unproductive: 0 })
-    expect(await checkTurnBudget('tenant', 'u', 't')).toEqual({ allowed: false, reason: 'daily_total' })
+    expect(await checkTurnBudget('tenant', 'u', ['t'])).toEqual({ allowed: false, reason: 'daily_total' })
   })
 
   it('landlord cap scales with occupied units — 32 units → 240/day (7.5/unit)', async () => {
     mockQueryOne
       .mockResolvedValueOnce({ total: 239, unproductive: 0 }) // today's counts
       .mockResolvedValueOnce({ n: 32 })                       // occupied units
-    expect(await checkTurnBudget('landlord', 'u', 'L')).toEqual({ allowed: true })
+    expect(await checkTurnBudget('landlord', 'u', ['L'])).toEqual({ allowed: true })
 
     mockQueryOne
       .mockResolvedValueOnce({ total: 240, unproductive: 0 })
       .mockResolvedValueOnce({ n: 32 })
-    expect(await checkTurnBudget('landlord', 'u', 'L')).toEqual({ allowed: false, reason: 'daily_total' })
+    expect(await checkTurnBudget('landlord', 'u', ['L'])).toEqual({ allowed: false, reason: 'daily_total' })
   })
 
   it('small/empty landlords get the tenant-budget floor, not the raw formula', async () => {
@@ -57,17 +57,17 @@ describe('checkTurnBudget', () => {
     mockQueryOne
       .mockResolvedValueOnce({ total: 59, unproductive: 0 })
       .mockResolvedValueOnce({ n: 2 })
-    expect(await checkTurnBudget('landlord', 'u', 'L')).toEqual({ allowed: true })
+    expect(await checkTurnBudget('landlord', 'u', ['L'])).toEqual({ allowed: true })
     // 0 units (mid-onboarding) → still the full tenant budget.
     mockQueryOne
       .mockResolvedValueOnce({ total: 59, unproductive: 0 })
       .mockResolvedValueOnce({ n: 0 })
-    expect(await checkTurnBudget('landlord', 'u', 'L')).toEqual({ allowed: true })
+    expect(await checkTurnBudget('landlord', 'u', ['L'])).toEqual({ allowed: true })
   })
 
   it('landlord off-topic cap is 10 regardless of portfolio size', async () => {
     mockQueryOne.mockResolvedValueOnce({ total: 30, unproductive: 10 })
-    expect(await checkTurnBudget('landlord', 'u', 'L')).toEqual({ allowed: false, reason: 'daily_unproductive' })
+    expect(await checkTurnBudget('landlord', 'u', ['L'])).toEqual({ allowed: false, reason: 'daily_unproductive' })
   })
 })
 

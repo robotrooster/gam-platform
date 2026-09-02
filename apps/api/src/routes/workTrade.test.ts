@@ -112,8 +112,8 @@ async function seed(): Promise<Fixture> {
       tenantAId: tenantA, tenantAUserId: taUser.rows[0].user_id,
       tenantBId: tenantB, tenantBUserId: tbUser.rows[0].user_id,
       leaseAId: leaseA,
-      tokenA:       sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: aId, permissions: {} }),
-      tokenB:       sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: bId, permissions: {} }),
+      tokenA:       sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: null, landlordIds: [aId], permissions: {} }),
+      tokenB:       sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: null, landlordIds: [bId], permissions: {} }),
       tenantAToken: sign({ userId: taUser.rows[0].user_id, role: 'tenant', email: 'ta@t.dev', profileId: tenantA, permissions: {} }),
       tenantBToken: sign({ userId: tbUser.rows[0].user_id, role: 'tenant', email: 'tb@t.dev', profileId: tenantB, permissions: {} }),
       adminToken:   sign({ userId: admin.rows[0].id, role: 'admin', email: 'a@t.dev', profileId: null, permissions: {} }),
@@ -136,13 +136,24 @@ async function seedAgreement(f: Fixture, landlordId = f.landlordAId, tenantId = 
 // ───────────────────────────────────────────────────────────────────
 
 describe('POST /  — S397 tenant scope fix', () => {
-  it('cross-landlord unit → 404', async () => {
+  // S633: still refused — the status moved from 404 to 403 and nothing else did.
+  // The company a work-trade agreement belongs to is now DERIVED from the unit
+  // (landlordIdForUnit) instead of being assumed from session state, and that
+  // helper answers "that unit is not yours to act on" rather than pretending the
+  // unit does not exist. 403 is also what the three GET routes in this very file
+  // already return for the identical cross-landlord case, so this makes the file
+  // consistent rather than introducing a new shape. The isolation itself is
+  // unchanged: landlord A cannot write against landlord B's unit.
+  it("cross-landlord unit → 403, and no agreement is written", async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post('/api/work-trade/')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ unitId: f.unitBId, tenantId: f.tenantAId, startDate: '2026-06-01' })
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(403)
+    const rows = await db.query(
+      `SELECT id FROM work_trade_agreements WHERE unit_id = $1`, [f.unitBId])
+    expect(rows.rows).toHaveLength(0)
   })
 
   it('S397 → S576 (B-8): stranger tenantId (no active lease on this unit) → 400; no row created', async () => {

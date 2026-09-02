@@ -21,9 +21,11 @@ import { getClient, queryOne } from '../../../db'
 import { insertInspectionWithChecklist } from '../../inspections'
 import { INSPECTION_TYPES, type InspectionType } from '@gam/shared'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface UnitRow {
+  /** S634: the company the record belongs to — see the notify call below. */
+  landlord_id: string
   id: string
   unit_number: string | null
   bedrooms: number | null
@@ -80,10 +82,10 @@ export const createInspection: AgentTool = {
 
     // Resolve the unit, hard-scoped to THIS landlord.
     const unit = await queryOne<UnitRow>(
-      `SELECT id, unit_number, bedrooms, bathrooms, unit_type, dwelling_ownership, is_multi_level, is_ada_accessible, living_areas, features
-         FROM units WHERE unit_number ILIKE $1 AND landlord_id = $2
+      `SELECT id, unit_number, landlord_id, bedrooms, bathrooms, unit_type, dwelling_ownership, is_multi_level, is_ada_accessible, living_areas, features
+         FROM units WHERE unit_number ILIKE $1 AND landlord_id = ANY($2::uuid[])
          ORDER BY unit_number LIMIT 1`,
-      [unitArg, actor.profileId],
+      [unitArg, actorLandlordIds(actor)],
     )
     if (!unit) return { ok: false, error: `No unit “${unitArg}” on your account. Check the unit number.` }
 
@@ -128,7 +130,8 @@ export const createInspection: AgentTool = {
       await client.query('BEGIN')
       const { id, seededItems } = await insertInspectionWithChecklist(client, {
         unitId: unit.id,
-        landlordId: actor.profileId,
+        // S634: the inspection belongs to the company that owns the unit.
+        landlordId: unit.landlord_id,
         unitType: unit.unit_type,
         bedrooms: unit.bedrooms,
         bathrooms: unit.bathrooms,

@@ -40,10 +40,15 @@ export async function createAutoFieldJob(templateId: string, landlordId: string)
 }
 
 /** Fetch a job scoped to its owning landlord (null if not found / not theirs). */
-export async function getAutoFieldJob(jobId: string, landlordId: string): Promise<AutoFieldJob | null> {
+// S633: scoped to every company the ACCOUNT owns. The landlord_id filter still
+// stops one landlord polling another's job; it is just no longer narrowed to
+// whichever company the session sat on, which would have made a job started
+// under one company unreadable from the same login.
+export async function getAutoFieldJob(jobId: string, landlordIds: string[]): Promise<AutoFieldJob | null> {
+  if (!landlordIds.length) return null
   return queryOne<AutoFieldJob>(
-    `SELECT * FROM auto_field_jobs WHERE id = $1 AND landlord_id = $2`,
-    [jobId, landlordId])
+    `SELECT * FROM auto_field_jobs WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+    [jobId, landlordIds])
 }
 
 /**

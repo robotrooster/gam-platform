@@ -91,24 +91,33 @@ export async function createPosCustomer(args: {
   }
 }
 
-export async function listPosCustomers(landlordId: string): Promise<PosCustomerRow[]> {
+// S633: takes EVERY entity the account owns, not one. A landlord who owns two
+// companies has one customer roster from their side of the counter; scoping it
+// to a single entity id hid half of it with no error and no empty-state — the
+// list simply came back short. Callers pass landlordScopeIds(req.user).
+export async function listPosCustomers(landlordIds: string[]): Promise<PosCustomerRow[]> {
+  if (!landlordIds.length) return []
   return query<PosCustomerRow>(
     `SELECT * FROM pos_customers
-      WHERE landlord_id = $1 AND archived_at IS NULL
+      WHERE landlord_id = ANY($1::uuid[]) AND archived_at IS NULL
       ORDER BY last_name, first_name`,
-    [landlordId],
+    [landlordIds],
   )
 }
 
-export async function archivePosCustomer(args: { landlordId: string; customerId: string }): Promise<void> {
+// S633: landlordIds is the caller's whole scope, so archiving works on a
+// customer at any company the account owns. The filter is still there — it is
+// what stops one landlord archiving another's customer — it is just no longer
+// narrowed to whichever entity the session happened to sit on.
+export async function archivePosCustomer(args: { landlordIds: string[]; customerId: string }): Promise<void> {
   // Soft-archive — don't break historical pos_transactions /
   // flex_charge_accounts that reference this row.
   const row = await queryOne<{ id: string }>(
     `UPDATE pos_customers
         SET archived_at = NOW(), updated_at = NOW()
-      WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL
+      WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND archived_at IS NULL
       RETURNING id`,
-    [args.customerId, args.landlordId],
+    [args.customerId, args.landlordIds],
   )
   if (!row) throw new AppError(404, 'Customer not found or already archived')
 }
@@ -233,13 +242,17 @@ export async function createFlexChargeAccount(args: {
   }
 }
 
+// S633: landlordIds, plural — the account's whole scope. A landlord with two
+// companies has one book of FlexCharge accounts, and narrowing it to a single
+// entity id returned a short list with no sign that anything was missing.
 export async function listFlexChargeAccounts(args: {
-  landlordId: string
+  landlordIds: string[]
   propertyId?: string
   status?:    FlexChargeAccountStatus
 }): Promise<Array<FlexChargeAccountRow & { customer_name: string | null; customer_email: string | null; balance: number }>> {
-  const where: string[] = ['a.landlord_id = $1']
-  const params: any[] = [args.landlordId]
+  if (!args.landlordIds.length) return []
+  const where: string[] = ['a.landlord_id = ANY($1::uuid[])']
+  const params: any[] = [args.landlordIds]
   if (args.propertyId) { params.push(args.propertyId); where.push(`a.property_id = $${params.length}`) }
   if (args.status)     { params.push(args.status);     where.push(`a.status = $${params.length}`) }
 
@@ -271,8 +284,11 @@ export async function listFlexChargeAccounts(args: {
   )
 }
 
+// S633: scoped to every entity the account owns. The landlord_id filter is
+// still the thing that stops one landlord editing another's account — it is
+// just no longer narrowed to whichever entity the session sat on.
 export async function updateFlexChargeAccount(args: {
-  landlordId:   string
+  landlordIds:  string[]
   accountId:    string
   creditLimit?: number
   status?:      FlexChargeAccountStatus
@@ -300,11 +316,11 @@ export async function updateFlexChargeAccount(args: {
   }
   if (sets.length === 0) throw new AppError(400, 'Nothing to update')
 
-  params.push(args.accountId, args.landlordId)
+  params.push(args.accountId, args.landlordIds)
   const row = await queryOne<FlexChargeAccountRow>(
     `UPDATE flex_charge_accounts
         SET ${sets.join(', ')}, updated_at = NOW()
-      WHERE id = $${params.length - 1} AND landlord_id = $${params.length}
+      WHERE id = $${params.length - 1} AND landlord_id = ANY($${params.length}::uuid[])
       RETURNING *`,
     params,
   )
@@ -349,12 +365,13 @@ export interface DisputedTransactionRow {
  * before the next statement cycle; account flips to disqualified).
  */
 export async function listAccountStatements(args: {
-  landlordId: string
+  landlordIds: string[]
   accountId:  string
 }): Promise<{ statements: AccountStatementRow[]; disputes: DisputedTransactionRow[] }> {
+  // S633: any entity the account owns, not one.
   const acct = await queryOne<{ id: string }>(
-    'SELECT id FROM flex_charge_accounts WHERE id=$1 AND landlord_id=$2',
-    [args.accountId, args.landlordId],
+    'SELECT id FROM flex_charge_accounts WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+    [args.accountId, args.landlordIds],
   )
   if (!acct) throw new AppError(404, 'Account not found')
   const statements = await query<AccountStatementRow>(

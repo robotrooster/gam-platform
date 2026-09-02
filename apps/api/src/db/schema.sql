@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Un3yFBhusRBLhaATERdtxmjHhtcS27qodyOggbgbVL0pfT4pouaSx4zfdFiVtKn
+\restrict cNsOhZbFH7raNd4eqQH2ABks2vvGgfNnwr5csU8yKCYevn4ODZtgAMGarnxK28T
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -137,6 +137,70 @@ BEGIN
     RETURN OLD;
   END IF;
   RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: enforce_meter_utility_retype(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_meter_utility_retype() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  v_unit text;
+BEGIN
+  IF NEW.utility_type IS DISTINCT FROM OLD.utility_type THEN
+    SELECT u.unit_number INTO v_unit
+      FROM utility_meter_units mu
+      JOIN units u ON u.id = mu.unit_id
+     WHERE mu.meter_id = NEW.id
+       AND EXISTS (
+         SELECT 1 FROM utility_meter_units mu2
+           JOIN utility_meters m2 ON m2.id = mu2.meter_id
+          WHERE mu2.unit_id = mu.unit_id
+            AND m2.id <> NEW.id
+            AND m2.utility_type = NEW.utility_type)
+     LIMIT 1;
+    IF v_unit IS NOT NULL THEN
+      RAISE EXCEPTION
+        'Unit % is already on another % meter. Changing this meter to % would put that unit on two.',
+        v_unit, NEW.utility_type, NEW.utility_type
+        USING ERRCODE = 'unique_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_one_meter_per_unit_utility(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_one_meter_per_unit_utility() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  v_utility text;
+  v_conflict text;
+BEGIN
+  SELECT utility_type INTO v_utility FROM utility_meters WHERE id = NEW.meter_id;
+  SELECT m.label INTO v_conflict
+    FROM utility_meter_units mu
+    JOIN utility_meters m ON m.id = mu.meter_id
+   WHERE mu.unit_id = NEW.unit_id
+     AND m.id <> NEW.meter_id
+     AND m.utility_type = v_utility
+   LIMIT 1;
+  IF v_conflict IS NOT NULL THEN
+    RAISE EXCEPTION
+      'This unit is already on the % meter "%". A unit can only be on one % meter — remove it from that one first.',
+      v_utility, v_conflict, v_utility
+      USING ERRCODE = 'unique_violation';
+  END IF;
+  RETURN NEW;
 END;
 $$;
 
@@ -314,6 +378,50 @@ $$;
 
 
 --
+-- Name: intent_default_existing_tenancy(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.intent_default_existing_tenancy() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.is_existing_tenancy IS NOT TRUE THEN
+    SELECT (now() < l.created_at + (28 * INTERVAL '1 day'))
+      INTO NEW.is_existing_tenancy
+      FROM landlords l WHERE l.id = NEW.landlord_id;
+    NEW.is_existing_tenancy := COALESCE(NEW.is_existing_tenancy, false);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: landlord_members_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.landlord_members_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO landlord_member_history
+      (landlord_id, user_id, action, role, added_by_user_id, application)
+    VALUES (NEW.landlord_id, NEW.user_id, 'added', NEW.role, NEW.added_by_user_id,
+            current_setting('application_name', true));
+    RETURN NEW;
+  ELSE
+    INSERT INTO landlord_member_history
+      (landlord_id, user_id, action, role, added_by_user_id, application)
+    VALUES (OLD.landlord_id, OLD.user_id, 'removed', OLD.role, NULL,
+            current_setting('application_name', true));
+    RETURN OLD;
+  END IF;
+END;
+$$;
+
+
+--
 -- Name: occupy_unit_on_active_lease(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -339,6 +447,73 @@ BEGIN
      AND retired_at IS NULL;
 
   RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: property_unit_subtypes_resync(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.property_unit_subtypes_resync() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE r record;
+BEGIN
+  IF NEW.rv_site_layout IS DISTINCT FROM OLD.rv_site_layout
+     OR NEW.rv_amp_service IS DISTINCT FROM OLD.rv_amp_service
+     OR NEW.bedrooms IS DISTINCT FROM OLD.bedrooms
+     OR NEW.bathrooms IS DISTINCT FROM OLD.bathrooms
+     OR NEW.storage_size IS DISTINCT FROM OLD.storage_size
+     OR NEW.dwelling_ownership IS DISTINCT FROM OLD.dwelling_ownership THEN
+    FOR r IN SELECT unit_id FROM unit_subtype_links WHERE subtype_id = NEW.id LOOP
+      PERFORM sync_unit_facts_from_subtypes(r.unit_id);
+    END LOOP;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_platform_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_platform_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_id uuid;
+BEGIN
+  SELECT user_id INTO owner_id FROM platform_owner LIMIT 1;
+  IF owner_id IS NULL THEN
+    RETURN COALESCE(NEW, OLD);
+  END IF;
+
+  IF TG_OP = 'DELETE' AND OLD.id = owner_id THEN
+    RAISE EXCEPTION 'The platform owner account cannot be deleted.'
+      USING ERRCODE = 'raise_exception';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND OLD.id = owner_id AND NEW.role IS DISTINCT FROM OLD.role THEN
+    RAISE EXCEPTION 'The platform owner''s role cannot be changed.'
+      USING ERRCODE = 'raise_exception';
+  END IF;
+
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+
+--
+-- Name: protect_platform_owner_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_platform_owner_row() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'Platform ownership cannot be changed here — it takes a migration.'
+    USING ERRCODE = 'raise_exception';
 END;
 $$;
 
@@ -432,6 +607,62 @@ COMMENT ON FUNCTION public.supersede_utility_service_agreement() IS 'S615: a lea
 
 
 --
+-- Name: sync_unit_facts_from_subtypes(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.sync_unit_facts_from_subtypes(p_unit_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  v_layouts text[]; v_amps text[]; v_beds int[]; v_baths numeric[];
+  v_sizes text[]; v_owns text[]; v_amp text;
+BEGIN
+  SELECT array_agg(DISTINCT s.rv_site_layout) FILTER (WHERE s.rv_site_layout IS NOT NULL AND s.rv_site_layout <> 'none'),
+         array_agg(DISTINCT s.bedrooms)       FILTER (WHERE s.bedrooms IS NOT NULL),
+         array_agg(DISTINCT s.bathrooms)      FILTER (WHERE s.bathrooms IS NOT NULL),
+         array_agg(DISTINCT btrim(s.storage_size)) FILTER (WHERE btrim(COALESCE(s.storage_size,'')) <> ''),
+         array_agg(DISTINCT s.dwelling_ownership)  FILTER (WHERE s.dwelling_ownership IS NOT NULL)
+    INTO v_layouts, v_beds, v_baths, v_sizes, v_owns
+    FROM unit_subtype_links l JOIN property_unit_subtypes s ON s.id = l.subtype_id
+   WHERE l.unit_id = p_unit_id;
+
+  -- 30 amp AND 50 amp is a real pedestal, so amp tags UNION rather than clash.
+  SELECT array_agg(DISTINCT a) INTO v_amps FROM (
+    SELECT unnest(CASE WHEN s.rv_amp_service = 'both' THEN ARRAY['30','50']
+                       ELSE ARRAY[s.rv_amp_service] END) AS a
+      FROM unit_subtype_links l JOIN property_unit_subtypes s ON s.id = l.subtype_id
+     WHERE l.unit_id = p_unit_id
+       AND s.rv_amp_service IS NOT NULL AND s.rv_amp_service <> 'none') q;
+
+  IF array_length(v_layouts, 1) > 1 THEN
+    RAISE EXCEPTION 'A site is back-in or pull-through, not both — pick one layout for this space.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF array_length(v_beds, 1) > 1 OR array_length(v_baths, 1) > 1
+     OR array_length(v_sizes, 1) > 1 OR array_length(v_owns, 1) > 1 THEN
+    RAISE EXCEPTION 'Two of those subtypes describe the same thing differently — untick one.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_amp := CASE
+    WHEN v_amps @> ARRAY['30','50'] THEN 'both'
+    WHEN array_length(v_amps, 1) = 1 THEN v_amps[1]
+    ELSE NULL END;
+
+  UPDATE units SET
+    rv_site_layout     = COALESCE(v_layouts[1], rv_site_layout),
+    rv_amp_service     = COALESCE(v_amp,        rv_amp_service),
+    bedrooms           = COALESCE(v_beds[1],    bedrooms),
+    bathrooms          = COALESCE(v_baths[1],   bathrooms),
+    storage_size       = COALESCE(v_sizes[1],   storage_size),
+    dwelling_ownership = COALESCE(v_owns[1],    dwelling_ownership),
+    updated_at         = NOW()
+  WHERE id = p_unit_id;
+END;
+$$;
+
+
+--
 -- Name: unit_inspection_videos_no_delete(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -456,6 +687,20 @@ BEGIN
     RAISE EXCEPTION 'unit_inspection_videos.video_url is immutable and cannot be changed';
   END IF;
   RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: unit_subtype_links_sync(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.unit_subtype_links_sync() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  PERFORM sync_unit_facts_from_subtypes(COALESCE(NEW.unit_id, OLD.unit_id));
+  RETURN COALESCE(NEW, OLD);
 END;
 $$;
 
@@ -549,6 +794,37 @@ CREATE TABLE public.admin_action_log_archive (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     archived_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+
+--
+-- Name: admin_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_invitations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    email text NOT NULL,
+    role text NOT NULL,
+    invited_by_user_id uuid NOT NULL,
+    token text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    note text,
+    expires_at timestamp with time zone NOT NULL,
+    accepted_at timestamp with time zone,
+    accepted_user_id uuid,
+    revoked_at timestamp with time zone,
+    revoked_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_invitations_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text]))),
+    CONSTRAINT admin_invitations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: TABLE admin_invitations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.admin_invitations IS 'S631: super_admin-issued invitations to the admin console. Accepting creates a NEW user in the invited role; an existing email is refused, never promoted.';
 
 
 --
@@ -3981,6 +4257,31 @@ CREATE TABLE public.landlord_instant_margins (
 
 
 --
+-- Name: landlord_member_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_member_history (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    action text NOT NULL,
+    role text,
+    added_by_user_id uuid,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    db_user text DEFAULT CURRENT_USER NOT NULL,
+    application text,
+    CONSTRAINT landlord_member_history_action_check CHECK ((action = ANY (ARRAY['added'::text, 'removed'::text])))
+);
+
+
+--
+-- Name: TABLE landlord_member_history; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.landlord_member_history IS 'S631: append-only record of every co-owner added to or removed from an entity, written by trigger so a direct database edit is captured too.';
+
+
+--
 -- Name: landlord_member_invitations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4186,12 +4487,28 @@ CREATE TABLE public.landlords (
     welcome_outreach_sent_at timestamp with time zone,
     books_start_date date,
     migration_window_ends_at timestamp with time zone,
+    first_billing_cycle date,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
+    CONSTRAINT landlords_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
     CONSTRAINT landlords_pos_default_margin_pct_check CHECK (((pos_default_margin_pct IS NULL) OR ((pos_default_margin_pct >= (0)::numeric) AND (pos_default_margin_pct < (100)::numeric)))),
     CONSTRAINT landlords_volume_tier_check CHECK ((volume_tier = ANY (ARRAY['standard'::text, 'growth'::text, 'professional'::text, 'enterprise'::text, 'partner'::text])))
 );
+
+
+--
+-- Name: COLUMN landlords.theme_accent; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.theme_accent IS 'S633 SUPERSEDED by users.theme_accent — portal chrome is per account, not per company. Retained as the record of what was set before the move; nothing reads it.';
+
+
+--
+-- Name: COLUMN landlords.font_style; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.font_style IS 'S633 SUPERSEDED by users.font_style. See landlords.theme_accent.';
 
 
 --
@@ -4262,6 +4579,13 @@ COMMENT ON COLUMN public.landlords.welcome_outreach_sent_at IS 'S605: when the a
 --
 
 COMMENT ON COLUMN public.landlords.books_start_date IS 'S605: bank transactions posted before this date are imported but auto-ignored, keeping pre-GAM history out of the review queue and the P&L. NULL = no cutoff.';
+
+
+--
+-- Name: COLUMN landlords.first_billing_cycle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.first_billing_cycle IS 'S632 SUPERSEDED by properties.first_billing_cycle — onboarding is per property. Retained only as the record of what was set before the move; nothing reads it.';
 
 
 --
@@ -4573,7 +4897,7 @@ CREATE TABLE public.lease_template_fields (
     options text,
     parent_field_id uuid,
     parent_option text,
-    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'custom_text'::text]))))
+    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'custom_text'::text]))))
 );
 
 
@@ -4778,6 +5102,7 @@ CREATE TABLE public.leases (
     source_application_id uuid,
     tenant_renewal_pinged_at timestamp with time zone,
     landlord_renewal_alerted_at timestamp with time zone,
+    is_existing_tenancy boolean DEFAULT false NOT NULL,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -4805,6 +5130,13 @@ COMMENT ON COLUMN public.leases.tenant_renewal_pinged_at IS 'S628: when the 60-d
 --
 
 COMMENT ON COLUMN public.leases.landlord_renewal_alerted_at IS 'S628: when the landlord was told where the renewal stands (~32 days out). Guard against repeat alerts.';
+
+
+--
+-- Name: COLUMN leases.is_existing_tenancy; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.is_existing_tenancy IS 'S631: this lease papers a tenancy that already existed when the landlord joined GAM, rather than a new move-in. Suppresses move-in rent proration — the first rent invoice is the next full cycle.';
 
 
 --
@@ -5224,6 +5556,7 @@ CREATE TABLE public.payments (
     sublease_markup_amount numeric DEFAULT 0 NOT NULL,
     home_sale_installment_id uuid,
     revenue_owner text DEFAULT 'landlord'::text NOT NULL,
+    work_trade_suspended_at timestamp with time zone,
     CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'prior_arrangement'::text])))),
@@ -5281,6 +5614,13 @@ COMMENT ON COLUMN public.payments.home_sale_installment_id IS 'S594: the home_sa
 --
 
 COMMENT ON COLUMN public.payments.revenue_owner IS 'S609: whose money this charge is. ''landlord'' (the default) = the tenant owes it because of their LEASE — rent, utilities, late fees, any fee a landlord billed. ''gam'' = the tenant owes it for using a GAM service — a returned bank payment, a declined card, a manual-payment recording, or an opt-in product. Stamped at creation because entry_description cannot distinguish a landlord''s hand-billed fee from a GAM subscription (both write ''SUBSCRIP''). Read by services/allocation.ts to decide whether an owner share is booked.';
+
+
+--
+-- Name: COLUMN payments.work_trade_suspended_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.work_trade_suspended_at IS 'S634: set while a work-trade agreement covers this charge for a month still being worked. A suspended row is NOT owed — it is excluded from invoices.total_amount and from outstanding balances. Month-close settlement clears it, leaving 0 (hours met) or the prorated lapse.';
 
 
 --
@@ -5425,7 +5765,14 @@ CREATE TABLE public.pending_tenant_intents (
     screening_attested boolean DEFAULT false NOT NULL,
     screening_waived_unit_id uuid,
     invite_last_nudged_at timestamp with time zone,
-    CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text])))
+    is_existing_tenancy boolean DEFAULT false NOT NULL,
+    is_work_trade boolean DEFAULT false NOT NULL,
+    work_trade_hours_target integer,
+    work_trade_duties text,
+    work_trade_covered_charges text[],
+    CONSTRAINT pending_intent_work_trade_covered_check CHECK (((work_trade_covered_charges IS NULL) OR ((array_length(work_trade_covered_charges, 1) > 0) AND (work_trade_covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text])))),
+    CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text]))),
+    CONSTRAINT pti_work_trade_hours_positive CHECK (((work_trade_hours_target IS NULL) OR (work_trade_hours_target > 0)))
 );
 
 
@@ -5434,6 +5781,20 @@ CREATE TABLE public.pending_tenant_intents (
 --
 
 COMMENT ON COLUMN public.pending_tenant_intents.cancelled_at IS 'Set when a landlord backs out of a pending invite. Soft-hide: the row + its tenant/user/PDF are retained on the server; the invite just leaves the landlord''s view and releases the held unit. Distinct from resolved_at (became a lease).';
+
+
+--
+-- Name: COLUMN pending_tenant_intents.is_existing_tenancy; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pending_tenant_intents.is_existing_tenancy IS 'S631: the landlord is papering an existing resident rather than inviting a new move-in. Copied onto the lease at signing.';
+
+
+--
+-- Name: COLUMN pending_tenant_intents.is_work_trade; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pending_tenant_intents.is_work_trade IS 'S631: this resident trades work for rent. A work_trade_agreement is created from this the moment their lease exists, BEFORE the move-in invoice, so the first invoice is late-fee exempt from birth.';
 
 
 --
@@ -5578,6 +5939,26 @@ CREATE TABLE public.platform_growth_snapshots (
     active_tenant_users_30d integer,
     active_landlord_side_users_30d integer
 );
+
+
+--
+-- Name: platform_owner; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_owner (
+    only_row boolean DEFAULT true NOT NULL,
+    user_id uuid NOT NULL,
+    established timestamp with time zone DEFAULT now() NOT NULL,
+    note text,
+    CONSTRAINT platform_owner_only_row_check CHECK (only_row)
+);
+
+
+--
+-- Name: TABLE platform_owner; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.platform_owner IS 'S631: the one account that cannot be deleted, downgraded, or deactivated, and the only one that may create super admins. Deliberately not surfaced in any admin listing — other super admins should see an ordinary account.';
 
 
 --
@@ -6408,6 +6789,10 @@ CREATE TABLE public.propane_fills (
     tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
     client_key uuid,
     delivery_fee_share numeric(10,2) DEFAULT 0 NOT NULL,
+    true_cost_per_gallon numeric(10,4),
+    markup_per_gallon numeric(8,4),
+    invoice_total numeric(12,2),
+    invoice_gallons numeric(12,2),
     CONSTRAINT propane_fills_delivery_fee_share_check CHECK ((delivery_fee_share >= (0)::numeric)),
     CONSTRAINT propane_fills_gallons_check CHECK ((gallons > (0)::numeric)),
     CONSTRAINT propane_fills_installment_count_check CHECK ((installment_count = ANY (ARRAY[1, 2, 4]))),
@@ -6427,6 +6812,20 @@ COMMENT ON COLUMN public.propane_fills.client_key IS 'S594: client-supplied idem
 --
 
 COMMENT ON COLUMN public.propane_fills.delivery_fee_share IS 'S613: this tank''s share of the delivery charge on the supplier ticket (hazmat / fuel surcharge / per-stop fee). Included in total_amount and in the instalment schedule. Untaxed — the propane tax applies to the fuel.';
+
+
+--
+-- Name: COLUMN propane_fills.true_cost_per_gallon; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.true_cost_per_gallon IS 'S632: the delivery''s blended cost — supplier invoice total (tax, delivery, surcharges included) divided by total gallons delivered. NULL on fills recorded before S632 or entered at a flat rate.';
+
+
+--
+-- Name: COLUMN propane_fills.invoice_total; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.propane_fills.invoice_total IS 'S632: the whole supplier invoice for the delivery this fill came from — kept so a margin can be re-derived years later without the paper.';
 
 
 --
@@ -6505,6 +6904,8 @@ CREATE TABLE public.properties (
     timezone_source text DEFAULT 'derived'::text NOT NULL,
     lease_signing_email text,
     lease_signing_name text,
+    propane_markup_per_gallon numeric(8,4) DEFAULT 0 NOT NULL,
+    first_billing_cycle date,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -6512,11 +6913,13 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
     CONSTRAINT properties_deposit_interest_accrual_method_check CHECK ((deposit_interest_accrual_method = ANY (ARRAY['simple'::text, 'compound'::text]))),
     CONSTRAINT properties_deposit_interest_payment_cadence_check CHECK ((deposit_interest_payment_cadence = ANY (ARRAY['annual'::text, 'at_return'::text, 'on_anniversary'::text]))),
+    CONSTRAINT properties_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
     CONSTRAINT properties_flex_charge_finance_pct_check CHECK (((flex_charge_finance_pct >= (0)::numeric) AND (flex_charge_finance_pct <= 0.06))),
     CONSTRAINT properties_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
     CONSTRAINT properties_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT properties_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT properties_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT properties_propane_markup_sane CHECK (((propane_markup_per_gallon >= (0)::numeric) AND (propane_markup_per_gallon <= (10)::numeric))),
     CONSTRAINT properties_propane_split_four_gte_min_check CHECK ((propane_split_four_min_gallons >= propane_split_min_gallons)),
     CONSTRAINT properties_propane_split_min_gallons_check CHECK ((propane_split_min_gallons > 0)),
     CONSTRAINT properties_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (booking_slug IS NOT NULL))),
@@ -6588,6 +6991,20 @@ COMMENT ON COLUMN public.properties.timezone_source IS 'S624: derived = from the
 --
 
 COMMENT ON COLUMN public.properties.lease_signing_email IS 'Where landlord lease-signature requests and lease notifications for THIS property go. Falls back to the account email. Never shown to guests — see office_email for that.';
+
+
+--
+-- Name: COLUMN properties.propane_markup_per_gallon; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.propane_markup_per_gallon IS 'S632: cents-per-gallon added to the delivery''s true cost to reach the billed rate. Applies to every fill at the property regardless of payment plan — a margin, not a finance charge.';
+
+
+--
+-- Name: COLUMN properties.first_billing_cycle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.first_billing_cycle IS 'S632: the first month GAM invoices THIS property''s existing (onboarded) tenants for. Per property because onboarding is per property. NULL = bill the month each lease starts in.';
 
 
 --
@@ -9099,10 +9516,11 @@ CREATE TABLE public.users (
     email_2fa_enabled boolean DEFAULT false NOT NULL,
     referral_code text,
     referred_by_user_id uuid,
-    active_landlord_id uuid,
     pending_email text,
     pending_email_token text,
     pending_email_expires_at timestamp with time zone,
+    theme_accent text,
+    font_style text,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -9178,17 +9596,24 @@ COMMENT ON COLUMN public.users.referred_by_user_id IS 'S592: this person''s sing
 
 
 --
--- Name: COLUMN users.active_landlord_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.users.active_landlord_id IS 'The landlord entity this user is currently operating in. NULL falls back to the entity they own (pre-S620 behaviour). Only ever set to an entity they are a member of — enforced in the route, since a FK cannot express it.';
-
-
---
 -- Name: COLUMN users.pending_email; Type: COMMENT; Schema: public; Owner: -
 --
 
 COMMENT ON COLUMN public.users.pending_email IS 'A requested new login email, not yet in effect. Becomes users.email only when the link mailed to it is opened.';
+
+
+--
+-- Name: COLUMN users.theme_accent; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.theme_accent IS 'S633: portal accent colour, per ACCOUNT. Chrome belongs to the person, not to any company they own.';
+
+
+--
+-- Name: COLUMN users.font_style; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.font_style IS 'S633: portal font, per ACCOUNT. See users.theme_accent.';
 
 
 --
@@ -9454,8 +9879,16 @@ CREATE TABLE public.utility_reading_runs (
     bills_created integer,
     billed_total numeric(12,2),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    utility_type text,
     CONSTRAINT utility_reading_runs_status_check CHECK ((status = ANY (ARRAY['open'::text, 'double_check'::text, 'completed'::text])))
 );
+
+
+--
+-- Name: COLUMN utility_reading_runs.utility_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_reading_runs.utility_type IS 'S631: the utility this run covers, so each bills as soon as its own reads are in. NULL = every readable meter on the property (the original whole-property run).';
 
 
 --
@@ -9800,6 +10233,22 @@ ALTER TABLE ONLY public.ach_monitoring_log
 
 ALTER TABLE ONLY public.admin_action_log
     ADD CONSTRAINT admin_action_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_invitations admin_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_invitations admin_invitations_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_token_key UNIQUE (token);
 
 
 --
@@ -11035,6 +11484,14 @@ ALTER TABLE ONLY public.landlord_instant_margins
 
 
 --
+-- Name: landlord_member_history landlord_member_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_member_history
+    ADD CONSTRAINT landlord_member_history_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: landlord_member_invitations landlord_member_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11568,6 +12025,14 @@ ALTER TABLE ONLY public.platform_growth_snapshots
 
 ALTER TABLE ONLY public.platform_growth_snapshots
     ADD CONSTRAINT platform_growth_snapshots_snapshot_date_state_city_key UNIQUE (snapshot_date, state, city);
+
+
+--
+-- Name: platform_owner platform_owner_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_owner
+    ADD CONSTRAINT platform_owner_pkey PRIMARY KEY (only_row);
 
 
 --
@@ -12923,14 +13388,6 @@ ALTER TABLE ONLY public.utility_reading_runs
 
 
 --
--- Name: utility_reading_runs utility_reading_runs_property_id_billing_cycle_month_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.utility_reading_runs
-    ADD CONSTRAINT utility_reading_runs_property_id_billing_cycle_month_key UNIQUE (property_id, billing_cycle_month);
-
-
---
 -- Name: utility_service_agreements utility_service_agreements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12968,6 +13425,20 @@ ALTER TABLE ONLY public.work_trade_logs
 
 ALTER TABLE ONLY public.work_trade_settlements
     ADD CONSTRAINT work_trade_settlements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_invitations_one_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX admin_invitations_one_pending ON public.admin_invitations USING btree (lower(email)) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: admin_invitations_recent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_invitations_recent ON public.admin_invitations USING btree (created_at DESC);
 
 
 --
@@ -17017,6 +17488,20 @@ CREATE UNIQUE INDEX landlord_gam_charges_source_uniq ON public.landlord_gam_char
 
 
 --
+-- Name: landlord_member_history_by_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_member_history_by_landlord ON public.landlord_member_history USING btree (landlord_id, occurred_at DESC);
+
+
+--
+-- Name: landlord_member_history_by_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_member_history_by_user ON public.landlord_member_history USING btree (user_id, occurred_at DESC);
+
+
+--
 -- Name: landlord_members_user_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17112,6 +17597,13 @@ CREATE INDEX lease_tenants_supersedes ON public.lease_tenants USING btree (super
 --
 
 CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id);
+
+
+--
+-- Name: payments_work_trade_suspended_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payments_work_trade_suspended_idx ON public.payments USING btree (invoice_id) WHERE (work_trade_suspended_at IS NOT NULL);
 
 
 --
@@ -17367,13 +17859,6 @@ CREATE UNIQUE INDEX uq_business_wo_time_entries_one_running ON public.business_w
 
 
 --
--- Name: users_active_landlord_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX users_active_landlord_idx ON public.users USING btree (active_landlord_id) WHERE (active_landlord_id IS NOT NULL);
-
-
---
 -- Name: users_referred_by_user_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17392,6 +17877,13 @@ CREATE INDEX utility_meter_readings_meter_time_idx ON public.utility_meter_readi
 --
 
 CREATE UNIQUE INDEX utility_meter_readings_one_cycle_read_per_month ON public.utility_meter_readings USING btree (meter_id, billing_cycle_month) WHERE (reason = 'monthly_cycle'::text);
+
+
+--
+-- Name: utility_reading_runs_property_cycle_utility; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX utility_reading_runs_property_cycle_utility ON public.utility_reading_runs USING btree (property_id, billing_cycle_month, COALESCE(utility_type, 'all'::text));
 
 
 --
@@ -18599,10 +19091,24 @@ CREATE TRIGGER trg_generated_routes_updated_at BEFORE UPDATE ON public.generated
 
 
 --
+-- Name: pending_tenant_intents trg_intent_default_existing_tenancy; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_intent_default_existing_tenancy BEFORE INSERT ON public.pending_tenant_intents FOR EACH ROW EXECUTE FUNCTION public.intent_default_existing_tenancy();
+
+
+--
 -- Name: invoices trg_invoices_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_invoices_updated_at BEFORE UPDATE ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.fn_invoices_updated_at();
+
+
+--
+-- Name: landlord_members trg_landlord_members_history; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_landlord_members_history AFTER INSERT OR DELETE ON public.landlord_members FOR EACH ROW EXECUTE FUNCTION public.landlord_members_history();
 
 
 --
@@ -18662,6 +19168,13 @@ CREATE TRIGGER trg_maintenance_updated_at BEFORE UPDATE ON public.maintenance_re
 
 
 --
+-- Name: utility_meters trg_meter_utility_retype; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_meter_utility_retype BEFORE UPDATE ON public.utility_meters FOR EACH ROW EXECUTE FUNCTION public.enforce_meter_utility_retype();
+
+
+--
 -- Name: mobile_homes trg_mobile_homes_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -18680,6 +19193,13 @@ CREATE TRIGGER trg_notification_preferences_updated_at BEFORE UPDATE ON public.n
 --
 
 CREATE TRIGGER trg_occupy_unit_on_active_lease AFTER INSERT OR UPDATE OF status, start_date ON public.leases FOR EACH ROW EXECUTE FUNCTION public.occupy_unit_on_active_lease();
+
+
+--
+-- Name: utility_meter_units trg_one_meter_per_unit_utility; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_one_meter_per_unit_utility BEFORE INSERT OR UPDATE ON public.utility_meter_units FOR EACH ROW EXECUTE FUNCTION public.enforce_one_meter_per_unit_utility();
 
 
 --
@@ -18715,6 +19235,27 @@ CREATE TRIGGER trg_properties_updated_at BEFORE UPDATE ON public.properties FOR 
 --
 
 CREATE TRIGGER trg_property_allocation_rules_updated_at BEFORE UPDATE ON public.property_allocation_rules FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: property_unit_subtypes trg_property_unit_subtypes_resync; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_property_unit_subtypes_resync AFTER UPDATE ON public.property_unit_subtypes FOR EACH ROW EXECUTE FUNCTION public.property_unit_subtypes_resync();
+
+
+--
+-- Name: users trg_protect_platform_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_platform_owner BEFORE DELETE OR UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.protect_platform_owner();
+
+
+--
+-- Name: platform_owner trg_protect_platform_owner_row; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_protect_platform_owner_row BEFORE DELETE OR UPDATE ON public.platform_owner FOR EACH ROW EXECUTE FUNCTION public.protect_platform_owner_row();
 
 
 --
@@ -18809,6 +19350,13 @@ CREATE TRIGGER trg_unit_inspection_videos_protect_url BEFORE UPDATE ON public.un
 
 
 --
+-- Name: unit_subtype_links trg_unit_subtype_links_sync; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_subtype_links_sync AFTER INSERT OR DELETE ON public.unit_subtype_links FOR EACH ROW EXECUTE FUNCTION public.unit_subtype_links_sync();
+
+
+--
 -- Name: units trg_units_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -18858,6 +19406,30 @@ ALTER TABLE ONLY public.ach_monitoring_log
 
 ALTER TABLE ONLY public.admin_action_log
     ADD CONSTRAINT admin_action_log_admin_user_id_fkey FOREIGN KEY (admin_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: admin_invitations admin_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_accepted_user_id_fkey FOREIGN KEY (accepted_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: admin_invitations admin_invitations_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: admin_invitations admin_invitations_revoked_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_revoked_by_user_id_fkey FOREIGN KEY (revoked_by_user_id) REFERENCES public.users(id);
 
 
 --
@@ -22221,6 +22793,14 @@ ALTER TABLE ONLY public.platform_fee_config
 
 
 --
+-- Name: platform_owner platform_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_owner
+    ADD CONSTRAINT platform_owner_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: platform_revenue_ledger platform_revenue_ledger_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24469,14 +25049,6 @@ ALTER TABLE ONLY public.user_totp_recovery_codes
 
 
 --
--- Name: users users_active_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.users
-    ADD CONSTRAINT users_active_landlord_id_fkey FOREIGN KEY (active_landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
-
-
---
 -- Name: users users_default_management_payout_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24800,5 +25372,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Un3yFBhusRBLhaATERdtxmjHhtcS27qodyOggbgbVL0pfT4pouaSx4zfdFiVtKn
+\unrestrict cNsOhZbFH7raNd4eqQH2ABks2vvGgfNnwr5csU8yKCYevn4ODZtgAMGarnxK28T
 

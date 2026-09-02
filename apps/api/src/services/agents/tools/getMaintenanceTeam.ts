@@ -9,7 +9,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface WorkerRow {
   user_id: string
@@ -37,9 +37,9 @@ export const getMaintenanceTeam: AgentTool = {
               COALESCE(array_length(s.property_ids, 1), 0) AS property_count
          FROM maintenance_worker_scopes s
          JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1
+        WHERE s.landlord_id = ANY($1::uuid[])
         ORDER BY u.first_name, u.last_name`,
-      [actor.profileId]
+      [actorLandlordIds(actor)]
     )
     return {
       ok: true,

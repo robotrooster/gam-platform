@@ -179,7 +179,7 @@ describe('confirming a deposit', () => {
     expect(credit.reason).toContain('2026-09-04')
   })
 
-  it('raises the manual-payment fee, and marks the bank row matched', async () => {
+  it('charges nothing for cash (S630), and marks the bank row matched', async () => {
     const s = await buildStack()
     // Give the tenant a prior settled rent so this isn't the free first payment.
     await db.query(
@@ -191,13 +191,17 @@ describe('confirming a deposit', () => {
     const r = await confirmDepositMatch({
       bankTransactionId: s.txnId, chargeIds: [s.rentId], method: 'cash',
     })
-    expect(r.feeBilledTo).toBe('tenant')
-    const fee = (await db.query(
-      `SELECT amount::float AS amount, entry_description, invoice_id FROM payments
-        WHERE lease_id=$1 AND entry_description='MANUALPAY'`, [s.leaseId])).rows[0]
-    expect(fee.amount).toBe(MANUAL_PAYMENT_FEE)
-    // S620: the fee belongs to NO invoice, so the late-fee engine cannot grow it.
-    expect(fee.invoice_id).toBeNull()
+    // S630 (Nic, DIRECTIVE): "cash is FREE." MANUAL_PAYMENT_FEE is 0, so a cash
+    // confirmation raises NO fee row at all and nobody is billed — this test
+    // still said 'tenant' from when the fee was $10. `feeBilledTo: 'none'` is
+    // the whole point of that directive, and the absent row is what proves it:
+    // a $0 row would still show up on a tenant's ledger as a charge.
+    expect(r.feeBilledTo).toBe('none')
+    expect(MANUAL_PAYMENT_FEE).toBe(0)
+    const feeRows = (await db.query(
+      `SELECT amount::float AS amount FROM payments
+        WHERE lease_id=$1 AND entry_description='MANUALPAY'`, [s.leaseId])).rows
+    expect(feeRows).toHaveLength(0)
 
     const txn = (await db.query(
       `SELECT status, matched_payment_id FROM bank_transactions WHERE id=$1`,

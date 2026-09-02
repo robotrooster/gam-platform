@@ -10,7 +10,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface TenantMatch {
   tenant_id: string
@@ -155,7 +155,7 @@ export const lookupTenantPaymentStatus: AgentTool = {
       `SELECT DISTINCT t.id AS tenant_id, us.first_name, us.last_name, us.email,
               un.unit_number, p.name AS property_name
          FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1
+         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = ANY($1::uuid[])
          JOIN tenants t ON t.id = lt.tenant_id
          JOIN users us ON us.id = t.user_id
          JOIN units un ON un.id = l.unit_id
@@ -172,7 +172,7 @@ export const lookupTenantPaymentStatus: AgentTool = {
                AND regexp_replace(un.unit_number, '[^0-9]', '', 'g')::bigint
                    = regexp_replace($3, '[^0-9]', '', 'g')::bigint))
           AND ($4::text[] IS NULL OR un.unit_type = ANY($4))`,
-      [actor.profileId, `%${needle}%`, needle, typeFilter]
+      [actorLandlordIds(actor), `%${needle}%`, needle, typeFilter]
     )
 
     if (matches.length === 0) {
@@ -246,22 +246,22 @@ export const lookupTenantPaymentStatus: AgentTool = {
               COALESCE(SUM(amount) FILTER (WHERE status IN ('failed','returned')), 0) AS returned,
               COUNT(*) FILTER (WHERE status IN ('failed','returned')) AS returned_count
          FROM payments
-        WHERE tenant_id = $1 AND landlord_id = $2 AND status = ANY($3)`,
-      [m.tenant_id, actor.profileId, OUTSTANDING_STATUSES]
+        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = ANY($3)`,
+      [m.tenant_id, actorLandlordIds(actor), OUTSTANDING_STATUSES]
     )
     const flight = await query<{ in_flight: string | null }>(
       `SELECT COALESCE(SUM(amount), 0) AS in_flight
          FROM payments
-        WHERE tenant_id = $1 AND landlord_id = $2 AND status = ANY($3)`,
-      [m.tenant_id, actor.profileId, IN_FLIGHT_STATUSES]
+        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[]) AND status = ANY($3)`,
+      [m.tenant_id, actorLandlordIds(actor), IN_FLIGHT_STATUSES]
     )
     const recent = await query<{ type: string; amount: string; status: string; due_date: string | null }>(
       `SELECT type, amount, status, due_date
          FROM payments
-        WHERE tenant_id = $1 AND landlord_id = $2
+        WHERE tenant_id = $1 AND landlord_id = ANY($2::uuid[])
         ORDER BY COALESCE(due_date, created_at) DESC
         LIMIT 5`,
-      [m.tenant_id, actor.profileId]
+      [m.tenant_id, actorLandlordIds(actor)]
     )
 
     return {

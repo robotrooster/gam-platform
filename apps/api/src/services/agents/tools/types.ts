@@ -11,6 +11,33 @@
 
 import type { AgentAudience } from '../types'
 
+/**
+ * S634 — WHICH COMPANIES DOES THIS ACTOR'S ACCOUNT OWN?
+ *
+ * Nic (DIRECTIVE, S633): "Account ownership is no correlation to a specific
+ * entity. Entities own properties. The account owns the entities."
+ *
+ * Every landlord tool scopes its SQL by landlord_id, and until now each read
+ * `actor.profileId` — the ONE company a session used to sit on. An account that
+ * owns two got answers about one of them, silently: the agent would report a
+ * portfolio, an occupancy figure or a delinquency list that was true of half
+ * the business and looked like the whole of it. That is worse than an error,
+ * because a wrong number spoken confidently is one somebody acts on.
+ *
+ * Use this in every landlord-audience tool, with
+ * `WHERE landlord_id = ANY($n::uuid[])`. A landlord actor's profileId is EMPTY
+ * (S634) — there is nothing else to read.
+ *
+ * For a TENANT actor profileId is their `tenants.id` and is still exactly
+ * right — tenant tools must keep using it, and this returns an empty array for
+ * them so a misuse scopes to nothing rather than to a tenant id that would read
+ * as a company.
+ */
+export function actorLandlordIds(actor: AgentActor): string[] {
+  if (actor.role !== 'landlord') return []
+  return Array.from(new Set((actor.landlordIds ?? []).filter(Boolean)))
+}
+
 export interface AgentActor {
   /** users.id of the logged-in caller. For a token-scoped booking guest
    *  (role='guest') there is no GAM account — this carries the access-token
@@ -18,9 +45,20 @@ export interface AgentActor {
   userId: string
   /** caller role, e.g. 'tenant' | 'landlord' | 'guest' */
   role: string
-  /** profile id: tenant uuid when role='tenant', landlord id when 'landlord',
-   *  booking id when role='guest'. */
+  /** profile id: tenant uuid when role='tenant', booking id when role='guest'.
+   *
+   *  S634 — EMPTY FOR A LANDLORD, ON PURPOSE.
+   *  An account is not an entity; it owns entities (see lib/landlordScope).
+   *  `landlordIds` below is a landlord actor's scope, full stop, and every
+   *  landlord tool reads it through actorLandlordIds(). This is left EMPTY
+   *  rather than pinned to the account's first company so that a tool which
+   *  still reached for it scopes to nothing and becomes visible, instead of
+   *  quietly answering for one company out of several — which is the failure
+   *  this release exists to remove. */
   profileId: string
+  /** S633/S634: every company the ACCOUNT owns. Empty for non-landlord actors.
+   *  This — not profileId — is a landlord actor's scope. */
+  landlordIds?: string[]
   /** the unit_bookings.id a guest actor is scoped to. Set ONLY for
    *  role='guest'; guest tools read/write only this one booking. */
   bookingId?: string

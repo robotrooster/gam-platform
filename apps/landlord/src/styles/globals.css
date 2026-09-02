@@ -764,3 +764,66 @@ fieldset:disabled { opacity: 1; }
 .font-bold  { font-weight: 700; }
 .w-full     { width: 100%; }
 .truncate   { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── AUTH SPLIT LAYOUT (S631) ────────────────────────────────────────
+ *
+ * Nic: his brother, accepting a co-owner invite on a phone — "the sidebar
+ * pulling up, you can't close it at all, and it's trying to offer some sort of
+ * sales pitch on a screen where they're already in an invite flow... when he
+ * turns the orientation sideways he also cannot scroll. He was able to scroll
+ * briefly, and then it locked up."
+ *
+ * Three symptoms, one cause: the register page was a hardcoded desktop split
+ * with no breakpoint anywhere. A 420px fixed panel on a 390px phone IS the
+ * "sidebar you can't close" — it is not a drawer, it is a marketing column
+ * eating the whole viewport and pushing the form off-screen to the right.
+ *
+ * THE SCROLL LOCK. The right pane centred its child with `align-items:center`
+ * on a `min-height:100vh` flex container. When the child is taller than the
+ * viewport — which is every landscape phone — a centred flex item overflows
+ * EQUALLY in both directions and the top is clipped into unreachable space:
+ * scrolling cannot reach above the container's start edge. That is the "scrolled
+ * briefly then locked" exactly. `margin:auto` centres the same way while leaving
+ * the overflow reachable, which is the fix.
+ */
+.auth-split{ min-height:100dvh; background:var(--bg-0); display:flex; }
+.auth-aside{
+  width:420px; flex-shrink:0; background:var(--bg-1);
+  border-right:1px solid var(--border-0); padding:48px 40px;
+  display:flex; flex-direction:column; justify-content:space-between;
+}
+.auth-main{
+  flex:1; display:flex; padding:40px 24px; min-width:0;
+  /* Not align-items:center — see the note above. */
+}
+.auth-main > *{ width:100%; max-width:480px; margin:auto; }
+
+@media (max-width: 860px){
+  /* The pitch is desktop-only. On a phone the person is either already sold
+     (they followed an invite) or has a form to fill in; a full screen of
+     feature bullets before either is just an obstacle. */
+  .auth-aside{ display:none; }
+  .auth-main{ padding:28px 18px; }
+}
+/* Short viewports — a landscape phone — must never centre-and-clip. */
+@media (max-height: 620px){
+  .auth-main{ align-items:flex-start; padding-top:20px; padding-bottom:32px; }
+  .auth-main > *{ margin-top:0; }
+}
+
+/* S631: the single-card auth screens (login, 2FA, forgot/reset password, the
+ * co-owner invite itself) all shipped the same shape as the register page:
+ *   minHeight:100vh; display:flex; align-items:center
+ * which clips the top of any card taller than the viewport and makes it
+ * unreachable — the landscape-phone lock. `margin:auto` centres identically
+ * while keeping the overflow scrollable, and 100dvh keeps mobile browser
+ * chrome from stealing the last rows. */
+.auth-center{
+  min-height:100dvh; background:var(--bg-0);
+  display:flex; padding:20px;
+}
+.auth-center > *{ margin:auto; }
+@media (max-height: 620px){
+  .auth-center{ align-items:flex-start; padding-top:18px; padding-bottom:28px; }
+  .auth-center > *{ margin-top:0; }
+}

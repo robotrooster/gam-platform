@@ -35,7 +35,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 /** Occupied = a unit someone lives in. Same set the portfolio and KPI use. */
 const OCCUPIED = `('active','delinquent','suspended')`
@@ -60,6 +60,15 @@ const ALL: Topic[] = [
   'occupancy', 'tenants', 'rent', 'payments', 'leases', 'maintenance',
   'money', 'deposits', 'applications', 'bookings', 'inspections',
 ]
+
+// S634: analytics_data_gaps names ONE company. A landlord conversation can span
+// several, so attribute it only when there is exactly one honest answer and
+// leave it null otherwise — the column is nullable, and a made-up attribution is
+// what a later report would count.
+function soleCompany(actor: AgentActor): string | null {
+  const owned = actorLandlordIds(actor)
+  return owned.length === 1 ? owned[0] : null
+}
 
 export const getPortfolioStats: AgentTool = {
   name: 'get_portfolio_stats',
@@ -95,10 +104,11 @@ export const getPortfolioStats: AgentTool = {
       void query(
         `INSERT INTO analytics_data_gaps (landlord_id, audience, tool, requested)
          VALUES ($1, 'landlord', 'get_portfolio_stats', $2)`,
-        [actor.profileId, asked],
+        [soleCompany(actor), asked],
       ).catch(() => {})
     }
-    const id = actor.profileId
+    // S634: the stat queries below filter on the ACCOUNT's companies.
+    const id = actorLandlordIds(actor)
     const out: Record<string, unknown> = { ok: true }
     const missing: string[] = []
 
@@ -109,7 +119,7 @@ export const getPortfolioStats: AgentTool = {
                 COUNT(*) FILTER (WHERE u.status IN ('vacant','available'))::int AS vacant,
                 COUNT(DISTINCT u.property_id)::int AS properties
            FROM units u
-          WHERE u.landlord_id = $1 AND u.retired_at IS NULL`, [id])
+          WHERE u.landlord_id = ANY($1::uuid[]) AND u.retired_at IS NULL`, [id])
       out.occupancy = {
         properties: r.properties, units: r.units,
         occupied: r.occupied, vacant: r.vacant,
@@ -126,7 +136,7 @@ export const getPortfolioStats: AgentTool = {
            FROM leases l
            JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
            JOIN tenants t        ON t.id = lt.tenant_id
-          WHERE l.landlord_id = $1 AND l.status = 'active'`, [id])
+          WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'`, [id])
       const avgAge = numOrNull(r.avg_age)
       if (avgAge === null) missing.push('date of birth is not recorded for any current tenant, so there is no average age')
       out.tenants = {
@@ -143,7 +153,7 @@ export const getPortfolioStats: AgentTool = {
         `SELECT SUM(l.rent_amount) AS roll,
                 ROUND(AVG(l.rent_amount)::numeric, 2) AS avg_rent,
                 MIN(l.rent_amount) AS min_rent, MAX(l.rent_amount) AS max_rent
-           FROM leases l WHERE l.landlord_id = $1 AND l.status = 'active'`, [id])
+           FROM leases l WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'`, [id])
       out.rent = {
         monthlyRentRoll: numOrNull(r.roll),
         averageRent: numOrNull(r.avg_rent),
@@ -164,7 +174,7 @@ export const getPortfolioStats: AgentTool = {
                 SUM(p.amount) FILTER (WHERE p.status IN ('pending','failed')) AS unpaid_amount
            FROM payments p
            JOIN leases l ON l.id = p.lease_id
-          WHERE p.landlord_id = $1 AND p.type = 'rent' AND p.due_date <= CURRENT_DATE`, [id])
+          WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE`, [id])
       out.payments = {
         rentChargesToDate: r.due,
         paidLate: r.late,
@@ -188,7 +198,7 @@ export const getPortfolioStats: AgentTool = {
                   WHERE l.status = 'active' AND l.end_date IS NOT NULL
                     AND l.end_date <= CURRENT_DATE + INTERVAL '90 days')::int AS ending_90d,
                 ROUND(AVG(l.end_date - l.start_date) FILTER (WHERE l.end_date IS NOT NULL)::numeric, 0) AS avg_len_days
-           FROM leases l WHERE l.landlord_id = $1`, [id])
+           FROM leases l WHERE l.landlord_id = ANY($1::uuid[])`, [id])
       const avgLen = numOrNull(r.avg_len_days)
       out.leases = {
         active: r.active,
@@ -208,7 +218,7 @@ export const getPortfolioStats: AgentTool = {
                 ROUND(AVG(EXTRACT(EPOCH FROM (m.completed_at - m.created_at)) / 86400)
                       FILTER (WHERE m.completed_at IS NOT NULL)::numeric, 1) AS avg_days,
                 ROUND(AVG(m.actual_cost) FILTER (WHERE m.actual_cost IS NOT NULL)::numeric, 2) AS avg_cost
-           FROM maintenance_requests m WHERE m.landlord_id = $1`, [id])
+           FROM maintenance_requests m WHERE m.landlord_id = ANY($1::uuid[])`, [id])
       out.maintenance = {
         openNow: r.open,
         completedLast12Months: r.done_12m,
@@ -226,13 +236,13 @@ export const getPortfolioStats: AgentTool = {
       const [r] = await query<any>(
         `SELECT
            (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
-             WHERE landlord_id=$1 AND voided_at IS NULL
+             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
                AND expense_date >= CURRENT_DATE - INTERVAL '12 months') AS expenses,
            (SELECT COALESCE(SUM(amount),0) FROM landlord_other_income
-             WHERE landlord_id=$1 AND voided_at IS NULL
+             WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
                AND income_date >= CURRENT_DATE - INTERVAL '12 months') AS other_income,
            (SELECT COALESCE(SUM(amount),0) FROM payments
-             WHERE landlord_id=$1 AND type='rent' AND status='settled'
+             WHERE landlord_id= ANY($1::uuid[]) AND type='rent' AND status='settled'
                AND settled_at >= CURRENT_DATE - INTERVAL '12 months') AS rent_collected`,
         [id])
       const rent = Number(r.rent_collected), exp = Number(r.expenses), other = Number(r.other_income)
@@ -255,7 +265,7 @@ export const getPortfolioStats: AgentTool = {
                 ROUND(AVG(total_deductions) FILTER (WHERE finalized_at IS NOT NULL)::numeric, 2) AS avg_deduction,
                 ROUND(AVG(refund_amount)   FILTER (WHERE finalized_at IS NOT NULL)::numeric, 2) AS avg_refund,
                 COUNT(*) FILTER (WHERE finalized_at IS NOT NULL AND total_deductions = 0)::int AS fully_refunded
-           FROM deposit_returns WHERE landlord_id = $1`, [id])
+           FROM deposit_returns WHERE landlord_id = ANY($1::uuid[])`, [id])
       if (r.settled === 0) missing.push('no deposit has been settled at move-out yet, so there is no deduction history')
       out.deposits = {
         settledAtMoveOut: r.settled,
@@ -272,7 +282,7 @@ export const getPortfolioStats: AgentTool = {
                 COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
                 COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected,
                 ROUND(AVG(monthly_income)::numeric, 2) AS avg_income
-           FROM unit_applications WHERE landlord_id = $1`, [id])
+           FROM unit_applications WHERE landlord_id = ANY($1::uuid[])`, [id])
       if (r.total === 0) missing.push('no applications have come through the platform yet')
       out.applications = {
         received: r.total, approved: r.approved, rejected: r.rejected,
@@ -288,7 +298,7 @@ export const getPortfolioStats: AgentTool = {
                 COUNT(*)::int AS bookings,
                 ROUND(AVG(nightly_rate)::numeric, 2) AS avg_nightly
            FROM unit_bookings
-          WHERE landlord_id = $1 AND status NOT IN ('cancelled','no_show')`, [id])
+          WHERE landlord_id = ANY($1::uuid[]) AND status NOT IN ('cancelled','no_show')`, [id])
       out.bookings = {
         bookings: r.bookings,
         nightsBooked: r.nights,
@@ -302,7 +312,7 @@ export const getPortfolioStats: AgentTool = {
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE finalized_at IS NOT NULL)::int AS finalized,
                 COUNT(*) FILTER (WHERE status NOT IN ('completed','cancelled') AND finalized_at IS NULL)::int AS outstanding
-           FROM unit_inspections WHERE landlord_id = $1`, [id])
+           FROM unit_inspections WHERE landlord_id = ANY($1::uuid[])`, [id])
       out.inspections = {
         total: r.total, finalized: r.finalized, outstanding: r.outstanding,
       }

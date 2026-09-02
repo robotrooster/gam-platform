@@ -50,11 +50,11 @@ describe('auto-field jobs (async)', () => {
     const tid = await seedTemplate(landlordId, `/api/esign/files/${fname}`)
 
     const jobId = await createAutoFieldJob(tid, landlordId)
-    expect((await getAutoFieldJob(jobId, landlordId))?.status).toBe('processing')
+    expect((await getAutoFieldJob(jobId, [landlordId]))?.status).toBe('processing')
 
     await runAutoFieldJob(jobId)
 
-    const done = await getAutoFieldJob(jobId, landlordId)
+    const done = await getAutoFieldJob(jobId, [landlordId])
     expect(done?.status).toBe('done')
     expect(done?.result?.fields?.length).toBe(1)
     expect(done?.result?.modelUsed).toBe(true)
@@ -67,7 +67,7 @@ describe('auto-field jobs (async)', () => {
     const tid = await seedTemplate(landlordId, `/api/esign/files/does-not-exist-${Date.now()}.pdf`)
     const jobId = await createAutoFieldJob(tid, landlordId)
     await expect(runAutoFieldJob(jobId)).resolves.toBeUndefined()
-    const job = await getAutoFieldJob(jobId, landlordId)
+    const job = await getAutoFieldJob(jobId, [landlordId])
     expect(job?.status).toBe('error')
     expect(job?.error).toMatch(/not found/i)
   })
@@ -77,7 +77,7 @@ describe('auto-field jobs (async)', () => {
     const b = await seedLL()
     const tid = await seedTemplate(a, null)
     const jobId = await createAutoFieldJob(tid, a)
-    expect(await getAutoFieldJob(jobId, b)).toBeNull()       // not landlord b's job
-    expect(await getAutoFieldJob(jobId, a)).not.toBeNull()
+    expect(await getAutoFieldJob(jobId, [b])).toBeNull()       // not landlord b's job
+    expect(await getAutoFieldJob(jobId, [a])).not.toBeNull()
   })
 })

@@ -83,13 +83,15 @@ homeOwnershipRouter.get('/portfolio/:ownerUserId', async (req: any, res, next) =
       return res.json({ success: true, data: homes })
     }
     // Landlord/staff: only homes on units they manage.
-    const landlordId = role === 'landlord' ? req.user.profileId : req.user.landlordId
+    // S633: the per-row check below (canAccessLandlordResource against each
+    // unit's own landlord_id) is what actually scopes this, and it already asks
+    // the ACCOUNT. The resolved id was never used — it was `void`ed two lines
+    // down — so it is gone rather than left to rot as a wrong-looking default.
     const scoped = []
     for (const h of homes) {
       const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id=$1', [h.unit_id])
       if (unit && canAccessLandlordResource(req.user, unit.landlord_id)) scoped.push(h)
     }
-    void landlordId
     res.json({ success: true, data: scoped })
   } catch (e) { next(e) }
 })

@@ -14,7 +14,7 @@ import type { AgentActor } from './tools/types'
 
 const mockQuery = query as unknown as ReturnType<typeof vi.fn>
 const TENANT: AgentActor = { userId: 'u1', role: 'tenant', profileId: 't1' }
-const LANDLORD: AgentActor = { userId: 'u2', role: 'landlord', profileId: 'L1' }
+const LANDLORD: AgentActor = { userId: 'u2', role: 'landlord', profileId: '', landlordIds: ['L1'] }
 
 const result = (over: Partial<AgentSessionResult> = {}): AgentSessionResult => ({
   reply: 'ok',

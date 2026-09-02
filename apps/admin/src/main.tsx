@@ -327,6 +327,11 @@ function Layout(){
           {isSuperAdmin&&<NavLink to="/scaling" className={({isActive})=>`ni${isActive?' active':''}`}><TrendingUp size={15}/> Scaling Readiness</NavLink>}
           {isSuperAdmin&&<NavLink to="/agent-analytics" className={({isActive})=>`ni${isActive?' active':''}`}><Bot size={15}/> Agent Analytics</NavLink>}
 
+          {/* S631: who can reach this console. Super-admin only — an admin
+              cannot mint more admins, which is the whole difference between
+              the two roles. */}
+          {isSuperAdmin&&<NavLink to="/team" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Team</NavLink>}
+
           <div className="nl" style={{marginTop:8}}>Account</div>
           <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}><Lock size={15}/> Security</NavLink>
         </nav>
@@ -2959,6 +2964,232 @@ function LoginPage(){
 
 
 // ── SUPER ADMIN GUARD ─────────────────────────────────────────────────
+// ── TEAM / ADMIN INVITATIONS (S631) ──────────────────────────────────
+//
+// Nic: "Let's make a way to invite other admins to admin portal." Before this,
+// a new admin was a hand-written INSERT against production — the most
+// privileged role on the platform was the only one with no invitation trail.
+//
+// Two lists, because "who can get in" is a different question from "who was
+// invited": the accounts that exist right now, and the invitations outstanding.
+// ── ACCEPTING AN INVITATION (S631) ───────────────────────────────────
+//
+// Public — the invitee has no account yet, which is the point. The token is the
+// only credential, so the page shows the invited address read-only: it cannot be
+// pointed at a different one, and the role was fixed when the invitation was
+// sent. On success it hands off to the normal login, which runs straight into
+// the mandatory 2FA enrolment every admin must pass.
+function AcceptInvite(){
+  const token=window.location.pathname.split('/').pop()||''
+  const navigate=useNavigate()
+  const[inv,setInv]=useState<any>(null)
+  const[loadErr,setLoadErr]=useState('')
+  const[first,setFirst]=useState('');const[last,setLast]=useState('')
+  const[pw,setPw]=useState('');const[pw2,setPw2]=useState('')
+  const[err,setErr]=useState('');const[busy,setBusy]=useState(false);const[done,setDone]=useState(false)
+
+  useEffect(()=>{
+    axios.get(`${API}/api/admin-invite/${token}`)
+      .then(r=>setInv(r.data.data))
+      .catch(e=>setLoadErr(e?.response?.data?.error||'This invitation could not be opened.'))
+  },[token])
+
+  const MIN=12
+  const tooShort=pw.length>0&&pw.length<MIN
+  const mismatch=pw2.length>0&&pw!==pw2
+  const ready=first.trim()&&last.trim()&&pw.length>=MIN&&pw===pw2&&!busy
+
+  const submit=async()=>{
+    setBusy(true);setErr('')
+    try{
+      await axios.post(`${API}/api/admin-invite/${token}/accept`,
+        {firstName:first.trim(),lastName:last.trim(),password:pw})
+      setDone(true)
+    }catch(e:any){ setErr(e?.response?.data?.error||'Could not create the account') }
+    finally{ setBusy(false) }
+  }
+
+  const box:React.CSSProperties={maxWidth:420,margin:'8vh auto',padding:'0 20px'}
+  if(loadErr)return<div style={box}><div className="card">
+    <h2 style={{color:'var(--t0)',marginBottom:8}}>Invitation unavailable</h2>
+    <p style={{color:'var(--t3)',fontSize:'.85rem'}}>{loadErr}</p>
+    <p style={{color:'var(--t3)',fontSize:'.78rem',marginTop:10}}>Ask whoever invited you to send a new one.</p>
+  </div></div>
+  if(!inv)return<div className="loading">Loading…</div>
+  if(done)return<div style={box}><div className="card">
+    <h2 style={{color:'var(--t0)',marginBottom:8}}>Account created</h2>
+    <p style={{color:'var(--t3)',fontSize:'.85rem',lineHeight:1.6}}>
+      Sign in with <b style={{color:'var(--t0)'}}>{inv.email}</b>. You&apos;ll be asked to set up
+      two-factor authentication before you can go any further — that&apos;s required for every
+      admin account.
+    </p>
+    <button className="btn" style={{marginTop:14}} onClick={()=>navigate('/login')}>Go to sign in</button>
+  </div></div>
+
+  return<div style={box}><div className="card">
+    <h2 style={{color:'var(--t0)',marginBottom:4}}>Join the GAM admin console</h2>
+    <p style={{color:'var(--t3)',fontSize:'.82rem',lineHeight:1.55,marginBottom:16}}>
+      Invited as <b style={{color:'var(--t0)'}}>{inv.role==='super_admin'?'a super admin':'an admin'}</b>.
+      This is staff access to platform operations — separate from any landlord or tenant account.
+    </p>
+    <label className="lbl">Email</label>
+    <input className="inp" value={inv.email} disabled style={{width:'100%',marginBottom:12}}/>
+    <div style={{display:'flex',gap:8,marginBottom:12}}>
+      <div style={{flex:1}}>
+        <label className="lbl">First name</label>
+        <input className="inp" value={first} onChange={e=>setFirst(e.target.value)} style={{width:'100%'}}/>
+      </div>
+      <div style={{flex:1}}>
+        <label className="lbl">Last name</label>
+        <input className="inp" value={last} onChange={e=>setLast(e.target.value)} style={{width:'100%'}}/>
+      </div>
+    </div>
+    <label className="lbl">Password</label>
+    <input className="inp" type="password" value={pw} onChange={e=>setPw(e.target.value)}
+      style={{width:'100%',marginBottom:4}}/>
+    <div style={{fontSize:'.72rem',color:tooShort?'var(--amber,#d19a2b)':'var(--t3)',marginBottom:10}}>
+      At least {MIN} characters.
+    </div>
+    <label className="lbl">Confirm password</label>
+    <input className="inp" type="password" value={pw2} onChange={e=>setPw2(e.target.value)}
+      onKeyDown={e=>{if(e.key==='Enter'&&ready)submit()}} style={{width:'100%'}}/>
+    {mismatch&&<div style={{fontSize:'.72rem',color:'var(--amber,#d19a2b)',marginTop:4}}>Both passwords must match.</div>}
+    {err&&<div style={{fontSize:'.78rem',color:'var(--red,#e5534b)',marginTop:10}}>{err}</div>}
+    <button className="btn" style={{width:'100%',marginTop:14}} disabled={!ready} onClick={submit}>
+      {busy?'Creating…':'Create my account'}
+    </button>
+  </div></div>
+}
+
+function Team(){
+  const qc=useQueryClient()
+  const{data:staff=[]}=useQuery<any[]>('admin-staff',()=>get<any[]>('/admin/staff'))
+  const{data:invites=[]}=useQuery<any[]>('admin-invites',()=>get<any[]>('/admin/invitations'))
+  // S631: whether THIS viewer may create a super admin. The endpoint only ever
+  // answers about the caller — a super admin learns what they can do without
+  // learning which account outranks them.
+  const{data:caps}=useQuery<any>('admin-team-caps',()=>get<any>('/admin/team-capabilities'))
+  const canInviteSuper=!!caps?.canInviteSuperAdmin
+  const[email,setEmail]=useState('')
+  const[role,setRole]=useState<'admin'|'super_admin'>('admin')
+  const[note,setNote]=useState('')
+  const[err,setErr]=useState('')
+  const[sent,setSent]=useState('')
+
+  const invite=useMutation(()=>post('/admin/invitations',{email:email.trim(),role,note:note.trim()||undefined}),{
+    onSuccess:()=>{qc.invalidateQueries('admin-invites');setSent(email.trim());setEmail('');setNote('');setErr('')},
+    onError:(e:any)=>{setErr(e?.response?.data?.error||'Could not send that invitation');setSent('')},
+  })
+  const revoke=useMutation((id:string)=>api.delete(`/admin/invitations/${id}`).then(r=>r.data),{
+    onSuccess:()=>qc.invalidateQueries('admin-invites'),
+    onError:(e:any)=>setErr(e?.response?.data?.error||'Could not revoke'),
+  })
+
+  const live=invites.filter((i:any)=>i.status==='pending'&&!i.expired)
+  const past=invites.filter((i:any)=>!(i.status==='pending'&&!i.expired))
+  const when=(d:any)=>d?new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric'}):'—'
+
+  return(
+    <div>
+      <div className="ph"><div>
+        <h1 className="pt">Team</h1>
+        <p className="ps">Who can reach this console, and who has been invited</p>
+      </div></div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="ct">Invite someone</div>
+        <p style={{color:'var(--t3)',fontSize:'.78rem',lineHeight:1.55,margin:'6px 0 14px'}}>
+          Admin access needs its own login — an address already used by a landlord or tenant is
+          refused, never promoted. The invitation expires in 72 hours, and whoever accepts must
+          turn on two-factor before they can do anything.
+          {canInviteSuper
+            ? ' Admins are staff. Super admins are owners of the software.'
+            : ' Admins are staff — sales, portfolio strategists.'}
+        </p>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'flex-end'}}>
+          <div style={{flex:'2 1 240px'}}>
+            <label className="lbl">Email</label>
+            <input className="inp" type="email" placeholder="name@example.com" value={email}
+              onChange={e=>{setEmail(e.target.value);setErr('');setSent('')}} style={{width:'100%'}}/>
+          </div>
+          <div style={{flex:'1 1 150px'}}>
+            <label className="lbl">Role</label>
+            <select className="inp" value={role} onChange={e=>setRole(e.target.value as any)} style={{width:'100%'}}>
+              <option value="admin">Admin</option>
+              {/* S631: offered only to the platform owner. Everyone else sees a
+                  single choice and no explanation — the absence is the answer. */}
+              {canInviteSuper&&<option value="super_admin">Super admin</option>}
+            </select>
+          </div>
+          <div style={{flex:'2 1 200px'}}>
+            <label className="lbl">Note (optional)</label>
+            <input className="inp" placeholder="what they're here to do" value={note}
+              onChange={e=>setNote(e.target.value)} style={{width:'100%'}}/>
+          </div>
+          <button className="btn" disabled={!email.trim()||invite.isLoading}
+            onClick={()=>invite.mutate()}>{invite.isLoading?'Sending…':'Send invitation'}</button>
+        </div>
+        {role==='super_admin'&&(
+          <div style={{marginTop:10,fontSize:'.75rem',color:'var(--amber,#d19a2b)'}}>
+            A super admin sees platform financials and can invite other admins — including more
+            super admins.
+          </div>
+        )}
+        {err&&<div style={{marginTop:10,fontSize:'.78rem',color:'var(--red,#e5534b)'}}>{err}</div>}
+        {sent&&<div style={{marginTop:10,fontSize:'.78rem',color:'var(--green,#4caf7d)'}}>Invitation emailed to {sent}.</div>}
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="ct">Console accounts ({staff.length})</div>
+        <table className="tbl"><thead><tr>
+          <th>Email</th><th>Name</th><th>Role</th><th>2FA</th><th>Added</th>
+        </tr></thead><tbody>
+          {staff.map((u:any)=>(
+            <tr key={u.id}>
+              <td className="mono">{u.email}</td>
+              <td>{[u.firstName,u.lastName].filter(Boolean).join(' ')||'—'}</td>
+              <td>{u.role==='super_admin'?'Super admin':'Admin'}</td>
+              {/* 2FA is mandatory for these roles — an off here means they have
+                  been invited but have not finished their first sign-in. */}
+              <td style={{color:u.twoFactorOn?'var(--green,#4caf7d)':'var(--amber,#d19a2b)'}}>
+                {u.twoFactorOn?'on':'not yet'}
+              </td>
+              <td>{when(u.createdAt)}</td>
+            </tr>
+          ))}
+        </tbody></table>
+      </div>
+
+      <div className="card">
+        <div className="ct">Invitations ({live.length} outstanding)</div>
+        {invites.length===0
+          ? <p style={{color:'var(--t3)',fontSize:'.82rem',marginTop:10}}>None sent yet.</p>
+          : <table className="tbl"><thead><tr>
+              <th>Email</th><th>Role</th><th>Status</th><th>Invited by</th><th>Sent</th><th></th>
+            </tr></thead><tbody>
+              {[...live,...past].map((i:any)=>(
+                <tr key={i.id}>
+                  <td className="mono">{i.email}</td>
+                  <td>{i.role==='super_admin'?'Super admin':'Admin'}</td>
+                  <td>{i.status==='accepted'?`accepted ${when(i.acceptedAt)}`
+                      :i.status==='revoked'?'revoked'
+                      :i.expired?'expired':`expires ${when(i.expiresAt)}`}</td>
+                  <td style={{color:'var(--t3)'}}>{i.invitedByName||i.invitedByEmail}</td>
+                  <td>{when(i.createdAt)}</td>
+                  <td style={{textAlign:'right'}}>
+                    {i.status==='pending'&&!i.expired&&(
+                      <button className="btn-sm" onClick={()=>revoke.mutate(i.id)}
+                        disabled={revoke.isLoading}>Revoke</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody></table>}
+      </div>
+    </div>
+  )
+}
+
 function SuperAdminGuard({children}:{children:React.ReactNode}){
   const{user}=useAuth()
   if(user?.role!=='super_admin')return(
@@ -3339,6 +3570,8 @@ function App(){
       <VersionWatch/>
       <Routes>
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
+        {/* S631: public — no session exists until the invitation is accepted. */}
+        <Route path="/accept-invite/:token" element={<AcceptInvite/>}/>
         {/* S289: TOTP enrollment lives outside the Layout — it's the only
             route a mustEnrollTotp user can reach until they complete it. */}
         <Route path="/totp/enroll" element={
@@ -3360,6 +3593,7 @@ function App(){
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
+          <Route path="team"          element={<SuperAdminGuard><Team/></SuperAdminGuard>}/>
           <Route path="units"         element={<Units/>}/>
           <Route path="payments"      element={<Payments/>}/>
           <Route path="disbursements" element={<Disbursements/>}/>

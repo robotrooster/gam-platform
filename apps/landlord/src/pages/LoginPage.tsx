@@ -70,7 +70,7 @@ export function LoginPage() {
   // ── Step 2 (email 2FA): emailed code ─────────────────────────────
   if (emailOtpSession) {
     return (
-      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+      <div className="auth-center">
         <div style={{width:'100%',maxWidth:420}}>
           <div style={{textAlign:'center',marginBottom:40}}>
             <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
@@ -126,7 +126,7 @@ export function LoginPage() {
   // ── Step 2: TOTP code ────────────────────────────────────────────
   if (totpSession) {
     return (
-      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+      <div className="auth-center">
         <div style={{width:'100%',maxWidth:420}}>
           <div style={{textAlign:'center',marginBottom:40}}>
             <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
@@ -174,7 +174,7 @@ export function LoginPage() {
 
   // ── Step 1: credentials ──────────────────────────────────────────
   return (
-    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+    <div className="auth-center">
       <div style={{width:'100%',maxWidth:420}}>
         <div style={{textAlign:'center',marginBottom:40}}>
           <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>

@@ -22,7 +22,8 @@
 import { query } from '../../../db'
 import { cashBankingPosition } from '../../cashBankingControl'
 import { unmatchedDepositsWithCandidates, settledPayersAround } from '../../bankDepositCandidates'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { resolveActorCompany, COMPANY_PARAM } from './companyScope'
 
 export const getUnreconciledCash: AgentTool = {
   name: 'get_unreconciled_cash',
@@ -34,6 +35,7 @@ export const getUnreconciledCash: AgentTool = {
   parameters: {
     type: 'object',
     properties: {
+      ...COMPANY_PARAM,
       graceDays: {
         type: 'integer',
         description: 'How many days a collection may sit before it counts as outstanding (default 3).',
@@ -44,7 +46,7 @@ export const getUnreconciledCash: AgentTool = {
   async execute(args, actor: AgentActor) {
     const connected = await query<{ n: string }>(
       `SELECT COUNT(*) AS n FROM bank_connections
-        WHERE landlord_id = $1 AND status = 'active'`, [actor.profileId])
+        WHERE landlord_id = ANY($1::uuid[]) AND status = 'active'`, [actorLandlordIds(actor)])
     if (parseInt(connected[0]?.n ?? '0', 10) === 0) {
       return {
         ok: true,
@@ -57,13 +59,19 @@ export const getUnreconciledCash: AgentTool = {
 
     const raw = Number(args.graceDays)
     const graceDays = Number.isFinite(raw) ? Math.min(30, Math.max(0, Math.trunc(raw))) : 3
+    // S634: bank reconciliation is per COMPANY — each entity has its own
+    // connected account, so deposits from two of them cannot be reconciled in
+    // one list without inventing a relationship that does not exist.
+    const company = await resolveActorCompany(actor, (args as any).company)
+    if (!company.ok) return { ok: false, error: company.error }
     const [position, deposits] = await Promise.all([
-      cashBankingPosition(actor.profileId, { graceDays }),
-      unmatchedDepositsWithCandidates(actor.profileId, 25),
+      cashBankingPosition(company.landlordId, { graceDays }),
+      unmatchedDepositsWithCandidates(company.landlordId, 25),
     ])
 
     return {
       ok: true,
+      company: company.name,
       bankConnected: true,
       depositsAwaitingMatch: deposits.deposits.length,
       depositsNotListed: deposits.remaining,
@@ -72,7 +80,7 @@ export const getUnreconciledCash: AgentTool = {
         // an unplaceable deposit came back as "doesn't match any pending rent
         // charges" — of course it didn't. Money already in the bank came from
         // payments that already SETTLED, and those name a payer.
-        const settled = await settledPayersAround(actor.profileId, d.postedDate, d.amount)
+        const settled = await settledPayersAround(company.landlordId, d.postedDate, d.amount)
         return {
           amount: d.amount,
           postedDate: d.postedDate,

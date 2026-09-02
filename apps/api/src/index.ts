@@ -85,7 +85,7 @@ import { utilityRouter }      from './routes/utility'
 import { utilityServiceAgreementsRouter } from './routes/utilityServiceAgreements'
 import { oneOffChargesRouter } from './routes/oneOffCharges'
 import { propaneRouter }      from './routes/propane'
-import { adminRouter }        from './routes/admin'
+import { adminRouter, adminInviteRouter } from './routes/admin'
 import { portfolioRouter }    from './routes/portfolio'
 import { webhooksRouter }     from './routes/webhooks'
 import { stripeRouter }       from './routes/stripe'
@@ -386,6 +386,8 @@ app.use('/api/one-off-charges', oneOffChargesRouter)
 app.use('/api/utility',       utilityRouter)
 app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)
+// S631: unauthenticated — the invitee has no account until they accept.
+app.use('/api/admin-invite',  authLimiter, adminInviteRouter)
 app.use('/api/portfolio',     portfolioRouter)  // S592: PM-scoped surface (allow-list)
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/declared-deposits', declaredDepositsRouter)

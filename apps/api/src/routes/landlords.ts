@@ -2,10 +2,12 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireAdmin, requireLandlord, requirePerm } from '../middleware/auth'
-import { resolveLandlordIdForUser } from '../lib/scope'
 import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { emailTenantOnboarded } from '../services/email'
+// S633 — the account is not an entity. Reads span every company the account
+// owns; writes name their target and are authorised against it.
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
+import { emailTenantOnboarded, emailTenantInvite} from '../services/email'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
@@ -21,7 +23,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
@@ -217,7 +219,7 @@ landlordsRouter.get('/referral-earnings', requireAuth, requireLandlord, async (r
 landlordsRouter.get('/pos-customers', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { listPosCustomers } = await import('../services/flexCharge')
-    const rows = await listPosCustomers(req.user!.profileId)
+    const rows = await listPosCustomers(landlordScopeIds(req.user!))
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -229,8 +231,11 @@ landlordsRouter.post('/pos-customers', requireAuth, requireLandlord, async (req,
     if (!firstName || !lastName || !email) {
       throw new AppError(400, 'firstName, lastName, email required')
     }
+    // S633: a customer is created under a NAMED company. An account that owns
+    // one gets it silently; an account that owns several is asked, because
+    // filing a customer under the wrong company is unwound by hand.
     const row = await createPosCustomer({
-      landlordId: req.user!.profileId,
+      landlordId: resolveLandlordTarget(req.user!, req.body?.landlordId, 'customer'),
       firstName, lastName, email, phone, notes,
     })
     res.status(201).json({ success: true, data: row })
@@ -240,7 +245,7 @@ landlordsRouter.post('/pos-customers', requireAuth, requireLandlord, async (req,
 landlordsRouter.delete('/pos-customers/:id', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { archivePosCustomer } = await import('../services/flexCharge')
-    await archivePosCustomer({ landlordId: req.user!.profileId, customerId: req.params.id })
+    await archivePosCustomer({ landlordIds: landlordScopeIds(req.user!), customerId: req.params.id })
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -271,7 +276,7 @@ landlordsRouter.post('/pos-customers/:id/send-onboarding', requireAuth, requireL
       [req.params.id],
     )
     if (!customer) throw new AppError(404, 'POS customer not found')
-    if (customer.landlord_id !== req.user!.profileId) throw new AppError(403, 'Forbidden')
+    if (!ownsLandlord(req.user!, customer.landlord_id)) throw new AppError(403, 'Forbidden')
     if (customer.archived_at) throw new AppError(409, 'Customer is archived')
     if (customer.ach_verified) throw new AppError(409, 'Customer is already ACH-verified — onboarding not needed')
 
@@ -309,7 +314,7 @@ landlordsRouter.get('/flex-charge/accounts', requireAuth, requireLandlord, async
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : undefined
     const status     = req.query.status ? String(req.query.status) as any : undefined
     const rows = await listFlexChargeAccounts({
-      landlordId: req.user!.profileId,
+      landlordIds: landlordScopeIds(req.user!),
       propertyId, status,
     })
     res.json({ success: true, data: rows })
@@ -321,8 +326,10 @@ landlordsRouter.post('/flex-charge/accounts', requireAuth, requireLandlord, asyn
     const { createFlexChargeAccount } = await import('../services/flexCharge')
     const { tenantId, posCustomerId, propertyId, creditLimit, notes } = req.body
     if (!propertyId) throw new AppError(400, 'propertyId required')
+    // S633: the company is the one that owns the named property — there is
+    // nothing for the caller to get wrong, and the authorisation is the same.
     const row = await createFlexChargeAccount({
-      landlordId:     req.user!.profileId,
+      landlordId:     await landlordIdForProperty(req.user!, propertyId, query),
       propertyId,
       tenantId:       tenantId ?? null,
       posCustomerId:  posCustomerId ?? null,
@@ -338,7 +345,7 @@ landlordsRouter.patch('/flex-charge/accounts/:id', requireAuth, requireLandlord,
     const { updateFlexChargeAccount } = await import('../services/flexCharge')
     const { creditLimit, status, notes } = req.body
     const row = await updateFlexChargeAccount({
-      landlordId: req.user!.profileId,
+      landlordIds: landlordScopeIds(req.user!),
       accountId:  req.params.id,
       creditLimit,
       status,
@@ -352,7 +359,7 @@ landlordsRouter.get('/flex-charge/accounts/:id/statements', requireAuth, require
   try {
     const { listAccountStatements } = await import('../services/flexCharge')
     const out = await listAccountStatements({
-      landlordId: req.user!.profileId,
+      landlordIds: landlordScopeIds(req.user!),
       accountId:  req.params.id,
     })
     res.json({ success: true, data: out })
@@ -369,9 +376,9 @@ landlordsRouter.get('/flex-charge/finance-rates', requireAuth, requireLandlord, 
     const rows = await query(
       `SELECT id AS property_id, name, flex_charge_finance_pct::float AS finance_pct
          FROM properties
-        WHERE landlord_id = $1 AND flexcharge_enabled = TRUE
+        WHERE landlord_id = ANY($1::uuid[]) AND flexcharge_enabled = TRUE
         ORDER BY name`,
-      [req.user!.profileId])
+      [landlordScopeIds(req.user!)])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -388,20 +395,26 @@ landlordsRouter.patch('/flex-charge/finance-rate', requireAuth, requireLandlord,
     const prop = await queryOne(
       `UPDATE properties
           SET flex_charge_finance_pct = $1, updated_at = NOW()
-        WHERE id = $2 AND landlord_id = $3
+        WHERE id = $2 AND landlord_id = ANY($3::uuid[])
         RETURNING id AS property_id, flex_charge_finance_pct::float AS finance_pct`,
-      [financePct, propertyId, req.user!.profileId])
+      [financePct, propertyId, landlordScopeIds(req.user!)])
     if (!prop) throw new AppError(404, 'Property not found')
     res.json({ success: true, data: prop })
   } catch (e) { next(e) }
 })
 
 // ── GET /api/landlords/theme ───────────────────────────────────────────────
+//
+// S633: the theme belongs to the ACCOUNT, not to a company. It is chrome for
+// the person looking at the screen, and it used to be read off `landlords`
+// through whichever entity the session sat on — so an account that owns two
+// companies saw the portal change colour depending on invisible session state,
+// and selling that company would have taken the theme with it.
 landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
   try {
     const row = await queryOne(
-      'SELECT theme_accent, font_style FROM landlords WHERE id=$1',
-      [req.user!.profileId]
+      'SELECT theme_accent, font_style FROM users WHERE id=$1',
+      [req.user!.userId]
     )
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
@@ -412,12 +425,16 @@ landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
 // by req.user.profileId — a property_manager's profileId is their
 // landlord's id, so a manager could rewrite their landlord's portal
 // theme/font branding. Theme is owner-controlled.
+//
+// S633: writes to the caller's own account row, so a team member can only ever
+// change their own chrome. That makes the S236 hazard structural rather than
+// role-gated — there is no longer a landlord row here to overwrite.
 landlordsRouter.patch('/theme', requireLandlord, async (req, res, next) => {
   try {
     const { themeAccent, fontStyle } = req.body
     await query(
-      'UPDATE landlords SET theme_accent=$1, font_style=$2 WHERE id=$3',
-      [themeAccent || null, fontStyle || null, req.user!.profileId]
+      'UPDATE users SET theme_accent=$1, font_style=$2, updated_at=NOW() WHERE id=$3',
+      [themeAccent || null, fontStyle || null, req.user!.userId]
     )
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -430,8 +447,10 @@ landlordsRouter.patch('/theme', requireLandlord, async (req, res, next) => {
 landlordsRouter.get('/members', async (req, res, next) => {
   try {
     const u = req.user!
-    const landlordId = (req.query.landlordId as string) || u.profileId
-    if (!canManageLandlordResource(u, landlordId, [])) throw new AppError(403, 'Forbidden')
+    // S633: names the company whose owners are being listed. Falls back to the
+    // account's only company; an account that owns several must say which,
+    // because "the entity the session sat on" is the thing being retired.
+    const landlordId = resolveLandlordTarget(u, req.query.landlordId as string | undefined, 'owner list')
     const rows = await query(
       `SELECT lm.id, lm.user_id, lm.role, lm.created_at,
               us.email, us.first_name, us.last_name,
@@ -455,8 +474,10 @@ landlordsRouter.post('/members', async (req, res, next) => {
       email: z.string().trim().email(),
       landlordId: z.string().uuid().optional(),
     }).parse(req.body)
-    const landlordId = b.landlordId || u.profileId
-    if (!canManageLandlordResource(u, landlordId, [])) throw new AppError(403, 'Forbidden')
+    // S633: an owner is added TO a named company. Adding one to the wrong
+    // company hands a stranger a book of business, so this asks rather than
+    // guesses when the account owns more than one.
+    const landlordId = resolveLandlordTarget(u, b.landlordId, 'owner')
 
     const target = await queryOne<any>(
       `SELECT id, role, first_name FROM users WHERE lower(email) = lower($1)`, [b.email])
@@ -562,7 +583,13 @@ landlordsRouter.delete('/members/:id', async (req, res, next) => {
 
 landlordsRouter.get('/:id', async (req, res, next) => {
   try {
-    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    // S633: 'me' used to mean "the entity my session sits on". It names a
+    // COMPANY, so the account says which — silently when it owns one, by
+    // ?landlordId= when it owns several. Returning an arbitrary one is what
+    // made this endpoint show Oak Park's details on a Mountain View screen.
+    const id = req.params.id === 'me'
+      ? resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined, 'company')
+      : req.params.id
     // S70: replaced inline check with canAccessLandlordResource. Pre-S70
     // excluded team-role users (PM/onsite/maintenance) from viewing the
     // landlord they're scoped to.
@@ -606,7 +633,7 @@ landlordsRouter.get('/:id', async (req, res, next) => {
 
 landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
   try {
-    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    const meAggregate = req.params.id === 'me' && req.user!.role === 'landlord'
     // S605 (Nic): a landlord who co-owns another entity was seeing a dashboard
     // for ONE of them while their Properties list showed all of them — Oak Park
     // appeared in the list but its income was missing from the rollup, so the
@@ -620,9 +647,13 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // numbers unless they co-own it.
     //
     // An EXPLICIT id (admin inspecting one landlord) still scopes to that entity.
-    const scopeIds = req.params.id === 'me' && req.user!.role === 'landlord'
-      ? Array.from(new Set([req.user!.profileId, ...(req.user!.landlordIds ?? [])]))
-      : [id]
+    // S633: the aggregate IS the answer for 'me' — an account's dashboard is
+    // every company it owns. Only an explicit id (an admin inspecting one
+    // landlord) narrows it.
+    const scopeIds = meAggregate
+      ? landlordScopeIds(req.user!)
+      : [req.params.id]
+    const id = meAggregate ? scopeIds[0] : req.params.id
     // Dashboard surfaces revenue + disbursement totals — financial view.
     // Landlord/admin only; team roles don't get the financial rollup.
     if (!canViewLandlordFinances(req.user, id)) {
@@ -796,8 +827,13 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
 // Financial view — same gate as the dashboard rollup.
 landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
   try {
-    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
-    if (!canViewLandlordFinances(req.user, id)) {
+    // S633: a rent roll is a list of what is rented — an account's, across every
+    // company it owns, unless an explicit entity is named.
+    const rentRollIds = req.params.id === 'me' && req.user!.role === 'landlord'
+      ? landlordScopeIds(req.user!)
+      : [req.params.id]
+    const id = rentRollIds[0]
+    if (!rentRollIds.every(x => canViewLandlordFinances(req.user, x))) {
       throw new AppError(403, 'Forbidden')
     }
     const rows = await query<any>(`
@@ -836,6 +872,9 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
     // S513 fee-payer election (walkthrough #2). The landlord may elect to
     // cover its tenants' ACH fees; card is ALWAYS the tenant's. Default tenant.
     const achPayer: 'landlord' | 'tenant' = coverTenantAch === true ? 'landlord' : 'tenant'
+    // S633: onboarding is completed FOR a company — the signature is that
+    // company's agreement. Named explicitly, or the account's only one.
+    const settingsLandlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
 
     await query(`
       UPDATE landlords SET
@@ -844,7 +883,7 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
         agreement_signature = $1,
         default_ach_fee_payer = $3
       WHERE id = $2`,
-      [signature, req.user!.profileId, achPayer]
+      [signature, settingsLandlordId, achPayer]
     )
 
     // Apply the election across the landlord's existing properties so it takes
@@ -857,11 +896,11 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
         ach_fee_payer = $1,
         card_fee_payer = 'tenant'
       WHERE property_id IN (SELECT id FROM properties WHERE landlord_id = $2)`,
-      [achPayer, req.user!.profileId]
+      [achPayer, settingsLandlordId]
     )
 
     // Also update user profile phone/business if provided
-    const landlord = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [req.user!.profileId])
+    const landlord = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [settingsLandlordId])
 
     res.json({ success: true, data: { onboardingComplete: true } })
   } catch (e) { next(e) }
@@ -873,6 +912,9 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
 landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_approval'), async (req, res, next) => {
   try {
     const { businessName, ein, maintApprovalThreshold, depositReturnApprovalThreshold, defaultEarlyTerminationMonthsRent } = req.body
+    // S633: these are a COMPANY's details — its legal name, its EIN, its
+    // approval thresholds. The account names which one it is editing.
+    const settingsLandlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
     // Sentinel value 'CLEAR' on the months-rent field nulls it out
     // (no policy on file). Otherwise COALESCE preserves prior value
     // when the field is absent.
@@ -887,10 +929,10 @@ landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_appr
         updated_at = NOW()
       WHERE id = $4`,
       clearMonths
-        ? [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId, depositReturnApprovalThreshold ?? null]
-        : [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId, depositReturnApprovalThreshold ?? null, defaultEarlyTerminationMonthsRent||null]
+        ? [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null]
+        : [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null, defaultEarlyTerminationMonthsRent||null]
     )
-    const updated = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [req.user!.profileId])
+    const updated = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [settingsLandlordId])
     res.json({ success: true, data: updated })
   } catch(e) { next(e) }
 })
@@ -923,7 +965,7 @@ landlordsRouter.get('/me/deposit-interest-overrides', requireLandlord, async (re
          FROM landlord_deposit_interest_rate_overrides
         WHERE landlord_id = $1
         ORDER BY effective_year DESC, state_code ASC`,
-      [req.user!.profileId],
+      [resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')],
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -968,7 +1010,7 @@ landlordsRouter.put('/me/deposit-interest-overrides', requireLandlord, async (re
                  annual_rate_pct::text AS annual_rate_pct,
                  source_notes`,
       [
-        req.user!.profileId,
+        resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'),
         body.stateCode,
         body.effectiveYear,
         body.annualRatePct,
@@ -991,7 +1033,7 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
       await query(
         `DELETE FROM landlord_deposit_interest_rate_overrides
           WHERE landlord_id = $1 AND state_code = $2 AND effective_year = $3`,
-        [req.user!.profileId, stateCode, year],
+        [resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'), stateCode, year],
       )
       res.json({ success: true })
     } catch (e) { next(e) }
@@ -1038,12 +1080,15 @@ landlordsRouter.get('/me/entities', requireLandlord, async (req, res, next) => {
               l.connect_payouts_enabled,
               (SELECT COUNT(*) FROM properties p WHERE p.landlord_id = l.id)::int AS property_count,
               (l.user_id = $1) AS is_owner,
-              (l.id = $2) AS is_active
+              -- S633: there is no "active" entity. The account is signed into
+              -- ALL of them at once; nothing switches. Kept as a false column
+              -- only so an older client reading it does not crash.
+              FALSE AS is_active
          FROM landlord_members lm
          JOIN landlords l ON l.id = lm.landlord_id
         WHERE lm.user_id = $1
         ORDER BY (l.user_id = $1) DESC, l.created_at ASC`,
-      [req.user!.userId, req.user!.profileId])
+      [req.user!.userId])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -1075,10 +1120,10 @@ landlordsRouter.post('/me/entities', requireLandlord, async (req, res, next) => 
        VALUES ($1, $2, 'owner', $2)`,
       [landlordId, req.user!.userId])
 
-    // Land them in it. Creating an entity and staying in the old one would be
-    // a confusing no-op.
-    await client.query(`UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
-      [req.user!.userId, landlordId])
+    // S634: there is nothing to "land in". The membership row above is what
+    // makes the new company theirs, and the account is signed into every company
+    // it owns at once — the old `users.active_landlord_id` write existed only to
+    // pick which one the session sat on, and that idea is gone.
     await client.query('COMMIT')
 
     // onboarding_complete is TRUE because they are an established landlord —
@@ -1110,8 +1155,8 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // one, since accepting an invite always requires registering first.
     //
     // Same scope as the dashboard now: own entity + co-owned entities.
-    const scopeIds = Array.from(
-      new Set([req.user!.profileId, ...(req.user!.landlordIds ?? [])].filter(Boolean)))
+    // S633: every company the account owns.
+    const scopeIds = landlordScopeIds(req.user!)
     const userId = req.user!.userId
 
     // S67: bank readiness derives from active user_bank_accounts. The
@@ -1648,8 +1693,13 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
       throw new AppError(400, 'autoRenewMode must be extend_same_term or convert_to_month_to_month when autoRenew=true')
     }
 
-    // --- Verify unit belongs to this landlord ---
-    const landlordId = req.user!.profileId
+    // S633: the company is the one that owns the UNIT being onboarded into —
+    // derived from the unit, not from whichever company the session sat on.
+    // The old form compared the unit's landlord_id to `req.user.profileId` and
+    // 403'd when they differed, which is how an account that owns two companies
+    // was refused a unit it owns: signed into Oak Park, every Mountain View unit
+    // "belonged to another landlord". The ownership check is still here — it is
+    // just asked of the ACCOUNT now instead of one of its companies.
     const unit = await queryOne<any>(
       `SELECT u.id, u.unit_number, u.property_id, u.landlord_id,
               p.name AS property_name, p.street1, p.city, p.state, p.zip
@@ -1658,7 +1708,10 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
       [unitId]
     )
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (unit.landlord_id !== landlordId) throw new AppError(403, 'Unit not owned by this landlord')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'That unit is not yours to onboard into.')
+    }
+    const landlordId: string = unit.landlord_id
 
     // S537 gate: no onboarding onto an UNDECIDED late-fee class.
     await assertLateFeeDecisionForUnit(unit.id)
@@ -1866,7 +1919,7 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
 // tenants can still be grandfathered and mark a property's onboarding complete.
 landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, next) => {
   try {
-    res.json({ success: true, data: await listOnboardingWindowsForLandlord(req.user!.profileId) })
+    res.json({ success: true, data: await listOnboardingWindowsForLandlord(landlordScopeIds(req.user!)) })
   } catch (e) { next(e) }
 })
 
@@ -1882,7 +1935,8 @@ landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, 
 landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboard'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { firstName, lastName, email, phone, unitId } = req.body
+    const { firstName, lastName, email, phone, unitId,
+            isWorkTrade, workTradeHoursTarget, workTradeDuties } = req.body
     // S629 (Nic): "I don't have everybody's phone number, just emails. Email has
     // to be mandatory for the invite to work, I get that, and the electronic
     // signature. Phone number, the tenant can update it on their contact
@@ -1897,13 +1951,22 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     const emailNorm = String(email).trim().toLowerCase()
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) throw new AppError(400, 'Invalid email format')
 
-    const landlordId = req.user!.profileId
+    // S633: the company is the one that owns the UNIT being onboarded into —
+    // derived from the unit, not from whichever company the session sat on.
+    // The old form compared the unit's landlord_id to `req.user.profileId` and
+    // 403'd when they differed, which is how an account that owns two companies
+    // was refused a unit it owns: signed into Oak Park, every Mountain View unit
+    // "belonged to another landlord". The ownership check is still here — it is
+    // just asked of the ACCOUNT now instead of one of its companies.
     const unit = await queryOne<any>(
       `SELECT u.id, u.unit_number, u.property_id, u.landlord_id, u.rent_amount, u.occupancy_mode,
               p.name AS property_name, p.street1, p.city, p.state, p.zip
          FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (unit.landlord_id !== landlordId) throw new AppError(403, 'Unit not owned by this landlord')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'That unit is not yours to onboard into.')
+    }
+    const landlordId: string = unit.landlord_id
     // Gate: unit metrics (rent) must be set before inviting anyone to the unit.
     if (unit.rent_amount == null || Number(unit.rent_amount) <= 0) {
       throw new AppError(400, 'Set the unit’s rent before inviting a tenant to it.')
@@ -2132,14 +2195,23 @@ type CsvRow = {
 // builds a real lease from it. Activation email fires only at lease creation.
 
 // POST /api/landlords/me/onboard-tenant-pending
-// Body: { firstName, lastName, email, phone, unitId? }
+// Body: { firstName, lastName, email, phone, unitId?,
+//         isWorkTrade?, workTradeHoursTarget?, workTradeDuties? }
+//
+// S631 (Nic, DIRECTIVE): work trade is declared HERE, at invite, not after
+// signing. A work_trade_agreement needs an active lease, so it cannot exist
+// until the tenant signs — but the move-in invoice is written in that same
+// moment, and an invoice generated before the agreement is a chargeable one. The
+// landlord knows at invite time; recording it here is what lets the agreement be
+// inserted immediately before the invoice rather than after it.
 // W-27 (S531): unitId optionally binds the spot the incoming tenant already
 // occupies — that unit is excluded from guest booking until the intent
 // resolves (migration protection for permanent RV tenants).
 landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { firstName, lastName, email, phone, unitId } = req.body
+    const { firstName, lastName, email, phone, unitId,
+            isWorkTrade, workTradeHoursTarget, workTradeDuties } = req.body
 
     if (!firstName || !lastName || !email || !phone) {
       throw new AppError(400, 'firstName, lastName, email, phone required')
@@ -2150,7 +2222,19 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       throw new AppError(400, 'Invalid email format')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: THIS IS THE ROUTE THAT BLOCKED THE MOUNTAIN VIEW INVITES.
+    //
+    // It read `req.user.profileId` — the one company the session sat on — and
+    // then refused any unit belonging to the other: "unitId does not belong to
+    // this landlord". Nic owns both companies. It failed CLOSED, so nothing was
+    // corrupted, but he could not invite ~75 residents to a park he owns.
+    //
+    // The company now comes from the UNIT being invited into. Where no unit is
+    // named (an invite with the spot decided later) the account names the
+    // company, silently when it owns one.
+    const landlordId = unitId
+      ? await landlordIdForUnit(req.user!, String(unitId), query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'invite')
 
     // Cross-landlord conflict — same rule as /onboard-tenant. If this email is
     // already an active tenant of a DIFFERENT landlord, refuse.
@@ -2202,6 +2286,10 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     if (unitId) {
       const owned = await queryOne<any>(
         'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [unitId, landlordId])
+      // Unreachable now that landlordId is derived FROM this unit — kept as a
+      // belt-and-braces assertion rather than deleted, so a future change that
+      // reintroduces a guessed entity fails here instead of writing a tenant
+      // into the wrong company's books.
       if (!owned) throw new AppError(400, 'unitId does not belong to this landlord')
       // S537 gate: pending intents bound to a unit require a late-fee
       // decision for that unit's class (unbound intents gate at resolve).
@@ -2248,10 +2336,16 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     // 3. Intent row. UNIQUE(tenant_id) protects against races; on conflict we
     // already returned 409 above, so this insert should always succeed here.
     const intent = await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
-       VALUES ($1, $2, 'not_uploaded', $3)
-       RETURNING id, parser_status, created_at`,
-      [landlordId, tenantId, unitId || null]
+      `INSERT INTO pending_tenant_intents
+         (landlord_id, tenant_id, parser_status, unit_id,
+          is_work_trade, work_trade_hours_target, work_trade_duties)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6)
+       RETURNING id, parser_status, created_at, is_work_trade`,
+      [landlordId, tenantId, unitId || null,
+       isWorkTrade === true,
+       isWorkTrade === true && Number(workTradeHoursTarget) > 0
+         ? Math.floor(Number(workTradeHoursTarget)) : null,
+       isWorkTrade === true ? (workTradeDuties || null) : null]
     )
 
     await client.query('COMMIT')
@@ -2319,7 +2413,12 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
       throw new AppError(400, 'rows array required')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     type RowResult = {
       rowIndex: number
@@ -2486,7 +2585,10 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
 // once a lease is built, the intent disappears from the active queue.
 landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async (req, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S633: the landlord_id filter below is the ownership check. It now asks
+    // the ACCOUNT — every company it owns — instead of the one the session sat
+    // on, which hid the other company's records behind a 404.
+    const landlordIds = landlordScopeIds(req.user!)
 
     const intents = await query<any>(
       `SELECT
@@ -2514,11 +2616,11 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
        JOIN users   u  ON u.id = t.user_id
        LEFT JOIN units un ON un.id = pti.unit_id
        LEFT JOIN properties pr ON pr.id = un.property_id
-       WHERE pti.landlord_id = $1
+       WHERE pti.landlord_id = ANY($1::uuid[])
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
        ORDER BY pti.created_at DESC`,
-      [landlordId]
+      [landlordIds]
     )
 
     res.json({
@@ -2561,17 +2663,20 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
 landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onboarding.pending_manage'), async (req, res, next) => {
   try {
     const { intentId } = req.params
-    const landlordId = req.user!.profileId
+    // S633: the landlord_id filter below is the ownership check. It now asks
+    // the ACCOUNT — every company it owns — instead of the one the session sat
+    // on, which hid the other company's records behind a 404.
+    const landlordIds = landlordScopeIds(req.user!)
 
     // Only an open (not-yet-resolved, not-already-cancelled) invite owned by
     // this landlord can be canceled. Nothing is deleted — we just stamp it.
     const updated = await queryOne<any>(
       `UPDATE pending_tenant_intents
           SET cancelled_at = NOW(), updated_at = NOW()
-        WHERE id = $1 AND landlord_id = $2
+        WHERE id = $1 AND landlord_id = ANY($2::uuid[])
           AND resolved_at IS NULL AND cancelled_at IS NULL
         RETURNING id`,
-      [intentId, landlordId]
+      [intentId, landlordIds]
     )
     if (!updated) {
       throw new AppError(404, 'Pending tenant not found, already resolved/cancelled, or not owned by you')
@@ -2632,7 +2737,10 @@ landlordsRouter.post(
       if (!req.file) throw new AppError(400, 'No file uploaded')
 
       const { intentId } = req.params
-      const landlordId = req.user!.profileId
+      // S633: the landlord_id filter below is the ownership check. It now asks
+      // the ACCOUNT — every company it owns — instead of the one the session sat
+      // on, which hid the other company's records behind a 404.
+      const landlordIds = landlordScopeIds(req.user!)
 
       // Verify ownership and that the intent is in a state that accepts uploads.
       // Allowed states: 'not_uploaded' (first upload), 'error' / 'mismatch' (re-upload
@@ -2641,8 +2749,8 @@ landlordsRouter.post(
       const intent = await queryOne<any>(
         `SELECT id, parser_status, imported_pdf_url
          FROM pending_tenant_intents
-         WHERE id = $1 AND landlord_id = $2 AND resolved_at IS NULL AND cancelled_at IS NULL`,
-        [intentId, landlordId]
+         WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND resolved_at IS NULL AND cancelled_at IS NULL`,
+        [intentId, landlordIds]
       )
       if (!intent) {
         // Clean up the uploaded file before rejecting.
@@ -2715,12 +2823,15 @@ landlordsRouter.get(
   async (req, res, next) => {
     try {
       const { intentId } = req.params
-      const landlordId = req.user!.profileId
+      // S633: the landlord_id filter below is the ownership check. It now asks
+      // the ACCOUNT — every company it owns — instead of the one the session sat
+      // on, which hid the other company's records behind a 404.
+      const landlordIds = landlordScopeIds(req.user!)
 
       const intent = await queryOne<any>(
         `SELECT imported_pdf_url FROM pending_tenant_intents
-         WHERE id = $1 AND landlord_id = $2`,
-        [intentId, landlordId]
+         WHERE id = $1 AND landlord_id = ANY($2::uuid[])`,
+        [intentId, landlordIds]
       )
       if (!intent || !intent.imported_pdf_url) {
         throw new AppError(404, 'Document not found for this pending tenant')
@@ -2748,7 +2859,10 @@ landlordsRouter.get(
   async (req, res, next) => {
     try {
       const { intentId } = req.params
-      const landlordId = req.user!.profileId
+      // S633: the landlord_id filter below is the ownership check. It now asks
+      // the ACCOUNT — every company it owns — instead of the one the session sat
+      // on, which hid the other company's records behind a 404.
+      const landlordIds = landlordScopeIds(req.user!)
 
       const rows = await query<any>(
         `SELECT
@@ -2772,10 +2886,10 @@ landlordsRouter.get(
          JOIN tenants t ON t.id = pti.tenant_id
          JOIN users   u ON u.id = t.user_id
          WHERE pti.id = $1
-           AND pti.landlord_id = $2
+           AND pti.landlord_id = ANY($2::uuid[])
            AND pti.resolved_at IS NULL
          LIMIT 1`,
-        [intentId, landlordId]
+        [intentId, landlordIds]
       )
 
       if (rows.length === 0) {
@@ -2823,7 +2937,10 @@ landlordsRouter.post(
   async (req, res, next) => {
     try {
       const { intentId } = req.params
-      const landlordId = req.user!.profileId
+      // S633: the landlord_id filter below is the ownership check. It now asks
+      // the ACCOUNT — every company it owns — instead of the one the session sat
+      // on, which hid the other company's records behind a 404.
+      const landlordIds = landlordScopeIds(req.user!)
       const overrides = (req.body?.landlordOverrides ?? {}) as any
       if (typeof overrides !== 'object' || Array.isArray(overrides) || overrides === null) {
         throw new AppError(400, 'landlordOverrides must be an object')
@@ -2831,7 +2948,7 @@ landlordsRouter.post(
       // S582: confirmSupersede lets the landlord acknowledge that resolving into
       // an already-leased unit will END the sitting lease (parser migration case).
       const confirmSupersede = req.body?.confirmSupersede === true
-      const result = await resolveIntent(intentId, landlordId, overrides, { confirmSupersede })
+      const result = await resolveIntent(intentId, landlordIds, overrides, { confirmSupersede })
       res.json({ success: true, data: result })
     } catch (e) { next(e) }
   }
@@ -2942,7 +3059,12 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
 
     records = applyPropertyMapping(records, sourceNorm as CsvImportPlatform)
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     // Pre-load existing properties + units for this landlord so we can
     // find-or-create idempotently. Property match is on lower(name) +
@@ -3252,7 +3374,12 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
       throw new AppError(400, 'claimedPlatformName is required for generic uploads')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     for (const row of rows as PropertyCsvRow[]) {
       const blockers = (row.issues || []).filter(i => i.severity === 'block')
@@ -3539,7 +3666,12 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
     // Name' → 'first_name' before the validator runs against canonical keys.
     records = applyMapping(records, sourceNorm as CsvImportPlatform)
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     const units = await query<any>(
       `SELECT u.id, u.unit_number, u.property_id, p.name AS property_name
@@ -3848,7 +3980,12 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
       throw new AppError(400, 'claimedPlatformName is required for generic uploads')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     // Defense in depth: re-resolve unit ownership and check no blockers remain.
     const unitIds = Array.from(new Set((rows as CsvRow[]).map(r => r.resolvedUnitId).filter(Boolean) as string[]))
@@ -4277,7 +4414,12 @@ landlordsRouter.post('/me/onboard-payment-history-csv/validate', requirePerm('te
 
     records = applyPaymentMapping(records, sourceNorm as CsvImportPlatform)
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     // Pre-load every active-lease tenant in the landlord's portfolio.
     // S29X-round-3: this used to load only the emails referenced in
@@ -4532,7 +4674,12 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
       throw new AppError(400, 'claimedPlatformName is required for generic uploads')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: an import lands in ONE named company. The account says which —
+    // silently when it owns only one. This used to be whichever company the
+    // session sat on, which would have filed Mountain View's residents into Oak
+    // Park's books on a single wrong click, with nothing on screen naming the
+    // company the rows were going to.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'import')
 
     // Defense in depth: every row must have resolved IDs and zero blockers.
     for (const row of rows as PaymentCsvRow[]) {
@@ -4651,7 +4798,10 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
 // call about who handles bounce remediation. Defer.
 landlordsRouter.get('/me/email-failures', requireLandlord, async (req: any, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S633: the landlord_id filter below is the ownership check. It now asks
+    // the ACCOUNT — every company it owns — instead of the one the session sat
+    // on, which hid the other company's records behind a 404.
+    const landlordIds = landlordScopeIds(req.user!)
     const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200)
     const sinceDays = Math.min(Math.max(parseInt(String(req.query.since_days ?? '30'), 10) || 30, 1), 365)
 
@@ -4659,12 +4809,12 @@ landlordsRouter.get('/me/email-failures', requireLandlord, async (req: any, res,
       SELECT id, to_email, subject, category, error_message,
              related_entity_type, related_entity_id, metadata, created_at
         FROM email_send_log
-       WHERE landlord_id = $1
+       WHERE landlord_id = ANY($1::uuid[])
          AND status = 'failed'
          AND created_at >= NOW() - ($2::int * INTERVAL '1 day')
        ORDER BY created_at DESC
        LIMIT $3
-    `, [landlordId, sinceDays, limit])
+    `, [landlordIds, sinceDays, limit])
 
     res.json({ success: true, data: { rows, limit, sinceDays } })
   } catch (e) { next(e) }
@@ -4681,7 +4831,10 @@ landlordsRouter.get('/me/email-failures', requireLandlord, async (req: any, res,
 // audience.
 landlordsRouter.get('/me/pm-impact', requireLandlord, async (req: any, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S633: the landlord_id filter below is the ownership check. It now asks
+    // the ACCOUNT — every company it owns — instead of the one the session sat
+    // on, which hid the other company's records behind a 404.
+    const landlordIds = landlordScopeIds(req.user!)
     const isISODate = (v: unknown): v is string =>
       typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
     const fromQ = req.query.from
@@ -4694,7 +4847,7 @@ landlordsRouter.get('/me/pm-impact', requireLandlord, async (req: any, res, next
     // Aggregate ledger entries per property in the window.
     // owner_share + manager_fee + pm_company_fee come from rent payments
     // referenced via reference_id; sum the absolute amounts per property.
-    const params: any[] = [landlordId]
+    const params: any[] = [landlordIds]
     let dateClause = ''
     if (from) { params.push(from); dateClause += ` AND ubl.created_at >= $${params.length}::date` }
     if (to)   { params.push(to);   dateClause += ` AND ubl.created_at <  ($${params.length}::date + INTERVAL '1 day')` }
@@ -4721,7 +4874,7 @@ landlordsRouter.get('/me/pm-impact', requireLandlord, async (req: any, res, next
        AND ubl.reference_type = 'payment'
        AND ubl.type IN ('allocation_owner_share', 'allocation_pm_company_fee', 'allocation_manager_fee')
        ${dateClause}
-     WHERE p.landlord_id = $1
+     WHERE p.landlord_id = ANY($1::uuid[])
      GROUP BY p.id, p.name, p.pm_company_id, c.name, p.pm_fee_plan_id, fp.name, fp.fee_type
      ORDER BY p.name ASC
     `, params)
@@ -4749,18 +4902,22 @@ landlordsRouter.get('/me/pm-impact', requireLandlord, async (req: any, res, next
 // owner profileId and team-worker landlordId claim.
 landlordsRouter.get('/me/payouts', requirePerm('payments.view_all'), async (req: any, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
-
-    const u = await queryOne<{ user_id: string }>(
-      `SELECT user_id FROM landlords WHERE id=$1`, [landlordId]
-    )
-    if (!u) throw new AppError(404, 'Landlord not found')
+    // S633: payouts land in the Connect account of whoever OWNS the companies in
+    // scope — the account itself for a landlord, their landlord for a team
+    // member. Resolved from the entities rather than from a single "active" one,
+    // so an account that owns two companies sees both books of payouts instead
+    // of half of them.
+    const scopeIds = landlordScopeIds(req.user!)
+    if (!scopeIds.length) throw new AppError(400, 'No landlord scope on this user')
+    const owners = await query<{ user_id: string }>(
+      `SELECT DISTINCT user_id FROM landlords WHERE id = ANY($1::uuid[])`, [scopeIds])
+    if (!owners.length) throw new AppError(404, 'Landlord not found')
+    const ownerUserIds = owners.map(o => o.user_id)
 
     const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200)
     const status = typeof req.query.status === 'string' ? req.query.status : null
 
-    const params: any[] = [u.user_id]
+    const params: any[] = [ownerUserIds]
     let statusClause = ''
     if (status) { params.push(status); statusClause = `AND status = $${params.length}` }
     params.push(limit)
@@ -4770,7 +4927,7 @@ landlordsRouter.get('/me/payouts', requirePerm('payments.view_all'), async (req:
              destination_bank_last4, arrival_date, failure_code, failure_message,
              created_at, updated_at
         FROM connect_payouts
-       WHERE user_id = $1 ${statusClause}
+       WHERE user_id = ANY($1::uuid[]) ${statusClause}
        ORDER BY created_at DESC
        LIMIT $${params.length}
     `, params)
@@ -4786,13 +4943,14 @@ landlordsRouter.get('/me/payouts', requirePerm('payments.view_all'), async (req:
 // a legal/financial action.
 landlordsRouter.get('/me/disputes', requirePerm('payments.view_all'), async (req: any, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a read — every company the account owns.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
 
     const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200)
     const onlyPending = req.query.pending === 'true'
 
-    const params: any[] = [landlordId]
+    const params: any[] = [landlordIds]
     let pendingClause = ''
     if (onlyPending) {
       // S358 fix: alias `d.status` explicitly — the JOIN to payments p
@@ -4814,7 +4972,7 @@ landlordsRouter.get('/me/disputes', requirePerm('payments.view_all'), async (req
         LEFT JOIN payments p ON p.id = d.payment_id
         LEFT JOIN units u ON u.id = p.unit_id
         LEFT JOIN properties pr ON pr.id = u.property_id
-       WHERE d.landlord_id = $1 ${pendingClause}
+       WHERE d.landlord_id = ANY($1::uuid[]) ${pendingClause}
        ORDER BY
          CASE d.status WHEN 'needs_response' THEN 1
                        WHEN 'warning_needs_response' THEN 2
@@ -4844,8 +5002,8 @@ landlordsRouter.post('/me/disputes/:id/respond', requireLandlord, async (req: an
     }).parse(req.body)
 
     const dispute = await queryOne<{ stripe_dispute_id: string; status: string }>(
-      `SELECT stripe_dispute_id, status FROM connect_disputes WHERE id=$1 AND landlord_id=$2`,
-      [req.params.id, req.user!.profileId]
+      `SELECT stripe_dispute_id, status FROM connect_disputes WHERE id=$1 AND landlord_id = ANY($2::uuid[])`,
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!dispute) throw new AppError(404, 'Dispute not found')
     if (dispute.status !== 'needs_response' && dispute.status !== 'warning_needs_response') {
@@ -4879,13 +5037,14 @@ landlordsRouter.post('/me/disputes/:id/respond', requireLandlord, async (req: an
 // Same posture as /me/payouts and /me/disputes (read).
 landlordsRouter.get('/me/payments-history', requirePerm('payments.view_all'), async (req: any, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
-
-    const u = await queryOne<{ user_id: string }>(
-      `SELECT user_id FROM landlords WHERE id=$1`, [landlordId]
-    )
-    if (!u) throw new AppError(404, 'Landlord not found')
+    // S633: a read — every company the account owns, and every Connect account
+    // those companies pay out to.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+    const owners = await query<{ user_id: string }>(
+      `SELECT DISTINCT user_id FROM landlords WHERE id = ANY($1::uuid[])`, [landlordIds])
+    const ownerUserIds = owners.map(o => o.user_id)
+    if (!ownerUserIds.length) throw new AppError(404, 'Landlord not found')
 
     const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200)
 
@@ -4899,11 +5058,11 @@ landlordsRouter.get('/me/payments-history', requirePerm('payments.view_all'), as
         LEFT JOIN properties pr ON pr.id = un.property_id
         LEFT JOIN tenants t ON t.id = p.tenant_id
         LEFT JOIN users tu ON tu.id = t.user_id
-       WHERE p.landlord_id = $1
+       WHERE p.landlord_id = ANY($1::uuid[])
          AND p.stripe_payment_intent_id IS NOT NULL
        ORDER BY p.created_at DESC
        LIMIT $2
-    `, [landlordId, limit])
+    `, [landlordIds, limit])
 
     const payouts = await query<any>(`
       SELECT 'payout' AS kind, id, amount, status,
@@ -4911,10 +5070,10 @@ landlordsRouter.get('/me/payments-history', requirePerm('payments.view_all'), as
              arrival_date, failure_code, failure_message,
              created_at, updated_at
         FROM connect_payouts
-       WHERE user_id = $1
+       WHERE user_id = ANY($1::uuid[])
        ORDER BY created_at DESC
        LIMIT $2
-    `, [u.user_id, limit])
+    `, [ownerUserIds, limit])
 
     res.json({ success: true, data: { charges, payouts } })
   } catch (e) { next(e) }
@@ -4931,7 +5090,11 @@ landlordsRouter.get('/me/payments-history', requirePerm('payments.view_all'), as
 landlordsRouter.get('/me/otp/visibility', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { isOtpVisibleForLandlord } = await import('../services/otp')
-    const visible = await isOtpVisibleForLandlord(req.user!.profileId)
+    // S633: visible if ANY company on the account has it. A read on page load —
+    // it must never 400 an account for owning two companies. (OTP is shelved and
+    // off everywhere; this keeps the dormant path honest.)
+    const scopeIds = landlordScopeIds(req.user!)
+    const visible = (await Promise.all(scopeIds.map(isOtpVisibleForLandlord))).some(Boolean)
     res.json({ success: true, data: { visible } })
   } catch (e) { next(e) }
 })
@@ -4940,7 +5103,8 @@ landlordsRouter.get('/me/otp/visibility', requireAuth, requireLandlord, async (r
 landlordsRouter.get('/me/otp/eligible-tenants', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { isOtpVisibleForLandlord, getQualificationStatus } = await import('../services/otp')
-    const visible = await isOtpVisibleForLandlord(req.user!.profileId)
+    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
 
     const tenants = await query<any>(`
@@ -4953,9 +5117,9 @@ landlordsRouter.get('/me/otp/eligible-tenants', requireAuth, requireLandlord, as
         JOIN leases l ON l.id = lt.lease_id AND l.status IN ('active','pending')
         JOIN units un ON un.id = l.unit_id
         JOIN properties p ON p.id = un.property_id
-       WHERE l.landlord_id = $1
+       WHERE l.landlord_id = ANY($1::uuid[])
        ORDER BY u.last_name, u.first_name`,
-      [req.user!.profileId])
+      [landlordScopeIds(req.user!)])
 
     const enriched = await Promise.all(tenants.map(async (t: any) => {
       const status = await getQualificationStatus(t.id)
@@ -4971,7 +5135,7 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/enable', requireAuth, requireLan
     const { enableOtpForTenant } = await import('../services/otp')
     const result = await enableOtpForTenant({
       tenantId: req.params.tenantId,
-      landlordId: req.user!.profileId,
+      landlordId: resolveLandlordTarget(req.user!, req.body?.landlordId, 'company'),
       enabledByUserId: req.user!.userId,
     })
     if (!result.ok) throw new AppError(400, result.reason)
@@ -4984,11 +5148,12 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/disable', requireAuth, requireLa
   try {
     const reason = (req.body?.reason as string | undefined) || 'landlord_initiated'
     const { disableOtpForTenant, isOtpVisibleForLandlord } = await import('../services/otp')
-    const visible = await isOtpVisibleForLandlord(req.user!.profileId)
+    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
     await disableOtpForTenant({
       tenantId: req.params.tenantId,
-      landlordId: req.user!.profileId,
+      landlordId: otpLandlordId,
       reason,
     })
     res.json({ success: true })
@@ -4999,7 +5164,8 @@ landlordsRouter.post('/me/otp/tenants/:tenantId/disable', requireAuth, requireLa
 landlordsRouter.get('/me/otp/advances', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const { isOtpVisibleForLandlord } = await import('../services/otp')
-    const visible = await isOtpVisibleForLandlord(req.user!.profileId)
+    const otpLandlordId = resolveLandlordTarget(req.user!, req.query.landlordId as string | undefined ?? req.body?.landlordId, 'company')
+    const visible = await isOtpVisibleForLandlord(otpLandlordId)
     if (!visible) throw new AppError(403, 'OTP not enabled')
 
     const rows = await query<any>(`
@@ -5014,10 +5180,10 @@ landlordsRouter.get('/me/otp/advances', requireAuth, requireLandlord, async (req
         JOIN users u ON u.id = t.user_id
         JOIN units un ON un.id = a.unit_id
         JOIN properties p ON p.id = un.property_id
-       WHERE a.landlord_id = $1
+       WHERE a.landlord_id = ANY($1::uuid[])
        ORDER BY a.cycle_month DESC, a.created_at DESC
        LIMIT 100`,
-      [req.user!.profileId])
+      [landlordScopeIds(req.user!)])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -5051,7 +5217,7 @@ landlordsRouter.patch('/me/default-pm-company', requirePerm('settings.default_pm
     const updated = await queryOne(
       `UPDATE landlords SET default_pm_company_id=$1 WHERE id=$2
        RETURNING id, default_pm_company_id`,
-      [body.pmCompanyId, req.user!.profileId]
+      [body.pmCompanyId, resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')]
     )
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -5067,10 +5233,10 @@ landlordsRouter.get('/me/linked-pm-companies', requireLandlord, async (req: any,
              COUNT(p.id)::int AS property_count
         FROM pm_companies c
         JOIN properties p ON p.pm_company_id = c.id
-       WHERE p.landlord_id = $1
+       WHERE p.landlord_id = ANY($1::uuid[])
        GROUP BY c.id, c.name, c.business_email, c.status
        ORDER BY c.name ASC
-    `, [req.user!.profileId])
+    `, [landlordScopeIds(req.user!)])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -5086,6 +5252,12 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
       proposedFeePlanId: z.string().uuid().nullish(),
     }).parse(req.body)
 
+    // S633: the company handing the property over is the one that OWNS it —
+    // derived from the property named in the request, and authorised by the same
+    // check. Handing over a property from the wrong company is a real-world
+    // authority mistake, not a display bug.
+    const pmInviteLandlordId = await landlordIdForProperty(req.user!, body.propertyId, query)
+
     const feePlanId = body.proposedScope === 'manage' ? (body.proposedFeePlanId ?? null) : null
 
     const client = await getClient()
@@ -5096,7 +5268,7 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
         direction: 'owner_to_pm',
         pmCompanyId: body.pmCompanyId,
         propertyId: body.propertyId,
-        landlordId: req.user!.profileId,
+        landlordId: pmInviteLandlordId,
         invitedEmail: body.invitedEmail,
         invitedByUserId: req.user!.userId,
         proposedScope: body.proposedScope,
@@ -5125,7 +5297,7 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
             ctx: {
               pmCompanyId: body.pmCompanyId,
               invitationId,
-              landlordId: req.user!.profileId,
+              landlordId: pmInviteLandlordId,
             },
           })
         } catch (mailErr) {
@@ -5147,7 +5319,7 @@ landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.
 landlordsRouter.get('/me/pm-property-invitations', requireLandlord, async (req: any, res, next) => {
   try {
     const status = typeof req.query.status === 'string' ? req.query.status : null
-    const params: any[] = [req.user!.profileId]
+    const params: any[] = [landlordScopeIds(req.user!)]
     let statusClause = ''
     if (status) { params.push(status); statusClause = `AND i.status = $${params.length}` }
 
@@ -5163,7 +5335,7 @@ landlordsRouter.get('/me/pm-property-invitations', requireLandlord, async (req: 
         JOIN pm_companies c  ON c.id = i.pm_company_id
         JOIN properties   p  ON p.id = i.property_id
    LEFT JOIN pm_fee_plans fp ON fp.id = i.proposed_fee_plan_id
-       WHERE i.landlord_id = $1 ${statusClause}
+       WHERE i.landlord_id = ANY($1::uuid[]) ${statusClause}
        ORDER BY i.created_at DESC
     `, params)
 
@@ -5183,7 +5355,7 @@ landlordsRouter.post('/me/pm-property-invitations/:invId/accept', requirePerm('p
       [req.params.invId]
     )
     if (!inv) throw new AppError(404, 'Invitation not found')
-    if (inv.landlord_id !== req.user!.profileId) {
+    if (!ownsLandlord(req.user!, inv.landlord_id)) {
       throw new AppError(403, 'Invitation does not belong to this landlord')
     }
     if (inv.direction !== 'pm_to_owner') {
@@ -5219,7 +5391,7 @@ landlordsRouter.post('/me/pm-property-invitations/:invId/reject', requirePerm('p
       [req.params.invId]
     )
     if (!inv) throw new AppError(404, 'Invitation not found')
-    if (inv.landlord_id !== req.user!.profileId) {
+    if (!ownsLandlord(req.user!, inv.landlord_id)) {
       throw new AppError(403, 'Invitation does not belong to this landlord')
     }
     if (inv.direction !== 'pm_to_owner') {
@@ -5251,7 +5423,7 @@ landlordsRouter.delete('/me/pm-property-invitations/:invId', requirePerm('pm_inv
       [req.params.invId]
     )
     if (!inv) throw new AppError(404, 'Invitation not found')
-    if (inv.landlord_id !== req.user!.profileId) {
+    if (!ownsLandlord(req.user!, inv.landlord_id)) {
       throw new AppError(403, 'Invitation does not belong to this landlord')
     }
     if (inv.direction !== 'owner_to_pm') {
@@ -5359,22 +5531,26 @@ landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
     // were in. If they add their first property later, the dashboard's standing
     // tasks (Connect KYC, connect your operating bank) surface what's needed —
     // those are the gates that matter before money can move.
+    // S633: "their OWN entity" is now "every company the account owns that holds
+    // no property" — the empty one registering created, and any other. Each is
+    // judged on its own properties, so a company that already has property keeps
+    // whatever onboarding state it was in and a real onboarding is never skipped.
     await query(
-      `UPDATE landlords SET onboarding_complete = TRUE
-        WHERE id = $1
-          AND onboarding_complete = FALSE
-          AND NOT EXISTS (SELECT 1 FROM properties WHERE landlord_id = $1)`,
-      [u.profileId])
+      `UPDATE landlords l SET onboarding_complete = TRUE
+        WHERE l.id = ANY($1::uuid[])
+          AND l.onboarding_complete = FALSE
+          AND NOT EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = l.id)`,
+      [landlordScopeIds(u)])
 
     // S620 (Nic): "that co-owner should see everything. It should be defaulted
     // to the invited entity, not defaulted to a blank entity."
     //
-    // Land them IN the entity they were invited to. Without this they arrive on
-    // the empty entity registering created for them — which is exactly what
-    // happened to Blue: an onboarding wizard and no sign of Oak Park.
-    await query(
-      `UPDATE users SET active_landlord_id = $2 WHERE id = $1`,
-      [u.userId, inv.landlord_id]).catch(() => {})
+    // S634: nothing to default TO any more. Accepting the invite created the
+    // membership row, and a co-owner is now signed into every company they
+    // belong to at once — including the empty one registering made for them and
+    // the one they were just invited into. The bug this guarded against (Blue
+    // landing on an onboarding wizard with no sign of Oak Park) is fixed by the
+    // account seeing both, not by choosing one for him.
 
     // landlordIds is stamped into the JWT at login, so the new entity appears
     // once they re-authenticate. Say so rather than letting them wonder why the
@@ -5382,3 +5558,192 @@ landlordsRouter.post('/member-invite/:token/accept', async (req, res, next) => {
     res.json({ success: true, data: { landlordId: inv.landlord_id, reloginRequired: true } })
   } catch (e) { next(e) }
 })
+
+// ── First billing cycle — MOVED (S633) ───────────────────────────────────────
+//
+// This lived here as PATCH /landlords/me/first-billing-cycle, set on the ENTITY.
+// That was the wrong grain: onboarding happens one PROPERTY at a time, so a park
+// bought in November under an LLC that onboarded another park in September would
+// have inherited September and invoiced its residents for months they had
+// already paid someone else. Nic caught it the same day.
+//
+// It is now PATCH /properties/:id/first-billing-cycle. `landlords.first_billing_cycle`
+// is retained only as the record of what was answered before the move; nothing
+// reads it.
+
+// PATCH /api/landlords/me/pending-intents/:id/work-trade
+//
+// S631 (Nic): "I need you to put Oak Park RV number three space as a work trade
+// agreement. I'm getting ready to sign the lease for that space."
+//
+// The invite form declares this now, but an invite already SENT — accepted, even
+// — cannot be recalled and re-sent just to tick a box. The window that matters
+// is still open right up until the lease is signed, because that is when the
+// agreement is created and the first invoice written. So this exists to change
+// the answer on an outstanding invite, and it refuses once the lease exists:
+// after that the agreement is a real record with its own start date, and
+// POST /work-trade/agreements is the honest way to create it (which also
+// exempts any invoice already issued).
+landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants.create'),
+  async (req, res, next) => {
+    try {
+      const body = z.object({
+        isWorkTrade: z.boolean(),
+        hoursTarget: z.number().int().positive().max(400).nullable().optional(),
+        duties: z.string().max(2000).nullable().optional(),
+        // S635 (Nic): which charges the trade covers, decided WITH the invite —
+        // it is the same question the landlord answers on a live agreement, and
+        // leaving it until after signing means the first invoice is written
+        // against the all-inclusive default. Omitted/null keeps that default.
+        coveredCharges: z.array(z.enum(WORK_TRADE_COVERABLE))
+          .min(1).nullable().optional(),
+      }).parse(req.body)
+
+      const intent = await queryOne<any>(
+        `SELECT id, landlord_id, unit_id, resolved_at FROM pending_tenant_intents
+          WHERE id = $1 AND cancelled_at IS NULL`, [req.params.id])
+      if (!intent) throw new AppError(404, 'That invite no longer exists.')
+      if (!canManageLandlordResource(req.user, intent.landlord_id)) throw new AppError(403, 'Forbidden')
+      if (intent.resolved_at) {
+        throw new AppError(409,
+          'This tenant has already signed — their lease exists, so work trade is now an agreement ' +
+          'rather than a plan. Create it from the unit, which will also clear late fees from any ' +
+          'invoice already issued.')
+      }
+      if (body.isWorkTrade && !intent.unit_id) {
+        throw new AppError(400,
+          'Work trade is per unit — bind this invite to a space first, since the trade pays that ' +
+          "space's rent.")
+      }
+
+      const updated = await queryOne<any>(
+        `UPDATE pending_tenant_intents
+            SET is_work_trade = $2,
+                work_trade_hours_target = CASE WHEN $2 THEN $3::int ELSE NULL END,
+                work_trade_duties       = CASE WHEN $2 THEN $4::text ELSE NULL END,
+                work_trade_covered_charges =
+                  CASE WHEN $2 THEN $5::text[] ELSE NULL END,
+                updated_at = NOW()
+          WHERE id = $1
+        RETURNING id, is_work_trade, work_trade_hours_target, work_trade_duties,
+                  work_trade_covered_charges`,
+        [intent.id, body.isWorkTrade, body.hoursTarget ?? null, body.duties ?? null,
+         body.coveredCharges ?? null])
+      res.json({ success: true, data: updated })
+    } catch (e) { next(e) }
+  })
+
+// PATCH /api/landlords/me/pending-intents/:id/contact
+//
+// S632 (Nic): "Let's make a way for a landlord to resend the invite. Otherwise
+// I'm gonna be asking you every time."
+//
+// Jonathan Covey changed his email between being invited and accepting, so his
+// invitation was sitting in a mailbox he no longer reads — and there was no way
+// in the product to fix it. Correcting a tenant's invite address took a direct
+// database write. Over 29 invites at one park and 75 at another, a wrong or
+// changed address is not an edge case, it is a weekly occurrence.
+//
+// Corrects the name and/or address on an OUTSTANDING invite and re-sends it with
+// a fresh token. Refused once they have accepted or signed in: at that point the
+// account is theirs, the address is proven, and changing it from the landlord's
+// side would be taking over somebody's login.
+landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.create'),
+  async (req, res, next) => {
+    try {
+      const body = z.object({
+        email:     z.string().trim().email().optional(),
+        firstName: z.string().trim().min(1).max(80).optional(),
+        lastName:  z.string().trim().min(1).max(80).optional(),
+        resend:    z.boolean().optional(),
+      }).parse(req.body)
+      if (!body.email && !body.firstName && !body.lastName && !body.resend) {
+        throw new AppError(400, 'Nothing to change — send a new address, a name, or ask for a resend.')
+      }
+
+      const intent = await queryOne<any>(
+        `SELECT pti.id, pti.landlord_id, pti.unit_id, pti.property_id, pti.tenant_id,
+                pti.accepted_at, pti.resolved_at,
+                t.user_id, u.email, u.first_name, u.last_name, u.last_login_at
+           FROM pending_tenant_intents pti
+           JOIN tenants t ON t.id = pti.tenant_id
+           JOIN users u ON u.id = t.user_id
+          WHERE pti.id = $1 AND pti.cancelled_at IS NULL`, [req.params.id])
+      if (!intent) throw new AppError(404, 'That invite no longer exists.')
+      if (!canManageLandlordResource(req.user, intent.landlord_id)) throw new AppError(403, 'Forbidden')
+      if (intent.resolved_at) {
+        throw new AppError(409, 'They have already signed — their account is their own now.')
+      }
+      if (intent.accepted_at || intent.last_login_at) {
+        throw new AppError(409,
+          'They have already accepted and signed in, so this account belongs to them. ' +
+          'Ask them to change their own email from their portal.')
+      }
+
+      const newEmail = body.email?.toLowerCase() ?? null
+      if (newEmail && newEmail !== String(intent.email).toLowerCase()) {
+        const taken = await queryOne<{ id: string }>(
+          `SELECT id FROM users WHERE lower(email) = $1 AND id <> $2`, [newEmail, intent.user_id])
+        if (taken) {
+          throw new AppError(409, 'Somebody already has an account with that address.')
+        }
+      }
+
+      // A new address is unverified by definition — never inherit the old one's
+      // verified status onto a mailbox nobody has proven they can read.
+      await query(
+        `UPDATE users
+            SET email = COALESCE($2, email),
+                email_verified = CASE WHEN $2 IS NULL THEN email_verified ELSE false END,
+                first_name = COALESCE($3, first_name),
+                last_name = COALESCE($4, last_name),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [intent.user_id, newEmail, body.firstName ?? null, body.lastName ?? null])
+
+      let sent = false
+      if (body.resend !== false) {
+        // A fresh token on every send: the old link went to an address that may
+        // no longer be under their control, and it must stop working.
+        const inviteToken = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+        await query(
+          `UPDATE users SET tenant_invite_token = $1,
+                            tenant_invite_expires_at = NOW() + INTERVAL '7 days'
+            WHERE id = $2`, [inviteToken, intent.user_id])
+        const ctx = await queryOne<any>(
+          `SELECT p.name AS property_name, un.unit_number,
+                  COALESCE(NULLIF(la.business_name, ''),
+                           NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
+                           'Your landlord') AS landlord_name
+             FROM landlords la
+             JOIN users lu ON lu.id = la.user_id
+             LEFT JOIN units un ON un.id = $2::uuid
+             LEFT JOIN properties p ON p.id = COALESCE(un.property_id, $3::uuid)
+            WHERE la.id = $1`,
+          [intent.landlord_id, intent.unit_id, intent.property_id])
+        const to = newEmail ?? intent.email
+        const first = body.firstName ?? intent.first_name
+        try {
+          await emailTenantInvite(
+            to, first,
+            ctx?.landlord_name || 'Your landlord',
+            ctx?.property_name || 'their property',
+            ctx?.unit_number ? `Unit ${ctx.unit_number}` : null,
+            `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/accept-invite?token=${inviteToken}`,
+            !intent.unit_id,
+            { landlordId: intent.landlord_id, tenantId: intent.tenant_id },
+          )
+          sent = true
+        } catch (e) {
+          logger.error({ err: e, to }, '[INVITE] resend failed')
+        }
+      }
+
+      res.json({ success: true, data: {
+        email: newEmail ?? intent.email,
+        firstName: body.firstName ?? intent.first_name,
+        lastName: body.lastName ?? intent.last_name,
+        resent: sent,
+      } })
+    } catch (e) { next(e) }
+  })

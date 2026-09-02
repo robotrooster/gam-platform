@@ -98,7 +98,7 @@ async function seed(): Promise<Fixture> {
     await seedLeaseTenant(c, { leaseId: leaseA, tenantId: tenantA, role: 'primary' })
     await c.query('COMMIT')
     const sign = (uid: string, lid: string) => jwt.sign(
-      { userId: uid, role: 'landlord', email: 'l@t.dev', profileId: lid, permissions: {} },
+      { userId: uid, role: 'landlord', email: 'l@t.dev', profileId: null, landlordIds: [lid], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
       landlordAUserId: aUid, landlordAId: aId,

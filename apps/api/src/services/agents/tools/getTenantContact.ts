@@ -10,7 +10,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface TenantMatch {
   tenant_id: string
@@ -45,11 +45,11 @@ export const getTenantContact: AgentTool = {
     const matches = await query<TenantMatch>(
       `SELECT DISTINCT t.id AS tenant_id, us.first_name, us.last_name, us.email, us.phone
          FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1
+         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = ANY($1::uuid[])
          JOIN tenants t ON t.id = lt.tenant_id
          JOIN users us ON us.id = t.user_id
         WHERE us.email ILIKE $2 OR (COALESCE(us.first_name,'') || ' ' || COALESCE(us.last_name,'')) ILIKE $2`,
-      [actor.profileId, `%${needle}%`]
+      [actorLandlordIds(actor), `%${needle}%`]
     )
 
     if (matches.length === 0) return { ok: false, error: `No tenant on your leases matches “${needle}”.` }
@@ -67,12 +67,12 @@ export const getTenantContact: AgentTool = {
     const units = await query<{ unit_number: string | null; property_name: string | null; lease_status: string }>(
       `SELECT DISTINCT u.unit_number, p.name AS property_name, l.status AS lease_status
          FROM lease_tenants lt
-         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1
+         JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = ANY($1::uuid[])
          LEFT JOIN units u ON u.id = l.unit_id
          LEFT JOIN properties p ON p.id = u.property_id
         WHERE lt.tenant_id = $2
         ORDER BY (l.status = 'active') DESC`,
-      [actor.profileId, m.tenant_id]
+      [actorLandlordIds(actor), m.tenant_id]
     )
 
     return {

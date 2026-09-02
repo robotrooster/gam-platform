@@ -180,7 +180,7 @@ describe('surveys are anonymous, and the agent must never promise otherwise', ()
   it('a multiple-choice question without options is refused before anything is written', async () => {
     const r: any = await getTool('create_and_send_survey')!.execute(
       { property: 'x', title: 'T', questions: [{ prompt: 'Staying?', type: 'multiple_choice' }] },
-      { userId: 'u', role: 'landlord', profileId: '00000000-0000-0000-0000-000000000000' } as any,
+      { userId: 'u', role: 'landlord', profileId: '', landlordIds: ['00000000-0000-0000-0000-000000000000'] } as any,
     )
     expect(r.ok).toBe(false)
     // Property resolution fails first for a nonexistent landlord, which is

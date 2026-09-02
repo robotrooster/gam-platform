@@ -3,8 +3,8 @@ import { occupancyRateFrom } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordIdForUser } from '../lib/scope'
-import { platformFeesByProperty, periodMonths } from '../services/platformFee'
+import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { platformFeesByProperty, platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import { computeLandlordPL } from '../services/landlordPL'
 import {
   runReport, REPORT_LEVELS, REPORT_BUCKETS,
@@ -28,6 +28,37 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
 
+/**
+ * S633 — REPORTS SPLIT TWO WAYS, AND THE SPLIT IS NOT ARBITRARY.
+ *
+ * The account owns entities; entities own properties. So "which landlord is
+ * this report for?" has two different right answers depending on the report:
+ *
+ *  - An ANALYTICAL rollup — how is my portfolio doing — is about the account.
+ *    It spans every entity the account owns. Nic, on the dashboard doing this
+ *    already: "I see everything combined for mine, without the two mixing."
+ *    Use `reportScope()`.
+ *
+ *  - A TAX or STATEMENT document — a 1099, a tax summary, a monthly statement —
+ *    belongs to ONE company. It carries that company's name and EIN, and an LLC
+ *    files its own return. Summing two LLCs into one statement would produce a
+ *    document that is wrong on its face. Use `reportEntity()`, which asks which
+ *    company when the account owns more than one.
+ *
+ * Both replace `resolveLandlordIdForUser`, which answered with whichever single
+ * entity the session sat on — silently omitting the other company's money from
+ * every figure on the page.
+ */
+function reportScope(user: any): string[] {
+  const ids = landlordScopeIds(user)
+  if (!ids.length) throw new AppError(400, 'No landlord scope on this user')
+  return ids
+}
+
+function reportEntity(user: any, explicit: unknown): string {
+  return resolveLandlordTarget(user, typeof explicit === 'string' ? explicit : undefined, 'report')
+}
+
 // ── SUMMARY (S69) ─────────────────────────────────────────────
 // GET /api/reports/summary
 // Backs the landlord ReportsPage. Per-landlord scoped (admin/super_admin
@@ -43,9 +74,11 @@ function round2(n: number): number {
 reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
     const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
-    const landlordId = isAdmin ? null : resolveLandlordIdForUser(req.user!)
+    // S633: spans every entity the account owns. Scoped to one entity, the
+    // headline figures on the Reports page silently excluded the other
+    // company's rent — a number that is wrong with no sign that it is wrong.
+    const landlordIds = isAdmin ? null : reportScope(req.user!)
     const userId = req.user!.userId
-    if (!isAdmin && !landlordId) throw new AppError(400, 'No landlord scope on this user')
 
     const monthlyRows = isAdmin
       ? await query<any>(`
@@ -60,10 +93,10 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE landlord_id=$1 AND status='settled' AND type='rent'
+           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
              AND settled_at > NOW() - INTERVAL '6 months'
            GROUP BY 1 ORDER BY 1 DESC
-        `, [landlordId])
+        `, [landlordIds])
 
     const disbursementRows = isAdmin
       ? await query<any>(`
@@ -121,9 +154,9 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
       : await queryOne<any>(`
           SELECT COALESCE(SUM(amount), 0)::numeric AS amount
             FROM payments
-           WHERE landlord_id=$1 AND status='settled' AND type='rent'
+           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
              AND settled_at >= date_trunc('month', NOW())
-        `, [landlordId])
+        `, [landlordIds])
     const collectedMtd = parseFloat(collectedMtdRow?.amount ?? '0')
 
     // Outstanding = invoice total minus settled payments matched to that invoice.
@@ -147,8 +180,8 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
                 FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
                GROUP BY invoice_id
             ) p ON p.invoice_id = i.id
-           WHERE i.landlord_id = $1 AND i.status IN ('pending', 'partial')
-        `, [landlordId])
+           WHERE i.landlord_id = ANY($1::uuid[]) AND i.status IN ('pending', 'partial')
+        `, [landlordIds])
     const outstanding = parseFloat(outstandingRow?.amount ?? '0')
 
     // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
@@ -166,8 +199,8 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT
             COUNT(*) FILTER (WHERE status <> 'utility_service')::int AS total,
             COUNT(*) FILTER (WHERE status='active')::int AS active
-          FROM units WHERE landlord_id = $1
-        `, [landlordId])
+          FROM units WHERE landlord_id = ANY($1::uuid[])
+        `, [landlordIds])
     const nightsRow = await queryOne<{ nights: number }>(`
       SELECT COALESCE(SUM(
                GREATEST(
@@ -175,13 +208,13 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
                    - GREATEST(b.check_in, date_trunc('month', CURRENT_DATE))::date, 0)), 0)::int AS nights
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
-       WHERE ($1::uuid IS NULL OR u.landlord_id = $1::uuid)
+       WHERE ($1::uuid[] IS NULL OR u.landlord_id = ANY($1::uuid[]))
          AND u.status <> 'utility_service'
          AND b.lease_type IN ('nightly','weekly')
          AND b.status NOT IN ('cancelled','no_show')
          AND b.check_in  < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
          AND b.check_out > date_trunc('month', CURRENT_DATE)`,
-      [isAdmin ? null : landlordId])
+      [isAdmin ? null : landlordIds])
     const total = parseInt(occRow?.total ?? '0', 10)
     const active = parseInt(occRow?.active ?? '0', 10)
     const occupancyRate = occupancyRateFrom(active, nightsRow?.nights || 0, total)
@@ -213,10 +246,10 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
           SELECT to_char(date_trunc('month', settled_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS collected
             FROM payments
-           WHERE landlord_id=$1 AND status='settled' AND type='rent'
+           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
              AND settled_at >= date_trunc('year', NOW())
            GROUP BY 1 ORDER BY 1
-        `, [landlordId])
+        `, [landlordIds])
     const ytdMonthly = ytdRows.map((r: any) => ({ month: r.month, collected: parseFloat(r.collected ?? '0') }))
     const ytdCollected = round2(ytdMonthly.reduce((s: number, m: any) => s + m.collected, 0))
 
@@ -262,8 +295,11 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
     const month = parseInt(req.query.month as string) || (now.getMonth() + 1)
     if (month < 1 || month > 12) throw new AppError(400, 'month must be 1-12')
     const { start, end } = monthRange(year, month)
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a STATEMENT belongs to one company — it carries that company's name
+    // and EIN, and an LLC files its own return. Summing two together produces a
+    // document that is wrong on its face, so this asks which when the account
+    // owns more than one.
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
 
     // Settled income recognized in-month by ACTUAL payment date.
     const payments = await query<any>(`
@@ -314,8 +350,11 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
     const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
     const month = parseInt(req.query.month as string) || new Date().getMonth()
     const { start, end } = monthRange(year, month)
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a STATEMENT belongs to one company — it carries that company's name
+    // and EIN, and an LLC files its own return. Summing two together produces a
+    // document that is wrong on its face, so this asks which when the account
+    // owns more than one.
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
 
     // Landlord info
     const landlord = await queryOne<any>(`
@@ -462,8 +501,11 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
     const year = parseInt(req.query.year as string) || new Date().getFullYear()
     const start = `${year}-01-01`
     const end   = `${year}-12-31`
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a STATEMENT belongs to one company — it carries that company's name
+    // and EIN, and an LLC files its own return. Summing two together produces a
+    // document that is wrong on its face, so this asks which when the account
+    // owns more than one.
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
 
     const landlord = await queryOne<any>(`
       SELECT l.*, u.first_name, u.last_name, u.email
@@ -574,8 +616,10 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
   try {
     const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
     const month = req.query.month ? parseInt(req.query.month as string) : null
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: an analytical rollup is about the ACCOUNT, so it spans every company
+    // it owns. Scoped to one entity, every figure here silently omitted the
+    // other company's money.
+    const landlordIds = reportScope(req.user!)
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
     const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
 
@@ -604,16 +648,16 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
           WHERE u.property_id = p.id
             AND mr.completed_at >= $2 AND mr.completed_at <= $3) AS maint_cost
       FROM properties p
-      WHERE p.landlord_id = $1
+      WHERE p.landlord_id = ANY($1::uuid[])
       ORDER BY p.name`,
-      [landlordId, start, end])
+      [landlordIds, start, end])
 
     // Platform fee per property = GAM's actual billed income over the period
     // (accruals + live estimate for un-accrued months), period-based and
     // short-stay-aware — replaces the current-occupancy snapshot that read $0 on
     // earning properties with no active long-term lease at query time. The
     // maintenance platform fee is never surfaced; landlord net = rent − maint − fee.
-    const feeMap = await platformFeesByProperty(landlordId, periodMonths(year, month))
+    const feeMap = await platformFeesByPropertyForEntities(landlordIds, periodMonths(year, month))
 
     const result = properties.map((p:any) => {
       const rent     = parseFloat(p.rent_collected || 0)
@@ -644,8 +688,10 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     const year  = parseInt(req.query.year as string)  || new Date().getFullYear()
     const month = req.query.month ? parseInt(req.query.month as string) : null
     if (month !== null && (month < 1 || month > 12)) throw new AppError(400, 'month must be 1-12')
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: the company is the one that owns the property being reported on —
+    // derived, not guessed from session state. Authorised below by the same
+    // landlord_id filter that has always been there.
+    const landlordIds = reportScope(req.user!)
 
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
     const end   = month ? new Date(year, month, 0).toISOString().split('T')[0] : `${year}-12-31`
@@ -662,7 +708,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
            JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units
       FROM properties p
-      WHERE p.id = $1 AND p.landlord_id = $2`, [propertyId, landlordId])
+      WHERE p.id = $1 AND p.landlord_id = ANY($2::uuid[])`, [propertyId, landlordIds])
     if (!property) throw new AppError(404, 'Property not found')
 
     const occupied = parseInt(property.occupied_units || '0', 10)
@@ -716,7 +762,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     // (accruals + live estimate for un-accrued months) — period-based and
     // short-stay-aware, so a property that earned rent never shows a $0 fee. The
     // maintenance platform fee is never surfaced; landlord pays only actual cost.
-    const feeMap = await platformFeesByProperty(landlordId, periodMonths(year, month), propertyId)
+    const feeMap = await platformFeesByPropertyForEntities(landlordIds, periodMonths(year, month), propertyId)
     const platformFee = round2(feeMap.get(propertyId) ?? 0)
     const net = round2(collected - maintCost - platformFee)
 
@@ -754,8 +800,11 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
 reportsRouter.get('/work-trade-1099', requirePerm('books.view'), async (req, res, next) => {
   try {
     const year = parseInt(req.query.year as string) || new Date().getFullYear()
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: a STATEMENT belongs to one company — it carries that company's name
+    // and EIN, and an LLC files its own return. Summing two together produces a
+    // document that is wrong on its face, so this asks which when the account
+    // owns more than one.
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
 
     const landlord = await queryOne<any>(`
       SELECT l.*, u.first_name, u.last_name, u.email, l.ein
@@ -815,8 +864,10 @@ reportsRouter.get('/work-trade-1099', requirePerm('books.view'), async (req, res
 //   ?start=YYYY-MM-DD&end=YYYY-MM-DD&level=property&bucket=monthly
 reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: an analytical rollup is about the ACCOUNT, so it spans every company
+    // it owns. Scoped to one entity, every figure here silently omitted the
+    // other company's money.
+    const landlordIds = reportScope(req.user!)
 
     const start = String(req.query.start || '')
     const end   = String(req.query.end   || '')
@@ -842,7 +893,7 @@ reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, n
     // pull portfolio-wide money (gam-audience-data-isolation). null = owner.
     const scopedIds = await getScopedPropertyIds(req.user)
 
-    const result = await runReport({ landlordId, start, end, level, bucket, propertyIds: scopedIds })
+    const result = await runReport({ landlordIds, start, end, level, bucket, propertyIds: scopedIds })
     res.json({
       success: true,
       data: {
@@ -867,8 +918,10 @@ reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, n
 // the landlord's own P&L.
 reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const landlordId = resolveLandlordIdForUser(req.user!)
-    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+    // S633: an analytical rollup is about the ACCOUNT, so it spans every company
+    // it owns. Scoped to one entity, every figure here silently omitted the
+    // other company's money.
+    const landlordIds = reportScope(req.user!)
 
     // Trailing twelve FULL months ending with last month — the current partial
     // month is excluded on purpose, because a T-12 that includes a half-finished
@@ -891,7 +944,7 @@ reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, nex
     }
 
     const result = await runReport({
-      landlordId, start: iso(startD), end: iso(endD),
+      landlordIds, start: iso(startD), end: iso(endD),
       level: 'property', bucket: 'monthly', propertyIds,
     })
     res.json({

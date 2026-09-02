@@ -119,7 +119,14 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // Anything before this date is kept but auto-ignored, so the review queue is
   // only the GAM era. Retroactive and reversible; categorized rows are never
   // touched.
-  const { data: me } = useQuery<any>('landlord-books-start', () => apiGet('/landlords/me'))
+  // S633: books-start-date is a COMPANY's setting, and this page already knows
+  // which company the user is looking at. Without the id, /landlords/me now asks
+  // an account that owns several which one it means — so pass the one already
+  // selected above rather than making them answer twice.
+  const { data: me } = useQuery<any>(
+    ['landlord-books-start', entityId],
+    () => apiGet(`/landlords/me?landlordId=${entityId}`),
+    { enabled: !!entityId })
   const [booksStart, setBooksStart] = useState<string>('')
   useEffect(() => {
     if (me?.booksStartDate) setBooksStart(String(me.booksStartDate).slice(0, 10))

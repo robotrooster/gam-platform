@@ -44,7 +44,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Subject = 'tenants' | 'units' | 'properties'
 
@@ -73,7 +73,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               JOIN tenants t        ON t.id = lt.tenant_id
               JOIN users u          ON u.id = t.user_id
               JOIN units un         ON un.id = l.unit_id
-             WHERE l.landlord_id = $1 AND l.status = 'active'
+             WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     maintenance_requests: {
@@ -86,7 +86,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               JOIN tenants t  ON t.id = m.tenant_id
               JOIN users u    ON u.id = t.user_id
               LEFT JOIN units un ON un.id = m.unit_id
-             WHERE m.landlord_id = $1
+             WHERE m.landlord_id = ANY($1::uuid[])
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     maintenance_cost: {
@@ -98,7 +98,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM maintenance_requests m
               JOIN tenants t  ON t.id = m.tenant_id
               JOIN users u    ON u.id = t.user_id
-             WHERE m.landlord_id = $1
+             WHERE m.landlord_id = ANY($1::uuid[])
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     late_payments: {
@@ -114,7 +114,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               JOIN leases l  ON l.id = p.lease_id
               JOIN tenants t ON t.id = p.tenant_id
               JOIN users u   ON u.id = t.user_id
-             WHERE p.landlord_id = $1 AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
+             WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     balance_owed: {
@@ -126,7 +126,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM payments p
               JOIN tenants t ON t.id = p.tenant_id
               JOIN users u   ON u.id = t.user_id
-             WHERE p.landlord_id = $1 AND p.status IN ('pending','failed')
+             WHERE p.landlord_id = ANY($1::uuid[]) AND p.status IN ('pending','failed')
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     complaints_filed: {
@@ -139,7 +139,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               JOIN tenants t ON t.id = c.tenant_id
               JOIN users u   ON u.id = t.user_id
               LEFT JOIN units un ON un.id = c.unit_id
-             WHERE c.landlord_id = $1
+             WHERE c.landlord_id = ANY($1::uuid[])
              GROUP BY t.id, u.first_name, u.last_name`,
     },
     notices_received: {
@@ -151,7 +151,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               JOIN leases l  ON l.id = n.lease_id
               JOIN tenants t ON t.id = n.tenant_id
               JOIN users u   ON u.id = t.user_id
-             WHERE l.landlord_id = $1
+             WHERE l.landlord_id = ANY($1::uuid[])
              GROUP BY t.id, u.first_name, u.last_name`,
     },
   },
@@ -164,7 +164,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM maintenance_requests m
               JOIN units un     ON un.id = m.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE m.landlord_id = $1
+             WHERE m.landlord_id = ANY($1::uuid[])
              GROUP BY un.id, un.unit_number`,
     },
     maintenance_cost: {
@@ -175,7 +175,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM maintenance_requests m
               JOIN units un     ON un.id = m.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE m.landlord_id = $1
+             WHERE m.landlord_id = ANY($1::uuid[])
              GROUP BY un.id, un.unit_number`,
     },
     complaints_about: {
@@ -186,7 +186,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM tenant_complaints c
               JOIN units un     ON un.id = c.about_unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE c.landlord_id = $1
+             WHERE c.landlord_id = ANY($1::uuid[])
              GROUP BY un.id, un.unit_number`,
     },
     turnover: {
@@ -198,7 +198,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM leases l
               JOIN units un     ON un.id = l.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE l.landlord_id = $1
+             WHERE l.landlord_id = ANY($1::uuid[])
              GROUP BY un.id, un.unit_number`,
     },
     rent: {
@@ -209,7 +209,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM leases l
               JOIN units un     ON un.id = l.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE l.landlord_id = $1 AND l.status = 'active'`,
+             WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'`,
     },
   },
   properties: {
@@ -222,7 +222,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
                    COUNT(*)::text || ' units' AS detail
               FROM units un
               JOIN properties p ON p.id = un.property_id
-             WHERE un.landlord_id = $1 AND un.retired_at IS NULL
+             WHERE un.landlord_id = ANY($1::uuid[]) AND un.retired_at IS NULL
              GROUP BY p.id, p.name`,
     },
     rent_roll: {
@@ -233,7 +233,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM leases l
               JOIN units un     ON un.id = l.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE l.landlord_id = $1 AND l.status = 'active'
+             WHERE l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'
              GROUP BY p.id, p.name`,
     },
     maintenance_cost: {
@@ -244,7 +244,7 @@ const MEASURES: Record<Subject, Record<string, Measure>> = {
               FROM maintenance_requests m
               JOIN units un     ON un.id = m.unit_id
               JOIN properties p ON p.id = un.property_id
-             WHERE m.landlord_id = $1
+             WHERE m.landlord_id = ANY($1::uuid[])
              GROUP BY p.id, p.name`,
     },
   },
@@ -276,6 +276,15 @@ function catalog() {
     ),
     notCaptured: NOT_CAPTURED,
   }
+}
+
+// S634: analytics_data_gaps names ONE company. A landlord conversation can span
+// several, so attribute it only when there is exactly one honest answer and
+// leave it null otherwise — the column is nullable, and a made-up attribution is
+// what a later report would count.
+function soleCompany(actor: AgentActor): string | null {
+  const owned = actorLandlordIds(actor)
+  return owned.length === 1 ? owned[0] : null
 }
 
 export const queryPortfolio: AgentTool = {
@@ -312,7 +321,7 @@ export const queryPortfolio: AgentTool = {
         void query(
           `INSERT INTO analytics_data_gaps (landlord_id, audience, tool, requested)
            VALUES ($1, 'landlord', 'query_portfolio', $2)`,
-          [actor.profileId, `${subject || 'unknown'}.${measureKey}`],
+          [soleCompany(actor), `${subject || 'unknown'}.${measureKey}`],
         ).catch(() => {})
       }
       return catalog()
@@ -331,7 +340,7 @@ export const queryPortfolio: AgentTool = {
         WHERE value IS NOT NULL
         ORDER BY value ${desc ? 'DESC' : 'ASC'} NULLS LAST
         LIMIT ${limit}`,
-      [actor.profileId],
+      [actorLandlordIds(actor)],
     )
 
     if (rows.length === 0) {

@@ -21,6 +21,7 @@ import {
   LEASE_TEMPLATE_PURPOSES,
   isValidSignerRole,
   MIGRATION_WINDOW_DAYS,
+  leaseColumnDisplayValue,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -43,6 +44,7 @@ import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType }
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord } from '../lib/landlordScope'
 
 export const esignRouter = Router()
 
@@ -384,8 +386,28 @@ export async function createDocumentRecord(client: any, opts: {
            LEFT JOIN users lu ON lu.id = l.user_id
           WHERE u.id = $1`, [opts.unitId]).then((r: any) => r.rows[0])
       if (ctx) {
+        // S632 (Nic): "The box on the first page that says RV space should just
+        // have a number and not the word RV by it, because it says RV Space
+        // number right before that point. The space number three is overlapping
+        // the word RV that's already printed on the document."
+        //
+        // A lease form names the kind of space in its own printed text — "RV
+        // Space #___", "Unit #___" — so stamping the full label into the box
+        // after it prints the type twice, and on a tight box the value lands on
+        // top of the word. The box wants the number.
+        //
+        // Nic (S632, decided): "Having just the unit number is fine because the
+        // template is already labeled as a lease for that type of unit. The back
+        // end already marks it as a template for a specific type of unit, and
+        // that bullet point already says it's for an RV space. You can just put
+        // the number in that spot for all future reference."
+        //
+        // He is right that the type is never in doubt: templates are bound to a
+        // unit type (S535 refuses a mismatched pairing outright) and the form's
+        // own text names the space. So the box gets the number and nothing else.
+        const shortNumber = String(ctx.unit_number || '').replace(/^[A-Za-z]+\s*/, '')
         const identity: Record<string, string | null> = {
-          unit_number: ctx.unit_number,
+          unit_number: shortNumber || ctx.unit_number,
           property_name: ctx.property_name,
           property_address: ctx.property_address,
           landlord_name: ctx.landlord_name,
@@ -429,11 +451,19 @@ export async function createDocumentRecord(client: any, opts: {
       // If this field is bound to a lease_column and the send form supplied a value,
       // persist it now so it auto-renders for signers. Signature/initial/date_signed
       // are filled by signers themselves and are never prefilled here.
+      // S635 (Nic): "month to month printed raw on all the leases I just sent."
+      // Every tagged value goes through the display map on its way onto the
+      // page — an enum reaches the signed document as English or not at all.
       const prefill = nameSlot >= 0
         ? rosterNames[nameSlot]
-        : f.lease_column && prefillValues[f.lease_column] != null
-          ? String(prefillValues[f.lease_column])
-          : null
+        : f.lease_column === 'occupant_names'
+          // S635: one line naming the whole household, in invite order. The
+          // form asks who lives here; the roster is the answer, and the
+          // landlord does not retype it.
+          ? (rosterNames.join(', ') || null)
+          : f.lease_column && prefillValues[f.lease_column] != null
+            ? leaseColumnDisplayValue(f.lease_column, prefillValues[f.lease_column])
+            : null
       await client.query(`
         INSERT INTO lease_document_fields
           (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column,
@@ -822,6 +852,74 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
      ) RETURNING id, status`,
     [...writableValues, ...tailValues]
   ).then((r: any) => r.rows[0])
+
+  // S631 (Nic): carry "this papers an existing tenancy" from the invite onto the
+  // lease. The invite is where the landlord said which it was; the lease is
+  // where every downstream reader — move-in billing today, an onboarding-cohort
+  // report next year — needs to find it without reconstructing it from dates.
+  // Any intent for this unit that this signing resolves; onboarding invites are
+  // per unit and per resident, so the flag agrees across them.
+  {
+    const intent = await client.query(
+      `SELECT bool_or(COALESCE(is_existing_tenancy, false)) AS existing
+         FROM pending_tenant_intents
+        WHERE unit_id = $1 AND cancelled_at IS NULL
+          AND (resolved_at IS NULL OR resolved_lease_id = $2)`,
+      [doc.unit_id, lease.id])
+    if (intent.rows[0]?.existing) {
+      await client.query('UPDATE leases SET is_existing_tenancy = TRUE WHERE id=$1', [lease.id])
+    }
+  }
+
+  // S631 (Nic, DIRECTIVE): "Let's flag on invite so that no matter when they
+  // accept it, the work-trade agreement has inserted it slightly before the
+  // invoice is created... That way it's automatically in a suspended state."
+  //
+  // Created HERE — after the lease exists, before generateMoveInInvoice below —
+  // because that is the only window in which both facts are true: there is a
+  // lease for the agreement to attach to, and no invoice has been written yet.
+  // The move-in invoice reads this agreement to decide late_fee_exempt, so the
+  // first invoice is exempt from birth rather than being repaired afterwards.
+  //
+  // The agreement starts on the LEASE's start date, not today: the trade covers
+  // the tenancy, and a later start would leave the first cycle chargeable —
+  // precisely the gap this is here to close.
+  {
+    const wtIntent = await client.query(
+      `SELECT work_trade_hours_target, work_trade_duties, work_trade_covered_charges
+         FROM pending_tenant_intents
+        WHERE unit_id = $1 AND is_work_trade = TRUE AND cancelled_at IS NULL
+          AND (resolved_at IS NULL OR resolved_lease_id = $2)
+        LIMIT 1`,
+      [doc.unit_id, lease.id])
+    if (wtIntent.rows[0]) {
+      const propDefault = await client.query(
+        `SELECT p.work_trade_hours_target FROM properties p
+           JOIN units u ON u.property_id = p.id WHERE u.id = $1`, [doc.unit_id])
+      // S635 (Nic): WHAT THE TRADE COVERS RIDES FROM THE INVITE.
+      //
+      // This used to pass no covered_charges at all, so every agreement took the
+      // column default — rent, fees and every utility. For an arrangement like
+      // Mountain View's MH 01 ("covers electricity and propane") that silently
+      // suspended the RENT too, on the resident's first invoice, and the mistake
+      // shows up as somebody who was never billed for what they owe. NULL on the
+      // intent still means "not stated" and still takes the table default, so an
+      // invite flagged before this existed behaves exactly as it did.
+      const covers: string[] | null = wtIntent.rows[0].work_trade_covered_charges ?? null
+      await client.query(
+        `INSERT INTO work_trade_agreements
+           (unit_id, tenant_id, landlord_id, duties, start_date, monthly_hours_target,
+            covered_charges)
+         VALUES ($1, $2, $3, $4, $5, $6,
+                 COALESCE($7::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))`,
+        [doc.unit_id, primarySigner.tenant_id, doc.landlord_id,
+         wtIntent.rows[0].work_trade_duties || null,
+         startDate,
+         wtIntent.rows[0].work_trade_hours_target
+           ?? propDefault.rows[0]?.work_trade_hours_target ?? 80,
+         covers])
+    }
+  }
 
   // S577: stamp late_fee_accrual_from onto the lease from the (property, unit_type)
   // policy. It's a computation QUALIFIER on the daily-accrual clause, not a
@@ -1501,9 +1599,10 @@ esignRouter.get('/recipients', requireAuth, requirePerm('leases.create'), async 
   try {
     const { unitId, propertyId } = req.query as { unitId?: string; propertyId?: string }
     if (!unitId && !propertyId) throw new AppError(400, 'unitId or propertyId required')
-    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
-    if (!landlordId) throw new AppError(403, 'Forbidden')
-    const params: any[] = [landlordId]
+    // S633: a read — every company the account owns.
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Forbidden')
+    const params: any[] = [landlordIds]
     const filter = unitId
       ? `AND l.unit_id = $${params.push(unitId)}`
       : `AND u.property_id = $${params.push(propertyId)}`
@@ -1553,11 +1652,11 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
       FROM lease_templates t
       LEFT JOIN lease_template_fields f ON f.template_id = t.id
       LEFT JOIN properties p ON p.id = t.property_id
-      WHERE t.landlord_id = $1 AND t.is_active = TRUE
+      WHERE t.landlord_id = ANY($1::uuid[]) AND t.is_active = TRUE
         AND ($2::text IS NULL OR t.unit_type IS NULL OR t.unit_type = $2)
         AND ($3::uuid IS NULL OR t.property_id IS NULL OR t.property_id = $3)
         AND ($4::text IS NULL OR t.purpose = $4)
-      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [req.user!.profileId, unitTypeFilter, propertyFilter, purposeFilter])
+      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [landlordScopeIds(req.user!), unitTypeFilter, propertyFilter, purposeFilter])
     // S622: the prose-stated conditional fees the landlord confirmed, so the
     // editor can show what is already tracked and not re-ask on every open.
     if (templates.length > 0) {
@@ -1609,15 +1708,17 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     }
     // S535: optional PROPERTY lock (null = any property) — the form
     // carries a property's name/address, so it belongs to that property.
-    if (propertyId) {
-      const prop = await queryOne<any>(
-        'SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
-      if (!prop) throw new AppError(404, 'Property not found')
-    }
+    // S633: a template belongs to a company. When it is locked to a property,
+    // that property's company IS the answer; otherwise the account names one
+    // (silently, if it owns only one). A template filed under the wrong company
+    // is invisible to the properties that need it.
+    const templateLandlordId = propertyId
+      ? await landlordIdForProperty(req.user!, String(propertyId), query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
     const t = await queryOne<any>(`
       INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose])
+      [templateLandlordId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose])
 
     // S629 (Nic): "when you add a template for a unit type and there is no
     // default, it should automatically become the default."
@@ -1636,14 +1737,14 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
           WHERE landlord_id=$1 AND unit_type=$2 AND property_id IS NOT DISTINCT FROM $3
             AND is_unit_type_default = TRUE AND is_active <> FALSE AND id <> $4
           LIMIT 1`,
-        [req.user!.profileId, unitType, propertyId || null, t.id])
+        [templateLandlordId, unitType, propertyId || null, t.id])
       if (!existingDefault) {
         await query(`UPDATE lease_templates SET is_unit_type_default=TRUE, updated_at=NOW() WHERE id=$1`, [t.id])
         t.is_unit_type_default = true
         autoDefaulted = true
         // And draft anything that was waiting on exactly this.
         await draftPendingForUnitType({
-          landlordId: req.user!.profileId, unitType, propertyId: propertyId || null,
+          landlordId: templateLandlordId, unitType, propertyId: propertyId || null,
         }).catch(() => null)
       }
     }
@@ -1653,7 +1754,7 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
 
 esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
-    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
     const fields = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY page, sort_order, y', [template.id])
     res.json({ success: true, data: { ...template, fields } })
@@ -1663,7 +1764,7 @@ esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), asy
 esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount, isActive, unitType, depositMonths, defaultTermMonths } = req.body
-    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!t) throw new AppError(404, 'Template not found')
     if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
       throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
@@ -1705,7 +1806,7 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
   const client = await getClient()
   try {
     const makeDefault = req.body?.isDefault !== false // default true
-    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!t) throw new AppError(404, 'Template not found')
     if (makeDefault && !t.unit_type) {
       throw new AppError(400, 'Set the template’s unit type before making it a default — a default is per unit type.')
@@ -1718,7 +1819,7 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
         `UPDATE lease_templates SET is_unit_type_default=false, updated_at=NOW()
           WHERE landlord_id=$1 AND unit_type=$2 AND property_id IS NOT DISTINCT FROM $3
             AND is_unit_type_default=true AND id<>$4`,
-        [req.user!.profileId, t.unit_type, t.property_id, t.id])
+        [t.landlord_id, t.unit_type, t.property_id, t.id])
     }
     const updated = await client.query(
       `UPDATE lease_templates SET is_unit_type_default=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
@@ -1733,7 +1834,7 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
     let retried: { drafted: number; skipped: number } | null = null
     if (makeDefault && t.unit_type) {
       retried = await draftPendingForUnitType({
-        landlordId: req.user!.profileId,
+        landlordId: t.landlord_id,
         unitType: t.unit_type,
         propertyId: t.property_id ?? null,
       }).catch(() => null)
@@ -1749,7 +1850,7 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
 
 esignRouter.delete('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -1757,7 +1858,7 @@ esignRouter.delete('/templates/:id', requireAuth, requirePerm('esign.template_ma
 esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { fields } = req.body
-    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
 
     for (const f of (fields || [])) {
@@ -1837,7 +1938,7 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
 // the model can take its natural time (better labels, never truncated).
 esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
     if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
     const filename = extractUploadFilename(template.base_pdf_url)
@@ -1845,7 +1946,7 @@ esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.t
     if (!fs.existsSync(path.join(uploadDir, filename))) throw new AppError(404, 'Template PDF file not found on disk')
 
     const { createAutoFieldJob, runAutoFieldJob } = await import('../services/autoFieldJobs')
-    const jobId = await createAutoFieldJob(template.id, req.user!.profileId)
+    const jobId = await createAutoFieldJob(template.id, template.landlord_id)
     // Detached — runAutoFieldJob catches its own errors onto the job row.
     void runAutoFieldJob(jobId)
     res.status(202).json({ success: true, data: { jobId, status: 'processing' } })
@@ -1857,7 +1958,7 @@ esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.t
 esignRouter.get('/templates/:id/auto-fields/:jobId', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { getAutoFieldJob } = await import('../services/autoFieldJobs')
-    const job = await getAutoFieldJob(req.params.jobId, req.user!.profileId)
+    const job = await getAutoFieldJob(req.params.jobId, landlordScopeIds(req.user!))
     if (!job || job.template_id !== req.params.id) throw new AppError(404, 'Job not found')
     // S622: pagesTotal/pagesDone let the editor show real progress instead of an
     // unlabelled spinner. pagesTotal is null until the PDF has been parsed.
@@ -1874,7 +1975,7 @@ esignRouter.get('/templates/:id/auto-fields/:jobId', requireAuth, requirePerm('e
 esignRouter.get('/units/:unitId/prefill-suggestions', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const unit = await queryOne<{ id: string }>(
-      'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [req.params.unitId, req.user!.profileId])
+      'SELECT id FROM units WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.unitId, landlordScopeIds(req.user!)])
     if (!unit) throw new AppError(404, 'Unit not found')
     // S558: deposit derives from the selected template's deposit_months, so the
     // send form passes ?templateId when a template is chosen (deposit box fills
@@ -1894,8 +1995,8 @@ esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('e
     // Same class as the S390 variants cross-tenant fix on
     // pos_item_variants.
     const template = await queryOne<{ id: string }>(
-      'SELECT id FROM lease_templates WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId])
+      'SELECT id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
     await query('DELETE FROM lease_template_fields WHERE id=$1 AND template_id=$2', [req.params.fieldId, req.params.id])
     res.json({ success: true })
@@ -1911,14 +2012,26 @@ esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (
     const docs = await query<any>(`
       SELECT d.*, u.unit_number, p.name as property_name,
         COUNT(DISTINCT s.id)::int as signer_count,
-        COUNT(DISTINCT s.id) FILTER (WHERE s.status='signed')::int as signed_count
+        COUNT(DISTINCT s.id) FILTER (WHERE s.status='signed')::int as signed_count,
+        -- S632 (Nic): "Where as the landlord can I sign the lease inside the
+        -- app? I see one in progress and two pending, and I need to sign my half
+        -- of those two." He could not, from anywhere. The signing route existed
+        -- and took a document id; nothing in the product linked to it, so the
+        -- only way in was an emailed link. This says whether THIS caller still
+        -- owes a signature, so the row can offer one.
+        EXISTS (
+          SELECT 1 FROM lease_document_signers ms
+           WHERE ms.document_id = d.id
+             AND ms.role = 'landlord'
+             AND ms.status IS DISTINCT FROM 'signed'
+        ) AS landlord_must_sign
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
       LEFT JOIN lease_document_signers s ON s.document_id = d.id
-      WHERE d.landlord_id = $1
+      WHERE d.landlord_id = ANY($1::uuid[])
       GROUP BY d.id, u.unit_number, p.name
-      ORDER BY d.created_at DESC`, [req.user!.profileId])
+      ORDER BY d.created_at DESC`, [landlordScopeIds(req.user!)])
     res.json({ success: true, data: docs })
   } catch (e) { next(e) }
 })
@@ -1947,10 +2060,10 @@ esignRouter.get('/batches', requireAuth, requirePerm('leases.create'), async (re
         COUNT(d.id) FILTER (WHERE d.status = 'voided')::int AS voided_count
       FROM document_batches b
       LEFT JOIN lease_documents d ON d.batch_id = b.id
-      WHERE b.landlord_id = $1
+      WHERE b.landlord_id = ANY($1::uuid[])
       GROUP BY b.id
       ORDER BY b.created_at DESC`,
-      [req.user!.profileId])
+      [landlordScopeIds(req.user!)])
     res.json({ success: true, data: batches })
   } catch (e) {
     next(e)
@@ -1967,18 +2080,30 @@ esignRouter.get('/batches', requireAuth, requirePerm('leases.create'), async (re
  * Returns null when unit_number is not provided (caller falls back to the unitId
  * already on the request body from the tenant-lookup path).
  */
+// S633: matches across every company the ACCOUNT owns. A landlord typing a unit
+// number into the Document Values form is naming a space they own — which
+// company holds it is not something they should have to have selected first.
+// Ambiguity across companies falls through to the same address disambiguator
+// that already handles ambiguity within one.
 async function resolveUnitFromPrefill(
-  landlordId: string,
+  landlordIds: string[],
   prefillValues: Record<string,string>
 ): Promise<string|null> {
   const unitNumber = (prefillValues?.unit_number || '').trim()
   if (!unitNumber) return null
+  // S632: documents now show the bare number ("03"), so that is what a landlord
+  // will type back into the Document Values form. Match the stored label exactly
+  // OR by its digits, so "03" and "RV 03" both find RV 03. Ambiguity is still
+  // refused rather than guessed — "03" matching both RV 03 and MH 03 falls
+  // through to the property-address disambiguator below, exactly as before.
   const matches = await query<any>(
     `SELECT u.id, u.unit_number, p.street1, p.street2, p.city, p.state, p.zip, p.name AS property_name
        FROM units u
        JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = $1 AND u.unit_number = $2`,
-    [landlordId, unitNumber]
+      WHERE u.landlord_id = ANY($1::uuid[])
+        AND (u.unit_number = $2
+             OR regexp_replace(u.unit_number, '^[A-Za-z]+\\s*', '') = $2)`,
+    [landlordIds, unitNumber]
   )
   if (matches.length === 0) {
     throw new AppError(400, `No unit matches unit number '${unitNumber}' for this landlord.`)
@@ -2034,7 +2159,7 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     let tmplPropertyId: string | null = null
     let tmplPurpose = 'lease'
     if (templateId) {
-      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, req.user!.profileId])
+      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [templateId, landlordScopeIds(req.user!)])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
       tmplUnitType = tmpl.unit_type || null
@@ -2045,8 +2170,14 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     // Unit resolver — if the template binds unit_number and the landlord filled
     // it in the Document Values form, match against this landlord's units. On
     // success, override any unitId that came from the tenant-lookup fallback.
-    const resolvedUnitId = await resolveUnitFromPrefill(req.user!.profileId, prefillValues || {})
+    const resolvedUnitId = await resolveUnitFromPrefill(landlordScopeIds(req.user!), prefillValues || {})
     const finalUnitId = resolvedUnitId || unitId || null
+    // S633: the document belongs to the company that owns the unit it is being
+    // sent for — derived, and authorised by the same check. With no unit (a
+    // standalone form), the account names the company.
+    const docLandlordId = finalUnitId
+      ? await landlordIdForUnit(req.user!, finalUnitId, query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'document')
 
     // S535: templates are per unit type and may be property-locked —
     // refuse incompatible pairings (NULLs fit everything).
@@ -2095,7 +2226,7 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
-      landlordId: req.user!.profileId,
+      landlordId: docLandlordId,
       templateId: templateId || null,
       unitId: finalUnitId,
       leaseId: docLeaseId,
@@ -2159,8 +2290,8 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
       })).min(1).max(10),
     }).parse(req.body)
 
-    const landlordId = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
-    if (!landlordId) throw new AppError(403, 'A landlord context is required to create a document.')
+    // S633: the document is created under a NAMED company.
+    const landlordId = resolveLandlordTarget(req.user as any, (req.body as any)?.landlordId, 'document')
 
     for (const s of body.signers) {
       if (!isValidSignerRole(s.role)) throw new AppError(400, `Invalid signer role: ${s.role}`)
@@ -2574,7 +2705,7 @@ esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.cre
     let pdfUrl = basePdfUrl
     if (templateId) {
       const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
-        [templateId, req.user!.profileId])
+        [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
     }
@@ -2583,7 +2714,7 @@ esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.cre
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
-      landlordId: req.user!.profileId,
+      landlordId: lease.landlord_id,
       templateId: templateId || null,
       unitId: lease.unit_id,
       leaseId: lease.id,
@@ -2727,7 +2858,7 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requirePerm('leases.
     let pdfUrl = basePdfUrl
     if (templateId) {
       const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
-        [templateId, req.user!.profileId])
+        [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
     }
@@ -2736,7 +2867,7 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requirePerm('leases.
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
-      landlordId: req.user!.profileId,
+      landlordId: lease.landlord_id,
       templateId: templateId || null,
       unitId: lease.unit_id,
       leaseId: lease.id,
@@ -2780,7 +2911,11 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requirePerm('le
       throw new AppError(400, 'scopeType must be one of: units, property, landlord_all')
     }
 
-    const landlordId = req.user!.profileId
+    // S633: a batch addendum writes a document against EVERY lease in scope, so
+    // "landlord_all" has to mean one named company — an account that owns two
+    // would otherwise paper both companies' residents from one click. Named
+    // explicitly, or the account's only company when it has one.
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'addendum batch')
     const landlordUserId = req.user!.userId
 
     // 2. Template ownership
@@ -3064,7 +3199,7 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
     let pdfUrl = basePdfUrl
     if (templateId) {
       const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
-        [templateId, req.user!.profileId])
+        [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
     }
@@ -3093,7 +3228,7 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
-      landlordId: req.user!.profileId,
+      landlordId: lease.landlord_id,
       templateId: templateId || null,
       unitId: lease.unit_id,
       leaseId: lease.id,
@@ -3167,7 +3302,6 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
     const { workTradeAgreementId, templateId } = req.body
     if (!workTradeAgreementId) throw new AppError(400, 'workTradeAgreementId required')
     if (!templateId) throw new AppError(400, 'templateId required — pick your work-trade addendum form')
-    const landlordId = req.user!.profileId
 
     const agr = await queryOne<any>(`
       SELECT wta.id, wta.unit_id, wta.tenant_id, wta.landlord_id, wta.status,
@@ -3178,6 +3312,9 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
        WHERE wta.id=$1`, [workTradeAgreementId])
     if (!agr) throw new AppError(404, 'Work-trade agreement not found')
     if (!canManageLandlordResource(req.user, agr.landlord_id)) throw new AppError(403, 'Not your agreement')
+    // S633: the company is the agreement's own — derived, not taken from session
+    // state, and already authorised by the line above.
+    const landlordId: string = agr.landlord_id
     if (agr.status !== 'active') throw new AppError(409, `Agreement is ${agr.status} — resume or renew the lease before sending an addendum`)
 
     // The gate guarantees an active lease for this tenant on this unit.
@@ -3310,7 +3447,7 @@ esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
       WHERE d.id = $1`, [req.params.id])
     if (!doc) throw new AppError(404, 'Document not found')
 
-    const isOwner = doc.landlord_id === req.user!.profileId
+    const isOwner = ownsLandlord(req.user!, doc.landlord_id)
     const isSigner = await queryOne<any>('SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND user_id=$2', [doc.id, req.user!.userId])
     if (!isOwner && !isSigner) throw new AppError(403, 'Not authorized for this document')
 
@@ -3331,7 +3468,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
       JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
-      WHERE d.id=$1 AND d.landlord_id=$2`, [req.params.id, req.user!.profileId])
+      WHERE d.id=$1 AND d.landlord_id = ANY($2::uuid[])`, [req.params.id, landlordScopeIds(req.user!)])
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'completed') throw new AppError(400, 'Document already completed')
     if (doc.status === 'voided')    throw new AppError(400, 'Document has been voided')
@@ -3547,8 +3684,8 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     await client.query('BEGIN')
 
     const doc = await client.query(
-      'SELECT * FROM lease_documents WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+      'SELECT * FROM lease_documents WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     ).then((r: any) => r.rows[0])
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
@@ -4455,7 +4592,10 @@ esignRouter.get('/pending', requireAuth, async (req, res, next) => {
 
 esignRouter.get('/landlord-pending', requireAuth, requirePerm('leases.sign'), async (req, res, next) => {
   try {
-    const landlordUser = await queryOne<any>('SELECT user_id FROM landlords WHERE id=$1', [req.user!.profileId])
+    // S633: every company the account owns, and this caller as the signer.
+    // Resolving "the landlord's user" through one entity meant a co-owner or a
+    // second company's documents never appeared in the signing queue.
+    const scopeIds = landlordScopeIds(req.user!)
     const pending = await query<any>(`
       SELECT d.id as document_id, s.status, s.name, d.title, d.status as doc_status,
         u.unit_number, p.name as property_name, d.base_pdf_url,
@@ -4465,11 +4605,11 @@ esignRouter.get('/landlord-pending', requireAuth, requirePerm('leases.sign'), as
       JOIN lease_documents d ON d.id = s.document_id
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
-      WHERE d.landlord_id = $1
+      WHERE d.landlord_id = ANY($1::uuid[])
         AND s.user_id = $2
         AND s.status IN ('sent','viewed')
         AND d.status NOT IN ('completed','voided')
-      ORDER BY s.created_at DESC`, [req.user!.profileId, landlordUser?.user_id])
+      ORDER BY s.created_at DESC`, [scopeIds, req.user!.userId])
     res.json({ success: true, data: pending })
   } catch(e) { next(e) }
 })
@@ -4520,7 +4660,7 @@ esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.si
     // lease forms usually carry it, and a unique match auto-locks the
     // template to that property in the create modal. Best-effort.
     const detectedProperty = await detectPropertyFromPdf(
-      req.user!.profileId, fs.readFileSync(req.file.path))
+      landlordScopeIds(req.user!), fs.readFileSync(req.file.path))
     res.json({ success: true, data: { url: fileUrl, filename: req.file.originalname, size: req.file.size, pageCount, detectedProperty } })
   } catch (e) { next(e) }
 })
@@ -4576,12 +4716,13 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
     // FIRST document row sharing a base_pdf_url, so a legitimate signer
     // on the second+ document drafted from the same template 403'd.
     const userId = req.user!.userId
-    const profileId = req.user!.profileId
     const role = req.user!.role
     const filename = req.params.filename
     const urlSuffix = '/api/esign/files/' + filename
-    const scopeLandlordId =
-      role === 'landlord' ? profileId : (req.user!.landlordId ?? null)
+    // S633: the account's companies, not one. Still authorised PER ROW below —
+    // the document must belong to a company this caller owns, or they must be a
+    // signer on it. Widening the scope does not widen who may read a file.
+    const scopeLandlordIds = landlordScopeIds(req.user!)
 
     const exists = await queryOne<any>(`
       SELECT 1 FROM lease_documents WHERE base_pdf_url = $1 OR executed_pdf_url = $1
@@ -4593,13 +4734,13 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
     const authorized = await queryOne<any>(`
       SELECT 1 FROM lease_documents d
        WHERE (d.base_pdf_url = $1 OR d.executed_pdf_url = $1)
-         AND (($2::uuid IS NOT NULL AND d.landlord_id = $2)
+         AND ((COALESCE(array_length($2::uuid[], 1), 0) > 0 AND d.landlord_id = ANY($2::uuid[]))
               OR EXISTS (SELECT 1 FROM lease_document_signers s
                           WHERE s.document_id = d.id AND s.user_id = $3))
       UNION ALL
       SELECT 1 FROM lease_templates t
-       WHERE t.base_pdf_url = $1 AND $2::uuid IS NOT NULL AND t.landlord_id = $2
-      LIMIT 1`, [urlSuffix, scopeLandlordId, userId])
+       WHERE t.base_pdf_url = $1 AND COALESCE(array_length($2::uuid[], 1), 0) > 0 AND t.landlord_id = ANY($2::uuid[])
+      LIMIT 1`, [urlSuffix, scopeLandlordIds, userId])
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 
     res.sendFile(filePath)

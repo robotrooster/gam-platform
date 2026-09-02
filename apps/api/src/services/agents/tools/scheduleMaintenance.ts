@@ -13,7 +13,7 @@
 import { query, queryOne } from '../../../db'
 import { notifyMaintenanceUpdated } from '../../notifications'
 import { logger } from '../../../lib/logger'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 export const scheduleMaintenance: AgentTool = {
   name: 'schedule_maintenance',
@@ -42,8 +42,8 @@ export const scheduleMaintenance: AgentTool = {
     }
 
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = $2',
-      [requestId, actor.profileId]
+      'SELECT * FROM maintenance_requests WHERE id = $1 AND landlord_id = ANY($2::uuid[])',
+      [requestId, actorLandlordIds(actor)]
     )
     if (!request) return { ok: false, error: 'No such maintenance request for your account.' }
     if (request.status === 'completed' || request.status === 'cancelled') {
@@ -53,8 +53,8 @@ export const scheduleMaintenance: AgentTool = {
     // Self-scoped write: re-assert ownership + exclude terminal states.
     const updated = await queryOne<any>(
       `UPDATE maintenance_requests SET scheduled_at = $1, updated_at = NOW()
-        WHERE id = $2 AND landlord_id = $3 AND status NOT IN ('completed','cancelled') RETURNING *`,
-      [when.toISOString(), requestId, actor.profileId]
+        WHERE id = $2 AND landlord_id = ANY($3::uuid[]) AND status NOT IN ('completed','cancelled') RETURNING *`,
+      [when.toISOString(), requestId, actorLandlordIds(actor)]
     )
     if (!updated) return { ok: false, error: 'That request was just updated — please re-check its status first.' }
 

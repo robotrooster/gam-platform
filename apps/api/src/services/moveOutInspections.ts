@@ -80,7 +80,19 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
 
   // Coarse SQL window, precise business-day filter here: schedule once
   // today >= (end_date − 3 business days).
-  const today = new Date().toISOString().slice(0, 10)
+  //
+  // S634 — "TODAY" MUST BE THE SAME DAY THE SQL MEANT.
+  //
+  // This read `new Date().toISOString()`, which is the UTC date, while the
+  // window above is Postgres `CURRENT_DATE` — the server's local date. In
+  // Phoenix (UTC−7) those disagree from 5pm every evening, so for seven hours a
+  // night this filter believed it was tomorrow and scheduled move-out
+  // inspections a day early, with a deadline computed off the wrong "today".
+  // It surfaced as a suite that passed in the afternoon and failed after 5pm.
+  //
+  // Asking the database keeps the two halves of the same decision on one clock.
+  const today = (await queryOne<{ d: string }>(
+    `SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`))!.d
   const due = candidates.filter((l: any) => subtractBusinessDays(l.end_date, 3) <= today)
 
   let scheduled = 0

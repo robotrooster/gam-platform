@@ -10,6 +10,7 @@ import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { PROCESSING_FEES } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
@@ -1218,9 +1219,9 @@ backgroundRouter.get('/pool/matches', requireAuth, requirePerm('tenants.run_back
         JOIN users tu            ON tu.id = ap.user_id
         LEFT JOIN units u        ON u.id  = mr.unit_id
         LEFT JOIN properties p   ON p.id  = u.property_id
-       WHERE mr.landlord_id = $1
+       WHERE mr.landlord_id = ANY($1::uuid[])
        ORDER BY mr.requested_at DESC`,
-      [req.user!.profileId])
+      [landlordScopeIds(req.user!)])
     res.json({ success: true, data: matches })
   } catch (e) { next(e) }
 })
@@ -1235,9 +1236,18 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     )
     if (!entry) throw new AppError(404, 'Pool entry not found')
 
+    // S633: the company making contact is the one that owns the unit being
+    // offered — an applicant is being invited to a specific space, so the unit
+    // answers "which company" with nothing for the caller to get wrong. With no
+    // unit named, the account must say which company is reaching out: this
+    // message goes to a real person and cannot be unsent.
+    const landlordId = unitId
+      ? await landlordIdForUnit(req.user!, String(unitId), query)
+      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'outreach')
+
     const existing = await queryOne<any>(
       'SELECT id FROM pool_match_requests WHERE pool_entry_id=$1 AND landlord_id=$2',
-      [entry.id, req.user!.profileId]
+      [entry.id, landlordId]
     )
     if (existing) throw new AppError(400, 'Already contacted this applicant')
 
@@ -1250,7 +1260,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
           `SELECT u.*, p.name as property_name
            FROM units u JOIN properties p ON p.id=u.property_id
            WHERE u.id=$1 AND u.landlord_id=$2`,
-          [unitId, req.user!.profileId]
+          [unitId, landlordId]
         )
       : null
     if (unitId && !unit) throw new AppError(404, 'Unit not found')
@@ -1294,7 +1304,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
           message || null,
           monthlyRent != null ? Number(monthlyRent) : null,
           undefined,
-          { landlordId: req.user!.profileId, matchRequestId: match!.id }
+          { landlordId, matchRequestId: match!.id }
         )
       }
     } catch (e) { logger.error({ err: e }, '[EMAIL]') }

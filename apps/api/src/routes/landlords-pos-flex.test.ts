@@ -106,8 +106,10 @@ async function seedPFFixture(): Promise<PFFixture> {
     const { userId: landlordUserId, landlordId } = await seedLandlord(client)
     await client.query('COMMIT')
     const landlordToken = jwt.sign(
+      // S633: a landlord session names no entity — the ACCOUNT's companies ride
+      // in landlordIds and profileId is null for role='landlord'.
       { userId: landlordUserId, role: 'landlord', email: 'll@test.dev',
-        profileId: landlordId, permissions: {} },
+        profileId: null, landlordIds: [landlordId], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     return { landlordUserId, landlordId, landlordToken }
@@ -130,14 +132,28 @@ async function seedPosCustomer(f: PFFixture, opts: {
   return { id: r.rows[0].id, email }
 }
 
+async function seedProp(f: PFFixture): Promise<string> {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    const propertyId = await seedProperty(client, {
+      landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+    })
+    await client.query('UPDATE properties SET flexcharge_enabled = TRUE WHERE id = $1', [propertyId])
+    await client.query('COMMIT')
+    return propertyId
+  } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+}
+
 describe('POS customers — GET/POST/DELETE pass-through', () => {
-  it('GET /pos-customers calls listPosCustomers with landlord profileId', async () => {
+  it('GET /pos-customers calls listPosCustomers with EVERY company the account owns', async () => {
     const f = await seedPFFixture()
     const res = await request(buildApp())
       .get('/api/landlords/pos-customers')
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
-    expect(listPosCustomersMock).toHaveBeenCalledWith(f.landlordId)
+    // S633: the whole scope, not one entity — one counter, one customer roster.
+    expect(listPosCustomersMock).toHaveBeenCalledWith([f.landlordId])
   })
 
   it('POST /pos-customers missing required fields → 400', async () => {
@@ -164,15 +180,17 @@ describe('POS customers — GET/POST/DELETE pass-through', () => {
     })
   })
 
-  it('DELETE /pos-customers/:id passes landlordId + customerId to archivePosCustomer', async () => {
+  it('DELETE /pos-customers/:id scopes the archive to the account\'s companies', async () => {
     const f = await seedPFFixture()
     const customerId = randomUUID()
     const res = await request(buildApp())
       .delete(`/api/landlords/pos-customers/${customerId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
+    // S633: the landlord_id filter is still the thing that stops one landlord
+    // archiving another's customer — it just asks the ACCOUNT now.
     expect(archivePosCustomerMock).toHaveBeenCalledWith({
-      landlordId: f.landlordId, customerId,
+      landlordIds: [f.landlordId], customerId,
     })
   })
 })
@@ -255,9 +273,13 @@ describe('FlexCharge accounts — GET/POST/PATCH/statements pass-through', () =>
     expect(createFlexChargeAccountMock).not.toHaveBeenCalled()
   })
 
-  it('POST happy: passes landlordId + body fields to createFlexChargeAccount', async () => {
+  it('POST happy: derives the company from the property, and passes the body through', async () => {
     const f = await seedPFFixture()
-    const propertyId = randomUUID()
+    // S633: the company is no longer taken from session state — it is the one
+    // that owns the named property, so the property must exist and be the
+    // caller's. A random uuid used to sail through and file the account under
+    // whichever entity the session sat on.
+    const propertyId = await seedProp(f)
     const tenantId = randomUUID()
     const res = await request(buildApp())
       .post('/api/landlords/flex-charge/accounts')
@@ -279,26 +301,13 @@ describe('FlexCharge accounts — GET/POST/PATCH/statements pass-through', () =>
       .send({ creditLimit: 1000, status: 'frozen' })
     expect(res.status).toBe(200)
     expect(updateFlexChargeAccountMock).toHaveBeenCalledWith({
-      landlordId: f.landlordId, accountId,
+      landlordIds: [f.landlordId], accountId,
       creditLimit: 1000, status: 'frozen', notes: undefined,
     })
   })
 })
 
 describe('FlexCharge merchant finance rate (S583)', () => {
-  async function seedProp(f: PFFixture): Promise<string> {
-    const client = await db.connect()
-    try {
-      await client.query('BEGIN')
-      const propertyId = await seedProperty(client, {
-        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
-      })
-      await client.query('UPDATE properties SET flexcharge_enabled = TRUE WHERE id = $1', [propertyId])
-      await client.query('COMMIT')
-      return propertyId
-    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
-  }
-
   it('PATCH sets a valid per-property rate; GET returns it (camelCase wire contract)', async () => {
     const f = await seedPFFixture()
     const propertyId = await seedProp(f)

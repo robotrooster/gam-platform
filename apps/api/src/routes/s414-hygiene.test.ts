@@ -137,7 +137,12 @@ describe('POST /api/units quantity — S399 hardening carried to S527 path', () 
     expect(numbers).toEqual(['RV 03', 'RV 04'])
   })
 
-  it('S527: subtypeId supplies type, facts, and pricing; units record it', async () => {
+  // S630 (Nic, DIRECTIVE — supersedes the S527 pricing half): "Subtypes should
+  // not price the unit... Pricing should be per individual unit." The class
+  // still supplies the TYPE and the physical FACTS, which is what makes bulk
+  // creation worth having; the money is typed once for the batch and belongs to
+  // the units from then on.
+  it('S527/S630: subtypeId supplies type and facts — the rent is the units\' own', async () => {
     const f = await seedPropsFixture()
     const sub = await db.query<{ id: string }>(
       `INSERT INTO property_unit_subtypes
@@ -147,7 +152,8 @@ describe('POST /api/units quantity — S399 hardening carried to S527 path', () 
     const res = await request(buildUnitsApp())
       .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 2, subtypeId: sub.rows[0].id })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 2, subtypeId: sub.rows[0].id,
+              rentAmount: 500, nightlyRate: 60 })
     expect(res.status).toBe(201)
     const units = res.body.data.units
     expect(units).toHaveLength(2)

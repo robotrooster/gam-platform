@@ -150,7 +150,7 @@ describe('GET /api/landlords/:id/dashboard', () => {
   })
 })
 
-describe('PATCH /api/landlords/theme — S236 owner-only', () => {
+describe('PATCH /api/landlords/theme — S236 owner-only, S633 account-level', () => {
   it('landlord can update theme', async () => {
     const f = await seedLFixture()
     const res = await request(buildApp())
@@ -159,7 +159,8 @@ describe('PATCH /api/landlords/theme — S236 owner-only', () => {
       .send({ themeAccent: '#ff8800', fontStyle: 'serif' })
     expect(res.status).toBe(200)
     const row = await db.query<{ theme_accent: string; font_style: string }>(
-      `SELECT theme_accent, font_style FROM landlords WHERE id=$1`, [f.landlordId])
+      // S633: the theme lives on the ACCOUNT now, not on a company.
+      `SELECT theme_accent, font_style FROM users WHERE id=$1`, [f.landlordUserId])
     expect(row.rows[0].theme_accent).toBe('#ff8800')
     expect(row.rows[0].font_style).toBe('serif')
   })

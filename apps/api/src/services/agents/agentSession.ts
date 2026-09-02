@@ -25,7 +25,7 @@ import { getTurnGate } from './turnGate'
 import { answerCache, answerCacheEnabled, normalizeQuestion } from './cache'
 import { checkTurnBudget, BUDGET_CAPPED_REPLY } from './turnBudget'
 import { matchCuratedFaq } from './curatedFaq'
-import type { AgentActor } from './tools/types'
+import { actorLandlordIds, type AgentActor } from './tools/types'
 import type { HandoffSignal } from './tools/escalation'
 import { logger } from '../../lib/logger'
 import type { AgentAudience, AgentProfile, AgentTier, ChatMessage } from './types'
@@ -322,7 +322,9 @@ async function runAgentSessionInner(input: AgentSessionInput): Promise<AgentSess
   // cache fast-paths on purpose: cached answers cost nothing, so a capped
   // user keeps getting FAQ answers all day. Over budget → canned reply,
   // zero model calls, logged as outcome 'rate_limited'.
-  const budget = await checkTurnBudget(audience, actor.userId, actor.profileId).catch(() => ({ allowed: true as const }))
+  // S634: the landlord allowance is sized by the ACCOUNT's occupied units.
+  const budget = await checkTurnBudget(audience, actor.userId, actorLandlordIds(actor))
+    .catch(() => ({ allowed: true as const }))
   if (!budget.allowed) {
     logger.warn({ audience, reason: (budget as any).reason }, 'agent session: turn refused by daily budget')
     return finalize(

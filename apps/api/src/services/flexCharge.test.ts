@@ -145,8 +145,8 @@ describe('pos_customers CRUD', () => {
     await createPosCustomer({ landlordId: ctx.landlordId, firstName: 'Zoe', lastName: 'Adams', email: 'z@t.dev' })
     await createPosCustomer({ landlordId: ctx.landlordId, firstName: 'Ann', lastName: 'Brown', email: 'a@t.dev' })
     const archived = await createPosCustomer({ landlordId: ctx.landlordId, firstName: 'Old', lastName: 'Customer', email: 'old@t.dev' })
-    await archivePosCustomer({ landlordId: ctx.landlordId, customerId: archived.id })
-    const list = await listPosCustomers(ctx.landlordId)
+    await archivePosCustomer({ landlordIds: [ctx.landlordId], customerId: archived.id })
+    const list = await listPosCustomers([ctx.landlordId])
     expect(list).toHaveLength(2)
     expect(list[0].last_name).toBe('Adams')
     expect(list[1].last_name).toBe('Brown')
@@ -167,7 +167,7 @@ describe('pos_customers CRUD', () => {
       firstName: 'X', lastName: 'Y', email: 'x@t.dev',
     })
     await expect(archivePosCustomer({
-      landlordId: bLandlordId, customerId: cust.id,
+      landlordIds: [bLandlordId], customerId: cust.id,
     })).rejects.toMatchObject({ statusCode: 404 })
     // Row still active.
     const { rows: [check] } = await db.query<any>(
@@ -181,9 +181,9 @@ describe('pos_customers CRUD', () => {
       landlordId: ctx.landlordId,
       firstName: 'X', lastName: 'Y', email: 'x@t.dev',
     })
-    await archivePosCustomer({ landlordId: ctx.landlordId, customerId: cust.id })
+    await archivePosCustomer({ landlordIds: [ctx.landlordId], customerId: cust.id })
     await expect(archivePosCustomer({
-      landlordId: ctx.landlordId, customerId: cust.id,
+      landlordIds: [ctx.landlordId], customerId: cust.id,
     })).rejects.toMatchObject({ statusCode: 404 })
   })
 })
@@ -286,7 +286,7 @@ describe('createFlexChargeAccount — enrollment gating', () => {
     const cust = await createPosCustomer({
       landlordId: ctx.landlordId, firstName: 'X', lastName: 'Y', email: 'x@t.dev',
     })
-    await archivePosCustomer({ landlordId: ctx.landlordId, customerId: cust.id })
+    await archivePosCustomer({ landlordIds: [ctx.landlordId], customerId: cust.id })
     await expect(createFlexChargeAccount({
       landlordId: ctx.landlordId, propertyId: ctx.propertyId,
       posCustomerId: cust.id,
@@ -323,7 +323,7 @@ describe('listFlexChargeAccounts', () => {
       landlordId: ctx.landlordId, propertyId: ctx.propertyId,
       tenantId: ctx.tenantId, creditLimit: 500,
     })
-    const list = await listFlexChargeAccounts({ landlordId: ctx.landlordId })
+    const list = await listFlexChargeAccounts({ landlordIds: [ctx.landlordId] })
     expect(list).toHaveLength(1)
     expect(list[0].id).toBe(row.id)
     expect(list[0].balance).toBe(0)
@@ -344,7 +344,7 @@ describe('listFlexChargeAccounts', () => {
     await db.query(
       `INSERT INTO flex_charge_transactions (account_id, amount, status)
        VALUES ($1, 500, 'billed'), ($1, 40, 'pending')`, [acct.id])
-    const list = await listFlexChargeAccounts({ landlordId: ctx.landlordId })
+    const list = await listFlexChargeAccounts({ landlordIds: [ctx.landlordId] })
     expect(list[0].balance).toBe(140)   // 100 carried + 40 pending (NOT + 500 billed)
   })
 
@@ -376,7 +376,7 @@ describe('listFlexChargeAccounts', () => {
       posCustomerId: cust.id, creditLimit: 250,
     })
     const filtered = await listFlexChargeAccounts({
-      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      landlordIds: [ctx.landlordId], propertyId: ctx.propertyId,
     })
     expect(filtered).toHaveLength(1)
     expect(filtered[0].property_id).toBe(ctx.propertyId)
@@ -396,7 +396,7 @@ describe('listFlexChargeAccounts', () => {
       bLandlordId = landlordId
       await c.query('COMMIT')
     } finally { c.release() }
-    const list = await listFlexChargeAccounts({ landlordId: bLandlordId })
+    const list = await listFlexChargeAccounts({ landlordIds: [bLandlordId] })
     expect(list).toEqual([])
   })
 })
@@ -483,7 +483,7 @@ describe('updateFlexChargeAccount', () => {
       tenantId: ctx.tenantId, creditLimit: 500,
     })
     const updated = await updateFlexChargeAccount({
-      landlordId: ctx.landlordId, accountId: acc.id,
+      landlordIds: [ctx.landlordId], accountId: acc.id,
       creditLimit: 1000, notes: 'bumped',
     })
     expect(Number(updated.credit_limit)).toBe(1000)
@@ -498,7 +498,7 @@ describe('updateFlexChargeAccount', () => {
       await c.query('COMMIT')
     } finally { c.release() }
     await expect(updateFlexChargeAccount({
-      landlordId: bLandlordId, accountId: acc.id, creditLimit: 999,
+      landlordIds: [bLandlordId], accountId: acc.id, creditLimit: 999,
     })).rejects.toMatchObject({ statusCode: 404 })
   })
 
@@ -509,7 +509,7 @@ describe('updateFlexChargeAccount', () => {
       tenantId: ctx.tenantId, creditLimit: 500,
     })
     await expect(updateFlexChargeAccount({
-      landlordId: ctx.landlordId, accountId: acc.id,
+      landlordIds: [ctx.landlordId], accountId: acc.id,
       status: 'disqualified' as any,
     })).rejects.toMatchObject({ statusCode: 400 })
   })
@@ -521,7 +521,7 @@ describe('updateFlexChargeAccount', () => {
       tenantId: ctx.tenantId, creditLimit: 500,
     })
     await expect(updateFlexChargeAccount({
-      landlordId: ctx.landlordId, accountId: acc.id,
+      landlordIds: [ctx.landlordId], accountId: acc.id,
     })).rejects.toMatchObject({ statusCode: 400 })
   })
 })

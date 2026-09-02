@@ -19,15 +19,24 @@
  *            push, not a live inheritance — editing the subtype later never
  *            silently rewrites units that were minted from it.
  *
- * S613 (Nic): a class OWNS the price of the units in it. Linking a unit to a
- * class therefore sets that unit's rent, deposit and stay rates — that is what
- * belonging to a class means, and it is why editing a class moves every unit in
- * it (the DB trigger in 20260820170000). A unit in NO class keeps its own
- * price, editable on the unit itself.
+ * S629/S630 (Nic, DIRECTIVE) — A SUBTYPE DOES NOT PRICE THE UNIT.
  *
- * That is safe on an occupied unit because the unit's price is the ASKING
- * price: a long-term tenant is billed from leases.rent_amount and the lease is
- * law. The 12-year tenant at $380 under a $440 class keeps paying $380.
+ * "Subtypes should not price the unit. People can bulk set a price when they
+ *  are adding new units, and it would look on the surface like the subtype is
+ *  pricing the unit... but it needs to not be linked to that subtype feature.
+ *  That way they can be independently adjusted."
+ *
+ * This file used to do the opposite: S613 made the class own the price, and
+ * S629 reversed that for CREATION but left applyPricingToUnit() running on
+ * both link paths — so the COALESCE-only default right above it was overwritten
+ * on the very next line. Linking an Oak Park unit to a class would have pulled
+ * its rent to the class's $440 and, because that overwrite wrote
+ * `security_deposit = COALESCE(class deposit, 0)`, ZEROED the deposit of any
+ * unit joining a class that carries none. The $500 spot Nic priced by hand
+ * would have silently gone back to $440 the moment someone classified it.
+ *
+ * Now: linking is classification and nothing else. The class's numbers fill
+ * only fields the unit has left blank, and never replace one somebody set.
  *
  * `applyDetails` now covers only the PHYSICAL facts (layout, amp service,
  * bed/bath, storage size, who owns the dwelling), which is a separate question
@@ -107,7 +116,34 @@ export async function setSubtypeUnits(
         `so its details don't apply. Change the unit's type first, or pick a subtype that matches.`)
     }
 
-    // Unlink anything dropped from the list.
+    // S631: MEMBERSHIP OF THIS ONE SUBTYPE, in unit_subtype_links.
+    //
+    // This screen only ever wrote units.subtype_id, which since S630 holds just
+    // the FIRST of a unit's tags — so ticking spaces here appeared to work and
+    // changed nothing the property page, the unit page or any count then read.
+    // A landlord could tick nineteen units, save, and watch the tag still say 0.
+    //
+    // Only THIS subtype's link is added or removed; a unit's other tags are
+    // untouched, because this screen asks one question ("which spaces are in
+    // this class") and must not answer any other.
+    await client.query(
+      `DELETE FROM unit_subtype_links l
+        USING units u
+        WHERE u.id = l.unit_id
+          AND l.subtype_id = $1 AND u.retired_at IS NULL
+          AND NOT (l.unit_id = ANY($2::uuid[]))`,
+      [subtype.id, unitIds],
+    )
+    if (unitIds.length) {
+      await client.query(
+        `INSERT INTO unit_subtype_links (unit_id, subtype_id)
+         SELECT unnest($1::uuid[]), $2 ON CONFLICT DO NOTHING`,
+        [unitIds, subtype.id],
+      )
+    }
+
+    // Kept in step for readers still on the single column — it holds whichever
+    // tag sorts first, and unit_subtype_links is the truth.
     await client.query(
       `UPDATE units SET subtype_id = NULL, updated_at = NOW()
         WHERE subtype_id = $1 AND retired_at IS NULL
@@ -135,7 +171,6 @@ export async function setSubtypeUnits(
          WHERE id = $1`,
         [u.id, subtype.security_deposit, subtype.nightly_rate,
          subtype.weekly_rate, subtype.monthly_rate])
-      await applyPricingToUnit(client, subtype, u)
       if (!opts.applyDetails) continue
       await applyDetailsToUnit(client, subtype, u)
       result.detailsApplied++
@@ -158,25 +193,6 @@ export async function setSubtypeUnits(
  * units, so a class with no rent leaves the unit's last number standing rather
  * than failing the landlord's save (same rule as the DB trigger).
  */
-async function applyPricingToUnit(
-  client: PoolClient,
-  s: UnitSubtypeRow,
-  u: { id: string },
-): Promise<void> {
-  const isRv = s.unit_type === 'rv_spot'
-  await client.query(
-    `UPDATE units SET
-       rent_amount      = COALESCE($2::numeric, rent_amount),
-       security_deposit = COALESCE($3::numeric, 0),
-       nightly_rate     = CASE WHEN $4 THEN $5::numeric ELSE nightly_rate END,
-       weekly_rate      = CASE WHEN $4 THEN $6::numeric ELSE weekly_rate  END,
-       monthly_rate     = CASE WHEN $4 THEN $7::numeric ELSE monthly_rate END,
-       updated_at = NOW()
-     WHERE id = $1`,
-    [u.id, s.rent_amount, s.security_deposit, isRv, s.nightly_rate, s.weekly_rate, s.monthly_rate],
-  )
-}
-
 /** Copy the subtype's PHYSICAL facts onto ONE unit. */
 async function applyDetailsToUnit(
   client: PoolClient,
@@ -236,7 +252,16 @@ export async function linkUnitToSubtype(
   try {
     await client.query('BEGIN')
     await client.query(`UPDATE units SET subtype_id=$1, updated_at=NOW() WHERE id=$2`, [s.id, unit.id])
-    await applyPricingToUnit(client, s, unit)
+    // S630: defaults only, never an overwrite — see applySubtypeToUnits.
+    await client.query(
+      `UPDATE units SET
+         security_deposit = COALESCE(security_deposit, $2::numeric),
+         nightly_rate     = COALESCE(nightly_rate,     $3::numeric),
+         weekly_rate      = COALESCE(weekly_rate,      $4::numeric),
+         monthly_rate     = COALESCE(monthly_rate,     $5::numeric),
+         updated_at = NOW()
+       WHERE id = $1`,
+      [unit.id, s.security_deposit, s.nightly_rate, s.weekly_rate, s.monthly_rate])
     if (opts.applyDetails) await applyDetailsToUnit(client, s, unit)
     await client.query('COMMIT')
   } catch (e) {

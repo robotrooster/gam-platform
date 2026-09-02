@@ -6,11 +6,14 @@ import { loadPdfjs } from '../lib/pdfjs'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
-  SCREENING_FEE_EXCLUSION_REASON } from '@gam/shared'
+  SCREENING_FEE_EXCLUSION_REASON,
+  isAutoFilledLeaseColumn,
+} from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
-import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical, Undo2, Redo2 } from 'lucide-react'
+import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -799,6 +802,28 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           {sel && !isLockedLeaseColumn(sel.leaseColumn) && (
             <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
               <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
+              {/* S635 (Nic, DIRECTIVE): "the tenant names and the names of the
+                  occupants both are landlord boxes, and those should be derived
+                  from all the invites that went out."
+
+                  An identity column is a fact GAM already holds — who is on the
+                  lease, the unit, the property, the date. The VALUE was always
+                  filled from the roster at send time, but the field still
+                  carried a signer role, so the editor asked WHO FILLS THIS IN
+                  about something nobody fills in — and auto-placement answered
+                  "landlord" for all four tenant-name blanks. Unlike a locked
+                  field this one is still ordinary furniture: move it, relabel
+                  it, delete it. You just never fill it. */}
+              {isAutoFilledLeaseColumn(sel.leaseColumn) && (
+                <div style={{ marginBottom:8, padding:'8px 10px', background:'rgba(201,162,39,.07)',
+                              border:'1px solid rgba(201,162,39,.22)', borderRadius:7,
+                              fontSize:'.68rem', color:'var(--text-2)', lineHeight:1.45 }}>
+                  Filled in automatically from the invite &mdash; nobody types this.
+                  {sel.leaseColumn === 'occupant_names'
+                    ? ' Everyone invited to the space, on one line, in household order.'
+                    : ''}
+                </div>
+              )}
               {/* S629 (Nic): "give me a button to just change the role from one
                   person to the next."
 
@@ -812,7 +837,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
 
                   Placed first in the panel because on an auto-placed field it
                   is the thing most likely to be wrong. */}
-              <div style={{ marginBottom:8 }}>
+              <div style={{ marginBottom:8, display: isAutoFilledLeaseColumn(sel.leaseColumn) ? 'none' : undefined }}>
                 <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Who fills this in</label>
                 <select className="input" value={sel.signerRole || ''}
                         onChange={e => updateSelected('signerRole', e.target.value)}
@@ -1453,6 +1478,7 @@ function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; 
 }
 
 export function ESignPage() {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const { can } = usePerms()
   const [tab, setTab]           = useState<'documents'|'templates'>('documents')
@@ -1616,6 +1642,17 @@ export function ESignPage() {
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
                       <div style={{ display:'flex', gap:6 }}>
+                        {/* S632 (Nic): "Where as the landlord can I sign the
+                            lease inside the app?" Nowhere — this table offered
+                            Download and Void and nothing else, so a lease
+                            waiting on the landlord's own signature had no way
+                            in except an emailed link. */}
+                        {d.landlordMustSign && d.status !== 'voided' && (
+                          <button className="btn btn-primary btn-sm"
+                            onClick={() => navigate(`/sign/${d.id}`)}>
+                            <PenLine size={12} /> Sign
+                          </button>
+                        )}
                         {can('esign.download') && d.executedPdfUrl && <a href={d.executedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>

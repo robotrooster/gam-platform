@@ -81,7 +81,7 @@ const mockCreateNotification = createNotification as unknown as ReturnType<typeo
 const mockFindStayConflict = findStayConflict as unknown as ReturnType<typeof vi.fn>
 
 const TENANT_ACTOR: AgentActor = { userId: 'u1', role: 'tenant', profileId: 't1' }
-const LANDLORD_ACTOR: AgentActor = { userId: 'u2', role: 'landlord', profileId: 'L1' }
+const LANDLORD_ACTOR: AgentActor = { userId: 'u2', role: 'landlord', profileId: '', landlordIds: ['L1'] }
 const GUEST_ACTOR: AgentActor = { userId: 'tok1', role: 'guest', profileId: 'bk1', bookingId: 'bk1' }
 
 describe('tool allowlist', () => {
@@ -402,7 +402,7 @@ describe('read tools scope to the actor', () => {
       { id: 'L', status: 'active', rent_amount: '1400.00', rent_due_day: 3, start_date: '2026-01-01', end_date: null, late_fee_grace_days: 5, unit_number: '12', property_name: 'Maple Court' },
     ])
     const res: any = await getMyLease.execute({}, TENANT_ACTOR)
-    expect((query as any).mock.calls[0][1]).toEqual(['t1']) // scoped to actor.profileId
+    expect((query as any).mock.calls[0][1]).toEqual(['t1']) // scoped to the account's companies
     expect(res.leases[0]).toMatchObject({ monthlyRent: 1400, rentDueDay: 3, property: 'Maple Court' })
   })
 
@@ -421,7 +421,7 @@ describe('read tools scope to the actor', () => {
       .mockResolvedValueOnce([{ property_count: 2, total_units: 10, occupied_units: 8, vacant_units: 2 }])
       .mockResolvedValueOnce([{ amount: '5000.00', status: 'settled', unit_count: 8, target_date: '2026-06-01', settled_at: '2026-06-01' }])
     const res: any = await getLandlordPortfolio.execute({}, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1]).toEqual(['L1'])
+    expect((query as any).mock.calls[0][1]).toEqual([['L1']])
     expect(res.portfolio).toMatchObject({ properties: 2, totalUnits: 10, occupiedUnits: 8, vacantUnits: 2 })
     expect(res.recentPayouts[0]).toMatchObject({ amount: 5000, unitCount: 8 })
   })
@@ -447,7 +447,7 @@ describe('read tools scope to the actor', () => {
       { title: 'Small', status: 'open', priority: 'normal', created_at: 'd', unit_number: '3', property_name: 'Oak' },
     ])
     const res: any = await getPendingMaintenance.execute({}, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1][0]).toBe('L1')
+    expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
     expect(res.awaitingApproval).toBe(1)
     expect(res.count).toBe(2)
   })
@@ -460,9 +460,9 @@ describe('read tools scope to the actor', () => {
         .mockResolvedValueOnce([{ type: 'rent', amount: '1200.00', status: 'failed', due_date: 'd' }])
       const res: any = await lookupTenantPaymentStatus.execute({ tenant: 'Jane' }, LANDLORD_ACTOR)
       // match query scoped to landlord id
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       // payment query scoped to BOTH tenant AND landlord
-      expect((query as any).mock.calls[1][1]).toEqual(['tX', 'L1', expect.any(Array)])
+      expect((query as any).mock.calls[1][1]).toEqual(['tX', ['L1'], expect.any(Array)])
       expect(res.outstandingBalance).toBe(1200)
       expect(res.tenant).toMatchObject({ name: 'Jane Doe' })
     })
@@ -553,8 +553,8 @@ describe('read tools scope to the actor', () => {
       ;(query as any).mockResolvedValue([{ first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev', overdue: '1400', items: '1', oldest_due: 'd' }])
       const res: any = await getDelinquentTenants.execute({}, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
-      expect(sql).toMatch(/p\.landlord_id = \$1/)
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect(sql).toMatch(/p\.landlord_id = ANY\(\$1/)
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       // S626: split into two groups. A row with no return_code is somebody who
       // never attempted a payment, not somebody whose ACH came back.
       expect(res.noPaymentAttempted[0]).toMatchObject({ name: 'Jane Doe', amountOverdue: 1400 })
@@ -580,7 +580,7 @@ describe('read tools scope to the actor', () => {
     it('get_pending_applications binds to the landlord id and exposes no SSN', async () => {
       ;(query as any).mockResolvedValue([{ first_name: 'Sam', last_name: 'Lee', email: 's@x.dev', phone: '555', move_in_date: 'd', occupants: 2, has_pets: false, status: 'pending', created_at: 'd', unit_number: '4', property_name: 'Oak' }])
       const res: any = await getPendingApplications.execute({}, LANDLORD_ACTOR)
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect((query as any).mock.calls[0][0]).not.toMatch(/ssn|date_of_birth/i)
       expect(res.applications[0]).toMatchObject({ applicant: 'Sam Lee', status: 'pending', unit: '4' })
     })
@@ -588,7 +588,7 @@ describe('read tools scope to the actor', () => {
     it('get_my_payouts binds to the landlord id', async () => {
       ;(query as any).mockResolvedValue([{ amount: '5000.00', status: 'settled', unit_count: 8, target_date: 'd', settled_at: 'd', trigger_type: 'auto' }])
       const res: any = await getMyPayouts.execute({}, LANDLORD_ACTOR)
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect(res.payouts[0]).toMatchObject({ amount: 5000, status: 'settled' })
     })
 
@@ -615,7 +615,7 @@ describe('read tools scope to the actor', () => {
         .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0', onboarding_complete: false }) // counts (by landlord_id)
       const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
       expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['u2']) // connect by actor.userId
-      expect((mockQueryOne as any).mock.calls[1][1]).toEqual(['L1']) // counts by actor.profileId
+      expect((mockQueryOne as any).mock.calls[1][1]).toEqual([['L1']]) // counts by the account's companies
       expect(res.complete).toBe(false)
       expect(res.completedSteps).toBe(2) // bank (details submitted) + property
       expect(res.nextStep).toMatch(/units/i) // next incomplete step
@@ -625,8 +625,8 @@ describe('read tools scope to the actor', () => {
       ;(query as any).mockResolvedValue([{ property_name: 'Maple', unit_number: '1', status: 'active', rent_amount: '1400.00', tenants: 'Jane Doe' }])
       const res: any = await getPropertyRentRoll.execute({ propertyName: 'Maple' }, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
-      expect(sql).toMatch(/u\.landlord_id = \$1/)
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect(sql).toMatch(/u\.landlord_id = ANY\(\$1/)
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect((query as any).mock.calls[0][1]).toContain('%Maple%') // property filter param
       expect(res.rentRoll[0]).toMatchObject({ property: 'Maple', rent: 1400, tenants: 'Jane Doe' })
     })
@@ -644,7 +644,7 @@ describe('read tools scope to the actor', () => {
         .mockResolvedValueOnce(null) // tenant notify lookup
       const res: any = await approveMaintenanceRequest.execute({ requestId: 'r1' }, LANDLORD_ACTOR)
       // the fetch query is scoped to both id AND landlord id
-      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['r1', 'L1'])
+      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['r1', ['L1']])
       expect(res.ok).toBe(true)
     })
 
@@ -668,14 +668,14 @@ describe('read tools scope to the actor', () => {
       expect(res.ok).toBe(false)
       expect(res.error).toMatch(/just updated/i)
       // the self-scoped UPDATE binds landlord id as a param
-      expect((mockQueryOne as any).mock.calls[1][1]).toContain('L1')
+      expect((mockQueryOne as any).mock.calls[1][1]).toContainEqual(['L1'])
     })
 
     it('message_tenant only messages a tenant on the landlord’s lease', async () => {
-      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
+      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
       const res: any = await messageTenant.execute({ tenant: 'Jane', message: 'Plumber comes Tuesday' }, LANDLORD_ACTOR)
       // tenant match query scoped to landlord id
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({ userId: 'tenantUser', landlordId: 'L1', body: 'Plumber comes Tuesday' }))
       expect(res.ok).toBe(true)
     })
@@ -693,7 +693,7 @@ describe('read tools scope to the actor', () => {
       expect(res.needsConfirmation).toBe(true)
       expect(res.recipientCount).toBe(3)
       // recipient query scoped to the landlord, COUNT only (no INSERT)
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect((query as any).mock.calls[0][0]).toMatch(/COUNT/i)
       expect((query as any).mock.calls[0][0]).not.toMatch(/INSERT/i)
     })
@@ -703,8 +703,8 @@ describe('read tools scope to the actor', () => {
       const res: any = await sendBulkMessage.execute({ message: 'Water shutoff Tuesday', confirmed: true }, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
       expect(sql).toMatch(/INSERT INTO notifications/i)
-      expect(sql).toMatch(/l\.landlord_id = \$1/) // recipients scoped to the landlord
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect(sql).toMatch(/l\.landlord_id = ANY\(\$1/) // recipients scoped to the landlord
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect(res.ok).toBe(true)
       expect(res.sent).toBe(3)
     })
@@ -713,16 +713,16 @@ describe('read tools scope to the actor', () => {
       ;(query as any).mockResolvedValue([{ first_name: 'Sam', last_name: 'Lee', status: 'complete', result_url: 'https://portal/report/1', created_at: 'd' }])
       const res: any = await getBackgroundCheckStatus.execute({}, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect(sql).not.toMatch(/ssn|date_of_birth|monthly_income|employer/i)
       expect(res.checks[0]).toMatchObject({ applicant: 'Sam Lee', status: 'complete', reportLink: 'https://portal/report/1' })
     })
 
     it('flag_applicant_decision records intent (decline) without deciding — notifies, never touches background_checks', async () => {
-      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd' }])
+      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd' }])
       const res: any = await flagApplicantDecision.execute({ applicant: 'Jane Doe', decision: 'decline' }, LANDLORD_ACTOR)
       // lookup scoped to the landlord, NOT a decision write
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect((query as any).mock.calls[0][0]).not.toMatch(/UPDATE background_checks|decided_at|decision_notes/i)
       // intent captured as a durable notification for THIS landlord
       expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({
@@ -737,7 +737,7 @@ describe('read tools scope to the actor', () => {
     })
 
     it('flag_applicant_decision refuses an undecidable check (e.g. still pending) — no intent recorded', async () => {
-      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'pending', created_at: 'd' }])
+      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', status: 'pending', created_at: 'd' }])
       const res: any = await flagApplicantDecision.execute({ applicant: 'Jane Doe', decision: 'approve' }, LANDLORD_ACTOR)
       expect(res.ok).toBe(false)
       expect(mockCreateNotification).not.toHaveBeenCalled()
@@ -753,7 +753,7 @@ describe('read tools scope to the actor', () => {
 
     it('flag_applicant_decision asks which one when the name matches several checks', async () => {
       ;(query as any).mockResolvedValueOnce([
-        { id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd1' },
+        { id: 'bc1', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd1' },
         { id: 'bc2', first_name: 'Jane', last_name: 'Doerr', status: 'processing', created_at: 'd2' },
       ])
       const res: any = await flagApplicantDecision.execute({ applicant: 'Jane', decision: 'approve' }, LANDLORD_ACTOR)
@@ -765,7 +765,7 @@ describe('read tools scope to the actor', () => {
     it('flag_applicant_decision by checkId scopes the lookup to the landlord', async () => {
       ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'bc9', first_name: 'Sam', last_name: 'Lee', status: 'submitted', created_at: 'd' })
       const res: any = await flagApplicantDecision.execute({ checkId: 'bc9', decision: 'approve' }, LANDLORD_ACTOR)
-      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['bc9', 'L1'])
+      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['bc9', ['L1']])
       expect(res.ok).toBe(true)
     })
 
@@ -776,10 +776,10 @@ describe('read tools scope to the actor', () => {
     })
 
     it('draft_tenant_notice returns a draft WITHOUT sending until approved', async () => {
-      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
+      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
       const res: any = await draftTenantNotice.execute({ tenant: 'Jane', subject: 'Rent Increase', notice: 'Your rent will increase by $50 starting Aug 1.' }, LANDLORD_ACTOR)
       // tenant lookup scoped to the landlord
-      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
       expect(res.needsApproval).toBe(true)
       expect(res.draft).toMatchObject({ to: 'Jane Doe', subject: 'Rent Increase' })
       // nothing delivered in the draft phase
@@ -787,7 +787,7 @@ describe('read tools scope to the actor', () => {
     })
 
     it('draft_tenant_notice delivers to the tenant only when confirmed', async () => {
-      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
+      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
       const res: any = await draftTenantNotice.execute({ tenant: 'Jane', subject: 'Lease Violation', notice: 'Please remove the trailer from the common lot.', confirmed: true }, LANDLORD_ACTOR)
       expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({
         userId: 'tenantUser', landlordId: 'L1', type: 'landlord_notice', title: 'Lease Violation',
@@ -825,7 +825,7 @@ describe('maintenance assignment tools (landlord, team-scoped)', () => {
       { user_id: 'w1', first_name: 'Mike', last_name: 'Diaz', job_categories: ['plumbing'], all_properties: false, property_count: 2 },
     ])
     const res: any = await getMaintenanceTeam.execute({}, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1]).toEqual(['L1']) // scoped to actor.profileId
+    expect((query as any).mock.calls[0][1]).toEqual([['L1']]) // scoped to the account's companies
     expect(res.ok).toBe(true)
     expect(res.workers[0]).toMatchObject({ workerId: 'w1', name: 'Mike Diaz', coverage: '2 properties' })
   })
@@ -842,9 +842,9 @@ describe('maintenance assignment tools (landlord, team-scoped)', () => {
     const res: any = await assignMaintenanceRequest.execute({ requestId: 'r1', workerName: 'Mike' }, LANDLORD_ACTOR)
 
     expect(res).toMatchObject({ ok: true, assignedTo: 'Mike Diaz', newStatus: 'assigned' })
-    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', 'L1']) // request scoped to landlord
-    expect((query as any).mock.calls[0][1][0]).toBe('L1') // worker resolution scoped to landlord
-    expect(mockQueryOne.mock.calls[1][1]).toEqual(['w1', 'assigned', 'r1', 'L1']) // UPDATE scoped to worker+request+landlord
+    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', ['L1']]) // request scoped to landlord
+    expect((query as any).mock.calls[0][1][0]).toEqual(['L1']) // worker resolution scoped to landlord
+    expect(mockQueryOne.mock.calls[1][1]).toEqual(['w1', 'assigned', 'r1', ['L1']]) // UPDATE scoped to worker+request+landlord
     expect(mockCreateNotification).toHaveBeenCalledTimes(1) // worker notified
   })
 
@@ -891,8 +891,8 @@ describe('get_books_summary (landlord, ledger-scoped)', () => {
         { code: '5050', name: 'Utilities', period_amount: '300' },
       ]) // expenses
     const res: any = await getBooksSummary.execute({ period: 'last_month' }, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1][0]).toBe('L1') // income scoped to landlord
-    expect((query as any).mock.calls[1][1][0]).toBe('L1') // expenses scoped to landlord
+    expect((query as any).mock.calls[0][1][0]).toEqual(['L1']) // income scoped to landlord
+    expect((query as any).mock.calls[1][1][0]).toEqual(['L1']) // expenses scoped to landlord
     expect(res).toMatchObject({ totalIncome: 5150, totalExpenses: 1500, netIncome: 3650, period: 'last month' })
     expect(res.topExpenses[0]).toMatchObject({ category: 'Repairs & Maintenance', amount: 1200 })
   })
@@ -918,8 +918,8 @@ describe('reject_maintenance_request (landlord action)', () => {
     ;(query as any).mockResolvedValueOnce(undefined) // comment insert
     const res: any = await rejectMaintenanceRequest.execute({ requestId: 'r1', reason: 'duplicate' }, LANDLORD_ACTOR)
     expect(res).toMatchObject({ ok: true, newStatus: 'cancelled' })
-    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', 'L1']) // load scoped to landlord
-    expect(mockQueryOne.mock.calls[1][1]).toEqual(['r1', 'L1']) // UPDATE scoped to landlord
+    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', ['L1']]) // load scoped to landlord
+    expect(mockQueryOne.mock.calls[1][1]).toEqual(['r1', ['L1']]) // UPDATE scoped to landlord
   })
 
   it('refuses a request the landlord does not own', async () => {
@@ -944,8 +944,8 @@ describe('get_tenant_contact (landlord, lease-scoped)', () => {
       .mockResolvedValueOnce([{ tenant_id: 't9', first_name: 'Jane', last_name: 'Doe', email: 'jane@x.dev', phone: '555-1234' }]) // match
       .mockResolvedValueOnce([{ unit_number: '4', property_name: 'Maple Park', lease_status: 'active' }]) // units
     const res: any = await getTenantContact.execute({ tenant: 'Jane' }, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1][0]).toBe('L1') // match scoped to landlord
-    expect((query as any).mock.calls[1][1]).toEqual(['L1', 't9']) // units scoped to landlord + tenant
+    expect((query as any).mock.calls[0][1][0]).toEqual(['L1']) // match scoped to landlord
+    expect((query as any).mock.calls[1][1]).toEqual([['L1'], 't9']) // units scoped to landlord + tenant
     expect(res.tenant).toMatchObject({ name: 'Jane Doe', phone: '555-1234' })
     expect(res.tenant.units[0]).toMatchObject({ unit: '4', property: 'Maple Park' })
   })
@@ -1011,8 +1011,8 @@ describe('get_team (landlord, all-role roster)', () => {
       ]) // members
       .mockResolvedValueOnce([{ email: 'new@x.dev', role: 'onsite_manager' }]) // invites
     const res: any = await getTeam.execute({}, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1]).toEqual(['L1']) // members scoped to landlord
-    expect((query as any).mock.calls[1][1]).toEqual(['L1']) // invites scoped to landlord
+    expect((query as any).mock.calls[0][1]).toEqual([['L1']]) // members scoped to landlord
+    expect((query as any).mock.calls[1][1]).toEqual([['L1']]) // invites scoped to landlord
     expect(res.members).toEqual([
       { name: 'Mike Diaz', role: 'Maintenance', coverage: '2 properties' },
       { name: 'Bea Cook', role: 'Bookkeeper', coverage: 'books access' },
@@ -1033,8 +1033,8 @@ describe('schedule_maintenance (landlord action)', () => {
     ;(query as any).mockResolvedValueOnce(undefined) // comment insert
     const res: any = await scheduleMaintenance.execute({ requestId: 'r1', scheduledAt: '2026-06-13T09:00:00Z' }, LANDLORD_ACTOR)
     expect(res.ok).toBe(true)
-    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', 'L1']) // load scoped to landlord
-    expect(mockQueryOne.mock.calls[1][1]).toEqual(['2026-06-13T09:00:00.000Z', 'r1', 'L1']) // UPDATE scoped to landlord
+    expect(mockQueryOne.mock.calls[0][1]).toEqual(['r1', ['L1']]) // load scoped to landlord
+    expect(mockQueryOne.mock.calls[1][1]).toEqual(['2026-06-13T09:00:00.000Z', 'r1', ['L1']]) // UPDATE scoped to landlord
     expect(mockCreateNotification).not.toHaveBeenCalled() // schedule uses notifyMaintenanceUpdated, not createNotification
   })
 
@@ -1267,7 +1267,7 @@ describe('get_market_rent (anonymized aggregate, landlord audience)', () => {
     ])
     const res: any = await getMarketRentTool.execute({ unit_type: 'apartment', city: 'Phoenix', state: 'az', your_rent: 1250 }, LANDLORD_ACTOR)
     // exclude-self: the asking landlord id is passed as the 4th query param
-    expect((query as any).mock.calls[0][1][3]).toBe('L1')
+    expect((query as any).mock.calls[0][1][3]).toEqual(['L1'])
     expect(res.market).toMatchObject({ median_rent: 1500, typical_range: { low: 1350, high: 1700 } })
     expect(res.position).toBe('below')
     expect(res.note).toMatch(/anonymized aggregate/i)
@@ -1440,7 +1440,7 @@ describe('get_inspection_progress (landlord-run walkthrough)', () => {
     ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i1', inspection_type: 'move_in', status: 'draft', unit_number: '4', bedrooms: 2, unit_type: 'apartment' })
     ;(query as any).mockResolvedValueOnce([]) // photographed areas
     const res: any = await getInspectionProgress.execute({ inspectionId: 'i1' }, LANDLORD_ACTOR)
-    expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['i1', 'L1'])
+    expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['i1', ['L1']])
     const names = res.areas.map((a: any) => a.area)
     expect(names).toContain('Bedroom 1')
     expect(names).toContain('Bedroom 2')
@@ -1453,7 +1453,7 @@ describe('get_inspection_progress (landlord-run walkthrough)', () => {
     ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i2', inspection_type: 'turnover', status: 'draft', unit_number: '12', bedrooms: 0, unit_type: 'rv_spot' })
     ;(query as any).mockResolvedValueOnce([])
     const res: any = await getInspectionProgress.execute({ unit: '12' }, LANDLORD_ACTOR)
-    expect((mockQueryOne as any).mock.calls[0][1][0]).toBe('L1')
+    expect((mockQueryOne as any).mock.calls[0][1][0]).toEqual(['L1'])
     expect(res.ok).toBe(true)
     expect(res.areas.map((a: any) => a.area)).toContain('RV site')
   })

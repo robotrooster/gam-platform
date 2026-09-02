@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
-import { LEASE_COLUMN_CATEGORY, humanize } from '@gam/shared'
+import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
 
@@ -288,32 +288,14 @@ export function SignPage() {
    * the way out so the portal's own scrolling is untouched.
    */
   // S629 (Nic): "when I follow the link from the reminder email, the scroll was
-  // locked again. So whatever you did was just on that email."
+  // locked again." S633 (Nic): "Other tenant on mobile is having the same issue
+  // that you previously fixed for me... whatever you did was just a one off fix."
   //
-  // He was right, and the first version of this was too clever: it unlocked only
-  // when the URL carried a signer token, so a link built any other way — the
-  // reminder job still used the document id — stayed locked.
-  //
-  // The real condition is not the URL, it is whether this page is inside the
-  // app shell. Layout provides .page-content, the only scrolling region; a
-  // standalone signing page has no such ancestor and must scroll the document
-  // itself. Asked of the DOM rather than inferred from the address, so every
-  // entry path gets the same answer.
-  // Layout renders .page-content and nothing else does, so its absence from the
-  // document IS "no shell". Checked this way rather than through a ref, because
-  // a ref is null on the first render (the page is still loading) and would
-  // report standalone inside the portal.
-  const [standalone, setStandalone] = useState(false)
-  useEffect(() => { setStandalone(!document.querySelector('.page-content')) }, [])
-  useEffect(() => {
-    if (!standalone) return
-    const b = document.body.style
-    const prev = { overflow: b.overflow, height: b.height, overscrollBehavior: b.overscrollBehavior }
-    b.overflow = 'auto'; b.height = 'auto'; b.overscrollBehavior = 'auto'
-    return () => {
-      b.overflow = prev.overflow; b.height = prev.height; b.overscrollBehavior = prev.overscrollBehavior
-    }
-  }, [standalone])
+  // Both were right, and the second is why this now lives in @gam/shared: the
+  // identical page exists in apps/tenant and was never fixed, so the person a
+  // lease is actually SENT to could not scroll to confirm their font. See
+  // packages/shared/src/standaloneScroll.ts for the whole story.
+  useEffect(() => unlockScrollIfStandalone(), [])
   const navigate = useNavigate()
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
@@ -563,12 +545,26 @@ export function SignPage() {
       <h2 style={{ color:'var(--text-0)', margin:0 }}>{allDone?'Document Fully Executed!':'Signatures Submitted!'}</h2>
       <p style={{ color:'var(--text-3)', maxWidth:400, lineHeight:1.6 }}>{allDone?'All parties have signed. A copy will be sent to your email.':'Your signatures have been recorded. The next party will be notified.'}</p>
       <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Signed: {new Date().toLocaleString()} · UETA & E-SIGN Act compliant</div>
-      <button className="btn btn-primary" onClick={()=>navigate('/lease')}>Back to Lease</button>
+      {/* S632 (Nic): "Clicking back to lease at the end of the signing flow just
+          takes us to a black screen." It navigated to '/lease', which is not a
+          route — the page is '/leases'. No route matched, nothing rendered, and
+          with no catch-all in the router the result was a blank screen with no
+          way back except the browser button. */}
+      <button className="btn btn-primary" onClick={()=>navigate('/leases')}>Back to Leases</button>
     </div>
   )
 
   return (
-    <div>
+    // S632 (Nic): "It renders really wide and really enlarged on my screen on my
+    // computer. It only shows me about a quarter of the page with how much it's
+    // zoomed in."
+    //
+    // The page canvas is rendered at containerRef.clientWidth, and this wrapper
+    // had no cap — so on a wide monitor a letter page was drawn 1400px+ across,
+    // roughly 1.8x life size, and the 78vh viewport then showed a corner of it.
+    // A document has a readable width regardless of the monitor it is opened on;
+    // capping here caps the render, because the scale is derived from it.
+    <div style={{ maxWidth: 920, margin: '0 auto' }}>
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
@@ -603,7 +599,7 @@ export function SignPage() {
         <div style={{ height:'100%', background:'var(--gold,#c9a227)', borderRadius:2, width:`${requiredFields.length?Math.round((requiredFields.length-unfilledRequired.length)/requiredFields.length*100):0}%`, transition:'width .3s' }}/>
       </div>
 
-      <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'78vh', marginBottom:16 }}>
+      <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'82vh', marginBottom:16 }}>
         <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
           <canvas ref={canvasRef}/>
           {pdfDims && pageFields.map((f:any) => {
@@ -830,13 +826,29 @@ export function SignPage() {
               </div>
             )}
             {activeField.fieldType==='text' && (
-              <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
+              // S632 (Nic): "When it opens that little window to put in an
+              // amount for security deposit or pet deposit or proration, it
+              // should open with a cursor in the box already so I can just start
+              // typing. Instead everything is two and three extra clicks."
+              //
+              // A signer works down a page of boxes: tap the box, type, next.
+              // Opening an unfocused input turns each of those into tap, tap,
+              // type, tap. Selecting any existing value means typing REPLACES a
+              // prefilled figure rather than appending to it, and Enter commits
+              // so the mouse is not needed at all.
+              <input autoFocus
+                ref={el => { if (el && document.activeElement !== el) { el.focus(); el.select() } }}
+                defaultValue={fieldValues[activeField.id]||''}
+                onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
+                onKeyDown={e=>{ if (e.key === 'Enter') { e.preventDefault(); setActiveField(null) } }}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             {activeField.fieldType==='date' && (
               // S534: term dates (lease start/end) are picked deliberately —
               // stored as the locale string the stamped PDF prints.
-              <input type="date" onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
+              <input type="date" autoFocus
+                onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
+                onKeyDown={e=>{ if (e.key === 'Enter') { e.preventDefault(); setActiveField(null) } }}
                 style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             <div style={{ display:'flex', gap:8 }}>

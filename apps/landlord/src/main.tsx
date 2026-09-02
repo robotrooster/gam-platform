@@ -17,7 +17,7 @@ import { installDatePickerAutoClose, startVersionWatch } from '@gam/shared'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -294,6 +294,14 @@ export default function App() {
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />
               <Route path="flex-charge"               element={LAUNCH_HIDDEN.has('/flex-charge') ? <Navigate to="/dashboard" replace /> : <FlexChargePage />} />
+              {/* S632 (Nic): "Clicking back to lease at the end of the signing
+                  flow just takes us to a black screen." The button pointed at
+                  '/lease' instead of '/leases' — but a one-character typo should
+                  not be able to produce a dead end. With no catch-all, an
+                  unmatched path rendered NOTHING inside the layout: no message,
+                  no nav, no way back except the browser's own button. Any wrong
+                  path now lands somewhere with a way out. */}
+              <Route path="*" element={<NotFoundPage />} />
             </Route>
           </Routes>
         </BrowserRouter>
@@ -320,3 +328,20 @@ appRoot.render(
     <App />
   </SentryErrorBoundary>
 )
+
+
+// S632: the page an unmatched path lands on. Deliberately plain — it exists so
+// a bad link is recoverable, not so it is decorated.
+function NotFoundPage() {
+  const navigate = useNavigate()
+  const { pathname } = useLocation()
+  return (
+    <div style={{ padding: '64px 24px', textAlign: 'center' }}>
+      <h2 style={{ color: 'var(--text-0)', marginBottom: 8 }}>That page doesn&apos;t exist</h2>
+      <p style={{ color: 'var(--text-3)', fontSize: '.86rem', marginBottom: 20 }}>
+        Nothing here at <code style={{ color: 'var(--text-2)' }}>{pathname}</code>.
+      </p>
+      <button className="btn btn-primary" onClick={() => navigate('/dashboard')}>Back to dashboard</button>
+    </div>
+  )
+}

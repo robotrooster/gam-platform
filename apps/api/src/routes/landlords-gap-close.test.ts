@@ -249,7 +249,9 @@ describe('GET /theme', () => {
   it('PATCH /theme then GET reflects the change', async () => {
     const f = await seed()
     await db.query(
-      `UPDATE landlords SET theme_accent='blue', font_style='serif' WHERE id=$1`, [f.landlordAId])
+      // S633: theme is per ACCOUNT — the person's portal chrome, not an asset
+      // of any company they own.
+      `UPDATE users SET theme_accent='blue', font_style='serif' WHERE id=$1`, [f.landlordAUserId])
     const res = await request(buildApp())
       .get('/api/landlords/theme')
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -422,7 +424,7 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .send({ landlordOverrides: { rent_amount: 1600 } })
     expect(res.status).toBe(200)
     expect(res.body.data.leaseId).toBe('mock-lease-id')
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, { rent_amount: 1600 }, { confirmSupersede: false })
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], { rent_amount: 1600 }, { confirmSupersede: false })
   })
 
   it('empty body: resolveIntent called with empty overrides', async () => {
@@ -433,6 +435,6 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({})
     expect(res.status).toBe(200)
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, {}, { confirmSupersede: false })
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, [f.landlordAId], {}, { confirmSupersede: false })
   })
 })

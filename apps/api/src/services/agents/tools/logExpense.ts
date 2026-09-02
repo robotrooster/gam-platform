@@ -22,29 +22,32 @@
 import { EXPENSE_CATEGORIES } from '@gam/shared'
 import { query } from '../../../db'
 import { createLandlordExpense } from '../../landlordExpenses'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { resolveActorCompany, COMPANY_PARAM } from './companyScope'
 
 /** "the Oak Street roof" — a landlord names places, never ids. */
-async function resolvePlace(landlordId: string, place: string) {
+// S634: matches a spoken place across every company the ACCOUNT owns, and
+// carries back the owning company so the expense is filed against it.
+async function resolvePlace(landlordIds: string[], place: string) {
   const needle = place.trim()
   if (!needle) return { propertyId: null, unitId: null, matched: null as string | null }
   const units = await query<any>(
-    `SELECT u.id, u.unit_number, u.property_id, p.name AS property_name
+    `SELECT u.id, u.unit_number, u.property_id, u.landlord_id, p.name AS property_name
        FROM units u JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = $1 AND u.retired_at IS NULL
+      WHERE u.landlord_id = ANY($1::uuid[]) AND u.retired_at IS NULL
         AND (u.unit_number ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')
       ORDER BY (u.unit_number ILIKE $2) DESC
-      LIMIT 6`, [landlordId, needle])
+      LIMIT 6`, [landlordIds, needle])
   const exactUnit = units.find((u: any) => String(u.unit_number ?? '').toLowerCase() === needle.toLowerCase())
   if (exactUnit) {
-    return { propertyId: exactUnit.property_id, unitId: exactUnit.id, matched: `${exactUnit.property_name} ${exactUnit.unit_number}` }
+    return { propertyId: exactUnit.property_id, unitId: exactUnit.id, landlordId: exactUnit.landlord_id, matched: `${exactUnit.property_name} ${exactUnit.unit_number}` }
   }
   const props = await query<any>(
-    `SELECT id, name FROM properties WHERE landlord_id = $1 AND name ILIKE '%' || $2 || '%' LIMIT 6`,
-    [landlordId, needle])
-  if (props.length === 1) return { propertyId: props[0].id, unitId: null, matched: props[0].name }
+    `SELECT id, name, landlord_id FROM properties WHERE landlord_id = ANY($1::uuid[]) AND name ILIKE '%' || $2 || '%' LIMIT 6`,
+    [landlordIds, needle])
+  if (props.length === 1) return { propertyId: props[0].id, unitId: null, landlordId: props[0].landlord_id, matched: props[0].name }
   if (props.length > 1) return { propertyId: null, unitId: null, matched: null, ambiguous: props.map((p: any) => p.name) } as any
-  if (units.length === 1) return { propertyId: units[0].property_id, unitId: units[0].id, matched: `${units[0].property_name} ${units[0].unit_number}` }
+  if (units.length === 1) return { propertyId: units[0].property_id, unitId: units[0].id, landlordId: units[0].landlord_id, matched: `${units[0].property_name} ${units[0].unit_number}` }
   return { propertyId: null, unitId: null, matched: null, notFound: true } as any
 }
 
@@ -66,6 +69,7 @@ export const logExpense: AgentTool = {
   parameters: {
     type: 'object',
     properties: {
+      ...COMPANY_PARAM,
       amount: { type: 'number', description: 'What they paid, in dollars.' },
       category: { type: 'string', description: `One of: ${EXPENSE_CATEGORIES.join(', ')}` },
       description: { type: 'string', description: 'What it was for, in their words. e.g. "replaced the water heater"' },
@@ -99,8 +103,13 @@ export const logExpense: AgentTool = {
     let propertyId: string | null = null
     let unitId: string | null = null
     let matched: string | null = null
+    // S634: the expense is filed against the company that owns the place it was
+    // spent on. Portfolio-level (no place named) falls back to the account's
+    // only company, and asks when it owns several — an expense in the wrong
+    // company's books is a wrong P&L and a wrong tax return.
+    let expenseLandlordId: string | null = null
     if (args.place != null && String(args.place).trim()) {
-      const r: any = await resolvePlace(actor.profileId, String(args.place))
+      const r: any = await resolvePlace(actorLandlordIds(actor), String(args.place))
       if (r.ambiguous) {
         return {
           ok: false, needsNarrowing: true, error: `"${args.place}" matches more than one property.`,
@@ -114,12 +123,18 @@ export const logExpense: AgentTool = {
         }
       }
       propertyId = r.propertyId; unitId = r.unitId; matched = r.matched
+      expenseLandlordId = r.landlordId ?? null
+    }
+    if (!expenseLandlordId) {
+      const company = await resolveActorCompany(actor, (args as any).company)
+      if (!company.ok) return { ok: false, error: company.error }
+      expenseLandlordId = company.landlordId
     }
 
     // The service does the ownership checks — a unit or property that is not
     // theirs is rejected there, which is exactly where the portal rejects it.
     const row: any = await createLandlordExpense({
-      landlordId: actor.profileId,
+      landlordId: expenseLandlordId,
       createdBy: (actor as any).userId,
       propertyId, unitId, category, amount,
       description: args.description != null ? String(args.description).slice(0, 500) : null,

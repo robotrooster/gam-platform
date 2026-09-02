@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 import { UserRole, LandlordAssignableRole } from '@gam/shared'
-import { query } from '../db'
+import { query, queryOne } from '../db'
 import { AppError } from './errorHandler'
 import { isPosLimitedRequestAllowed } from '../lib/posLock'
 
@@ -9,7 +9,13 @@ export interface AuthPayload {
   userId:      string
   role:        UserRole
   email:       string
-  profileId:   string
+  // S633: NULL for role=landlord. An account is not an entity, so a landlord
+  // session names no `landlords` row — see routes/auth.ts. For every other role
+  // this is still the one profile row that genuinely is one-to-one with the
+  // user (tenant, business). Typed nullable ON PURPOSE: it is what makes the
+  // compiler point at any landlord-scoping site still reading it, instead of
+  // that site quietly filtering on undefined and returning nothing.
+  profileId:   string | null
   landlordId?: string | null
   // S553: multi-owner entities — ALL landlord entities this user is an
   // owner-member of (landlord_members), resolved at login. profileId stays
@@ -128,9 +134,45 @@ export function requireSuperAdmin(req: Request, res: Response, next: NextFunctio
 // S567: the platform OWNER only. System Features (feature-flag toggles) is
 // locked to this single account so no other admin can flip a flag by accident.
 export const OWNER_EMAIL = process.env.OWNER_EMAIL || 'nic@golddoor.io'
-export function requireOwner(req: Request, res: Response, next: NextFunction) {
+
+/**
+ * S631: is this user THE platform owner — the one account that cannot be
+ * deleted or downgraded, and the only one that may create super admins.
+ *
+ * Matched on user id via the platform_owner table, NOT on an email string. The
+ * old check compared req.user.email to OWNER_EMAIL, which was a live bug rather
+ * than a theoretical one: GAM has an email-change flow, and Nic moved his own
+ * login off the Oak Park address the same day this was written. Under the string
+ * match, changing his email would have silently stripped his own owner powers —
+ * and granted them to whoever next registered the old address.
+ *
+ * Fails CLOSED. A database error answers "not the owner", so a blip denies a
+ * privileged action rather than handing it out.
+ */
+export async function isPlatformOwner(
+  userId: string | undefined,
+  email?: string | null,
+): Promise<boolean> {
+  if (!userId) return false
+  try {
+    const row = await queryOne<{ user_id: string }>(
+      `SELECT user_id FROM platform_owner WHERE user_id = $1`, [userId])
+    if (row) return true
+    // BOOTSTRAP ONLY. A platform_owner row cannot be deleted (the table's own
+    // trigger refuses it), so an EMPTY table means one was never established —
+    // a fresh deployment or a test database, not a tampered production one.
+    // There, and only there, the OWNER_EMAIL constant still names the owner, so
+    // a new environment is never ownerless. The moment a row exists this branch
+    // is unreachable and identity is the account id alone.
+    const anyOwner = await queryOne<{ n: string }>(`SELECT count(*)::text AS n FROM platform_owner`)
+    if (Number(anyOwner?.n ?? 0) === 0) return !!email && email === OWNER_EMAIL
+    return false
+  } catch { return false }
+}
+
+export async function requireOwner(req: Request, res: Response, next: NextFunction) {
   if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
-  if (req.user.email !== OWNER_EMAIL) {
+  if (!(await isPlatformOwner(req.user.userId, req.user.email))) {
     return res.status(403).json({ success: false, error: 'Owner only' })
   }
   next()
@@ -275,13 +317,18 @@ async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
   const hit = membershipCache.get(key)
   const now = Date.now()
   if (hit && now - hit.at < MEMBERSHIP_TTL_MS) return hit.ids
+  // S633: membership OR founding ownership. This used to fall back on the
+  // token's profileId to cover accounts predating landlord_members — but
+  // profileId no longer names an entity for a landlord, so the fallback has to
+  // be the fact it was standing in for: `landlords.user_id`. Without this union
+  // an older account loses the company it founded the moment the session stops
+  // carrying an entity id.
   const rows = await query<{ landlord_id: string }>(
-    `SELECT landlord_id FROM landlord_members WHERE user_id = $1`, [payload.userId])
-  // The token's own profileId still counts — a landlord with no membership row
-  // (older accounts predating S553) must not lose their own book.
+    `SELECT landlord_id FROM landlord_members WHERE user_id = $1
+     UNION
+     SELECT id           FROM landlords        WHERE user_id = $1`, [payload.userId])
   const ids = Array.from(new Set([
     ...(payload.landlordIds ?? []),
-    ...(payload.profileId ? [payload.profileId] : []),
     ...rows.map((r) => r.landlord_id),
   ].filter(Boolean))) as string[]
   membershipCache.set(key, { ids, at: now })

@@ -4,12 +4,16 @@ import fs from 'fs'
 import { Router, type Request } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL } from '../middleware/auth'
+import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL, isPlatformOwner } from '../middleware/auth'
 import { latencyP95, sampleSize, MIN_SAMPLES } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
+import { randomUUID } from 'crypto'
+import bcrypt from 'bcryptjs'
+import { getClient } from '../db'
+import { emailAdminInvitation } from '../services/email'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES } from '@gam/shared'
+import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
@@ -3304,5 +3308,231 @@ adminRouter.post('/demo-feed/rotate', async (req, res, next) => {
         WHERE id = true RETURNING feed_token`)
     const token = row!.feed_token
     res.json({ success: true, data: { token, ...salesFeedUrls(req, token) } })
+  } catch (e) { next(e) }
+})
+
+// ── ADMIN INVITATIONS (S631) ─────────────────────────────────────────
+//
+// Nic: "Let's make a way to invite other admins to admin portal."
+//
+// Before this, a new admin was a hand-written INSERT against production. That is
+// how the most privileged role on the platform ended up as the only one with no
+// invitation record — and this same session showed what an untracked hand-edit
+// costs when a co-owner vanished and nothing could say who removed them.
+//
+// Every route here is requireSuperAdmin. An `admin` cannot mint admins and
+// cannot mint a super_admin; otherwise the two roles differ only in cosmetics,
+// since any admin could promote themselves through a second account.
+const ADMIN_INVITE_TTL_HOURS = 72
+const ROLE_LABEL: Record<string, string> = { admin: 'an admin', super_admin: 'a super admin' }
+
+// GET /api/admin/invitations — the standing list, live ones first.
+adminRouter.get('/invitations', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(`
+      SELECT i.id, i.email, i.role, i.status, i.note,
+             i.created_at, i.expires_at, i.accepted_at, i.revoked_at,
+             (i.status = 'pending' AND i.expires_at <= now()) AS expired,
+             inv.email AS invited_by_email,
+             NULLIF(BTRIM(COALESCE(inv.first_name,'') || ' ' || COALESCE(inv.last_name,'')), '') AS invited_by_name,
+             acc.email AS accepted_email
+        FROM admin_invitations i
+        JOIN users inv ON inv.id = i.invited_by_user_id
+        LEFT JOIN users acc ON acc.id = i.accepted_user_id
+       ORDER BY (i.status = 'pending' AND i.expires_at > now()) DESC, i.created_at DESC
+       LIMIT 200`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/staff — who already has console access. Invitations only tell
+// half the story; the other half is the accounts that exist right now.
+adminRouter.get('/staff', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(`
+      SELECT id, email, role, first_name, last_name, created_at,
+             (totp_enabled OR email_2fa_enabled) AS two_factor_on, last_login_at
+        FROM users WHERE role IN ('admin', 'super_admin')
+       ORDER BY role DESC, created_at`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/team-capabilities — what THIS viewer may do here. Only ever
+// answers about the caller, so it tells a super admin what they can do without
+// telling them which other account outranks them.
+adminRouter.get('/team-capabilities', requireSuperAdmin, async (req, res, next) => {
+  try {
+    res.json({ success: true, data: {
+      canInviteSuperAdmin: await isPlatformOwner(req.user!.userId, req.user!.email),
+    } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/admin/invitations — invite somebody to the console.
+adminRouter.post('/invitations', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      email: z.string().trim().email(),
+      role: z.enum(['admin', 'super_admin']),
+      note: z.string().max(500).optional(),
+    }).parse(req.body)
+    const email = body.email.toLowerCase()
+
+    // S631 (Nic, DIRECTIVE): "I want super admins to only be able to be added by
+    // me. Other super admins can only add regular level admins. I don't need
+    // people adding people willy nilly left and right."
+    //
+    // A super admin is an OWNER of the software; a regular admin is staff —
+    // sales, portfolio strategists. Letting any super admin mint another makes
+    // ownership self-propagating, and one compromised or departing account could
+    // seed a second before anyone noticed.
+    if (body.role === 'super_admin' && !(await isPlatformOwner(req.user!.userId, req.user!.email))) {
+      throw new AppError(403,
+        'Only the platform owner can add a super admin. You can invite an admin.')
+    }
+
+    // ONE ACCOUNT, ONE AUDIENCE. An address already on the platform is refused
+    // rather than promoted — a landlord login that is also an admin login sits
+    // on both sides of every isolation rule GAM has. Nic runs this way himself:
+    // his super_admin and his landlord account are different addresses.
+    const existing = await queryOne<{ role: string }>(
+      `SELECT role FROM users WHERE lower(email) = $1`, [email])
+    if (existing) {
+      throw new AppError(409, existing.role === 'admin' || existing.role === 'super_admin'
+        ? 'That address already has console access.'
+        : `That address is already a ${String(existing.role).replace(/_/g, ' ')} account on GAM. ` +
+          'Admin access needs its own separate login — invite a different address.')
+    }
+
+    const token = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+    const expiresAt = new Date(Date.now() + ADMIN_INVITE_TTL_HOURS * 3600_000).toISOString()
+    const row = await queryOne<{ id: string }>(
+      `INSERT INTO admin_invitations (email, role, invited_by_user_id, token, expires_at, note)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (lower(email)) WHERE status = 'pending'
+       DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at,
+                     role = EXCLUDED.role, note = EXCLUDED.note,
+                     invited_by_user_id = EXCLUDED.invited_by_user_id, updated_at = now()
+       RETURNING id`,
+      [email, body.role, req.user!.userId, token, expiresAt, body.note ?? null])
+
+    const inviter = await queryOne<{ first_name: string | null; last_name: string | null; email: string }>(
+      `SELECT first_name, last_name, email FROM users WHERE id = $1`, [req.user!.userId])
+    const inviterName = [inviter?.first_name, inviter?.last_name].filter(Boolean).join(' ').trim()
+      || inviter?.email || 'A GAM super admin'
+    const base = (process.env.ADMIN_APP_URL || 'https://admin.goldassetmanagement.com').replace(/\/$/, '')
+    await emailAdminInvitation(
+      email, inviterName, ROLE_LABEL[body.role] ?? body.role,
+      `${base}/accept-invite/${token}`, ADMIN_INVITE_TTL_HOURS, { invitationId: row!.id },
+    ).catch(() => { /* the row stands; it can be resent */ })
+
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'admin_invitation_sent',
+      targetId: row!.id, targetType: 'admin_invitation',
+      notes: `Invited ${email} as ${body.role}`,
+      metadata: { email, role: body.role },
+    })
+    res.status(201).json({ success: true, data: { id: row!.id, email, role: body.role, expiresAt } })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/admin/invitations/:id — revoke a live invitation.
+adminRouter.delete('/invitations/:id', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const row = await queryOne<any>(
+      `UPDATE admin_invitations
+          SET status = 'revoked', revoked_at = now(), revoked_by_user_id = $2, updated_at = now()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING id, email`,
+      [req.params.id, req.user!.userId])
+    if (!row) throw new AppError(404, 'That invitation is no longer pending.')
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'admin_invitation_revoked',
+      targetId: row.id, targetType: 'admin_invitation', notes: `Revoked invite for ${row.email}`,
+    })
+    res.json({ success: true, data: { id: row.id } })
+  } catch (e) { next(e) }
+})
+
+// ── ACCEPTING AN ADMIN INVITATION (S631) ─────────────────────────────
+//
+// A SEPARATE, UNAUTHENTICATED router. The invitee has no account yet — that is
+// the whole point — so these two routes cannot live on adminRouter, which is
+// behind requireAuth and an admin-role gate. Mounted at /api/admin-invite.
+//
+// What keeps it safe without a session: the 64-hex token is the only way in, it
+// is single-use, it dies in 72 hours, and it can only ever create the ONE email
+// address the super_admin typed. A stolen link cannot be pointed at a different
+// address, cannot choose its own role, and cannot reach anything before the
+// mandatory 2FA enrolment gate.
+export const adminInviteRouter = Router()
+
+const liveInvite = (token: string) => queryOne<any>(
+  `SELECT id, email, role, expires_at FROM admin_invitations
+    WHERE token = $1 AND status = 'pending' AND expires_at > now()`, [token])
+
+// GET /api/admin-invite/:token — what the accept page shows before anyone types.
+// Returns the invited address and role and nothing else; a probed token that is
+// dead answers exactly as a token that never existed.
+adminInviteRouter.get('/:token', async (req, res, next) => {
+  try {
+    const inv = await liveInvite(req.params.token)
+    if (!inv) throw new AppError(404, 'This invitation has expired or already been used.')
+    res.json({ success: true, data: { email: inv.email, role: inv.role, expiresAt: inv.expires_at } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/admin-invite/:token/accept — create the account.
+adminInviteRouter.post('/:token/accept', async (req, res, next) => {
+  try {
+    const body = z.object({
+      firstName: z.string().trim().min(1).max(80),
+      lastName: z.string().trim().min(1).max(80),
+      password: z.string().min(PASSWORD_MIN_LEN),
+    }).parse(req.body)
+
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      // Re-read INSIDE the transaction and lock it: two people opening the same
+      // link at once must not both get an account.
+      const inv = (await client.query(
+        `SELECT id, email, role FROM admin_invitations
+          WHERE token = $1 AND status = 'pending' AND expires_at > now()
+          FOR UPDATE`, [req.params.token])).rows[0]
+      if (!inv) throw new AppError(404, 'This invitation has expired or already been used.')
+
+      // Re-check the address here too. It was free when the invite was sent;
+      // somebody may have registered it in the days since, and silently handing
+      // that account admin is exactly what the send-time check exists to stop.
+      const taken = (await client.query(
+        `SELECT 1 FROM users WHERE lower(email) = lower($1)`, [inv.email])).rows[0]
+      if (taken) {
+        throw new AppError(409,
+          'An account already exists for this address, so this invitation can no longer be used. ' +
+          'Ask for a new invitation to a different address.')
+      }
+
+      const hash = await bcrypt.hash(body.password, 12)
+      const user = (await client.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name)
+         VALUES (lower($1), $2, $3, $4, $5) RETURNING id, email, role`,
+        [inv.email, hash, inv.role, body.firstName, body.lastName])).rows[0]
+
+      await client.query(
+        `UPDATE admin_invitations
+            SET status = 'accepted', accepted_at = now(), accepted_user_id = $2, updated_at = now()
+          WHERE id = $1`, [inv.id, user.id])
+      await client.query('COMMIT')
+
+      // No session is issued here on purpose. They sign in normally, which runs
+      // them straight into the mandatory 2FA enrolment every admin must pass —
+      // handing back a token would route around the one gate that matters.
+      res.status(201).json({ success: true, data: { email: user.email, role: user.role } })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
   } catch (e) { next(e) }
 })

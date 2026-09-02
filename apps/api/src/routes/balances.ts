@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { query } from '../db'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
@@ -16,7 +17,9 @@ balancesRouter.use(requireAuth)
 // property, so scoped workers don't see them either).
 balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => {
   try {
-    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId ?? req.user!.profileId
+    // S633: every company the account owns. A balances view scoped to one
+    // entity showed half the money owed and looked like the rest was paid.
+    const landlordIds = landlordScopeIds(req.user!)
     const scopedIds = await getScopedPropertyIds(req.user)
     const rows = await query<any>(`
       SELECT
@@ -39,14 +42,79 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
          WHERE status = 'settled' AND invoice_id IS NOT NULL
          GROUP BY invoice_id
       ) pd ON pd.invoice_id = i.id
-      WHERE i.landlord_id = $1
+      WHERE i.landlord_id = ANY($1::uuid[])
         AND i.status IN ('pending', 'partial')
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
       GROUP BY t.id, tu.first_name, tu.last_name, tu.phone, tu.email,
                u.unit_number, pr.id, pr.name
       HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) > 0
       ORDER BY balance DESC
-    `, [landlordId, scopedIds])
+    `, [landlordIds, scopedIds])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/balances/:tenantId/invoices — S634 (Nic, DIRECTIVE).
+ *
+ * "From the landlord page, these outstanding balances need to be clickable so I
+ * can get into the invoice and actually view it. There's no way for me to see
+ * what the breakdown of charges is, and as a landlord, you need to be able to
+ * explain that to a tenant."
+ *
+ * The balances list gave a NUMBER and nothing behind it. A landlord asked
+ * "what's this $217?" by a resident standing at the counter had no way to answer
+ * from the product — which makes the number useless at exactly the moment it
+ * matters. This returns every open invoice for the tenant with its lines, so the
+ * charge can be read out loud.
+ *
+ * Same scope and the same property lock as the list itself: an account's own
+ * companies, and a property-scoped worker sees only their assignments.
+ */
+balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (req, res, next) => {
+  try {
+    const landlordIds = landlordScopeIds(req.user!)
+    const scopedIds = await getScopedPropertyIds(req.user)
+    const invoices = await query<any>(`
+      SELECT i.id, i.invoice_number, i.due_date, i.status,
+             i.subtotal_rent, i.subtotal_fees, i.subtotal_utilities,
+             i.subtotal_deposits, i.subtotal_late_fees,
+             i.work_trade_credit_amount, i.total_amount,
+             COALESCE(pd.paid, 0)                         AS amount_paid,
+             (i.total_amount - COALESCE(pd.paid, 0))      AS balance,
+             u.unit_number, pr.name AS property_name
+        FROM invoices i
+        LEFT JOIN units u       ON u.id  = i.unit_id
+        LEFT JOIN properties pr ON pr.id = u.property_id
+        LEFT JOIN (
+          SELECT invoice_id, SUM(amount) AS paid
+            FROM payments
+           WHERE status = 'settled' AND invoice_id IS NOT NULL
+           GROUP BY invoice_id
+        ) pd ON pd.invoice_id = i.id
+       WHERE i.tenant_id = $1
+         AND i.landlord_id = ANY($2::uuid[])
+         AND i.status IN ('pending', 'partial')
+         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+       ORDER BY i.due_date ASC`,
+      [req.params.tenantId, landlordIds, scopedIds])
+    if (invoices.length === 0) return res.json({ success: true, data: [] })
+
+    // The LINES are the point. `notes` is where the utility reads, the flat-rate
+    // multiplier and the cycle a straggler belongs to are written — that is the
+    // sentence a landlord repeats to the tenant.
+    const lines = await query<any>(`
+      SELECT p.invoice_id, p.id, p.type, p.entry_description, p.amount,
+             p.status, p.due_date, p.notes
+        FROM payments p
+       WHERE p.invoice_id = ANY($1::uuid[])
+       ORDER BY p.due_date ASC, p.type ASC, p.created_at ASC`,
+      [invoices.map((i: any) => i.id)])
+    const byInvoice = new Map<string, any[]>()
+    for (const l of lines) {
+      if (!byInvoice.has(l.invoice_id)) byInvoice.set(l.invoice_id, [])
+      byInvoice.get(l.invoice_id)!.push(l)
+    }
+    res.json({ success: true, data: invoices.map((i: any) => ({ ...i, lines: byInvoice.get(i.id) ?? [] })) })
   } catch (e) { next(e) }
 })

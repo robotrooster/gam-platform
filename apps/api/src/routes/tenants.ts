@@ -14,6 +14,7 @@ import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
 import { applyScreeningWaive } from '../services/onboardingWindow'
+import { landlordScopeIds } from '../lib/landlordScope'
 
 export const tenantsRouter = Router()
 
@@ -38,8 +39,11 @@ export const tenantsRouter = Router()
 // display), deduped.
 tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
   try {
-    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
-    if (!landlordId) throw new AppError(403, 'Forbidden')
+    // S633: every tenant under every company the account owns. This is the
+    // picker five landlord screens read from — scoped to one entity it silently
+    // dropped half the roster, which reads as "that tenant isn't on GAM".
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Forbidden')
     const rows = await query<any>(
       `SELECT DISTINCT ON (t.id)
               t.id, uu.first_name, uu.last_name, uu.email, uu.phone,
@@ -50,9 +54,9 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
          JOIN leases l ON l.id = lt.lease_id
          JOIN units un ON un.id = l.unit_id
          JOIN properties p ON p.id = un.property_id
-        WHERE l.landlord_id = $1
+        WHERE l.landlord_id = ANY($1::uuid[])
         ORDER BY t.id, l.created_at DESC`,
-      [landlordId])
+      [landlordIds])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -314,7 +318,7 @@ tenantsRouter.get('/me/landlord-banking-status', async (req: any, res, next) => 
        WHERE t.id = $1
        ORDER BY (vlat.role = 'primary') DESC
        LIMIT 1
-    `, [req.user!.profileId])
+    `, [req.user!.profileId!])
 
     // No active lease → unable to pay anyway, but report ready=false so
     // the UI shows the same blocked state.
@@ -329,7 +333,7 @@ tenantsRouter.get('/me/landlord-banking-status', async (req: any, res, next) => 
 // existing log table that captures every send (success and failure).
 tenantsRouter.post('/me/nudge-landlord-banking', async (req: any, res, next) => {
   try {
-    const tenantId = req.user!.profileId
+    const tenantId = req.user!.profileId!
 
     const recent = await queryOne<{ id: string }>(`
       SELECT id FROM email_send_log
@@ -484,7 +488,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
       ) sa ON TRUE
       LEFT JOIN units sau      ON sau.id = sa.unit_id
       LEFT JOIN properties sap ON sap.id = sau.property_id
-      WHERE t.id = $1`, [req.user!.profileId])
+      WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })
   } catch (e) { next(e) }
@@ -500,7 +504,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
 tenantsRouter.get('/lease-notices', requireAuth, async (req, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
-    const tenantId = req.user!.profileId
+    const tenantId = req.user!.profileId!
     const rows = await query<any>(
       `SELECT ln.id, ln.title, ln.body,
               to_char(ln.effective_date, 'YYYY-MM-DD') AS effective_date,
@@ -528,7 +532,7 @@ tenantsRouter.get('/lease-notices', requireAuth, async (req, res, next) => {
 tenantsRouter.post('/lease-notices/:id/acknowledge', requireAuth, async (req, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
-    const tenantId = req.user!.profileId
+    const tenantId = req.user!.profileId!
     const r = await query<{ id: string }>(
       `UPDATE lease_notices
           SET status = 'acknowledged',
@@ -551,7 +555,7 @@ tenantsRouter.post('/lease-notices/:id/acknowledge', requireAuth, async (req, re
 tenantsRouter.get('/me/payment-health', async (req, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
-    const tenantId = req.user!.profileId
+    const tenantId = req.user!.profileId!
     const s = await queryOne<any>(`
       SELECT
         COUNT(*) AS total_payments,
@@ -559,7 +563,7 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'failed')  AS failed,
         COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) AS total_paid,
         MIN(due_date) AS first_payment
-      FROM payments WHERE tenant_id = $1`, [req.user!.profileId])
+      FROM payments WHERE tenant_id = $1`, [req.user!.profileId!])
     const total = parseInt(s?.total_payments || 0)
     const settled = parseInt(s?.settled || 0)
     const firstPayment = s?.first_payment ? new Date(s.first_payment) : null
@@ -649,7 +653,7 @@ tenantsRouter.get('/me/move-in-gate', async (req, res, next) => {
        WHERE vlat.tenant_id = $1
          AND i.status <> 'cancelled'
        ORDER BY i.created_at DESC
-       LIMIT 1`, [req.user!.profileId])
+       LIMIT 1`, [req.user!.profileId!])
 
     if (!row) { res.json({ success: true, data: { gated: false, hasMoveIn: false } }); return }
 
@@ -689,7 +693,7 @@ tenantsRouter.get('/me/move-in-gate', async (req, res, next) => {
 // principal but no interest line.
 tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
   try {
-    const tenantId = req.user!.profileId
+    const tenantId = req.user!.profileId!
 
     const deposit = await queryOne<{
       id:                 string
@@ -804,7 +808,7 @@ tenantsRouter.post('/verify-ach', async (req, res, next) => {
         END AS deposit_fully_funded
       FROM tenants t
       LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
-      WHERE t.id = $1`, [req.user!.profileId])
+      WHERE t.id = $1`, [req.user!.profileId!])
 
     const qualifies = row?.deposit_fully_funded === true
 
@@ -813,7 +817,7 @@ tenantsRouter.post('/verify-ach', async (req, res, next) => {
          SET ach_verified = TRUE,
              bank_last4   = $1
        WHERE id = $2`,
-      [last4, req.user!.profileId])
+      [last4, req.user!.profileId!])
 
     res.json({
       success: true,
@@ -841,7 +845,7 @@ tenantsRouter.get('/flexcharge', async (req, res, next) => {
   try {
     const { isFlexChargeVisible, getFlexChargeAccountsForTenant } = await import('../services/flexCharge')
     if (!await isFlexChargeVisible()) return res.json({ success: true, data: { visible: false } })
-    const accounts = await getFlexChargeAccountsForTenant(req.user!.profileId)
+    const accounts = await getFlexChargeAccountsForTenant(req.user!.profileId!)
     res.json({ success: true, data: { visible: true, accounts } })
   } catch (e) { next(e) }
 })
@@ -861,7 +865,7 @@ tenantsRouter.post('/flexcharge/dispute/:txId', async (req, res, next) => {
     const { disputeFlexChargeTransaction } = await import('../services/flexCharge')
     const out = await disputeFlexChargeTransaction({
       transactionId:    req.params.txId,
-      disputerTenantId: req.user!.profileId,
+      disputerTenantId: req.user!.profileId!,
       reason:           String(reason),
     })
     res.json({ success: true, data: out })
@@ -878,7 +882,7 @@ tenantsRouter.post('/flexcharge/:accountId/pay', async (req, res, next) => {
     const { payDownFlexCharge } = await import('../services/flexCharge')
     const out = await payDownFlexCharge({
       accountId: req.params.accountId,
-      tenantId:  req.user!.profileId,
+      tenantId:  req.user!.profileId!,
       amount,
     })
     res.json({ success: true, data: out })
@@ -902,7 +906,7 @@ tenantsRouter.get('/questionnaires', async (req: any, res, next) => {
          FROM tenant_questionnaires
         WHERE tenant_id = $1 AND status = 'pending'
         ORDER BY created_at ASC`,
-      [req.user!.profileId])
+      [req.user!.profileId!])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -918,7 +922,7 @@ tenantsRouter.post('/questionnaires/:id/answer', async (req: any, res, next) => 
     }).parse(req.body)
     const { answerQuestionnaire } = await import('../services/tenantQuestionnaires')
     const out = await answerQuestionnaire({
-      tenantId: req.user!.profileId,
+      tenantId: req.user!.profileId!,
       questionnaireId: req.params.id,
       answers: body,
     })
@@ -931,7 +935,7 @@ tenantsRouter.post('/questionnaires/:id/dismiss', async (req: any, res, next) =>
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
     const { dismissQuestionnaire } = await import('../services/tenantQuestionnaires')
-    const ok = await dismissQuestionnaire(req.user!.profileId, req.params.id)
+    const ok = await dismissQuestionnaire(req.user!.profileId!, req.params.id)
     if (!ok) throw new AppError(404, 'Questionnaire not found or already completed')
     res.json({ success: true, data: { dismissed: true } })
   } catch (e) { next(e) }
@@ -975,7 +979,7 @@ tenantsRouter.post('/flexpay/inquiry/proof', flexpayProofUpload.single('file'), 
     if (!req.file) throw new AppError(400, 'No file')
     const inq = await queryOne<{ id: string; status: string; proof_file_path: string | null }>(
       `SELECT id, status, proof_file_path FROM flexpay_inquiries WHERE tenant_id = $1`,
-      [req.user!.profileId])
+      [req.user!.profileId!])
     if (!inq) throw new AppError(409, 'No FlexPay request on file — tap "I’m interested" first')
     if (inq.status !== 'pending') throw new AppError(409, 'Your request has already been reviewed')
     // Replace semantics: one active document; unlink the old one.
@@ -1012,7 +1016,7 @@ tenantsRouter.get('/flexpay/inquiry/proof-file', async (req: any, res, next) => 
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
     const inq = await queryOne<{ proof_file_path: string | null }>(
       `SELECT proof_file_path FROM flexpay_inquiries WHERE tenant_id = $1`,
-      [req.user!.profileId])
+      [req.user!.profileId!])
     if (!inq?.proof_file_path) throw new AppError(404, 'No proof on file')
     const fp = path.join(flexpayProofDir, path.basename(inq.proof_file_path))
     if (!fs.existsSync(fp)) throw new AppError(404, 'File missing')
@@ -1053,9 +1057,9 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
               flexpay_enrolled_at, flexpay_disqualified_until,
               flexpay_disqualified_reason
          FROM tenants WHERE id = $1`,
-      [req.user!.profileId],
+      [req.user!.profileId!],
     )
-    const eligibility = await getFlexPayEligibility(req.user!.profileId)
+    const eligibility = await getFlexPayEligibility(req.user!.profileId!)
 
     // S541: demand-test gate — the tenant's inquiry disposition drives
     // the card state (inquire → pending → approved-can-enroll / declined).
@@ -1063,7 +1067,7 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
       `SELECT id, status, claimed_income_source, created_at, reviewed_at,
               proof_original_name, proof_uploaded_at
          FROM flexpay_inquiries WHERE tenant_id = $1`,
-      [req.user!.profileId],
+      [req.user!.profileId!],
     )
 
     // S542c (Nic): tenants NEVER see a queue number — no promises.
@@ -1082,7 +1086,7 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
           WHERE lt.tenant_id = $1 AND lt.status = 'active'
             AND l.status IN ('active', 'pending')
           LIMIT 1`,
-        [req.user!.profileId])
+        [req.user!.profileId!])
       stateHold = !!hold
     }
 
@@ -1133,7 +1137,7 @@ tenantsRouter.post('/flexpay/inquiry', async (req, res, next) => {
 
     const existing = await queryOne<{ status: string }>(
       `SELECT status FROM flexpay_inquiries WHERE tenant_id = $1`,
-      [req.user!.profileId],
+      [req.user!.profileId!],
     )
     if (existing) throw new AppError(409, 'You already have a FlexPay request on file')
 
@@ -1141,7 +1145,7 @@ tenantsRouter.post('/flexpay/inquiry', async (req, res, next) => {
       `INSERT INTO flexpay_inquiries (tenant_id, claimed_income_source, desired_pull_day, benefit_schedule, tenant_note)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id, status, claimed_income_source, created_at`,
-      [req.user!.profileId, body.incomeSource, derivedDay, body.benefitSchedule ?? null, body.note ?? null],
+      [req.user!.profileId!, body.incomeSource, derivedDay, body.benefitSchedule ?? null, body.note ?? null],
     )
 
     // S545c: silent birthdate-consistency check — may place a
@@ -1154,8 +1158,8 @@ tenantsRouter.post('/flexpay/inquiry', async (req, res, next) => {
       severity: 'info',
       category: 'flexpay_inquiry',
       title: 'New FlexPay interest request',
-      body: `Tenant ${req.user!.profileId} requested FlexPay (claims ${body.incomeSource.toUpperCase()}). Review in Admin → FlexPay Requests.`,
-      context: { tenant_id: req.user!.profileId, inquiry_id: row.id },
+      body: `Tenant ${req.user!.profileId!} requested FlexPay (claims ${body.incomeSource.toUpperCase()}). Review in Admin → FlexPay Requests.`,
+      context: { tenant_id: req.user!.profileId!, inquiry_id: row.id },
     })
 
     res.json({ success: true, data: row })
@@ -1172,7 +1176,7 @@ tenantsRouter.post('/flexpay/enroll', async (req, res, next) => {
     const pullDay = Number(req.body?.pullDay)
     const acceptedTerms = req.body?.acceptedTerms === true
     const out = await enrollFlexPay({
-      tenantId:      req.user!.profileId,
+      tenantId:      req.user!.profileId!,
       userId:        req.user!.userId,
       pullDay,
       acceptedTerms,
@@ -1190,7 +1194,7 @@ tenantsRouter.post('/flexpay/enroll', async (req, res, next) => {
 tenantsRouter.patch('/flexpay/pull-day', async (req, res, next) => {
   try {
     const { changeFlexPayPullDay } = await import('../services/flexpay')
-    const out = await changeFlexPayPullDay(req.user!.profileId, Number(req.body?.pullDay))
+    const out = await changeFlexPayPullDay(req.user!.profileId!, Number(req.body?.pullDay))
     if (!out.ok) return res.status(400).json({ success: false, error: out.reason })
     res.json({ success: true, data: { pullDay: out.pullDay, fee: out.fee, effective: out.effective } })
   } catch (e) { next(e) }
@@ -1211,7 +1215,7 @@ tenantsRouter.get('/flexpay/terms', async (req, res, next) => {
     }
     const fee = calculateFlexPayFee(pullDay)
     const { renderedText } = await renderFlexPayAcceptanceText({
-      tenantId:  req.user!.profileId,
+      tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
       pullDay,
       fee,
@@ -1239,7 +1243,7 @@ tenantsRouter.get('/flexsuite/re-acceptance-status', async (req, res, next) => {
   try {
     const { getPendingReAcceptances } =
       await import('../services/flexsuiteAcceptance')
-    const pending = await getPendingReAcceptances(req.user!.profileId)
+    const pending = await getPendingReAcceptances(req.user!.profileId!)
     res.json({ success: true, data: { pending } })
   } catch (e) { next(e) }
 })
@@ -1257,7 +1261,7 @@ tenantsRouter.get('/flexsuite/re-acceptance-preview', async (req, res, next) => 
       throw new AppError(400, 'product must be flexpay or flexdeposit')
     }
     const { renderedText } = await renderReAcceptanceTerms({
-      tenantId:  req.user!.profileId,
+      tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
       product,
       ip:        null,
@@ -1289,7 +1293,7 @@ tenantsRouter.post('/flexsuite/re-accept', async (req, res, next) => {
     const { commitReAcceptance } =
       await import('../services/flexsuiteAcceptance')
     const acceptanceId = await commitReAcceptance({
-      tenantId:  req.user!.profileId,
+      tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
       product,
       ip:        req.ip ?? null,
@@ -1303,7 +1307,7 @@ tenantsRouter.post('/flexsuite/re-accept', async (req, res, next) => {
 tenantsRouter.delete('/flexpay', async (req, res, next) => {
   try {
     const { cancelFlexPay } = await import('../services/flexpay')
-    await cancelFlexPay(req.user!.profileId)
+    await cancelFlexPay(req.user!.profileId!)
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -1324,7 +1328,7 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
     const visible = await isFlexDepositVisible()
     if (!visible) return res.json({ success: true, data: { visible: false } })
 
-    const eligibility = await getFlexDepositEligibility(req.user!.profileId)
+    const eligibility = await getFlexDepositEligibility(req.user!.profileId!)
 
     // Active plan view: any installments rows belonging to this tenant.
     const plan = await query<any>(
@@ -1334,7 +1338,7 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
          FROM flex_deposit_installments i
         WHERE i.tenant_id = $1
         ORDER BY i.installment_number ASC`,
-      [req.user!.profileId],
+      [req.user!.profileId!],
     )
 
     // S514: deposit-row context for the LeasePage. Returns the most recently
@@ -1362,7 +1366,7 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
           AND sd.flex_deposit_enabled = TRUE
         ORDER BY sd.created_at DESC
         LIMIT 1`,
-      [req.user!.profileId],
+      [req.user!.profileId!],
     )
 
     res.json({ success: true, data: { visible: true, eligibility, plan, deposit } })
@@ -1377,7 +1381,7 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
 tenantsRouter.post('/flexdeposit/pay-ahead', async (req, res, next) => {
   try {
     const { payAheadFlexDeposit } = await import('../services/flexDeposit')
-    const out = await payAheadFlexDeposit({ tenantId: req.user!.profileId })
+    const out = await payAheadFlexDeposit({ tenantId: req.user!.profileId! })
     if (!out.ok) return res.status(400).json({ success: false, error: out.reason })
     res.json({ success: true, data: out })
   } catch (e) { next(e) }
@@ -1397,7 +1401,7 @@ tenantsRouter.post('/flexdeposit/enroll', async (req, res, next) => {
     const acceptedTerms =
       req.body?.acceptedTerms === true || req.body?.acknowledgedTos === true
     const out = await enrollFlexDeposit({
-      tenantId:         req.user!.profileId,
+      tenantId:         req.user!.profileId!,
       userId:           req.user!.userId,
       installmentCount,
       acceptedTerms,
@@ -1424,12 +1428,12 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
       throw new AppError(400, 'installmentCount must be an integer 2..6')
     }
     const preview = await previewFlexDepositSchedule({
-      tenantId: req.user!.profileId,
+      tenantId: req.user!.profileId!,
       installmentCount,
     })
     if (!preview.ok) throw new AppError(400, preview.reason)
     const { renderedText } = await renderFlexDepositAcceptanceText({
-      tenantId:               req.user!.profileId,
+      tenantId:               req.user!.profileId!,
       userId:                 req.user!.userId,
       depositId:              preview.depositId,
       installmentCount,
@@ -1466,7 +1470,7 @@ tenantsRouter.get('/me/deposit/portability/eligibility', async (req, res, next) 
     const { detectPortabilityEligible } = await import('../services/depositPortability')
     const result = await detectPortabilityEligible({
       leaseId,
-      tenantId: req.user!.profileId,
+      tenantId: req.user!.profileId!,
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
@@ -1482,7 +1486,7 @@ tenantsRouter.post('/me/deposit/portability/authorize', async (req, res, next) =
     }
     const { authorizeDepositPortability } = await import('../services/depositPortability')
     const out = await authorizeDepositPortability({
-      tenantId:      req.user!.profileId,
+      tenantId:      req.user!.profileId!,
       depositId,
       targetLeaseId,
       signature,
@@ -1499,7 +1503,7 @@ tenantsRouter.post('/me/deposit/portability/decline', async (req, res, next) => 
     if (!depositId) throw new AppError(400, 'depositId required')
     const { declineDepositPortability } = await import('../services/depositPortability')
     await declineDepositPortability({
-      tenantId:  req.user!.profileId,
+      tenantId:  req.user!.profileId!,
       depositId,
     })
     res.json({ success: true })
@@ -1510,7 +1514,7 @@ tenantsRouter.post('/me/deposit/portability/decline', async (req, res, next) => 
 tenantsRouter.delete('/flexdeposit', async (req, res, next) => {
   try {
     const { cancelFlexDeposit } = await import('../services/flexDeposit')
-    const out = await cancelFlexDeposit(req.user!.profileId)
+    const out = await cancelFlexDeposit(req.user!.profileId!)
     if (!out.ok) return res.status(400).json({ success: false, error: out.reason })
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -1527,7 +1531,7 @@ tenantsRouter.post('/enroll-credit-reporting', async (req, res, next) => {
     if (!await isFeatureEnabled('flexcredit_rollout_visible')) {
       return res.json({ success: true, data: { visible: false } })
     }
-    await query(`UPDATE tenants SET credit_reporting_enrolled=TRUE WHERE id=$1`, [req.user!.profileId])
+    await query(`UPDATE tenants SET credit_reporting_enrolled=TRUE WHERE id=$1`, [req.user!.profileId!])
     res.json({ success: true, message: 'Credit reporting enrolled — $5/month reported to all 3 bureaus' })
   } catch (e) { next(e) }
 })
@@ -1545,7 +1549,7 @@ tenantsRouter.get('/flexcredit/inquiry', async (req, res, next) => {
     const visible = await isFeatureEnabled('flexcredit_rollout_visible')
     const inq = await queryOne<{ status: string; created_at: string }>(
       `SELECT status, created_at FROM flexcredit_inquiries WHERE tenant_id = $1`,
-      [req.user!.profileId]
+      [req.user!.profileId!]
     )
     res.json({ success: true, data: { visible, interested: !!inq, status: inq?.status ?? null } })
   } catch (e) { next(e) }
@@ -1563,7 +1567,7 @@ tenantsRouter.post('/flexcredit/inquiry', async (req, res, next) => {
       `INSERT INTO flexcredit_inquiries (tenant_id, status)
        VALUES ($1, 'interested')
        ON CONFLICT (tenant_id) DO UPDATE SET updated_at = NOW()`,
-      [req.user!.profileId]
+      [req.user!.profileId!]
     )
     res.json({ success: true, data: { visible: true, inquiryFiled: true } })
   } catch (e) { next(e) }
@@ -1577,7 +1581,7 @@ tenantsRouter.get('/payments', async (req, res, next) => {
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE p.tenant_id = $1
-      ORDER BY p.due_date DESC LIMIT 24`, [req.user!.profileId])
+      ORDER BY p.due_date DESC LIMIT 24`, [req.user!.profileId!])
     res.json({ success: true, data: payments })
   } catch (e) { next(e) }
 })
@@ -1840,7 +1844,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
 
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
-    const isSelf = role === 'tenant' && req.user!.profileId === req.params.id
+    const isSelf = role === 'tenant' && req.user!.profileId! === req.params.id
     if (!isAdmin && !isSelf) {
       // Find any landlord this tenant has a lease relationship with, then
       // check if the calling user has access to that landlord's resources.
@@ -1975,7 +1979,7 @@ tenantsRouter.get('/:id/available-units', requirePerm('tenants.archive'), async 
           WHERE l.unit_id = u.id AND l.status IN ('active', 'pending')
         )
       ORDER BY p.name, u.unit_number`,
-      [req.user!.profileId])
+      [req.user!.profileId!])
     res.json({ success: true, data: units })
   } catch (e) { next(e) }
 })
@@ -2024,9 +2028,9 @@ tenantsRouter.patch('/profile', requireAuth, async (req, res, next) => {
       await query('UPDATE users SET phone=COALESCE($1,phone) WHERE id=$2',
         [phone||null, req.user!.userId])
     }
-    if (req.user!.profileId) {
+    if (req.user!.profileId!) {
       await query('UPDATE tenants SET bio=$1, theme_accent=$2, font_style=$3 WHERE id=$4',
-        [bio||null, themeAccent||null, fontStyle||null, req.user!.profileId])
+        [bio||null, themeAccent||null, fontStyle||null, req.user!.profileId!])
     }
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -2063,7 +2067,7 @@ tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (r
   try {
     if (!req.file) throw new AppError(400, 'No file')
     const url = '/api/tenants/avatar-files/' + req.file.filename
-    if (req.user!.profileId) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId])
+    if (req.user!.profileId!) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId!])
     res.json({ success: true, data: { url } })
   } catch(e) { next(e) }
 })

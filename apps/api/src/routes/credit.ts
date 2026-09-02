@@ -4,6 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { requireLendingService } from '../middleware/requireLendingService'
 import { AppError } from '../middleware/errorHandler'
+import { resolveLandlordTarget, landlordScopeIds, ownsLandlord } from '../lib/landlordScope'
 import {
   appendEvent,
   findSubjectId,
@@ -51,6 +52,30 @@ import { logger } from '../lib/logger'
 // ============================================================
 
 export const creditRouter = Router()
+
+/**
+ * S633 — WHOSE CREDIT RECORD IS THIS?
+ *
+ * For a tenant, the answer is their own tenant row and always has been.
+ *
+ * For a landlord it is an ENTITY's record, not the account's. Rental
+ * reputation attaches to the company that did the renting — that is the whole
+ * point of it surviving a sale, and Nic's framing exactly: "People buy and sell
+ * entities all the time." An account that owns two companies therefore has two
+ * credit records, and must say which one it means rather than have the session
+ * pick.
+ *
+ * Replaces `u.profileId`, which for a landlord named whichever entity the
+ * session sat on — so the record shown was one of two, arbitrarily, with
+ * nothing on screen saying so.
+ */
+function subjectRefId(u: any, explicit?: unknown): string {
+  if (u.role === 'landlord') {
+    return resolveLandlordTarget(u, typeof explicit === 'string' ? explicit : undefined, 'credit record')
+  }
+  return u.profileId
+}
+
 
 creditRouter.use(requireAuth)
 
@@ -100,24 +125,29 @@ async function canViewSubject(
   if (selector.subject_type === 'tenant' && u.role === 'tenant' && u.profileId === selector.subject_ref_id) {
     return ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network']
   }
-  if (selector.subject_type === 'landlord' && u.role === 'landlord' && u.profileId === selector.subject_ref_id) {
+  // S633: a landlord viewing their OWN company's record — any company the
+  // account owns is "their own", which is the point of the account/entity split.
+  if (selector.subject_type === 'landlord' && u.role === 'landlord' && ownsLandlord(u, selector.subject_ref_id)) {
     return ['private_to_subject', 'visible_to_current_landlord', 'visible_to_gam_network']
   }
 
   // Active relationship between landlord requester and tenant subject.
   if (selector.subject_type === 'tenant' && (u.role === 'landlord' || u.role === 'property_manager' || u.role === 'onsite_manager')) {
-    const landlordId = u.role === 'landlord' ? u.profileId : u.landlordId
-    if (!landlordId) return []
+    // S633: a landlord's relationship to a tenant holds if the tenant is on a
+    // lease at ANY company the account owns — the account is the relationship,
+    // not one of its companies. Team roles keep their single landlordId.
+    const landlordIds = landlordScopeIds(u)
+    if (!landlordIds.length) return []
     const rel = await queryOne(
       `SELECT 1
          FROM lease_tenants lt
          JOIN leases l   ON l.id = lt.lease_id
         WHERE lt.tenant_id = $1
-          AND l.landlord_id = $2
+          AND l.landlord_id = ANY($2::uuid[])
           AND lt.status = 'active'
           AND l.status IN ('active','pending')
         LIMIT 1`,
-      [selector.subject_ref_id, landlordId],
+      [selector.subject_ref_id, landlordIds],
     )
     if (rel) {
       return ['visible_to_current_landlord', 'visible_to_gam_network']
@@ -161,7 +191,7 @@ creditRouter.get('/subject/own', async (req, res, next) => {
     if (!subjectType) {
       throw new AppError(400, 'No subject mapping for this role; query by /subject/:id instead')
     }
-    const sid = await findSubjectId(subjectType, u.profileId)
+    const sid = await findSubjectId(subjectType, subjectRefId(u, req.query.landlordId))
     if (!sid) return res.json({ success: true, data: { subject_id: null, events: [] } })
     const events = await getSubjectChain(sid)
     res.json({
@@ -359,18 +389,26 @@ creditRouter.post('/attest', async (req, res, next) => {
     }
 
     // Confirm active relationship
-    const landlordId = u.role === 'landlord' ? u.profileId : u.landlordId
-    if (!landlordId) throw new AppError(403, 'No landlord relationship')
-    const rel = await queryOne(
-      `SELECT 1
+    // S633: a landlord's relationship to a tenant holds if the tenant is on a
+    // lease at ANY company the account owns — the account is the relationship,
+    // not one of its companies. Team roles keep their single landlordId.
+    const landlordIds = landlordScopeIds(u)
+    if (!landlordIds.length) throw new AppError(403, 'No landlord relationship')
+    // Returns WHICH company holds the lease, not just whether one does — an
+    // attestation is stamped with the attesting landlord id, and that has to be
+    // the company the tenancy is actually under, never an arbitrary one from
+    // the account's set.
+    const rel = await queryOne<{ landlord_id: string }>(
+      `SELECT l.landlord_id
          FROM lease_tenants lt
          JOIN leases l ON l.id = lt.lease_id
         WHERE lt.tenant_id = $1
-          AND l.landlord_id = $2
+          AND l.landlord_id = ANY($2::uuid[])
           AND lt.status IN ('active','removed')
           AND l.status IN ('active','pending','expired')
+        ORDER BY l.status = 'active' DESC, l.start_date DESC
         LIMIT 1`,
-      [body.tenantId, landlordId],
+      [body.tenantId, landlordIds],
     )
     if (!rel) throw new AppError(403, 'No tenancy relationship between you and this tenant')
 
@@ -392,7 +430,7 @@ creditRouter.post('/attest', async (req, res, next) => {
         // stats / score computation downstream. camelize interceptor
         // treats event_data as passthrough.
         attested_by_user_id: u.userId,
-        attested_by_landlord_id: landlordId,
+        attested_by_landlord_id: rel!.landlord_id,
         notes: body.notes ?? null,
         violation_type: body.violationType ?? null,
         ...body.evidence,
@@ -421,7 +459,7 @@ creditRouter.get('/disputes/mine', async (req, res, next) => {
       throw new AppError(403, 'Only tenants and landlords have disputes in v1')
     }
     const subjectType = u.role === 'tenant' ? 'tenant' : 'landlord'
-    const subjectId = await findSubjectId(subjectType, u.profileId)
+    const subjectId = await findSubjectId(subjectType, subjectRefId(u, req.query.landlordId))
     if (!subjectId) return res.json({ success: true, data: [] })
 
     const rows = await query<any>(
@@ -566,13 +604,13 @@ creditRouter.post('/dispute', async (req, res, next) => {
       throw new AppError(403, 'Only tenants and landlords can open disputes in v1')
     }
     const subjectType = u.role === 'tenant' ? 'tenant' : 'landlord'
-    const subjectId = await findSubjectId(subjectType, u.profileId)
+    const subjectId = await findSubjectId(subjectType, subjectRefId(u, req.body?.landlordId))
     if (!subjectId) throw new AppError(400, 'No credit subject for this user yet')
 
     const result = await openDispute({
       disputingSubjectId: subjectId,
       disputingSubjectType: subjectType,
-      disputingSubjectRefId: u.profileId,
+      disputingSubjectRefId: subjectRefId(u, req.body?.landlordId),
       disputedEventId: body.disputedEventId,
       reason: body.reason,
       notes: body.notes,
@@ -619,7 +657,7 @@ creditRouter.post('/dispute/:id/evidence', async (req, res, next) => {
     const result = await submitDisputeEvidence({
       disputeId: req.params.id,
       disputingSubjectType: subjectType,
-      disputingSubjectRefId: u.profileId,
+      disputingSubjectRefId: subjectRefId(u, req.body?.landlordId),
       evidence: body.evidence,
     })
     res.json({ success: true, data: result })
@@ -747,12 +785,12 @@ creditRouter.post('/hardship-context', async (req, res, next) => {
     if (u.role !== 'tenant') {
       throw new AppError(403, 'Hardship context is tenant-only')
     }
-    const subjectId = await findSubjectId('tenant', u.profileId)
+    const subjectId = await findSubjectId('tenant', u.profileId!)
     if (!subjectId) throw new AppError(400, 'No credit subject yet — submit any ledger event first')
 
     const event = await appendEvent({
       subjectType: 'tenant',
-      subjectRefId: u.profileId,
+      subjectRefId: u.profileId!,
       eventType: 'hardship_context_added',
       eventData: {
         // event_data JSONB content keys stay snake_case (passthrough).

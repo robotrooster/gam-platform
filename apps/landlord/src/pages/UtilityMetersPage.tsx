@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, CSSProperties } from 'react'
+import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
@@ -103,6 +103,15 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
     { enabled: !!propertyId && canRead }
   )
   const openRun = (runs as any[]).find(r => r.status === 'open' || r.status === 'double_check')
+  // S632: meters that can never bill until somebody sets their starting odometer.
+  const [openingReads, setOpeningReads] = useState(false)
+  const needsOpening = (() => {
+    const missing = (meters as any[]).filter((m: any) => m.hasBaseline === false)
+    const byType = new Map<string, number>()
+    for (const m of missing) byType.set(m.utilityType, (byType.get(m.utilityType) ?? 0) + 1)
+    const worst = [...byType.entries()].sort((a, b) => b[1] - a[1])[0]
+    return { count: missing.length, type: worst?.[0] ?? null }
+  })()
 
   const [walkRun, setWalkRun] = useState<any | null>(null)
   const [reviewReading, setReviewReading] = useState<any | null>(null)
@@ -114,6 +123,15 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
     qc.invalidateQueries(['reading-runs', propertyId])
     qc.invalidateQueries(['flagged-readings', propertyId])
     qc.invalidateQueries(['reads-due', propertyId])
+    // S632 (Nic): "When I clicked save, the page looked like it refreshed, but
+    // then everything was blank again... when I navigated away and came back
+    // they are showing as checked."
+    //
+    // units.has_propane_tank is what the tank picker reads, and this list was
+    // never refetched. Saving cleared the card's local selection and fell back
+    // to a stale units array — so the ticks vanished, the save looked lost, and
+    // it was tempting to save again. The write had worked every time.
+    qc.invalidateQueries(['units-for-property', propertyId])
   }
 
   const openRunMut = useMutation(
@@ -159,6 +177,42 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
         </div>
       ) : (
         <>
+          {/* ── OPENING READS COME FIRST (S632) ──────────────
+              Nic: "I don't see my onboarding opening reads. I see the banner at
+              the top, zero out of fifty three meters read for the end of August,
+              but I don't see the onboarding reads... it's not showing anything
+              on a to-do list."
+              He was looking at a gold banner urging him to walk 53 meters that
+              could not produce a single bill. Usage is this read minus the last
+              one; with no opening read there is no last one, so the engine
+              records the walk and bills NOTHING — silently. Oak Park never hit
+              this because its meters were created one at a time with an opening
+              read in the form. Mountain View's 53 were created by the water/
+              electric tick-box on Add Unit, which sets no baseline at all.
+              So this sits ABOVE the run, in red, and says what to do first. */}
+          {needsOpening.count > 0 && (
+            <div className="card" style={{ marginBottom:16, display:'flex', alignItems:'center', gap:16,
+              borderColor:'var(--red)', flexWrap:'wrap' }}>
+              <AlertTriangle size={26} style={{ color:'var(--red)', flexShrink:0 }}/>
+              <div style={{ flex:1, minWidth:220 }}>
+                <div style={{ fontWeight:700 }}>
+                  {needsOpening.count} meter{needsOpening.count === 1 ? '' : 's'} still need an opening read
+                </div>
+                <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:2 }}>
+                  Do these before the monthly walk. Usage is measured from the opening read — until one
+                  exists a meter bills <strong style={{ color:'var(--text-1)' }}>nothing</strong>, and it
+                  does it quietly.
+                </div>
+              </div>
+              {/* S632: straight into the one-date form. Sending him to the
+                  utility panel to click 53 individual controls was the problem,
+                  not the route to the solution. */}
+              <button className="btn btn-primary" onClick={()=>setOpeningReads(true)}>
+                Set opening reads <ChevronRight size={14}/>
+              </button>
+            </div>
+          )}
+
           {/* ── READING RUN ────────────────────────────────── */}
           {openRun ? (
             <div className="card" style={{ marginBottom:24, display:'flex', alignItems:'center', gap:16, borderColor:'var(--gold)', flexWrap:'wrap' }}>
@@ -170,7 +224,9 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                 <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:2 }}>
                   {openRun.status === 'double_check'
                     ? `${openRun.dcDone} of ${openRun.dcTotal} re-checks entered. Units with reads already bill on their invoice date — re-checks just verify them.`
-                    : `${openRun.metersRead} of ${openRun.metersTotal} meters read. Each unit bills on its tenant's next invoice as soon as its meters are read — an unread meter holds only that unit's invoice.`}
+                    : needsOpening.count > 0
+                      ? `${openRun.metersRead} of ${openRun.metersTotal} meters read — but ${needsOpening.count} have no opening read yet, so those will record a number and bill nothing. Set those first.`
+                      : `${openRun.metersRead} of ${openRun.metersTotal} meters read. Each unit bills on its tenant's next invoice as soon as its meters are read — an unread meter holds only that unit's invoice.`}
                 </div>
               </div>
               <button className="btn btn-primary" onClick={()=>setWalkRun(openRun)}>
@@ -260,7 +316,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                 <h2 style={{ fontSize:'.95rem', margin:'0 0 12px' }}>Neighbor utilities</h2>
                 <ServicedSpacesCard propertyId={propertyId} onChanged={invalidate} />
               </div>
-              <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
+              <div id="meter-config">
+                <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]}
+                  onChanged={invalidate} />
+              </div>
             </>
           )}
 
@@ -304,6 +363,11 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           {/* ── UTILITY TAX RATES ──────────────────────────── */}
           <TaxRatesCard propertyId={propertyId} />
         </>
+      )}
+
+      {openingReads && (
+        <OpeningReadsModal propertyId={propertyId} meters={meters as any[]}
+          onClose={()=>setOpeningReads(false)} onSaved={invalidate} />
       )}
 
       {walkRun && (
@@ -472,6 +536,7 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
 // advances. When the last meter is read the backend completes the run
 // and bills land on the tenants' next monthly invoices.
 function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 'verify'; onClose: () => void }) {
+  const qc = useQueryClient()
   const { data: meters = [], isLoading } = useQuery<any[]>(
     ['run-meters', run.id, mode],
     () => apiGet(mode === 'verify'
@@ -486,11 +551,23 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
   const [summary, setSummary] = useState<any | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  // Group the payload into steps: one per unit (its unread meters,
-  // ordered by utility), multi-unit/unassigned meters (RUBS masters)
-  // as their own property-level steps at the end. Built once per open —
-  // already-read meters are excluded so a resumed walk continues where
-  // it stopped.
+  // S631 (Nic, DIRECTIVE): "It's a shared workflow process... anybody that has
+  // access can jump on and complete some or all of it... they can be done really
+  // in any order. Nothing hinges on something else being done first... so
+  // anybody could do any portion of the flow, and there's no blocking order and
+  // no assigning. It's whoever jumps on and does what."
+  //
+  // Every meter is a step, DONE ONES INCLUDED. They used to be filtered out,
+  // which made this a one-person queue: it always resumed at the next unread
+  // meter and only moved forward, so somebody who came to enter the two water
+  // masters had to click past twenty-seven submeters to reach them, and could
+  // never see what a partner had already finished.
+  //
+  // Nothing here waits on anything else. That is not a new rule — S534 already
+  // bills each unit from its own reads (ensureBillsForUnit on the lease's due
+  // date), so a mobile home's water submeter bills that home whether or not the
+  // master bill has arrived. The run is a checklist for people, never a gate on
+  // money, and this list is what makes that visible.
   const steps = useMemo(() => {
     const byMeter = new Map<string, any>()
     for (const m of meters as any[]) {
@@ -500,7 +577,6 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
     const unitSteps = new Map<string, { title: string; meters: any[] }>()
     const propertySteps: { title: string; meters: any[] }[] = []
     for (const m of byMeter.values()) {
-      if (m.isRead) continue
       if (m.unitNumbers.length === 1) {
         const key = m.unitNumbers[0]
         if (!unitSteps.has(key)) unitSteps.set(key, { title: key, meters: [] })
@@ -514,24 +590,44 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
     return [...sorted, ...propertySteps]
   }, [meters])
 
+  // Read on the server (by anyone, at any point) or saved in this sitting.
+  const isDone = (m: any) => m.isRead || savedIds.has(m.meterId)
+  const stepDone = (st: { meters: any[] }) => st.meters.every(isDone)
   const totalMeters = steps.reduce((s, st) => s + st.meters.length, 0)
-  const doneMeters = savedIds.size
+  const doneMeters = steps.reduce((s, st) => s + st.meters.filter(isDone).length, 0)
   const step = steps[stepIdx]
+
+  // Land on the first thing still outstanding rather than the top of the list —
+  // a partner opening this after someone else has done half should not have to
+  // scroll past their work.
+  const jumpedRef = useRef(false)
+  useEffect(() => {
+    if (jumpedRef.current || !steps.length) return
+    jumpedRef.current = true
+    const first = steps.findIndex(st => !stepDone(st))
+    if (first > 0) setStepIdx(first)
+  }, [steps])
   // A submeter read is exactly the meter's digit width (odometer
   // convention — cycled-over meters are entered with leading zeros,
   // e.g. 000133). RUBS masters record a usage total: any length up to
   // the width.
-  // S607: a master on the bill total needs a usage figure ONLY when submetered
-  // units sit on its line — that carve-out is measured in usage. Otherwise the
-  // bill alone is enough, which is what an electric bill with peak/off-peak
-  // tiers, demand charges and riders leaves you with.
-  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount' && !m.hasSubmeteredUnits
+  // S634: a master on the bill total NEVER needs a usage figure. It used to,
+  // when submetered units on its line were carved out of the pool and that
+  // carve-out was measured in usage. Nothing is carved out now, so the bill
+  // alone is always enough — which is what an electric bill with peak/off-peak
+  // tiers, demand charges and riders leaves you with anyway.
+  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount'
   const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
     ? new RegExp(`^\\d{${m.digits}}$`).test(v)
     : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
   const billOk = (m: any, v: string) => m.rubsBasis !== 'bill_amount' || /^\d+(\.\d{1,2})?$/.test(v)
+  // S631 fix: `isDone` here, not `savedIds`. Including already-recorded meters
+  // as steps (so the verification walk shows what a partner finished) left a
+  // done step with an EMPTY, enabled input and a disabled Next — you landed on
+  // somebody else's completed re-read and could not move past it without
+  // retyping it. That is the "entered one and it locked up" Nic's brother hit.
   const stepComplete = !!step && step.meters.every(m =>
-    savedIds.has(m.meterId) || (readOk(m, values[m.meterId] ?? '') && billOk(m, bills[m.meterId] ?? '')))
+    isDone(m) || (readOk(m, values[m.meterId] ?? '') && billOk(m, bills[m.meterId] ?? '')))
 
   const [saving, setSaving] = useState(false)
   const next = async () => {
@@ -552,6 +648,12 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
         last = r?.data
       }
       setSavedIds(saved)
+      // S631: the count on the page behind is read from the reading-runs query.
+      // It was only refetched when this modal CLOSED, so after recording a
+      // re-check the banner still showed the pre-save number — Nic's brother
+      // entered one and was told "0 of 6 done", and reasonably concluded it had
+      // not saved. It had; the page was just showing a stale copy.
+      qc.invalidateQueries(['reading-runs'])
       // Main walk done → the system generated the verification list.
       if (last?.run?.status === 'double_check') { setSummary({ kind: 'verify_ready', dcTotal: last.dcTotal }); return }
       // Verification done → bills ran; show the money summary.
@@ -595,7 +697,18 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
         ) : isLoading ? (
           <div style={{ color:'var(--text-3)', padding:16 }}>Loading…</div>
         ) : !step ? (
-          <div style={{ color:'var(--text-3)', padding:16, fontSize:'.85rem' }}>All meters on this run are already read.</div>
+          // S631: the list now includes read meters, so an empty list means this
+          // property has no readable meters at all — not that the work is done.
+          <div style={{ color:'var(--text-3)', padding:16, fontSize:'.85rem' }}>
+            No submeters or master meters are set up on this property yet.
+          </div>
+        ) : mode === 'read' ? (
+          // S631: the monthly read is a LIST, not a wizard. The verification
+          // re-read below stays one meter at a time on purpose — it is a blind
+          // second read, and showing the whole list at once is precisely what it
+          // must not do.
+          <ReadingListForm run={run} meters={meters as any[]}
+            onDone={setSummary} onClose={onClose} />
         ) : (
           <>
             <div className="modal-title" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
@@ -603,7 +716,35 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
               <span className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{doneMeters}/{totalMeters}</span>
             </div>
 
-            <div style={{ fontWeight:700, fontSize:'1.15rem', marginBottom:12 }}>{step.title}</div>
+            {/* S631: the whole list, any order. Tap what you're standing in
+                front of — or what arrived in your post — instead of walking the
+                queue to reach it. Done items stay visible so two people can see
+                each other's progress without asking. */}
+            <div style={{ display:'flex', flexWrap:'wrap', gap:5, marginBottom:12,
+              maxHeight:112, overflowY:'auto', padding:'2px 0' }}>
+              {steps.map((st, i) => {
+                const done = stepDone(st)
+                const here = i === stepIdx
+                return (
+                  <button key={st.title} type="button" onClick={() => setStepIdx(i)}
+                    title={done ? 'Already read' : 'Not read yet'}
+                    style={{ padding:'2px 8px', borderRadius:20, fontSize:'.68rem', fontWeight:700,
+                      cursor:'pointer', whiteSpace:'nowrap',
+                      border:`1px solid ${here ? 'var(--gold)' : done ? 'var(--border-0)' : 'rgba(201,162,39,.35)'}`,
+                      background: here ? 'rgba(201,162,39,.14)' : done ? 'var(--bg-2)' : 'transparent',
+                      color: done ? 'var(--text-3)' : here ? 'var(--gold)' : 'var(--text-1)' }}>
+                    {done ? '✓ ' : ''}{st.title}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div style={{ fontWeight:700, fontSize:'1.15rem', marginBottom:2 }}>{step.title}</div>
+            <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginBottom:12 }}>
+              {stepDone(step)
+                ? 'Already read this cycle — entering again replaces it.'
+                : 'Nothing waits on this. Each unit bills from its own reads.'}
+            </div>
 
             <div style={{ display:'grid', gap:12 }}>
               {step.meters.map((m: any, i: number) => (
@@ -617,8 +758,8 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
                     autoComplete="off"
                     autoFocus={i === 0}
                     placeholder={m.billingMethod === 'submeter' ? `${m.digits}-digit read, e.g. ${'0'.repeat(Math.max(0, m.digits - 3))}133` : `usage total (up to ${m.digits} digits)`}
-                    disabled={savedIds.has(m.meterId)}
-                    value={savedIds.has(m.meterId) ? '✓ recorded' : (values[m.meterId] ?? '')}
+                    disabled={isDone(m)}
+                    value={isDone(m) ? '✓ recorded' : (values[m.meterId] ?? '')}
                     onChange={e => {
                       const v = e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12)
                       setValues(prev => ({ ...prev, [m.meterId]: v }))
@@ -643,7 +784,7 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
                       both numbers come from the one document in front of you —
                       splitting them across two screens is how they end up from
                       two different cycles. */}
-                  {m.rubsBasis === 'bill_amount' && !savedIds.has(m.meterId) && (
+                  {m.rubsBasis === 'bill_amount' && !isDone(m) && (
                     <div style={{ marginTop:10 }}>
                       <span style={lbl}>Amount the utility charged</span>
                       <input
@@ -681,6 +822,384 @@ function ReadingWalkModal({ run, mode, onClose }: { run: any; mode: 'read' | 've
         )}
       </div>
     </div>
+  )
+}
+
+// ── OPENING READS (S632) ─────────────────────────────────────────────
+//
+// Nic: "We should choose a date for all the meters and type them all in and save
+// once at the end. It's just too many button clicks when I'm trying to onboard a
+// property. That's just electric for that many units. On a hundred space park
+// you're maybe looking at three hundred meters."
+//
+// The old control was per meter: expand, type, pick a date, save, collapse, next
+// — five interactions each, and the date asked 53 times for a walk that happened
+// on one afternoon. At 300 meters that is not tedium, it is a reason not to
+// onboard the property.
+//
+// ONE DATE, because the date belongs to the walk and not to the meter. ONE SAVE,
+// because a page of numbers is one act of work. PARTIAL is fine — type what you
+// have, save, come back; the rows already stored come back filled in and saving
+// again corrects them rather than duplicating.
+function OpeningReadsModal({ propertyId, meters, onClose, onSaved }: {
+  propertyId: string; meters: any[]; onClose: () => void; onSaved: () => void
+}) {
+  const rows = useMemo(() => {
+    const seen = new Map<string, any>()
+    for (const m of meters as any[]) {
+      if (m.billingMethod !== 'submeter') continue
+      if (!seen.has(m.meterId ?? m.id)) {
+        seen.set(m.meterId ?? m.id, { ...m, id: m.meterId ?? m.id, unitNumbers: [] })
+      }
+      if (m.unitNumber) seen.get(m.meterId ?? m.id).unitNumbers.push(m.unitNumber)
+    }
+    return [...seen.values()]
+      .map(m => ({ ...m, title: m.unitNumbers[0] || m.label }))
+      .sort((a, b) => String(a.utilityType).localeCompare(String(b.utilityType))
+        || a.title.localeCompare(b.title, undefined, { numeric: true }))
+  }, [meters])
+
+  // Default the date to the 1st of the current month — an opening read has to
+  // predate the reads it enables, and a walk done "this month" almost always
+  // means the cycle starts here.
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 8) + '01')
+  const [values, setValues] = useState<Record<string, string>>(() => {
+    const seed: Record<string, string> = {}
+    for (const m of rows) if (m.openingRead?.value != null) seed[m.id] = String(m.openingRead.value)
+    return seed
+  })
+  const [saving, setSaving] = useState(false)
+  const [result, setResult] = useState<any>(null)
+  const [err, setErr] = useState('')
+  const inputs = useRef<(HTMLInputElement | null)[]>([])
+
+  const filled = rows.filter(m => (values[m.id] ?? '').trim() !== '')
+  const tooWide = (m: any, v: string) => m.digits != null && v !== '' && Number(v) >= 10 ** m.digits
+
+  const save = async () => {
+    if (!filled.length || saving) return
+    setSaving(true); setErr(''); setResult(null)
+    try {
+      const r: any = await apiPost('/utility/opening-reads', {
+        propertyId, readingDate: date,
+        reads: filled.map(m => ({ meterId: m.id, value: Number(values[m.id]) })),
+      })
+      setResult(r?.data ?? r)
+      onSaved()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not save these opening reads')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 560, width: '95vw' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
+          <span>Opening reads</span>
+          <span className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>
+            {filled.length}/{rows.length}
+          </span>
+        </div>
+
+        {result ? (
+          <>
+            <div style={{ fontSize:'.86rem', color:'var(--text-2)', lineHeight:1.6 }}>
+              Saved <strong style={{ color:'var(--text-0)' }}>{result.saved}</strong> opening
+              read{result.saved === 1 ? '' : 's'} dated {result.readingDate}.
+              {result.stillNeedAnOpeningRead > 0
+                ? <> <strong style={{ color:'var(--text-0)' }}>{result.stillNeedAnOpeningRead}</strong> meter{result.stillNeedAnOpeningRead === 1 ? '' : 's'} still have none — come back and finish whenever.</>
+                : <> Every submeter on this property now has one.</>}
+            </div>
+            {result.failed > 0 && (
+              <div style={{ marginTop:12 }}>
+                <div style={{ fontSize:'.74rem', fontWeight:700, color:'var(--red)', marginBottom:6 }}>
+                  {result.failed} could not be saved — these were left untouched:
+                </div>
+                {result.results.filter((x: any) => x.status === 'error').map((x: any) => (
+                  <div key={x.meterId} style={{ fontSize:'.76rem', color:'var(--text-2)' }}>
+                    {x.label} — {x.message}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="modal-footer"><button className="btn btn-primary" onClick={onClose}>Done</button></div>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize:'.76rem', color:'var(--text-2)', lineHeight:1.55, margin:'6px 0 12px' }}>
+              The starting number on each meter face. One date for the whole walk — type what you
+              have and save once; anything you leave blank you can come back to.
+            </div>
+
+            <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.7rem', textTransform:'uppercase', letterSpacing:'.08em',
+                color:'var(--text-3)', display:'block', marginBottom:4 }}>
+                Date these were read
+              </label>
+              <input className="form-input" type="date" value={date}
+                onChange={e => setDate(e.target.value)} style={{ maxWidth:200 }} />
+            </div>
+
+            <div style={{ maxHeight:'50vh', overflowY:'auto', margin:'0 -4px', padding:'0 4px' }}>
+              {rows.map((m, i) => {
+                const v = values[m.id] ?? ''
+                const wide = tooWide(m, v)
+                return (
+                  <div key={m.id} style={{ display:'grid', gridTemplateColumns:'1fr 140px', gap:10,
+                    alignItems:'center', padding:'6px 0',
+                    borderBottom:'1px solid var(--border-1, rgba(255,255,255,.06))' }}>
+                    <div style={{ minWidth:0 }}>
+                      <div style={{ fontSize:'.84rem', fontWeight:600, color:'var(--text-0)' }}>{m.title}</div>
+                      <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>
+                        {UTILITY_ICONS[m.utilityType]} {m.utilityType} · {m.digits}-digit face
+                        {m.openingRead && <> · already set</>}
+                      </div>
+                      {wide && (
+                        <div style={{ fontSize:'.68rem', color:'var(--red)' }}>
+                          More than a {m.digits}-digit meter can show
+                        </div>
+                      )}
+                    </div>
+                    <input
+                      ref={el => { inputs.current[i] = el }}
+                      className="form-input mono" type="text" inputMode="numeric" autoComplete="off"
+                      maxLength={m.digits ?? 8}
+                      placeholder={'0'.repeat(m.digits ?? 5)}
+                      value={v}
+                      onChange={e => setValues(prev => ({ ...prev,
+                        [m.id]: e.target.value.replace(/\D/g, '').slice(0, m.digits ?? 8) }))}
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); inputs.current[i + 1]?.focus() } }}
+                      style={{ width:'100%', fontSize:'.95rem', letterSpacing:'.08em',
+                        borderColor: wide ? 'var(--red)' : undefined }} />
+                  </div>
+                )
+              })}
+            </div>
+
+            {err && <div style={{ marginTop:10, fontSize:'.8rem', color:'var(--red)' }}>{err}</div>}
+
+            <div className="modal-footer" style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
+                {filled.length === 0 ? 'Nothing entered yet'
+                  : `${filled.length} to save${rows.length - filled.length > 0 ? ` · ${rows.length - filled.length} left blank` : ''}`}
+              </span>
+              <div style={{ display:'flex', gap:8 }}>
+                <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+                <button className="btn btn-primary" disabled={!filled.length || saving || filled.some(m => tooWide(m, values[m.id] ?? ''))}
+                  onClick={save}>
+                  {saving ? 'Saving…' : `Save ${filled.length} opening read${filled.length === 1 ? '' : 's'}`}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── MONTHLY READ ENTRY (S631) ────────────────────────────────────────
+//
+// Nic, on the wizard this replaces: "That flow is terrible. Nobody's gonna click
+// each spot each time... when I click start a reading, it needs to ask me what
+// I'm gonna be [reading]."
+//
+// The old screen asked for one unit at a time and made you press Next to reach
+// the following one — 29 confirmations to enter 29 numbers. Turning it into
+// clickable chips made it worse: same one-at-a-time entry, now with a click to
+// choose each one. Somebody walking a park with a clipboard, or sitting down
+// with a utility bill, wants ONE list and a keyboard.
+//
+// So: pick what you came to do, then type down the page. Each row saves itself
+// the moment it holds a valid read, which is what makes this shareable — two
+// people can work the same list at once, in any order, and neither loses work by
+// closing the tab. Nothing here waits on anything else; S534 bills each unit
+// from its own reads.
+//
+// PRIOR READINGS ARE NOT SHOWN, deliberately (blind entry, S533) — seeing last
+// month's number is how a hurried read becomes last month's number.
+function ReadingListForm({ run, meters, onDone, onClose }: {
+  run: any; meters: any[]; onDone: (summary: any) => void; onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [bills, setBills] = useState<Record<string, string>>({})
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set())
+  const [savingIds, setSavingIds] = useState<Set<string>>(new Set())
+  const [rowErr, setRowErr] = useState<Record<string, string>>({})
+  const [filter, setFilter] = useState<string>('all')
+  const inputs = useRef<(HTMLInputElement | null)[]>([])
+
+  // One row per meter, units in natural order, masters last — a master is read
+  // off a bill at a desk, not on the walk, so it does not belong mid-list.
+  const rows = useMemo(() => {
+    const byMeter = new Map<string, any>()
+    for (const m of meters) {
+      if (!byMeter.has(m.meterId)) byMeter.set(m.meterId, { ...m, unitNumbers: [] })
+      if (m.unitNumber) byMeter.get(m.meterId).unitNumbers.push(m.unitNumber)
+    }
+    const all = [...byMeter.values()].map(m => ({
+      ...m,
+      title: m.unitNumbers.length === 1 ? m.unitNumbers[0] : m.label,
+      isMaster: m.billingMethod === 'rubs',
+    }))
+    return all.sort((a, b) =>
+      (a.isMaster ? 1 : 0) - (b.isMaster ? 1 : 0)
+      || a.title.localeCompare(b.title, undefined, { numeric: true })
+      || String(a.utilityType).localeCompare(String(b.utilityType)))
+  }, [meters])
+
+  // S631 (Nic, DIRECTIVE): "When I open the list again, I don't wanna see what's
+  // already been done, just what still needs to be done... I don't want two
+  // people reading meters and accidentally overwriting each other by typoing on
+  // a spot that was already done."
+  //
+  // So the list is what is LEFT. `isRead` is the server's answer at load, which
+  // means anything a partner finished before you opened this is simply not here
+  // to be typed over. A row you complete in this sitting stays put, ticked, so
+  // you can see your own work land — it disappears next time the window opens.
+  // The count of the hidden ones is stated, because a list that silently omits
+  // things is its own kind of confusing.
+  const alreadyRead = rows.filter(r => r.isRead).length
+  const outstanding = rows.filter(r => !r.isRead)
+  const utilitiesLeft = [...new Set(outstanding.map(r => String(r.utilityType)))].sort()
+  const shown = outstanding.filter(r =>
+    filter === 'all' ? true
+    : filter === 'masters' ? r.isMaster
+    : filter === 'submeters' ? !r.isMaster
+    : r.utilityType === filter)
+
+  const usageOptional = (m: any) => m.rubsBasis === 'bill_amount' && !m.hasSubmeteredUnits
+  const readOk = (m: any, v: string) => m.billingMethod === 'submeter'
+    ? new RegExp(`^\\d{${m.digits}}$`).test(v)
+    : usageOptional(m) ? (v === '' || /^[0-9]+$/.test(v)) : /^[0-9]+$/.test(v)
+  const billOk = (m: any, v: string) => m.rubsBasis !== 'bill_amount' || /^\d+(\.\d{1,2})?$/.test(v)
+  const done = (m: any) => m.isRead || savedIds.has(m.meterId)
+
+  const save = async (m: any) => {
+    const v = values[m.meterId] ?? ''
+    const b = bills[m.meterId] ?? ''
+    if (savingIds.has(m.meterId)) return
+    if (!readOk(m, v) || !billOk(m, b)) return
+    if (v === '' && !usageOptional(m)) return
+    setSavingIds(prev => new Set(prev).add(m.meterId))
+    setRowErr(prev => ({ ...prev, [m.meterId]: '' }))
+    try {
+      const r: any = await apiPost(`/utility/reading-runs/${run.id}/meters/${m.meterId}/reading`,
+        { readingValue: Number(v || 0), ...(m.rubsBasis === 'bill_amount' ? { billAmount: Number(b) } : {}) })
+      setSavedIds(prev => new Set(prev).add(m.meterId))
+      // S631: keep the count on the page behind honest as each line lands —
+      // two people work this list at once, and a stale number reads as a lost save.
+      qc.invalidateQueries(['reading-runs'])
+      // The last meter tips the run into its verification phase — surface that
+      // rather than leaving somebody staring at a full list wondering.
+      if (r?.data?.run?.status === 'double_check') onDone({ kind: 'verify_ready', dcTotal: r.data.dcTotal })
+      if (r?.data?.run?.status === 'completed') onDone({ kind: 'completed', ...r.data.run })
+    } catch (e: any) {
+      setRowErr(prev => ({ ...prev, [m.meterId]: e?.response?.data?.error || 'Could not save' }))
+    } finally {
+      setSavingIds(prev => { const n = new Set(prev); n.delete(m.meterId); return n })
+    }
+  }
+
+  const doneCount = rows.filter(done).length
+  const leftCount = outstanding.filter(r => !savedIds.has(r.meterId)).length
+  const chip = (key: string, label: string) => (
+    <button key={key} type="button" onClick={() => setFilter(key)}
+      style={{ padding:'3px 10px', borderRadius:20, fontSize:'.72rem', fontWeight:700, cursor:'pointer',
+        border:`1px solid ${filter === key ? 'var(--gold)' : 'var(--border-0)'}`,
+        background: filter === key ? 'rgba(201,162,39,.1)' : 'var(--bg-2)',
+        color: filter === key ? 'var(--gold)' : 'var(--text-2)' }}>{label}</button>
+  )
+
+  return (
+    <>
+      <div className="modal-title" style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline' }}>
+        <span>Meter readings — {monthLabel(run.billingCycleMonth)}</span>
+        <span className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{doneCount}/{rows.length}</span>
+      </div>
+
+      <div style={{ fontSize:'.74rem', color:'var(--text-2)', marginBottom:10, lineHeight:1.5 }}>
+        What&apos;s still to read. Each line saves on its own, so anyone can pick up the rest later,
+        in any order — nothing waits on anything else.
+        {alreadyRead > 0 && (
+          <> <span style={{ color:'var(--text-3)' }}>
+            {alreadyRead} already read this cycle and not shown.
+          </span></>
+        )}
+      </div>
+
+      <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginBottom:12 }}>
+        {chip('all', `All (${outstanding.length})`)}
+        {utilitiesLeft.length > 1 && utilitiesLeft.map(u =>
+          chip(u, `${UTILITY_ICONS[u] ?? ''} ${u[0].toUpperCase() + u.slice(1)}`))}
+        {outstanding.some(r => r.isMaster) && chip('masters', 'Master bills')}
+        {outstanding.some(r => r.isMaster) && outstanding.some(r => !r.isMaster) && chip('submeters', 'Submeters')}
+      </div>
+
+      <div style={{ maxHeight:'52vh', overflowY:'auto', margin:'0 -4px', padding:'0 4px' }}>
+        {shown.map((m, i) => {
+          const isDone = done(m)
+          const saving = savingIds.has(m.meterId)
+          return (
+            <div key={m.meterId} style={{ display:'grid', gridTemplateColumns:'1fr 150px',
+              gap:10, alignItems:'center', padding:'7px 0',
+              borderBottom:'1px solid var(--border-1, rgba(255,255,255,.06))', opacity: isDone ? .55 : 1 }}>
+              <div style={{ minWidth:0 }}>
+                <div style={{ fontSize:'.84rem', fontWeight:600, color:'var(--text-0)',
+                  overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                  {isDone && <span style={{ color:'var(--green)' }}>✓ </span>}{m.title}
+                </div>
+                <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>
+                  {UTILITY_ICONS[m.utilityType]} {m.utilityType}
+                  {m.isMaster ? ' · master — total used this cycle, off the bill' : ` · ${m.digits}-digit read`}
+                </div>
+                {rowErr[m.meterId] && (
+                  <div style={{ fontSize:'.68rem', color:'var(--red)' }}>{rowErr[m.meterId]}</div>
+                )}
+              </div>
+              <div>
+                <input
+                  ref={el => { inputs.current[i] = el }}
+                  className="form-input mono" type="text" inputMode="numeric" autoComplete="off"
+                  maxLength={m.billingMethod === 'submeter' ? m.digits : 12}
+                  // S631: once it is in, it is in. Locking the field is what stops
+                  // a stray keystroke on a row you already finished — and this row
+                  // is gone entirely next time the window opens.
+                  disabled={isDone}
+                  placeholder={isDone ? 'recorded' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
+                  value={values[m.meterId] ?? ''}
+                  onChange={e => setValues(prev => ({ ...prev,
+                    [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12) }))}
+                  onBlur={() => save(m)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') { e.preventDefault(); save(m); inputs.current[i + 1]?.focus() }
+                  }}
+                  style={{ width:'100%', fontSize:'.95rem', letterSpacing:'.08em',
+                    borderColor: saving ? 'var(--gold)' : undefined }} />
+                {m.rubsBasis === 'bill_amount' && (
+                  <input
+                    className="form-input mono" type="text" inputMode="decimal" autoComplete="off"
+                    disabled={isDone}
+                    placeholder="bill $" value={bills[m.meterId] ?? ''}
+                    onChange={e => setBills(prev => ({ ...prev,
+                      [m.meterId]: e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1') }))}
+                    onBlur={() => save(m)}
+                    style={{ width:'100%', fontSize:'.9rem', marginTop:5 }} />
+                )}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="modal-footer" style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
+          {leftCount === 0 ? 'Nothing left to read.' : `${leftCount} still to read`}
+        </span>
+        <button className="btn btn-primary" onClick={onClose}>Done for now</button>
+      </div>
+    </>
   )
 }
 
@@ -1294,7 +1813,11 @@ function PropaneTanksCard({ propertyId, units, onChanged }: {
     () => apiPut('/propane/tanks', { propertyId, unitIds: Array.from(current) }),
     {
       onSuccess: (r: any) => {
-        setPicked(null)
+        // S632: do NOT clear the local selection here. `current` falls back to
+        // the units prop when picked is null, and that prop is stale until the
+        // refetch returns — clearing first is what made the ticks disappear.
+        // The next render off fresh units carries the same set, so leaving it
+        // is invisible when it works and correct when the network is slow.
         onChanged()
         toast(`${r?.changed ?? 0} space${r?.changed === 1 ? '' : 's'} changed — ${r?.withTank ?? 0} now on Record Delivery.`)
       },
@@ -1639,8 +2162,9 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
   )
 }
 
-function MeterConfigSection({ propertyId, meters, units, onChanged }: {
+function MeterConfigSection({ propertyId, meters, units, onChanged, initialType }: {
   propertyId: string; meters: any[]; units: any[]; onChanged: () => void
+  initialType?: string | null
 }) {
   const [showAdd, setShowAdd] = useState(false)
   // S609: the meter currently being edited (null = none open).
@@ -1655,7 +2179,10 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
     ['utility-property-rates', propertyId], () => apiGet(`/utility/property-rates?propertyId=${propertyId}`))
 
   // S613: which utility panel is open. Null = the summary of all of them.
-  const [openType, setOpenType] = useState<string | null>(null)
+  // S632: seeded from ?utility= so the opening-reads banner on the page above
+  // can send you straight into the utility that needs them.
+  const [openType, setOpenType] = useState<string | null>(() => initialType ?? null)
+  useEffect(() => { if (initialType) setOpenType(initialType) }, [initialType])
 
   // A propane TANK is not a meter (units.has_propane_tank), so propane can be
   // fully set up at a property with no propane meter at all. Counted here so the
@@ -1758,7 +2285,19 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
   const billBack = useMutation((id: string) => apiPost(`/utility/meters/${id}/bill-back`, {}), {
     onSuccess: (r: any) => {
       onChanged()
-      toast(`${r?.data?.leasesUpdated ?? 0} lease${r?.data?.leasesUpdated === 1 ? '' : 's'} updated — it starts on the next invoice.`)
+      // S634 (Nic): "It needs to start immediately with those suspended amounts
+      // from the previous meter reads." It does now — say so, and say how much,
+      // because "starts on the next invoice" read like the metered usage
+      // already sitting there had been written off.
+      const n = r?.data?.leasesUpdated ?? 0
+      const held = r?.data?.heldChargesReleased ?? 0
+      const amt = r?.data?.heldAmountReleased ?? 0
+      toast(
+        `${n} lease${n === 1 ? '' : 's'} updated.` +
+        (held > 0
+          ? ` ${held} held charge${held === 1 ? '' : 's'} from earlier meter reads billed now ($${Number(amt).toFixed(2)}).`
+          : ' Nothing was being held, so this applies from the next reading.')
+      )
     },
     onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record that'),
   })
@@ -1768,16 +2307,23 @@ function MeterConfigSection({ propertyId, meters, units, onChanged }: {
     return (
       <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 7, fontSize: '.72rem', lineHeight: 1.6,
                     color: 'var(--amber)', background: 'rgba(245,158,11,.07)', border: '1px solid rgba(245,158,11,.25)' }}>
+        {/* S634: only shown when a lease EXPLICITLY says the tenant is not
+            responsible (or the meter bills the landlord). A lease that simply
+            does not mention the utility is silent, and the meter decides — it
+            bills fine, and warning about it sent Nic chasing a lost month of
+            electric that was never lost. */}
         ⚠ {blocked.length} unit{blocked.length === 1 ? '' : 's'} on this
-        ({blocked.map(unitLabel).join(', ')}) {blocked.length === 1 ? 'has a lease that' : 'have leases that'}
-        &nbsp;don&apos;t mention {m.utilityType}, so {blocked.length === 1 ? 'it bills' : 'they bill'} nothing.
+        ({blocked.map(unitLabel).join(', ')}) {blocked.length === 1 ? 'has a lease that says' : 'have leases that say'}
+        &nbsp;the tenant is not responsible for {m.utilityType}, so {blocked.length === 1 ? 'it bills' : 'they bill'} nothing.
         <button className="btn btn-secondary btn-sm" style={{ marginLeft: 8, padding: '1px 8px', fontSize: '.68rem' }}
           disabled={billBack.isLoading}
           onClick={() => appConfirm(
             `Bill ${m.utilityType} back to ${blocked.length} tenant${blocked.length === 1 ? '' : 's'}?\n\n` +
-            `Their leases don't cover it, so this is an addendum — you should have their written ` +
-            `agreement, the same as adding it on paper. GAM records that you turned it on and when.\n\n` +
-            `It starts on the next invoice. Nothing already sent changes.`,
+            `Their leases say the tenant is NOT responsible, so this is an addendum — you should ` +
+            `have their written agreement, the same as adding it on paper. GAM records that you ` +
+            `turned it on and when.\n\n` +
+            `Anything already metered and held for these units is billed straight away. ` +
+            `Invoices already sent do not change.`,
             { confirmLabel: 'Bill it back' },
           ).then(ok => { if (ok) billBack.mutate(m.id) })}>
           Bill it back
@@ -2292,7 +2838,6 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
   const [method, setMethod] = useState(meter?.billingMethod ?? 'rubs')
   const [basis, setBasis] = useState(meter?.rubsBasis ?? 'usage_rate')
   const [subRate, setSubRate] = useState(meter?.rubsSubmeterRate ?? 'property_rate')
-  const [exclMode, setExclMode] = useState(meter?.rubsExclusionMode ?? 'usage')
   const [rate] = useState('')   // S605: rates are property policy; kept only for the create payload
   // S609: no longer editable — the flat-rate amount is the property rate, and a
   // RUBS master's own base fee is set with the property rates. Kept so the value
@@ -2348,7 +2893,6 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
             rubsBasis: basis,
             rubsWeights: weightsPayload(),
             rubsSubmeterRate: subRate,
-            rubsExclusionMode: exclMode,
           } : {}),
         })
       : apiPost('/utility/meters', {
@@ -2360,7 +2904,6 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
       rubsBasis: method === 'rubs' ? basis : undefined,
       rubsWeights: weightsPayload() ?? undefined,
       rubsSubmeterRate: method === 'rubs' ? subRate : undefined,
-      rubsExclusionMode: method === 'rubs' ? exclMode : undefined,
       ...(method === 'submeter' && baselineReading !== ''
         ? { baselineReading: Number(baselineReading), baselineDate }
         : {}),
@@ -2498,31 +3041,28 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
                   : 'The property rate prices the usage. Anything the provider charges beyond that — service fees, taxes — stays with you.'}
               </div>
             </div>
-            {/* S607 (Nic, DIRECTIVE): "we're going for flexibility here." How a
-                master shares its line with submetered units is TWO independent
-                choices, both defaulting to what the platform already did. */}
+            {/* S634 (Nic, DIRECTIVE): the "take them out of the pool by" picker
+                is GONE. Nothing comes out of the pool — "RUBS portion is divided
+                out first. The RUBS people eat the full bill. Submeter is extra."
+                A control that no longer changes any number is worse than no
+                control: it reads as a lever the landlord has, and they would set
+                it and expect the bill to move. What a submetered tenant PAYS is
+                still a real choice, so that one stays. */}
             {basis === 'bill_amount' && (
               <div style={{ marginBottom: 10, padding: 10, borderRadius: 8,
                             background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.18)' }}>
                 <div style={{ fontSize: '.72rem', color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.45 }}>
-                  Only applies where some units on this meter have their own submeter.
+                  Only applies where this property also has submetered units.
                 </div>
                 <label style={lbl}>Submetered units are billed at</label>
-                <select className="form-select" value={subRate} onChange={e => setSubRate(e.target.value)} style={{ width: '100%', marginBottom: 8 }}>
+                <select className="form-select" value={subRate} onChange={e => setSubRate(e.target.value)} style={{ width: '100%' }}>
                   <option value="property_rate">Your published rate</option>
                   <option value="blended">The blended rate off this bill</option>
                 </select>
-                <label style={lbl}>Take them out of the pool by</label>
-                <select className="form-select" value={exclMode} onChange={e => setExclMode(e.target.value)} style={{ width: '100%' }}>
-                  <option value="usage">Their usage — price whatever is left</option>
-                  <option value="dollars">Their invoiced dollars — the bill closes exactly</option>
-                </select>
                 <div style={{ marginTop: 6, fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.45 }}>
-                  {subRate === 'property_rate' && exclMode === 'usage'
-                    ? 'Heads up: with a published submeter rate, subtracting usage can leave the pool over or short of the bill. Subtracting dollars closes it.'
-                    : exclMode === 'dollars'
-                      ? 'Every dollar of the bill lands on somebody, whatever rate each submetered unit paid.'
-                      : 'Everyone on the line ends up at the same cost per unit.'}
+                  This meter&rsquo;s bill divides across the units on it, whole. A unit with
+                  its own submeter is billed on that meter instead, on top &mdash; it never
+                  reduces what the units here owe.
                 </div>
               </div>
             )}

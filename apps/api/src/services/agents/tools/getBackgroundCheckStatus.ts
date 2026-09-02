@@ -7,7 +7,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   first_name: string | null
@@ -33,9 +33,9 @@ export const getBackgroundCheckStatus: AgentTool = {
       // PII columns (ssn_*, date_of_birth, income, employer, address) are
       // intentionally NOT selected — only status + name + the report link.
       `SELECT first_name, last_name, status, result_url, created_at
-         FROM background_checks WHERE landlord_id = $1
+         FROM background_checks WHERE landlord_id = ANY($1::uuid[])
         ORDER BY created_at DESC LIMIT $2`,
-      [actor.profileId, limit]
+      [actorLandlordIds(actor), limit]
     )
     return {
       ok: true,

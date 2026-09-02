@@ -82,7 +82,7 @@ subleasesRouter.post('/', async (req, res, next) => {
     }
     const body = createSchema.parse(req.body)
 
-    const sublessorTenantId = req.user!.profileId
+    const sublessorTenantId = req.user!.profileId!
 
     // 1. Master lease exists + caller is on it. S247: also join the
     //    property to enforce the property-level subleasing_allowed
@@ -657,7 +657,7 @@ subleasesRouter.get('/me/credit', async (req, res, next) => {
       throw new AppError(403, 'Only tenants have sublessor credit balances')
     }
     const { getSublessorCredit } = await import('../services/subleaseAllocation')
-    const view = await getSublessorCredit(req.user!.profileId)
+    const view = await getSublessorCredit(req.user!.profileId!)
     res.json({ success: true, data: view })
   } catch (e) { next(e) }
 })
@@ -673,7 +673,7 @@ subleasesRouter.post('/me/credit/withdraw', async (req, res, next) => {
     const amount = Number(req.body?.amount)
     const { withdrawSublessorCredit } = await import('../services/subleaseAllocation')
     const out = await withdrawSublessorCredit({
-      sublessorTenantId: req.user!.profileId,
+      sublessorTenantId: req.user!.profileId!,
       amountDollars:     amount,
     })
     res.json({ success: true, data: out })

@@ -268,6 +268,31 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   )
   const activeBankAccounts = bankAccounts.filter(b => b.status === 'active')
 
+  // S631 (Nic): "I'm pretty sure I already added the Oak Park bank account with
+  // Stripe, with the know-your-customer information. So why is it still asking
+  // me for a bank account here? The default deposit account for platform payouts
+  // should be the same account that's verified for KYC through Stripe."
+  //
+  // He is right, and the old copy was worse than redundant — it was FALSE. This
+  // selector lists GAM-side bank rows, a leftover from the pre-Phase-4 model
+  // where GAM swept its own ledger. Payouts have gone through Stripe Connect
+  // since S561: jobs/autoPayouts.ts reads the live Connect balance and fires
+  // stripe.payouts.create against the bank attached during KYC. This field only
+  // TAGS a ledger row; it moves no money and blocks none. So a landlord with
+  // Connect fully enabled was told "rent will accumulate, not pay out" about
+  // money that was already paying out on schedule.
+  //
+  // Keyed to THIS property's entity. The status endpoint answers per entity —
+  // a bare call returns the signed-in user's own account, which on a portfolio
+  // of LLCs is the wrong one, and would have reported "not set up" about an
+  // entity whose payouts are live.
+  const payoutEntityId = (property as any)?.landlordId || form.landlordId || null
+  const { data: connectStatus } = useQuery<any>(
+    ['stripe-connect-status', 'landlord', payoutEntityId],
+    () => apiGet(`/stripe/connect/status?entity=landlord&entityId=${payoutEntityId}`),
+    { enabled: !!payoutEntityId, staleTime: 60_000 })
+  const connectBank = connectStatus?.payoutsEnabled ? connectStatus?.payoutBank : null
+
   // S481: state-law warnings from property PATCH response. Empty on
   // close-immediately path; populated when the backend surfaced a
   // hedged factual mismatch (modal stays open with banner).
@@ -509,6 +534,26 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               {errors.name && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.name}</div>}
             </div>
 
+            {/* S631 (Nic, DIRECTIVE): "We should maybe lock the street address once
+                it's set. That way it's not altering our future heat map." An
+                address decides which state's laws apply, which timezone rent is
+                due in, and whether two landlords are claiming the same park — so
+                it is stated once and then read-only. The server refuses a change
+                too; this is the half that explains why. */}
+            {isEdit ? (
+              <div style={{ marginBottom: 10 }}>
+                <label style={lbl}>Address</label>
+                <div style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)',
+                  background: 'var(--bg-2)', fontSize: '.85rem', color: 'var(--text-1)' }}>
+                  {[form.street1, form.street2].filter(Boolean).join(' ')}<br />
+                  {form.city}{form.city && form.state ? ', ' : ''}{form.state} {form.zip}
+                </div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
+                  Fixed once set — it decides which state&apos;s rules apply and which timezone rent is
+                  due in. If it&apos;s wrong, contact support and we&apos;ll correct it.
+                </div>
+              </div>
+            ) : (<>
             <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10, marginBottom: 10 }}>
               <div style={{ position: 'relative' }}>
                 <label style={lbl}>Street Address * {addrVerified && <span style={{ color: 'var(--green)', fontWeight: 400, textTransform: 'none' }}>✓ Verified</span>}</label>
@@ -552,6 +597,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 {errors.zip && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.zip}</div>}
               </div>
             </div>
+            </>)}
 
             <div>
               <label style={lbl}>Amenities</label>
@@ -795,23 +841,53 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 Payout Bank Account
               </span>
             </div>
-            <select
-              value={form.allocationRule.ownerBankAccountId ?? ''}
-              onChange={e => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, ownerBankAccountId: e.target.value || null } }))}
-              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}>
-              <option value="">— None (rent will accumulate, not pay out) —</option>
-              {activeBankAccounts.map(b => (
-                <option key={b.id} value={b.id}>
-                  {b.nickname} • {b.accountType} •••• {b.accountNumberLast4}
-                </option>
-              ))}
-            </select>
-            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
-              Multiple properties can share one account — they collapse into a single Friday disbursement.{' '}
-              <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
-                + Add bank account
-              </Link>
-            </div>
+            {connectBank ? (
+              <>
+                <div style={{ fontSize: '.82rem', color: 'var(--text-0)', padding: '8px 12px',
+                  borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)' }}>
+                  {connectBank.bankName || 'Your verified bank'}
+                  {connectBank.last4 ? ` •••• ${connectBank.last4}` : ''}
+                </div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
+                  The account you verified with Stripe. Rent for this property pays out there on the
+                  weekly run — nothing to set up here.{' '}
+                  <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
+                    Change it
+                  </Link>
+                </div>
+                {activeBankAccounts.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>
+                      Or send this property&apos;s rent somewhere else
+                    </div>
+                    <select
+                      value={form.allocationRule.ownerBankAccountId ?? ''}
+                      onChange={e => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, ownerBankAccountId: e.target.value || null } }))}
+                      style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}>
+                      <option value="">Use the verified account above</option>
+                      {activeBankAccounts.map(b => (
+                        <option key={b.id} value={b.id}>
+                          {b.nickname} • {b.accountType} •••• {b.accountNumberLast4}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: '.82rem', color: 'var(--text-0)', padding: '8px 12px',
+                  borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)' }}>
+                  Not set up yet — rent will accumulate until it is
+                </div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
+                  Payouts run on the bank you verify with Stripe.{' '}
+                  <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
+                    Set up payouts
+                  </Link>
+                </div>
+              </>
+            )}
           </div>
 
           {propMut.isError && (

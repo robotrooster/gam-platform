@@ -222,6 +222,36 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
     return next
   })
   const isRv = f.unitType === 'rv_spot'
+  // S630 (Nic): "I tagged the spot as thirty, fifty, and pull through and back
+  // in, and it doesn't give me any sort of warning that a unit can only be one."
+  //
+  // The unit page CAN tell that two layout tags contradict each other — but only
+  // by reading what each tag DECLARES, and his "Pull-Through" and "Back In" both
+  // declared "Not specified". The name said it; the machine-readable field, left
+  // on its default, said nothing. So nothing downstream could see the conflict,
+  // and 53 spaces were classified by a label no report could group on either.
+  //
+  // Typing a name that plainly states a fact now moves the matching select, in
+  // full view, while the field is still empty. Never an override: a landlord who
+  // has already chosen keeps their choice, and the select sits right there to
+  // change. Naming a class "Riverfront" still declares nothing, which is fine —
+  // a tag is allowed to be just a label. It should not be one by accident.
+  const nameImplies = (name: string, cur: any): any => {
+    if (cur.unitType !== 'rv_spot') return {}
+    const out: any = {}
+    if (!cur.rvSiteLayout || cur.rvSiteLayout === 'none') {
+      if (/pull[\s-]?thr(ough|u)?/i.test(name)) out.rvSiteLayout = 'pull_through'
+      else if (/back[\s-]?in/i.test(name)) out.rvSiteLayout = 'back_in'
+    }
+    if (!cur.rvAmpService || cur.rvAmpService === 'none') {
+      const has30 = /\b30\s*(amp|a)\b/i.test(name), has50 = /\b50\s*(amp|a)\b/i.test(name)
+      if (has30 && has50) out.rvAmpService = 'both'
+      else if (has50) out.rvAmpService = '50'
+      else if (has30) out.rvAmpService = '30'
+    }
+    return out
+  }
+
   const hasBeds = UNIT_TYPE_HAS_BEDROOMS[f.unitType]
   // S550: ownership is a subtype fact for RV/MH — "MH Lot" (tenant-owned)
   // vs "Park Model Rental" (park-owned). Tenant-owned is the norm/default.
@@ -268,7 +298,7 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
           <div style={lbl}>Subtype name</div>
           <input className="input" placeholder={isRv ? 'e.g. Riverfront pull-through' : hasBeds ? 'e.g. Studio, 2BR Deluxe' : f.unitType === 'storage' ? 'e.g. 10x10' : 'e.g. Corner suite'}
             value={f.name}
-            onChange={e => { setNameTouched(true); setF(x => ({ ...x, name: e.target.value })) }}
+            onChange={e => { setNameTouched(true); setF(x => ({ ...x, ...nameImplies(e.target.value, x), name: e.target.value })) }}
             style={{ width: '100%', ...(dupe ? { borderColor: 'var(--red)' } : {}) }} />
         </div>
         {hasBeds && (

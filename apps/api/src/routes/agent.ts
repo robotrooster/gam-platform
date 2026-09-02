@@ -27,6 +27,7 @@ import { loadConversationHistory, loadGuestConversationHistory } from '../servic
 import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
 import { resolveProperty } from '../services/propertyBookingQuote'
 import type { AgentAudience, ChatMessage } from '../services/agents/types'
+import { landlordScopeIds } from '../lib/landlordScope'
 
 export const agentRouter = Router()
 agentRouter.use(requireAuth)
@@ -106,7 +107,20 @@ agentRouter.post('/chat', async (req, res, next) => {
       // S626: forward the caller's verified claims so an action tool can
       // perform the action through the real endpoint with the real
       // authorization. requireAuth already ran; this is its output.
-      actor: { userId, role, profileId, auth: req.user as any },
+      // S634: the actor carries the ACCOUNT's companies, and nothing else. Any
+      // tool acting through a real endpoint uses the forwarded auth payload,
+      // which is account-scoped in the API itself.
+      actor: {
+        userId, role,
+        // S634: for a landlord this is EMPTY. The compatibility value that used
+        // to pin the account's first company here is gone, now that every
+        // landlord tool reads `landlordIds` instead. Empty rather than absent so
+        // any tool that still reached for it scopes to nothing and shows up,
+        // instead of quietly answering for one company.
+        profileId: role === 'landlord' ? '' : profileId!,
+        landlordIds: role === 'landlord' ? landlordScopeIds(req.user!) : undefined,
+        auth: req.user as any,
+      },
       message: body.message,
       conversationId,
       history,

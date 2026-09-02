@@ -7,7 +7,7 @@ import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
 import { queryOne } from '../db'
-import { landlordScopeIds } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
@@ -39,9 +39,8 @@ function scope(req: any): string {
     }
     return requested
   }
-  const id = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
-  if (!id) throw new AppError(403, 'A landlord context is required.')
-  return id
+  // S633: no entity named — the account's only company, or a clear ask.
+  return resolveLandlordTarget(req.user, undefined, 'record')
 }
 
 // POST /api/bank-feed/link-session — start FC link; returns client secret.

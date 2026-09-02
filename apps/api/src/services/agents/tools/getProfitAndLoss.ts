@@ -29,6 +29,7 @@
 import { computeLandlordPL } from '../../landlordPL'
 import { periodMonths } from '../../platformFee'
 import type { AgentTool, AgentActor } from './types'
+import { resolveActorCompany, COMPANY_PARAM } from './companyScope'
 
 const money = (n: number) => Math.round(n * 100) / 100
 
@@ -46,6 +47,7 @@ export const getProfitAndLoss: AgentTool = {
   parameters: {
     type: 'object',
     properties: {
+      ...COMPANY_PARAM,
       year: { type: 'integer', description: 'Calendar year (default: this year).' },
       month: { type: 'integer', description: 'Month 1-12 for a single month. Omit for the whole year.' },
     },
@@ -67,12 +69,18 @@ export const getProfitAndLoss: AgentTool = {
       ? new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10)   // last day of that month
       : `${year}-12-31`
 
-    const pl = await computeLandlordPL(actor.profileId, start, end, periodMonths(year, month))
+    // S634: a P&L belongs to ONE company — separate books, separate bank, its
+    // own return. Adding two together is a figure that is true of nothing, so
+    // the account names which when it owns several.
+    const company = await resolveActorCompany(actor, (args as any).company)
+    if (!company.ok) return { ok: false, error: company.error }
+    const pl = await computeLandlordPL(company.landlordId, start, end, periodMonths(year, month))
 
     const noExpensesEntered = pl.expenses.enteredExpenses === 0
 
     return {
       ok: true,
+      company: company.name,
       period: month ? `${year}-${String(month).padStart(2, '0')}` : String(year),
       from: start,
       to: end,

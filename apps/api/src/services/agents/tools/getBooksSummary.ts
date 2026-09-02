@@ -11,7 +11,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 type Period = 'this_month' | 'last_month' | 'this_year' | 'last_year'
 const PERIODS: Period[] = ['this_month', 'last_month', 'this_year', 'last_year']
@@ -78,20 +78,20 @@ export const getBooksSummary: AgentTool = {
          FROM books_accounts ba
          LEFT JOIN journal_entry_lines jel ON jel.account_id = ba.id
          LEFT JOIN journal_entries je ON je.id = jel.entry_id
-           AND je.date BETWEEN $2 AND $3 AND je.status = 'posted' AND je.landlord_id = $1
-        WHERE ba.type = 'income' AND ba.active = TRUE AND ba.landlord_id = $1
+           AND je.date BETWEEN $2 AND $3 AND je.status = 'posted' AND je.landlord_id = ANY($1::uuid[])
+        WHERE ba.type = 'income' AND ba.active = TRUE AND ba.landlord_id = ANY($1::uuid[])
         GROUP BY ba.id ORDER BY ba.code`,
-      [actor.profileId, start, end]
+      [actorLandlordIds(actor), start, end]
     )
     const expenses = await query<AcctRow>(
       `SELECT ba.code, ba.name, COALESCE(SUM(jel.debit - jel.credit), 0) AS period_amount
          FROM books_accounts ba
          LEFT JOIN journal_entry_lines jel ON jel.account_id = ba.id
          LEFT JOIN journal_entries je ON je.id = jel.entry_id
-           AND je.date BETWEEN $2 AND $3 AND je.status = 'posted' AND je.landlord_id = $1
-        WHERE ba.type = 'expense' AND ba.active = TRUE AND ba.landlord_id = $1
+           AND je.date BETWEEN $2 AND $3 AND je.status = 'posted' AND je.landlord_id = ANY($1::uuid[])
+        WHERE ba.type = 'expense' AND ba.active = TRUE AND ba.landlord_id = ANY($1::uuid[])
         GROUP BY ba.id ORDER BY ba.code`,
-      [actor.profileId, start, end]
+      [actorLandlordIds(actor), start, end]
     )
 
     const round2 = (n: number) => Math.round(n * 100) / 100

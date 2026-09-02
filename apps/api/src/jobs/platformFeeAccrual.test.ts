@@ -337,9 +337,14 @@ describe('processPlatformFeeAccrual', () => {
   })
 
   it('short-stay nights: cancelled bookings excluded from the count', async () => {
-    // Same booking shape as the previous test but status='cancelled' —
-    // engine WHERE clause filters these out. Property should accrue
-    // 0 billable units; total_billable=0 + min=$10 ⇒ accrued at min.
+    // Same booking shape as the previous test but status='cancelled' — the
+    // engine's WHERE clause filters these out, so nothing is billable.
+    //
+    // S631 (Nic, DIRECTIVE): "We do ten dollars a month minimum, but only when
+    // money's moving through the system." A cancelled booking is no money
+    // moving, so this month costs the landlord NOTHING — no accrual row, no
+    // floor. The floor is what a transacting account pays when $2/unit lands
+    // under $10; it is not rent on an empty record.
     const client = await getClient()
     let propertyId: string, unitId: string, landlordId: string
     try {
@@ -368,28 +373,44 @@ describe('processPlatformFeeAccrual', () => {
     }
 
     const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
-    // S630: nothing was EARNED, so the per-property pass accrues nothing. The
-    // payout account is live, so its floor still applies and the group pass is
-    // what writes the row. Same $10 outcome, arrived at honestly.
+    // Nothing earned, nothing billable — so neither pass writes anything.
     expect(result.feesAccrued).toBe(0)
-    expect(result.connectMinimumsApplied).toBe(1)
+    expect(result.connectMinimumsApplied).toBe(0)
 
-    const accrual = await db.query<{
-      short_stay_nights: number; total_billable: number
-      total_amount: string; connect_min_topup: string
-    }>(
-      `SELECT short_stay_nights, total_billable,
-              total_amount::text, connect_min_topup::text
-         FROM platform_fee_accruals WHERE property_id=$1`,
-      [propertyId!]
-    )
-    expect(accrual.rows[0]).toMatchObject({
-      short_stay_nights: 0,
-      total_billable:    0,
-      total_amount:      '10.00',  // pure minimum, no usage
-    })
-    // The whole $10 is the floor, not an unexplained fee against zero units.
-    expect(accrual.rows[0].connect_min_topup).toBe('10.00')
+    const accrual = await db.query(
+      `SELECT id FROM platform_fee_accruals WHERE property_id=$1`, [propertyId!])
+    // No invoice at all. Not a $0 row, not a floored $10 row — nothing.
+    expect(accrual.rows).toHaveLength(0)
+  })
+
+  // S631 (Nic): the abandoned-signup case that prompted the rule. A landlord
+  // signs up, adds one space, never comes back — no tenant, no lease, no Connect
+  // account. The daily grace-cap sweep stamps billing_starts_at when the cap
+  // arrives, which used to hand them a $10/month invoice forever. "Leaving it
+  // vacant forever as a ghost in the system is okay."
+  it('abandoned signup past its grace cap is never billed', async () => {
+    const client = await getClient()
+    let propertyId: string, landlordId: string
+    try {
+      const { userId: ownerUserId, landlordId: lid } = await seedLandlord(client)
+      landlordId = lid
+      propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      // One space, never leased.
+      await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
+      // Grace cap has passed: the sweep has stamped them live.
+      await client.query(
+        `UPDATE landlords SET billing_starts_at = '2026-04-01' WHERE id = $1`, [landlordId])
+    } finally {
+      client.release()
+    }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.connectMinimumsApplied).toBe(0)
+    const accrual = await db.query(
+      `SELECT id FROM platform_fee_accruals WHERE property_id=$1`, [propertyId!])
+    expect(accrual.rows).toHaveLength(0)
   })
 
   // ── S538 STR pricing: the nights/30 aggregation is ONLY for rv_spot

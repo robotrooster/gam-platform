@@ -7,7 +7,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface Row {
   first_name: string | null
@@ -40,9 +40,9 @@ export const getPendingApplications: AgentTool = {
          FROM unit_applications a
          JOIN units u ON u.id = a.unit_id
          JOIN properties p ON p.id = u.property_id
-        WHERE a.landlord_id = $1
+        WHERE a.landlord_id = ANY($1::uuid[])
         ORDER BY a.created_at DESC LIMIT $2`,
-      [actor.profileId, limit]
+      [actorLandlordIds(actor), limit]
     )
     return {
       ok: true,

@@ -584,15 +584,25 @@ describe('generateBillsForMeter — rubs', () => {
   })
 })
 
-// ─── S558: RUBS metered exclusion (UNIT-DRIVEN) ──────────────
-// A master serves a set of units; any served unit that has its OWN same-utility
-// submeter is billed on that submeter and subtracted from the pool — derived
-// from shared UNIT membership, no manual link.
+// ─── S634: THE RUBS POOL IS THE WHOLE BILL ───────────────────
+//
+// Nic (DIRECTIVE, verbatim): "The RUBS system needs to bill off of the total
+// dollar amount divided by occupancy off the master bill. Submeters bill off of
+// the gallons usage after. RUBS portion is divided out first. The RUBS people
+// eat the full bill. Submeter is extra."
+//
+// This REPLACES the S558/S605/S607 exclusion tests wholesale. Those asserted
+// that a submetered unit's usage (S558) or dollars (S607) came off the pool
+// before the split, and that the pool clamped at zero when the carve-out
+// overshot (S605). All three behaviours are gone: nothing is subtracted from the
+// pool, so there is nothing to clamp and nothing to estimate for.
+//
+// The tests below are written against the failure that ended the model. See
+// the S634 header in utilityBilling.ts.
 
-describe('generateBillsForMeter — rubs metered exclusion (S558)', () => {
-  // A RUBS master + a submetered unit (the MH): the submeter and the master
-  // both serve mhUnitId, so the master auto-excludes it.
-  async function seedMasterWithSubmeteredUnit(base: BaseCtx): Promise<{ masterId: string; submeterId: string; mhUnitId: string }> {
+describe('generateBillsForMeter — the RUBS pool is the whole bill (S634)', () => {
+  it('splits the WHOLE master across the RUBS units — a submeter takes nothing off it', async () => {
+    const base = await seedBaseProperty()
     const c = await db.connect()
     let masterId = '', submeterId = ''
     try {
@@ -602,92 +612,199 @@ describe('generateBillsForMeter — rubs metered exclusion (S558)', () => {
       await c.query('COMMIT')
     } finally { c.release() }
     await setMeterRubs(masterId, 'occupant_count')
-    await setMeterRateBase(masterId, 0.01, 0) // 1¢/gal, no base fee (Oak Park)
+    await setMeterRateBase(masterId, 0.01, 0)     // 1¢/gal, no base fee (Oak Park)
     await setMeterRateBase(submeterId, 0.01, 0)
-    const mh = await seedUnitWithActiveTenant(base)
-    await attachMeterToUnit(submeterId, mh.unitId) // the MH's own submeter
-    await attachMeterToUnit(masterId, mh.unitId)   // …and it's also on the master
-    return { masterId, submeterId, mhUnitId: mh.unitId }
-  }
 
-  it('pool = master − submetered-unit usage, split across the un-submetered units', async () => {
-    const base = await seedBaseProperty()
-    const { masterId, submeterId, mhUnitId } = await seedMasterWithSubmeteredUnit(base)
-    const u1 = await seedUnitWithActiveTenant(base) // 1 occupant, no submeter
-    const u2 = await seedUnitWithActiveTenant(base) // 1 occupant, no submeter
+    // The submetered mobile home is on its OWN meter and NOT on the master —
+    // S634's one-meter-per-utility rule. It bills its gallons separately.
+    const mh = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(submeterId, mh.unitId)
+    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId)
+    await seedReading(submeterId, '2026-05-01', 1100, base.landlordUserId) // 100 gal
+
+    const u1 = await seedUnitWithActiveTenant(base)
+    const u2 = await seedUnitWithActiveTenant(base)
     await attachMeterToUnit(masterId, u1.unitId)
     await attachMeterToUnit(masterId, u2.unitId)
-    // MH submeter usage this cycle: 1000 → 1100 = 100 gal, excluded from pool.
-    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId)
-    await seedReading(submeterId, '2026-05-01', 1100, base.landlordUserId)
-    // Master period usage = 300 → pool = 300 − 100 = 200 → 100 gal each × 1¢ = $1.
     await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)
+
     const res = await generateBillsForMeter(masterId, new Date(2026, 4, 1))
-    expect(res.billsCreated).toBe(2) // only u1, u2 — the MH is excluded
-    const { rows } = await db.query<any>(`SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
+    expect(res.billsCreated).toBe(2)
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
+    // THE POINT: 300 gal ÷ 2 = 150 each × 1¢ = $1.50. Under the old exclusion
+    // model the submeter's 100 gal came off first and each paid $1.00.
     expect(rows).toHaveLength(2)
-    for (const r of rows) expect(Number(r.charge_amount)).toBe(1)
-    // the master never bills the submetered unit
-    expect(rows.some((r: any) => r.unit_id === mhUnitId)).toBe(false)
+    for (const r of rows) expect(Number(r.charge_amount)).toBe(1.5)
+    expect(rows.some((r: any) => r.unit_id === mh.unitId)).toBe(false)
   })
 
-  // S605 (Nic, DIRECTIVE) — these two tests previously asserted that the master
-  // did NOT bill. That behaviour is now the bug: "if one water meter is broken
-  // or not spinning, or somebody was on vacation... it still needs to bill the
-  // water out." One unreadable submeter cost the landlord the entire property's
-  // water bill for the month.
-  it('STILL BILLS when a submeter on one of the master units has no reading', async () => {
+  it('a bill_amount master divides the FULL dollar bill by occupancy', async () => {
     const base = await seedBaseProperty()
-    const { masterId, submeterId } = await seedMasterWithSubmeteredUnit(base)
-    await attachMeterToUnit(masterId, (await seedUnitWithActiveTenant(base)).unitId)
-    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId) // prior only
-    await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)
-    const res = await generateBillsForMeter(masterId, new Date(2026, 4, 1))
-    expect(res.billsCreated).toBeGreaterThan(0)
-    // and it must SAY what it had to infer, rather than passing silently
-    expect(res.reason).toMatch(/estimated/i)
-  })
-
-  it('STILL BILLS when a submeter read is flagged for double-check', async () => {
-    const base = await seedBaseProperty()
-    const { masterId, submeterId } = await seedMasterWithSubmeteredUnit(base)
-    await attachMeterToUnit(masterId, (await seedUnitWithActiveTenant(base)).unitId)
-    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId)
-    await seedReading(submeterId, '2026-05-01', 1100, base.landlordUserId)
+    const c = await db.connect()
+    let masterId = ''
+    try {
+      await c.query('BEGIN')
+      masterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(masterId, 'occupant_count')
     await db.query(
-      `UPDATE utility_meter_readings SET needs_review = TRUE
-        WHERE meter_id = $1 AND billing_cycle_month = '2026-05-01'`, [submeterId])
-    await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)
+      `UPDATE utility_meters SET rubs_basis='bill_amount', rate_per_unit=0, base_fee=0 WHERE id=$1`,
+      [masterId])
+    const units = [
+      await seedUnitWithActiveTenant(base),
+      await seedUnitWithActiveTenant(base),
+      await seedUnitWithActiveTenant(base),
+      await seedUnitWithActiveTenant(base),
+    ]
+    for (const u of units) await attachMeterToUnit(masterId, u.unitId)
+    await seedReading(masterId, '2026-05-01', 710, base.landlordUserId, { billAmount: 94.00 })
+
     const res = await generateBillsForMeter(masterId, new Date(2026, 4, 1))
-    expect(res.billsCreated).toBeGreaterThan(0)
-    expect(res.reason).toMatch(/estimated/i)
+    expect(res.billsCreated).toBe(4)
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
+    for (const r of rows) expect(Number(r.charge_amount)).toBe(23.50)
+    // The landlord recovers the provider's bill exactly.
+    expect(rows.reduce((s: number, r: any) => s + Number(r.charge_amount), 0)).toBe(94)
   })
 
-  // A zero-usage read is LEGITIMATE (an empty spot, a tenant away all month) and
-  // must not be treated as a failure at all.
-  it('a zero-usage submeter read is normal — bills with a full pool', async () => {
+  it('THE OAK PARK REGRESSION: a wildly wrong submeter read cannot zero the RUBS bills', async () => {
+    // August 2026: MH 09's submeter was keyed 22100 → 227700 instead of ~22770.
+    // Priced against a $94.01 water bill the carve-out was $2,056, the pool
+    // floored at zero, and every RV spot on the property was billed $0.00 for
+    // water with nothing on screen to say why. One unit's typo silently wiped
+    // out eight other units' bills AND the landlord's cost recovery.
     const base = await seedBaseProperty()
-    const { masterId, submeterId } = await seedMasterWithSubmeteredUnit(base)
-    await attachMeterToUnit(masterId, (await seedUnitWithActiveTenant(base)).unitId)
-    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId)
-    await seedReading(submeterId, '2026-05-01', 1000, base.landlordUserId) // usage 0
-    await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)
+    const c = await db.connect()
+    let masterId = '', submeterId = ''
+    try {
+      await c.query('BEGIN')
+      masterId   = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      submeterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(masterId, 'occupant_count')
+    await db.query(
+      `UPDATE utility_meters SET rubs_basis='bill_amount', rate_per_unit=0, base_fee=0 WHERE id=$1`,
+      [masterId])
+    await setMeterRateBase(submeterId, 0.01, 0)
+
+    const mh = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(submeterId, mh.unitId)
+    await seedReading(submeterId, '2026-04-01', 22100, base.landlordUserId)
+    await seedReading(submeterId, '2026-05-01', 227700, base.landlordUserId) // the typo
+
+    const rv1 = await seedUnitWithActiveTenant(base)
+    const rv2 = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(masterId, rv1.unitId)
+    await attachMeterToUnit(masterId, rv2.unitId)
+    await seedReading(masterId, '2026-05-01', 710, base.landlordUserId, { billAmount: 94.01 })
+
     const res = await generateBillsForMeter(masterId, new Date(2026, 4, 1))
-    expect(res.billsCreated).toBeGreaterThan(0)
-    expect(res.reason).toBeUndefined()   // nothing was estimated
+    const { rows } = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
+    expect(res.billsCreated).toBe(2)
+    // Whole bill, split two ways — the neighbour's meter is irrelevant to it.
+    expect(rows.map((r: any) => Number(r.charge_amount)).sort()).toEqual([47.00, 47.01])
   })
 
-  it('STILL BILLS when submetered usage exceeds the master reading (bad reading)', async () => {
+  it('a legacy unit on BOTH bills its submeter and is left out of the split, and says so', async () => {
+    // The one-meter rule is enforced by a DB trigger, so this shape can only
+    // arrive from data that predates it. The engine must not double-bill, and
+    // must name the problem instead of absorbing it.
     const base = await seedBaseProperty()
-    const { masterId, submeterId } = await seedMasterWithSubmeteredUnit(base)
-    await attachMeterToUnit(masterId, (await seedUnitWithActiveTenant(base)).unitId)
-    await seedReading(submeterId, '2026-04-01', 1000, base.landlordUserId)
-    await seedReading(submeterId, '2026-05-01', 1400, base.landlordUserId) // usage 400
-    await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)   // master 300 < 400
+    const c = await db.connect()
+    let masterId = '', submeterId = ''
+    try {
+      await c.query('BEGIN')
+      masterId   = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      submeterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(masterId, 'occupant_count')
+    await setMeterRateBase(masterId, 0.01, 0)
+    await setMeterRateBase(submeterId, 0.01, 0)
+    const mh = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(submeterId, mh.unitId)
+    // Bypasses the trigger the way legacy rows did: the link predates it.
+    await db.query(`ALTER TABLE utility_meter_units DISABLE TRIGGER trg_one_meter_per_unit_utility`)
+    await attachMeterToUnit(masterId, mh.unitId)
+    await db.query(`ALTER TABLE utility_meter_units ENABLE TRIGGER trg_one_meter_per_unit_utility`)
+    const u1 = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(masterId, u1.unitId)
+    await seedReading(masterId, '2026-05-01', 300, base.landlordUserId)
+
     const res = await generateBillsForMeter(masterId, new Date(2026, 4, 1))
-    // Pool clamps to zero rather than going negative; the base fee still bills.
-    expect(res.billsCreated).toBeGreaterThan(0)
-    expect(res.reason).toMatch(/exceeded the master reading/i)
+    expect(res.billsCreated).toBe(1)          // u1 only
+    expect(res.reason).toMatch(/on both this master and a .* submeter/i)
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [masterId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].unit_id).toBe(u1.unitId)
+    expect(Number(rows[0].charge_amount)).toBe(3)   // 300 gal × 1¢, whole
+  })
+})
+
+// ─── S634: one meter type per unit, per utility ──────────────
+
+describe('utility_meter_units — one meter per unit per utility (S634)', () => {
+  // Nic: "The same unit cannot have two meter types for the same utility. It
+  // can't be part of one RUBS system and one submeter system. It could be one in
+  // one for separate utilities, but not for the same utility."
+  async function twoMeters(base: BaseCtx, aType: string, bType: string) {
+    const c = await db.connect()
+    let a = '', b = ''
+    try {
+      await c.query('BEGIN')
+      a = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      b = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(`UPDATE utility_meters SET utility_type=$2 WHERE id=$1`, [a, aType])
+    await db.query(`UPDATE utility_meters SET utility_type=$2 WHERE id=$1`, [b, bType])
+    return { a, b }
+  }
+
+  it('refuses a second meter of the same utility on one unit', async () => {
+    const base = await seedBaseProperty()
+    const { a, b } = await twoMeters(base, 'water', 'water')
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(a, u.unitId)
+    await expect(attachMeterToUnit(b, u.unitId)).rejects.toThrow(/only be on one water meter/i)
+  })
+
+  it('refuses a RUBS master on a unit that already has a submeter of that utility', async () => {
+    const base = await seedBaseProperty()
+    const { a, b } = await twoMeters(base, 'water', 'water')
+    await setMeterRubs(b, 'occupant_count')
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(a, u.unitId)
+    await expect(attachMeterToUnit(b, u.unitId)).rejects.toThrow(/only be on one water meter/i)
+  })
+
+  it('ALLOWS different utilities on different meter kinds — that is normal', async () => {
+    const base = await seedBaseProperty()
+    const { a, b } = await twoMeters(base, 'water', 'electric')
+    await setMeterRubs(b, 'occupant_count')
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(a, u.unitId)
+    await attachMeterToUnit(b, u.unitId)   // must not throw
+    const { rows } = await db.query<any>(
+      `SELECT 1 FROM utility_meter_units WHERE unit_id=$1`, [u.unitId])
+    expect(rows).toHaveLength(2)
+  })
+
+  it('refuses to RETYPE a meter into a collision', async () => {
+    const base = await seedBaseProperty()
+    const { a, b } = await twoMeters(base, 'water', 'electric')
+    const u = await seedUnitWithActiveTenant(base)
+    await attachMeterToUnit(a, u.unitId)
+    await attachMeterToUnit(b, u.unitId)
+    await expect(
+      db.query(`UPDATE utility_meters SET utility_type='water' WHERE id=$1`, [b]),
+    ).rejects.toThrow(/already on another water meter/i)
   })
 })
 
@@ -1944,6 +2061,70 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(again.released).toBe(0)
     const still = await db.query<any>(`SELECT id FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
     expect(still.rows).toHaveLength(1)
+  })
+
+  /**
+   * S634 — BILLING IT BACK MUST CLEAR WHAT IS ALREADY HELD.
+   *
+   * Nic, on RV 02 and RV 03: "I clicked to bill back anyway, and it said it
+   * wasn't gonna start until the next bill. It needs to start immediately with
+   * those suspended amounts from the previous meter reads."
+   *
+   * The held share is real metered usage the other residents were already
+   * charged around — the money exists, it just had nobody responsible for it.
+   * Turning the utility on and applying it only from the NEXT cycle silently
+   * writes that month off.
+   */
+  it('S634: a lease that refused the utility, then billed back, gets the held share NOW', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
+      await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // The lease EXPLICITLY refuses water, so releasing on signature cancels
+      // the hold rather than billing it — lease is law.
+      await c.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1,'water',false)`, [leaseId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const refused = await releaseSuspendedChargesForLease({
+      unitId: invited.unitId, leaseId, tenantId: invited.tenantId, landlordId: base.landlordId })
+    expect(refused.released).toBe(0)
+
+    // Now the landlord bills it back — an addendum, agreed on paper. The held
+    // share must land immediately, not next cycle.
+    await db.query(
+      `UPDATE lease_utility_responsibilities SET tenant_responsible = true
+        WHERE lease_id = $1 AND utility_type = 'water'`, [leaseId])
+    await db.query(
+      `UPDATE suspended_utility_charges SET cancelled_at = NULL WHERE unit_id = $1`, [invited.unitId])
+
+    const out = await releaseSuspendedChargesForLease({
+      unitId: invited.unitId, leaseId, tenantId: invited.tenantId, landlordId: base.landlordId })
+    expect(out.released).toBe(1)
+    expect(out.amount).toBe(50)
+
+    const bill = await db.query<any>(
+      `SELECT charge_amount, to_char(billing_cycle_month, 'YYYY-MM') AS cycle
+         FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bill.rows).toHaveLength(1)
+    expect(Number(bill.rows[0].charge_amount)).toBe(50)
+    // Dated to the cycle the usage happened in, not to today — the tenant is
+    // billed for May's water, in May's cycle, however late it is released.
+    expect(bill.rows[0].cycle).toBe('2026-05')
   })
 
   // S629 ORDER HAZARD (Nic, launch): at Oak Park the residents already live

@@ -63,77 +63,6 @@ function cycleUsageFromReadings(
   return usage * (multiplier > 0 ? multiplier : 1)
 }
 
-/** S558/S605: a linked submeter's usage for the cycle, for RUBS pool exclusion.
- *
- *  S605 (Nic, DIRECTIVE): this NEVER blocks. It used to return { blocked } for
- *  an unread, flagged, baseline-less or negative submeter, and the caller then
- *  refused to bill the WHOLE master — so one meter nobody could read stopped
- *  the entire property's water bill. Nic: "if one water meter is broken or not
- *  spinning, or somebody was on vacation and it gets a read that shows no
- *  usage... it still needs to bill the water out."
- *
- *  Unresolvable now falls back to the SAME estimate a broken meter already
- *  used since S559 — the lowest usage among comparable units at the property
- *  that cycle. The estimate is deliberately the LOWEST rather than an average:
- *  it is the figure that can be defended to the excluded tenant without
- *  argument, and it keeps the exclusion conservative.
- *
- *  `estimated` tells the caller the number was inferred, so the cycle can be
- *  surfaced for a read-and-correct instead of passing silently. */
-async function submeterCycleUsageForExclusion(
-  meterId: string, cycleIso: string,
-): Promise<{ usage: number; estimated?: string }> {
-  const m = await queryOne<{ digits: number; label: string; out_of_service: boolean; utility_type: string; property_id: string; reading_multiplier: string }>(
-    `SELECT digits, label, out_of_service, utility_type, property_id, reading_multiplier
-       FROM utility_meters WHERE id = $1`, [meterId])
-  if (!m) return { usage: 0, estimated: 'linked submeter not found' }
-  // Broken submeter (S559): no real read, but it must NOT block the RUBS
-  // pool. Its excluded amount is what it actually bills — the lowest
-  // comparable usage (0 when there's no comparable to draw from).
-  if (m.out_of_service) {
-    const est = await estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" is out of service`)
-    return { usage: est.usage }   // long-standing, expected state — not flagged as an anomaly
-  }
-  const cur = await queryOne<any>(
-    `SELECT reading_value, is_rollover, needs_review, reading_date, created_at FROM utility_meter_readings
-      WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle' ORDER BY reading_date DESC LIMIT 1`,
-    [meterId, cycleIso])
-  if (!cur) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" had no reading this cycle`)
-  // A flagged read is a number nobody has confirmed yet. Estimating rather than
-  // using it keeps an obviously-wrong read (stuck meter, transposed digits) out
-  // of the pool math, and the double-check queue still gets it either way.
-  if (cur.needs_review) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" is awaiting a double-check`)
-  // Point-in-time prior (S559) — see generateBillsForMeter.
-  const prior = await queryOne<any>(
-    `SELECT reading_value FROM utility_meter_readings
-      WHERE meter_id = $1 AND (reading_date, created_at) < ($2, $3)
-      ORDER BY reading_date DESC, created_at DESC LIMIT 1`, [meterId, cur.reading_date, cur.created_at])
-  if (!prior) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" has no opening read`)
-  const usage = cycleUsageFromReadings(
-    Number(cur.reading_value), Number(prior.reading_value), !!cur.is_rollover, m.digits,
-    Number(m.reading_multiplier ?? 1))
-  if (usage < 0) return estimateForUnresolvedSubmeter(m, meterId, cycleIso, `"${m.label}" read lower than the previous read`)
-  return { usage }
-}
-
-/** S605: the shared fallback — what a submeter is assumed to have used when its
- *  real usage can't be established this cycle. Mirrors the S559 broken-meter
- *  rule exactly, so a meter that is unread and a meter that is out of service
- *  are excluded on the same basis. 0 when the property has no comparable to
- *  draw from: we never invent a number with no evidence behind it. */
-async function estimateForUnresolvedSubmeter(
-  m: { utility_type: string; property_id: string },
-  meterId: string, cycleIso: string, why: string,
-): Promise<{ usage: number; estimated: string }> {
-  const u = await queryOne<{ unit_type: string | null; rv_amp_service: string | null }>(
-    `SELECT cu.unit_type, cu.rv_amp_service FROM utility_meter_units mu
-       JOIN units cu ON cu.id = mu.unit_id WHERE mu.meter_id = $1 LIMIT 1`, [meterId])
-  const comp = await lowestComparableUsage({
-    brokenMeterId: meterId, propertyId: m.property_id, utilityType: m.utility_type,
-    unitType: u?.unit_type ?? null, rvAmpService: u?.rv_amp_service ?? null, cycleIso,
-  })
-  return { usage: comp ?? 0, estimated: why }
-}
 
 /** S559: lowest comparable submeter usage for a BROKEN meter's cycle.
  *  A meter marked out of service has no valid read, so it bills the LOWEST
@@ -204,58 +133,48 @@ async function lowestComparableUsage(args: {
  *  they're not gonna like it... that just needs to have a blended rate on the
  *  back end to include any fee." One line item on the tenant's bill.
  *
- *  null whenever the unit is not on such a master, the dollar bill has not been
+ *  S634: RESOLVED BY PROPERTY, NOT BY SHARED MASTER MEMBERSHIP. This used to
+ *  find the master by joining utility_meter_units on the submetered unit — the
+ *  unit sat on both meters, which is exactly the shape S634 forbids ("the same
+ *  unit cannot have two meter types for the same utility"). With that link gone
+ *  the lookup returned nothing and every blended submeter silently fell back to
+ *  the property rate, or to zero where none was set.
+ *
+ *  The blended figure is a PROPERTY-level fact anyway — what this park actually
+ *  paid per gallon this cycle — so it is now computed from every blended-mode
+ *  master of that utility on the property: total dollars ÷ total usage. On the
+ *  single-master property (the common case, and Oak Park's mobile-home line)
+ *  that is the identical number it always was. On a two-master property it is
+ *  the honest combined cost rather than whichever master a join happened to
+ *  reach first.
+ *
+ *  null whenever the property has no such master, the dollar bill has not been
  *  entered, or the cycle recorded no usage to divide by — every one of which
  *  falls back to the ordinary rate path rather than blocking. */
 async function blendedRateForUnit(
   unitId: string, utilityType: string, cycleIso: string,
 ): Promise<{ rate: number; masterLabel: string } | null> {
   const row = await queryOne<{ label: string; bill_amount: string; reading_value: string }>(`
-    SELECT m.label, rd.bill_amount, rd.reading_value
-      FROM utility_meter_units mu
-      JOIN utility_meters m ON m.id = mu.meter_id
+    SELECT string_agg(DISTINCT m.label, ', ') AS label,
+           SUM(rd.bill_amount)   AS bill_amount,
+           SUM(rd.reading_value) AS reading_value
+      FROM units tu
+      JOIN utility_meters m ON m.property_id = tu.property_id
                            AND m.billing_method = 'rubs'
                            AND m.rubs_basis = 'bill_amount'
+                           AND m.rubs_submeter_rate = 'blended'
                            AND m.utility_type = $2
       JOIN utility_meter_readings rd ON rd.meter_id = m.id
                                     AND rd.billing_cycle_month = $3
                                     AND rd.reason = 'monthly_cycle'
-     WHERE mu.unit_id = $1
-       AND m.rubs_submeter_rate = 'blended'
-       AND rd.bill_amount IS NOT NULL
-       AND rd.needs_review = FALSE
-       AND rd.reading_value > 0
-     LIMIT 1`, [unitId, utilityType, cycleIso])
-  if (!row) return null
+                                    AND rd.bill_amount IS NOT NULL
+                                    AND rd.needs_review = FALSE
+                                    AND rd.reading_value > 0
+     WHERE tu.id = $1`, [unitId, utilityType, cycleIso])
+  if (!row || row.bill_amount == null || !(Number(row.reading_value) > 0)) return null
   return { rate: Number(row.bill_amount) / Number(row.reading_value), masterLabel: row.label }
 }
 
-/** S607: the rate a submetered unit on a master's line actually bills its
- *  consumption at — the same number the submeter branch will use, so the pool
- *  can subtract the DOLLARS that unit was charged instead of assuming a rate.
- *
- *  'blended' follows the master (dollars ÷ usage): everyone on the line pays an
- *  identical cost per unit and the pool carries no variance.
- *  'property_rate' (default) uses the rate the landlord published — Nic's penny
- *  a gallon for the mobile homes: the same number every month, checkable at the
- *  door, with the variance landing on the pool instead of the metered tenant.
- *
- *  Deliberately NOT capped by the prevailing-residential ceiling. Where that
- *  ceiling reduces a submetered tenant's bill, the shortfall is the landlord's
- *  to absorb — subtracting the uncapped amount keeps it off the neighbouring
- *  units, who did not cause it and cannot see it. */
-async function submeterConsumptionRate(
-  submeterId: string, blendedRate: number | null, mode: string,
-): Promise<number> {
-  if (mode === 'blended' && blendedRate != null) return blendedRate
-  const sm = await queryOne<{ rate_per_unit: string | null; property_id: string; utility_type: string }>(
-    `SELECT rate_per_unit, property_id, utility_type FROM utility_meters WHERE id = $1`, [submeterId])
-  if (!sm) return 0
-  const pr = await queryOne<{ rate_per_unit: string | null }>(
-    `SELECT rate_per_unit FROM property_utility_rates
-      WHERE property_id = $1 AND utility_type = $2`, [sm.property_id, sm.utility_type])
-  return Number((pr?.rate_per_unit ?? sm.rate_per_unit) || 0)
-}
 
 /** S607: the statutory ceiling on what a SUBMETERED tenant may be charged per
  *  unit of usage — A.R.S. § 33-1413.01(B) for mobile home parks and
@@ -267,9 +186,10 @@ async function submeterConsumptionRate(
  *  land above what a single-family customer pays for the same water.
  *
  *  NULL (not looked up yet) means no cap — this must never block a bill. Where
- *  it does apply the LANDLORD absorbs the difference; see the caller in the RUBS
- *  branch, which subtracts the uncapped amount from the pool so the shortfall is
- *  never quietly pushed onto the neighbouring spaces. */
+ *  it does apply the LANDLORD absorbs the difference. Under S634 that is
+ *  automatic: the RUBS pool is the whole master bill and no submeter's charge is
+ *  subtracted from it, so a capped submetered tenant's shortfall cannot reach
+ *  the neighbouring spaces by construction. */
 async function prevailingRateCap(propertyId: string, utilityType: string): Promise<number | null> {
   const r = await queryOne<{ prevailing_residential_rate: string | null }>(
     `SELECT prevailing_residential_rate FROM property_utility_rates
@@ -846,51 +766,51 @@ export async function generateBillsForMeter(
         AND smu.unit_id = ANY($1::uuid[])`,
     [units.map((u: any) => u.unit_id), meter.utility_type])
   const excludedUnitIds = new Set(subOnUnit.map(r => r.unit_id))
-  let excludedUsage = 0
-  // S605 (Nic, DIRECTIVE): "we need to block the behavior that stops the bill
-  // from going out for the master bill." One unread or flagged submeter used to
-  // abort the ENTIRE property's water bill — the landlord simply didn't get
-  // paid for water that month because somebody was on vacation. The exclusion
-  // now always resolves to a number (estimated where it must be), so the master
-  // always bills. Anything inferred is collected and reported so the landlord
-  // knows which meters to chase, rather than the whole bill silently vanishing.
   const estimatedNotes: string[] = []
-  // S607 (Nic, DIRECTIVE): the pool subtracts DOLLARS, not usage. Nic: "we set
-  // the utility rate at a penny per gallon for submeter usage for water. We bill
-  // the entire rate, and then we need to subtract not the usage from the pool
-  // for the RUBS, but the remaining dollar amount. That way it still zeros out."
+  // S634 (Nic, DIRECTIVE) — THE RUBS PORTION COMES OFF THE WHOLE BILL, FIRST.
   //
-  // Subtracting usage × the master's blended rate only closes when the submeters
-  // are billed at that same blended rate. The moment they are billed at a
-  // published rate instead — a predictable penny a gallon the tenant can check —
-  // the arithmetic stops closing and the pool silently runs short or over.
-  // Subtracting what those units were ACTUALLY charged for consumption always
-  // closes, whatever rate each one paid.
-  let excludedDollars = 0
-  for (const s of subOnUnit) {
-    const r = await submeterCycleUsageForExclusion(s.submeter_id, cycleIso)
-    if (r.estimated) estimatedNotes.push(r.estimated)
-    excludedUsage += r.usage
-    excludedDollars += r.usage * await submeterConsumptionRate(
-      s.submeter_id, blendedRate, meter.rubs_submeter_rate)
-  }
-  // S605: exclusions exceeding the master reading means a bad read somewhere,
-  // but aborting is still the wrong response — it was the abort that lost the
-  // landlord the whole bill. Clamp the pool at zero (the RUBS units are charged
-  // nothing rather than a negative), bill the base fee, and report it loudly.
-  if (excludedUsage > masterUsage) {
+  // Nic, verbatim: "The RUBS system needs to bill off of the total dollar amount
+  // divided by occupancy off the master bill. Submeters bill off of the gallons
+  // usage after. RUBS portion is divided out first. The RUBS people eat the full
+  // bill. Submeter is extra."
+  //
+  // WHAT THIS REPLACES. Every version of this code up to S607 treated the
+  // submetered units as a CARVE-OUT: price their measured gallons, subtract that
+  // from the master, and split what was left across the RUBS units. Two settings
+  // (`rubs_exclusion_mode` = 'usage' | 'dollars') existed only to argue about how
+  // to measure the carve-out. All of it is gone.
+  //
+  // WHY THE CARVE-OUT WAS WRONG, AND NOT JUST IMPRECISE. It made the RUBS units'
+  // bill a function of somebody else's meter. At Oak Park in August a single
+  // mis-keyed submeter read (22100 typed as 227700 on MH 09) priced that unit's
+  // "share" at $2,056 against a $94.01 water bill. The carve-out consumed the
+  // entire pool, the clamp floored it at zero, and every RUBS unit on the
+  // property was billed $0.00 for water — the landlord ate the whole bill and
+  // nothing in the product said so. A model where one unit's typo silently zeroes
+  // eight other units' bills is not a rounding problem.
+  //
+  // THE MODEL NOW. The master bill divides across the RUBS units by occupancy,
+  // whole. Submetered units are not part of that split and do not reduce it —
+  // they bill their own measured gallons, on top, as separate revenue. The
+  // landlord recovers the provider's bill from the RUBS side no matter what any
+  // submeter reads, and the submeters are the extra. That is what "the RUBS
+  // people eat the full bill, submeter is extra" means, and it is the shape that
+  // cannot be broken by a bad read on a meter that belongs to someone else.
+  //
+  // Under S634's one-meter-type-per-utility rule a unit can no longer be on both
+  // this master and a same-utility submeter, so `subOnUnit` is empty on any
+  // correctly-configured property. It is still honoured for legacy rows — such a
+  // unit bills its submeter, not a RUBS share — and reported, because a landlord
+  // whose data predates the constraint should be told which unit to fix.
+  if (excludedUnitIds.size > 0) {
     estimatedNotes.push(
-      `submetered usage (${excludedUsage}) exceeded the master reading (${masterUsage}) — check the readings`)
-    excludedUsage = masterUsage
+      `${excludedUnitIds.size} unit${excludedUnitIds.size === 1 ? ' is' : 's are'} on both this master `
+      + `and a ${meter.utility_type} submeter — they were billed on the submeter and left out of the `
+      + `RUBS split. A unit should be on one or the other for a given utility.`)
   }
-  if (billAmount != null && excludedDollars > billAmount) {
-    estimatedNotes.push(
-      `submetered charges ($${excludedDollars.toFixed(2)}) exceeded the bill ($${billAmount.toFixed(2)}) — check the readings and the rate`)
-    excludedDollars = billAmount
-  }
-  // Only the units WITHOUT their own submeter split the remaining pool.
+  // Only the units WITHOUT their own submeter split the pool.
   const rubsUnits = units.filter((u: any) => !excludedUnitIds.has(u.unit_id))
-  const totalUsage = masterUsage - excludedUsage
+  const totalUsage = masterUsage
   if (meter.rubs_basis === 'bill_amount' && billAmount == null) {
     return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
       reason: 'this master bills from the utility bill total, which has not been entered for this cycle' }
@@ -901,15 +821,9 @@ export async function generateBillsForMeter(
   // reconstruct, and forcing a usage figure to make the arithmetic work would be
   // asking the landlord to invent one.
   //
-  // The one case that genuinely needs it: when submetered units sit on this line,
-  // their share has to be carved out of the pool, and that carve-out is measured
-  // in usage. With no submeters there is nothing to carve — the whole bill simply
-  // divides across the units.
-  if (billAmount != null && masterUsage <= 0 && subOnUnit.length > 0) {
-    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
-      reason: `total usage is needed on this master — ${subOnUnit.length} submetered `
-        + `unit${subOnUnit.length === 1 ? '' : 's'} on this line must be subtracted from the pool` }
-  }
+  // S634 (Nic, DIRECTIVE) — THERE IS NO CARVE-OUT. See the pool note below: the
+  // RUBS units divide the WHOLE bill, so a master with no usage figure still
+  // divides cleanly whether or not submetered units sit on the line.
   // Blended mode substitutes the RATE only. A base fee configured here is the
   // LANDLORD'S own addition on top of the provider's bill — the admin/margin
   // lever RUBS billers normally charge — so it still applies. Left at 0 (the
@@ -938,29 +852,12 @@ export async function generateBillsForMeter(
          WHERE property_id = $1 AND utility_type = 'sewer'
       `, [meter.property_id]))?.tax_rate_pct || 0)
     : 0
-  // In blended mode the pool is DOLLARS: the whole bill, less what the submetered
-  // units on this line bill at the same blended rate. When no usage was recorded
-  // (bill-total-only, above) there is nothing to subtract and the pool is simply
-  // the bill.
-  // S607 (Nic, DIRECTIVE): the carve-out is the landlord's CHOICE.
-  //   'usage'   — take the submetered units' measured usage off the top and
-  //               price what is left. The long-standing behaviour, and the
-  //               default, so no master changes shape without being told to.
-  //   'dollars' — take off what those units were actually invoiced. Closes at
-  //               any submeter rate, because it subtracts the invoices rather
-  //               than re-deriving them from a rate they may not have used.
-  // Identical whenever the submeters bill at the master's blended rate; they
-  // diverge exactly when the landlord publishes a separate submeter rate.
-  const totalWaterCharge = billAmount != null
-    ? (blendedRate == null
-        // Bill-total-only (no usage figure recorded). There is nothing to carve
-        // out — the guard above refuses this shape when submetered units are on
-        // the line — so the bill divides whole, whichever carve-out is selected.
-        ? billAmount
-        : meter.rubs_exclusion_mode === 'dollars'
-          ? (billAmount - excludedDollars)
-          : totalUsage * ratePerUnit) + totalBaseFee
-    : totalUsage * ratePerUnit + totalBaseFee
+  // S634: the pool is the WHOLE bill (or the whole master usage priced at the
+  // rate), plus whatever the landlord layers on. Nothing is subtracted — see the
+  // directive above. `rubs_exclusion_mode` no longer has anything to select
+  // between and is dead config; it is left on the table so no existing master
+  // fails to load, and the S607 migration comment marks it superseded.
+  const totalWaterCharge = (billAmount != null ? billAmount : totalUsage * ratePerUnit) + totalBaseFee
   const totalSewerCharge = totalUsage * sewerRate
   const totalCharge = totalWaterCharge + totalSewerCharge
 

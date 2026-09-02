@@ -15,12 +15,13 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
-import { db } from '../db'
+import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedUtilityMeter,
 } from '../test/dbHelpers'
 import { utilityRouter } from './utility'
+import { openReadingRun, getRunMeters, isRunFullyRead } from '../services/utilityReadingRuns'
 import { errorHandler } from '../middleware/errorHandler'
 import { lastBusinessDayOfMonth } from '../services/utilityReadingRuns'
 import { generateInvoices } from '../jobs/invoiceGeneration'
@@ -619,29 +620,32 @@ describe('S558 RUBS invoice gate', () => {
     expect(Number(inv.rows[0].subtotal_utilities)).toBeCloseTo(40.0, 2)
   })
 
-  it('an unread submeter on one of the master units also holds the RUBS unit invoice', async () => {
+  // S634 (Nic, DIRECTIVE) INVERTED THIS TEST. It used to assert that a submeter
+  // left unread anywhere on the master's line HELD the RUBS tenant's invoice,
+  // because the pool could not be computed without it. The pool no longer
+  // depends on any submeter — the RUBS units divide the whole bill — so one
+  // neighbour's unread meter must not sit on somebody else's invoice.
+  it('a neighbour\'s unread submeter no longer holds the RUBS unit invoice', async () => {
     const app = buildApp()
     const f = await seed()
     const masterId = await addRubsMaster(f)
-    // unit2 is ALSO served by the master and has its own water submeter — so
-    // the master's pool depends on it. Leave that submeter unread this cycle.
     const c = await db.connect()
     let subId = ''
     try {
       await c.query('BEGIN')
       subId = await seedUtilityMeter(c, { propertyId: f.propertyAId, utilityType: 'water', billingMethod: 'submeter' })
       await c.query(`UPDATE utility_meters SET rate_per_unit=0.01 WHERE id=$1`, [subId])
-      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [subId, f.unit2Id])       // submeter on unit2
-      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [masterId, f.unit2Id])    // unit2 also on the master
+      // S634: unit2 is submetered, so it is on the submeter ONLY.
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [subId, f.unit2Id])
       await c.query('COMMIT')
     } finally { c.release() }
     const run = await openRun(app, f)
     await enterReading(app, f, run.id, f.meterLeased, 1250)
     await enterReading(app, f, run.id, f.meterVacant, 560)
-    await enterReading(app, f, run.id, masterId, 500)   // master read…
-    // …but unit2's submeter is left unread → pool unknowable → hold.
+    await enterReading(app, f, run.id, masterId, 500)
+    // unit2's submeter is left unread — and unitA's invoice goes out anyway.
     await generateInvoices(AUG)
-    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // still held
+    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(1)
   })
 })
 
@@ -901,10 +905,14 @@ describe('S607: bill_amount RUBS masters', () => {
     const master = await seedDollarMaster(f)
     const run = await openRun(app, f)
 
-    // unitA also has its own water submeter, so it is excluded from the pool
+    // unitA has its own water submeter, so under S634 it comes OFF the master
     // and bills its MEASURED gallons — at the master's blended rate, not at the
-    // property rate. That is what makes the line recover the bill exactly.
+    // property rate. (Pre-S634 it sat on both and its usage was carved out of
+    // the pool. The blended PRICING under test here is unchanged; only the
+    // membership is.)
     await db.query(`UPDATE utility_meters SET rubs_submeter_rate = 'blended' WHERE id = $1`, [master])
+    await db.query(`DELETE FROM utility_meter_units WHERE meter_id=$1 AND unit_id=$2`,
+      [master, f.unitAId])
     const sub = await db.query(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
        VALUES ($1, 'water', 'MH sub', 'submeter', 6, 0) RETURNING id`, [f.propertyAId])
@@ -943,6 +951,8 @@ describe('S607: bill_amount RUBS masters', () => {
       `INSERT INTO property_utility_rates (property_id, utility_type, prevailing_residential_rate)
        VALUES ($1, 'water', 0.012)`, [f.propertyAId])
 
+    await db.query(`DELETE FROM utility_meter_units WHERE meter_id=$1 AND unit_id=$2`,
+      [master, f.unitAId])   // S634: submetered, so not on the master
     const sub = await db.query(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
        VALUES ($1, 'water', 'MH sub', 'submeter', 6, 0) RETURNING id`, [f.propertyAId])
@@ -1067,17 +1077,24 @@ describe('S607: bill total with no usage figure', () => {
     expect(Number(rows[0].charge_amount)).toBeCloseTo(742.19, 2)
   })
 
-  it('says plainly that usage is needed once a submetered unit is on the line', async () => {
+  // S634 (Nic, DIRECTIVE) REPLACED THIS TEST. It used to assert that a bill with
+  // no usage figure REFUSED to bill once a submetered unit was on the line,
+  // because the carve-out was measured in usage and there was none to measure.
+  // There is no carve-out any more — the RUBS units divide the whole bill — so
+  // the usage figure is not needed for anything and the bill goes out.
+  it('divides a usage-less bill even with a submetered unit on the property', async () => {
     const app = buildApp()
     const f = await seed()
     const master = await seedBillOnlyMaster(f)
-    // unitA now has its own gas submeter, so its share must come out of the pool
-    // — and that carve-out is measured in usage.
+    // unit2 has its own gas submeter, so it comes OFF the master (S634: one
+    // meter per unit per utility). unitA is the RUBS side and eats the bill.
+    await db.query(`DELETE FROM utility_meter_units WHERE meter_id=$1 AND unit_id=$2`,
+      [master, f.unit2Id])
     const sub = await db.query(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
        VALUES ($1, 'gas', 'Sub', 'submeter', 6, 0) RETURNING id`, [f.propertyAId])
     await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
-      [sub.rows[0].id, f.unitAId])
+      [sub.rows[0].id, f.unit2Id])
 
     const run = await openRun(app, f)
     await request(app)
@@ -1086,11 +1103,13 @@ describe('S607: bill total with no usage figure', () => {
       .send({ readingValue: 0, billAmount: 742.19 })
 
     const res = await generateBillsForMeter(master, new Date(CYCLE + 'T00:00:00Z'))
-    expect(res.billsCreated).toBe(0)
-    expect(res.reason).toMatch(/total usage is needed/i)
+    expect(res.billsCreated).toBe(1)
+    const rows = (await db.query(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id = $1`, [master])).rows
+    expect(Number(rows[0].charge_amount)).toBeCloseTo(742.19, 2)
   })
 
-  it('still carves submetered usage out when the usage total IS given', async () => {
+  it('does NOT carve the submetered usage out — the RUBS side gets the whole bill', async () => {
     const app = buildApp()
     const f = await seed()
     const master = await seedBillOnlyMaster(f)
@@ -1098,7 +1117,8 @@ describe('S607: bill total with no usage figure', () => {
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
        VALUES ($1, 'gas', 'Sub', 'submeter', 6, 0) RETURNING id`, [f.propertyAId])
     const subId = sub.rows[0].id
-    // unit2 is the submetered one; unitA (rented) splits what's left.
+    await db.query(`DELETE FROM utility_meter_units WHERE meter_id=$1 AND unit_id=$2`,
+      [master, f.unit2Id])
     await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [subId, f.unit2Id])
     await db.query(
       `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
@@ -1108,7 +1128,7 @@ describe('S607: bill total with no usage figure', () => {
     await request(app)
       .post(`/api/utility/reading-runs/${run.id}/meters/${master}/reading`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ readingValue: 1000, billAmount: 1000 })      // blended $1.00 / therm
+      .send({ readingValue: 1000, billAmount: 1000 })
     await request(app)
       .post(`/api/utility/reading-runs/${run.id}/meters/${subId}/reading`)
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -1117,35 +1137,39 @@ describe('S607: bill total with no usage figure', () => {
     await generateBillsForMeter(master, new Date(CYCLE + 'T00:00:00Z'))
     const rows = (await db.query(
       `SELECT charge_amount FROM utility_bills WHERE meter_id = $1`, [master])).rows
-    // $1,000 bill − 200 therms × $1.00 carved out = $800 left for unitA.
+    // S634: the full $1,000 — the submetered unit's 200 therms bill on its own
+    // meter, ON TOP, and never reduce what the RUBS side owes. Was $800.
     expect(rows).toHaveLength(1)
-    expect(Number(rows[0].charge_amount)).toBeCloseTo(800, 2)
+    expect(Number(rows[0].charge_amount)).toBeCloseTo(1000, 2)
   })
 })
 
-// S607 (Nic, DIRECTIVE): "we're going for flexibility here." The submeter rate
-// and the carve-out are two INDEPENDENT settings, both defaulting to what the
-// platform already did. This covers Oak Park's intended combination — mobile
-// homes on a published penny a gallon, the spaces dividing whatever dollars
-// that leaves of the real bill.
-describe('S607: submeter rate × carve-out are independent options', () => {
-  async function seedLine(f: Fixture, opts: { subRate: string; exclMode: string }) {
+// S634 (Nic, DIRECTIVE) DELETED THE CARVE-OUT. This describe used to prove that
+// `rubs_exclusion_mode` chose HOW the submetered units' share came off the pool
+// — 'dollars' (what they were invoiced) or 'usage' (their gallons at the blended
+// rate) — and that the two diverged whenever a published submeter rate was in
+// play. Nothing comes off the pool now: "RUBS portion is divided out first. The
+// RUBS people eat the full bill. Submeter is extra."
+//
+// What survives is the SUBMETER RATE setting, which is a genuinely separate
+// question (what the metered tenant pays per gallon) and is unaffected.
+describe('S634: nothing is carved out of the RUBS pool', () => {
+  async function seedLine(f: Fixture, opts: { subRate: string }) {
     const c = await db.connect()
     try {
       await c.query('BEGIN')
       const master = await seedUtilityMeter(c, { propertyId: f.propertyAId, utilityType: 'water', billingMethod: 'submeter' })
       await c.query(
         `UPDATE utility_meters SET billing_method = 'rubs', rubs_allocation_method = 'rented_spaces',
-                rubs_basis = 'bill_amount', base_fee = 0,
-                rubs_submeter_rate = $2, rubs_exclusion_mode = $3 WHERE id = $1`,
-        [master, opts.subRate, opts.exclMode])
-      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2), ($1,$3)`,
-        [master, f.unitAId, f.unit2Id])
-      // A published $0.01/gal for submetered units at this property.
+                rubs_basis = 'bill_amount', base_fee = 0, rubs_submeter_rate = $2 WHERE id = $1`,
+        [master, opts.subRate])
+      // S634: unit2 is submetered, so it is NOT on the master. unitA is the
+      // whole RUBS side of this line.
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+        [master, f.unitAId])
       await c.query(
         `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit)
          VALUES ($1, 'water', 0.01)`, [f.propertyAId])
-      // unit2 is submetered; unitA (the only OTHER rented unit) takes the pool.
       const sub = await c.query(
         `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
          VALUES ($1, 'water', 'MH sub', 'submeter', 6, 0) RETURNING id`, [f.propertyAId])
@@ -1182,57 +1206,41 @@ describe('S607: submeter rate × carve-out are independent options', () => {
     return Number(pool[0]?.charge_amount ?? 0)
   }
 
-  it('published rate + dollars carve-out: the bill closes exactly', async () => {
+  it('the RUBS side takes the WHOLE bill on a published submeter rate', async () => {
     const app = buildApp()
     const f = await seed()
-    const ids = await seedLine(f, { subRate: 'property_rate', exclMode: 'dollars' })
-    const poolCharge = await runCycle(app, f, ids)
-    // The submetered unit is invoiced 5,000 × $0.01 = $50. The pool takes the
-    // rest of the REAL bill: $2,000 − $50 = $1,950. Together they are the bill.
-    expect(poolCharge).toBeCloseTo(1950, 2)
+    const poolCharge = await runCycle(app, f, await seedLine(f, { subRate: 'property_rate' }))
+    // Was $1,950 — the submetered unit's $50 came off first. Now the RUBS side
+    // eats the bill and the submetered unit's $50 is revenue on top.
+    expect(poolCharge).toBeCloseTo(2000, 2)
   })
 
-  it('published rate + usage carve-out: priced at the blended rate instead', async () => {
+  it('…and on a blended submeter rate, which used to differ', async () => {
     const app = buildApp()
     const f = await seed()
-    const ids = await seedLine(f, { subRate: 'property_rate', exclMode: 'usage' })
-    const poolCharge = await runCycle(app, f, ids)
-    // Usage carve-out: (100,000 − 5,000) × $0.02 blended = $1,900. The
-    // submetered unit still pays only $50, so $50 of the bill goes unrecovered —
-    // the reason Nic wanted the dollars option, and why the setup card warns
-    // about this exact pairing.
-    expect(poolCharge).toBeCloseTo(1900, 2)
+    const poolCharge = await runCycle(app, f, await seedLine(f, { subRate: 'blended' }))
+    // Was $1,900 under either carve-out. The submeter rate no longer touches
+    // the pool at all, so the two settings can no longer disagree about it.
+    expect(poolCharge).toBeCloseTo(2000, 2)
   })
 
-  it('blended rate: both carve-outs agree, because there is one rate', async () => {
-    const app = buildApp()
-    const f = await seed()
-    const byUsage = await runCycle(app, f, await seedLine(f, { subRate: 'blended', exclMode: 'usage' }))
-    const f2 = await seed()
-    const byDollars = await runCycle(app, f2, await seedLine(f2, { subRate: 'blended', exclMode: 'dollars' }))
-    expect(byUsage).toBeCloseTo(1900, 2)
-    expect(byDollars).toBeCloseTo(1900, 2)
-  })
-
-  it('defaults leave a master on the long-standing carve-out', async () => {
+  it('the submeter rate default is untouched — it is a separate question', async () => {
     const c = await db.connect()
     try {
       const r = await c.query(
         `SELECT column_default FROM information_schema.columns
-          WHERE table_name = 'utility_meters' AND column_name IN ('rubs_exclusion_mode','rubs_submeter_rate')
-          ORDER BY column_name`)
-      expect(r.rows[0].column_default).toContain('usage')          // exclusion_mode
-      expect(r.rows[1].column_default).toContain('property_rate')  // submeter_rate
+          WHERE table_name = 'utility_meters' AND column_name = 'rubs_submeter_rate'`)
+      expect(r.rows[0].column_default).toContain('property_rate')
     } finally { c.release() }
   })
 })
 
-// S607 — Nic's worked example, at a rate where the arithmetic is visible.
-// Master bill $2,000 for 100,000 gal. Two submetered mobile homes at a
-// published $0.03/gal. Two RV spaces split the remaining DOLLARS by headcount,
-// so two people pay twice what one person pays. Everyone sees one dollar figure.
-describe('S607: worked example — $0.03/gal submeters, remainder by occupancy', () => {
-  it('subtracts submeter dollars and splits the rest per person', async () => {
+// S634 — Nic's worked example, re-cut to the model he ruled. Master bill $2,000
+// for 100,000 gal. A submetered mobile home on a published $0.03/gal. Two RV
+// spaces divide the WHOLE $2,000 by headcount, so two people pay twice what one
+// person pays. The mobile home's $240 is extra on top, not a deduction.
+describe('S634: worked example — RUBS eats the bill, submeter is extra', () => {
+  it('splits the whole bill per person and bills the submeter on top', async () => {
     const app = buildApp()
     const f = await seed()
     const c = await db.connect()
@@ -1261,12 +1269,13 @@ describe('S607: worked example — $0.03/gal submeters, remainder by occupancy',
       await c.query(
         `UPDATE utility_meters SET billing_method='rubs', rubs_allocation_method='occupant_count',
                 rubs_basis='bill_amount', rubs_submeter_rate='property_rate',
-                rubs_exclusion_mode='dollars', base_fee=0 WHERE id=$1`, [master])
-      // The master feeds the mobile home AND both spaces.
-      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2), ($1,$3), ($1,$4)`,
-        [master, f.unitAId, spot1, spot2])
+                base_fee=0 WHERE id=$1`, [master])
+      // S634: the master feeds the two SPACES. The mobile home is submetered,
+      // so it is not on the master at all.
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2), ($1,$3)`,
+        [master, spot1, spot2])
 
-      // unitA is submetered — it falls out of the split automatically.
+      // unitA's own submeter — its whole billing relationship for water.
       const r = await c.query(
         `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
          VALUES ($1,'water','MH 01 water','submeter',6,0) RETURNING id`, [f.propertyAId])
@@ -1301,17 +1310,19 @@ describe('S607: worked example — $0.03/gal submeters, remainder by occupancy',
     // Mobile home: 8,000 × $0.03 = $240 — its own published rate, nothing else.
     expect(Number(mh[0].charge_amount)).toBeCloseTo(240, 2)
 
-    // Pool: $2,000 − $240 = $1,760, split by headcount across 1 + 2 people.
+    // Pool: the WHOLE $2,000, split by headcount across 1 + 2 people.
     const one = pool.find((r: any) => r.unit_id === spot1!)
     const two = pool.find((r: any) => r.unit_id === spot2!)
     expect(Number(one.allocation_basis)).toBe(1)
     expect(Number(two.allocation_basis)).toBe(2)
-    expect(Number(one.charge_amount)).toBeCloseTo(586.67, 2)   // 1,760 × 1/3
-    expect(Number(two.charge_amount)).toBeCloseTo(1173.33, 2)  // 1,760 × 2/3 — twice the single occupant
+    expect(Number(one.charge_amount)).toBeCloseTo(666.67, 2)   // 2,000 × 1/3
+    expect(Number(two.charge_amount)).toBeCloseTo(1333.33, 2)  // 2,000 × 2/3 — twice the single occupant
 
-    // And the whole bill is accounted for, to the cent.
+    // The RUBS side alone recovers the provider's bill exactly…
+    expect(pool.reduce((s: number, r: any) => s + Number(r.charge_amount), 0)).toBeCloseTo(2000, 2)
+    // …and the submeter is revenue ON TOP of it, which is the whole point.
     const total = Number(mh[0].charge_amount) + pool.reduce((s: number, r: any) => s + Number(r.charge_amount), 0)
-    expect(total).toBeCloseTo(2000, 2)
+    expect(total).toBeCloseTo(2240, 2)
   })
 })
 
@@ -1452,12 +1463,13 @@ describe('S607: several master meters on one property', () => {
         await c.query(
           `UPDATE utility_meters SET billing_method='rubs', rubs_allocation_method='rented_spaces',
                   rubs_basis='bill_amount', rubs_submeter_rate='property_rate',
-                  rubs_exclusion_mode='dollars', base_fee=0, label=$2 WHERE id=$1`,
+                  base_fee=0, label=$2 WHERE id=$1`,
           [m, `Master ${i + 1}`])
         await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [m, unit])
         M.push(m); U.push(unit)
       }
-      // Master 3 also feeds a SUBMETERED unit, which must affect master 3 only.
+      // A submetered unit sits alongside master 3's line. S634: it is on its
+      // own meter only, and it must not change ANY master's arithmetic.
       const subUnit = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
       const subLease = await seedLease(c, { unitId: subUnit, landlordId: f.landlordAId, status: 'active' })
       const st = await seedTenant(c)
@@ -1465,7 +1477,6 @@ describe('S607: several master meters on one property', () => {
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
          VALUES ($1,'water',TRUE)`, [subLease])
-      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [M[2], subUnit])
       const sr = await c.query(
         `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits, base_fee)
          VALUES ($1,'water','MH sub','submeter',6,0) RETURNING id`, [f.propertyAId])
@@ -1502,10 +1513,11 @@ describe('S607: several master meters on one property', () => {
     expect(await charge(M[1])).toBeCloseTo(500, 2)
     // Submetered unit pays its own measured usage at the published rate.
     expect(await charge(subId)).toBeCloseTo(40, 2)          // 4,000 × $0.01
-    // Master 3's pool is ITS bill less ITS submeter's invoice: $900 − $40.
-    expect(await charge(M[2])).toBeCloseTo(860, 2)
-    // Every line closes on its own bill.
-    expect(await charge(M[0]) + await charge(M[1]) + await charge(M[2]) + await charge(subId))
+    // S634: master 3's pool is its WHOLE bill. Was $860 ($900 less the $40
+    // submeter invoice).
+    expect(await charge(M[2])).toBeCloseTo(900, 2)
+    // Every master recovers its own bill in full, and the submeter is on top.
+    expect(await charge(M[0]) + await charge(M[1]) + await charge(M[2]))
       .toBeCloseTo(300 + 500 + 900, 2)
   })
 
@@ -1531,7 +1543,7 @@ describe('S607: several master meters on one property', () => {
     const r = await request(app).post(`/api/utility/meters/${M[1]}/units`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ unitId: f.unitAId })
     expect(r.status).toBe(400)
-    expect(r.body.error).toMatch(/only be on one master meter/i)
+    expect(r.body.error).toMatch(/only be on one water meter/i)
   })
 })
 
@@ -1605,4 +1617,143 @@ describe('S607: rented_spaces vs occupant_count — recovery and fairness', () =
     expect(r.total).toBeCloseTo(900, 2)     // still nothing left on the landlord
   })
 
+})
+
+// S631 (Nic): "My brother can input the electric meter reads himself, but the
+// water bill comes to me in the mail. Can it be two separate flows?"
+describe('S631 utility-scoped reading runs', () => {
+  it('an electric run completes and bills while water is still outstanding', async () => {
+    const client = await getClient()
+    let propertyId: string, elecMeterId: string, waterMeterId: string, landlordId: string, readerUserId: string
+    try {
+      const { userId: ownerUserId, landlordId: lid } = await seedLandlord(client)
+      landlordId = lid; readerUserId = ownerUserId
+      propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+      const mk = async (utility: string) => {
+        const m = await client.query(
+          `INSERT INTO utility_meters (property_id, utility_type, label,
+                                       billing_method, base_fee, digits)
+           VALUES ($1,$2,$3,'submeter',0,5) RETURNING id`,
+          [propertyId, utility, `${utility} meter`])
+        await client.query(
+          `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+          [m.rows[0].id, unitId])
+        return m.rows[0].id as string
+      }
+      elecMeterId = await mk('electric')
+      waterMeterId = await mk('water')
+    } finally { client.release() }
+
+    const cycle = '2026-05-01'
+    const elecRun = await openReadingRun(propertyId!, cycle, { notify: false, utilityType: 'electric' })
+    const waterRun = await openReadingRun(propertyId!, cycle, { notify: false, utilityType: 'water' })
+    expect(elecRun.id).not.toBe(waterRun.id)
+
+    // The electric walk lists ONLY electric — the reader is never handed a
+    // water meter they have no number for.
+    const elecMeters = await getRunMeters(elecRun.id)
+    expect(elecMeters.map((m: any) => m.utility_type)).toEqual(['electric'])
+
+    // Reading every electric meter finishes the electric run, even though the
+    // water meter has never been touched. This is the whole point.
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+       VALUES ($1, '2026-05-31', 100, $2, 'monthly_cycle', $3)`,
+      [elecMeterId!, cycle, readerUserId!])
+    expect(await isRunFullyRead(elecRun.id)).toBe(true)
+    expect(await isRunFullyRead(waterRun.id)).toBe(false)
+  })
+
+  it('a whole-property run (utility_type NULL) still waits for every meter', async () => {
+    const client = await getClient()
+    let propertyId: string, elecMeterId: string, landlordId: string, readerUserId: string
+    try {
+      const { userId: ownerUserId, landlordId: lid } = await seedLandlord(client)
+      landlordId = lid; readerUserId = ownerUserId
+      propertyId = await seedProperty(client, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+      for (const utility of ['electric', 'water']) {
+        const m = await client.query(
+          `INSERT INTO utility_meters (property_id, utility_type, label,
+                                       billing_method, base_fee, digits)
+           VALUES ($1,$2,$3,'submeter',0,5) RETURNING id`,
+          [propertyId, utility, `${utility} meter`])
+        await client.query(
+          `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+          [m.rows[0].id, unitId])
+        if (utility === 'electric') elecMeterId = m.rows[0].id
+      }
+    } finally { client.release() }
+
+    const cycle = '2026-06-01'
+    const run = await openReadingRun(propertyId!, cycle, { notify: false })
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+       VALUES ($1, '2026-06-30', 100, $2, 'monthly_cycle', $3)`,
+      [elecMeterId!, cycle, readerUserId!])
+    // Unscoped runs are unchanged — one reader, one walk, all meters.
+    expect(await isRunFullyRead(run.id)).toBe(false)
+  })
+})
+
+// S631 (Nic): "I don't want two people reading meters and accidentally
+// overwriting each other by typoing on a spot that was already done."
+describe('S631 a second person cannot silently replace a read', () => {
+  it('refuses another user\'s overwrite, allows the original reader to correct', async () => {
+    const client = await getClient()
+    let propertyId: string, meterId: string, landlordId: string
+    let ownerUserId: string, coOwnerUserId: string
+    try {
+      const owner = await seedLandlord(client)
+      landlordId = owner.landlordId; ownerUserId = owner.userId
+      const co = await seedLandlord(client)
+      coOwnerUserId = co.userId
+      await client.query(
+        `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1,$2,'owner')
+         ON CONFLICT DO NOTHING`, [landlordId, coOwnerUserId])
+      propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId })
+      // TWO meters: one read must not finish the run, or the second call is
+      // refused for being late to a completed run rather than for clashing.
+      // S634: one electric meter per unit, so they sit on a unit each.
+      for (const label of ['E1', 'E2']) {
+        const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+        const m = await client.query(
+          `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, base_fee, digits)
+           VALUES ($1,'electric',$2,'submeter',0,5) RETURNING id`, [propertyId, label])
+        await client.query(
+          `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [m.rows[0].id, unitId])
+        if (label === 'E1') meterId = m.rows[0].id
+      }
+    } finally { client.release() }
+
+    const app = buildApp()
+    const tok = (userId: string, profileId: string) => jwt.sign(
+      { userId, role: 'landlord', email: `${userId}@t.dev`, profileId,
+        landlordIds: [profileId], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '10m' })
+
+    const run = await openReadingRun(propertyId!, '2026-07-01', { notify: false })
+    const post = (userId: string, value: number, replace?: boolean) =>
+      request(app)
+        .post(`/api/utility/reading-runs/${run.id}/meters/${meterId!}/reading`)
+        .set('Authorization', `Bearer ${tok(userId, landlordId!)}`)
+        .send({ readingValue: value, ...(replace ? { replace: true } : {}) })
+
+    expect((await post(ownerUserId!, 100)).status).toBe(201)
+    // The other person typos onto a row that was already done.
+    const clash = await post(coOwnerUserId!, 99999)
+    expect(clash.status).toBe(409)
+    expect(String(clash.body.error)).toMatch(/already recorded/i)
+    // The original reader fixing their own number is not a clash.
+    expect((await post(ownerUserId!, 123)).status).toBe(201)
+
+    const kept = await db.query<{ v: string }>(
+      `SELECT reading_value::text AS v FROM utility_meter_readings
+        WHERE meter_id=$1 AND reason='monthly_cycle'`, [meterId!])
+    expect(Number(kept.rows[0].v)).toBe(123)
+  })
 })

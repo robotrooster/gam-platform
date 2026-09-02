@@ -7,7 +7,7 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface OccupancyRow {
   property_count: number
@@ -52,17 +52,17 @@ export const getLandlordPortfolio: AgentTool = {
               COUNT(u.id) FILTER (WHERE u.status IN ('vacant','available'))::int AS vacant_units
          FROM properties p
          LEFT JOIN units u ON u.property_id = p.id
-        WHERE p.landlord_id = $1`,
-      [actor.profileId]
+        WHERE p.landlord_id = ANY($1::uuid[])`,
+      [actorLandlordIds(actor)]
     )
 
     const payouts = await query<PayoutRow>(
       `SELECT amount, status, unit_count, target_date, settled_at
          FROM disbursements
-        WHERE landlord_id = $1
+        WHERE landlord_id = ANY($1::uuid[])
         ORDER BY COALESCE(settled_at, target_date, created_at) DESC
         LIMIT $2`,
-      [actor.profileId, payoutLimit]
+      [actorLandlordIds(actor), payoutLimit]
     )
 
     const o = occ[0]

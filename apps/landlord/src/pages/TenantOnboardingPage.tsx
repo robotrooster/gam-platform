@@ -1,5 +1,7 @@
 import { useState, useRef, useMemo, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
+// S633: an import lands in ONE company. The account names it.
+import { EntityPicker } from '../components/EntityPicker'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
@@ -660,11 +662,27 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
     { enabled: !!propertyIdForWindow, staleTime: 60_000 })
   const windowOpen = !!obWindow?.open
   const [attestExisting, setAttestExisting] = useState(true)
+  // S631 (Nic, DIRECTIVE): "Let's flag on invite so that no matter when they
+  // accept it, the work-trade agreement has inserted it slightly before the
+  // invoice is created." Declared here because a work_trade_agreement needs an
+  // active lease and cannot exist until they sign — by which point the first
+  // invoice is already written, and already chargeable.
+  const [isWorkTrade, setIsWorkTrade] = useState(false)
+  const [wtHours, setWtHours] = useState('')
+  const [wtDuties, setWtDuties] = useState('')
 
   const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
 
   const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-tenant-pending', { ...form, unitId: unitId || undefined, existingResident: !!unitId && windowOpen && attestExisting }),
+    () => apiPost<any>('/landlords/me/onboard-tenant-pending', {
+      ...form,
+      unitId: unitId || undefined,
+      existingResident: !!unitId && windowOpen && attestExisting,
+      // Work trade is per unit — it trades labour for THAT tenancy's rent.
+      isWorkTrade: !!unitId && isWorkTrade,
+      workTradeHoursTarget: isWorkTrade && wtHours ? Number(wtHours) : undefined,
+      workTradeDuties: isWorkTrade ? (wtDuties.trim() || undefined) : undefined,
+    }),
     {
       onSuccess: (res: any) => {
         // Codebase convention: handlers return { success, data: { ... } }.
@@ -819,6 +837,43 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             </div>
           ))}
 
+          {/* S631: work trade, declared before the lease exists. */}
+          {unitId && (
+            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 16 }}>
+              <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer' }}>
+                <input type="checkbox" checked={isWorkTrade}
+                  onChange={e => setIsWorkTrade(e.target.checked)}
+                  style={{ marginTop: 3, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Work trade — they work off their rent</div>
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
+                    Their invoice still issues in full and is credited at month close from the
+                    hours they log. No late fees while they&apos;re working the month off.
+                  </div>
+                </div>
+              </label>
+              {isWorkTrade && (
+                <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                  <div>
+                    <label style={{ fontSize: '.72rem', color: 'var(--text-2)', display: 'block', marginBottom: 3 }}>
+                      Hours per month
+                    </label>
+                    <input className="form-input" type="number" min={1} max={400}
+                      style={{ maxWidth: 140 }} placeholder="property default"
+                      value={wtHours} onChange={e => setWtHours(e.target.value)} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '.72rem', color: 'var(--text-2)', display: 'block', marginBottom: 3 }}>
+                      Duties (optional)
+                    </label>
+                    <input className="form-input" placeholder="e.g. grounds, laundry room, snow"
+                      value={wtDuties} onChange={e => setWtDuties(e.target.value)} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           <button type="submit" disabled={submitMut.isLoading} className="btn btn-primary" style={{ width: '100%' }}>
             {submitMut.isLoading ? 'Adding...' : 'Add tenant to pending pool'}
           </button>
@@ -895,6 +950,10 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
 
 function BulkCsvMode({ onBack }: { onBack: () => void }) {
   const [source, setSource] = useState<string>('generic')
+  // S633: a tenant import lands in ONE company. Single-company accounts never
+  // see the picker; an account that owns several must say which, because a
+  // roster imported into the wrong LLC is unwound tenant by tenant.
+  const [landlordId, setLandlordId] = useState<string>('')
   const [fileName, setFileName] = useState<string>('')
   const [csvText, setCsvText] = useState<string>('')
   const [punchListRows, setPunchListRows] = useState<CsvRow[] | null>(null)
@@ -929,7 +988,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   }, [claimedPlatformName])
 
   const validateMut = useMutation(
-    (body: { csv: string; source: string; claimedPlatformName?: string }) => apiPost<ValidateResponse>('/landlords/me/onboard-tenants-csv/validate', body),
+    (body: { csv: string; source: string; claimedPlatformName?: string }) => apiPost<ValidateResponse>('/landlords/me/onboard-tenants-csv/validate', { ...body, landlordId }),
     {
       onSuccess: async (res: any) => {
         const data: ValidateResponse = res.data
@@ -963,6 +1022,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         if (fastPathRows.length > 0) {
           try {
             const commitRes: any = await apiPost<CommitResponse>('/landlords/me/onboard-tenants-csv/commit', {
+              landlordId,
               rows: fastPathRows, source,
               ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
             })
@@ -990,7 +1050,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
           try {
             const limboRes: any = await apiPost<{ created: number; skipped: number; results: Array<{ rowIndex: number; email: string; status: string; intentId?: string; message?: string }> }>(
               '/landlords/me/onboard-tenants-csv/commit-pending',
-              { rows: limboRows }
+              { rows: limboRows, landlordId }
             )
             const l = limboRes.data
             if (l.created > 0) {
@@ -1134,6 +1194,9 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   return (
     <div>
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
+
+      <EntityPicker value={landlordId} onChange={setLandlordId}
+        note="Every tenant in this file is onboarded under this company." />
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
         <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the Source Platform</h2>
@@ -1352,7 +1415,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
       {validateSummary && <ValidateSummary summary={validateSummary} hasPunchList={!!(punchListRows && punchListRows.length > 0)} />}
 
       {punchListRows && punchListRows.length > 0 && (
-        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} onUnitCommitted={handleUnitCommitted} />
+        <PunchList rows={punchListRows} source={source} claimedPlatformName={claimedPlatformName} landlordId={landlordId} onUnitCommitted={handleUnitCommitted} />
       )}
 
       {punchListRows && punchListRows.length === 0 && validateSummary && validateSummary.total > 0 && !fastPathBanner && (
@@ -1396,7 +1459,10 @@ function SummaryStat({ label, value, color, icon }: { label: string; value: numb
 
 // ── Punch list — per-unit cards ─────────────────────────────────────────
 
-function PunchList({ rows, source, claimedPlatformName, onUnitCommitted }: { rows: CsvRow[]; source: string; claimedPlatformName: string; onUnitCommitted: (unitId: string) => void }) {
+// S633: landlordId is threaded down rather than re-resolved here — the company
+// was chosen once, at the top of the import, and every row in the file belongs
+// to it. Re-deriving per card would let one file straddle two companies.
+function PunchList({ rows, source, claimedPlatformName, landlordId, onUnitCommitted }: { rows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; onUnitCommitted: (unitId: string) => void }) {
   // Group by resolvedUnitId. Rows without a resolved unit get a synthetic key per row
   // (so each unmatched row appears as its own card with a clear "add property first" message).
   const groups = useMemo(() => {
@@ -1423,6 +1489,7 @@ function PunchList({ rows, source, claimedPlatformName, onUnitCommitted }: { row
           initialRows={groupRows}
           source={source}
           claimedPlatformName={claimedPlatformName}
+          landlordId={landlordId}
           onCommitted={() => { if (groupRows[0].resolvedUnitId) onUnitCommitted(groupRows[0].resolvedUnitId) }}
         />
       ))}
@@ -1430,7 +1497,7 @@ function PunchList({ rows, source, claimedPlatformName, onUnitCommitted }: { row
   )
 }
 
-function UnitCard({ initialRows, source, claimedPlatformName, onCommitted }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; onCommitted: () => void }) {
+function UnitCard({ initialRows, source, claimedPlatformName, landlordId, onCommitted }: { initialRows: CsvRow[]; source: string; claimedPlatformName: string; landlordId: string; onCommitted: () => void }) {
   const [groupRows, setGroupRows] = useState<CsvRow[]>(initialRows)
   const [submitErr, setSubmitErr] = useState<string>('')
   const [submitting, setSubmitting] = useState<boolean>(false)
@@ -1509,10 +1576,11 @@ function UnitCard({ initialRows, source, claimedPlatformName, onCommitted }: { i
         // the whole group to limbo. Each row becomes a user + tenant +
         // pending_tenant_intent on the backend; lease will be built later
         // from a parsed PDF or manual entry.
-        await apiPost('/landlords/me/onboard-tenants-csv/commit-pending', { rows: groupRows })
+        await apiPost('/landlords/me/onboard-tenants-csv/commit-pending', { rows: groupRows, landlordId })
         setRoutedTo('limbo')
       } else {
         await apiPost<CommitResponse>('/landlords/me/onboard-tenants-csv/commit', {
+          landlordId,
           rows: groupRows, source,
           ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
         })

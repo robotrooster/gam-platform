@@ -661,3 +661,127 @@ describe('propane delivery charge (S613)', () => {
     expect(Number(rows[0].total_amount)).toBe(150)
   })
 })
+
+// S632 (Nic, DIRECTIVE): "We put in our true cost total dollar bill, and then we
+// divide out total gallons delivered... we need a back end setting for the
+// markup. That way when we have a fluctuating rate, we have our margin always
+// balanced on the back end. The markup applies on every customer. It doesn't
+// matter if they pay in full or get finance charge."
+describe('S632 true cost + property markup', () => {
+  async function unitWithTank(f: Fixture): Promise<string> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const unitId = await seedUnit(c, { propertyId: f.propertyAId, landlordId: f.landlordAId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId: f.landlordAId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query(`UPDATE units SET has_propane_tank = true WHERE id = $1`, [unitId])
+      await c.query('COMMIT')
+      return unitId
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it("Nic's example: $5,000 / 1,000 gal + 25c, a 200-gallon tank bills $1,050", async () => {
+    const f = await seed()
+    const app = buildApp()
+    const unitId = await unitWithTank(f)
+    await request(app).post('/api/propane/settings')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, markupPerGallon: 0.25 }).expect(200)
+
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, invoiceTotal: 5000, invoiceGallons: 1000,
+              installments: 1, lines: [{ unitId, gallons: 200 }] })
+    expect(res.status).toBe(201)
+    expect(res.body.data.trueCostPerGallon).toBe(5)
+    expect(res.body.data.billedPerGallon).toBe(5.25)
+    expect(res.body.data.totalAmount).toBe(1050)     // 200 × $5.25
+    expect(res.body.data.margin).toBe(50)            // 200 × $0.25
+    expect(res.body.data.unallocatedGallons).toBe(800)
+  })
+
+  it('keeps full precision on a rate that does not divide cleanly', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const unitId = await unitWithTank(f)
+    await request(app).post('/api/propane/settings')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, markupPerGallon: 0.20 }).expect(200)
+
+    // $4,873.20 / 940 gal = $5.1842553..., NOT $5.18. Rounding the rate would
+    // lose real money across the delivery — the point of deriving it server-side.
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, invoiceTotal: 4873.20, invoiceGallons: 940,
+              installments: 1, lines: [{ unitId, gallons: 300 }] })
+    expect(res.status).toBe(201)
+    expect(res.body.data.trueCostPerGallon).toBeCloseTo(5.1843, 3)
+    // 300 × (5.1842553 + 0.20) = 1615.28, not 300 × 5.38 = 1614.00
+    expect(res.body.data.totalAmount).toBeCloseTo(1615.28, 2)
+  })
+
+  it('the markup does not vary with the payment plan — 1 or 4 bills the same', async () => {
+    const f = await seed()
+    const app = buildApp()
+    // Instalments are OFF per property by default — a 4-way split is refused
+    // until the landlord turns them on. That is the gate, not the markup.
+    await request(app).post('/api/propane/settings')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, markupPerGallon: 0.25, allowInstallments: true })
+      .expect(200)
+
+    const totals: number[] = []
+    for (const installments of [1, 4]) {
+      const unitId = await unitWithTank(f)
+      const res = await request(app).post('/api/propane/deliveries')
+        .set('Authorization', `Bearer ${f.tokenA}`)
+        .send({ propertyId: f.propertyAId, invoiceTotal: 5000, invoiceGallons: 1000,
+                installments, lines: [{ unitId, gallons: 200 }] })
+      expect(res.status).toBe(201)
+      totals.push(res.body.data.totalAmount)
+    }
+    // Paying over time costs no more than paying at once: a margin, not a
+    // finance charge. This is the assertion that keeps it that way.
+    expect(totals[0]).toBe(totals[1])
+  })
+
+  it('snapshots the cost and markup so a later rate change cannot restate history', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const unitId = await unitWithTank(f)
+    await request(app).post('/api/propane/settings')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, markupPerGallon: 0.25 }).expect(200)
+    await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, invoiceTotal: 5000, invoiceGallons: 1000,
+              installments: 1, lines: [{ unitId, gallons: 100 }] }).expect(201)
+
+    // The market moves and the landlord re-rates the property.
+    await request(app).post('/api/propane/settings')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, markupPerGallon: 0.40 }).expect(200)
+
+    const row = await db.query<{ t: string; m: string; p: string }>(
+      `SELECT true_cost_per_gallon::text AS t, markup_per_gallon::text AS m,
+              price_per_gallon::text AS p
+         FROM propane_fills WHERE unit_id = $1`, [unitId])
+    expect(Number(row.rows[0].t)).toBe(5)
+    expect(Number(row.rows[0].m)).toBe(0.25)   // still what it was that day
+    expect(Number(row.rows[0].p)).toBe(5.25)
+  })
+
+  it('refuses a half-given invoice rather than guessing', async () => {
+    const f = await seed()
+    const app = buildApp()
+    const unitId = await unitWithTank(f)
+    const res = await request(app).post('/api/propane/deliveries')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.propertyAId, invoiceTotal: 5000,
+              installments: 1, lines: [{ unitId, gallons: 200 }] })
+    expect(res.status).toBe(400)
+    expect(String(res.body.error)).toMatch(/gallons delivered/i)
+  })
+})

@@ -12,8 +12,8 @@ import { dispatchPortalAction, __setTransport } from './portalDispatch'
 import { PORTAL_ACTIONS, getPortalAction } from './portalActions'
 
 const LANDLORD = {
-  userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999',
-  auth: { userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999', email: 'a@b.dev',
+  userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['99999999-9999-4999-8999-999999999999'],
+  auth: { userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['99999999-9999-4999-8999-999999999999'], email: 'a@b.dev',
           permissions: { 'leases.edit': true }, iat: 111, exp: 222 },
 } as any
 const ANON = { userId: 'c1', role: 'prospect', profileId: 'c1' } as any
@@ -69,7 +69,7 @@ describe('audience and credentials', () => {
   it('fails CLOSED for the right audience with no credentials', async () => {
     // The real case: a landlord session that somehow carries no claims. It must
     // do nothing and must not let the agent pretend it did.
-    const noAuth = { userId: 'u1', role: 'landlord', profileId: '99999999-9999-4999-8999-999999999999' } as any
+    const noAuth = { userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['99999999-9999-4999-8999-999999999999'] } as any
     const r = await dispatchPortalAction('add_units', { propertyId: 'p', unitNumber: '1' }, noAuth)
     expect(r.ok).toBe(false)
     expect(r.refused).toBe('no_credentials')

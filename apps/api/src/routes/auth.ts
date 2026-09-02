@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS } from '@gam/shared'
+import { UserRole, PLATFORM_FEE_GRACE_CYCLES, MIGRATION_WINDOW_DAYS, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
@@ -94,7 +94,8 @@ export const authRouter = Router()
 // users toward predictable patterns ("Password1!") that don't help
 // against modern attacks. Length increases brute-force cost
 // directly. Composition checks intentionally skipped.
-const PASSWORD_MIN_LEN = 12
+// S631: moved to @gam/shared so every login-minting path uses one number.
+const PASSWORD_MIN_LEN = SHARED_PASSWORD_MIN_LEN
 
 const registerSchema = z.object({
   email:     z.string().email(),
@@ -247,8 +248,13 @@ authRouter.post('/register', async (req, res, next) => {
       // (the emailed code proves ownership), so no separate verification-link
       // email is needed here.
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+      // S633: a landlord session names no entity, at registration exactly as at
+      // login. A brand-new landlord owns precisely one company, so landlordIds
+      // is that one — but profileId stays null so the same rule holds from the
+      // very first session and nothing downstream learns to read it.
       const emailOtpSession = signEmailOtpSessionToken({
-        userId: user.id, role: user.role, email: user.email, profileId,
+        userId: user.id, role: user.role, email: user.email,
+        profileId: body.role === 'landlord' ? null : profileId,
         landlordId: null,
         landlordIds: body.role === 'landlord' ? [profileId] : null,
         businessId: null, staffRole: null, permissions: null,
@@ -302,18 +308,14 @@ authRouter.post('/login', async (req, res, next) => {
     const { email, password } = loginSchema.parse(req.body)
     const user = await queryOne<any>(
       `SELECT u.*,
-              COALESCE(l.id, t.id, b.id) AS profile_id,
-              b.id                       AS business_id
+              COALESCE(t.id, b.id) AS profile_id,
+              b.id                 AS business_id
        FROM users u
-       -- S620: prefer the entity the user has CHOSEN. The old join assumed one
-       -- owned entity per person and returns several once someone owns two,
-       -- making the active entity arbitrary. The chosen one wins; the fallback keeps
-       -- every existing landlord on exactly the entity they have today, since
-       -- their active_landlord_id is NULL.
-       LEFT JOIN landlords  active ON active.id = u.active_landlord_id
-       LEFT JOIN landlords  owned  ON owned.user_id = u.id
-                                  AND u.active_landlord_id IS NULL
-       LEFT JOIN landlords  l ON l.id = COALESCE(active.id, owned.id)
+       -- S634: NO landlords JOIN. profile_id is null for a landlord anyway (an
+       -- account is not an entity — see the profileId block below), and joining
+       -- the landlords table here is what forced the old "which one is active?"
+       -- question that users.active_landlord_id existed to answer. The column is
+       -- gone and so is the join; a landlord's companies come from landlordIds.
        LEFT JOIN tenants    t ON t.user_id = u.id
        -- S453: business_owner login also resolves business_id directly.
        -- business_staff users go through getScopeForUser instead because
@@ -401,12 +403,44 @@ authRouter.post('/login', async (req, res, next) => {
         : 'Your account has been deactivated. Contact your landlord.'
       throw new AppError(403, msg)
     }
-    const profileId = user.profile_id || scope?.landlordId || scope?.businessId || null
-    // S553: multi-owner entities — every landlord entity this user is an
-    // owner-member of rides in the JWT so scope checks stay synchronous.
+    // ── S633: A LANDLORD SESSION CARRIES NO ENTITY ──────────────────────────
+    //
+    // Nic (DIRECTIVE, verbatim): "Account ownership is no correlation to a
+    // specific entity. Entities own properties. The account owns the entities.
+    // When I'm logged into my account, I can invite any fucking person to any
+    // fucking property I own without switching a goddamn thing." And: "I don't
+    // want it to say fucking Oak Park ID when I sign into my login."
+    //
+    // `profileId` used to be resolved to ONE `landlords` row here — whichever
+    // entity `active_landlord_id` named, or an arbitrary one when it was null.
+    // Around 269 landlord call sites then read that id as "the landlord", so a
+    // person who owns two companies was only ever half signed in. It did not
+    // fail loudly: it returned an empty list. That is how a meter list at his
+    // own park came back with zero rows, how a billing-cycle card could not
+    // reach his second company, and how an invite refused a unit he owns.
+    //
+    // For a landlord it is now NULL, deliberately and permanently. Nulling it is
+    // the point of the change, not a side effect: any scoping site still reading
+    // it now fails where it can be seen and fixed, instead of silently answering
+    // for one company. An account is not an entity, so its session does not name
+    // one.
+    //
+    // Every other role is untouched — a tenant's profileId is their tenant row,
+    // a business owner's is their business, a team worker's scope arrives as
+    // landlordId. Those are genuinely one-to-one and stay exactly as they were.
+    const profileId = user.role === 'landlord'
+      ? null
+      : (user.profile_id || scope?.landlordId || scope?.businessId || null)
+
+    // S553/S633: EVERY entity this account owns — the whole of a landlord's
+    // identity now. Unions membership rows with founding ownership, because an
+    // account that predates `landlord_members` has a company it owns with no
+    // member row, and dropping profileId must not drop that company with it.
     const landlordIds = user.role === 'landlord'
       ? await query<{ landlord_id: string }>(
-          `SELECT landlord_id FROM landlord_members WHERE user_id = $1`, [user.id]
+          `SELECT landlord_id FROM landlord_members WHERE user_id = $1
+           UNION
+           SELECT id           FROM landlords        WHERE user_id = $1`, [user.id]
         ).then((rows) => rows.map((r) => r.landlord_id))
       : null
     // S453: businessId carries either the owner's business (from JOIN) or
@@ -571,21 +605,43 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- Test the real precondition instead: do they operate on land they
          -- don't own. Not "is lot rent already set" — that would hide the very
          -- page where they'd go to set it.
-         EXISTS (
-           SELECT 1 FROM properties pr
-            WHERE pr.landlord_id = l.id AND pr.operator_owns_land = FALSE
-         ) AS has_mobile_home_units,
+         COALESCE(l.operates_leased_land, FALSE) AS has_mobile_home_units,
          t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
        FROM users u
-       -- S620: prefer the entity the user has CHOSEN. The old join assumed one
-       -- owned entity per person and returns several once someone owns two,
-       -- making the active entity arbitrary. The chosen one wins; the fallback keeps
-       -- every existing landlord on exactly the entity they have today, since
-       -- their active_landlord_id is NULL.
-       LEFT JOIN landlords  active ON active.id = u.active_landlord_id
-       LEFT JOIN landlords  owned  ON owned.user_id = u.id
-                                  AND u.active_landlord_id IS NULL
-       LEFT JOIN landlords  l ON l.id = COALESCE(active.id, owned.id)
+       -- S634: users.active_landlord_id IS GONE. There is no active entity —
+       -- the account owns companies and is signed into all of them at once.
+       --
+       -- This join used to pick ONE landlords row through that column, which is
+       -- how a landlord who owns two ended up half signed in. Everything read
+       -- off l here is a coarse ACCOUNT-level flag (does the onboarding wizard
+       -- show, does the Lot Rent nav item show, is a payout account set up), so
+       -- each is answered across every company the account owns. business_name
+       -- is a display label and takes the founding company's — the name the
+       -- portal has always shown.
+       LEFT JOIN LATERAL (
+         SELECT (array_agg(x.business_name ORDER BY x.created_at))[1] AS business_name,
+                (array_agg(x.id            ORDER BY x.created_at))[1] AS id,
+                bool_or(x.onboarding_complete)     AS onboarding_complete,
+                bool_or(x.connect_payouts_enabled) AS connect_payouts_enabled,
+                EXISTS (
+                  SELECT 1 FROM properties pr
+                   WHERE pr.landlord_id = ANY(array_agg(x.id))
+                     AND pr.operator_owns_land = FALSE
+                ) AS operates_leased_land
+           FROM landlords x
+          WHERE x.id IN (
+                  -- Membership OR founding ownership. An account that predates
+                  -- landlord_members owns a company with no membership row, and
+                  -- requiring one would hand it business_name NULL and
+                  -- onboarding_complete FALSE — i.e. send an established
+                  -- landlord back to the signup wizard. Same union the API uses
+                  -- to refresh landlordIds (middleware/auth currentLandlordIds);
+                  -- there is one such account in production today.
+                  SELECT lm.landlord_id FROM landlord_members lm WHERE lm.user_id = u.id
+                  UNION
+                  SELECT y.id            FROM landlords y        WHERE y.user_id  = u.id
+                )
+       ) l ON TRUE
        LEFT JOIN tenants    t ON t.user_id = u.id
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        WHERE u.id = $1`, [req.user!.userId]

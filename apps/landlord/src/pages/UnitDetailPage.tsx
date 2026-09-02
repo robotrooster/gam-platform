@@ -51,6 +51,27 @@ export function UnitDetailPage() {
   const fileRef = useRef<HTMLInputElement>(null)
 
   const { data: unit, isLoading } = useQuery(['unit', id], () => apiGet<any>('/units/' + id))
+  // S630: which physical facts this unit's TAGS decide. Same query key the
+  // subtype row uses, so react-query serves one request. A fact the tags own is
+  // shown here rather than offered as an editable field — two places to set one
+  // value is the drift Nic caught ("the electrical service on the unit card
+  // still says thirty and fifty").
+  const { data: allSubtypes = [] } = useQuery<PropertyUnitSubtype[]>(
+    ['property-unit-subtypes', unit?.propertyId],
+    () => apiGet(`/properties/${unit.propertyId}/unit-subtypes`),
+    { enabled: !!unit?.propertyId },
+  )
+  const tagDecides = (() => {
+    const ids: string[] = ((unit?.subtypes || []) as any[]).map((x: any) => x.id)
+    const has = (v: any) => v != null && v !== '' && v !== 'none'
+    const mine = (allSubtypes as PropertyUnitSubtype[]).filter(x => x.id && ids.includes(x.id))
+    return {
+      layout: mine.some(x => has(x.rvSiteLayout)),
+      amp:    mine.some(x => has(x.rvAmpService)),
+      beds:   mine.some(x => has(x.bedrooms)),
+      size:   mine.some(x => has(x.storageSize)),
+    }
+  })()
   const { data: econ } = useQuery(['unit-econ', id], () => apiGet<any>('/units/' + id + '/economics'))
   const { data: maintenance = [] } = useQuery(['unit-maint', id], () => apiGet<any[]>('/maintenance?unitId=' + id))
 
@@ -301,39 +322,15 @@ export function UnitDetailPage() {
                     <div className="data-row"><span className="data-key">Bathrooms</span><input {...inpS} type="number" min={0} step={0.5} value={editForm.bathrooms} onChange={e => set('bathrooms', e.target.value)} /></div>
                     <div className="data-row"><span className="data-key">Sq ft</span><input {...inpS} type="number" min={0} value={editForm.sqft} onChange={e => set('sqft', e.target.value)} /></div>
                   </>}
-                  {/* S613 (Nic, DIRECTIVE): "when there is a subtype set, all
-                      units with that subtype have to be the same price... if one
-                      doesn't exist, then it can be a different price." So these
-                      are fields on a unit that stands alone and a readout on one
-                      that belongs to a class. */}
-                  {unit.subtypeId ? (
-                    <>
-                      {/* S629 (Nic, DIRECTIVE): this unit's own price. The
-                          subtype is shown as the label it now is — what the
-                          unit IS, for reporting — not what it costs. */}
-                      <div className="data-row"><span className="data-key">Rent (/mo)</span>
-                        {editing ? (
-                          <span className="data-val mono" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <input {...inpS} type="number" min={0} step={1} value={editForm.rentAmount}
-                                   onChange={e => set('rentAmount', e.target.value)} />
-                            <span style={{ color: 'var(--text-3)', fontSize: '.68rem', fontFamily: 'inherit' }}>
-                              this unit only · {unit.subtypeName} is a classification
-                            </span>
-                          </span>
-                        ) : (
-                          <span className="data-val mono">{fmt(unit.rentAmount)}</span>
-                        )}
-                      </div>
-                      <div className="data-row"><span className="data-key">Deposit</span>
-                        <span className="data-val mono">{fmt(unit.securityDeposit)}</span>
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="data-row"><span className="data-key">Rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.rentAmount} onChange={e => set('rentAmount', e.target.value)} /></div>
-                      <div className="data-row"><span className="data-key">Deposit</span><input {...inpS} type="number" min={0} value={editForm.securityDeposit} onChange={e => set('securityDeposit', e.target.value)} /></div>
-                    </>
-                  )}
+                  {/* S629/S630 (Nic, DIRECTIVE): "Subtypes should not price the
+                      unit... each unit needs to hold those details individually."
+                      This used to branch: a unit in a class got a READ-ONLY
+                      deposit, because the class was said to own it. That is how
+                      an unpriced deposit became unfixable — the three Mountain
+                      View back-in spots sat at $0 with no field to correct them.
+                      One editable pair now, classed or not. */}
+                  <div className="data-row"><span className="data-key">Rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.rentAmount} onChange={e => set('rentAmount', e.target.value)} /></div>
+                  <div className="data-row"><span className="data-key">Deposit</span><input {...inpS} type="number" min={0} value={editForm.securityDeposit} onChange={e => set('securityDeposit', e.target.value)} /></div>
                   {(isRv || editForm.unitType === 'mobile_home') && (
                     <div className="data-row"><span className="data-key">{isRv ? 'RV owner' : 'Home owner'}</span>
                       <select {...selS} value={editForm.dwellingOwnership} onChange={e => set('dwellingOwnership', e.target.value)}>
@@ -394,14 +391,28 @@ export function UnitDetailPage() {
                   )}
                   {isRv && <>
                     <div className="data-row"><span className="data-key">Site layout</span>
-                      <select {...selS} value={editForm.rvSiteLayout} onChange={e => set('rvSiteLayout', e.target.value)}>
-                        <option value="none">—</option><option value="back_in">Back-in</option><option value="pull_through">Pull-through</option>
-                      </select>
+                      {tagDecides.layout ? (
+                        <span className="data-val" style={{ fontSize: '.78rem' }}>
+                          {unit.rvSiteLayout === 'pull_through' ? 'Pull-through' : 'Back-in'}
+                          <span style={{ color: 'var(--text-3)', fontSize: '.68rem', marginLeft: 6 }}>from its tags</span>
+                        </span>
+                      ) : (
+                        <select {...selS} value={editForm.rvSiteLayout} onChange={e => set('rvSiteLayout', e.target.value)}>
+                          <option value="none">—</option><option value="back_in">Back-in</option><option value="pull_through">Pull-through</option>
+                        </select>
+                      )}
                     </div>
                     <div className="data-row"><span className="data-key">Electrical</span>
-                      <select {...selS} value={editForm.rvAmpService} onChange={e => set('rvAmpService', e.target.value)}>
-                        <option value="none">—</option><option value="30">30 amp</option><option value="50">50 amp</option><option value="both">30/50 amp</option>
-                      </select>
+                      {tagDecides.amp ? (
+                        <span className="data-val" style={{ fontSize: '.78rem' }}>
+                          {unit.rvAmpService === 'both' ? '30/50 amp' : `${unit.rvAmpService} amp`}
+                          <span style={{ color: 'var(--text-3)', fontSize: '.68rem', marginLeft: 6 }}>from its tags</span>
+                        </span>
+                      ) : (
+                        <select {...selS} value={editForm.rvAmpService} onChange={e => set('rvAmpService', e.target.value)}>
+                          <option value="none">—</option><option value="30">30 amp</option><option value="50">50 amp</option><option value="both">30/50 amp</option>
+                        </select>
+                      )}
                     </div>
                   </>}
                   {editForm.unitType === 'storage' && (
@@ -487,13 +498,8 @@ export function UnitDetailPage() {
               <UnitSubtypeRow unit={unit} />
               <div className="data-row"><span className="data-key">Leasing</span><span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span></div>
               <div className="data-row"><span className="data-key">Rent</span>
-                <span className="data-val mono">{fmt(unit.rentAmount)}/mo
-                  {unit.subtypeName && (
-                    <span style={{ color: 'var(--text-3)', fontSize: '.7rem', marginLeft: 6, fontFamily: 'inherit' }}>
-                      set by {unit.subtypeName}
-                    </span>
-                  )}
-                </span>
+                {/* S629: no "set by <subtype>" — the unit owns this number. */}
+                <span className="data-val mono">{fmt(unit.rentAmount)}/mo</span>
               </div>
               <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
               {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
@@ -884,46 +890,53 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
     { enabled: !!unit.propertyId },
   )
   const forType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === unit.unitType)
-  const current = forType.find(s => s.id === unit.subtypeId) || null
+  // S630: the unit's whole set, not just units.subtype_id. `subtypes` comes back
+  // as [{id, name}] from the unit endpoint.
+  const on: string[] = ((unit.subtypes || []) as any[]).map((x: any) => x.id)
 
-  const linkMut = useMutation(
-    (body: { subtypeId: string | null; applyDetails?: boolean }) => apiPatch(`/units/${unit.id}/subtype`, body),
+  const setMut = useMutation(
+    (subtypeIds: string[]) => apiPost(`/units/subtype`, { unitIds: [unit.id], subtypeIds }),
     {
       onSuccess: () => {
         setErr('')
         qc.invalidateQueries(['unit', unit.id])
         qc.invalidateQueries(['property-unit-subtypes', unit.propertyId])
       },
-      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not set that subtype'),
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not change that'),
     },
   )
+  const toggle = (id: string) =>
+    setMut.mutate(on.includes(id) ? on.filter(x => x !== id) : [...on, id])
 
-  // What the unit would gain by applying — shown so "Apply" is never a leap of
-  // faith. Blank subtype fields say nothing about the unit and are skipped.
-  const diffs: string[] = []
-  if (current) {
-    const differs = (a: any, b: any) => a != null && a !== '' && a !== 'none' && String(a) !== String(b)
-    if (unit.unitType === 'rv_spot') {
-      if (differs(current.rvSiteLayout, unit.rvSiteLayout)) diffs.push(current.rvSiteLayout === 'pull_through' ? 'pull-through' : 'back-in')
-      if (differs(current.rvAmpService, unit.rvAmpService)) diffs.push(current.rvAmpService === 'both' ? '30/50 amp' : `${current.rvAmpService} amp`)
-    }
-    if (UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType]) {
-      if (differs(current.bedrooms, unit.bedrooms)) diffs.push(`${current.bedrooms} bed`)
-      if (differs(current.bathrooms, unit.bathrooms)) diffs.push(`${current.bathrooms} bath`)
-    }
-    if (unit.unitType === 'storage' && differs(current.storageSize, unit.storageSize)) diffs.push(String(current.storageSize))
-    // Prices are NOT compared: the subtype owns them, so a linked unit always
-    // carries its class's numbers. Only the physical facts can drift.
+  // Contradictions worth showing: a spot tagged "50 Amp" whose own electrical
+  // service says 30 is one of the two that is wrong, and only the landlord
+  // knows which. Named, never auto-corrected — the unit's own fields are the
+  // ones that bill and quote, and they are editable directly above this row.
+  // S630 (Nic, DIRECTIVE): "Once I tagged it as thirty amp and fifty amp and
+  // then deselected the fifty amp, the electrical service on the unit card still
+  // says thirty and fifty. Things need to be actually reflecting the reality."
+  //
+  // This row used to OFFER to reconcile the unit's fields with its tags, which
+  // guaranteed drift — accepting the offer and untagging are two separate clicks
+  // with nothing holding them together. The tags now DECIDE those facts, in a
+  // database trigger so every writer obeys it, and this is only a read-out of
+  // what they decided. Money is untouched: rent and deposit stay per unit.
+  const tagged = forType.filter(x => x.id && on.includes(x.id))
+  const declared = (v: any) => v != null && v !== '' && v !== 'none'
+  const facts: string[] = []
+  if (unit.unitType === 'rv_spot') {
+    if (declared(unit.rvSiteLayout)) facts.push(unit.rvSiteLayout === 'pull_through' ? 'pull-through' : 'back-in')
+    if (declared(unit.rvAmpService)) facts.push(unit.rvAmpService === 'both' ? '30/50 amp' : `${unit.rvAmpService} amp`)
   }
+  const tagsDeclareAnything = tagged.some(st =>
+    declared(st.rvSiteLayout) || declared(st.rvAmpService) || declared(st.bedrooms) ||
+    declared(st.bathrooms) || declared(st.storageSize))
 
-  if (forType.length === 0 && !current) {
-    // No subtypes on the property is a perfectly normal state — this unit just
-    // prices on its own. Say where they come from without implying something
-    // is missing.
+  if (forType.length === 0) {
     return (
-      <div className="data-row"><span className="data-key">Subtype</span>
+      <div className="data-row"><span className="data-key">Subtypes</span>
         <span className="data-val" style={{ color: 'var(--text-3)', fontSize: '.76rem' }}>
-          None — this unit prices on its own. Subtypes are added on the property page.
+          None defined — subtypes are added on the property page.
         </span>
       </div>
     )
@@ -931,41 +944,51 @@ function UnitSubtypeRow({ unit }: { unit: any }) {
 
   return (
     <>
-      <div className="data-row"><span className="data-key">Subtype</span>
-        {/* S613: this is where the unit's rent comes from — changing it here
-            moves the unit into another class and onto that class's price. */}
+      <div className="data-row" style={{ alignItems: 'flex-start' }}>
+        <span className="data-key">Subtypes</span>
         {can('schedule.configure_unit') ? (
-          <select className="form-select" style={{ maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' }}
-            value={unit.subtypeId || ''} disabled={linkMut.isLoading}
-            onChange={e => linkMut.mutate({ subtypeId: e.target.value || null })}>
-            {/* S613 (Nic): a subtype is optional. In one, the unit takes the
-                class price and matches every other unit in it. In none, the
-                unit prices on its own — the fields below become editable. */}
-            <option value="">No subtype — price this unit on its own</option>
-            {forType.map(s => (
-              <option key={s.id} value={s.id}>
-                {s.name}{unitSubtypeFactsLabel(s) ? ` (${unitSubtypeFactsLabel(s)})` : ''}
-              </option>
-            ))}
-          </select>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 340, justifyContent: 'flex-end' }}>
+            {/* S630 (Nic, DIRECTIVE): "Units need to be able to handle multiple
+                subtypes as a checkbox... 'fifty amp back in' should not be one
+                subtype. It's two." A dropdown could only ever hold one, which is
+                what forced landlords to pre-bundle a row per combination. */}
+            {forType.map(st => {
+              const active = !!st.id && on.includes(st.id)
+              return (
+                <div key={st.id} role="checkbox" aria-checked={active} tabIndex={0}
+                  onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); st.id && toggle(st.id) } }}
+                  onClick={() => st.id && !setMut.isLoading && toggle(st.id)}
+                  title={unitSubtypeFactsLabel(st) || undefined}
+                  style={{
+                    padding: '3px 10px', borderRadius: 999, cursor: setMut.isLoading ? 'default' : 'pointer',
+                    fontSize: '.72rem', fontWeight: 600, opacity: setMut.isLoading ? .6 : 1,
+                    border: `1px solid ${active ? 'var(--gold)' : 'var(--border-0)'}`,
+                    background: active ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                    color: active ? 'var(--gold)' : 'var(--text-2)',
+                  }}>
+                  {active ? '✓ ' : ''}{st.name}
+                </div>
+              )
+            })}
+          </div>
         ) : (
-          <span className="data-val">{current ? current.name : '—'}</span>
+          <span className="data-val">
+            {on.length ? ((unit.subtypes || []) as any[]).map((x: any) => x.name).join(' · ') : '—'}
+          </span>
         )}
       </div>
+      {/* S630: what the tags decided, so it is visible in the same breath as the
+          toggles that decide it — and what they deliberately do NOT decide. */}
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '-2px 0 8px', textAlign: 'right' }}>
+        {tagsDeclareAnything && facts.length > 0
+          ? <>This space is {facts.join(', ')} because of its tags. Rent and deposit stay its own.</>
+          : <>Grouping only — tagging never changes this space&apos;s rent or deposit.</>}
+      </div>
       {err && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginBottom: 6 }}>{err}</div>}
-      {current && diffs.length > 0 && can('schedule.configure_unit') && (
-        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '-2px 0 8px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span>This unit&apos;s details don&apos;t match it: {diffs.join(', ')}.</span>
-          <button className="btn btn-secondary btn-sm" style={{ padding: '1px 8px', fontSize: '.7rem' }}
-            disabled={linkMut.isLoading}
-            onClick={() => linkMut.mutate({ subtypeId: current.id!, applyDetails: true })}>
-            Copy onto this unit
-          </button>
-        </div>
-      )}
     </>
   )
 }
+
 
 // S609: the old note here said "the utilities page has no meters list" — that
 // stopped being true when the Utilities page grew its own meter management, so

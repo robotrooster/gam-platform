@@ -38,6 +38,20 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S633 ──────────────────────────────────────────────────────────────────
+  'properties PATCH /:id/first-billing-cycle':
+    'declares which month GAM starts invoicing a property\'s EXISTING tenants — it moves money for every onboarded tenancy at once, and only the landlord knows which months they already collected off-platform. Not derivable, not delegable, and answered once during onboarding on a screen that explains the consequence.',
+  // ── Named while closing S633\'s parity failure; all five predate it. ───────
+  'landlords PATCH /me/pending-intents/:id/work-trade':
+    'flips an outstanding invite to work-trade before the lease is signed. The agent can create a work-trade agreement outright (POST /work-trade/agreements); amending an invite mid-flight is a correction to paperwork already sent, which the landlord makes on the pending-tenant screen where they can see what the invite currently says.',
+  'landlords PATCH /me/pending-intents/:id/contact':
+    'corrects the email or phone an invitation was sent to. Retyping somebody\'s contact details from a spoken sentence is exactly where a transcription error sends an invite to a stranger, so this stays typed and visible.',
+  'properties DELETE /:id':
+    'super_admin-only, and only for a property that was never real (see the properties-are-permanent directive). A landlord never deletes a property — they transfer it or go vacant — so there is nothing here for a landlord agent to reach.',
+  'units POST /subtype':
+    'creates a unit CLASS, a structural piece of a property\'s setup that every later unit inherits its facts from. Named and shaped on the property setup screen where the existing classes are visible; spoken creation would quietly grow near-duplicate classes.',
+  'utility POST /opening-reads':
+    'records the starting number on physical meters, hundreds at a time, transcribed off the dials on site. It is a bulk data-entry screen with a date picker and one save — dictating three hundred five-digit readings is not a thing anybody would do, and a misheard digit becomes a wrong bill.',
   'background PATCH /:id/decision':
     'record-intent-only by directive (FCRA / fair housing) — flag_applicant_decision captures the landlord\'s intent and routes them to record it themselves',
   'background POST /:id/adverse-action':

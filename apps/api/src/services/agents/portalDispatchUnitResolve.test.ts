@@ -13,8 +13,8 @@ import { query } from '../../db'
 import { dispatchPortalAction, __setTransport } from './portalDispatch'
 
 const LANDLORD = {
-  userId: 'u1', role: 'landlord', profileId: 'll-1',
-  auth: { userId: 'u1', role: 'landlord', profileId: 'll-1' },
+  userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['ll-1'],
+  auth: { userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['ll-1'] },
 } as any
 
 const UNITS = [
@@ -86,8 +86,8 @@ describe('dispatchPortalAction — unit id from what the landlord said', () => {
       'set_eviction_mode', { unitId: 'RV 07', enable: true, confirm: true }, LANDLORD)
     const sql = (query as any).mock.calls[0][0]
     const params = (query as any).mock.calls[0][1]
-    expect(sql).toMatch(/p\.landlord_id = \$1/)
-    expect(params).toEqual(['ll-1'])
+    expect(sql).toMatch(/p\.landlord_id = ANY\(\$1/)
+    expect(params).toEqual([['ll-1']])
   })
 
   // S630: leases and properties are named in words, not numbers — "the Alvarez

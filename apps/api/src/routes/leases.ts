@@ -333,7 +333,7 @@ leasesRouter.get('/:id', async (req, res, next) => {
     if (!lease) throw new AppError(404, 'Lease not found')
 
     if (req.user!.role === 'tenant') {
-      const onLease = await isTenantOnLease(lease.id, req.user!.profileId)
+      const onLease = await isTenantOnLease(lease.id, req.user!.profileId!)
       if (!onLease) throw new AppError(403, 'Forbidden')
     } else if (!canAccessLandlordResource(req.user, lease.landlord_id)) {
       throw new AppError(403, 'Forbidden')
@@ -1703,7 +1703,7 @@ leasesRouter.post('/:id/terminate-early', async (req, res, next) => {
     const { requestEarlyTermination } = await import('../services/leaseTermination')
     const result = await requestEarlyTermination({
       leaseId: req.params.id,
-      tenantId: u.profileId,
+      tenantId: u.profileId!,
       requestedByUserId: u.userId,
       reason: body.reason,
     })

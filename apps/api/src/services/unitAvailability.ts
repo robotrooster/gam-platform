@@ -61,14 +61,17 @@ export const STAY_CONFLICT_MESSAGE: Record<Exclude<StayConflict, null>, string> 
 // in packages/shared, no SQL re-implementation. Subtype pricing is joined so
 // consumers (reach-out rent prefill) read the unit's preset rent without a
 // second query: unit override first, subtype fallback.
+// S633: every company the ACCOUNT owns. A landlord checking what is free is
+// asking about their whole portfolio; scoped to one entity the availability
+// picker silently omitted the other park's spaces.
 export async function findAvailableUnits(opts: {
-  landlordId: string
+  landlordIds: string[]
   window: StayWindow
   propertyId?: string | null
   scopedPropertyIds?: string[] | null   // staff allow-list; null = unrestricted
 }): Promise<any[]> {
   const w = opts.window
-  const params: any[] = [opts.landlordId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn]
+  const params: any[] = [opts.landlordIds, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn]
   let filter = ''
   if (opts.propertyId) filter += ` AND u.property_id = $${params.push(opts.propertyId)}`
   if (opts.scopedPropertyIds) filter += ` AND u.property_id = ANY($${params.push(opts.scopedPropertyIds)})`
@@ -83,7 +86,7 @@ export async function findAvailableUnits(opts: {
     FROM units u
     JOIN properties p ON p.id = u.property_id
     LEFT JOIN property_unit_subtypes s ON s.id = u.subtype_id
-    WHERE u.landlord_id = $1 ${filter}
+    WHERE u.landlord_id = ANY($1::uuid[]) ${filter}
       -- S605: a retired unit keeps its history but is never offered again. The
       -- DB triggers already refuse a new lease/booking on one; this keeps it out
       -- of the picker so nobody is shown a choice that would then be rejected.

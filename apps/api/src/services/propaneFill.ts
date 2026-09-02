@@ -108,6 +108,12 @@ export async function recordFill(
     clientKey?: string | null
     /** S613: this tank's share of the ticket's delivery charge. Untaxed. */
     deliveryFeeShare?: number
+    // S632: what the delivery cost and what was added to it. Snapshotted so a
+    // fill explains itself later without depending on today's markup setting.
+    trueCostPerGallon?: number | null
+    markupPerGallon?: number | null
+    invoiceTotal?: number | null
+    invoiceGallons?: number | null
   },
 ): Promise<any> {
   const { unit } = args
@@ -152,11 +158,14 @@ export async function recordFill(
     `INSERT INTO propane_fills
        (property_id, landlord_id, unit_id, lease_id, tenant_id, gallons,
         price_per_gallon, total_amount, installment_count, created_by_user_id,
-        tax_rate_pct, tax_amount, client_key, delivery_fee_share)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+        tax_rate_pct, tax_amount, client_key, delivery_fee_share,
+        true_cost_per_gallon, markup_per_gallon, invoice_total, invoice_gallons)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
     [unit.property_id, unit.landlord_id, unit.id, args.leaseId, args.tenantId,
      args.gallons, args.pricePerGallon, total, args.installments, args.createdByUserId,
-     taxRatePct, taxAmount, args.clientKey ?? null, deliveryFee])
+     taxRatePct, taxAmount, args.clientKey ?? null, deliveryFee,
+     args.trueCostPerGallon ?? null, args.markupPerGallon ?? null,
+     args.invoiceTotal ?? null, args.invoiceGallons ?? null])
   const fillId = fill.rows[0].id
 
   // S609 (Nic): NOTHING BILLS IMMEDIATELY. "All decided before any money moves."

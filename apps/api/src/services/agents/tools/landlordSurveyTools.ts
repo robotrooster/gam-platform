@@ -19,14 +19,16 @@
  */
 import { query, queryOne, getClient } from '../../../db'
 import { createNotification } from '../../notifications'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
-async function resolveProperty(landlordId: string, name: string) {
+// S634: resolves across the ACCOUNT's companies and returns the property's own
+// landlord_id — a survey is sent by the company that owns the property.
+async function resolveProperty(landlordIds: string[], name: string) {
   const needle = String(name ?? '').trim()
   if (!needle) return { error: 'Which property? A survey goes to the tenants at one property.' }
-  const rows = await query<{ id: string; name: string }>(
-    `SELECT id, name FROM properties WHERE landlord_id = $1 AND name ILIKE '%' || $2 || '%' LIMIT 6`,
-    [landlordId, needle])
+  const rows = await query<{ id: string; name: string; landlord_id: string }>(
+    `SELECT id, name, landlord_id FROM properties WHERE landlord_id = ANY($1::uuid[]) AND name ILIKE '%' || $2 || '%' LIMIT 6`,
+    [landlordIds, needle])
   if (rows.length === 0) return { error: `No property of theirs matches "${needle}".` }
   if (rows.length > 1) return { ambiguous: rows.map((r) => r.name) }
   return { property: rows[0] }
@@ -72,7 +74,7 @@ export const createAndSendSurvey: AgentTool = {
   audiences: ['landlord'],
 
   async execute(args, actor: AgentActor) {
-    const r: any = await resolveProperty(actor.profileId, String(args.property ?? ''))
+    const r: any = await resolveProperty(actorLandlordIds(actor), String(args.property ?? ''))
     if (r.error) return { ok: false, error: r.error }
     if (r.ambiguous) {
       return { ok: false, needsNarrowing: true, options: r.ambiguous,
@@ -107,7 +109,8 @@ export const createAndSendSurvey: AgentTool = {
       const s = await client.query(
         `INSERT INTO surveys (landlord_id, property_id, created_by, title, description, anonymous, status)
          VALUES ($1,$2,$3,$4,$5,true,'draft') RETURNING id`,
-        [actor.profileId, r.property.id, (actor as any).userId, title,
+        // S634: a survey belongs to the company that owns the property.
+        [r.property.landlord_id, r.property.id, (actor as any).userId, title,
          args.description != null ? String(args.description).slice(0, 1000) : null])
       surveyId = s.rows[0].id
       for (let i = 0; i < questions.length; i++) {
@@ -140,7 +143,7 @@ export const createAndSendSurvey: AgentTool = {
     for (const rec of recipients) {
       try {
         await createNotification({
-          userId: rec.user_id, landlordId: actor.profileId, type: 'survey_sent',
+          userId: rec.user_id, landlordId: r.property.landlord_id, type: 'survey_sent',
           title: 'New survey from your landlord',
           body: `Please share your input: "${title}"`,
           actionUrl: '/communication?tab=surveys',
@@ -179,10 +182,10 @@ export const getSurveyResults: AgentTool = {
     const survey = await queryOne<any>(
       `SELECT s.id, s.title, s.property_id, s.sent_at, p.name AS property_name
          FROM surveys s JOIN properties p ON p.id = s.property_id
-        WHERE s.landlord_id = $1 AND s.is_active = true
+        WHERE s.landlord_id = ANY($1::uuid[]) AND s.is_active = true
           AND ($2 = '' OR s.title ILIKE '%' || $2 || '%')
         ORDER BY s.sent_at DESC NULLS LAST LIMIT 1`,
-      [actor.profileId, needle])
+      [actorLandlordIds(actor), needle])
     if (!survey) return { ok: true, found: false, note: needle ? `No survey of theirs matches "${needle}".` : 'They have not sent any surveys.' }
 
     const questions = await query<any>(

@@ -34,7 +34,7 @@ import { extractPositionedText, type TextItem } from '../lib/pdfText'
 // came through.
 import { detectConditionalFees, auditUnattributedAmounts } from '../jobs/leaseParser/extractors'
 import type { ParserExtractedConditionalFee } from '@gam/shared'
-import { isScreeningFeeText } from '@gam/shared'
+import { isScreeningFeeText, isAutoFilledLeaseColumn } from '@gam/shared'
 import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
 
@@ -52,7 +52,9 @@ const MODEL_ENABLED = (process.env.AUTO_FIELD_MODEL_ENABLED || 'true') !== 'fals
 // Unfilled slots are dropped at send, so we may place up to 4 freely.
 export const TENANT_ROLES = ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3'] as const
 export type TenantRole = (typeof TENANT_ROLES)[number]
-export type SignerRole = TenantRole | 'landlord' | 'witness'
+// S635: null = NOBODY fills this in. An identity field is filled from the
+// invite at send time, so it belongs to no signer — see isAutoFilledLeaseColumn.
+export type SignerRole = TenantRole | 'landlord' | 'witness' | null
 export type FieldType = 'signature' | 'initials' | 'date' | 'text' | 'checkbox' | 'radio_group'
 
 export interface ProposedField {
@@ -533,7 +535,18 @@ function nonSigRole(col: string | null, label: string | null, ctx: string, split
   // Genuinely tenant-supplied facts — date of birth, emergency contact, driver's
   // licence, phone — carry NO lease column (the landlord does not hold them), so
   // they fall through to the personal-info path below and stay with the tenant.
-  if (col) return 'landlord'
+  // S635 (Nic, DIRECTIVE) EXTENDS THE RULE ABOVE ONE STEP. S622's reasoning was
+  // that a value GAM already holds is "wrong by construction" as a tenant-entry
+  // box. The same sentence disqualifies a LANDLORD-entry box: nobody should be
+  // typing a fact the system took at invite time, and asking them to invites the
+  // typo the rule exists to prevent. Nic: "the tenant names and the names of the
+  // occupants both are landlord boxes, and those should be derived from all the
+  // invites that went out."
+  //
+  // Only IDENTITY columns — who is on the lease, the unit, the property, the
+  // date. Money columns stay the landlord's: a rent amount or a deposit is a
+  // figure they state on this lease, not a fact already recorded.
+  if (col) return isAutoFilledLeaseColumn(col) ? null : 'landlord'
   if (split === 'per_tenant') return 'primary'
   if (isPersonal(label, ctx)) return 'primary'
   return 'landlord'
@@ -600,7 +613,11 @@ function heuristicClassify(t: RawTarget): Classification {
   // line ABOVE the blank ("following named persons:" then a full-width
   // underscore line), so check aboveText too.
   if (ROSTER_LINE.test(t.lineText) || ROSTER_LINE.test(t.aboveText)) {
-    return { keep: true, fieldType: 'text', leaseColumn: null, signerRole: 'landlord', label: 'Occupants', split: 'none' }
+    // S635 (Nic, DIRECTIVE): "the names of the occupants... should be derived
+    // from all the invites that went out." This bound the roster line to NOTHING
+    // and handed it to the landlord to type, so every uploaded lease produced a
+    // blank box asking for a list GAM already has. `occupant_names` is that list.
+    return { keep: true, fieldType: 'text', leaseColumn: 'occupant_names', signerRole: null, label: 'Occupants', split: 'none' }
   }
   // comprehensiveness: unknown blank still gets a typeable box — landlord-
   // filled unless it reads as tenant-personal info.
@@ -946,7 +963,7 @@ function buildFields(
       // all four date boxes line up (Nic S556). Fallback: right half of the sig.
       const detDate = fields.find(
         (f) => f.page === pm.page && f.fieldType === 'date' && f.leaseColumn === 'date_signed' &&
-          (TENANT_ROLES as readonly string[]).includes(f.signerRole),
+          !!f.signerRole && (TENANT_ROLES as readonly string[]).includes(f.signerRole),
       )
       const dateX = detDate ? detDate.x : anchor.x + Math.round(anchor.width / 2)
       const dateW = detDate ? detDate.width : 90
@@ -1641,6 +1658,19 @@ export async function autoPlaceFields(
     ...screeningFromConditional,
     ...allUnattributed.filter(u => isScreeningFeeText(u.context)),
   ]
+
+  // S635 (Nic): LAST WORD ON IDENTITY FIELDS, whichever path produced them.
+  //
+  // Two things classify a blank — the heuristic above and, when it runs, the
+  // model — and the model returns its own signerRole. Fixing only the heuristic
+  // would leave a model-classified tenant-name box addressed to the landlord on
+  // exactly the uploads that get the most help. Nic's question was whether this
+  // holds for every new landlord's template, not just his: "That's not gonna
+  // happen every time a new landlord opens a lease and tries to set that." So
+  // the rule is applied once, at the end, over everything.
+  for (const f of all as any[]) {
+    if (isAutoFilledLeaseColumn(f.leaseColumn)) f.signerRole = null
+  }
 
   return {
     pageCount: extracted.pageCount,

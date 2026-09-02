@@ -29,7 +29,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { notificationsRouter } from './notifications'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -84,14 +84,15 @@ async function seed(): Promise<Fixture> {
     return {
       landlordUserId, landlordId,
       landlordToken: sign({
+        // S633: the account's companies, not one "active" entity.
         userId: landlordUserId, role: 'landlord', email: 'll@t.dev',
-        profileId: landlordId,
+        profileId: null, landlordIds: [landlordId],
         permissions: { 'notifications.send_bulk': true },
       }),
       otherUserId,
       otherToken: sign({
         userId: otherUserId, role: 'landlord', email: 'other@t.dev',
-        profileId: randomUUID(), permissions: {},
+        profileId: null, landlordIds: [randomUUID()], permissions: {},
       }),
       noteA, noteB, noteOther,
     }
@@ -297,9 +298,18 @@ describe('POST /api/notifications/bulk', () => {
     }))
   })
 
-  it('happy: propertyId passed through when valid uuid', async () => {
+  it('happy: propertyId passed through when it is a REAL property of the caller', async () => {
     const f = await seed()
-    const propId = randomUUID()
+    // S633: the company a blast goes out under is now DERIVED from the property
+    // named, so the property has to exist and be the caller's. It used to be
+    // taken from session state and the id passed through unchecked — a random
+    // uuid was accepted, and the message went out scoped to nothing.
+    const c = await db.connect()
+    let propId: string
+    try {
+      propId = await seedProperty(c, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+    } finally { c.release() }
     const res = await request(buildApp()).post('/api/notifications/bulk')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ title: 'X', body: 'Y', propertyId: propId })

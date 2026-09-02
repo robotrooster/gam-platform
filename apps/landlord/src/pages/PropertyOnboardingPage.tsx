@@ -1,5 +1,7 @@
 import { useState, useRef, useMemo } from 'react'
 import { useMutation } from 'react-query'
+// S633: an import lands in ONE company. The account names it.
+import { EntityPicker } from '../components/EntityPicker'
 import { useNavigate } from 'react-router-dom'
 import { Upload, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { apiPost } from '../lib/api'
@@ -86,6 +88,10 @@ const PLATFORM_OPTIONS = [
 export function PropertyOnboardingPage() {
   const navigate = useNavigate()
   const [source, setSource] = useState<string>('generic')
+  // S633: an import lands in ONE company. With a single company the picker
+  // renders nothing and this is that company; with several the account chooses,
+  // because a file imported into the wrong LLC is unwound by hand.
+  const [landlordId, setLandlordId] = useState<string>('')
   const [fileName, setFileName] = useState<string>('')
   const [csvText, setCsvText] = useState<string>('')
   const [punchListRows, setPunchListRows] = useState<PropertyCsvRow[] | null>(null)
@@ -117,7 +123,7 @@ export function PropertyOnboardingPage() {
 
   const validateMut = useMutation(
     (body: { csv: string; source: string; claimedPlatformName?: string }) =>
-      apiPost<ValidateResponse>('/landlords/me/onboard-properties-csv/validate', body),
+      apiPost<ValidateResponse>('/landlords/me/onboard-properties-csv/validate', { ...body, landlordId }),
     {
       onSuccess: (res: any) => {
         const data: ValidateResponse = res.data
@@ -139,7 +145,7 @@ export function PropertyOnboardingPage() {
   const commitMut = useMutation(
     ({ rows, decisions }: { rows: PropertyCsvRow[]; decisions: any[] }) =>
       apiPost<CommitResponse>('/landlords/me/onboard-properties-csv/commit', {
-        rows, source, lateFeeDecisions: decisions,
+        rows, source, lateFeeDecisions: decisions, landlordId,
         ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
       }),
     {
@@ -266,6 +272,8 @@ export function PropertyOnboardingPage() {
         <h1 style={{ fontSize: '1.6rem', fontWeight: 700, color: 'var(--text-0)', margin: 0 }}>
           Property &amp; Unit Onboarding
         </h1>
+        <EntityPicker value={landlordId} onChange={setLandlordId}
+          note="Imported properties and units are created under this company." />
         <p style={{ fontSize: '.88rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
           Bring your full portfolio onto GAM in one shot. One CSV row per unit;
           the property is created automatically if it doesn't already exist

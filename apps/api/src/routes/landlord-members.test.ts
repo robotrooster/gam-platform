@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
-import { db } from '../db'
+import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { landlordsRouter } from './landlords'
 import { propertiesRouter } from './properties'
@@ -232,5 +232,37 @@ describe('aggregated portfolio (the Oak Park case)', () => {
       .get(`/api/landlords/${oakPark.landlordId}/dashboard`)
       .set('Authorization', `Bearer ${tokenFor(stranger)}`)
     expect(dashDenied.status).toBe(403)
+  })
+})
+
+// S631 (Nic): "What happened to my other partner Blu that was a co-owner of Oak
+// Park? He seems to have disappeared from the list." Nobody could answer,
+// because removal was a hard DELETE with no record — and the removal that
+// actually happened bypassed the app entirely, so app-level logging would have
+// missed it too. The history is written by a DATABASE trigger for that reason.
+describe('S631 membership history', () => {
+  it('records an add and a removal, including one made straight in the database', async () => {
+    const client = await getClient()
+    let landlordId: string, coOwnerUserId: string
+    try {
+      const { landlordId: lid } = await seedLandlord(client)
+      landlordId = lid
+      const co = await seedLandlord(client)
+      coOwnerUserId = co.userId
+    } finally { client.release() }
+
+    // A direct write — exactly the shape that erased Blu with no trace.
+    await db.query(
+      `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [landlordId!, coOwnerUserId!])
+    await db.query(
+      `DELETE FROM landlord_members WHERE landlord_id=$1 AND user_id=$2`,
+      [landlordId!, coOwnerUserId!])
+
+    const h = await db.query<{ action: string }>(
+      `SELECT action FROM landlord_member_history
+        WHERE landlord_id=$1 AND user_id=$2 ORDER BY occurred_at, action DESC`,
+      [landlordId!, coOwnerUserId!])
+    expect(h.rows.map(r => r.action)).toEqual(['added', 'removed'])
   })
 })

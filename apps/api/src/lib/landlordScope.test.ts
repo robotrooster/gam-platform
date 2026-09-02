@@ -29,14 +29,35 @@ describe('landlordScopeIds', () => {
     expect(landlordScopeIds(user({ landlordIds: ['own'] }))).toEqual(['own'])
   })
 
-  it('handles a session minted before co-ownership existed', () => {
-    // landlordIds is absent on older tokens; they must not lose their own book.
-    expect(landlordScopeIds(user({ landlordIds: null }))).toEqual(['own'])
-    expect(landlordScopeIds(user({ landlordIds: undefined }))).toEqual(['own'])
+  it('S633: a landlord session with no landlordIds scopes to NOTHING, not to profileId', () => {
+    // The old behaviour fell back to profileId so a pre-S553 token kept its own
+    // book. S633 removes that on purpose: profileId no longer names an entity
+    // for a landlord (routes/auth.ts mints it null), so falling back to it would
+    // scope queries to a value that is either null or, worse, some other role's
+    // profile row — that exact fallback let a TENANT's profileId read as a
+    // company.
+    //
+    // Nothing is lost by removing it, because the token is no longer the source:
+    // requireAuth refreshes landlordIds from `landlord_members` UNION
+    // `landlords.user_id` on every landlord request (see middleware/auth.ts
+    // currentLandlordIds), so an older token gets a correct, current set before
+    // any scope check runs. An empty array here means "genuinely no companies",
+    // and callers refuse on it rather than running an unfiltered query.
+    expect(landlordScopeIds(user({ landlordIds: null }))).toEqual([])
+    expect(landlordScopeIds(user({ landlordIds: undefined }))).toEqual([])
   })
 
-  it('de-duplicates when profileId also appears in the list', () => {
+  it('de-duplicates a repeated entity', () => {
     expect(landlordScopeIds(user({ landlordIds: ['own', 'own'] }))).toEqual(['own'])
+  })
+
+  it('S633: a TENANT never resolves a landlord scope from their profileId', () => {
+    // profileId for a tenant is their `tenants.id`. The pre-S633 fallback
+    // returned [that tenant id], which read downstream as "this account owns
+    // exactly one company" and would have handed a tenant id back as the company
+    // to write against. Caught by the terminal suite when its "no landlord scope
+    // → 400" case started returning 200.
+    expect(landlordScopeIds(user({ role: 'tenant' as any, profileId: 'tenant-row-id' }))).toEqual([])
   })
 
   it('leaves team roles exactly as they were — landlordId, not profileId', () => {

@@ -13,18 +13,21 @@
  */
 
 import { query } from '../../../db'
-import type { AgentTool, AgentActor } from './types'
+import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 const TYPE = 'landlord_message'
 const TITLE = 'Message from your landlord'
 
 /** Build the recipient subquery (active tenants of this landlord, optional
  *  property filter). Returns [sql, params] with the landlord id as $1. */
-function recipientSource(landlordId: string, propertyName?: string): { from: string; params: any[] } {
-  const params: any[] = [landlordId]
+// S634: a blast reaches the tenants of every company the ACCOUNT owns unless a
+// property narrows it — which is what "message everyone" means to somebody who
+// owns two parks.
+function recipientSource(landlordIds: string[], propertyName?: string): { from: string; params: any[] } {
+  const params: any[] = [landlordIds]
   let from =
     `FROM lease_tenants lt
-       JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = $1 AND l.status = 'active'
+       JOIN leases l ON l.id = lt.lease_id AND l.landlord_id = ANY($1::uuid[]) AND l.status = 'active'
        JOIN tenants t ON t.id = lt.tenant_id`
   if (propertyName && propertyName.trim()) {
     params.push(`%${propertyName.trim()}%`)
@@ -59,7 +62,7 @@ export const sendBulkMessage: AgentTool = {
     const propertyName = typeof args.propertyName === 'string' ? args.propertyName : undefined
     const scope = propertyName ? `tenants at "${propertyName}"` : 'all your active tenants'
 
-    const src = recipientSource(actor.profileId, propertyName)
+    const src = recipientSource(actorLandlordIds(actor), propertyName)
 
     // Preview step: count recipients, send nothing.
     if (args.confirmed !== true) {

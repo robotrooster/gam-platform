@@ -196,7 +196,7 @@ describe('the composing pass under a guard-driven rewrite', () => {
 
     const res = await runAgentWithTools({
       profile: requireProfile('landlord_entry'),
-      actor: { userId: 'u1', role: 'landlord', profileId: 'l1' } as AgentActor,
+      actor: { userId: 'u1', role: 'landlord', profileId: '', landlordIds: ['l1'] } as AgentActor,
       message: 'tell me more about the apt 204 one',
       history: [{ role: 'assistant', content: REPEATED }],
     } as any)

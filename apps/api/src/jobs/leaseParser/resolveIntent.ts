@@ -117,7 +117,11 @@ export function pickCandidateByAddress<T extends { street1: string | null }>(
  */
 export async function resolveIntent(
   intentId: string,
-  landlordId: string,
+  // S633: every company the ACCOUNT owns. The filter below is still the
+  // ownership check — it is just no longer narrowed to the one company the
+  // session sat on, which made an intent created under the other company
+  // unresolvable from the same login.
+  landlordIds: string[],
   landlordOverrides: Partial<ParserOutput>,
   opts: { confirmSupersede?: boolean } = {},
 ): Promise<ResolveResult> {
@@ -127,12 +131,17 @@ export async function resolveIntent(
   const intent = await queryOne<IntentRow>(
     `SELECT id, landlord_id, tenant_id, parser_status, parser_output, imported_pdf_url
      FROM pending_tenant_intents
-     WHERE id = $1 AND landlord_id = $2 AND resolved_at IS NULL`,
-    [intentId, landlordId]
+     WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND resolved_at IS NULL`,
+    [intentId, landlordIds]
   )
   if (!intent) {
     throw new AppError(404, 'Pending tenant not found, already resolved, or not owned by you')
   }
+  // S633: from here on, the company is the INTENT's own — the one the invite was
+  // created under. Everything below writes a lease, a tenant and an invoice, and
+  // they all belong to that company, not to whichever one the caller's session
+  // happened to name.
+  const landlordId: string = intent.landlord_id
   if (!['parsed', 'mismatch', 'error'].includes(intent.parser_status)) {
     throw new AppError(409, `Cannot resolve while parser_status='${intent.parser_status}'. Wait for parsing to finish.`)
   }

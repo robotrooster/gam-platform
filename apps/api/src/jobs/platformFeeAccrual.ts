@@ -140,11 +140,28 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
  * through the grace the accrual path just declined to bill through.
  */
 export async function applyConnectAccountMinimums(monthIso: string): Promise<number> {
-  // Every payout group whose landlord is PAST GRACE, whether or not it earned
-  // anything this month — a live account with no occupied units still owes the
-  // floor, exactly as it did when the floor was per property. Landlords still in
-  // onboarding grace (billing_starts_at NULL or in the future) are absent, so
-  // this can never bill through the grace the accrual path just honoured.
+  // Every payout group whose landlord is PAST GRACE **and has something to bill
+  // this month**.
+  //
+  // S631 (Nic, DIRECTIVE): "We do ten dollars a month minimum, but only when
+  // money's moving through the system. Leaving it vacant forever as a ghost in
+  // the system is okay."
+  //
+  // The floor used to apply to any past-grace account whether or not it earned
+  // anything — it would create a zero row purely to hang a $10 top-up off. That
+  // turned every abandoned signup into a $10/month invoice the moment the grace
+  // cap stamped billing_starts_at: a landlord who kicked the tyres, added one
+  // space, never came back and never had a tenant would be billed forever. It
+  // also contradicted the standing rule that a landlord goes non-charged when
+  // every unit is vacant, since a fully-vacant portfolio earns zero and would
+  // have been floored to $10 all the same.
+  //
+  // The floor is what a TRANSACTING account pays when $2/unit lands under $10 —
+  // one occupied space is $2, and the floor lifts it to $10. It was never meant
+  // to be a subscription for holding an empty record. So a group with nothing
+  // billable this month is skipped entirely: no row, no top-up, no invoice.
+  // Occupancy is the trigger, not settlement — a landlord whose tenant simply
+  // hasn't paid yet still has a billable unit and still owes the floor.
   const groups = await query<{
     group_key: string; min_amount: string; earned: string
     anchor_accrual_id: string | null; anchor_property_id: string; anchor_landlord_id: string
@@ -165,7 +182,8 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
          AND l.is_system = FALSE
     ),
     joined AS (
-      SELECT live.*, a.id AS accrual_id, COALESCE(a.total_amount, 0) AS amount
+      SELECT live.*, a.id AS accrual_id, COALESCE(a.total_amount, 0) AS amount,
+             COALESCE(a.total_billable, 0) AS billable
         FROM live
         LEFT JOIN platform_fee_accruals a
                ON a.property_id = live.property_id AND a.accrual_month = $1::date
@@ -183,7 +201,10 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
            (ARRAY_AGG(property_id ORDER BY amount DESC, property_id))[1]::text AS anchor_property_id,
            (ARRAY_AGG(landlord_id ORDER BY amount DESC, property_id))[1]::text AS anchor_landlord_id
       FROM joined
-     GROUP BY group_key`, [monthIso])
+     GROUP BY group_key
+     -- S631: something has to be moving. A group with no billable unit and no
+     -- earnings this month is not floored — it is not billed at all.
+    HAVING SUM(COALESCE(billable, 0)) > 0 OR SUM(amount) > 0`, [monthIso])
 
   let applied = 0
   for (const g of groups) {
@@ -205,9 +226,11 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
       await client.query('BEGIN')
       let accrualId = g.anchor_accrual_id
       if (!accrualId) {
-        // The whole group earned nothing this month. The floor still applies, so
-        // it needs a row to hang off — created at zero, with the top-up carrying
-        // the entire amount, so the row states plainly that no unit was billed.
+        // The group has billable units (the HAVING above guarantees it) but no
+        // accrual row landed — the property-level accrual errored or was skipped.
+        // The floor still applies, so it needs a row to hang off, created at zero
+        // with the top-up carrying the whole amount. An account with NOTHING
+        // billable never reaches here: S631 skips it before the loop.
         const payerRes = await client.query<{ platform_fee_payer: string | null }>(
           `SELECT platform_fee_payer FROM property_allocation_rules WHERE property_id = $1`,
           [g.anchor_property_id])
@@ -270,15 +293,30 @@ export async function applyConnectAccountMinimums(monthIso: string): Promise<num
 
 /**
  * Daily grace-cap sweep (S600). A landlord in onboarding grace has
- * billing_starts_at NULL. Once their grace cap month arrives, billing must begin
- * even if they never took a rent payment — they've had the free setup + preview
- * window (setup cycle + PLATFORM_FEE_GRACE_CYCLES full cycles). Cap =
- * billing_grace_until, falling back to first-of-month(created_at) +
+ * billing_starts_at NULL. Once their grace cap month arrives, billing begins
+ * even if they never took a rent payment THROUGH GAM — they've had the free
+ * setup + preview window (setup cycle + PLATFORM_FEE_GRACE_CYCLES full cycles).
+ * Cap = billing_grace_until, falling back to first-of-month(created_at) +
  * PLATFORM_FEE_GRACE_CYCLES months when unset (covers any landlord created
  * before the app-code that stamps billing_grace_until at signup). Idempotent:
  * only NULL rows whose cap month has arrived flip. Activation via first settled
  * rent (webhooks.ts) always wins the race — it fills billing_starts_at earlier,
  * so this sweep never touches an already-live landlord.
+ *
+ * S631 (Nic): the cap now skips a landlord who never STARTED. It used to stamp
+ * every account whose window ran out, including someone who signed up, typed a
+ * property name, and never came back — and after the S631 floor change that
+ * account is billed nothing anyway, so the stamp bought no revenue and cost the
+ * truth: the row then claims "billing since October" about a landlord who never
+ * had a tenant. Any signup-conversion or active-landlord count read off this
+ * column would have counted abandoned signups as customers.
+ *
+ * "Started" is deliberately wider than "paid us": a landlord holding an ACTIVE
+ * LEASE is operating on the platform whether or not the rent flows through it,
+ * and the cap exists precisely so that landlord can't sit in free grace forever
+ * by collecting off-platform. It is only the empty account — no lease, no
+ * payment, ever — that stays NULL, and stays NULL indefinitely. If they come
+ * back a year later and sign a tenant, the cap picks them up on the next sweep.
  */
 export async function applyBillingGraceCaps(now: Date = new Date()): Promise<number> {
   const flipped = await query<{ id: string }>(
@@ -292,6 +330,17 @@ export async function applyBillingGraceCaps(now: Date = new Date()): Promise<num
                 ) AS cap_month
            FROM landlords
           WHERE billing_starts_at IS NULL
+            -- S631: never operated → never stamped. Either signal counts.
+            AND (
+              EXISTS (SELECT 1 FROM payments pay
+                       WHERE pay.landlord_id = landlords.id
+                         AND pay.type = 'rent' AND pay.status = 'settled')
+              OR EXISTS (SELECT 1 FROM leases le
+                           JOIN units u ON u.id = le.unit_id
+                           JOIN properties pr ON pr.id = u.property_id
+                          WHERE pr.landlord_id = landlords.id
+                            AND le.status IN ('active', 'pending'))
+            )
        ) cap
       WHERE l.id = cap.id
         AND cap.cap_month <= date_trunc('month', $2::timestamptz)::date

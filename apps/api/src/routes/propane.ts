@@ -278,8 +278,22 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
   try {
     const body = z.object({
       propertyId:     z.string().uuid(),
-      // One price for the whole delivery — it is what the invoice charged.
-      pricePerGallon: z.number().nonnegative().max(999),
+      // S632 (Nic): the number the landlord actually has is the SUPPLIER
+      // INVOICE, not a rate. "We put in our true cost total dollar bill, and
+      // then we divide out total gallons delivered to the property... so it's
+      // five dollars a gallon."
+      //
+      // Send invoiceTotal + invoiceGallons and the blended cost is derived here,
+      // to full precision, then the property's standing markup is added. Doing
+      // the division in the browser meant a landlord typing $5.18 for a rate
+      // that was really $5.184255 and quietly losing the difference on every
+      // gallon of a 900-gallon delivery.
+      //
+      // pricePerGallon stays for a caller that genuinely has a rate — an
+      // already-blended figure, or a single-tank fill priced off a ticket.
+      invoiceTotal:   z.number().positive().max(10_000_000).optional(),
+      invoiceGallons: z.number().positive().max(100_000).optional(),
+      pricePerGallon: z.number().nonnegative().max(999).optional(),
       // S613: the ticket's delivery charge (hazmat / fuel surcharge / per stop),
       // passed through to the tanks on this run. Suppliers bill it per STOP, so
       // pro-rata by gallons is the normal split; even-per-tank is the other
@@ -302,10 +316,41 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       seen.add(l.unitId)
     }
 
-    const property = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id = $1', [body.propertyId])
+    const property = await queryOne<any>(
+      'SELECT id, landlord_id, propane_markup_per_gallon FROM properties WHERE id = $1',
+      [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+
+    // ── What the fuel cost, and what the tenant is charged ──────────────
+    //
+    // trueCost is the WHOLE invoice over the WHOLE delivery: tax, delivery,
+    // fuel surcharge, everything the supplier billed. Nic pays the tax upstream
+    // and does not re-charge it, so it belongs inside the blended rate rather
+    // than as a separate line — which is also why no tax rate is configured for
+    // propane on any property.
+    //
+    // The markup is the property's, applied to every fill regardless of payment
+    // plan. See the migration for why that flatness matters.
+    const markup = Number(property.propane_markup_per_gallon ?? 0)
+    let trueCost: number | null = null
+    let billedRate: number
+    if (body.invoiceTotal != null || body.invoiceGallons != null) {
+      if (body.invoiceTotal == null || body.invoiceGallons == null) {
+        throw new AppError(400,
+          'A delivery priced from the invoice needs both the invoice total and the gallons delivered.')
+      }
+      // Full precision on purpose — rounding the rate here loses real money
+      // across a large delivery. The per-fill totals round to the cent.
+      trueCost = body.invoiceTotal / body.invoiceGallons
+      billedRate = trueCost + markup
+    } else if (body.pricePerGallon != null) {
+      billedRate = body.pricePerGallon
+    } else {
+      throw new AppError(400,
+        'Give either the supplier invoice (total + gallons delivered) or a price per gallon.')
     }
 
     const client = await getClient()
@@ -361,8 +406,12 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       for (const [i, p] of prepared.entries()) {
         fills.push(await recordFill(client, {
           unit: p.unit, leaseId: p.leaseId, tenantId: p.tenantId,
-          gallons: p.gallons, pricePerGallon: body.pricePerGallon,
+          gallons: p.gallons, pricePerGallon: billedRate,
           deliveryFeeShare: feeShares[i],
+          trueCostPerGallon: trueCost,
+          markupPerGallon: trueCost != null ? markup : null,
+          invoiceTotal: body.invoiceTotal ?? null,
+          invoiceGallons: body.invoiceGallons ?? null,
           installments: body.installments, createdByUserId: req.user!.userId,
           // The key marks the delivery; only the first line carries it, which is
           // enough for the repeat-submit check above.
@@ -371,12 +420,23 @@ propaneRouter.post('/deliveries', requirePerm('properties.edit'), async (req, re
       }
       await client.query('COMMIT')
       const totalGallons = body.lines.reduce((s, l) => s + l.gallons, 0)
+      const allocated = Math.round(totalGallons * 100) / 100
       res.status(201).json({ success: true, data: {
         fills,
         tanks: fills.length,
-        totalGallons: Math.round(totalGallons * 100) / 100,
+        totalGallons: allocated,
         deliveryCharge: Math.round((body.deliveryCharge ?? 0) * 100) / 100,
         totalAmount: Math.round(fills.reduce((s, f) => s + Number(f.total_amount), 0) * 100) / 100,
+        // S632: the margin, stated rather than inferred.
+        trueCostPerGallon: trueCost != null ? Math.round(trueCost * 10000) / 10000 : null,
+        markupPerGallon: trueCost != null ? markup : null,
+        billedPerGallon: Math.round(billedRate * 10000) / 10000,
+        margin: trueCost != null ? Math.round(markup * allocated * 100) / 100 : null,
+        // Gallons on the invoice that were NOT put on a tank — the park's own
+        // usage, or a line missed. Surfaced because it is the number that
+        // silently eats a margin.
+        unallocatedGallons: body.invoiceGallons != null
+          ? Math.round((body.invoiceGallons - allocated) * 100) / 100 : null,
       } })
     } catch (e) {
       await client.query('ROLLBACK')
@@ -394,9 +454,14 @@ propaneRouter.post('/settings', requirePerm('properties.edit'), async (req, res,
       // S534: landlord-set gallon thresholds for the 2- and 4-way splits.
       splitMinGallons:        z.number().int().min(1).max(9999).optional(),
       splitFourMinGallons:    z.number().int().min(1).max(9999).optional(),
+      // S632: cents per gallon on top of the delivery's true cost. Flat across
+      // every tenant at the property — see the migration on why it must not vary
+      // by payment plan.
+      markupPerGallon:        z.number().min(0).max(10).optional(),
     }).parse(req.body)
     const property = await queryOne<any>(
-      `SELECT id, landlord_id, propane_split_min_gallons, propane_split_four_min_gallons
+      `SELECT id, landlord_id, propane_split_min_gallons, propane_split_four_min_gallons,
+              propane_markup_per_gallon
          FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
@@ -411,12 +476,15 @@ propaneRouter.post('/settings', requirePerm('properties.edit'), async (req, res,
       `UPDATE properties SET
          propane_allow_installments = COALESCE($2, propane_allow_installments),
          propane_split_min_gallons = COALESCE($3, propane_split_min_gallons),
-         propane_split_four_min_gallons = COALESCE($4, propane_split_four_min_gallons)
+         propane_split_four_min_gallons = COALESCE($4, propane_split_four_min_gallons),
+         propane_markup_per_gallon = COALESCE($5, propane_markup_per_gallon)
        WHERE id = $1
        RETURNING id, propane_allow_installments,
-                 propane_split_min_gallons, propane_split_four_min_gallons`,
+                 propane_split_min_gallons, propane_split_four_min_gallons,
+                 propane_markup_per_gallon`,
       [body.propertyId, body.allowInstallments ?? null,
-       body.splitMinGallons ?? null, body.splitFourMinGallons ?? null])
+       body.splitMinGallons ?? null, body.splitFourMinGallons ?? null,
+       body.markupPerGallon ?? null])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

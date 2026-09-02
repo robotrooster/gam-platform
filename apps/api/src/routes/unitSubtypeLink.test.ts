@@ -86,13 +86,20 @@ describe('unit ↔ subtype linking (S613)', () => {
     const row = (await db.query(`SELECT rv_site_layout, rv_amp_service, rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
     expect(row.rv_site_layout).toBe('back_in')
     expect(row.rv_amp_service).toBe('30')
-    expect(Number(row.rent_amount)).toBe(440)
+    // S630 (Nic, DIRECTIVE — supersedes S613): "Subtypes should not price the
+    // unit... Maybe one spot's bigger and worth more, maybe one spot's tiny or
+    // inconvenient so they get a deal — it doesn't change the fact that it's a
+    // pull through or a fifty amp spot." Applying a class pushes the physical
+    // FACTS and nothing else; the unit's own price is left exactly as it was.
+    expect(Number(row.rent_amount)).toBe(1000)
   })
 
-  // S613: an occupied park has to be classifiable, and moving a space into a
-  // class takes that class's asking price. The TENANT is unaffected — the lease
-  // carries its own rent and that is what bills.
-  it('an occupied unit takes its class price; the lease keeps its own rent', async () => {
+  // S630 (supersedes S613): an occupied park still has to be classifiable, and
+  // classifying it must move NO money — not the unit's asking price, and not the
+  // sitting tenant's rent. This used to assert the opposite (the unit took the
+  // class's price); it is inverted rather than deleted, because "classifying a
+  // space silently repriced it" is precisely what must never happen again.
+  it('classifying an occupied unit changes no price — not the unit\'s, not the lease\'s', async () => {
     const app = buildApp(); const f = await seed()
     const c = await db.connect()
     let leaseId = ''
@@ -107,7 +114,7 @@ describe('unit ↔ subtype linking (S613)', () => {
     const row = (await db.query(`SELECT subtype_id, rv_amp_service, rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
     expect(row.subtype_id).toBe(s.id)
     expect(row.rv_amp_service).toBe('50')
-    expect(Number(row.rent_amount)).toBe(999)   // the asking price is the class's
+    expect(Number(row.rent_amount)).toBe(1000)  // the unit's own asking price, untouched
     const lease = (await db.query(`SELECT rent_amount FROM leases WHERE id=$1`, [leaseId])).rows[0]
     expect(Number(lease.rent_amount)).toBe(380) // what the tenant actually pays
   })
@@ -133,10 +140,11 @@ describe('unit ↔ subtype linking (S613)', () => {
       .set('Authorization', `Bearer ${f.token}`)
       .send({ id: s.id, unitType: 'rv_spot', name: 'Back-in 50 amp', rentAmount: 480 })
 
-    // The class price is a DEFAULT for units created after it, never a
-    // retroactive reprice: a spot already quoted at 440 stays at 440.
+    // S630: the class price is a DEFAULT offered when units are CREATED, never a
+    // retroactive reprice and never applied on assignment. The unit keeps the
+    // price it has always had.
     const row = (await db.query(`SELECT rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
-    expect(Number(row.rent_amount)).toBe(440)
+    expect(Number(row.rent_amount)).toBe(1000)
   })
 
   it('a unit IN a subtype can be priced on its own', async () => {
@@ -231,7 +239,9 @@ describe('unit ↔ subtype linking (S613)', () => {
     expect(out.status).toBe(200)
     const row = (await db.query(`SELECT subtype_id, rent_amount FROM units WHERE id=$1`, [f.rvA])).rows[0]
     expect(row.subtype_id).toBeNull()
-    expect(Number(row.rent_amount)).toBe(520)   // kept, not reset
+    // S630: the unit's price was never the class's to begin with, so leaving the
+    // class cannot change it. Kept, not reset.
+    expect(Number(row.rent_amount)).toBe(1000)
 
     const edit = await request(app).patch(`/api/units/${f.rvA}/details`)
       .set('Authorization', `Bearer ${f.token}`).send({ rentAmount: 600 })
@@ -253,8 +263,9 @@ describe('unit ↔ subtype linking (S613)', () => {
     const rows = (await db.query(
       `SELECT id, rent_amount, subtype_id FROM units WHERE id = ANY($1::uuid[])`, [[f.rvA, f.rvB]])).rows
     expect(Number(rows.find((r: any) => r.id === f.rvA).rent_amount)).toBe(700)
-    // The neighbour is untouched, and both keep the classification.
-    expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(440)
+    // The neighbour is untouched — at its OWN price, which joining the class
+    // never overwrote (S630) — and both keep the classification.
+    expect(Number(rows.find((r: any) => r.id === f.rvB).rent_amount)).toBe(1000)
     expect(rows.every((r: any) => r.subtype_id === s.id)).toBe(true)
   })
 })
@@ -388,10 +399,13 @@ describe('charges outside the lease (S613)', () => {
     await request(app).post(`/api/utility/meters/${meter.body.data.id}/units`)
       .set('Authorization', `Bearer ${f.token}`).send({ unitId: f.rvB })
 
+    // S634: a lease that is SILENT about trash is not a lease that refuses it —
+    // the meter decides (standing directive: the meter/unit setup says who
+    // pays). Both units bill fine, so the warning must be empty.
     const before = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
       .set('Authorization', `Bearer ${f.token}`)
     const m = before.body.data.find((x: any) => x.id === meter.body.data.id)
-    expect((m.units_not_billing ?? m.unitsNotBilling).length).toBe(2)
+    expect((m.units_not_billing ?? m.unitsNotBilling).length).toBe(0)
 
     const res = await request(app).post(`/api/utility/meters/${meter.body.data.id}/bill-back`)
       .set('Authorization', `Bearer ${f.token}`).send({})
@@ -402,5 +416,73 @@ describe('charges outside the lease (S613)', () => {
       .set('Authorization', `Bearer ${f.token}`)
     const m2 = after.body.data.find((x: any) => x.id === meter.body.data.id)
     expect((m2.units_not_billing ?? m2.unitsNotBilling).length).toBe(0)
+  })
+
+  /**
+   * S634 — THE WARNING THAT CRIED WOLF, AND THE MONTH IT LOOKED LIKE LOSING.
+   *
+   * Nic, the day RV 02 and RV 03's leases were signed: "the system is detecting
+   * that leases are not billed back for utilities... I clicked to bill back
+   * anyway, and it said it wasn't gonna start until the next bill."
+   *
+   * Both units were billing correctly. RV 02 had no utility rows on its lease at
+   * all and RV 03 none for trash, and the billing engine reads that silence the
+   * way the directive says to — the meter decides. The METER LIST read it the
+   * other way and said they billed nothing, which is the same defect in two
+   * voices disagreeing.
+   */
+  it('a lease that is SILENT about a utility still bills — no warning', async () => {
+    const app = buildApp(); const f = await seed()
+    await activeLease(f.rvA, f.landlordId)
+    const meter = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', baseFee: 25, assignUnitId: f.rvA })
+    const list = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m = list.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m.units_not_billing ?? m.unitsNotBilling)).toEqual([])
+  })
+
+  it('a lease that EXPLICITLY refuses a utility is the one that warns', async () => {
+    const app = buildApp(); const f = await seed()
+    await activeLease(f.rvA, f.landlordId)
+    const meter = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'trash', label: 'Trash',
+              billingMethod: 'flat_rate', baseFee: 25, assignUnitId: f.rvA })
+    // The landlord says, on the lease, that this tenant does not pay trash.
+    const off = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ utilityType: 'trash', tenantResponsible: false })
+    expect(off.status).toBe(200)
+
+    const list = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m = list.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m.units_not_billing ?? m.unitsNotBilling)).toEqual([f.rvA])
+
+    // ...and billing it back clears it.
+    const res = await request(app).post(`/api/utility/meters/${meter.body.data.id}/bill-back`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
+    expect(res.status).toBe(200)
+    expect(res.body.data.leasesUpdated).toBe(1)
+    const after = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m2 = after.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m2.units_not_billing ?? m2.unitsNotBilling)).toEqual([])
+  })
+
+  it('a master meter billed to the landlord warns on every unit', async () => {
+    const app = buildApp(); const f = await seed()
+    await activeLease(f.rvA, f.landlordId)
+    const meter = await request(app).post('/api/utility/meters')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, utilityType: 'water', label: 'Master',
+              billingMethod: 'master_bill_to_landlord', baseFee: 0, assignUnitId: f.rvA })
+    const list = await request(app).get(`/api/utility/meters?propertyId=${f.propertyId}`)
+      .set('Authorization', `Bearer ${f.token}`)
+    const m = list.body.data.find((x: any) => x.id === meter.body.data.id)
+    expect((m.units_not_billing ?? m.unitsNotBilling)).toEqual([f.rvA])
   })
 })

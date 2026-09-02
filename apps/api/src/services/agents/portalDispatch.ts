@@ -35,7 +35,7 @@ import jwt from 'jsonwebtoken'
 import { logger } from '../../lib/logger'
 import { query } from '../../db'
 import { getPortalAction, type PortalAction } from './portalActions'
-import type { AgentActor } from './tools/types'
+import { actorLandlordIds, type AgentActor } from './tools/types'
 
 /** Injected in tests so the suite never needs a listening server. */
 export type Transport = (url: string, init: any) => Promise<{ status: number; json: any }>
@@ -99,7 +99,7 @@ const LOOKUP: Record<string, string> = {
   unitId: `SELECT un.id, un.unit_number AS label
              FROM units un
              JOIN properties p ON p.id = un.property_id
-            WHERE p.landlord_id = $1 AND un.retired_at IS NULL`,
+            WHERE p.landlord_id = ANY($1::uuid[]) AND un.retired_at IS NULL`,
   // A lease is named by the unit it is on, or by whoever signed it. Ended
   // leases are excluded: "204's lease" means the live one.
   leaseId: `SELECT l.id,
@@ -128,7 +128,11 @@ async function resolveHumanId(
 
   let rows: Array<{ id: string; label: string }> = []
   try {
-    rows = await query<{ id: string; label: string }>(LOOKUP[key], [actor.profileId])
+    // S634: resolve a spoken "spot 7" against every company the ACCOUNT owns.
+    // Scoped to one, a landlord naming a unit at their other park got "I could
+    // not confirm which one that is" — a refusal that was true of the session
+    // and false of the account.
+    rows = await query<{ id: string; label: string }>(LOOKUP[key], [actorLandlordIds(actor)])
   } catch (e) {
     // Fail CLOSED. If the unit list cannot be read there is no safe way to turn
     // a spoken number into an id, and guessing is the one thing this must not

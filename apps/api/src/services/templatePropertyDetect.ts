@@ -45,8 +45,11 @@ export function matchPropertiesInText(
   return hits[0]
 }
 
+// S633: matches against every property the ACCOUNT owns. A lease PDF carries a
+// property's name and address; which of the account's companies holds that
+// property is not something the uploader should have had to select first.
 export async function detectPropertyFromPdf(
-  landlordId: string,
+  landlordIds: string[],
   pdfBuffer: Buffer,
 ): Promise<DetectedProperty | null> {
   try {
@@ -55,7 +58,7 @@ export async function detectPropertyFromPdf(
     const text = extracted.pages.flatMap(pg => pg.items.map(i => i.text)).join(' ')
     if (!text.trim()) return null
     const properties = await query<{ id: string; name: string | null; street1: string | null }>(
-      `SELECT id, name, street1 FROM properties WHERE landlord_id = $1`, [landlordId])
+      `SELECT id, name, street1 FROM properties WHERE landlord_id = ANY($1::uuid[])`, [landlordIds])
     return matchPropertiesInText(text, properties)
   } catch {
     // Detection is best-effort — never fail the upload over it.

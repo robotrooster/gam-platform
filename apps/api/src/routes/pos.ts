@@ -11,9 +11,33 @@ import {
 } from '../services/posTerminal'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
+import { resolveLandlordTarget, ownsLandlord } from '../lib/landlordScope'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
+
+/**
+ * S633 — WHICH COMPANY'S REGISTER IS THIS?
+ *
+ * POS is landlord-operated: items, tax categories, stock and sales all hang off
+ * a `landlords` row. Every route here used to read `req.user.profileId` — the
+ * single company a session sat on — which stops being an answer once an account
+ * owns more than one. It is the same defect the rest of S633 removes, and
+ * leaving it would have made the register unusable rather than merely wrong:
+ * profileId is null for a landlord now.
+ *
+ * So the register names its company. An account that owns exactly one gets it
+ * silently — every existing single-company merchant is unaffected. An account
+ * that owns several must say which, because a sale, a stock adjustment and a
+ * tax rate all belong to one book and cannot be split after the fact.
+ *
+ * NOTE for the POS UI: a multi-company account needs a register/location picker
+ * that sends `landlordId`. Until it has one, such an account gets a clear 400
+ * naming the problem rather than a silently mis-filed sale.
+ */
+function posLandlordId(req: any): string {
+  return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId, 'register')
+}
 
 // POS money/quantity fields are never negative. Mirrors the client-side nonNeg
 // guards on POSPage so a negative can't slip in via a direct API call. Optional
@@ -96,7 +120,7 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
             AND pi.is_active = TRUE
             AND pi.property_id = $2
           ORDER BY pc.name, pi.name`,
-        [req.user!.profileId, propertyFilter],
+        [posLandlordId(req), propertyFilter],
       )
     } else {
       items = await query<any>(
@@ -107,7 +131,7 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
           LEFT JOIN pos_tax_categories tc ON tc.id = pi.tax_category_id
           WHERE pi.landlord_id=$1 AND pi.is_active=TRUE
           ORDER BY pc.name, pi.name`,
-        [req.user!.profileId],
+        [posLandlordId(req)],
       )
     }
 
@@ -123,12 +147,12 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
           `INSERT INTO pos_categories (landlord_id, name, icon, sort_order)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (landlord_id, name) DO NOTHING`,
-          [req.user!.profileId, cat.name, cat.icon, cat.sort_order],
+          [posLandlordId(req), cat.name, cat.icon, cat.sort_order],
         )
       }
       const cats = await query<{ id: string; name: string }>(
         'SELECT id, name FROM pos_categories WHERE landlord_id=$1',
-        [req.user!.profileId],
+        [posLandlordId(req)],
       )
       const catIdByName = new Map(cats.map(c => [c.name, c.id]))
       for (const item of DEFAULT_ITEMS) {
@@ -136,7 +160,7 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
         if (!catId) continue  // defensive — shouldn't happen since we just seeded
         await query(`INSERT INTO pos_items (landlord_id,property_id,name,category_id,icon,sell_price,cost_price,tax_rate,stock_qty,stock_min,stock_max,charge_eligible,margin_pct)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,ROUND((($6-$7)/$6)*100,2))`,
-          [req.user!.profileId, propertyFilter, item.name, catId, item.icon, item.sell_price,
+          [posLandlordId(req), propertyFilter, item.name, catId, item.icon, item.sell_price,
            item.cost_price, item.tax_rate, item.stock_qty, item.stock_min, item.stock_max,
            item.charge_eligible ?? true])
       }
@@ -146,7 +170,7 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
           WHERE pi.landlord_id=$1 AND pi.is_active=TRUE AND pi.property_id=$2
           ORDER BY pc.name, pi.name`,
-        [req.user!.profileId, propertyFilter],
+        [posLandlordId(req), propertyFilter],
       )
     }
 
@@ -161,7 +185,7 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
 posRouter.get('/settings', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
     const row = await queryOne<{ pos_default_margin_pct: string | null; business_name: string | null }>(
-      `SELECT pos_default_margin_pct, business_name FROM landlords WHERE id = $1`, [req.user!.profileId])
+      `SELECT pos_default_margin_pct, business_name FROM landlords WHERE id = $1`, [posLandlordId(req)])
     res.json({ success: true, data: {
       defaultMarginPct: row?.pos_default_margin_pct != null ? Number(row.pos_default_margin_pct) : null,
       businessName: row?.business_name || null,
@@ -178,7 +202,7 @@ posRouter.patch('/settings', requirePerm('pos.manage_inventory'), async (req, re
       val = Number(defaultMarginPct)
       if (!Number.isFinite(val) || val < 0 || val >= 100) throw new AppError(400, 'Margin must be 0–99.99%')
     }
-    await query(`UPDATE landlords SET pos_default_margin_pct = $1 WHERE id = $2`, [val, req.user!.profileId])
+    await query(`UPDATE landlords SET pos_default_margin_pct = $1 WHERE id = $2`, [val, posLandlordId(req)])
     res.json({ success: true, data: { defaultMarginPct: val } })
   } catch (e) { next(e) }
 })
@@ -202,7 +226,7 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
       `SELECT landlord_id FROM pos_categories WHERE id = $1`,
       [categoryId],
     )
-    if (!cat || cat.landlord_id !== req.user!.profileId) {
+    if (!cat || cat.landlord_id !== posLandlordId(req)) {
       throw new AppError(400, 'categoryId does not belong to this landlord')
     }
 
@@ -213,14 +237,14 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
       `SELECT landlord_id FROM properties WHERE id = $1`,
       [propertyId],
     )
-    if (!prop || prop.landlord_id !== req.user!.profileId) {
+    if (!prop || prop.landlord_id !== posLandlordId(req)) {
       throw new AppError(400, 'propertyId does not belong to this landlord')
     }
 
     const item = await queryOne<any>(`INSERT INTO pos_items
       (landlord_id,property_id,name,category_id,icon,cost_price,sell_price,margin_pct,tax_rate,charge_eligible,stock_qty,stock_min,stock_max,vendor_id,shelf_label_enabled,tax_category_id)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-      [req.user!.profileId, propertyId, name, categoryId, icon||'📦', costPrice||0, sellPrice,
+      [posLandlordId(req), propertyId, name, categoryId, icon||'📦', costPrice||0, sellPrice,
        margin, taxRate||0, chargeEligible??true, stockQty||0, stockMin||5, stockMax||50,
        vendorId||null, shelfLabelEnabled??true, taxCategoryId||null])
 
@@ -232,7 +256,7 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
 // S227: accepts categoryId (uuid). Validates ownership before assignment.
 posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const item = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const item = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!item) throw new AppError(404, 'Item not found')
 
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
@@ -261,7 +285,7 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
         `SELECT landlord_id FROM pos_categories WHERE id = $1`,
         [categoryId],
       )
-      if (!cat || cat.landlord_id !== req.user!.profileId) {
+      if (!cat || cat.landlord_id !== posLandlordId(req)) {
         throw new AppError(400, 'categoryId does not belong to this landlord')
       }
       newCategoryId = categoryId
@@ -277,7 +301,7 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
         `SELECT landlord_id FROM properties WHERE id = $1`,
         [propertyId],
       )
-      if (!prop || prop.landlord_id !== req.user!.profileId) {
+      if (!prop || prop.landlord_id !== posLandlordId(req)) {
         throw new AppError(400, 'propertyId does not belong to this landlord')
       }
       newPropertyId = propertyId
@@ -297,7 +321,7 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
         `SELECT landlord_id FROM pos_vendors WHERE id = $1`,
         [vendorId],
       )
-      if (!v || v.landlord_id !== req.user!.profileId) {
+      if (!v || v.landlord_id !== posLandlordId(req)) {
         throw new AppError(400, 'vendorId does not belong to this landlord')
       }
       newVendorId = vendorId
@@ -326,7 +350,7 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     if (newStockQty !== item.stock_qty) {
       await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
         VALUES ($1,$2,$3,'manual','Item edit form',$4,$5)`,
-        [item.id, req.user!.profileId, newStockQty - item.stock_qty, item.stock_qty, newStockQty])
+        [item.id, posLandlordId(req), newStockQty - item.stock_qty, item.stock_qty, newStockQty])
     }
 
     res.json({ success: true, data: updated })
@@ -346,12 +370,12 @@ const DEFAULT_TAX_CATEGORIES = [
 posRouter.get('/tax-categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
     const inactive = req.query.all === '1' ? '' : 'AND is_active=TRUE'
-    let rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [req.user!.profileId])
+    let rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [posLandlordId(req)])
     if (rows.length === 0) {
       for (const t of DEFAULT_TAX_CATEGORIES) {
-        await query('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4)', [req.user!.profileId, t.name, t.rate, t.sort_order])
+        await query('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4)', [posLandlordId(req), t.name, t.rate, t.sort_order])
       }
-      rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [req.user!.profileId])
+      rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [posLandlordId(req)])
     }
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
@@ -364,7 +388,7 @@ posRouter.post('/tax-categories', requirePerm('pos.manage_inventory'), async (re
     const r = Number(rate)
     if (!Number.isFinite(r) || r < 0 || r > 1) throw new AppError(400, 'rate must be a decimal 0–1 (e.g. 0.08 for 8%)')
     try {
-      const row = await queryOne('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.profileId, name.trim(), r, sortOrder||0])
+      const row = await queryOne('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4) RETURNING *', [posLandlordId(req), name.trim(), r, sortOrder||0])
       res.status(201).json({ success: true, data: row })
     } catch (e: any) {
       if (e?.code === '23505') throw new AppError(409, `A tax category named "${name.trim()}" already exists`)
@@ -375,7 +399,7 @@ posRouter.post('/tax-categories', requirePerm('pos.manage_inventory'), async (re
 
 posRouter.patch('/tax-categories/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const cat = await queryOne<any>('SELECT * FROM pos_tax_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const cat = await queryOne<any>('SELECT * FROM pos_tax_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!cat) throw new AppError(404, 'Tax category not found')
     const { name, rate, isActive, sortOrder } = req.body
     let r = cat.rate
@@ -394,14 +418,14 @@ posRouter.patch('/tax-categories/:id', requirePerm('pos.manage_inventory'), asyn
 posRouter.post('/items/:id/adjust-stock', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { changeQty, reason, notes } = req.body
-    const item = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const item = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!item) throw new AppError(404, 'Item not found')
 
     const newQty = Math.max(0, item.stock_qty + changeQty)
     await query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, item.id])
     await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [item.id, req.user!.profileId, changeQty, reason||'adjustment', notes||null, item.stock_qty, newQty])
+      [item.id, posLandlordId(req), changeQty, reason||'adjustment', notes||null, item.stock_qty, newQty])
 
     res.json({ success: true, data: { stockBefore: item.stock_qty, stockAfter: newQty } })
   } catch (e) { next(e) }
@@ -446,7 +470,7 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
-    const totals = await computeCartTotals(req.user!.profileId, items, { surcharge, discountAmount })
+    const totals = await computeCartTotals(posLandlordId(req), items, { surcharge, discountAmount })
     res.json({ success: true, data: totals })
   } catch (e) { next(e) }
 })
@@ -495,7 +519,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           WHERE id = ANY($1::uuid[])
             AND landlord_id = $2
             AND charge_eligible = TRUE`,
-        [linkedIds, req.user!.profileId],
+        [linkedIds, posLandlordId(req)],
       )
       if (eligible.length !== linkedIds.length) {
         throw new AppError(400, 'One or more cart items are not eligible for FlexCharge')
@@ -517,7 +541,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       if (account.status !== 'active') {
         throw new AppError(409, `FlexCharge account is ${account.status}`)
       }
-      if (account.landlord_id !== req.user!.profileId) {
+      if (account.landlord_id !== posLandlordId(req)) {
         throw new AppError(403, 'FlexCharge account belongs to a different landlord')
       }
       flexChargeAccountId = account.id
@@ -530,7 +554,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     const cartLines = items
       .filter((it: any) => !!it.id)
       .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
-    const tax = await calculateCartTax(req.user!.profileId, cartLines)
+    const tax = await calculateCartTax(posLandlordId(req), cartLines)
     const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total } =
       aggregateCartTotals(tax, items, { surcharge, discountAmount })
 
@@ -547,7 +571,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // misbehaving cashier could pass an arbitrary id and stamp the
     // transaction as paid.
     if (paymentMethod === 'card' && stripePaymentIntentId) {
-      const connectId = await getLandlordConnectId(req.user!.profileId)
+      const connectId = await getLandlordConnectId(posLandlordId(req))
       const intent = await retrieveTerminalPaymentIntent({
         landlordConnectAccountId: connectId,
         paymentIntentId:          stripePaymentIntentId,
@@ -555,7 +579,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       if (intent.metadata?.gam_purpose !== 'pos_terminal') {
         throw new AppError(400, 'PaymentIntent is not a POS terminal sale')
       }
-      if (intent.metadata?.gam_landlord_id !== req.user!.profileId) {
+      if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
         throw new AppError(403, 'PaymentIntent belongs to a different landlord')
       }
       if (intent.status !== 'succeeded') {
@@ -588,7 +612,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const txRes = await client.query(`INSERT INTO pos_transactions
           (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-          [req.user!.profileId, tenantId||null, posCustomerId||null, req.user!.userId,
+          [posLandlordId(req), tenantId||null, posCustomerId||null, req.user!.userId,
            paymentMethod, subtotal, taxAmount, surchargeAmt, total, changeGiven||0, platformFee,
            stripePaymentIntentId || null, propertyId || null, discountAmt, discountReason || null])
         tx = txRes.rows[0]
@@ -619,7 +643,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const dbItem = item.id
           ? await client.query<any>(
               'SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2',
-              [item.id, req.user!.profileId],
+              [item.id, posLandlordId(req)],
             ).then(r => r.rows[0] ?? null)
           : null
 
@@ -636,7 +660,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           await client.query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, dbItem.id])
           await client.query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,reference_id,stock_before,stock_after)
             VALUES ($1,$2,$3,'sale',$4,$5,$6)`,
-            [dbItem.id, req.user!.profileId, -item.qty, tx.id, dbItem.stock_qty, newQty])
+            [dbItem.id, posLandlordId(req), -item.qty, tx.id, dbItem.stock_qty, newQty])
 
           // Queue auto-PO for post-commit. dbItem snapshot here uses
           // the pre-decrement stock_qty, matching the original pre-S341
@@ -669,7 +693,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // a future PO failure never leaks through and breaks the
       // 201 response.
       for (const item of inventoryNeedsPO) {
-        try { await autoDraftPO(req.user!.profileId, item) }
+        try { await autoDraftPO(posLandlordId(req), item) }
         catch (e) { logger.error({ err: e, itemId: item.id }, '[POS] Post-commit auto-PO error:') }
       }
 
@@ -719,7 +743,7 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
     // property; the filter applies to every query below.
     const salesProp = req.query.propertyId ? String(req.query.propertyId) : null
     const propFilter = salesProp ? `AND t.property_id = $2` : ''
-    const salesParams: any[] = salesProp ? [req.user!.profileId, salesProp] : [req.user!.profileId]
+    const salesParams: any[] = salesProp ? [posLandlordId(req), salesProp] : [posLandlordId(req)]
 
     // S390: dateFilter must qualify `created_at` with the `t.` alias —
     // the topItems and byCategory queries JOIN pos_transaction_items
@@ -800,7 +824,7 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
 
 posRouter.get('/vendors', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const vendors = await query<any>('SELECT * FROM pos_vendors WHERE landlord_id=$1 ORDER BY name', [req.user!.profileId])
+    const vendors = await query<any>('SELECT * FROM pos_vendors WHERE landlord_id=$1 ORDER BY name', [posLandlordId(req)])
     res.json({ success: true, data: vendors })
   } catch (e) { next(e) }
 })
@@ -812,7 +836,7 @@ posRouter.post('/vendors', requirePerm('pos.manage_inventory'), async (req, res,
     const vendor = await queryOne<any>(`INSERT INTO pos_vendors
       (landlord_id,name,contact_name,email,phone,address,lead_time_days,notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user!.profileId, name, contactName||null, email||null, phone||null,
+      [posLandlordId(req), name, contactName||null, email||null, phone||null,
        address||null, leadTimeDays||3, notes||null])
     res.status(201).json({ success: true, data: vendor })
   } catch (e) { next(e) }
@@ -822,7 +846,7 @@ posRouter.patch('/vendors/:id', requirePerm('pos.manage_inventory'), async (req,
   try {
     const { name, contactName, email, phone, address, leadTimeDays, notes, isActive } = req.body
     assertNonNeg([leadTimeDays, 'Lead time'])
-    const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!vendor) throw new AppError(404, 'Vendor not found')
     const updated = await queryOne<any>(`UPDATE pos_vendors SET
       name=$1, contact_name=$2, email=$3, phone=$4, address=$5, lead_time_days=$6, notes=$7, is_active=$8, updated_at=NOW()
@@ -841,7 +865,7 @@ posRouter.get('/purchase-orders', requirePerm('pos.manage_inventory'), async (re
     // W-12 (S531): ?propertyId= filters to that receiving property; legacy
     // NULL rows stay visible everywhere (created before property stamping).
     const poProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const poParams: any[] = [req.user!.profileId]
+    const poParams: any[] = [posLandlordId(req)]
     const poFilter = poProp ? `AND (po.property_id = $${poParams.push(poProp)} OR po.property_id IS NULL)` : ''
     const pos = await query<any>(`
       SELECT po.*, v.name as vendor_name, v.email as vendor_email,
@@ -861,7 +885,7 @@ posRouter.get('/purchase-orders', requirePerm('pos.manage_inventory'), async (re
 posRouter.patch('/purchase-orders/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { status, notes, expectedDate } = req.body
-    const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!po) throw new AppError(404, 'PO not found')
 
     const timestamps: Record<string, string> = {}
@@ -896,7 +920,7 @@ posRouter.patch('/purchase-orders/:id', requirePerm('pos.manage_inventory'), asy
         await query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, item.item_id])
         await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,reference_id,stock_before,stock_after)
           VALUES ($1,$2,$3,'po_received',$4,$5,$6)`,
-          [item.item_id, req.user!.profileId, qty, po.id, dbItem.stock_qty, newQty])
+          [item.item_id, posLandlordId(req), qty, po.id, dbItem.stock_qty, newQty])
       }
     }
 
@@ -909,7 +933,7 @@ posRouter.get('/low-stock', requirePerm('pos.manage_inventory'), async (req, res
   try {
     // W-12 (S531): ?propertyId= scopes low-stock to that property's items.
     const lsProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const lsParams: any[] = [req.user!.profileId]
+    const lsParams: any[] = [posLandlordId(req)]
     const lsFilter = lsProp ? `AND i.property_id = $${lsParams.push(lsProp)}` : ''
     const items = await query<any>(`
       SELECT i.*, v.name as vendor_name
@@ -952,7 +976,7 @@ posRouter.get('/categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'
     // full list. The two filters are orthogonal and compose.
     const includeInactive = req.query.all === '1'
     const propertyFilter = req.query.propertyId as string | undefined
-    const params: any[] = [req.user!.profileId]
+    const params: any[] = [posLandlordId(req)]
     let where = 'WHERE landlord_id=$1'
     if (!includeInactive) where += ' AND is_active=TRUE'
     if (propertyFilter) {
@@ -967,7 +991,7 @@ posRouter.get('/categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'
       // an empty result just means "no categories scoped to this
       // property" — don't seed.
       for (const cat of DEFAULT_CATEGORIES) {
-        await query('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4)', [req.user!.profileId, cat.name, cat.icon, cat.sort_order])
+        await query('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4)', [posLandlordId(req), cat.name, cat.icon, cat.sort_order])
       }
       cats = await query(`SELECT * FROM pos_categories ${where} ORDER BY sort_order, name`, params)
     }
@@ -984,9 +1008,9 @@ posRouter.post('/categories', requirePerm('pos.manage_inventory'), async (req, r
     // property_ids: null/empty → all properties (company-wide); a non-empty
     // array scopes the category to exactly those properties (each validated
     // to belong to this landlord).
-    const propIds = await validateCategoryPropertyIds(propertyIds, req.user!.profileId)
+    const propIds = await validateCategoryPropertyIds(propertyIds, posLandlordId(req))
     try {
-      const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order,property_ids) VALUES ($1,$2,$3,$4,$5::uuid[]) RETURNING *', [req.user!.profileId, name.trim(), icon||'📦', sortOrder||0, propIds])
+      const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order,property_ids) VALUES ($1,$2,$3,$4,$5::uuid[]) RETURNING *', [posLandlordId(req), name.trim(), icon||'📦', sortOrder||0, propIds])
       res.status(201).json({ success: true, data: cat })
     } catch (e: any) {
       // Category names are unique per landlord → clean 409 instead of a 500.
@@ -1001,14 +1025,14 @@ posRouter.post('/categories', requirePerm('pos.manage_inventory'), async (req, r
 posRouter.patch('/categories/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, icon, sortOrder, isActive, propertyIds } = req.body
-    const cat = await queryOne<any>('SELECT * FROM pos_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const cat = await queryOne<any>('SELECT * FROM pos_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!cat) { res.status(404).json({ success: false, error: 'Not found' }); return }
 
     // property_ids: undefined preserves the existing scope; otherwise
     // null/empty → all properties, a non-empty array → that specific subset.
     let newPropIds: string[] | null = cat.property_ids
     if (propertyIds !== undefined) {
-      newPropIds = await validateCategoryPropertyIds(propertyIds, req.user!.profileId)
+      newPropIds = await validateCategoryPropertyIds(propertyIds, posLandlordId(req))
     }
 
     // S219: sortOrder uses !==undefined so a deliberate 0 (top of list)
@@ -1029,7 +1053,7 @@ posRouter.patch('/categories/:id', requirePerm('pos.manage_inventory'), async (r
 
 posRouter.delete('/categories/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    await query('UPDATE pos_categories SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    await query('UPDATE pos_categories SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -1045,7 +1069,7 @@ posRouter.get('/items/:id/variants', requirePerm('pos.ring_sale', 'pos.manage_in
     // transitive via item_id, so we resolve the item first.
     const item = await queryOne<{ id: string }>(
       'SELECT id FROM pos_items WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId])
+      [req.params.id, posLandlordId(req)])
     if (!item) {
       res.status(404).json({ success: false, error: 'Not found' })
       return
@@ -1058,7 +1082,7 @@ posRouter.get('/items/:id/variants', requirePerm('pos.ring_sale', 'pos.manage_in
 posRouter.post('/items/:id/variants', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, costPrice, sellPrice, stockQty, stockMin, sortOrder } = req.body
-    const item = await queryOne('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const item = await queryOne('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!item) { res.status(404).json({ success: false, error: 'Not found' }); return }
     await query('UPDATE pos_items SET has_variants=TRUE WHERE id=$1', [item.id])
     const variant = await queryOne('INSERT INTO pos_item_variants (item_id,name,cost_price,sell_price,stock_qty,stock_min,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [item.id, name, costPrice||0, sellPrice, stockQty||0, stockMin||5, sortOrder||0])
@@ -1078,7 +1102,7 @@ posRouter.patch('/items/:id/variants/:variantId', requirePerm('pos.manage_invent
     // transitive via item_id.
     const item = await queryOne<{ id: string }>(
       'SELECT id FROM pos_items WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId])
+      [req.params.id, posLandlordId(req)])
     if (!item) { res.status(404).json({ success: false, error: 'Not found' }); return }
     const v = await queryOne('SELECT * FROM pos_item_variants WHERE id=$1 AND item_id=$2', [req.params.variantId, req.params.id])
     if (!v) { res.status(404).json({ success: false, error: 'Not found' }); return }
@@ -1103,12 +1127,12 @@ posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory')
           WHERE landlord_id = $1
             AND (property_id = $2 OR property_id IS NULL)
           ORDER BY tax_type, name`,
-        [req.user!.profileId, propertyFilter],
+        [posLandlordId(req), propertyFilter],
       )
     } else {
       rates = await query<any>(
         'SELECT * FROM pos_tax_rates WHERE landlord_id=$1 ORDER BY tax_type, name',
-        [req.user!.profileId],
+        [posLandlordId(req)],
       )
     }
     res.json({ success: true, data: rates })
@@ -1127,14 +1151,14 @@ posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, re
         'SELECT landlord_id FROM properties WHERE id = $1',
         [propertyId],
       )
-      if (!prop || prop.landlord_id !== req.user!.profileId) {
+      if (!prop || prop.landlord_id !== posLandlordId(req)) {
         throw new AppError(400, 'propertyId does not belong to this landlord')
       }
     }
 
     const r = await queryOne<any>(`INSERT INTO pos_tax_rates (landlord_id,property_id,name,rate,tax_type,applies_to)
       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.user!.profileId, propertyId||null, name, rate, taxType, appliesTo||['all']])
+      [posLandlordId(req), propertyId||null, name, rate, taxType, appliesTo||['all']])
     res.status(201).json({ success: true, data: r })
   } catch (e) { next(e) }
 })
@@ -1143,7 +1167,7 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
   try {
     const existing = await queryOne<any>(
       'SELECT * FROM pos_tax_rates WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!existing) throw new AppError(404, 'Tax rate not found')
 
@@ -1160,7 +1184,7 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
         'SELECT landlord_id FROM properties WHERE id = $1',
         [propertyId],
       )
-      if (!prop || prop.landlord_id !== req.user!.profileId) {
+      if (!prop || prop.landlord_id !== posLandlordId(req)) {
         throw new AppError(400, 'propertyId does not belong to this landlord')
       }
       newPropertyId = propertyId
@@ -1171,14 +1195,14 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
       applies_to=COALESCE($4,applies_to), is_active=COALESCE($5,is_active),
       property_id=$6
       WHERE id=$7 AND landlord_id=$8 RETURNING *`,
-      [name, rate, taxType, appliesTo, isActive, newPropertyId, req.params.id, req.user!.profileId])
+      [name, rate, taxType, appliesTo, isActive, newPropertyId, req.params.id, posLandlordId(req)])
     res.json({ success: true, data: r })
   } catch (e) { next(e) }
 })
 
 posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    await query('UPDATE pos_tax_rates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    await query('UPDATE pos_tax_rates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -1190,7 +1214,7 @@ posRouter.get('/discounts', requirePerm('pos.discount', 'pos.manage_inventory'),
     // W-12 (S531): ?propertyId= returns (discounts at that property) UNION
     // (company-wide NULL rows) — same posture as pos_tax_rates (S217).
     const dProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const dParams: any[] = [req.user!.profileId]
+    const dParams: any[] = [posLandlordId(req)]
     const dFilter = dProp ? `AND (property_id = $${dParams.push(dProp)} OR property_id IS NULL)` : ''
     const discounts = await query<any>(`SELECT * FROM pos_discounts WHERE landlord_id=$1 AND is_active=TRUE ${dFilter} ORDER BY name`, dParams)
     res.json({ success: true, data: discounts })
@@ -1203,12 +1227,12 @@ posRouter.post('/discounts', requirePerm('pos.manage_inventory'), async (req, re
     assertNonNeg([value, 'Discount value'])
     // W-12: NULL propertyId = company-wide; a uuid scopes to one property.
     if (propertyId) {
-      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, posLandlordId(req)])
       if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
     }
     const d = await queryOne<any>(`INSERT INTO pos_discounts (landlord_id,name,type,value,code,property_id)
       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.user!.profileId, name, type, value, code||null, propertyId||null])
+      [posLandlordId(req), name, type, value, code||null, propertyId||null])
     res.status(201).json({ success: true, data: d })
   } catch (e) { next(e) }
 })
@@ -1221,7 +1245,7 @@ posRouter.patch('/discounts/:id', requirePerm('pos.manage_inventory'), async (re
       name=COALESCE($1,name), type=COALESCE($2,type), value=COALESCE($3,value),
       code=COALESCE($4,code), is_active=COALESCE($5,is_active)
       WHERE id=$6 AND landlord_id=$7 RETURNING *`,
-      [name, type, value, code, isActive, req.params.id, req.user!.profileId])
+      [name, type, value, code, isActive, req.params.id, posLandlordId(req)])
     res.json({ success: true, data: d })
   } catch (e) { next(e) }
 })
@@ -1231,7 +1255,7 @@ posRouter.patch('/discounts/:id', requirePerm('pos.manage_inventory'), async (re
 // removed. Soft-delete, landlord-scoped, mirrors DELETE /tax-rates/:id.
 posRouter.delete('/discounts/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    await query('UPDATE pos_discounts SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    await query('UPDATE pos_discounts SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -1243,7 +1267,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
   let txnOpen = false
   try {
     const { amount, reason, items, refundMethod } = req.body
-    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!tx) throw new AppError(404, 'Transaction not found')
     if (tx.status === 'voided') throw new AppError(400, 'Cannot refund a voided transaction')
 
@@ -1316,7 +1340,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
 
     await client.query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method)
       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [tx.id, req.user!.profileId, refundAmt, reason||null, items ? JSON.stringify(items) : null, resolvedMethod])
+      [tx.id, posLandlordId(req), refundAmt, reason||null, items ? JSON.stringify(items) : null, resolvedMethod])
 
     await client.query(`UPDATE pos_transactions SET
       status=$1, refund_amount=$2, refunded_at=NOW() WHERE id=$3`,
@@ -1347,7 +1371,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
 posRouter.post('/transactions/:id/void', requirePerm('pos.void'), async (req, res, next) => {
   try {
     const { reason } = req.body
-    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!tx) throw new AppError(404, 'Transaction not found')
     if (tx.status !== 'completed') throw new AppError(400, 'Only completed transactions can be voided')
     await query('UPDATE pos_transactions SET status=$1, void_reason=$2 WHERE id=$3',
@@ -1361,7 +1385,7 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
   try {
     // W-12 (S531): optional ?propertyId= — history is viewed per property.
     const txProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const txParams: any[] = [req.user!.profileId]
+    const txParams: any[] = [posLandlordId(req)]
     const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}` : ''
     const txns = await query<any>(`
       SELECT t.*,
@@ -1380,12 +1404,12 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
 posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { vendorId, notes, expectedDate, items, propertyId } = req.body
-    const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [vendorId, req.user!.profileId])
+    const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [vendorId, posLandlordId(req)])
     if (!vendor) throw new AppError(404, 'Vendor not found')
     // W-12 (S531): POs stamp their receiving property when created from a
     // property context.
     if (propertyId) {
-      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, posLandlordId(req)])
       if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
     }
     // S590: every linked itemId must be the landlord's OWN pos_item — otherwise a
@@ -1397,7 +1421,7 @@ posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (r
       if (linkedIds.length > 0) {
         const owned = await query<{ id: string }>(
           'SELECT id FROM pos_items WHERE landlord_id=$1 AND id = ANY($2::uuid[])',
-          [req.user!.profileId, linkedIds])
+          [posLandlordId(req), linkedIds])
         if (owned.length !== linkedIds.length) {
           throw new AppError(400, 'A purchase-order line references an item that does not belong to this landlord')
         }
@@ -1408,7 +1432,7 @@ posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (r
     const po = await queryOne<any>(`INSERT INTO pos_purchase_orders
       (landlord_id,vendor_id,status,po_number,notes,expected_date,property_id)
       VALUES ($1,$2,'draft',$3,$4,$5,$6) RETURNING *`,
-      [req.user!.profileId, vendorId, poNumber, notes||null, expectedDate||null, propertyId||null])
+      [posLandlordId(req), vendorId, poNumber, notes||null, expectedDate||null, propertyId||null])
 
     let subtotal = 0
     if (items && items.length > 0) {
@@ -1433,12 +1457,12 @@ posRouter.post('/purchase-orders/:id/items', requirePerm('pos.manage_inventory')
   try {
     const { itemId, itemName, qtyOrdered, unitCost } = req.body
     assertNonNeg([unitCost, 'Unit cost'], [qtyOrdered, 'Qty ordered'])
-    const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, posLandlordId(req)])
     if (!po) throw new AppError(404, 'PO not found')
     if (po.status !== 'draft') throw new AppError(400, 'Can only add items to draft POs')
     // S590: a linked itemId must be the landlord's own pos_item (see the create route).
     if (itemId) {
-      const owned = await queryOne('SELECT id FROM pos_items WHERE id=$1 AND landlord_id=$2', [itemId, req.user!.profileId])
+      const owned = await queryOne('SELECT id FROM pos_items WHERE id=$1 AND landlord_id=$2', [itemId, posLandlordId(req)])
       if (!owned) throw new AppError(400, 'This item does not belong to this landlord')
     }
 
@@ -1463,7 +1487,7 @@ posRouter.get('/inventory-log', requirePerm('pos.manage_inventory'), async (req,
   try {
     // W-12 (S531): ?propertyId= filters movement to that property's items.
     const ilProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const ilParams: any[] = [req.user!.profileId]
+    const ilParams: any[] = [posLandlordId(req)]
     const ilFilter = ilProp ? `AND i.property_id = $${ilParams.push(ilProp)}` : ''
     const log = await query<any>(`
       SELECT l.*, i.name as item_name, i.icon as item_icon, pc.name AS category
@@ -1485,7 +1509,7 @@ posRouter.get('/eod', requirePerm('pos.end_of_day', 'pos.ring_sale'), async (req
     // W-12 (S531): settlements are per (landlord, property, day) — the
     // optional ?propertyId= scopes the list to one register/location.
     const eodProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const eodParams: any[] = [req.user!.profileId, limit]
+    const eodParams: any[] = [posLandlordId(req), limit]
     const eodFilter = eodProp ? `AND e.property_id = $${eodParams.push(eodProp)}` : ''
     const rows = await query<any>(
       `SELECT e.*, p.name AS property_name FROM pos_eod_settlements e
@@ -1509,7 +1533,7 @@ posRouter.get('/eod/:date', requirePerm('pos.end_of_day', 'pos.ring_sale'), asyn
       throw new AppError(400, 'date must be YYYY-MM-DD')
     }
     const dProp = req.query.propertyId ? String(req.query.propertyId) : null
-    const dParams: any[] = [req.user!.profileId, req.params.date]
+    const dParams: any[] = [posLandlordId(req), req.params.date]
     const dFilter = dProp ? `AND e.property_id = $${dParams.push(dProp)}` : ''
     const rows = await query<any>(
       `SELECT e.*, p.name AS property_name FROM pos_eod_settlements e
@@ -1537,11 +1561,11 @@ posRouter.post('/eod/close', requirePerm('pos.end_of_day'), async (req, res, nex
     }
     // W-12 (S531): each register/location closes its own drawer.
     if (!propertyId) throw new AppError(400, 'propertyId required — EOD closes per property')
-    const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+    const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, posLandlordId(req)])
     if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
     const { generateEodSettlement } = await import('../services/posEod')
     const result = await generateEodSettlement(
-      req.user!.profileId,
+      posLandlordId(req),
       propertyId,
       businessDay,
       {
@@ -1566,11 +1590,11 @@ posRouter.post('/eod/regenerate', requirePerm('pos.end_of_day'), async (req, res
       throw new AppError(400, 'businessDay (YYYY-MM-DD) required')
     }
     if (!propertyId) throw new AppError(400, 'propertyId required — EOD closes per property')
-    const regenOwned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+    const regenOwned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, posLandlordId(req)])
     if (!regenOwned) throw new AppError(400, 'propertyId does not belong to this landlord')
     const { generateEodSettlement } = await import('../services/posEod')
     const result = await generateEodSettlement(
-      req.user!.profileId,
+      posLandlordId(req),
       propertyId,
       businessDay,
       { closedBy: req.user!.userId, status: 'manually_closed' }
@@ -1580,7 +1604,7 @@ posRouter.post('/eod/regenerate', requirePerm('pos.end_of_day'), async (req, res
     await query(
       `UPDATE pos_eod_settlements SET status='reopened', updated_at=NOW()
         WHERE landlord_id=$1 AND business_day=$2`,
-      [req.user!.profileId, businessDay]
+      [posLandlordId(req), businessDay]
     )
     res.json({ success: true, data: { ...result, status: 'reopened' } })
   } catch (e) { next(e) }
@@ -1621,7 +1645,7 @@ async function getLandlordConnectId(profileId: string): Promise<string> {
 // Frontend fetches one each time the SDK initializes a reader connection.
 posRouter.post('/terminal/connection-token', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const secret = await createConnectionToken(connectId)
     res.json({ success: true, data: { secret } })
   } catch (e) { next(e) }
@@ -1642,13 +1666,13 @@ posRouter.post('/terminal/readers', requirePerm('pos.manage_inventory'), async (
     const prop = await queryOne<{ landlord_id: string }>(
       `SELECT landlord_id FROM properties WHERE id = $1`,
       [propertyId])
-    if (!prop || prop.landlord_id !== req.user!.profileId) {
+    if (!prop || prop.landlord_id !== posLandlordId(req)) {
       throw new AppError(400, 'propertyId does not belong to this landlord')
     }
 
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const row = await registerReader({
-      landlordId:               req.user!.profileId,
+      landlordId:               posLandlordId(req),
       landlordConnectAccountId: connectId,
       propertyId,
       registrationCode:         String(registrationCode).trim(),
@@ -1665,7 +1689,7 @@ posRouter.post('/terminal/readers', requirePerm('pos.manage_inventory'), async (
 posRouter.get('/terminal/readers', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : undefined
-    const rows = await listReaders(req.user!.profileId, propertyId)
+    const rows = await listReaders(posLandlordId(req), propertyId)
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -1676,7 +1700,7 @@ posRouter.get('/terminal/readers', requirePerm('pos.ring_sale', 'pos.manage_inve
 // transactions referencing this row still resolve.
 posRouter.delete('/terminal/readers/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const row = await archiveReader(req.user!.profileId, req.params.id)
+    const row = await archiveReader(posLandlordId(req), req.params.id)
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
@@ -1719,14 +1743,14 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
     const prop = await queryOne<{ landlord_id: string }>(
       `SELECT landlord_id FROM properties WHERE id = $1`,
       [propertyId])
-    if (!prop || prop.landlord_id !== req.user!.profileId) {
+    if (!prop || prop.landlord_id !== posLandlordId(req)) {
       throw new AppError(400, 'propertyId does not belong to this landlord')
     }
 
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const intent = await createCardPresentPaymentIntent({
       landlordConnectAccountId: connectId,
-      landlordId:               req.user!.profileId,
+      landlordId:               posLandlordId(req),
       propertyId,
       amountCents,
       description,
@@ -1750,12 +1774,12 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
 posRouter.get('/terminal/payment-intents/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const intent = await retrieveTerminalPaymentIntent({
       landlordConnectAccountId: connectId,
       paymentIntentId,
     })
-    if (intent.metadata?.gam_landlord_id !== req.user!.profileId) {
+    if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
       throw new AppError(403, 'PaymentIntent belongs to a different landlord')
     }
     res.json({
@@ -1780,10 +1804,10 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
     const { stripeReaderId } = req.body
     if (!stripeReaderId) throw new AppError(400, 'stripeReaderId is required')
 
-    const ownerRow = await assertReaderBelongsToLandlord(req.user!.profileId, stripeReaderId)
+    const ownerRow = await assertReaderBelongsToLandlord(posLandlordId(req), stripeReaderId)
     if (!ownerRow) throw new AppError(404, 'Reader not registered to this landlord')
 
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const reader = await processPaymentIntentOnReader({
       landlordConnectAccountId: connectId,
       stripeReaderId,
@@ -1805,7 +1829,7 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const intent = await captureTerminalPaymentIntent({
       landlordConnectAccountId: connectId,
       paymentIntentId,
@@ -1820,7 +1844,7 @@ posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/cancel', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(req.user!.profileId)
+    const connectId = await getLandlordConnectId(posLandlordId(req))
     const intent = await cancelTerminalPaymentIntent({
       landlordConnectAccountId: connectId,
       paymentIntentId,
@@ -1844,7 +1868,7 @@ posRouter.get('/sessions', requirePerm('pos.ring_sale'), async (req, res, next) 
   try {
     const status = String(req.query.status || 'open')
     const propertyId = req.query.propertyId ? String(req.query.propertyId) : null
-    const params: any[] = [req.user!.profileId, status]
+    const params: any[] = [posLandlordId(req), status]
     let propertyClause = ''
     if (propertyId) { params.push(propertyId); propertyClause = ' AND s.property_id = $3' }
     const sessions = await query<any>(
@@ -1882,7 +1906,7 @@ posRouter.post('/sessions', requirePerm('pos.ring_sale'), async (req, res, next)
       `SELECT landlord_id FROM properties WHERE id = $1`,
       [propertyId],
     )
-    if (!prop || prop.landlord_id !== req.user!.profileId) {
+    if (!prop || prop.landlord_id !== posLandlordId(req)) {
       throw new AppError(403, 'Property does not belong to this landlord')
     }
     // Property lock: scoped cashier may only open a session on their property.
@@ -1893,7 +1917,7 @@ posRouter.post('/sessions', requirePerm('pos.ring_sale'), async (req, res, next)
          (property_id, landlord_id, opened_by_user_id, pos_customer_id, tenant_id, notes)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [propertyId, req.user!.profileId, req.user!.userId, posCustomerId || null, tenantId || null, notes || null],
+      [propertyId, posLandlordId(req), req.user!.userId, posCustomerId || null, tenantId || null, notes || null],
     )
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
@@ -1915,7 +1939,7 @@ posRouter.get('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, ne
          LEFT JOIN users         tu  ON tu.id  = t.user_id
          LEFT JOIN properties    pr  ON pr.id  = s.property_id
         WHERE s.id = $1 AND s.landlord_id = $2`,
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!session) throw new AppError(404, 'Session not found')
     const items = await query<any>(
@@ -1932,7 +1956,7 @@ posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, 
   try {
     const session = await queryOne<any>(
       `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!session) throw new AppError(404, 'Session not found')
     if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
@@ -1970,7 +1994,7 @@ posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, 
   try {
     const session = await queryOne<any>(
       `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!session) throw new AppError(404, 'Session not found')
     if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
@@ -2010,7 +2034,7 @@ posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), asy
   try {
     const session = await queryOne<any>(
       `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!session) throw new AppError(404, 'Session not found')
     if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
@@ -2057,7 +2081,7 @@ posRouter.delete('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), as
   try {
     const session = await queryOne<any>(
       `SELECT id, status FROM pos_sessions WHERE id = $1 AND landlord_id = $2`,
-      [req.params.id, req.user!.profileId],
+      [req.params.id, posLandlordId(req)],
     )
     if (!session) throw new AppError(404, 'Session not found')
     if (session.status !== 'open') throw new AppError(409, `Session is ${session.status}`)
@@ -2083,7 +2107,7 @@ posRouter.post('/sessions/:id/void', requirePerm('pos.ring_sale'), async (req, r
               updated_at = NOW()
         WHERE id = $2 AND landlord_id = $3 AND status = 'open'
         RETURNING *`,
-      [req.body?.reason || null, req.params.id, req.user!.profileId],
+      [req.body?.reason || null, req.params.id, posLandlordId(req)],
     )
     if (!updated) throw new AppError(404, 'Open session not found')
     res.json({ success: true, data: updated })
@@ -2106,7 +2130,7 @@ posRouter.post('/sessions/:id/complete', requirePerm('pos.ring_sale'), async (re
       `SELECT landlord_id FROM pos_transactions WHERE id = $1`,
       [transactionId],
     )
-    if (!tx || tx.landlord_id !== req.user!.profileId) {
+    if (!tx || tx.landlord_id !== posLandlordId(req)) {
       throw new AppError(403, 'Transaction not owned by this landlord')
     }
 
@@ -2118,7 +2142,7 @@ posRouter.post('/sessions/:id/complete', requirePerm('pos.ring_sale'), async (re
               updated_at = NOW()
         WHERE id = $2 AND landlord_id = $3 AND status = 'open'
         RETURNING *`,
-      [transactionId, req.params.id, req.user!.profileId],
+      [transactionId, req.params.id, posLandlordId(req)],
     )
     // Idempotent: if already completed for this transaction, return success.
     if (!updated) {
