@@ -989,6 +989,8 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       method: body.method,
       settledAt: null,
       reference: body.reference ?? null,
+      // S636 (Nic): cash clears the whole balance, like a card does.
+      settleWholeBalance: true,
     })
     const landlordCovers = pmt.manual_fee_payer === 'landlord'
 

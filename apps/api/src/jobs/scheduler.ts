@@ -338,19 +338,60 @@ async function processInvitationExpiry() {
 }
 
 // ── ESIGN TIMEOUTS (S29 item 4) ─────────────────────────────
-// Every 15 min: 2h reminder (one-shot per signer) + 24h auto-void —
-// NON-renewal docs only. Renewals (renews_lease_id) get their own
-// cadence at the bottom of this function (S536): deadline = 1 day
-// before the predecessor lease ends, landlord reminded each morning,
-// tenant reminded twice daily after the landlord signs.
-// Reminder anchor is invite_sent_at (per-signer), so when the cascade
-// flips the next signer to 'sent', their 2h clock resets correctly.
+// Every 15 min. NON-renewal docs only. Renewals (renews_lease_id) get
+// their own cadence at the bottom of this function (S536): deadline =
+// 1 day before the predecessor lease ends, landlord reminded each
+// morning, tenant reminded twice daily after the landlord signs.
+//
+// S636 (Nic) — TWO 48-HOUR WINDOWS, one per side:
+//   "From the time I sign it to the time tenants sign it needs to only
+//    be forty eight hours. They don't need seven fucking days. From the
+//    time the tenant accepts the portal invite to the time the landlord
+//    signs the lease needs to also be forty eight hours."
+//
+// Before S636 the two sides were wildly asymmetric and the tenant side
+// had no clock at all: the auto-void only looked at status='sent', and
+// the landlord's signature flips a doc to 'in_progress', so the moment
+// the landlord signed the document left the expiry window FOREVER.
+// Eleven Oak Park / Mountain View leases were sitting in exactly that
+// state — signed by the landlord, waiting on a tenant, no deadline and
+// (pass 1 being one-shot) no further reminders after the first nudge.
+//
+//   Window A — waiting on the LANDLORD: 48h from sent_at (the doc is
+//     drafted and sent the moment the tenant accepts their portal
+//     invite, so sent_at IS the accept moment).
+//   Window B — waiting on a TENANT: 48h from the LANDLORD'S signature.
+//     Anchored on the landlord, not per-signer, so a household of three
+//     signers still shares ONE 48-hour deadline rather than resetting
+//     the clock at each relay hop.
+//
+// Reminders: a signer waiting on the landlord still gets the one-shot
+// 2h nudge. A tenant whose landlord has ALREADY signed is nudged every
+// 2 hours until they sign or the window closes (Nic: "Send reminders
+// every two fucking hours for the tenant that hasn't signed after the
+// landlord has already signed"). Job cadence is 15 min, so the
+// reminder_sent_at gap check is what paces it.
+//
 // Auto-void uses cascade-first ordering for idempotent re-runs:
 // pending_add/pending_remove cleanup is a no-op once already updated,
 // so a partial failure is safely re-tried on the next cycle.
-async function processEsignTimeouts() {
+// S636: the moment the two 48-hour windows started existing. Documents
+// already in flight are floored at this instant so the new rule cannot
+// retroactively void a lease that was live and legitimately waiting.
+// Read at call time (not module load) and overridable, so the window
+// tests can place the cutover in the past and exercise the real query.
+const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00:00Z'
+
+export async function processEsignTimeouts() {
   try {
-    // Pass 1: reminders
+    // Pass 1: reminders.
+    //
+    // S636 (Nic): two cadences now. A signer the LANDLORD has not yet
+    // cleared keeps the original one-shot nudge at +2h. A tenant whose
+    // landlord HAS signed is nudged every 2 hours until they sign —
+    // that is the case that used to go permanently silent after one
+    // email. `landlordSigned` distinguishes them in a single query so
+    // the relay ordering stays in one place.
     const remind = await query<any>(`
       SELECT s.id, s.email, s.name, s.role, s.token,
              d.id as doc_id, d.title, d.landlord_id,
@@ -363,11 +404,27 @@ async function processEsignTimeouts() {
       JOIN landlords la ON la.id = d.landlord_id
       JOIN users lu ON lu.id = la.user_id
       WHERE s.status IN ('sent','viewed')
-        AND s.reminder_sent_at IS NULL
         AND s.invite_sent_at IS NOT NULL
         AND s.invite_sent_at < NOW() - INTERVAL '2 hours'
         AND d.status NOT IN ('completed','voided','execution_failed')
         AND d.renews_lease_id IS NULL
+        AND (
+          CASE WHEN s.role <> 'landlord' AND EXISTS (
+                 SELECT 1 FROM lease_document_signers ls
+                  WHERE ls.document_id = d.id
+                    AND ls.role = 'landlord'
+                    AND ls.status = 'signed')
+                 AND NOT EXISTS (
+                 SELECT 1 FROM lease_document_signers ls2
+                  WHERE ls2.document_id = d.id
+                    AND ls2.role = 'landlord'
+                    AND ls2.status <> 'signed')
+               -- landlord is done: nudge this tenant every 2 hours
+               THEN s.reminder_sent_at IS NULL
+                 OR s.reminder_sent_at < NOW() - INTERVAL '2 hours'
+               -- still waiting on the landlord: one nudge, as before
+               ELSE s.reminder_sent_at IS NULL
+          END)
     `)
     for (const r of remind as any[]) {
       try {
@@ -399,23 +456,56 @@ async function processEsignTimeouts() {
       logger.info(`[ESIGN-TIMEOUTS] sent ${(remind as any[]).length} reminder(s)`)
     }
 
-    // Pass 2: auto-void
+    // Pass 2: auto-void — BOTH 48-hour windows (S636).
+    //
+    //   status='sent'        → nobody has signed; waiting on the
+    //                          landlord. 48h from sent_at, which is the
+    //                          moment the tenant accepted their portal
+    //                          invite (the draft is created and sent in
+    //                          that same request).
+    //   status='in_progress' → the landlord signed and a tenant has
+    //                          not. 48h from the LANDLORD'S signature,
+    //                          shared by every remaining signer, so a
+    //                          three-signer household does not reset
+    //                          the clock at each relay hop.
+    //
+    // GRANDFATHER: eleven leases were already parked in 'in_progress'
+    // with no deadline when this shipped — some for days. Measuring
+    // their window from a signature in the past would void live,
+    // in-flight leases the instant this deployed, including ones Nic
+    // was actively chasing. GREATEST() floors every anchor at the
+    // cutover, so pre-existing documents get a full fresh 48 hours from
+    // the moment the rule started existing. Harmless once past.
     const expired = await query<any>(`
       SELECT d.id, d.title, d.document_type, d.landlord_id,
              u.unit_number, p.name as property_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
-      WHERE d.status='sent'
-        AND d.sent_at IS NOT NULL
-        AND d.sent_at < NOW() - INTERVAL '24 hours'
-        AND d.renews_lease_id IS NULL
-    `)
+      WHERE d.renews_lease_id IS NULL
+        AND (
+          (d.status='sent'
+             AND d.sent_at IS NOT NULL
+             AND GREATEST(d.sent_at, $1::timestamptz) < NOW() - INTERVAL '48 hours')
+          OR
+          (d.status='in_progress'
+             AND EXISTS (
+               SELECT 1 FROM lease_document_signers ls
+                WHERE ls.document_id = d.id
+                  AND ls.role = 'landlord'
+                  AND ls.status = 'signed'
+                  AND GREATEST(ls.signed_at, $1::timestamptz) < NOW() - INTERVAL '48 hours')
+             AND EXISTS (
+               SELECT 1 FROM lease_document_signers ps
+                WHERE ps.document_id = d.id
+                  AND ps.status IN ('pending','sent','viewed')))
+        )
+    `, [esign48hCutover()])
     for (const d of expired as any[]) {
       try {
         await cascadeLeaseTenantsOnVoid(query, d)
         await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: signers did not respond within 24 hours', d.id])
+          ['auto-voided: signers did not respond within 48 hours', d.id])
 
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
         const recipients = await query<any>(`

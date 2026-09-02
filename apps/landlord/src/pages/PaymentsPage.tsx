@@ -268,6 +268,18 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
                 <div style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}>
                   Record off-platform payment
                 </div>
+                {/* S636 (Nic): say what the click actually does. The settle
+                    clears the household's WHOLE balance, so a dialog that names
+                    one charge would understate what is about to happen. */}
+                <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10, lineHeight: 1.5 }}>
+                  {(p as any)._groupTotal != null
+                    ? <>This settles <strong>all {(p as any)._groupCount} outstanding charge
+                        {(p as any)._groupCount === 1 ? '' : 's'}</strong> for this household —{' '}
+                        <strong>{fmt((p as any)._groupTotal)}</strong> in full. Cash, checks and
+                        money orders are free.</>
+                    : <>This settles the household&rsquo;s whole outstanding balance, not just this
+                        charge — the same as a card payment. Cash, checks and money orders are free.</>}
+                </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                   <select className="form-input" style={{ width: 'auto' }} value={method}
                     onChange={e => setMethod(e.target.value as ManualPaymentMethod)}>
@@ -400,6 +412,45 @@ export function PaymentsPage() {
       || (p.propertyName || '').toLowerCase().includes(q)
   })
 
+  // S636 (Nic, DIRECTIVE): ONE ROW PER HOUSEHOLD FOR WHAT IS OWED.
+  //
+  // "It shows everybody's name duplicated for every single charge — Tyler
+  // Rhoades four charges, Russ Fuller four charges... any of those are clickable
+  // to record a payment on. They need to be consolidated where it's one item per
+  // household as a bulk record payment, an all-or-nothing thing."
+  //
+  // Every outstanding charge was its own clickable row, so nine rows stood for
+  // three people and a landlord taking cash picked a line to apply it to. Money
+  // arrives against a BALANCE, and letting it be aimed at one line lets the
+  // oldest debt be skipped — the thing every other payment path settles first.
+  // The backend already settles the whole balance (services/manualPaymentSettle);
+  // this is the screen catching up with it.
+  //
+  // Grouped by LEASE where there is one, else by tenant — the same scope the
+  // settle uses, so what the row promises is exactly what the click does.
+  // SETTLED history stays itemised: that is a record of individual events, and
+  // collapsing it would hide what was actually paid and when.
+  const OUTSTANDING = new Set(['pending', 'failed'])
+  const outstandingGroups = (() => {
+    const groups = new Map<string, any>()
+    for (const p of filteredPayments) {
+      if (!OUTSTANDING.has(p.status)) continue
+      if (p.workTradeSuspendedAt) continue   // worked off, not owed
+      const key = p.leaseId || `tenant:${p.tenantId}`
+      const g = groups.get(key) ?? {
+        key, unitNumber: p.unitNumber, propertyName: p.propertyName,
+        tenantFirst: p.tenantFirst, tenantLast: p.tenantLast,
+        charges: [] as any[], total: 0, earliestDue: p.dueDate,
+      }
+      g.charges.push(p)
+      g.total += Number(p.amount || 0)
+      if (p.dueDate && (!g.earliestDue || p.dueDate < g.earliestDue)) g.earliestDue = p.dueDate
+      groups.set(key, g)
+    }
+    return [...groups.values()].sort((a, b) =>
+      String(a.earliestDue ?? '').localeCompare(String(b.earliestDue ?? '')))
+  })()
+
   return (
     <div>
       <div className="page-header">
@@ -435,6 +486,57 @@ export function PaymentsPage() {
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
         ) : (
+          <>
+          {/* S636 (Nic): what each household OWES, as one line. Clicking it
+              records against the whole balance — the same all-or-nothing a card
+              payment does. The itemised table below is history. */}
+          {outstandingGroups.length > 0 && (
+            <div className="card" style={{ padding: 0, marginBottom: 16 }}>
+              <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
+                            fontSize: '.78rem', fontWeight: 700, color: 'var(--text-2)' }}>
+                Outstanding balances — {outstandingGroups.length} household{outstandingGroups.length === 1 ? '' : 's'}
+                <span style={{ fontWeight: 400, color: 'var(--text-3)', marginLeft: 8 }}>
+                  recording a payment settles the whole balance
+                </span>
+              </div>
+              <table className="data-table" style={{ minWidth: 720 }}>
+                <thead>
+                  <tr>
+                    <th>Oldest due</th><th>Unit</th><th>Tenant</th>
+                    <th>Charges</th><th>Balance</th><th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {outstandingGroups.map((g: any) => (
+                    <tr key={g.key}>
+                      <td className="mono" style={{ fontSize: '.78rem' }}>
+                        {g.earliestDue ? new Date(g.earliestDue).toLocaleDateString() : '—'}
+                      </td>
+                      <td className="mono">{g.unitNumber || '—'}</td>
+                      <td style={{ fontSize: '.8rem' }}>
+                        {`${g.tenantFirst ?? ''} ${g.tenantLast ?? ''}`.trim() || '—'}
+                        {/* Unit numbers repeat across parks — name the property. */}
+                        {g.propertyName && (
+                          <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{g.propertyName}</div>
+                        )}
+                      </td>
+                      <td style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+                        {g.charges.map((c: any) => humanize(c.type)).join(', ')}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>{fmt(g.total)}</td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button className="btn btn-primary btn-sm"
+                          onClick={() => setSelected({ ...g.charges[0], _groupTotal: g.total, _groupCount: g.charges.length })}>
+                          Record payment
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           <table className="data-table" style={{ minWidth: 880 }}>
             <thead>
               <tr>
@@ -498,6 +600,7 @@ export function PaymentsPage() {
               )}
             </tbody>
           </table>
+          </>
         )}
       </div>
 

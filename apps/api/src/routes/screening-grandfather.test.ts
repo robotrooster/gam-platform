@@ -165,18 +165,57 @@ describe('POST /tenants/:id/waive-screening — grandfather', () => {
     expect(res.body.error).toMatch(/onboarding window/i)
   })
 
-  it('one grandfather per occupied unit → 409 for a second tenant on the same unit', async () => {
+  // S636 (Nic, DIRECTIVE) REVERSED THIS. It asserted one grandfather per unit,
+  // which meant one per HOUSEHOLD — the first adult in a mobile home was waived
+  // and their spouse was sent to a background check. See the household describe
+  // below for the rule that replaced it.
+})
+
+
+// ─── S636: a household, not a slot ───────────────────────────────────────────
+//
+// Nic (DIRECTIVE): "All people that are onboarding as existing tenants with a
+// new electronic signature should not be asked to do the background screening at
+// all. The onboarding existing tenants should automatically be bypassing that
+// during the onboarding window."
+//
+// The waive used to be ONE PER UNIT, which in practice meant one per HOUSEHOLD:
+// the first adult invited to a mobile home was grandfathered and their spouse
+// was sent to a background check. Both have lived there for years and neither is
+// applying for anything. At Mountain View it put 22 sitting residents in front
+// of a screening they should never have seen — Nic found it when the second
+// Fierro was asked for one.
+describe('S636 every adult in a household is grandfathered, not just the first', () => {
+  it('a second tenant on the SAME unit is waived too', async () => {
     const f = await seedFixture()
     await openWindow(f.propertyId)
     const first = await seedTenant()
     const second = await seedTenant()
-    await request(buildApp()).post(`/api/tenants/${first}/waive-screening`)
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true }).expect(200)
-    const res = await request(buildApp()).post(`/api/tenants/${second}/waive-screening`)
+
+    for (const tenantId of [first, second]) {
+      const res = await request(buildApp())
+        .post(`/api/tenants/${tenantId}/waive-screening`)
+        .set('Authorization', `Bearer ${f.token}`)
+        .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
+      expect(res.status, `tenant ${tenantId} was refused the waive`).toBe(200)
+    }
+
+    const { rows } = await db.query<{ background_check_status: string }>(
+      `SELECT background_check_status FROM tenants WHERE id = ANY($1::uuid[])`, [[first, second]])
+    expect(rows).toHaveLength(2)
+    // THE POINT: the spouse is not sent to a background check.
+    expect(rows.every(r => r.background_check_status === 'waived')).toBe(true)
+  })
+
+  it('the window still bounds it — a closed window screens everybody', async () => {
+    const f = await seedFixture()
+    await openWindow(f.propertyId)
+    await db.query(`UPDATE properties SET onboarding_completed_at = NOW() WHERE id = $1`, [f.propertyId])
+    const tenantId = await seedTenant()
+    const res = await request(buildApp())
+      .post(`/api/tenants/${tenantId}/waive-screening`)
       .set('Authorization', `Bearer ${f.token}`)
       .send({ propertyId: f.propertyId, unitId: f.unitId, attested: true })
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/already has a grandfathered/i)
+    expect(res.status).toBe(403)
   })
 })

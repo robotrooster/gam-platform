@@ -1266,6 +1266,33 @@ unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async 
        lotRentAmount, nightlyRate, weeklyRate, monthlyRate, isBookable, leaseTypesAllowed,
        req.params.id, floorLevel, livingAreas, JSON.stringify(features),
        body.ownerHouseholdSize ?? null, body.hasPropaneTank ?? null])
+
+    // S636 (Nic, DIRECTIVE): THE OTHER DIRECTION OF THE SAME RULE.
+    //
+    // "If I edit the rent in this field, the rent box in the lease template
+    // should be changed to match that." A document already out for signature
+    // carries the OLD figure, so the landlord corrects the unit and the tenant
+    // still signs the stale number — and the signed lease then governs, because
+    // the lease is law. That is the wrong way round for a mistake caught before
+    // anybody signed.
+    //
+    // Only documents nobody has signed yet. Once a signature is on it the
+    // amount is part of an executed instrument and is changed by a new document,
+    // never by editing a unit.
+    if (rentAmount != null && Number(rentAmount) > 0
+        && Number(rentAmount) !== Number(unit.rent_amount)) {
+      await query(`
+        UPDATE lease_document_fields f
+           SET value = $2
+          FROM lease_documents d
+         WHERE d.id = f.document_id
+           AND d.unit_id = $1
+           AND d.status IN ('pending','sent')
+           AND f.lease_column = 'rent_amount'
+           AND NOT EXISTS (SELECT 1 FROM lease_document_signers s
+                            WHERE s.document_id = d.id AND s.signed_at IS NOT NULL)`,
+        [req.params.id, Number(rentAmount).toFixed(2)])
+    }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

@@ -451,7 +451,17 @@ export function SignPage() {
   // Only ACTIVE fields count toward gating/rendering — a hidden conditional
   // child is neither shown nor required (S556).
   const activeFields = allFields.filter(isFieldActive)
-  const requiredFields = activeFields.filter((f:any)=>f.required)
+  // S636 (Nic): the document now arrives WHOLE — the landlord's terms, and any
+  // co-signer who has already signed. "The document should show every field that
+  // is completed... if a second tenant is signing, it should show that the first
+  // tenant has also signed in addition to the landlord."
+  //
+  // So rendering uses every field, while everything that counts what is LEFT TO
+  // DO uses only this signer's. Older payloads carry no `mine`, in which case
+  // every field returned was already this signer's — treat it as true.
+  const isMine = (f:any) => f.mine !== false
+  const myFields = activeFields.filter(isMine)
+  const requiredFields = myFields.filter((f:any)=>f.required)
   // Filled by the system rather than by this signer — lease data stamped at
   // draft time, plus the signing date. Counted separately so the header can say
   // what is actually left to do.
@@ -459,7 +469,7 @@ export function SignPage() {
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
-  const currentPageRequired = pageFields.filter((f:any)=>f.required)
+  const currentPageRequired = pageFields.filter((f:any)=>f.required && isMine(f))
   const currentPageComplete = currentPageRequired.every((f:any)=>fieldValues[f.id]?.trim())
   const allFilled = unfilledRequired.length === 0
 
@@ -549,8 +559,19 @@ export function SignPage() {
           takes us to a black screen." It navigated to '/lease', which is not a
           route — the page is '/leases'. No route matched, nothing rendered, and
           with no catch-all in the router the result was a blank screen with no
-          way back except the browser button. */}
-      <button className="btn btn-primary" onClick={()=>navigate('/leases')}>Back to Leases</button>
+          way back except the browser button.
+
+          S636 (Nic): it went to Leases, which is the wrong place at onboarding.
+          "You're not really gonna be viewing all the signed leases as soon as
+          you're done signing, you're gonna wanna move straight into signing the
+          next one." Nine leases landed at once when Mountain View came on; going
+          back to a list of finished ones between each is friction on repeat. The
+          signing queue is the destination; Leases stays one click away for when
+          the batch is actually done. */}
+      <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', justifyContent:'center' }}>
+        <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>
+        <button className="btn btn-ghost" onClick={()=>navigate('/leases')}>Back to Leases</button>
+      </div>
     </div>
   )
 
@@ -633,6 +654,37 @@ export function SignPage() {
             )
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'
+            // S636 (Nic): "It needs to show all fields that are previously filled
+            // out as not a box to be filled out. It just needs to show it as
+            // plain text data, not an actual box."
+            //
+            // Somebody else's completed field is part of the DOCUMENT now, not
+            // an input — it belongs to the landlord's terms or to a co-signer who
+            // already signed. Drawing it as a green box implies this signer did
+            // it, and drawing it as a grey one implies they still have to. It is
+            // neither: it is the page they are reading.
+            if (!isMine(f) && val) {
+              return (
+                <div key={f.id} id={'field-'+f.id}
+                  style={{
+                    position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                    overflow:'hidden', boxSizing:'border-box' as const,
+                    pointerEvents:'none' as const, zIndex:3,
+                  }}>
+                  {(f.fieldType==='signature'||f.fieldType==='initials') && String(val).startsWith('data:')
+                    ? <img src={val} style={{ width:'100%', height:'100%', objectFit:'contain' }}/>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
+                                     fontSize:fitFontSize(String(val), f.width*s, f.height*s),
+                                     color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
+                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                </div>
+              )
+            }
+            // Somebody else's field that is still EMPTY stays out of the way —
+            // it is not this signer's to fill and an empty box invites a click
+            // that does nothing.
+            if (!isMine(f)) return null
             return (
               <div key={f.id} id={'field-'+f.id}
                 // S534: filled fields stay CLICKABLE — renewal prefills are

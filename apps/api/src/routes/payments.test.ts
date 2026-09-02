@@ -1347,3 +1347,66 @@ describe('S622: one tenant, two units, separate ledgers', () => {
     await expect(resolveTargetLease(f.tenant1Id, lease2)).resolves.toBe(lease2)
   })
 })
+
+
+// ─── S636: cash pays the balance, not a line ─────────────────────────────────
+//
+// Nic (DIRECTIVE): "When I apply a manual payment, it needs to be the same as a
+// card payment. It applies to the entire balance. Those need to not be
+// separated... I can't apply cash to one or the other. That also makes it so a
+// landlord could pick and choose and apply it only to, you know, not the most
+// outstanding thing."
+//
+// record-manual settled `WHERE id = $1`, so a landlord holding a resident's cash
+// picked which of their charges it cleared — and could leave the oldest one
+// standing while marking a newer one paid.
+describe('S636 a manual payment settles the whole balance', () => {
+  /** One lease carrying rent + two utility charges, the shape Nic was looking at. */
+  async function seedBalance(f: any, opts: { suspendUtilities?: boolean } = {}) {
+    const mk = async (type: string, amount: number, suspended = false) => {
+      const { rows: [{ id }] } = await db.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
+                               status, entry_description, due_date, work_trade_suspended_at)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,CURRENT_DATE,$8) RETURNING id`,
+        [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id, type, amount,
+         type.toUpperCase(), suspended ? new Date().toISOString() : null])
+      return id
+    }
+    const rentPaymentId = await mk('rent', 1000)
+    await mk('utility', 120, !!opts.suspendUtilities)
+    await mk('utility', 45, !!opts.suspendUtilities)
+    return { rentPaymentId, leaseId: f.lease1Id }
+  }
+
+  it('clears every outstanding charge on the lease, not just the one clicked', async () => {
+    const f = await seed()
+    const b = await seedBalance(f)
+    const res = await request(buildApp())
+      .post(`/api/payments/${b.rentPaymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+
+    const { rows } = await db.query<{ status: string; type: string }>(
+      `SELECT status, type FROM payments WHERE lease_id = $1 AND type <> 'fee'`, [b.leaseId])
+    const unpaid = rows.filter(r => r.status !== 'settled')
+    expect(unpaid, `these were left outstanding after cash was taken: ${JSON.stringify(unpaid)}`)
+      .toEqual([])
+  })
+
+  it('leaves work-trade suspended charges alone — labour already covers them', async () => {
+    const f = await seed()
+    const b = await seedBalance(f, { suspendUtilities: true })
+    await request(buildApp())
+      .post(`/api/payments/${b.rentPaymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' }).expect(200)
+
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM payments
+        WHERE lease_id = $1 AND work_trade_suspended_at IS NOT NULL`, [b.leaseId])
+    expect(rows.length).toBeGreaterThan(0)
+    // Collecting these would take rent the resident's hours already paid.
+    expect(rows.every(r => r.status === 'pending')).toBe(true)
+  })
+})

@@ -2619,6 +2619,25 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
        WHERE pti.landlord_id = ANY($1::uuid[])
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
+         -- S636 (Nic): "It's double sending things. The pending pool has two
+         -- Blanca Avalos, two Little Joe Martinez. It's doubling people that
+         -- don't have two spaces. Some people do have two spaces, so it's
+         -- important to make that distinction."
+         --
+         -- A screening waive writes a SECOND intent row deliberately carrying no
+         -- unit (setting one would auto-draft a lease and collide with the e-sign
+         -- flow), purely to hold the audit — who waived, when, attested, which
+         -- unit it was for. This list showed it as another invite, so every
+         -- grandfathered resident appeared twice.
+         --
+         -- Hidden only when the same person ALSO has a real unit-bound invite, so
+         -- a genuine property-level invite (no unit yet) still shows, and anyone
+         -- actually renting two spaces still shows twice.
+         AND NOT (pti.unit_id IS NULL AND pti.screening_waived AND EXISTS (
+                   SELECT 1 FROM pending_tenant_intents o
+                    WHERE o.tenant_id = pti.tenant_id
+                      AND o.unit_id IS NOT NULL
+                      AND o.resolved_at IS NULL AND o.cancelled_at IS NULL))
        ORDER BY pti.created_at DESC`,
       [landlordIds]
     )

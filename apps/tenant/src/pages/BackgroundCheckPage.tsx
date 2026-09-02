@@ -3,6 +3,7 @@ import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
 import { loadStripe } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
+import { CONSUMER_TERMS_URL, CONSUMER_PRIVACY_URL } from '../lib/marketing'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -610,9 +611,9 @@ export function BackgroundCheckPage() {
                 <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Platform Terms &amp; Privacy</div>
                 <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>
                   I agree to the{' '}
-                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Terms of Service</a>
+                  <a href={CONSUMER_TERMS_URL} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Terms of Service</a>
                   {' '}and{' '}
-                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Privacy Policy</a>.
+                  <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Privacy Policy</a>.
                 </div>
               </div>
             </label>

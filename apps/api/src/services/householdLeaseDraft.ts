@@ -258,6 +258,15 @@ export async function draftPendingForUnitType(args: {
         const { createDocumentRecord } = await import('../routes/esign')
         const out = await autoDraftLeasesForUnit(client as any, unit_id, createDocumentRecord)
         await client.query('COMMIT')
+        // S636: same rule as the accept path — the send only works once the
+        // document is committed and a pool connection can see it.
+        if (out.draftedDocumentIds.length) {
+          const { autoSendDraftedDocument } = await import('../routes/esign')
+          for (const docId of out.draftedDocumentIds) {
+            await autoSendDraftedDocument(docId).catch(err =>
+              logger.error({ err, docId }, '[household-draft] auto-send after draft failed'))
+          }
+        }
         if (out.draftedDocumentIds.length) drafted++
         else {
           // S636: SAY WHICH REASON. This reported every non-draft as "waiting on

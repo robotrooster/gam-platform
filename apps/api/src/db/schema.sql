@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 613GOqf8eDCy4Qv9x9aAZ1WFvuKN8BdfJK9KAg7PVVZnEOdivHfoMrwLehC0ygj
+\restrict ufHahJ5VYg48wiPhM4gKQJtvCC2cafdhMGoc6F7qBye7dMxXbzsGMiV8LpCsuL2
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9011,7 +9011,8 @@ CREATE TABLE public.unit_applications (
     status text DEFAULT 'pending'::text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    applicant_user_id uuid
+    applicant_user_id uuid,
+    property_id uuid
 );
 
 
@@ -16907,6 +16908,13 @@ CREATE INDEX idx_unit_applications_landlord ON public.unit_applications USING bt
 
 
 --
+-- Name: idx_unit_applications_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_applications_property ON public.unit_applications USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
 -- Name: idx_unit_applications_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24625,6 +24633,14 @@ ALTER TABLE ONLY public.unit_applications
 
 
 --
+-- Name: unit_applications unit_applications_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_applications
+    ADD CONSTRAINT unit_applications_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
 -- Name: unit_applications unit_applications_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25372,5 +25388,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 613GOqf8eDCy4Qv9x9aAZ1WFvuKN8BdfJK9KAg7PVVZnEOdivHfoMrwLehC0ygj
+\unrestrict ufHahJ5VYg48wiPhM4gKQJtvCC2cafdhMGoc6F7qBye7dMxXbzsGMiV8LpCsuL2
 

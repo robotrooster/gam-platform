@@ -149,6 +149,62 @@ async function seedBill(f: Fixture, meterId: string): Promise<string> {
 // GET /bills
 // ───────────────────────────────────────────────────────────────────
 
+// ── GET /master-bills (S636) ─────────────────────────────────
+// S636 (Nic): the property utilities tab showed a per-TENANT charge
+// ledger where the master bills belong. These hold the replacement to
+// its two jobs: show masters only, and never across a landlord line.
+describe('GET /master-bills', () => {
+  it("returns the property's master bills with the provider's dollar amount", async () => {
+    const f = await seed()
+    const master = await seedMeter(f, f.propertyAId, { billingMethod: 'rubs' })
+    const c = await db.connect()
+    try {
+      await c.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, bill_amount)
+         VALUES ($1, '2026-08-31', 3990, '2026-08-01', $2, 74.79)`,
+        [master, f.landlordAUserId])
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .get(`/api/utility/master-bills?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(1)
+    expect(Number(res.body.data[0].bill_amount)).toBe(74.79)
+    expect(Number(res.body.data[0].reading_value)).toBe(3990)
+    expect(Number(res.body.data[0].recovered_amount)).toBe(0)
+  })
+
+  it("leaves per-unit submeter reads out — those are the tenant's charge, not the property's bill", async () => {
+    const f = await seed()
+    const sub = await seedMeter(f, f.propertyAId, { billingMethod: 'submeter' })
+    const c = await db.connect()
+    try {
+      await c.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
+         VALUES ($1, '2026-08-31', 42100, '2026-08-01', $2)`,
+        [sub, f.landlordAUserId])
+    } finally { c.release() }
+
+    const res = await request(buildApp())
+      .get(`/api/utility/master-bills?propertyId=${f.propertyAId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(0)
+  })
+
+  it("403s on another landlord's property", async () => {
+    const f = await seed()
+    await seedMeter(f, f.propertyBId, { billingMethod: 'rubs' })
+    const res = await request(buildApp())
+      .get(`/api/utility/master-bills?propertyId=${f.propertyBId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(403)
+  })
+})
+
 describe('GET /bills', () => {
   it('tenant: sees only own bills', async () => {
     const f = await seed()

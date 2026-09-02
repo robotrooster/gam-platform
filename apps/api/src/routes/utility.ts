@@ -1388,6 +1388,46 @@ utilityRouter.get('/reads-due', requirePerm('properties.edit', 'utility.read_met
   } catch (e) { next(e) }
 })
 
+// ── MASTER BILLS (S636) ──────────────────────────────────────
+// S636 (Nic): "that is where I wanna see when I input my master fucking
+// meters, not every person that gets charged different utilities."
+//
+// The property utilities tab used to end in a per-unit CHARGE ledger —
+// one row per tenant per utility. That is the tenant's invoice restated
+// in the landlord's setup screen, and it crowded out the only thing the
+// property owner actually receives: the master bill from the provider.
+// This returns one row per master reading per cycle — what the provider
+// billed, what was measured, and how much of it was pushed back out to
+// tenants (so the un-recovered remainder is visible at a glance).
+utilityRouter.get('/master-bills', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const property = await queryOne<{ landlord_id: string }>(
+      `SELECT landlord_id FROM properties WHERE id = $1`, [propertyId])
+    if (!property) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, propertyId)
+    const rows = await query<any>(`
+      SELECT r.id, r.billing_cycle_month, r.reading_date, r.reading_value,
+             r.bill_amount, r.reason,
+             m.id AS meter_id, m.label AS meter_label, m.utility_type,
+             m.billing_method, m.rubs_basis, m.rate_per_unit, m.base_fee,
+             (SELECT COUNT(*) FROM utility_meter_units mu WHERE mu.meter_id = m.id) AS unit_count,
+             COALESCE((SELECT SUM(ub.charge_amount) FROM utility_bills ub
+                        WHERE ub.meter_id = m.id
+                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_amount,
+             COALESCE((SELECT COUNT(*) FROM utility_bills ub
+                        WHERE ub.meter_id = m.id
+                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_count
+        FROM utility_meter_readings r
+        JOIN utility_meters m ON m.id = r.meter_id
+       WHERE m.property_id = $1
+         AND m.billing_method IN ('rubs','master_bill_to_landlord')
+       ORDER BY r.billing_cycle_month DESC, m.utility_type ASC, m.label ASC`, [propertyId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // ── SPECIAL / OFF-CYCLE READ (S559) ──────────────────────────
 // A read taken OUTSIDE the monthly run — front desk at stay turnover /
 // move-out (auto-reason from the to-do), a meter swap, or an ad-hoc

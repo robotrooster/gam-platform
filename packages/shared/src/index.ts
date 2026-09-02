@@ -740,8 +740,12 @@ const AUTO_FILLED_LEASE_COLUMNS = new Set<string>([
   'unit_number', 'property_name', 'property_address',
   // who is renting it out
   'landlord_name',
-  // when it was signed — stamped at completion
-  'date_signed_day', 'date_signed_month',
+  // NOT date_signed_day / date_signed_month. S636 put them here and it was
+  // wrong: they are not facts taken at invite time, they are stamped at the
+  // LANDLORD'S SIGNING MOMENT by the sign page, and the sign submit only writes
+  // fields whose signer_role matches the caller. Belonging to nobody made them
+  // unfillable by anyone, so five Mountain View leases were countersigned with
+  // "made and entered into on this ___ day of ______" left blank on the page.
 ])
 
 export function isAutoFilledLeaseColumn(col: string | null | undefined): boolean {

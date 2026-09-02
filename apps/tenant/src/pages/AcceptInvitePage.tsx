@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
+import { CONSUMER_TERMS_URL, CONSUMER_PRIVACY_URL } from '../lib/marketing'
 
 export function AcceptInvitePage() {
   const [params] = useSearchParams()
@@ -181,14 +182,33 @@ export function AcceptInvitePage() {
                 <input type="checkbox" checked={form.acceptedTerms} onChange={e => setForm(f => ({ ...f, acceptedTerms: e.target.checked }))} style={{ marginTop: 2 }} />
                 <div>
                   <div style={{ fontSize: '.78rem', fontWeight: 600, color: '#eef1f8' }}>Platform Terms &amp; Privacy</div>
+                  {/* S636 (Nic): the links are inside the <label>, so without
+                      stopPropagation a click on one toggles the checkbox instead
+                      of opening the document — which is exactly what "not
+                      clickable" looked like. */}
                   <div style={{ fontSize: '.7rem', color: '#7a8aaa', marginTop: 2, lineHeight: 1.5 }}>
                     I agree to the{' '}
-                    <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{ color: '#c9a227' }}>Terms of Service</a>
+                    <a href={CONSUMER_TERMS_URL} target="_blank" rel="noopener noreferrer"
+                       onClick={e => e.stopPropagation()}
+                       style={{ color: '#c9a227' }}>Terms of Service</a>
                     {' '}and{' '}
-                    <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{ color: '#c9a227' }}>Privacy Policy</a>.
+                    <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer"
+                       onClick={e => e.stopPropagation()}
+                       style={{ color: '#c9a227' }}>Privacy Policy</a>.
                   </div>
                 </div>
               </label>
+              {/* S636 (Nic): "Maybe we have those further down below for the
+                  privacy policy and terms of service, in case there's people
+                  that actually want to read them." Same reasoning as the email
+                  fix — a link that will not open leaves no way to reach the
+                  document, and this is the one someone is agreeing to. */}
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #1e2530',
+                            fontSize: '.63rem', color: '#5a6a86', lineHeight: 1.6, wordBreak: 'break-all' }}>
+                Prefer to read them directly?<br />
+                {CONSUMER_TERMS_URL}<br />
+                {CONSUMER_PRIVACY_URL}
+              </div>
             </div>
 
             {error && (

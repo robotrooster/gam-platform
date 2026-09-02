@@ -37,6 +37,21 @@ export interface ManualSettleInput {
   reference?: string | null
   /** Extra sentence for the payment's notes — e.g. which bank row proved it. */
   provenance?: string | null
+  /**
+   * S636 (Nic, DIRECTIVE): does this settle the resident's WHOLE BALANCE, or
+   * just the row named?
+   *
+   * `true` for a landlord taking cash — "it needs to be the same as a card
+   * payment. It applies to the entire balance... I can't apply cash to one or
+   * the other." Money arrives against what somebody owes, and letting the
+   * landlord aim it at one line lets them skip the oldest debt.
+   *
+   * `false` (the default) for BANK DEPOSIT MATCHING, which is the opposite
+   * problem: a deposit is matched to the specific charges it proves, and a late
+   * fee genuinely earned before that payment must stay owed. Defaulting to the
+   * narrow behaviour keeps every existing caller as it was.
+   */
+  settleWholeBalance?: boolean
 }
 
 export interface ManualSettleResult {
@@ -101,16 +116,42 @@ export async function settleManualRentPayment(
   const refNote = input.reference ? ` (ref ${input.reference})` : ''
   const provenance = input.provenance ? ` — ${input.provenance}` : ''
   await client.query(
+    // S636 (Nic, DIRECTIVE): CASH SETTLES THE WHOLE BALANCE, LIKE A CARD DOES.
+    //
+    // "When I apply a manual payment, it needs to be the same as a card payment.
+    // It applies to the entire balance. Those need to not be separated... I
+    // can't apply cash to one or the other."
+    //
+    // This settled `WHERE id = $1` — ONE row — so a landlord handed cash chose
+    // which of nine line items it landed on. Two things wrong with that: money
+    // arrives against a BALANCE, not against a line, and steering it lets the
+    // landlord skip the oldest debt, which every other payment path settles
+    // first. Nic: "a landlord could pick and choose and apply it only to, you
+    // know, not the most outstanding thing."
+    //
+    // Scoped by LEASE when the row carries one, else by TENANT — the same
+    // fallback the fee quote uses, so the quote and the charge cannot drift.
+    //
+    // Work-trade suspended rows are excluded: they are not owed now. They settle
+    // at month close against hours worked, and sweeping them into a cash payment
+    // would collect rent somebody's labour already covered.
     `UPDATE payments
         SET status = 'settled',
             settled_at = COALESCE($4::timestamptz, NOW()),
             manual_method = $2,
             platform_held = FALSE,
             notes = COALESCE(notes || ' — ', '') || $3
-      WHERE id = $1`,
+      WHERE CASE WHEN $5::boolean THEN
+              -- Whole balance: cash arrives against what a resident OWES.
+              (status IN ('pending', 'failed')
+               AND work_trade_suspended_at IS NULL
+               AND (CASE WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
+                         THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
+                         ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
+            ELSE id = $1 END`,
     [payment.id, method,
      `Recorded as manual ${method} payment${refNote}${provenance}`,
-     input.settledAt])
+     input.settledAt, input.settleWholeBalance === true])
 
   let feePaymentId: string | null = null
 

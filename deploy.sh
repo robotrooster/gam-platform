@@ -218,6 +218,42 @@ for entry in "${FRONTENDS[@]}"; do
   else bad "deployed but $domain still serves ${prod_hash:-none}"; FAILED=1; fi
 done
 
+# ── storefront (self-hosted: {slug}.gam.biz) ─────────────────────────────
+# S636: this surface was missing from the deploy entirely. It is not on
+# Vercel — apps/storefront/server.js runs under launchd on :3015 behind the
+# Cloudflare wildcard tunnel — so the Vercel loop above skipped it and a
+# storefront change silently never shipped. Found the hard way: the new
+# /apply page built clean, deploy.sh reported "all surfaces in sync", and
+# the page was not live.
+echo; echo "── storefront (self-hosted: *.gam.biz) ──"
+STOREFRONT_PROBE="${STOREFRONT_PROBE_URL:-https://mountain-view-rv-ranch-2843.gam.biz/}"
+if ! (cd apps/storefront && npm run build) >/tmp/gam-deploy-storefront.log 2>&1; then
+  bad "BUILD FAILED — see /tmp/gam-deploy-storefront.log"; FAILED=1
+else
+  sf_local=$(ls apps/storefront/dist/assets/index-*.js 2>/dev/null | head -1 | xargs basename 2>/dev/null)
+  sf_prod=$(curl -s --max-time 10 "$STOREFRONT_PROBE" | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1)
+  if [ -z "$sf_local" ]; then
+    bad "no build output found"; FAILED=1
+  elif [ "$sf_local" = "$sf_prod" ] && ! $FORCE; then
+    ok "already in sync ($sf_local)"
+  elif $CHECK_ONLY; then
+    warn "would deploy (local $sf_local → prod ${sf_prod:-none})"
+  else
+    echo "  ${DIM}local $sf_local → prod ${sf_prod:-none}${OFF}"
+    # The server reads dist off disk, but it is restarted anyway: a process
+    # holding an old in-memory index.html is the same failure the marketing
+    # note above describes.
+    launchctl kickstart -k "gui/$(id -u)/com.gam.storefront" >/dev/null 2>&1
+    for i in $(seq 1 10); do
+      sf_prod=$(curl -s --max-time 10 "$STOREFRONT_PROBE" | grep -oE 'index-[A-Za-z0-9_-]+\.js' | head -1)
+      [ "$sf_local" = "$sf_prod" ] && break
+      sleep 3
+    done
+    if [ "$sf_local" = "$sf_prod" ]; then ok "deployed and verified ($sf_local)"
+    else bad "restarted but the site still serves ${sf_prod:-none}"; FAILED=1; fi
+  fi
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "${GREEN}═══ all surfaces in sync ═══${OFF}"; else echo "${RED}═══ finished WITH FAILURES (see logs above) ═══${OFF}"; fi
 exit $FAILED

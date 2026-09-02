@@ -178,20 +178,51 @@ describe('e-sign emails', () => {
     expect(call.subject).toBe('Please sign: Lease 2026')
   })
 
-  it('emailSigningCompleted with pdfUrl: button points to PDF', async () => {
+  it('emailSigningCompleted with a URL: the button points at it', async () => {
     await email.emailSigningCompleted(
       's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1',
       'https://gam.example/executed.pdf')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).toContain('Download Signed Document')
     expect(call.html).toContain('https://gam.example/executed.pdf')
   })
 
-  it('emailSigningCompleted without pdfUrl: falls back to portal button', async () => {
+  // S636 (Nic): "Does it send the tenant a completed PDF of the lease to their
+  // email when all parties have signed?" It did not — only a link, and that link
+  // was a relative path to an authed route, so it did nothing at all. The signed
+  // copy is the one artifact a resident keeps; it goes as an attachment.
+  it('attaches the executed PDF when the bytes are available', async () => {
+    const bytes = Buffer.from('%PDF-1.7 fake executed lease')
     await email.emailSigningCompleted(
-      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1')
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1',
+      undefined, 'https://tenant.goldassetmanagement.com/lease', undefined, bytes)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.html).toContain('View in Portal')
+    expect(call.attachments).toHaveLength(1)
+    expect(call.attachments[0].filename).toBe('signed-lease.pdf')
+    expect(call.attachments[0].content).toBe(bytes)
+    expect(call.html).toContain('attached to this email')
+  })
+
+  it('still sends when there is no PDF to attach — the parties must learn it is done', async () => {
+    await email.emailSigningCompleted(
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1',
+      undefined, 'https://tenant.goldassetmanagement.com/lease')
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.attachments).toBeUndefined()
+    expect(call.html).toContain('Open your signed lease')
+  })
+
+  it('emailSigningCompleted without pdfUrl: sends them to their portal', async () => {
+    // S636: was "View in Portal" pointing at a DEFAULT of http://localhost:3002,
+    // and the caller passed nothing — so the one link a resident had to their
+    // freshly signed lease went to their own machine. The caller now passes a
+    // real portal URL and the address is copyable underneath.
+    await email.emailSigningCompleted(
+      's@mailer-test.co', 'Signer', 'Lease 2026', 'Unit A1',
+      undefined, 'https://tenant.goldassetmanagement.com/lease')
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.html).toContain('Open your signed lease')
+    expect(call.html).toContain('https://tenant.goldassetmanagement.com/lease')
+    expect(call.html).not.toContain('localhost')
   })
 
   it('emailDocumentDeclined: HTML-escapes signer name + reason (prevents XSS)', async () => {

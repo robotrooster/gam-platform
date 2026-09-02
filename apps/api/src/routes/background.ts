@@ -439,6 +439,16 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
             `SELECT property_id FROM pending_tenant_intents
               WHERE tenant_id=$1 AND cancelled_at IS NULL AND property_id IS NOT NULL
               ORDER BY created_at DESC LIMIT 1`, [tenant.id]))?.property_id : null)
+      // S636: a walk-up who scanned the property's QR code has neither a
+      // unit nor an invite — they applied cold. Their application carries
+      // the property, so it is the third and last place to look. Matched
+      // on the account's own email, so it cannot pick up a stranger's row.
+      || (await queryOne<{ property_id: string }>(
+            `SELECT a.property_id FROM unit_applications a
+              WHERE a.property_id IS NOT NULL
+                AND (a.applicant_user_id = $1 OR LOWER(a.email) = LOWER($2))
+              ORDER BY a.created_at DESC LIMIT 1`,
+            [req.user!.userId, req.user!.email]))?.property_id
       || null
 
     let check: any

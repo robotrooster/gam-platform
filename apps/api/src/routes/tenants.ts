@@ -144,8 +144,16 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
           await draftClient.query(`UPDATE pending_tenant_intents SET accepted_at=NOW(), updated_at=NOW() WHERE id=$1 AND accepted_at IS NULL`, [intent.id])
           const { autoDraftLeasesForUnit } = await import('../services/leaseOnboarding')
           const { createDocumentRecord } = await import('./esign')
-          await autoDraftLeasesForUnit(draftClient as any, intent.unit_id, createDocumentRecord)
+          const out = await autoDraftLeasesForUnit(draftClient as any, intent.unit_id, createDocumentRecord)
           await draftClient.query('COMMIT')
+          // S636: send AFTER the commit — autoSendDraftedDocument reads through
+          // the pool and cannot see rows this transaction has not committed yet.
+          // Best-effort: a mail failure must not undo a lease that exists.
+          const { autoSendDraftedDocument } = await import('./esign')
+          for (const docId of out.draftedDocumentIds) {
+            await autoSendDraftedDocument(docId).catch(err =>
+              logger.error({ err, docId }, '[ONBOARD-NEW-LEASE] auto-send after draft failed'))
+          }
         } catch (draftErr) {
           await draftClient.query('ROLLBACK').catch(() => {})
           logger.error({ err: draftErr, ctx: user.id }, '[ONBOARD-NEW-LEASE] auto-draft on accept failed')

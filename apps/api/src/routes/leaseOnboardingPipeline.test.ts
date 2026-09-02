@@ -263,3 +263,41 @@ describe('accept → auto-draft: draft failure is contained', () => {
     expect(notif.rows.length).toBeGreaterThanOrEqual(1)
   })
 })
+
+
+// ─── S636: a drafted lease is not done until it is SENT ──────────────────────
+//
+// autoSendDraftedDocument reads through the POOL, and it was being called from
+// inside the accept transaction — so it looked for a document that had not been
+// committed, found nothing, returned false, and every lease drafted on
+// acceptance sat at `pending` with the landlord never emailed. Nic noticed the
+// symptom, not the cause: "Why are some leases saying pending and some saying
+// sent?"
+//
+// Every test here asserted the document EXISTS. None asserted anyone was told
+// about it, which is why a year of drafts could go out unsent without a failure.
+describe('S636 an accepted household gets a lease that is actually sent', () => {
+  it('the drafted document reaches status sent, and the landlord is the one invited', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1.5, 12)
+    const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`
+    await onboard(f, eA, 'Aaa'); await onboard(f, eB, 'Bbb')
+    await accept(await inviteToken(eA))
+    await accept(await inviteToken(eB))
+
+    const { rows } = await db.query<any>(
+      `SELECT id, status FROM lease_documents WHERE unit_id = $1`, [f.unitId])
+    expect(rows).toHaveLength(1)
+    // THE POINT: not 'pending'. A draft nobody was told about helps no one.
+    expect(rows[0].status).toBe('sent')
+
+    const signers = await db.query<any>(
+      `SELECT role, status, invite_sent FROM lease_document_signers
+        WHERE document_id = $1 ORDER BY order_index`, [rows[0].id])
+    // The landlord signs first and is the only person emailed at this stage —
+    // tenants are relayed to after each signature.
+    expect(signers.rows[0].role).toBe('landlord')
+    expect(signers.rows[0].invite_sent).toBe(true)
+    expect(signers.rows.slice(1).every((s: any) => s.invite_sent === false)).toBe(true)
+  })
+})

@@ -79,6 +79,25 @@ export function TypedDateInput({
   const [dd, setDd] = useState(parts ? parts[3] : '')
   const [yyyy, setYyyy] = useState(parts ? parts[1] : '')
 
+  // S636 (Nic, EMERGENCY): re-sync when the caller hands us a DIFFERENT date.
+  //
+  // The three boxes were seeded once at mount, so a single instance reused
+  // across several date fields carried the previous field's digits into the
+  // next — and the emit effect below then wrote '' back over an answer the
+  // signer had already given. Callers should key per field (the sign page now
+  // does); this makes losing an answer impossible even when they do not.
+  //
+  // Only when `value` disagrees with what the boxes currently represent, so it
+  // never fights the user mid-type: our own emissions always match.
+  useEffect(() => {
+    const shown = mm.length === 2 && dd.length === 2 && yyyy.length === 4
+      ? `${yyyy}-${mm}-${dd}` : ''
+    if (value === shown) return
+    const p = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+    setMm(p ? p[2] : ''); setDd(p ? p[3] : ''); setYyyy(p ? p[1] : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
+
   const dayRef = useRef<HTMLInputElement>(null)
   const yearRef = useRef<HTMLInputElement>(null)
   const monthRef = useRef<HTMLInputElement>(null)

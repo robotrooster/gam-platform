@@ -22,6 +22,7 @@ import { insertInspectionWithChecklist } from '../../inspections'
 import { INSPECTION_TYPES, type InspectionType } from '@gam/shared'
 import { logger } from '../../../lib/logger'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
+import { resolveActorUnit } from './unitScope'
 
 interface UnitRow {
   /** S634: the company the record belongs to — see the notify call below. */
@@ -80,12 +81,17 @@ export const createInspection: AgentTool = {
       scheduledFor = d.toISOString()
     }
 
-    // Resolve the unit, hard-scoped to THIS landlord.
+    // S636 (Nic, DIRECTIVE): scoped to the PROPERTY, not just the landlord.
+    // This was `unit_number ILIKE $1 … LIMIT 1`, so an account with an RV 28 at
+    // two parks got one of them at random — and an inspection booked against the
+    // wrong park is not something anybody would notice until somebody drove
+    // there. Ambiguity is a question now, never a guess.
+    const picked = await resolveActorUnit(actor, unitArg, (args as any)?.property)
+    if (!picked.ok) return { ok: false, error: picked.error }
     const unit = await queryOne<UnitRow>(
       `SELECT id, unit_number, landlord_id, bedrooms, bathrooms, unit_type, dwelling_ownership, is_multi_level, is_ada_accessible, living_areas, features
-         FROM units WHERE unit_number ILIKE $1 AND landlord_id = ANY($2::uuid[])
-         ORDER BY unit_number LIMIT 1`,
-      [unitArg, actorLandlordIds(actor)],
+         FROM units WHERE id = $1`,
+      [picked.unitId],
     )
     if (!unit) return { ok: false, error: `No unit “${unitArg}” on your account. Check the unit number.` }
 

@@ -378,7 +378,7 @@ export async function createDocumentRecord(client: any, opts: {
     // caller passed explicitly — a renewal or a send form still wins.
     if (opts.unitId) {
       const ctx = await client.query(
-        `SELECT u.unit_number, p.name AS property_name,
+        `SELECT u.unit_number, u.rent_amount, u.security_deposit, p.name AS property_name,
                 CONCAT_WS(', ', p.street1, NULLIF(p.street2,''), p.city, p.state, p.zip) AS property_address,
                 TRIM(CONCAT_WS(' ', lu.first_name, lu.last_name)) AS landlord_name
            FROM units u
@@ -415,6 +415,31 @@ export async function createDocumentRecord(client: any, opts: {
         }
         for (const [col, val] of Object.entries(identity)) {
           if (val && prefillValues[col] == null) prefillValues[col] = String(val)
+        }
+
+        // S636 (Nic): THE UNIT'S RENT IS THE LEASE'S OPENING FIGURE.
+        //
+        // "He has a special deal with my grandpa where he pays $300 a month plus
+        // the electricity... I need that to be edited in the unit details and
+        // showing in the lease when he accepts the portal invite."
+        //
+        // An auto-drafted lease left rent BLANK and the landlord typed it at
+        // signing, so a per-unit arrangement recorded on the unit never reached
+        // the paper unless they remembered it at the moment of signing — and a
+        // typo there becomes the signed rent. Seeding it from the unit makes the
+        // record the starting point.
+        //
+        // A DEFAULT, not a lock: it stays editable on the document (S534 keeps
+        // prefilled fields clickable), and whatever is signed wins and writes
+        // back to the unit at execution. Skipped when the sender already supplied
+        // a value, so an explicit send always beats the unit's figure.
+        for (const [col, val] of Object.entries({
+          rent_amount:      ctx.rent_amount,
+          security_deposit: ctx.security_deposit,
+        })) {
+          if (val != null && Number(val) > 0 && prefillValues[col] == null) {
+            prefillValues[col] = Number(val).toFixed(2)
+          }
         }
       }
     }
@@ -1150,6 +1175,28 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     await client.query(
       `UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`,
       [doc.unit_id])
+  }
+
+  // S636 (Nic, DIRECTIVE): THE SIGNED RENT IS THE UNIT'S RENT.
+  //
+  // "The lease document says $589, and that's what the rent should be. But the
+  // unit details are showing her balance as $460. We need a way to make those
+  // synchronous at all times... if I type something else in the new document
+  // that's going out — maybe I forgot to update the unit details — it needs to
+  // automatically update the corresponding unit details to match."
+  //
+  // Execution wrote the amount onto the LEASE and left `units.rent_amount`
+  // stale, so MH 09 was papered at $589 while every unit-level screen still said
+  // $460. The signed document is the authority (see the lease-is-law rule), so
+  // it wins here rather than being reconciled by hand later.
+  //
+  // Only when the document actually states one — a renewal or addendum that
+  // leaves rent alone must not blank the unit's figure.
+  if (doc.unit_id && Number(vals.rent_amount) > 0) {
+    await client.query(
+      `UPDATE units SET rent_amount = $2, updated_at = NOW()
+        WHERE id = $1 AND rent_amount IS DISTINCT FROM $2`,
+      [doc.unit_id, Number(vals.rent_amount)])
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -3916,11 +3963,25 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     const signerTerminal = signer.status === 'signed' || signer.status === 'declined'
     const readOnly = docTerminal || signerTerminal
 
+    // S636 (Nic): THE SIGNER SEES THE WHOLE DOCUMENT, not just their own slots.
+    //
+    // This returned ONLY the current signer's fields, so a tenant received none
+    // of the landlord's boxes — and every value the landlord had filled in
+    // rendered as an empty blank on the page they were about to sign. Nic: "They
+    // can't see what the rent is. They can't see what the guest fee is... the
+    // whole point of the landlord signing it first is so that the tenant can see
+    // what they're signing."
+    //
+    // Everyone now gets every field. `mine` says which ones this signer may
+    // fill; the rest are theirs to READ. That is not a new trust boundary — the
+    // sign submit has always written `AND signer_role = <caller's role>`, so a
+    // value outside your own role silently no-ops however it is posted.
     const fields = await query<any>(
-      readOnly
-        ? `SELECT * FROM lease_document_fields WHERE document_id=$1 ORDER BY page, y`
-        : `SELECT * FROM lease_document_fields WHERE document_id=$1 AND signer_role=$2 ORDER BY page, y`,
-      readOnly ? [doc.id] : [doc.id, signer.role])
+      `SELECT * FROM lease_document_fields WHERE document_id=$1 ORDER BY page, y`,
+      [doc.id])
+    for (const f of fields as any[]) {
+      f.mine = readOnly ? false : (f.signer_role === signer.role)
+    }
 
     // S535: value-bearing tagged fields (writable / fee_row / utility_row)
     // are ALWAYS required for the landlord's pass — the sign submit
@@ -4410,8 +4471,36 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
 
       const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
       const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
+      // S636 (Nic): the executed copy goes out as an ATTACHMENT — read once for
+      // every signer. Best-effort: a missing or unreadable file must never stop
+      // the completion email, which is also how the parties learn it is done.
+      let executedBytes: Buffer | null = null
+      if (executedUrl) {
+        try {
+          const fname = executedUrl.split('/').pop()!
+          const fpath = resolveUploadPath(uploadDir, fname)
+          if (fpath && fs.existsSync(fpath)) executedBytes = fs.readFileSync(fpath)
+        } catch (e) { logger.error({ err: e, documentId: doc.id }, '[ESIGN] could not attach the executed PDF') }
+      }
       for (const s of allSigners as any[]) {
-        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, executedUrl || undefined, undefined, { landlordId: doc.landlord_id, documentId: doc.id })
+        // S636 (Nic): "It says click to download and view your lease, and it
+        // provides a link that does absolutely nothing from the tenant portal."
+        //
+        // Two dead links in one call. `executedUrl` is a RELATIVE path
+        // (/api/esign/files/…), which resolves to nothing from an email client —
+        // and even absolute it is an AUTHED route, so a click carrying no Bearer
+        // token could never fetch it. The fallback was worse: portalUrl defaulted
+        // to http://localhost:3002 and nothing was passed, so the alternative
+        // button pointed at the recipient's own machine.
+        //
+        // Send them to their portal instead, where they are signed in and the
+        // download button is already authed properly. Landlords to the landlord
+        // portal, everyone else to the tenant one.
+        const portalHome = isTenantRole(s.role)
+          ? (process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com') + '/lease'
+          : (process.env.LANDLORD_APP_URL || 'https://landlord.goldassetmanagement.com') + '/esign'
+        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, undefined, portalHome,
+          { landlordId: doc.landlord_id, documentId: doc.id }, executedBytes ?? undefined)
         await createNotification({
           userId: s.user_id,
           type: 'esign_completed',
@@ -4594,7 +4683,16 @@ esignRouter.get('/pending', requireAuth, async (req, res, next) => {
       JOIN landlords l ON l.id = d.landlord_id
       JOIN users lu ON lu.id = l.user_id
       WHERE s.user_id = $1
-        AND s.status IN ('sent','viewed')
+        -- S636 (Nic): "It shows now, but it wasn't showing even in the pending
+        -- state before."
+        --
+        -- 'pending' was excluded, so a lease that drafted but was never sent was
+        -- invisible here AND unmailed — it existed and no one could learn that
+        -- from either direction. That is precisely how the auto-send bug went
+        -- unnoticed: every lease drafted on acceptance sat unsent and unlisted.
+        -- The send is fixed, but mail can still fail, and a lease the landlord
+        -- cannot see is worse than one they can sign early.
+        AND s.status IN ('pending','sent','viewed')
         AND d.status NOT IN ('completed','voided')
       ORDER BY s.created_at DESC`, [req.user!.userId])
     res.json({ success: true, data: pending })

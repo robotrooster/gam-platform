@@ -252,7 +252,9 @@ function PendingSignBanner() {
     fetch((import.meta as any).env?.VITE_API_URL + '/api/esign/landlord-pending', {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_token') }
     }).then(r => r.json()).then(r => r.data || []),
-    { refetchInterval: 30000 }
+    // S636: also on return-to-tab and on navigation, not only every 30s — the
+    // banner is a work queue and a stale one sends you to a lease you just signed.
+    { refetchInterval: 30000, staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true }
   )
   if (!(pending as any[]).length) return null
   // S535 (Nic): landlord signs FIRST — the old copy hardcoded "Tenant has

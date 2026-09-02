@@ -78,9 +78,11 @@ export const recordCashPayment: AgentTool = {
                 u.payment_block, u.unit_number,
                 COALESCE(par.manual_fee_payer, 'tenant') AS manual_fee_payer,
                 t.background_check_status,
-                us.first_name, us.last_name
+                us.first_name, us.last_name,
+                pr.name AS property_name
            FROM payments p
            JOIN units u ON u.id = p.unit_id
+           JOIN properties pr ON pr.id = u.property_id
            LEFT JOIN tenants t ON t.id = p.tenant_id
            LEFT JOIN users us ON us.id = t.user_id
            LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
@@ -101,11 +103,17 @@ export const recordCashPayment: AgentTool = {
         return {
           ok: false, needsChoice: true,
           error: 'More than one rent charge is open — do not guess which one they paid.',
+          // S636 (Nic, DIRECTIVE): NAME THE PROPERTY. Unit numbers repeat across
+          // parks — Oak Park and Mountain View both have an RV 28 — so a choice
+          // list showing only "RV 28" twice asks the landlord to pick between
+          // two identical-looking options and take somebody's cash against
+          // whichever they guess.
           openCharges: open.map((r: any) => ({
             paymentId: r.id, amount: r.amount, dueDate: r.due_date,
-            tenant: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim(), unit: r.unit_number,
+            tenant: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim(),
+            unit: r.unit_number, property: r.property_name,
           })),
-          tellThem: 'Read the charges out with their dates and amounts and ask which one the money was for.',
+          tellThem: 'Read the charges out with their property, dates and amounts, and ask which one the money was for.',
         }
       }
 

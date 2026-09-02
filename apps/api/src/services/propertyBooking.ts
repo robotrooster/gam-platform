@@ -29,7 +29,7 @@ const HOLD_MINUTES = 30
  * (http://localhost:3015/{slug}) and subdomain in prod
  * (set STOREFRONT_URL_TEMPLATE=https://{slug}.gam.biz).
  */
-function storefrontUrl(slug: string, path = ''): string {
+export function storefrontUrl(slug: string, path = ''): string {
   const template = process.env.STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
   return template.replace('{slug}', slug) + path
 }

@@ -480,11 +480,18 @@ export function SignPage() {
   }
 
   const activeFields = allFields.filter(isFieldActive)
-  const requiredFields = activeFields.filter((f:any)=>f.required)
+  // S636 (Nic): the document arrives WHOLE now — the landlord's terms and any
+  // co-signer who already signed. "The whole point of the landlord signing it
+  // first is so that the tenant can see what they're signing." Rendering uses
+  // every field; the counters use only this signer's. Payloads without `mine`
+  // predate the change and contained only this signer's fields anyway.
+  const isMine = (f:any) => f.mine !== false
+  const myFields = activeFields.filter(isMine)
+  const requiredFields = myFields.filter((f:any)=>f.required)
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
-  const currentPageRequired = pageFields.filter((f:any)=>f.required)
+  const currentPageRequired = pageFields.filter((f:any)=>f.required && isMine(f))
   const currentPageComplete = currentPageRequired.every((f:any)=>fieldValues[f.id]?.trim())
   const allFilled = unfilledRequired.length === 0
 
@@ -629,6 +636,29 @@ export function SignPage() {
             const isNext = nextField?.id===f.id
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'
+            // S636 (Nic): "It needs to show all fields that are previously filled
+            // out as not a box to be filled out. It just needs to show it as
+            // plain text data, not an actual box." A value somebody else already
+            // entered is part of the page being read, not an input.
+            if (!isMine(f) && val) {
+              return (
+                <div key={f.id} id={'field-'+f.id}
+                  style={{
+                    position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                    overflow:'hidden', boxSizing:'border-box' as const,
+                    pointerEvents:'none' as const, zIndex:3,
+                  }}>
+                  {(f.fieldType==='signature'||f.fieldType==='initials') && String(val).startsWith('data:')
+                    ? <img src={val} style={{ width:'100%', height:'100%', objectFit:'contain' }}/>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
+                                     fontSize:fitFontSize(String(val), f.width*s, f.height*s),
+                                     color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
+                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                </div>
+              )
+            }
+            if (!isMine(f)) return null
             return (
               <div key={f.id} id={'field-'+f.id}
                 // S534: filled fields stay clickable so prefilled defaults
@@ -707,6 +737,23 @@ export function SignPage() {
             {activeField.fieldType==='date' && (
               <div style={{ marginBottom:14 }}>
                 <TypedDateInput
+                  // S636 (Nic, EMERGENCY): "It will not put their birthday in
+                  // correctly after they do it and go on to other boxes. It
+                  // seems to revert the birthday."
+                  //
+                  // TypedDateInput seeds its three boxes from `value` ONCE, at
+                  // mount, and never re-syncs. This modal is a single instance
+                  // reused for every date field on the lease, so opening a second
+                  // date box kept the first one's digits — and its emit effect,
+                  // comparing stale boxes against the new field's value, fired
+                  // onChange('') and WIPED a birthday the signer had already
+                  // entered.
+                  //
+                  // Keying on the field id gives each one its own instance,
+                  // initialised from its own value. (The component was also
+                  // hardened to re-sync — see its useEffect on `value` — so a
+                  // future caller that forgets the key cannot lose an answer.)
+                  key={activeField.id}
                   value={isoFromStored(fieldValues[activeField.id])}
                   onChange={iso=>{
                     // Stored in the signer's locale format, as before — it is

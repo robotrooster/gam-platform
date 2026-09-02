@@ -43,8 +43,8 @@ const api = axios.create({ baseURL: `${API}/api/public` })
 // ── Slug + page + claim-token resolution (subdomain in prod, path in dev) ──
 // S547: the storefront is a full multi-page property WEBSITE — home,
 // gallery, FAQ, booking — all living on the property's own subdomain.
-type Page = 'home' | 'gallery' | 'faq' | 'book' | 'contact' | 'booked' | 'claim' | 'stay'
-const PAGE_SEGMENTS = ['gallery', 'faq', 'book', 'contact', 'booked', 'claim', 'stay']
+type Page = 'home' | 'gallery' | 'faq' | 'book' | 'contact' | 'booked' | 'claim' | 'stay' | 'apply'
+const PAGE_SEGMENTS = ['gallery', 'faq', 'book', 'contact', 'booked', 'claim', 'stay', 'apply']
 
 function resolveLocation(): { slug: string | null; page: Page; claimToken: string | null; stayToken: string | null } {
   const host = location.hostname
@@ -63,7 +63,7 @@ function resolveLocation(): { slug: string | null; page: Page; claimToken: strin
 }
 
 /** Site-internal link (subdomain roots at /, dev prefixes /:slug). */
-function pageHref(slug: string, page: '' | 'gallery' | 'faq' | 'book' | 'contact'): string {
+function pageHref(slug: string, page: '' | 'gallery' | 'faq' | 'book' | 'contact' | 'apply'): string {
   const base = location.hostname.endsWith('gam.biz') ? '' : `/${slug}`
   return page ? `${base}/${page}` : (base || '/')
 }
@@ -201,6 +201,7 @@ function App() {
         {profile.photos.length > 0 && <a className={`nl${page === 'gallery' ? ' on' : ''}`} href={pageHref(s, 'gallery')}>Gallery</a>}
         {profile.faqs.length > 0 && <a className={`nl${page === 'faq' ? ' on' : ''}`} href={pageHref(s, 'faq')}>FAQ</a>}
         <a className={`nl${page === 'contact' ? ' on' : ''}`} href={pageHref(s, 'contact')}>Contact</a>
+        <a className={`nl${page === 'apply' ? ' on' : ''}`} href={pageHref(s, 'apply')}>Apply</a>
         <a className="book-cta" href={pageHref(s, 'book')}>Book Now</a>
       </div>
     </nav>
@@ -219,6 +220,8 @@ function App() {
         <FaqPage profile={profile} />
       ) : page === 'contact' ? (
         <ContactPage slug={s} profile={profile} />
+      ) : page === 'apply' ? (
+        <ApplyPage slug={s} profile={profile} />
       ) : page === 'stay' && stayToken ? (
         <StayPage slug={s} token={stayToken} profile={profile} />
       ) : page === 'book' ? (
@@ -659,6 +662,103 @@ function BookedView({ slug, propertyName }: { slug: string; propertyName: string
 }
 
 // ── S547: contact page — hours, phone, address, and the message form ──
+// ── Apply: the rental application, scoped to THIS property (S636) ──
+// Nic: "I need a link that takes them to that flow through a QR code.
+// It needs to map that tenant inquiry or invite or background to that
+// specific property."
+//
+// The landlord prints/texts a QR of {slug}.gam.biz/apply. Because the
+// slug already identifies the property, the application lands stamped
+// with it — and the applicant's later background check inherits that
+// same property when they screen, so a walk-up who never had a unit or
+// an invite still shows up under the right park.
+//
+// No screening money is asked for here. Applying is free; the check is
+// something they do afterward from their own account, which is the only
+// place their consent and their identity documents belong.
+function ApplyPage({ slug, profile }: { slug: string; profile: Profile }) {
+  const p = profile.property
+  const [f, setF] = useState({
+    firstName: '', lastName: '', email: '', phone: '',
+    moveInDate: '', monthlyIncome: '', occupants: '1',
+    hasPets: false, petDescription: '', message: '',
+  })
+  const [busy, setBusy] = useState(false)
+  const [sent, setSent] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const set = (k: keyof typeof f) => (e: any) =>
+    setF(v => ({ ...v, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value }))
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true); setErr(null)
+    try {
+      await api.post(`/property/${slug}/apply`, {
+        firstName: f.firstName.trim(),
+        lastName:  f.lastName.trim(),
+        email:     f.email.trim(),
+        phone:     f.phone.trim() || null,
+        moveInDate: f.moveInDate || null,
+        monthlyIncome: f.monthlyIncome ? Number(f.monthlyIncome) : null,
+        occupants: Number(f.occupants) || 1,
+        hasPets: f.hasPets,
+        petDescription: f.hasPets ? (f.petDescription.trim() || null) : null,
+        message: f.message.trim() || null,
+      })
+      setSent(true)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not send that. Please try again.')
+    } finally { setBusy(false) }
+  }
+
+  if (sent) return (
+    <section className="wrap">
+      <h2>Application received</h2>
+      <div className="a-ok" style={{ padding: 16, borderRadius: 10 }}>
+        Thanks, {f.firstName}. {p.name} has your application and will be in touch
+        at {f.email}. If they move forward, they'll send you a link to finish
+        your background check and set up your resident account.
+      </div>
+    </section>
+  )
+
+  return (
+    <section className="wrap">
+      <h2>Apply to live at {p.name}</h2>
+      <p style={{ color: 'var(--t2)', marginTop: -6 }}>
+        Applying is free and takes a minute. No payment and no background check
+        on this page.
+      </p>
+      <form className="card" style={{ display: 'grid', gap: 14, marginTop: 18 }} onSubmit={submit}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <label>First name<input className="inp" required value={f.firstName} onChange={set('firstName')} /></label>
+          <label>Last name<input className="inp" required value={f.lastName} onChange={set('lastName')} /></label>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <label>Email<input className="inp" type="email" required value={f.email} onChange={set('email')} /></label>
+          <label>Phone<input className="inp" type="tel" value={f.phone} onChange={set('phone')} /></label>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+          <label>Move-in date<input className="inp" type="date" value={f.moveInDate} onChange={set('moveInDate')} /></label>
+          <label>Monthly income<input className="inp" type="number" min="0" step="1" value={f.monthlyIncome} onChange={set('monthlyIncome')} /></label>
+          <label>People<input className="inp" type="number" min="1" max="50" value={f.occupants} onChange={set('occupants')} /></label>
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input type="checkbox" checked={f.hasPets} onChange={set('hasPets')} /> I have pets
+        </label>
+        {f.hasPets && (
+          <label>Tell us about them<input className="inp" value={f.petDescription} onChange={set('petDescription')} placeholder="Breed, size, how many" /></label>
+        )}
+        <label>Anything else?<textarea className="inp" rows={4} value={f.message} onChange={set('message')} /></label>
+        {err && <div className="a-warn" style={{ padding: 12, borderRadius: 8 }}>{err}</div>}
+        <button className="btn btn-p" disabled={busy} type="submit">
+          {busy ? 'Sending…' : 'Submit application'}
+        </button>
+      </form>
+    </section>
+  )
+}
+
 function ContactPage({ slug, profile }: { slug: string; profile: Profile }) {
   const p = profile.property
   const address = [p.street1, [p.city, p.state].filter(Boolean).join(', '), p.zip].filter(Boolean).join(' · ')

@@ -208,14 +208,42 @@ export function LeasePage() {
 
   if (isLoading) return <div style={{ padding:32, color:'var(--text-3)', textAlign:'center' }}>Loading lease…</div>
 
-  // Show pending signing banner
-
-
+  // S636 (Nic): A LEASE WAITING FOR THEM IS NOT "NO LEASE".
+  //
+  // A `leases` row is only written when a document is FULLY EXECUTED, so during
+  // onboarding — landlord signed, tenant next — there is no lease yet. This bailed
+  // out before the "Document Awaiting Your Signature" banner further down (the
+  // comment above it was left with nothing under it), so the resident was told
+  // "No lease on file yet. Your landlord will upload your lease when ready."
+  //
+  // For MH 09 that was the exact opposite of the truth: drafted, countersigned,
+  // emailed to her, and waiting on her signature. She had no way to reach it from
+  // the portal and no reason to think one existed. The banner comes first now.
   if (!lease) return (
-    <div style={{ padding:48, textAlign:'center' }}>
-      <FileText size={48} style={{ opacity:.2, display:'block', margin:'0 auto 12px' }} />
-      <div style={{ fontSize:'.9rem', color:'var(--text-3)' }}>No lease on file yet.</div>
-      <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:4 }}>Your landlord will upload your lease when ready.</div>
+    <div style={{ padding:32, maxWidth:720, margin:'0 auto' }}>
+      {(pendingDocs as any[]).length > 0 ? (
+        <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'20px 24px', display:'flex', alignItems:'center', justifyContent:'space-between', gap:16, flexWrap:'wrap' as const }}>
+          <div>
+            <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Your lease is ready to sign</div>
+            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>
+              {(pendingDocs as any[])[0].title}{(pendingDocs as any[])[0].propertyName ? ` · ${(pendingDocs as any[])[0].propertyName}` : ''}
+            </div>
+            <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginTop:4 }}>
+              Your landlord has already signed. Open it to read the terms and add your signature.
+            </div>
+          </div>
+          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].token)}
+            style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
+            Review &amp; Sign →
+          </button>
+        </div>
+      ) : (
+        <div style={{ padding:16, textAlign:'center' }}>
+          <FileText size={48} style={{ opacity:.2, display:'block', margin:'0 auto 12px' }} />
+          <div style={{ fontSize:'.9rem', color:'var(--text-3)' }}>No lease on file yet.</div>
+          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginTop:4 }}>Your landlord will upload your lease when ready.</div>
+        </div>
+      )}
     </div>
   )
 
@@ -638,7 +666,13 @@ async function downloadLeasePdf(documentUrl: string, token: string) {
   document.body.appendChild(a)
   a.click()
   a.remove()
-  URL.revokeObjectURL(objUrl)
+  // S636 (Nic): revoking the blob URL synchronously after click is a known
+  // ANDROID failure — desktop Chrome starts the download during click(), but
+  // mobile Chrome hands it to the download manager asynchronously, so pulling
+  // the URL out from under it cancels a download that never reports an error.
+  // The symptom is exactly "the button does nothing". A short delay costs
+  // nothing and the browser releases the memory either way.
+  setTimeout(() => URL.revokeObjectURL(objUrl), 60_000)
 }
 
 function AddendumHistorySection({ leaseId }: { leaseId: string }) {

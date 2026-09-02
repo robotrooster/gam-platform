@@ -193,8 +193,20 @@ export async function autoDraftLeasesForUnit(
       // Deliberately AFTER the savepoint is released: a send failure must not
       // roll back the draft. If the email cannot go, the lease still exists,
       // still says pending, and can be sent by hand.
-      const { autoSendDraftedDocument } = await import('../routes/esign')
-      const sent = await autoSendDraftedDocument(doc.id)
+      // S636: THE SEND CANNOT HAPPEN HERE, and never could.
+      //
+      // autoSendDraftedDocument reads through the POOL, and this runs inside the
+      // caller's still-open accept transaction — so it looked for a document
+      // that had not been committed yet, found nothing, and returned false every
+      // single time. Every lease drafted on acceptance stayed `pending` and the
+      // landlord was never emailed. It only ever appeared to work when something
+      // called it separately, after the commit.
+      //
+      // The id goes back to the caller instead, which sends once the
+      // transaction is committed. Same reason the S634 move-in bundle had to
+      // take its reads on the caller's client: a pool connection cannot see
+      // another connection's uncommitted rows.
+      const sent = false
 
       await createNotification({
         userId: landlord.userId, type: 'lease_ready_to_sign',

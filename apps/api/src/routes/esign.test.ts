@@ -3603,3 +3603,53 @@ describe('S636 lease_column vocabularies agree across both tables', () => {
     expect(rows[0].def).toContain('occupant_names')
   })
 })
+
+
+// ─── S636: a signer reads the WHOLE document ─────────────────────────────────
+//
+// GET /sign returned only the caller's own fields, so a tenant received none of
+// the landlord's boxes and every term the landlord had entered rendered as an
+// empty blank on the page they were signing. Nic: "They can't see what the rent
+// is. They can't see what the guest fee is... the whole point of the landlord
+// signing it first is so that the tenant can see what they're signing."
+//
+// Not a trust change: the sign submit has always written
+// `AND signer_role = <caller's role>`, so a value outside the caller's own role
+// no-ops however it is posted. `mine` is what the UI uses to decide which fields
+// are inputs and which are just the document.
+describe('S636 GET /sign gives every signer the whole document', () => {
+  it("a tenant receives the landlord's filled values, flagged as not theirs", async () => {
+    const f = await seedFixture()
+    // A doc mid-flight: landlord has signed, tenant is up next — the exact
+    // state Nic hit on Oak Park RV 24.
+    const { documentId: docId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ other_fee: '25.00' }),
+    })
+    // The tenant's own slot, so there is something that IS theirs to fill.
+    await db.query(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, required)
+       VALUES ($1, 'signature', 'primary', 'tenant_signature', TRUE)`, [docId])
+
+    const res = await request(buildApp())
+      .get(`/api/esign/sign/${docId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+
+    // buildApp() here mounts the router WITHOUT the app's outgoing camelCase
+    // middleware, so this harness sees the raw snake_case. Read both, so the
+    // test says what it means either way. `mine` has no underscore and is
+    // identical through the conversion.
+    const fields = res.body.data.fields as any[]
+    const col = (x: any) => x.leaseColumn ?? x.lease_column
+    const rent = fields.find(x => col(x) === 'rent_amount')
+    // THE POINT: it is present, it carries the value, and it is not the
+    // tenant's to fill.
+    expect(rent, 'the tenant never even received the rent field').toBeTruthy()
+    expect(Number(rent.value)).toBeGreaterThan(0)
+    expect(rent.mine).toBe(false)
+
+    // And their own slots are still theirs.
+    expect(fields.some(x => x.mine === true)).toBe(true)
+  })
+})

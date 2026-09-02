@@ -3,8 +3,9 @@ import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { toast } from '../components/dialogs'
 import { useAuth } from '../context/AuthContext'
-import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark, Globe } from 'lucide-react'
+import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark, Globe, QrCode, Copy } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
@@ -934,6 +935,7 @@ export function PropertiesPage() {
   const navigate = useNavigate()
   const [showAdd, setShowAdd] = useState(false)
   const [editProp, setEditProp] = useState<any>(null)
+  const [applyQrProp, setApplyQrProp] = useState<any>(null)
   const [addUnitForProp, setAddUnitForProp] = useState<any>(null)
 
   const { data: props = [], isLoading } = useQuery<any[]>('properties', () => apiGet('/properties'))
@@ -1057,6 +1059,17 @@ export function PropertiesPage() {
                           <Globe size={12} />
                         </a>
                       )}
+                      {/* S636 (Nic): "is that a navigable path that any landlord
+                          can just reach so they don't need to ask Claude for
+                          help." It lives on the property card itself — the
+                          same place the website link already sits. */}
+                      {publicSiteUrl(p) && (
+                        <button onClick={e => { e.stopPropagation(); setApplyQrProp(p) }}
+                          className="btn btn-ghost btn-sm" style={{ padding: '4px 8px', color: 'var(--gold)' }}
+                          title="Application QR code — print or text it">
+                          <QrCode size={12} />
+                        </button>
+                      )}
                       {can('properties.edit') && (
                         <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); setEditProp(p) }} style={{ padding: '4px 8px' }}>
                           <Edit2 size={12} />
@@ -1133,6 +1146,7 @@ export function PropertiesPage() {
 
       {showAdd && <AddEditModal onClose={() => setShowAdd(false)} />}
       {editProp && <AddEditModal property={editProp} onClose={() => setEditProp(null)} />}
+      {applyQrProp && <ApplyQrModal property={applyQrProp} onClose={() => setApplyQrProp(null)} />}
       {addUnitForProp && <AddUnitModal preselectedPropertyId={addUnitForProp.id} onClose={() => setAddUnitForProp(null)} />}
     </div>
   )
@@ -1187,6 +1201,89 @@ function ConnectReadinessBanner() {
         <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); navigate('/banking') }}>
           Open Banking →
         </button>
+      </div>
+    </div>
+  )
+}
+
+// ── APPLICATION QR (S636) ────────────────────────────────────
+// Nic: "Give me the path to get to generate a QR code for the
+// background check link... and I want to know if that is a navigable
+// path that any landlord can just reach so they don't need to ask
+// Claude for help."
+//
+// The code encodes {slug}.gam.biz/apply for THIS property. Because the
+// slug is the property's public identity, an application filed through
+// it is stamped with the property — and the applicant's later
+// background check inherits it, so a walk-up who never had a unit or an
+// invite still lands under the right park.
+//
+// The API renders the PNG rather than the browser, so print, text, and
+// email all get the identical image and there is no QR library in the
+// bundle.
+function ApplyQrModal({ property, onClose }: { property: any; onClose: () => void }) {
+  const { data, isLoading, error } = useQuery<any>(
+    ['apply-link', property.id],
+    () => apiGet(`/properties/${property.id}/apply-link`)
+  )
+  const url: string | null = data?.url ?? null
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    if (!url) return
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopied(true); setTimeout(() => setCopied(false), 1800)
+    } catch { toast.error('Could not copy — select the link and copy it manually') }
+  }
+  // Printing opens the image on its own so the sign is just the code and
+  // the property name — no app chrome around it.
+  const print = () => {
+    if (!data?.qrDataUrl) return
+    const w = window.open('', '_blank', 'width=420,height=560')
+    if (!w) { toast.error('Your browser blocked the print window'); return }
+    w.document.write(
+      `<title>Apply — ${property.name}</title>` +
+      `<body style="font-family:system-ui;text-align:center;padding:32px">` +
+      `<h2 style="margin:0 0 4px">Apply to live at</h2>` +
+      `<h1 style="margin:0 0 20px">${property.name}</h1>` +
+      `<img src="${data.qrDataUrl}" style="width:320px;height:320px" />` +
+      `<p style="color:#444;font-size:13px;margin-top:16px">${url ?? ''}</p></body>`)
+    w.document.close()
+    w.focus()
+    setTimeout(() => w.print(), 250)
+  }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Application QR — {property.name}</div>
+        {isLoading ? (
+          <p style={{ color: 'var(--text-3)' }}>Generating…</p>
+        ) : error || !url ? (
+          <div className="alert alert-warning" style={{ fontSize: '.85rem' }}>
+            This property has no public website yet, so there is no link to encode.
+            Turn the booking site on in the property's settings and the code appears here.
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: '.84rem', color: 'var(--text-3)', marginTop: 0 }}>
+              Print it for the office, or text it to someone asking about a space.
+              Applications through this code land tagged to {property.name}.
+            </p>
+            <div style={{ textAlign: 'center', background: '#fff', borderRadius: 12, padding: 16, margin: '4px 0 14px' }}>
+              <img src={data.qrDataUrl} alt={`Application QR for ${property.name}`}
+                style={{ width: 260, height: 260, display: 'block', margin: '0 auto' }} />
+            </div>
+            <div className="mono" style={{ fontSize: '.74rem', color: 'var(--text-3)', wordBreak: 'break-all', marginBottom: 14 }}>
+              {url}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={print}>Print</button>
+              <button className="btn btn-ghost" style={{ flex: 1 }} onClick={copy}>
+                <Copy size={13} /> {copied ? 'Copied' : 'Copy link'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

@@ -53,6 +53,7 @@ import {
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
 } from 'lucide-react'
+import { CONSUMER_TERMS_URL, CONSUMER_PRIVACY_URL } from './lib/marketing'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -4496,12 +4497,21 @@ function SignupPage() {
             {pw && pw.length>0 && pw.length<12 && <div style={{fontSize:'.72rem',color:'var(--warn,#f59e0b)',marginTop:-6,marginBottom:10}}>{12-pw.length} more character{12-pw.length===1?'':'s'} required</div>}
             <label style={{display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer',fontSize:'.8rem',color:'var(--t1)',lineHeight:1.5,margin:'4px 0 12px'}}>
               <input type="checkbox" {...register('acceptedTerms',{required:true})} style={{marginTop:2,flexShrink:0}} />
+              {/* S636: same two defects as the invite acceptance page — a click
+                  inside the <label> was going to the checkbox, and the URL was
+                  built from a fallback that shipped as localhost. */}
               <span>I agree to the{' '}
-                <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)'}}>Terms of Service</a>
+                <a href={CONSUMER_TERMS_URL} target="_blank" rel="noopener noreferrer"
+                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Terms of Service</a>
                 {' '}and{' '}
-                <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)'}}>Privacy Policy</a>.
+                <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer"
+                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Privacy Policy</a>.
               </span>
             </label>
+            <div style={{fontSize:'.63rem',color:'var(--t3,#5a6a86)',lineHeight:1.6,
+                         wordBreak:'break-all',margin:'0 0 12px'}}>
+              Prefer to read them directly?<br />{CONSUMER_TERMS_URL}<br />{CONSUMER_PRIVACY_URL}
+            </div>
             <button className="btn btn-p" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:8}}>
               {loading?<span className="spinner"/>:'Create account'}
             </button>

@@ -166,6 +166,78 @@ publicPropertyBookingRouter.post('/property/:slug/inquiry', publicWriteLimiter, 
   } catch (e) { next(e) }
 })
 
+// ── S636: RENTAL APPLICATION, SCOPED TO THIS PROPERTY ────────
+// Nic: "I need a link that takes them to that flow through a QR code.
+// It needs to map that tenant inquiry or invite or background to that
+// specific property."
+//
+// The public apply endpoint already existed at POST
+// /api/public/properties/apply — but it keys on unitId OR landlordId,
+// and nothing in any frontend ever called it. A walk-up scanning a code
+// at the office has no unit in mind yet, so the landlord-only branch is
+// what they would hit, and with several parks under one landlord that
+// loses which park they are standing in.
+//
+// This is the same write, addressed by the property's own public slug —
+// the identifier the {slug}.gam.biz site already runs on, so no new
+// token to mint, expire, or leak. The slug IS the property scope.
+publicPropertyBookingRouter.post('/property/:slug/apply', publicWriteLimiter, async (req, res, next) => {
+  try {
+    const b = z.object({
+      firstName:      z.string().trim().min(1).max(120),
+      lastName:       z.string().trim().min(1).max(120),
+      email:          z.string().email().max(200),
+      phone:          z.string().max(40).nullish(),
+      moveInDate:     z.string().max(40).nullish(),
+      monthlyIncome:  z.number().nonnegative().nullish(),
+      occupants:      z.number().int().positive().max(50).optional(),
+      hasPets:        z.boolean().optional(),
+      petDescription: z.string().max(2000).nullish(),
+      message:        z.string().max(5000).nullish(),
+      // Optional: the code can be printed per-space as well as per-park.
+      unitId:         z.string().uuid().optional(),
+    }).parse(req.body)
+    const prop = await resolveProperty(req.params.slug)
+
+    // A named unit must belong to THIS property — otherwise a scanned
+    // code for one park could file an application against another.
+    if (b.unitId) {
+      const u = await queryOne<{ property_id: string }>(
+        `SELECT property_id FROM units WHERE id = $1`, [b.unitId])
+      if (!u || u.property_id !== prop.id) throw new AppError(400, 'That space is not at this property')
+    }
+
+    const row = await queryOne<{ id: string }>(
+      `INSERT INTO unit_applications
+         (unit_id, property_id, landlord_id, first_name, last_name, email, phone,
+          move_in_date, monthly_income, occupants, has_pets, pet_description, message)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [b.unitId ?? null, prop.id, prop.landlord_id, b.firstName, b.lastName, b.email,
+       b.phone ?? null, b.moveInDate ?? null, b.monthlyIncome ?? null, b.occupants ?? 1,
+       b.hasPets ?? false, b.petDescription ?? null, b.message ?? null])
+
+    const landlord = await queryOne<{ user_id: string; email: string }>(
+      `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
+        WHERE l.id = $1`, [prop.landlord_id])
+    if (landlord) {
+      const { createNotification } = await import('../services/notifications')
+      await createNotification({
+        userId: landlord.user_id,
+        landlordId: prop.landlord_id,
+        type: 'property_inquiry',
+        title: `New rental application — ${prop.name}`,
+        body: `${b.firstName} ${b.lastName} (${b.email}${b.phone ? `, ${b.phone}` : ''})`
+            + `${b.moveInDate ? ` · wants in ${b.moveInDate}` : ''}`,
+        data: { application_id: row!.id, property_id: prop.id },
+        sendEmail: true,
+        emailTo: landlord.email,
+        emailSubject: `New rental application — ${prop.name}`,
+      })
+    }
+    res.status(201).json({ success: true, data: { received: true, applicationId: row!.id } })
+  } catch (e) { next(e) }
+})
+
 /** Store a guest inquiry + notify (and email) the landlord. Shared by the
  *  standalone contact form and the S547 with-reservation question. */
 async function recordGuestInquiry(

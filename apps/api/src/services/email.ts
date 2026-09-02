@@ -392,7 +392,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
   )
 }
 
-export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string }) {
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string }, pdfBytes?: Buffer) {
   await send(to, `✅ Document fully signed: ${documentTitle}`,
     base(
       h('Document Fully Executed') +
@@ -404,14 +404,28 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
         <div style="font-size:.75rem;color:#4a5568;text-transform:uppercase;letter-spacing:.06em;margin-top:10px">Signed On</div>
         <div style="color:#eef1f8;margin-top:2px">${new Date().toLocaleDateString()}</div>
       </div>` +
-      (pdfUrl ? btn('Download Signed Document', pdfUrl) : btn('View in Portal', portalUrl))
+      // S636 (Nic): "Does it send the tenant a completed PDF of the lease to
+      // their email when all parties have signed?" It did not — it sent a LINK,
+      // and that link was a relative path to an authed route, so it did nothing
+      // at all. The executed copy now rides along as an ATTACHMENT: it is the
+      // one artifact the resident actually keeps, it works on a phone with no
+      // login, and it survives the account being closed years later.
+      //
+      // The portal link stays for anyone who would rather read it there, with
+      // its address copyable in case the button will not render.
+      (pdfBytes ? p('<strong style="color:#eef1f8">Your signed copy is attached to this email.</strong>') : '') +
+      btnWithLink(pdfBytes ? 'Open it in your portal' : 'Open your signed lease', pdfUrl || portalUrl) +
+      p('<span style="font-size:.75rem;color:#4a5568">Sign in and your lease is under '
+        + 'Lease, with a Download PDF button for another copy any time.</span>')
     ),
     {
       category: 'esign_signing_completed',
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
-    }
+    },
+    'noreply',
+    pdfBytes ? [{ filename: 'signed-lease.pdf', content: pdfBytes }] : undefined,
   )
 }
 

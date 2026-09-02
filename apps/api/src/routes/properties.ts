@@ -458,6 +458,39 @@ propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create')
   } catch (e) { next(e) }
 })
 
+// GET /api/properties/:id/apply-link — the property's public rental
+// application link, plus a QR of it to print or text.
+//
+// S636 (Nic): "Give me the path to get to generate a QR code for the
+// background check link... for Mountain View RV property specifically...
+// and I want to know if that is a navigable path that any landlord can
+// just reach so they don't need to ask Claude for help."
+//
+// Deliberately NOT a minted token: the property's booking slug is
+// already its public identity, already unguessable enough to print, and
+// never expires — so a code on a laminated sign at the office does not
+// silently go dead. Revoking access means clearing the slug, the same
+// switch that takes the booking site down.
+propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ id: string; name: string; landlord_id: string; booking_slug: string | null }>(
+      `SELECT id, name, landlord_id, booking_slug FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!prop.booking_slug) {
+      // The slug is what makes the link property-specific. Without one
+      // there is nothing to encode, and a generic link would land the
+      // applicant with no property at all — the exact miss this closes.
+      return res.json({ success: true, data: { url: null, qrDataUrl: null, reason: 'no_booking_slug' } })
+    }
+    const { storefrontUrl } = await import('../services/propertyBooking')
+    const url = storefrontUrl(prop.booking_slug, '/apply')
+    const QRCode = (await import('qrcode')).default
+    const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 320 })
+    res.json({ success: true, data: { url, qrDataUrl, propertyName: prop.name } })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.get('/:id', async (req, res, next) => {
   try {
     const p = await queryOne<any>(`SELECT * FROM properties WHERE id=$1`,[req.params.id])

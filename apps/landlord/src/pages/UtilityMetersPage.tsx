@@ -36,7 +36,6 @@ const lbl: CSSProperties = { fontSize:'.75rem', color:'var(--text-3)', marginBot
 
 const UTILITY_ICONS: Record<string, string> = { water:'💧', gas:'🔥', electric:'⚡', sewer:'🚰', trash:'🗑️', propane:'🛢️' }
 const UTILITY_UNITS: Record<string, string> = { water:'gal', gas:'therms', electric:'kWh', sewer:'gal', trash:'', propane:'gal' }
-const BILL_STATUS: Record<string, string> = { unbilled:'badge-muted', billed:'badge-amber', paid:'badge-green', waived:'badge-muted' }
 
 const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00:00Z')
   .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
@@ -82,7 +81,14 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
     () => apiGet(`/units?propertyId=${propertyId}`),
     { enabled: !!propertyId }
   )
-  const { data: bills = [] } = useQuery<any[]>('utility-bills', () => apiGet('/utility/bills'))
+  // S636 (Nic): the bills card shows the MASTER bills that arrive at the
+  // property — not the per-tenant charges those get split into. Those
+  // already live on the tenant's invoice and on the unit.
+  const { data: masterBills = [] } = useQuery<any[]>(
+    ['master-bills', propertyId],
+    () => apiGet(`/utility/master-bills?propertyId=${propertyId}`),
+    { enabled: !!propertyId && canRead }
+  )
   const { data: runs = [] } = useQuery<any[]>(
     ['reading-runs', propertyId],
     () => apiGet(`/utility/reading-runs?propertyId=${propertyId}`),
@@ -119,7 +125,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 
   const invalidate = () => {
     qc.invalidateQueries(['utility-meters', propertyId])
-    qc.invalidateQueries('utility-bills')
+    qc.invalidateQueries(['master-bills', propertyId])
     qc.invalidateQueries(['reading-runs', propertyId])
     qc.invalidateQueries(['flagged-readings', propertyId])
     qc.invalidateQueries(['reads-due', propertyId])
@@ -149,7 +155,6 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
       onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not complete the run') }
   )
 
-  const propertyBills = (bills as any[]).filter(b => !propertyId || (units as any[]).some(u => u.id === b.unitId))
   const lastCompleted = (runs as any[]).find(r => r.status === 'completed')
 
   return (
@@ -323,36 +328,64 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             </>
           )}
 
-          {/* ── BILLS (read-only status; runs create these) ── */}
+          {/* ── MASTER BILLS (S636) ──────────────────────────────
+              S636 (Nic): "Why the fuck does that card even exist? It's
+              showing all these separate things as line items... that is
+              where I wanna see when I input my master fucking meters, not
+              every person that gets charged different utilities."
+
+              This space now shows what ARRIVES at the property — the
+              provider's bill per master, per cycle — and how much of it
+              went back out to tenants. The per-tenant split lives on the
+              tenant's own invoice and on the unit; restating it here was
+              the same money listed twice in the landlord's setup screen. */}
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
-            <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Utility Bills</h2>
+            <div>
+              <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Master bills</h2>
+              <p style={{ fontSize:'.76rem', color:'var(--text-3)', margin:'4px 0 0' }}>
+                What the provider billed the property each cycle, and how much of it was recovered from tenants.
+              </p>
+            </div>
             {canRead && (meters as any[]).some((m:any)=>m.billingMethod==='submeter') && (
               <button className="btn btn-primary btn-sm" onClick={()=>setSpecialRead({})}>
                 <Gauge size={13}/> Take a reading
               </button>
             )}
           </div>
-          <div className="card" style={{ padding:0, overflowX:'auto' }}>
-            {propertyBills.length === 0 ? (
-              <div className="empty-state" style={{ padding:40 }}><Receipt size={36}/><h3>No utility bills</h3><p>Complete a reading run — leased units bill automatically and the charge rides the tenant's next monthly invoice.</p></div>
+          <div className="card" style={{ padding:0, overflowX:'auto', marginBottom:28 }}>
+            {(masterBills as any[]).length === 0 ? (
+              <div className="empty-state" style={{ padding:40 }}><Receipt size={36}/><h3>No master bills yet</h3><p>Master meters are entered during a reading run — the run asks for the provider's total and dollar amount. Tenant charges from the split ride each tenant's own invoice.</p></div>
             ) : (
-              <table className="data-table" style={{ minWidth:800 }}>
-                {/* S560: raw start→end reads are LANDLORD-only history — front desk
-                    sees them on the actual invoice, not as a lookupable history here. */}
-                <thead><tr><th>Cycle</th><th>Unit</th><th>Meter</th>{canReview && <th>Reads</th>}<th>Usage</th><th>Amount</th><th>Tax</th><th>Status</th></tr></thead>
+              <table className="data-table" style={{ minWidth:760 }}>
+                <thead><tr><th>Cycle</th><th>Meter</th><th>Measured</th><th>Provider bill</th><th>Recovered</th><th>Landlord's share</th></tr></thead>
                 <tbody>
-                  {propertyBills.map((b:any) => (
-                    <tr key={b.id}>
-                      <td className="mono" style={{ fontSize:'.75rem' }}>{String(b.billingCycleMonth).slice(0,7)}</td>
-                      <td className="mono">{b.unitNumber}</td>
-                      <td style={{ fontSize:'.78rem' }}>{UTILITY_ICONS[b.utilityType]} {b.meterLabel}</td>
-                      {canReview && <td className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{b.readingStart != null && b.readingEnd != null ? `${fmtRead(b.readingStart, b.digits)} → ${fmtRead(b.readingEnd, b.digits)}` : '—'}</td>}
-                      <td className="mono" style={{ fontSize:'.78rem' }}>{b.usageAmount != null ? `${Number(b.usageAmount).toLocaleString()} ${UTILITY_UNITS[b.utilityType] || ''}` : '—'}</td>
-                      <td className="mono" style={{ fontWeight:600 }}>{fmt(b.chargeAmount)}</td>
-                      <td className="mono" style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{Number(b.taxAmount) > 0 ? `+${fmt(b.taxAmount)}` : '—'}</td>
-                      <td><span className={`badge ${BILL_STATUS[b.status] || 'badge-muted'}`}>{b.status === 'billed' ? 'on next invoice' : b.status}</span></td>
-                    </tr>
-                  ))}
+                  {(masterBills as any[]).map((b:any) => {
+                    const bill = b.billAmount != null ? Number(b.billAmount) : null
+                    const recovered = Number(b.recoveredAmount || 0)
+                    // A master_bill_to_landlord meter recovers nothing by
+                    // design — the landlord eats it. Showing "—" there
+                    // rather than a $0.00 keeps it from reading as a miss.
+                    const recovers = b.billingMethod === 'rubs'
+                    return (
+                      <tr key={b.id}>
+                        <td className="mono" style={{ fontSize:'.75rem' }}>{String(b.billingCycleMonth).slice(0,7)}</td>
+                        <td style={{ fontSize:'.78rem' }}>
+                          {UTILITY_ICONS[b.utilityType]} {b.meterLabel}
+                          <div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>
+                            {recovers ? `split across ${b.unitCount} space${Number(b.unitCount) === 1 ? '' : 's'}` : 'landlord pays'}
+                          </div>
+                        </td>
+                        <td className="mono" style={{ fontSize:'.78rem' }}>{b.readingValue != null ? `${Number(b.readingValue).toLocaleString()} ${UTILITY_UNITS[b.utilityType] || ''}` : '—'}</td>
+                        <td className="mono" style={{ fontWeight:600 }}>{bill != null ? fmt(bill) : '—'}</td>
+                        <td className="mono" style={{ fontSize:'.78rem' }}>
+                          {recovers ? <>{fmt(recovered)}<span style={{ color:'var(--text-3)' }}> · {b.recoveredCount} unit{Number(b.recoveredCount) === 1 ? '' : 's'}</span></> : '—'}
+                        </td>
+                        <td className="mono" style={{ fontSize:'.78rem', color: bill != null && recovered < bill ? 'var(--text-1)' : 'var(--text-3)' }}>
+                          {bill != null ? fmt(Math.max(0, bill - recovered)) : '—'}
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             )}

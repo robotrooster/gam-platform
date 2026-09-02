@@ -171,12 +171,23 @@ export async function applyScreeningWaive(opts: {
   if (!(await getOnboardingWindow(opts.propertyId)).open) {
     return { waived: false, reason: 'window_closed' }
   }
-  const taken = await queryOne<{ tenant_id: string }>(
-    `SELECT tenant_id FROM pending_tenant_intents
-      WHERE screening_waived_unit_id = $1 AND cancelled_at IS NULL AND tenant_id <> $2 LIMIT 1`,
-    [opts.unitId, opts.tenantId],
-  )
-  if (taken) return { waived: false, reason: 'unit_taken' }
+  // S636 (Nic, DIRECTIVE): "All people that are onboarding as existing tenants
+  // with a new electronic signature should not be asked to do the background
+  // screening at all. The onboarding existing tenants should automatically be
+  // bypassing that during the onboarding window."
+  //
+  // The slot used to be ONE PER UNIT, which quietly meant one per HOUSEHOLD: the
+  // first adult invited to a mobile home was grandfathered and their spouse was
+  // sent to a background check. That is the wrong shape — both of them have been
+  // sitting in that home for years, and neither is applying for anything. At
+  // Mountain View it put 22 existing residents in front of a screening they
+  // should never have seen.
+  //
+  // What still bounds this is the window and the invite: a waive only happens
+  // for somebody the landlord is actually onboarding to that unit, while the
+  // property's onboarding window is open. Once it closes, every new resident
+  // screens normally. The cap is the household, which is what it should have
+  // been.
 
   await query(`UPDATE tenants SET background_check_status = 'waived' WHERE id = $1`, [opts.tenantId])
   await query(

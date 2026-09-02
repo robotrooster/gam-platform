@@ -1557,7 +1557,19 @@ export function ESignPage() {
   const { data: templates = [], isLoading: tmplLoading } = useQuery<any[]>(
     ['esign-templates', tmplPropertyId],
     () => apiGet(`/esign/templates${tmplPropertyId ? `?propertyId=${tmplPropertyId}` : ''}`))
-  const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',  () => apiGet('/esign/documents'))
+  // S636 (Nic): "When I click sign the next one and it loads up the GoldSign
+  // tab, every time I toggle back to that tab, I want it to hard refresh
+  // automatically because it still shows a bunch of leases sent instead of
+  // reloading to show in progress for the ones I've already signed."
+  //
+  // The portal's global react-query config is staleTime 5min with
+  // refetchOnMount AND refetchOnWindowFocus both OFF, so this list never
+  // reloaded on navigation or on returning to the tab. That is defensible for
+  // reference data and wrong for a WORK QUEUE: the whole point of coming back
+  // here is to see what is left, and signing a lease changes it every time.
+  const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',
+    () => apiGet('/esign/documents'),
+    { staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true, refetchInterval: 60000 })
 
   // S576: search + property dropdown over the Documents tab. Keys on
   // propertyName (the docs payload has no propertyId); standalone contracts
