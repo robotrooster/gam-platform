@@ -1113,17 +1113,25 @@ async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promis
  */
 async function tenantOwesUtility(
   leaseId: string | null, utilityType: string, meterId: string,
+  q1: OneFn = queryOne,
 ): Promise<boolean> {
   if (leaseId) {
-    const resp = await queryOne<{ tenant_responsible: boolean }>(`
+    const resp = await q1<{ tenant_responsible: boolean }>(`
       SELECT tenant_responsible FROM lease_utility_responsibilities
        WHERE lease_id = $1 AND utility_type = $2`, [leaseId, utilityType])
     if (resp) return !!resp.tenant_responsible   // the lease spoke
   }
-  const m = await queryOne<{ billing_method: string }>(
+  const m = await q1<{ billing_method: string }>(
     `SELECT billing_method FROM utility_meters WHERE id = $1`, [meterId])
   return !!m && m.billing_method !== 'master_bill_to_landlord'
 }
+
+// S636: these let the release run either on the pool or inside a caller's
+// open transaction. A pool connection cannot see rows a caller has not
+// committed yet, so a release that must happen BEFORE that caller's
+// invoice is built has to borrow the caller's client.
+type ManyFn = <T>(text: string, params?: any[]) => Promise<T[]>
+type OneFn  = <T>(text: string, params?: any[]) => Promise<T | null>
 
 interface InsertBillArgs {
   meterId: string
@@ -1484,8 +1492,23 @@ function cycleLabel(cycle: unknown): string {
  */
 export async function releaseSuspendedChargesForLease(args: {
   unitId: string; leaseId: string; tenantId: string; landlordId: string
+  /**
+   * S636 (Nic), on RV 28 the day the Coveys signed: "the suspended
+   * utilities are not showing on their invoice."
+   *
+   * S634 had already taught the move-in invoice to pick these up — but
+   * this release ran POST-COMMIT, after that invoice was built, so it
+   * queried for utility_bills on a lease that had none yet. Both
+   * happened in the same second and the invoice still read $0 utilities.
+   * Passing the signing transaction's client lets the release land
+   * first, inside the same transaction, so the invoice sees the rows.
+   */
+  client?: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> }
 }): Promise<{ released: number; amount: number }> {
-  const held = await query<any>(`
+  const c = args.client
+  const q: ManyFn = c ? (async (t, p) => (await c.query(t, p)).rows) as ManyFn : query
+  const q1: OneFn = c ? (async (t, p) => (await c.query(t, p)).rows[0] ?? null) as OneFn : queryOne
+  const held = await q<any>(`
     SELECT * FROM suspended_utility_charges
      WHERE unit_id = $1 AND released_at IS NULL AND cancelled_at IS NULL
      ORDER BY billing_cycle_month`, [args.unitId])
@@ -1497,8 +1520,8 @@ export async function releaseSuspendedChargesForLease(args: {
       // so this is the first moment the terms can be applied — and if the
       // signed lease does not pass this utility through, the tenant never owed
       // it. Cancel the hold (kept, with a reason) instead of billing it.
-      if (!await tenantOwesUtility(args.leaseId, h.utility_type, h.meter_id)) {
-        await query(`
+      if (!await tenantOwesUtility(args.leaseId, h.utility_type, h.meter_id, q1)) {
+        await q(`
           UPDATE suspended_utility_charges
              SET cancelled_at = now(), updated_at = now(),
                  notes = COALESCE(notes,'') ||
@@ -1509,7 +1532,7 @@ export async function releaseSuspendedChargesForLease(args: {
           'utility billing: held share dropped — this utility is not passed through to the tenant')
         continue
       }
-      const bill = await queryOne<{ id: string }>(`
+      const bill = await q1<{ id: string }>(`
         INSERT INTO utility_bills
           (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month,
            usage_amount, allocation_method, allocation_basis, rate_per_unit,
@@ -1531,10 +1554,28 @@ export async function releaseSuspendedChargesForLease(args: {
          `Utility used before the lease was signed (${cycleLabel(h.billing_cycle_month)}).`])
       // A conflict means the cycle already has a bill for this unit — the share
       // is accounted for, so stop holding it rather than leaving it to re-run.
-      await query(
+      await q(
         `UPDATE suspended_utility_charges
             SET released_at = now(), released_bill_id = $2, updated_at = now()
           WHERE id = $1`, [h.id, bill?.id ?? null])
+      // ── S636: ATTACH TO AN INVOICE THAT ALREADY EXISTS ────────────────
+      //
+      // Nic: "Can you just order the utilities to be released two minutes
+      // after signature... we're just waiting for millisecond ordering to
+      // guess about getting it right."
+      //
+      // He is right that this should not depend on ordering — though a
+      // DELAY would have made it permanent, since the invoice is built
+      // FROM these rows. The fix is to stop caring which came first.
+      //
+      // A bill released before its invoice is picked up by
+      // generateMoveInInvoice (S634). A bill released AFTER one already
+      // exists had nowhere to go and sat 'unbilled' until the next
+      // month's run — which is what stranded the Coveys, and what would
+      // strand anyone whose meter read is corrected, or whose bill-back
+      // is switched on, after their invoice was cut. This lands it on
+      // the open invoice instead, so the tenant sees it when they log in.
+      if (bill?.id) await attachBillToOpenInvoice(bill.id, h, args, q, q1)
       if (bill?.id) { released++; amount += Number(h.charge_amount) }
     } catch (e) {
       logger.error({ err: e, suspendedId: h.id, unitId: args.unitId },
@@ -1546,4 +1587,91 @@ export async function releaseSuspendedChargesForLease(args: {
       'utility billing: held shares released onto the new lease')
   }
   return { released, amount }
+}
+
+
+/**
+ * Put a just-released utility bill onto the tenant's open invoice, if one is
+ * already sitting there for that cycle or later (S636).
+ *
+ * Mirrors the move-in bundle's utility rows exactly — a payments row of
+ * type 'utility' linked to the invoice, the bill stamped 'billed' so no
+ * later run double-bills it, and the invoice's own subtotals moved. Work
+ * trade is honoured the same way: a covered utility rides as a suspended
+ * $0-owed line rather than money due, so hours worked cover it.
+ *
+ * Silent no-op when there is no open invoice — the bill stays 'unbilled'
+ * and the next run picks it up, which is the pre-existing behaviour.
+ */
+async function attachBillToOpenInvoice(
+  billId: string,
+  held: any,
+  args: { unitId: string; leaseId: string; tenantId: string; landlordId: string },
+  q: ManyFn,
+  q1: OneFn,
+): Promise<void> {
+  const amount = Number(held.charge_amount)
+  if (!(amount > 0)) return
+  try {
+    // The earliest still-open invoice on this lease whose period already
+    // covers this cycle. 'settled' and 'void' are left alone — a paid
+    // invoice must never grow a new line after the fact.
+    const inv = await q1<{ id: string; due_date: string }>(
+      `SELECT id, due_date FROM invoices
+        WHERE lease_id = $1
+          AND status IN ('pending','partial')
+          AND date_trunc('month', due_date)::date >= date_trunc('month', $2::date)::date
+        ORDER BY due_date ASC LIMIT 1`,
+      [args.leaseId, held.billing_cycle_month])
+    if (!inv) return
+
+    const wt = await q1<{ covered_charges: string[] | null }>(
+      `SELECT covered_charges FROM work_trade_agreements
+        WHERE unit_id = $1 AND tenant_id = $2 AND status = 'active'
+          AND start_date <= $3::date AND (end_date IS NULL OR end_date >= $3::date)
+        LIMIT 1`,
+      [args.unitId, args.tenantId, inv.due_date])
+    // An empty/absent list means everything is covered — same reading the
+    // move-in bundle and the monthly run both use.
+    const covered = !!wt && (!wt.covered_charges || wt.covered_charges.length === 0
+      || wt.covered_charges.includes(String(held.utility_type)))
+
+    const kind = String(held.utility_type)
+    const label = `${kind[0].toUpperCase()}${kind.slice(1)} — ${cycleLabel(held.billing_cycle_month)}`
+      + ' (used before the lease was signed)'
+    const pay = await q1<{ id: string }>(
+      `INSERT INTO payments (
+         invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+         type, amount, status, due_date, entry_description, notes,
+         work_trade_suspended_at
+       ) VALUES ($1,$2,$3,$4,$5,'utility',$6,'pending',$7,'UTILITY',$8,$9)
+       RETURNING id`,
+      [inv.id, args.unitId, args.leaseId, args.tenantId, args.landlordId,
+       amount.toFixed(2), inv.due_date,
+       covered ? `${label} — work trade, suspended until month close` : label,
+       covered ? new Date().toISOString() : null])
+    if (!pay) return
+
+    await q(`UPDATE utility_bills
+                SET payment_id = $1, status = 'billed', billed_at = NOW(), updated_at = NOW()
+              WHERE id = $2`, [pay.id, billId])
+
+    // A suspended line was never money owed, so it moves the utilities
+    // subtotal but not the total — the same split the move-in bundle uses.
+    await q(`UPDATE invoices
+                SET subtotal_utilities = subtotal_utilities + $2,
+                    total_amount = total_amount + $3,
+                    updated_at = NOW()
+              WHERE id = $1`,
+      [inv.id, amount.toFixed(2), covered ? '0.00' : amount.toFixed(2)])
+
+    logger.info({ billId, invoiceId: inv.id, amount, covered },
+      'utility billing: released share attached to the open invoice')
+  } catch (e) {
+    // The bill exists and is correct; it just did not get onto this
+    // invoice. Leaving it 'unbilled' means the next run bills it — never
+    // silently dropped.
+    logger.error({ err: e, billId },
+      'utility billing: could not attach a released share to the open invoice — left unbilled')
+  }
 }

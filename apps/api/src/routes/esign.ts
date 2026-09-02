@@ -1261,6 +1261,39 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     }
   }
 
+  // ── S636: RELEASE HELD UTILITIES *BEFORE* THE INVOICE IS BUILT ──────────
+  //
+  // Nic, on RV 28 the day the Coveys signed: "the suspended utilities are not
+  // showing on their invoice. Why is there no water or electricity on there?"
+  //
+  // S634 already taught generateMoveInInvoice to pick up unbilled utility_bills
+  // for the lease — but the release that CREATES those rows ran post-commit,
+  // after this call. So the invoice queried a lease that had no utility bills
+  // yet and wrote $0. Both happened in the same second, which is what made it
+  // look like it had worked.
+  //
+  // It looked like it worked for a second reason: RV 02 (the lease that
+  // prompted S634) had its utilities put on its invoice BY HAND, not by this
+  // code. The fix shipped, was never exercised by a real signing, and the next
+  // signing failed identically.
+  //
+  // Runs on the signing transaction's client so the rows are visible to the
+  // invoice built immediately below. Best-effort: a share that will not release
+  // stays HELD rather than vanishing, and the post-commit pass further down
+  // remains as the backstop for anything left behind.
+  if (doc.unit_id && primarySigner?.tenant_id) {
+    try {
+      await releaseSuspendedChargesForLease({
+        unitId: doc.unit_id, leaseId: lease.id,
+        tenantId: primarySigner.tenant_id, landlordId: doc.landlord_id,
+        client,
+      })
+    } catch (e) {
+      logger.error({ err: e, leaseId: lease.id },
+        '[utility] pre-invoice release failed — shares stay held for the post-commit pass')
+    }
+  }
+
   // S196: security_deposit no longer passed as a separate input — it
   // flows in via the lease_fees move_in iteration inside
   // generateMoveInInvoice.
