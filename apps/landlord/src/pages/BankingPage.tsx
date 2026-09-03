@@ -229,7 +229,6 @@ function AddBankAccountModal({ onClose }: { onClose: () => void }) {
 
   const submit = () => {
     const errs: Record<string, string> = {}
-    if (!form.nickname.trim()) errs.nickname = 'Required'
     if (!form.accountHolderName.trim()) errs.accountHolderName = 'Required'
     if (!/^\d{9}$/.test(form.routingNumber.replace(/\D/g, ''))) errs.routingNumber = 'Must be 9 digits'
     const acct = form.accountNumber.replace(/\D/g, '')
@@ -256,7 +255,10 @@ function AddBankAccountModal({ onClose }: { onClose: () => void }) {
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={lbl}>Nickname <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--text-3)' }}>(e.g. "Acme Holdings LLC")</span></label>
+          {/* S637: optional — the server names it from the account details if
+              this is left blank. It stopped a co-owner who simply had not
+              thought to name his own bank account. */}
+          <label style={lbl}>Nickname <span style={{ fontWeight: 400, textTransform: 'none', color: 'var(--text-3)' }}>(optional — e.g. "Acme Holdings LLC")</span></label>
           <input className="input" style={{ width: '100%' }} value={form.nickname}
             onChange={e => setForm(f => ({ ...f, nickname: e.target.value }))} />
           {errors.nickname && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.nickname}</div>}
@@ -328,6 +330,16 @@ function AddBankAccountModal({ onClose }: { onClose: () => void }) {
             onChange={e => setForm(f => ({ ...f, confirm_accountNumber: e.target.value }))} />
           {errors.confirm_accountNumber && <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{errors.confirm_accountNumber}</div>}
         </div>
+
+        {/* S637: the button used to appear dead when a field above the fold
+            failed — setErrors re-renders and returns before any request, so
+            there is no spinner and no network call, and the message sits at the
+            top of a long form. Say it again where the button is. */}
+        {Object.keys(errors).filter(k => k !== 'submit').length > 0 && (
+          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
+            Check the highlighted {Object.keys(errors).filter(k => k !== 'submit').length === 1 ? 'field' : 'fields'} above — scroll up to see which.
+          </div>
+        )}
 
         {errors.submit && (
           <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>

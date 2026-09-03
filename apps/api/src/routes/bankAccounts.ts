@@ -51,7 +51,21 @@ bankAccountsRouter.get('/', async (req, res, next) => {
 })
 
 const createSchema = z.object({
-  nickname: z.string().min(1).max(80),
+  // ── S637: A NICKNAME IS A CONVENIENCE, NOT A REQUIREMENT ────────────
+  //
+  // Nic, watching a co-owner stall: "Is the nickname for the account actually
+  // required? That may be holding him up. He's old school, and he may not have
+  // named the account."
+  //
+  // It was required on both sides, and the client refused BEFORE any request —
+  // so the button produced a re-render and nothing else, with "Required"
+  // printed under the first field of a long form, off-screen on a phone. A
+  // person entering a routing number and an account number was blocked by a
+  // label for their own benefit.
+  //
+  // Optional now, and filled in below from the bank details themselves, which
+  // is a better name than most people would type anyway.
+  nickname: z.string().max(80).optional(),
   accountHolderName: z.string().min(1).max(120),
   accountHolderType: z.enum(ACCOUNT_HOLDER_TYPE_VALUES),
   accountType: z.enum(ACCOUNT_TYPE_VALUES),
@@ -80,6 +94,12 @@ bankAccountsRouter.post('/', async (req, res, next) => {
     const encrypted = encryptBankAccountNumber(acctRaw)
     const acctLast4 = last4(acctRaw)
 
+    // S637: name it from what they DID enter. "Checking ••4821" tells them
+    // which account this is on a list better than most people would type, and
+    // nobody is stopped by a blank box for a label.
+    const nickname = (body.nickname ?? '').trim()
+      || `${body.accountType === 'savings' ? 'Savings' : 'Checking'} ••${acctLast4}`
+
     const row = await queryOne<BankAccountSummary>(`
       INSERT INTO user_bank_accounts
         (user_id, nickname, account_holder_name, account_holder_type,
@@ -88,7 +108,7 @@ bankAccountsRouter.post('/', async (req, res, next) => {
       RETURNING ${SAFE_COLUMNS}
     `, [
       req.user!.userId,
-      body.nickname.trim(),
+      nickname,
       body.accountHolderName.trim(),
       body.accountHolderType,
       body.accountType,
