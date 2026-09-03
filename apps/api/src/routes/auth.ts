@@ -175,6 +175,8 @@ authRouter.post('/register', async (req, res, next) => {
       ).then(r => r.rows)
 
       let profileId: string
+      // S637: companies this account was INVITED into, claimed during signup.
+      let invitedLandlordIds: string[] = []
       // Hoisted so the post-commit signup alert can read closer attribution.
       let closerId: string | null = null
       let referredByUserId: string | null = null
@@ -210,6 +212,47 @@ authRouter.post('/register', async (req, res, next) => {
         // it (webhooks.ts), else the grace-cap cron flips it at billing_grace_until:
         // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
         // extendable for long large-portfolio setups.
+        // ── S637: AN INVITED CO-OWNER GETS ONE COMPANY, NOT TWO ───────────
+        //
+        // Nic: "Dusty only owns one company, but it's telling him he owns two.
+        // He had to select between Mountain View and a blank entity." And
+        // earlier: "They need to be merged into one. He doesn't have a
+        // separate account for anything."
+        //
+        // Registration always minted a personal entity. For somebody who was
+        // INVITED as a co-owner and registered instead of clicking the link,
+        // that produced an unnamed company owning nothing, sitting next to the
+        // real one in every entity picker on the platform — and on the banking
+        // page it turned a one-click task into a choice between a real company
+        // and a phantom.
+        //
+        // An invitation addressed to this email is proof of why the account
+        // exists. Claim it BEFORE deciding whether a personal entity is
+        // warranted: if they were invited, the invited company IS their
+        // company and no second one is created.
+        const claimed = await client.query<{ landlord_id: string; invited_by_user_id: string | null }>(
+          `UPDATE landlord_member_invitations
+              SET status = 'accepted', accepted_at = now(),
+                  accepted_user_id = $2, updated_at = now()
+            WHERE LOWER(email) = LOWER($1)
+              AND status = 'pending'
+              AND expires_at > now()
+            RETURNING landlord_id, invited_by_user_id`,
+          [user.email, user.id])
+        for (const inv of claimed.rows) {
+          await client.query(
+            `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
+             VALUES ($1, $2, 'owner', $3) ON CONFLICT (landlord_id, user_id) DO NOTHING`,
+            [inv.landlord_id, user.id, inv.invited_by_user_id ?? null])
+        }
+        invitedLandlordIds = claimed.rows.map(r => r.landlord_id)
+
+        // Somebody joining an existing company needs no company of their own.
+        // If they later buy property under their own name they can create one
+        // deliberately, which is a better moment to name it than a signup form.
+        if (invitedLandlordIds.length > 0) {
+          profileId = invitedLandlordIds[0]
+        } else {
         const [l] = await client.query(
           // S624: migration_window_ends_at MUST be set here. It was not, and a
           // NULL read as "window open forever" in the screening gate — so every
@@ -230,6 +273,8 @@ authRouter.post('/register', async (req, res, next) => {
           `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')
            ON CONFLICT (landlord_id, user_id) DO NOTHING`,
           [l.id, user.id])
+        }
+
       } else {
         const [t] = await client.query(
           `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [user.id]
@@ -256,7 +301,11 @@ authRouter.post('/register', async (req, res, next) => {
         userId: user.id, role: user.role, email: user.email,
         profileId: body.role === 'landlord' ? null : profileId,
         landlordId: null,
-        landlordIds: body.role === 'landlord' ? [profileId] : null,
+        // S637: every company they were invited into, not just the first —
+        // an account can be a co-owner of more than one from the start.
+        landlordIds: body.role === 'landlord'
+          ? (invitedLandlordIds.length > 0 ? invitedLandlordIds : [profileId])
+          : null,
         businessId: null, staffRole: null, permissions: null,
       })
       await issueEmailOtp(user.id, user.email)
@@ -940,8 +989,29 @@ export async function mintAndSendVerifyEmail(userId: string, email: string, firs
     `UPDATE users SET email_verify_token = $1 WHERE id = $2`,
     [token, userId],
   )
-  const base = process.env.VERIFY_EMAIL_URL
-    || 'http://localhost:3002/verify-email'
+  // ── S637: THE VERIFY LINK MUST REACH THE RIGHT PORTAL ───────────────
+  //
+  // Nic, on Dusty Rhoades mid-signup: "His email verification, it says he
+  // cannot reach that page."
+  //
+  // VERIFY_EMAIL_URL was never set in production, so this fell back to the DEV
+  // default and mailed every landlord and tenant a link to
+  // http://localhost:3002 — reachable only from this Mac. The same shape as
+  // the storefront URL bug earlier today, and the same fix: production must
+  // never be able to fall back to localhost.
+  //
+  // It is also per-ROLE. The default pointed at :3002, the tenant app, and the
+  // landlord portal had no /verify-email page at all — so even with the right
+  // host a landlord was sent to the wrong product, then told to sign in
+  // somewhere they do not have an account.
+  const role = (await queryOne<{ role: string }>(
+    `SELECT role FROM users WHERE id = $1`, [userId]))?.role ?? 'tenant'
+  const portal = role === 'landlord' || role === 'property_manager'
+    ? (process.env.LANDLORD_APP_URL || (process.env.NODE_ENV === 'production'
+        ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001'))
+    : (process.env.TENANT_APP_URL || (process.env.NODE_ENV === 'production'
+        ? 'https://tenant.goldassetmanagement.com' : 'http://localhost:3002'))
+  const base = process.env.VERIFY_EMAIL_URL || `${portal}/verify-email`
   const verifyUrl = `${base}?token=${encodeURIComponent(token)}`
   // Fire-and-forget; failures land in email_send_log.
   void sendEmailVerification(email, firstName, verifyUrl, { userId })

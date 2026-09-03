@@ -32,7 +32,22 @@ bankFeedRouter.use(requireAuth)
  * belongs to somebody else does not.
  */
 function scope(req: any): string {
-  const requested = typeof req.query?.entityId === 'string' ? req.query.entityId.trim() : ''
+  // ── S637: READ THE ENTITY FROM THE BODY TOO ─────────────────────────
+  //
+  // Nic: "When I select Mountain View or Oak Park from the banking page and
+  // then click connect to bank, it still wants me to choose which one it
+  // belongs to after I've already gone onto that entity's selection."
+  //
+  // This only ever looked at the QUERY STRING. The GET routes pass entityId
+  // that way, so listing connections and transactions respected the picker —
+  // but /link-session and /finalize are POSTs, and a POST carries its
+  // arguments in the body. So the one action that actually links a bank threw
+  // away the company the landlord had just chosen and asked again.
+  //
+  // bankReconciliation.ts has always read both. This is the same line.
+  const fromQuery = typeof req.query?.entityId === 'string' ? req.query.entityId.trim() : ''
+  const fromBody = typeof req.body?.entityId === 'string' ? req.body.entityId.trim() : ''
+  const requested = fromQuery || fromBody
   if (requested) {
     if (!landlordScopeIds(req.user).includes(requested)) {
       throw new AppError(403, 'You are not a member of that entity')

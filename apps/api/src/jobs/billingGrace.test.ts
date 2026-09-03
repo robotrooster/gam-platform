@@ -78,21 +78,50 @@ async function accrualRowCount(landlordId: string): Promise<number> {
 }
 
 describe('S600 platform-fee accrual gate', () => {
-  it('does NOT bill a landlord in grace (billing_starts_at NULL), even with an occupied unit', async () => {
+  // S637 (Nic, DIRECTIVE): OCCUPANCY IS WHAT ENDS THE GRACE.
+  //
+  // "It's a combination of active leases on a spot... Doesn't matter if they
+  // pay rent to the landlord or not. When they are in the system as an
+  // occupied spot, we are billing the landlord for that occupancy."
+  //
+  // Grace used to end only on rent settling THROUGH STRIPE, so a landlord
+  // collecting cash stayed in it forever and was never billed at all. It now
+  // ends for anyone who actually had somebody in a spot in the month being
+  // billed. Grace still protects a landlord with NO occupancy — see the
+  // vacant case below.
+  it('bills a landlord in grace once they HAVE an occupied unit', async () => {
     const { landlordId } = await buildOccupiedStack()
     await setBilling(landlordId, null)
 
     const result = await processPlatformFeeAccrual()
 
+    expect(result.graceEndedByOccupancy).toBe(1)
+    expect(result.feesAccrued).toBe(1)
+    expect(await accrualRowCount(landlordId)).toBe(1)
+  })
+
+  it('leaves a landlord in grace alone when nothing is occupied', async () => {
+    const { landlordId } = await buildOccupiedStack()
+    await setBilling(landlordId, null)
+    // End every lease before the month being billed — no occupancy, no trigger.
+    await db.query(
+      `UPDATE leases SET status = 'expired',
+              end_date = (date_trunc('month', now()) - INTERVAL '2 months')::date
+        WHERE landlord_id = $1`, [landlordId])
+
+    const result = await processPlatformFeeAccrual()
+
+    expect(result.graceEndedByOccupancy).toBe(0)
     expect(result.feesAccrued).toBe(0)
-    expect(result.skippedPreBilling).toBe(1)
     expect(await accrualRowCount(landlordId)).toBe(0)
   })
 
-  it('bills a live landlord (billing_starts_at = this cycle)', async () => {
+  it('bills a live landlord (billing_starts_at = the cycle being billed)', async () => {
     const { landlordId } = await buildOccupiedStack()
-    // seedLandlord already sets billing_starts_at = this month; be explicit.
-    await setBilling(landlordId, `date_trunc('month', now())::date`)
+    // S637: the fee is billed IN ARREARS — a run today bills LAST month, so
+    // that is the cycle billing must have started by. Set to this month, the
+    // landlord went live after the month being billed and is correctly skipped.
+    await setBilling(landlordId, `(date_trunc('month', now()) - INTERVAL '1 month')::date`)
 
     const result = await processPlatformFeeAccrual()
 

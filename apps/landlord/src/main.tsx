@@ -66,6 +66,7 @@ import { ResetPasswordPage }  from './pages/ResetPasswordPage'
 import ConfirmEmailChangePage from './pages/ConfirmEmailChangePage'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { AcceptOwnerInvitePage } from './pages/AcceptOwnerInvitePage'
+import { VerifyEmailPage } from './pages/VerifyEmailPage'
 import { DashboardPage }   from './pages/DashboardPage'
 import { ReferLandlordPage } from './pages/ReferLandlordPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
@@ -237,6 +238,10 @@ function App() {
             <Route path="/reset-password"  element={<ResetPasswordPage />} />
             {/* S630: public — proving the new mailbox happens without a session. */}
             <Route path="/confirm-email-change" element={<ConfirmEmailChangePage />} />
+            {/* S637: the landlord portal had NO verify-email page, so every
+                landlord's verification link pointed into the tenant app — and
+                with VERIFY_EMAIL_URL unset it pointed at localhost. */}
+            <Route path="/verify-email" element={<VerifyEmailPage />} />
             <Route path="/invite/:token" element={<AcceptInvitePage />} />
             {/* S605: co-owner invite. PUBLIC — the invitee may have no account
                 yet, which is the entire point of the flow. */}

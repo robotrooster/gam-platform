@@ -92,13 +92,16 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     try {
       const stripe = await stripePromise
       if (!stripe) throw new Error('Stripe failed to load')
-      const { data: session } = await apiPost('/bank-feed/link-session', {})
+      // S637: send the company the picker is on. Without it the endpoint fell
+      // back to "which of your companies?" and refused, after the landlord had
+      // already answered that question on screen.
+      const { data: session } = await apiPost('/bank-feed/link-session', { entityId })
       const { clientSecret, sessionId } = session
       const result = await (stripe as any).collectFinancialConnectionsAccounts({ clientSecret })
       if (result.error) throw new Error(result.error.message)
       const accounts = result.financialConnectionsSession?.accounts ?? []
       if (!accounts.length) { setLinking(false); return } // user closed the modal
-      await apiPost('/bank-feed/finalize', { sessionId })
+      await apiPost('/bank-feed/finalize', { sessionId, entityId })
       qc.invalidateQueries('bank-connections')
       qc.invalidateQueries(['bank-txns'])
       toast('Bank linked. Syncing transactions…')

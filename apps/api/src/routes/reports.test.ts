@@ -602,6 +602,12 @@ describe('GET /api/reports/property-detail', () => {
     const propId = await seedProperty(db as any, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
     await db.query(`UPDATE properties SET created_at = '2024-01-01' WHERE id = $1`, [propId])
     const unitId = await seedUnit(db as any, { propertyId: propId, landlordId: f.aLid })
+    // S637: the nights aggregation only counts rv_spot / campsite / boat_slip
+    // (NIGHTS_AGGREGATION_UNIT_TYPES). The default seeded type is not one, so
+    // this fixture produced ZERO billable and only reached $10 via the floor —
+    // it was passing for the opposite of the reason it claims. Now the nights
+    // genuinely count: 30 → 1 billable → $2 → lifted to the $10 floor.
+    await db.query(`UPDATE units SET unit_type = 'rv_spot' WHERE id = $1`, [unitId])
     await seedBooking({ unitId, landlordId: f.aLid, checkIn: '2025-04-01', checkOut: '2025-05-01' })
     await seedSettledRentPayment({ unitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 900, dueDate: '2025-04-10' })
     const res = await request(buildApp())
@@ -613,7 +619,7 @@ describe('GET /api/reports/property-detail', () => {
     expect(res.body.data.summary.platformFee).toBe(10)   // ← was $0 before the fix
   })
 
-  it('$10/property minimum full stop: a fully-vacant property still bills $10/mo', async () => {
+  it('S631: a fully-vacant property bills NOTHING — the floor is not a subscription', async () => {
     const f = await seed()
     // Fresh property with a unit but NO lease and NO booking — zero occupancy.
     const propId = await seedProperty(db as any, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
@@ -624,7 +630,12 @@ describe('GET /api/reports/property-detail', () => {
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
     expect(res.status).toBe(200)
     expect(res.body.data.property.occupiedUnits).toBe(0)
-    expect(res.body.data.summary.platformFee).toBe(10) // property minimum, even fully vacant
+    // S631 (Nic, DIRECTIVE): "We do ten dollars a month minimum, but only when
+    // money's moving through the system. Leaving it vacant forever as a ghost
+    // in the system is okay." The accrual has obeyed that since S631; the
+    // REPORT still floored an empty property, so the two disagreed and this
+    // test pinned the wrong side. An empty month bills nothing.
+    expect(res.body.data.summary.platformFee).toBe(0)
   })
 
   it('real onboarding: no platform fee for months before the property joined the platform', async () => {

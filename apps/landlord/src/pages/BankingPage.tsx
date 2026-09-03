@@ -386,6 +386,25 @@ function StripeConnectSection() {
     ['stripe-connect-status', connectEntity, entityId],
     () => apiGet(`/stripe/connect/status?${connectEntityQS}`),
     {
+      // ── S637: DO NOT ASK ABOUT AN ENTITY WE HAVE NOT CHOSEN YET ────────
+      //
+      // Nic, watching a co-owner: "he clicks the connect to bank button and it
+      // says you own more than one company, choose what record this belongs
+      // to. It doesn't let him try to add a bank. The adding a bank button
+      // does nothing right now."
+      //
+      // entityId starts as user.profileId, and since S633 a landlord's
+      // profileId is NULL — an account is not an entity. So the very first
+      // render asked for `entity=landlord&entityId=` with nothing after the
+      // equals, and the API answered, correctly, that it could not tell which
+      // company was meant. That error rendered before EntityPicker below had
+      // resolved and chosen one.
+      //
+      // Nic's own Oak Park bank linked fine because he had exactly ONE company
+      // on 14 August; Mountain View was created on the 28th. A single entity
+      // needs no disambiguation, so the empty id never mattered until a second
+      // company existed.
+      enabled: !isOwner || !!entityId,
       refetchInterval: (data) =>
         showOnboarding && !(data?.payoutsEnabled && data?.detailsSubmitted)
           ? 3000 : false,
@@ -401,6 +420,11 @@ function StripeConnectSection() {
   const startOnboarding = async () => {
     setInitErr(null)
     try {
+      // Say which company is missing rather than posting an empty id and
+      // letting the server answer with a question the button cannot ask.
+      if (isOwner && !entityId) {
+        throw new Error('Choose which company this bank account belongs to first.')
+      }
       if (!PUB_KEY) throw new Error('VITE_STRIPE_PUBLISHABLE_KEY is not configured.')
       const instance = await loadConnectAndInitialize({
         publishableKey: PUB_KEY,
@@ -496,7 +520,8 @@ function StripeConnectSection() {
               after that, the rest of the form happens right here without leaving GAM.
             </div>
           </div>
-          <button className="btn btn-primary" onClick={startOnboarding}>
+          <button className="btn btn-primary" onClick={startOnboarding}
+            disabled={isOwner && !entityId}>
             {statusQ.data?.exists ? 'Continue verification' : 'Start verification'}
           </button>
           {initErr && (
