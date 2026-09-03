@@ -257,7 +257,7 @@ export function BackgroundCheckPage() {
       <h2 style={{color:'#eef1f8',margin:0}}>{applyUrl?'One More Step':'Application Under Review'}</h2>
       {applyUrl ? (
         <>
-          <p style={{color:'#4a5568',maxWidth:400,lineHeight:1.6}}>Your application is in. To run your screening, complete the secure identity &amp; consent step with Checkr, our screening partner — it takes about two minutes. Checkr also emailed you this link.</p>
+          <p style={{color:'#4a5568',maxWidth:400,lineHeight:1.6}}>Your application is in. To run your screening, complete the secure identity &amp; consent step with Checkr, our screening partner — it takes about two minutes. Checkr also emailed you this link — if this computer has no camera, open that email on your phone and finish there.</p>
           <a href={applyUrl} target="_blank" rel="noopener noreferrer" style={{padding:'12px 28px',borderRadius:10,background:'#c9a227',color:'#060809',fontWeight:700,textDecoration:'none',fontSize:'.9rem'}}>Complete Screening with Checkr →</a>
         </>
       ) : (
@@ -387,7 +387,14 @@ export function BackgroundCheckPage() {
         {STEPS[step]==='Review & Pay'&&<div style={{textAlign:'center'}}>
           <div style={{fontSize:'2rem',marginBottom:8}}>🛡️</div>
           <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Review & Pay</div>
-          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:16}}>You pay for your own screening. {providerCollectsPii ? 'After payment, Checkr emails you a secure link to finish identity verification — a quick photo of your ID and a selfie, right from your phone.' : ''}</div>
+          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:16}}>You pay for your own screening. {/* S636 (Nic): "What happens when a person is doing the background
+              check flow from a desktop that does not have a webcam? It says
+              a quick photo of your ID and a selfie right from your phone,
+              but I'm on the desktop browser."
+              The link is EMAILED, so the device you paid on does not have to
+              be the device with the camera — but the copy assumed a phone and
+              read like a dead end on a desktop. It now names the way out. */}
+              {providerCollectsPii ? 'After payment, Checkr emails you a secure link to finish identity verification — a photo of your ID and a selfie. It takes about two minutes. On a computer without a camera, open that email on your phone and finish there.' : ''}</div>
           {price && (
             <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:16,marginBottom:16,textAlign:'left',fontSize:'.82rem',color:'#b8c4d8'}}>
               {/* S636 (Nic): "why is it showing a service fee of five dollars?

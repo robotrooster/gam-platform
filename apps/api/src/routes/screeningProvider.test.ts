@@ -42,14 +42,18 @@ function buildApp() {
   return app
 }
 
-const ENV = { ...process.env }
+const PRIOR_NODE_ENV = process.env.NODE_ENV
 beforeEach(async () => {
   await cleanupAllSchema()
   shellMock.mockReset()
   shellMock.mockResolvedValue(null)
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_screen'
+  process.env.NODE_ENV = PRIOR_NODE_ENV
 })
-afterEach(() => { process.env = { ...ENV } })
+// Restore ONLY what this file touches. Replacing process.env wholesale
+// dropped JWT_SECRET for every suite that ran afterwards, which surfaced as
+// unrelated 401s in the full run and passed fine in isolation.
+afterEach(() => { process.env.NODE_ENV = PRIOR_NODE_ENV })
 
 const price = (qs: string) => request(buildApp()).get(`/api/background/price?${qs}`)
 
