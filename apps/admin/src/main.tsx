@@ -23,7 +23,7 @@ import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
-  Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail,
+  Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail, Send,
   Target, TrendingUp, Bot, Lock, LogOut, DollarSign, Sun, Moon,
 } from 'lucide-react'
 import axios from 'axios'
@@ -308,6 +308,7 @@ function Layout(){
           <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
           {isSuperAdmin&&<NavLink to="/deposit-interest" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={15}/> Deposit Interest</NavLink>}
           <NavLink to="/outreach" className={({isActive})=>`ni${isActive?' active':''}`}><Mail size={15}/> Signup Outreach</NavLink>
+          <NavLink to="/send-email" className={({isActive})=>`ni${isActive?' active':''}`}><Send size={15}/> Send Email</NavLink>
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Compliance</div>}
           {isSuperAdmin&&<NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}><Activity size={15}/> NACHA Monitor</NavLink>}
           {isSuperAdmin&&<NavLink to="/nexus" className={({isActive})=>`ni${isActive?' active':''}`}><MapIcon size={15}/> Sales-Tax Nexus</NavLink>}
@@ -3607,6 +3608,7 @@ function App(){
           <Route path="deposit-portability" element={<SuperAdminGuard><DepositPortability/></SuperAdminGuard>}/>
           <Route path="deposit-interest" element={<SuperAdminGuard><DepositInterest/></SuperAdminGuard>}/>
           <Route path="outreach" element={<OutreachStatus/>}/>
+          <Route path="send-email" element={<SendEmail/>}/>
           <Route path="system-features" element={<OwnerGuard><SystemFeatures/></OwnerGuard>}/>
           <Route path="audit-log"     element={<SuperAdminGuard><AuditLog/></SuperAdminGuard>}/>
           <Route path="csv-imports"   element={<SuperAdminGuard><CsvImports/></SuperAdminGuard>}/>
@@ -4751,6 +4753,173 @@ const STAGE_STYLE: Record<string, { label: string; color: string }> = {
   sent:          { label: 'Sent',          color: 'var(--t3)' },
   undeliverable: { label: 'Undeliverable', color: '#c9635b' },
   failed:        { label: 'Send failed',   color: '#c9635b' },
+}
+
+// ── SEND EMAIL (S637) ────────────────────────────────────────
+//
+// Nic: "let's add a way in the administrative portal for an admin to send
+// email to onboarded landlords, tenants, etcetera, all coming from support at
+// gold asset management dot com. We can have generic drafted ones that are
+// preloaded, ready to go... and then I can also just compose an actual one if
+// I need to."
+//
+// Every sender in the platform fires off an event, so there was no way to
+// write one person a note — a human had to ask an assistant to do it.
+//
+// Shape of the screen, and why: find the person FIRST, because a draft is
+// filled with their name and an audience-wrong template is worth hiding.
+// Then a draft or a blank. Then the body, editable to the last character —
+// what goes out is what is on screen, so a template can always be bent to the
+// person receiving it. One recipient at a time, deliberately: this is a way
+// to write to somebody, not a mailing list.
+function SendEmail() {
+  const { user } = useAuth()
+  const [q, setQ] = useState('')
+  const [picked, setPicked] = useState<any>(null)
+  const [templateId, setTemplateId] = useState<string | null>(null)
+  const [subject, setSubject] = useState('')
+  const [body, setBody] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sentTo, setSentTo] = useState<string | null>(null)
+
+  const { data: templates = [] } = useQuery<any[]>(
+    'email-templates', () => get<any[]>('/admin/email/templates'),
+    { enabled: !!user, staleTime: Infinity })
+
+  // Debounced so typing a name is not one request per keystroke.
+  const [debounced, setDebounced] = useState('')
+  useEffect(() => { const t = setTimeout(() => setDebounced(q), 250); return () => clearTimeout(t) }, [q])
+  const { data: results = [] } = useQuery<any[]>(
+    ['email-recipients', debounced],
+    () => get<any[]>(`/admin/email/recipients?q=${encodeURIComponent(debounced)}`),
+    { enabled: !!user && debounced.trim().length >= 2 })
+
+  const applyTemplate = (t: any) => {
+    setTemplateId(t.id)
+    const name = (picked?.first_name || '').trim() || 'there'
+    const fill = (x: string) => x.replace(/\{\{firstName\}\}/g, name)
+    setSubject(fill(t.subject))
+    setBody(t.paragraphs.map(fill).join('\n\n'))
+  }
+
+  const send = async () => {
+    if (!picked) return
+    const paragraphs = body.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)
+    if (!subject.trim() || paragraphs.length === 0) { toast('Give it a subject and a message first'); return }
+    const ok = await appConfirm(
+      `This goes to ${picked.email} right now, from GAM Support. There is no undo.`,
+      { title: `Send to ${picked.first_name} ${picked.last_name}?`, confirmLabel: 'Send it' },
+    )
+    if (!ok) return
+    setSending(true)
+    try {
+      await post('/admin/email/send', { to: picked.email, subject: subject.trim(), paragraphs, templateId })
+      setSentTo(picked.email)
+      setPicked(null); setTemplateId(null); setSubject(''); setBody(''); setQ('')
+    } catch (e: any) {
+      toast(e?.response?.data?.error || 'Could not send that')
+    } finally { setSending(false) }
+  }
+
+  if (!user) return null
+  const relevant = (t: any) =>
+    t.audience === 'any' || !picked || t.audience === picked.kind
+
+  return (
+    <div>
+      <h1 className="pt">Send Email</h1>
+      <p className="ps">
+        A note to one landlord or tenant, from <strong>GAM Support</strong> and signed by you.
+        Replies come back to a person.
+      </p>
+
+      {sentTo && (
+        <div className="card" style={{ marginTop: 16, padding: 14, fontSize: '.82rem',
+          borderColor: 'var(--green, #22c55e)', color: 'var(--t0)' }}>
+          Sent to {sentTo}.
+        </div>
+      )}
+
+      {/* 1 — who */}
+      <div className="card" style={{ marginTop: 16, padding: 16 }}>
+        <div style={{ fontSize: '.72rem', textTransform: 'uppercase', letterSpacing: '.06em',
+          color: 'var(--t3)', marginBottom: 8 }}>1 · Who</div>
+        {picked ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div>
+              <div style={{ fontWeight: 700, color: 'var(--t0)' }}>
+                {picked.first_name} {picked.last_name}
+                <span style={{ fontSize: '.7rem', fontWeight: 600, color: 'var(--gold)', marginLeft: 8,
+                  textTransform: 'uppercase', letterSpacing: '.05em' }}>{picked.kind}</span>
+              </div>
+              <div className="mono" style={{ fontSize: '.76rem', color: 'var(--t3)' }}>{picked.email}</div>
+            </div>
+            <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto' }}
+              onClick={() => { setPicked(null); setQ('') }}>Change</button>
+          </div>
+        ) : (
+          <>
+            <input className="inp" placeholder="Search by name or email…" value={q}
+              onChange={e => setQ(e.target.value)} style={{ width: '100%' }} />
+            {debounced.trim().length >= 2 && results.length === 0 && (
+              <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginTop: 8 }}>Nobody by that name.</div>
+            )}
+            {results.map((r: any) => (
+              <button key={r.user_id} onClick={() => setPicked(r)}
+                style={{ display: 'block', width: '100%', textAlign: 'left', marginTop: 8,
+                  padding: '9px 12px', background: 'var(--bg3, #141a22)', border: '1px solid var(--border, #1e2530)',
+                  borderRadius: 8, cursor: 'pointer', color: 'var(--t0)' }}>
+                <span style={{ fontWeight: 600 }}>{r.first_name} {r.last_name}</span>
+                <span style={{ fontSize: '.7rem', color: 'var(--gold)', marginLeft: 8,
+                  textTransform: 'uppercase' }}>{r.kind}</span>
+                <div className="mono" style={{ fontSize: '.74rem', color: 'var(--t3)' }}>{r.email}</div>
+              </button>
+            ))}
+          </>
+        )}
+      </div>
+
+      {/* 2 — which draft. Only after a person is chosen, so the drafts arrive
+          with their name already in them and the wrong-audience ones are hidden. */}
+      {picked && (
+        <div className="card" style={{ marginTop: 12, padding: 16 }}>
+          <div style={{ fontSize: '.72rem', textTransform: 'uppercase', letterSpacing: '.06em',
+            color: 'var(--t3)', marginBottom: 8 }}>2 · Start from</div>
+          <div style={{ display: 'grid', gap: 8 }}>
+            {(templates as any[]).filter(relevant).map((t: any) => (
+              <button key={t.id} onClick={() => applyTemplate(t)}
+                style={{ textAlign: 'left', padding: '9px 12px', borderRadius: 8, cursor: 'pointer',
+                  background: templateId === t.id ? 'rgba(201,162,39,.10)' : 'var(--bg3, #141a22)',
+                  border: `1px solid ${templateId === t.id ? 'var(--gold)' : 'var(--border, #1e2530)'}`,
+                  color: 'var(--t0)' }}>
+                <div style={{ fontWeight: 600, fontSize: '.84rem' }}>{t.label}</div>
+                <div style={{ fontSize: '.73rem', color: 'var(--t3)' }}>{t.when}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 3 — the actual words */}
+      {picked && templateId && (
+        <div className="card" style={{ marginTop: 12, padding: 16 }}>
+          <div style={{ fontSize: '.72rem', textTransform: 'uppercase', letterSpacing: '.06em',
+            color: 'var(--t3)', marginBottom: 8 }}>3 · The message</div>
+          <input className="inp" placeholder="Subject" value={subject}
+            onChange={e => setSubject(e.target.value)} style={{ width: '100%', marginBottom: 10 }} />
+          <textarea className="inp" rows={14} value={body} onChange={e => setBody(e.target.value)}
+            placeholder="One blank line between paragraphs."
+            style={{ width: '100%', fontFamily: 'inherit', lineHeight: 1.6 }} />
+          <div style={{ fontSize: '.72rem', color: 'var(--t3)', margin: '6px 0 12px' }}>
+            Blank line between paragraphs. Signed with your name automatically — don't sign it yourself.
+          </div>
+          <button className="btn btn-primary" disabled={sending} onClick={send}>
+            {sending ? 'Sending…' : `Send to ${picked.first_name}`}
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function OutreachStatus() {

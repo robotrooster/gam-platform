@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL, isPlatformOwner } from '../middleware/auth'
 import { latencyP95, sampleSize, MIN_SAMPLES } from '../lib/apiMetrics'
+import { SUPPORT_TEMPLATES } from '../services/supportTemplates'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { randomUUID } from 'crypto'
@@ -281,6 +282,101 @@ adminRouter.get('/platform-health', requireSuperAdmin, async (req, res, next) =>
 // lies in both directions). What IS here is trustworthy: whether the recipient
 // server accepted it, whether it bounced, and whether they clicked the booking
 // link — which is first-party and proves intent.
+// ── SEND EMAIL (S637) ────────────────────────────────────────
+// Nic: "let's add a way in the administrative portal for an admin to send
+// email to onboarded landlords, tenants, etcetera, all coming from support at
+// gold asset management dot com."
+//
+// Every other sender in services/email.ts fires off an event, so there was no
+// way to write one person a note — which is why a human had to ask an
+// assistant to do it. These three endpoints are that gap: find a person,
+// start from a draft or from nothing, send it from support@.
+//
+// Deliberately NOT a bulk tool. One recipient per send, and the body that goes
+// out is the body the admin read — templates only prefill the box.
+
+// GET /api/admin/email/templates — the preloaded drafts.
+adminRouter.get('/email/templates', requireAdmin, async (_req, res) => {
+  res.json({ success: true, data: SUPPORT_TEMPLATES.map(t => ({
+    id: t.id, label: t.label, when: t.when, audience: t.audience,
+    subject: t.subject, paragraphs: t.paragraphs,
+  })) })
+})
+
+// GET /api/admin/email/recipients?q= — landlords and tenants by name or email.
+// Capped and search-only: this is a way to reach ONE person you already have
+// in mind, not a way to export an address book.
+adminRouter.get('/email/recipients', requireAdmin, async (req, res, next) => {
+  try {
+    const q = String(req.query.q ?? '').trim()
+    if (q.length < 2) return res.json({ success: true, data: [] })
+    const like = `%${q}%`
+    const rows = await query<any>(`
+      SELECT 'landlord' AS kind, u.id AS user_id, u.email,
+             u.first_name, u.last_name, l.id AS landlord_id,
+             (SELECT COUNT(*) FROM properties p WHERE p.landlord_id = l.id)::int AS property_count
+        FROM landlords l JOIN users u ON u.id = l.user_id
+       WHERE l.is_system IS NOT TRUE
+         AND (u.email ILIKE $1 OR (u.first_name || ' ' || u.last_name) ILIKE $1)
+      UNION ALL
+      SELECT 'tenant' AS kind, u.id AS user_id, u.email,
+             u.first_name, u.last_name, NULL::uuid AS landlord_id,
+             NULL::int AS property_count
+        FROM tenants t JOIN users u ON u.id = t.user_id
+       WHERE (u.email ILIKE $1 OR (u.first_name || ' ' || u.last_name) ILIKE $1)
+       ORDER BY 4, 5
+       LIMIT 25`, [like])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/admin/email/send — one note, from support@, logged like any other.
+adminRouter.post('/email/send', requireAdmin, async (req, res, next) => {
+  try {
+    const b = z.object({
+      to:         z.string().email().max(200),
+      subject:    z.string().trim().min(1).max(200),
+      paragraphs: z.array(z.string().max(5000)).min(1).max(40),
+      templateId: z.string().max(64).optional(),
+    }).parse(req.body)
+    if (!b.paragraphs.some(p => p.trim().length > 0)) {
+      throw new AppError(400, 'The message is empty')
+    }
+
+    // The address must belong to a real person on the platform. Without this
+    // an admin account becomes a way to send mail from goldassetmanagement.com
+    // to anybody at all, which is a domain-reputation problem before it is
+    // anything else.
+    const person = await queryOne<{ user_id: string; landlord_id: string | null }>(`
+      SELECT u.id AS user_id,
+             (SELECT l.id FROM landlords l WHERE l.user_id = u.id LIMIT 1) AS landlord_id
+        FROM users u WHERE LOWER(u.email) = LOWER($1) LIMIT 1`, [b.to])
+    if (!person) throw new AppError(404, 'No GAM account uses that email address')
+
+    const { emailSupportMessage } = await import('../services/email')
+    // Signed by whoever actually pressed send — the recipient replies to a
+    // named person, not to a shared mailbox with no author.
+    const me = await queryOne<{ first_name: string | null; last_name: string | null }>(
+      `SELECT first_name, last_name FROM users WHERE id = $1`, [req.user!.userId])
+    const sender = [me?.first_name, me?.last_name].filter(Boolean).join(' ').trim()
+    const providerId = await emailSupportMessage({
+      to: b.to,
+      subject: b.subject,
+      paragraphs: b.paragraphs,
+      signature: sender || undefined,
+      ctx: { landlordId: person.landlord_id, userId: person.user_id },
+    })
+
+    await query(
+      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, new_value)
+       VALUES ($1, 'admin_email_sent', 'user', $2, $3)`,
+      [req.user!.userId, person.user_id,
+       JSON.stringify({ to: b.to, subject: b.subject, template_id: b.templateId ?? null })])
+
+    res.json({ success: true, data: { sent: !!providerId, providerMessageId: providerId } })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/outreach-status', requireAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(`
