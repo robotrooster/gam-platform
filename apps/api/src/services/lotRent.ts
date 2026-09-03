@@ -39,7 +39,14 @@ export async function recordLotRentPaid(chargeId: string, landlordId: string): P
  * (income) vs lot rent (expense) = net, plus per-property + grand totals and the
  * outstanding lot-rent obligation. Only homes-only properties appear.
  */
-export async function getInvestorPortfolio(landlordId: string) {
+/**
+ * S637: takes ONE entity id or the whole set the account owns — the read side of
+ * "an account is not an entity" (S633). See routes/lotRent.ts for why.
+ */
+export async function getInvestorPortfolio(landlordId: string | string[]) {
+  // One id or many — normalised once, so every query below binds the same shape.
+  const ids = Array.isArray(landlordId) ? landlordId : [landlordId]
+
   const homes = await query<any>(
     `SELECT u.id AS unit_id, u.unit_number, u.rent_amount::float AS rent_amount,
             u.lot_rent_amount::float AS lot_rent_amount,
@@ -48,12 +55,13 @@ export async function getInvestorPortfolio(landlordId: string) {
             p.id AS property_id, p.name AS property_name
        FROM units u
        JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = $1 AND p.operator_owns_land = FALSE
-      ORDER BY p.name, u.unit_number`, [landlordId])
+      WHERE u.landlord_id = ANY($1::uuid[]) AND p.operator_owns_land = FALSE
+      ORDER BY p.name, u.unit_number`, [ids])
 
   const outstanding = await queryOne<{ pending_count: string; pending_amount: string }>(
     `SELECT COUNT(*)::text AS pending_count, COALESCE(SUM(amount),0)::text AS pending_amount
-       FROM lot_rent_charges WHERE landlord_id=$1 AND status='pending'`, [landlordId])
+       FROM lot_rent_charges
+      WHERE landlord_id = ANY($1::uuid[]) AND status = 'pending'`, [ids])
 
   const totals = homes.reduce((acc, h) => ({
     homes: acc.homes + 1,

@@ -41,9 +41,20 @@ disbursementsRouter.get('/', async (req, res, next) => {
              d.stripe_payout_id, d.initiated_at, d.settled_at,
              d.created_at, d.notes,
              u.first_name, u.last_name, u.email,
-             ba.nickname AS bank_nickname, ba.account_number_last4 AS bank_last4
+             ba.nickname AS bank_nickname, ba.account_number_last4 AS bank_last4,
+             -- S637 (Nic): "disbursements page needs to show first to who and
+             -- where." The recipient was already selected and never rendered;
+             -- the paying COMPANY was not selected at all. A payout has no
+             -- property (see \d disbursements — landlord_id + bank_account_id,
+             -- no property_id): it is per ENTITY, aggregating whatever rent came
+             -- in across that company's parks. So the company IS the grain to
+             -- name and to filter on, and inventing a property link here would
+             -- be inventing data.
+             d.landlord_id,
+             ll.business_name AS company_name
         FROM disbursements d
         LEFT JOIN users u ON u.id = d.user_id
+        LEFT JOIN landlords ll ON ll.id = d.landlord_id
         LEFT JOIN user_bank_accounts ba ON ba.id = d.bank_account_id
         ${filter}
        ORDER BY d.created_at DESC

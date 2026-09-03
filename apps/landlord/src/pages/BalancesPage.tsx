@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
+import { PropertySelect } from '../components/ListControls'
 
 // Front-desk "who owes" view. Read-only list of tenants with an unpaid balance
 // + contact info, so a front-counter person knows who to call. Data from
@@ -12,6 +13,7 @@ interface Owed {
   phone: string | null
   email: string | null
   unitNumber: string | null
+  propertyId: string | null
   propertyName: string | null
   balance: string
   openInvoices: number
@@ -119,7 +121,19 @@ export function BalancesPage() {
   // surface, not a report.
   const [openRow, setOpenRow] = useState<string | null>(null)
 
-  const total = (rows as Owed[]).reduce((s, r) => s + Number(r.balance), 0)
+  // S637 (Nic, DIRECTIVE): "The outstanding balance page on the financials tab
+  // does not let you sort by property. All pages that view information for more
+  // than one property need to be sortable by property."
+  //
+  // The payload has carried propertyId all along; nothing ever offered it as a
+  // control. Total follows the filter — a heading that keeps counting rows the
+  // table is no longer showing is worse than no total.
+  const [propertyId, setPropertyId] = useState('')
+  const propertyOptions = (rows as Owed[])
+    .map(r => ({ id: r.propertyId || '', name: r.propertyName || '' }))
+  const shown = (rows as Owed[]).filter(r => propertyId === '' || r.propertyId === propertyId)
+
+  const total = shown.reduce((s, r) => s + Number(r.balance), 0)
 
   return (
     <div>
@@ -128,19 +142,29 @@ export function BalancesPage() {
           <h1 className="page-title">Outstanding Balances</h1>
           <p className="page-subtitle">Who owes, how to reach them — click a row for the charge breakdown</p>
         </div>
-        {rows.length > 0 && (
+        {shown.length > 0 && (
           <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Total owed</div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              Total owed{propertyId ? ' — this property' : ''}
+            </div>
             <div style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--gold)' }}>{fmt(total)}</div>
           </div>
         )}
       </div>
 
+      {rows.length > 0 && (
+        <div className="filter-bar">
+          <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
+        </div>
+      )}
+
       {isLoading ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
-      ) : rows.length === 0 ? (
+      ) : shown.length === 0 ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>
-          🎉 No outstanding balances — everyone's current.
+          {rows.length === 0
+            ? "🎉 No outstanding balances — everyone's current."
+            : 'Nobody owes anything at this property.'}
         </div>
       ) : (
         <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
@@ -155,15 +179,14 @@ export function BalancesPage() {
               </tr>
             </thead>
             <tbody>
-              {(rows as Owed[]).map(r => {
+              {shown.map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
                 const rowKey = r.tenantId + (r.unitNumber || '')
                 const isOpen = openRow === rowKey
                 return (
-                  <>
-                  <tr key={rowKey}
-                      onClick={() => setOpenRow(isOpen ? null : rowKey)}
+                  <Fragment key={rowKey}>
+                  <tr onClick={() => setOpenRow(isOpen ? null : rowKey)}
                       style={{ cursor: 'pointer' }}
                       title="See what makes up this balance">
                     <td style={{ fontWeight: 500 }}>
@@ -195,13 +218,13 @@ export function BalancesPage() {
                     </td>
                   </tr>
                   {isOpen && (
-                    <tr key={rowKey + '-detail'}>
+                    <tr>
                       <td colSpan={5} style={{ padding: 0, background: 'rgba(255,255,255,.015)' }}>
                         <InvoiceBreakdown tenantId={r.tenantId} />
                       </td>
                     </tr>
                   )}
-                  </>
+                  </Fragment>
                 )
               })}
             </tbody>

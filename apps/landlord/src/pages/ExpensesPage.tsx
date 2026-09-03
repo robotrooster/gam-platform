@@ -7,6 +7,7 @@ import { apiGet, apiPost, api } from '../lib/api'
 import { EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, humanize } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 import { Trash2, Paperclip } from 'lucide-react'
+import { PropertySelect } from '../components/ListControls'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'
 const today = () => new Date().toISOString().slice(0, 10)
@@ -42,6 +43,17 @@ export function ExpensesPage() {
   const set = (patch: Partial<typeof form>) => setForm(f => ({ ...f, ...patch }))
 
   const propUnits = (units as any[]).filter(u => u.propertyId === form.propertyId)
+
+  // S637 (Nic, DIRECTIVE): "expenses, selected property." Options come from the
+  // PROPERTIES list, not from the expense rows, so a park with nothing logged
+  // against it yet is still selectable — that is the case where "did I record
+  // anything here?" is the actual question. A unit-scoped expense derives its
+  // property_id from the unit (services/landlordExpenses.ts:37), so unit rows
+  // filter correctly and do not vanish under a property selection.
+  const [filterPropertyId, setFilterPropertyId] = useState('')
+  const shownExpenses = (expenses as any[])
+    .filter(e => filterPropertyId === '' || e.propertyId === filterPropertyId)
+  const shownTotal = shownExpenses.reduce((sum: number, e: any) => sum + Number(e.amount || 0), 0)
 
   const create = useMutation(
     async () => {
@@ -173,13 +185,24 @@ export function ExpensesPage() {
       </div>
 
       <div className="card" style={{ padding: 0 }}>
-        <div className="card-title" style={{ padding: '14px 16px 0' }}>Logged expenses</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px 0', flexWrap: 'wrap' }}>
+          <div className="card-title" style={{ padding: 0 }}>Logged expenses</div>
+          <PropertySelect value={filterPropertyId} onChange={setFilterPropertyId}
+            properties={(properties as any[]).map(p => ({ id: p.id, name: p.name }))} />
+          {shownExpenses.length > 0 && (
+            <span className="mono" style={{ marginLeft: 'auto', fontSize: '.85rem', fontWeight: 700 }}>
+              {fmt(shownTotal)}
+            </span>
+          )}
+        </div>
         {isLoading ? <div style={{ padding: 24, color: 'var(--text-3)' }}>Loading…</div> :
-         (expenses as any[]).length === 0 ? <div style={{ padding: 24, color: 'var(--text-3)', fontSize: '.85rem' }}>No expenses logged yet.</div> : (
+         shownExpenses.length === 0 ? <div style={{ padding: 24, color: 'var(--text-3)', fontSize: '.85rem' }}>
+           {(expenses as any[]).length === 0 ? 'No expenses logged yet.' : 'No expenses logged at this property.'}
+         </div> : (
           <table className="data-table">
             <thead><tr><th>Date</th><th>Category</th><th>Scope</th><th>Amount</th><th>Description</th><th>Receipt</th><th></th></tr></thead>
             <tbody>
-              {(expenses as any[]).map(e => (
+              {shownExpenses.map((e: any) => (
                 <tr key={e.id}>
                   <td style={{ fontSize: '.8rem' }}>{new Date(String(e.expenseDate).slice(0, 10) + 'T12:00:00').toLocaleDateString()}</td>
                   <td>{EXPENSE_CATEGORY_LABEL[e.category as keyof typeof EXPENSE_CATEGORY_LABEL] || humanize(e.category)}</td>

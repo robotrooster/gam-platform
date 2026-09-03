@@ -5,6 +5,7 @@ import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Landmark } from 'lucide-react'
+import { PropertySelect } from '../components/ListControls'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
@@ -56,6 +57,20 @@ function AbsorbedManualFeesSection() {
 
 export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
+
+  // S637 (Nic, DIRECTIVE): "disbursements page needs to show first to who and
+  // where", and every multi-property view needs a filter.
+  //
+  // A payout carries no property — `disbursements` has landlord_id and
+  // bank_account_id and nothing else (checked against the live schema). One
+  // Friday payout aggregates whatever rent came in across that COMPANY's parks,
+  // so the company is the grain that exists, and it is also the cut that matters
+  // for an account holding more than one LLC. PropertySelect is reused as-is: it
+  // is an id/name dropdown, and the label says what these actually are.
+  const [companyId, setCompanyId] = useState('')
+  const companyOptions = (disbs as any[])
+    .map(d => ({ id: d.landlordId || '', name: d.companyName || 'Unnamed company' }))
+  const shown = (disbs as any[]).filter(d => companyId === '' || d.landlordId === companyId)
   const [selected, setSelected] = useState<any | null>(null)
   const { can } = usePerms()
 
@@ -90,6 +105,13 @@ export function DisbursementsPage() {
         </div>
       </div>
 
+      {(disbs as any[]).length > 0 && (
+        <div className="filter-bar">
+          <PropertySelect value={companyId} onChange={setCompanyId}
+            properties={companyOptions} allLabel="All companies" />
+        </div>
+      )}
+
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading...</div>
@@ -97,12 +119,19 @@ export function DisbursementsPage() {
           <>
             <table className="data-table" style={{ minWidth: 820 }}>
               <thead><tr>
-                <th>Date</th><th>Type</th><th>Amount</th><th>Fee</th><th>Bank</th><th>Status</th><th>Settled</th>
+                <th>Date</th><th>To</th><th>Company</th><th>Type</th><th>Amount</th><th>Fee</th><th>Bank</th><th>Status</th><th>Settled</th>
               </tr></thead>
               <tbody>
-                {(disbs as any[]).length ? (disbs as any[]).map((d: any) => (
+                {shown.length ? shown.map((d: any) => (
                   <tr key={d.id} onClick={() => setSelected(d)} style={{ cursor: 'pointer' }}>
                     <td className="mono">{new Date(d.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</td>
+                    {/* S637: WHO the money went to — selected by the API all
+                        along and never rendered. */}
+                    <td style={{ fontSize: '.8rem' }}>
+                      {[d.firstName, d.lastName].filter(Boolean).join(' ') || '—'}
+                      {d.email && <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{d.email}</div>}
+                    </td>
+                    <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>{d.companyName || '—'}</td>
                     <td style={{ fontSize: '.78rem' }}>
                       {d.triggerType === 'auto_friday' ? 'Auto-Friday' : d.triggerType === 'manual_on_demand' ? 'Manual' : (d.triggerType || '—')}
                     </td>
@@ -123,8 +152,10 @@ export function DisbursementsPage() {
                     </td>
                   </tr>
                 )) : (
-                  <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 40 }}>
-                    No disbursements yet. Auto-Friday payouts begin once a property is routed to a bank account and rent has been collected.
+                  <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 40 }}>
+                    {(disbs as any[]).length
+                      ? 'No disbursements for this company.'
+                      : 'No disbursements yet. Auto-Friday payouts begin once a property is routed to a bank account and rent has been collected.'}
                   </td></tr>
                 )}
               </tbody>

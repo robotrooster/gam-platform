@@ -44,6 +44,52 @@ async function seed() {
 }
 
 describe('lot rent', () => {
+  // S637 (Nic, whose account owns two LLCs): GET /lot-rent/portfolio answered
+  // "You own more than one company. Choose which one this record belongs to."
+  // — on a READ, so the Lot Rent tab could not be opened at all. Same defect as
+  // the Expenses tab: the WRITE resolver was scoping a list.
+  //
+  // Reads span every entity the account owns; writes still name their target.
+  it('S637: an account owning TWO entities can open the portfolio, spanning both', async () => {
+    const c = await db.connect()
+    let userId = '', llB = ''
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c); userId = a.userId
+      const propA = await seedProperty(c, { landlordId: a.landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET operator_owns_land = FALSE WHERE id = $1`, [propA])
+      await seedUnit(c, { propertyId: propA, landlordId: a.landlordId })
+
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [userId])
+      llB = b.rows[0].id
+      const propB = await seedProperty(c, { landlordId: llB, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET operator_owns_land = FALSE WHERE id = $1`, [propB])
+      await seedUnit(c, { propertyId: propB, landlordId: llB })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    // profileId null — what auth.ts mints for a landlord since S633.
+    const token = jwt.sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    const res = await request(buildApp()).get('/api/lot-rent/portfolio')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)                       // was 400 before S637
+    expect(res.body.data.homes.length).toBe(2)         // one from each company
+
+    // ?entityId= still narrows, through the same authorisation.
+    const justB = await request(buildApp()).get(`/api/lot-rent/portfolio?entityId=${llB}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(justB.status).toBe(200)
+    expect(justB.body.data.homes.length).toBe(1)
+
+    // Charges list spans the account too, rather than 400ing.
+    const charges = await request(buildApp()).get('/api/lot-rent/charges')
+      .set('Authorization', `Bearer ${token}`)
+    expect(charges.status).toBe(200)
+  })
+
   it('accrues one charge per homes-only home with lot rent (idempotent); skips owned parks', async () => {
     const f = await seed()
     const n = await accrueLotRentCharges('2026-08-01')

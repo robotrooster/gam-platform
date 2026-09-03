@@ -4,7 +4,7 @@ import { Router } from 'express'
 import { query } from '../db'
 import { requireAuth, requireLandlord, requireAdmin } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordTarget } from '../lib/landlordScope'
+import { resolveLandlordTarget, landlordScopeIds } from '../lib/landlordScope'
 import { getInvestorPortfolio, recordLotRentPaid, accrueLotRentCharges } from '../services/lotRent'
 
 export const lotRentRouter = Router()
@@ -18,17 +18,34 @@ function landlordScope(req: any): string {
   return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
 }
 
+/**
+ * S637 (Nic, on a two-company account): GET /lot-rent/portfolio answered
+ * "You own more than one company. Choose which one this record belongs to."
+ * — on a READ. The Lot Rent tab could not be opened at all, the same way the
+ * Expenses tab could not; the WRITE resolver was scoping a list.
+ *
+ * S633's rule has two halves and this route only had one: READS span every
+ * entity the account owns, WRITES take an explicit authorised target. A read
+ * narrows only when ?entityId= names one, and that path still goes through the
+ * same resolver, so an entity the account does not own is still a 403.
+ */
+function readScope(req: any): string[] {
+  const explicit = req.query?.entityId
+  if (explicit) return [resolveLandlordTarget(req.user, explicit, 'record')]
+  return landlordScopeIds(req.user)
+}
+
 // GET /api/lot-rent/portfolio — investor net across their homes-only properties.
 lotRentRouter.get('/portfolio', requireLandlord, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await getInvestorPortfolio(landlordScope(req)) })
+    res.json({ success: true, data: await getInvestorPortfolio(readScope(req)) })
   } catch (e) { next(e) }
 })
 
 // GET /api/lot-rent/charges — the operator's lot-rent obligations (newest first).
 lotRentRouter.get('/charges', requireLandlord, async (req: any, res, next) => {
   try {
-    const landlordId = landlordScope(req)
+    const landlordIds = readScope(req)
     const status = (req.query.status as string) || undefined
     const rows = await query<any>(
       `SELECT lrc.id, lrc.unit_id, lrc.billing_month, lrc.amount::float AS amount, lrc.status, lrc.paid_at,
@@ -36,9 +53,9 @@ lotRentRouter.get('/charges', requireLandlord, async (req: any, res, next) => {
          FROM lot_rent_charges lrc
          JOIN units u ON u.id = lrc.unit_id
          JOIN properties p ON p.id = lrc.property_id
-        WHERE lrc.landlord_id = $1 ${status ? 'AND lrc.status = $2' : ''}
+        WHERE lrc.landlord_id = ANY($1::uuid[]) ${status ? 'AND lrc.status = $2' : ''}
         ORDER BY lrc.billing_month DESC, p.name, u.unit_number`,
-      status ? [landlordId, status] : [landlordId])
+      status ? [landlordIds, status] : [landlordIds])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })

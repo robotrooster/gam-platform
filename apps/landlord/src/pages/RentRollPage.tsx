@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
+import { PropertySelect } from '../components/ListControls'
 import { ScrollText } from 'lucide-react'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -19,8 +21,20 @@ const STATUS_COLORS: Record<string, string> = {
 export function RentRollPage() {
   const navigate = useNavigate()
   const { data, isLoading } = useQuery<any>('rent-roll', () => apiGet('/landlords/me/rent-roll'))
-  const rows: any[] = data?.rows || []
-  const total: number = data?.total || 0
+  const allRows: any[] = data?.rows || []
+
+  // S637 (Nic, DIRECTIVE): "All pages that view information for more than one
+  // property need to be sortable by property." The page already GROUPS by
+  // property; with two parks that is two long tables to scroll past to read one.
+  //
+  // The KPI is recomputed from the filtered rows rather than read from
+  // data.total, so "Expected Monthly Rent" always describes the units actually
+  // listed underneath it. A headline total that disagrees with its own table is
+  // the bug this page was built to avoid.
+  const [propertyId, setPropertyId] = useState('')
+  const propertyOptions = allRows.map(r => ({ id: r.propertyId, name: r.propertyName }))
+  const rows = allRows.filter(r => propertyId === '' || r.propertyId === propertyId)
+  const total = rows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
 
   const byProperty = rows.reduce((acc: Record<string, any[]>, r) => {
     (acc[r.propertyName] = acc[r.propertyName] || []).push(r)
@@ -43,6 +57,12 @@ export function RentRollPage() {
           <div className="kpi-sub">contracted across {rows.length} occupied unit{rows.length === 1 ? '' : 's'}</div>
         </div>
       </div>
+
+      {allRows.length > 0 && (
+        <div className="filter-bar">
+          <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
+        </div>
+      )}
 
       {isLoading ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
