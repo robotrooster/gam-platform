@@ -284,33 +284,24 @@ backgroundRouter.get('/price', async (req, res) => {
 // for screening (GAM bills the landlord), so this always reports fee waived.
 backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
   try {
-    // S577 (Nic): the APPLICANT pays for the screen on BOTH routes, up front,
-    // before the check runs. LANDLORD route — the landlord is the property lock /
-    // merchant-of-record: the applicant's charge routes `on_behalf_of` the
-    // landlord's Connect (their applicant, FCRA permissible purpose, state-cap
-    // liability is theirs), funds settle to GAM (GAM pays Checkr + keeps its $5),
-    // landlord nets $0. POOL route (no landlordId) — applicant pays GAM directly
-    // for their own portable screen. Same flat national price either way.
+    // ── S636 (Nic, DIRECTIVE): THE LANDLORD IS NOT IN THIS TRANSACTION ──
+    //
+    // "Landlords are not part of the screening process at all. Doesn't matter
+    // what their bank account is set up for. The tenant is paying for the
+    // application. GAM and Checkr get the application fee. The landlord...
+    // why is that gated at all?"
+    //
+    // S577 routed the applicant's card `on_behalf_of` the landlord's Connect
+    // to make them merchant of record, and therefore refused to start a
+    // screening until that landlord had finished Connect onboarding. It never
+    // moved any money: there is no transfer_data, funds settle to GAM, the
+    // landlord nets $0. So the gate blocked a paying applicant over a payout
+    // account that the payment does not touch — and the pool route has always
+    // charged with no landlord at all, which is the proof it was never needed.
+    //
+    // Screening revenue is 100% platform. One path now, landlord or not.
     const landlordId = req.body?.landlordId || null
     const fee = await screeningIntakeFee(req.body?.state || null)
-
-    // LANDLORD route: resolve the landlord's Connect account for on_behalf_of.
-    // Screening can't start until the landlord has finished Connect (charges) —
-    // same account they use for rent.
-    let onBehalfOf: string | null = null
-    if (landlordId) {
-      const acct = await queryOne<{ acct: string | null; charges_ok: boolean }>(
-        `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS acct,
-                CASE WHEN l.stripe_connect_account_id IS NOT NULL
-                     THEN COALESCE(l.connect_charges_enabled, FALSE)
-                     ELSE COALESCE(u.connect_charges_enabled, FALSE) END AS charges_ok
-           FROM landlords l JOIN users u ON u.id = l.user_id
-          WHERE l.id = $1`, [landlordId])
-      if (!acct?.acct || !acct.charges_ok) {
-        throw new AppError(409, 'This property owner hasn’t finished payment setup yet, so screening can’t be started for it. Please try again once their account is ready.')
-      }
-      onBehalfOf = acct.acct
-    }
 
     if (!STRIPE_LIVE) {
       const mockId = 'pi_intake_mock_' + crypto.randomBytes(8).toString('hex')
@@ -324,10 +315,9 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
       currency: 'usd',
       payment_method_types: ['card'],
       description: landlordId ? 'GAM tenant background screening' : 'GAM renter-pool background screening',
+      // The landlord id still rides in metadata so the check can be attributed,
+      // but it steers nothing about the charge.
       metadata: { kind: 'background_check_intake', userId: req.user!.userId, feeUsd: String(fee.total), ...(landlordId ? { landlordId } : {}) },
-      // on_behalf_of makes the landlord the merchant of record; no transfer_data,
-      // so funds still settle to GAM (landlord nets $0).
-      ...(onBehalfOf ? { on_behalf_of: onBehalfOf } : {}),
     })
     res.json({
       success: true,
