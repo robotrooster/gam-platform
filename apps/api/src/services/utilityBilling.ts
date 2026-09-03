@@ -1365,14 +1365,44 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
 
-// Helper: generate bills for every meter on a property for a given cycle.
-// Used by the landlord-triggered POST /utility/generate-bills route.
+// Helper: generate bills for every METERED meter on a property for a given
+// cycle. Used by the landlord-triggered POST /utility/generate-bills route.
+//
+// ── S637: A FLAT RATE IS BILLED AHEAD, AND ONLY ONCE ──────────────────────
+//
+// Nic (DIRECTIVE, verbatim): "Trash is billed ahead because it's a flat rate.
+// It doesn't matter how much shit they put in the can. It's there available for
+// them to use. It's not a metered thing... It's like paying rent for the unit.
+// They're paying for the month that they're about to be there. On trash,
+// they're paying for the can they are about to use."
+//
+// That is the whole model, and the flat path in ensureBillsForUnit already
+// implements it: cycle = the INVOICE's own month, billed with the invoice, in
+// advance. Correct, and untouched.
+//
+// This sweep is the OTHER cadence, and it had no business touching a flat rate.
+// It bills whatever cycle the caller names — which for the reading-run path is
+// a month in the PAST, because a metered cycle cannot be billed until somebody
+// reads the meter. It selected EVERY meter on the property with no
+// billing_method filter, so completing August's water/electric reads on Sep 1
+// also minted an August TRASH cycle. The invoice run produced September's the
+// next day, and one tenant's first invoice carried two cans.
+//
+// Measured: 16 held August trash cycles and 17 September ones, generated
+// 2026-09-01 and 2026-09-02 — one day apart, one month apart on paper. Three
+// tenants (Covey, Fuller, Rhoades) were billed $50 of trash on a single
+// invoice; the rest were queued to be as they signed.
+//
+// A flat rate has no reading, so it has no arrears cycle to catch up on. There
+// is exactly one place it may be billed, and this is not it.
 export async function generateBillsForProperty(
   propertyId: string,
   cycleMonth: Date,
 ): Promise<GenerateBillsResult[]> {
   const meters = await query<{ id: string }>(
-    `SELECT id FROM utility_meters WHERE property_id = $1`, [propertyId])
+    `SELECT id FROM utility_meters
+      WHERE property_id = $1
+        AND billing_method <> 'flat_rate'`, [propertyId])
   const results: GenerateBillsResult[] = []
   for (const m of meters) {
     results.push(await generateBillsForMeter(m.id, cycleMonth))
@@ -1453,8 +1483,13 @@ export async function ensureBillsForUnit(
   return created
 }
 
-// Helper: every meter for every property under a landlord. Used by an
+// Helper: every METERED meter for every property under a landlord. Used by an
 // eventual monthly cron once payment integration lands.
+//
+// S637: same flat-rate exclusion as generateBillsForProperty above, and for the
+// same reason — a flat rate bills ahead with the invoice, never on a
+// catch-up cycle. Left unfiltered this would have reintroduced the duplicate
+// the moment the cron landed.
 export async function generateBillsForLandlord(
   landlordId: string,
   cycleMonth: Date,
@@ -1463,6 +1498,7 @@ export async function generateBillsForLandlord(
     SELECT m.id FROM utility_meters m
       JOIN properties p ON p.id = m.property_id
      WHERE p.landlord_id = $1
+       AND m.billing_method <> 'flat_rate'
   `, [landlordId])
   const results: GenerateBillsResult[] = []
   for (const m of meters) {

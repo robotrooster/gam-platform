@@ -2334,3 +2334,61 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(held.rows).toHaveLength(0)
   })
 })
+
+// ── S637: a flat rate bills AHEAD, and only once ──────────────────────────
+//
+// Nic (DIRECTIVE): "Trash is billed ahead because it's a flat rate... They're
+// paying for the can they are about to use."
+//
+// The bug: generateBillsForProperty selected EVERY meter with no
+// billing_method filter, so completing a PAST month's meter reads also minted
+// a past-month TRASH cycle. The invoice path then billed the current month's
+// trash as designed, and one tenant's first invoice carried two cans.
+describe('S637 — flat-rate meters bill ahead only, never on a catch-up sweep', () => {
+  it('generateBillsForProperty skips flat_rate meters', async () => {
+    const c = await db.connect()
+    let propertyId = '', unitId = '', flatMeter = '', landlordId = ''
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c); landlordId = ll.landlordId
+      propertyId = await seedProperty(c, { landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      unitId = await seedUnit(c, { propertyId, landlordId })
+      const m = await c.query<{ id: string }>(
+        `INSERT INTO utility_meters (property_id, label, utility_type, billing_method, base_fee)
+         VALUES ($1,'Trash can','trash','flat_rate',25) RETURNING id`, [propertyId])
+      flatMeter = m.rows[0].id
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+        [flatMeter, unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    // Sweeping a PAST cycle — the reading-run path — must not touch the can.
+    const results = await generateBillsForProperty(propertyId, new Date('2026-08-01T00:00:00Z'))
+    expect(results.every(r => r.meterId !== flatMeter)).toBe(true)
+
+    const bills = await db.query(
+      `SELECT 1 FROM utility_bills WHERE meter_id = $1`, [flatMeter])
+    expect(bills.rows).toHaveLength(0)
+  })
+
+  it('generateBillsForLandlord skips flat_rate meters too', async () => {
+    const c = await db.connect()
+    let landlordId = '', flatMeter = ''
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c); landlordId = ll.landlordId
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const m = await c.query<{ id: string }>(
+        `INSERT INTO utility_meters (property_id, label, utility_type, billing_method, base_fee)
+         VALUES ($1,'Trash can','trash','flat_rate',25) RETURNING id`, [propertyId])
+      flatMeter = m.rows[0].id
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+        [flatMeter, unitId])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const results = await generateBillsForLandlord(landlordId, new Date('2026-08-01T00:00:00Z'))
+    expect(results.every(r => r.meterId !== flatMeter)).toBe(true)
+  })
+})
