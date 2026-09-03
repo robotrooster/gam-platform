@@ -1360,6 +1360,56 @@ describe('S622: one tenant, two units, separate ledgers', () => {
 // record-manual settled `WHERE id = $1`, so a landlord holding a resident's cash
 // picked which of their charges it cleared — and could leave the oldest one
 // standing while marking a newer one paid.
+// ── S637: the settle is ANCHORED ON RENT ─────────────────────────────
+//
+// Nic: "submit button to record payment doesnt click and do anything."
+//
+// record-manual settles a household's whole balance but is anchored on one
+// charge, and refuses anything that is not rent. The landlord UI was posting
+// the FIRST charge in the outstanding group — and /payments orders by due_date
+// with no tiebreaker, so with rent and utilities all due the same day, which
+// one came first was arbitrary. Sometimes it was a utility, and the button
+// 409'd. The UI now finds the rent charge; this pins the contract it relies on.
+describe('S637 record-manual only anchors on rent', () => {
+  it('409s on a utility charge, however it was reached', async () => {
+    const f = await seed()
+    const { rows: [{ id }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
+                             status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'utility',84,'pending','UTILITY',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    const res = await request(buildApp())
+      .post(`/api/payments/${id}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/rent/i)
+  })
+
+  it('accepts the rent charge and clears the utilities with it', async () => {
+    const f = await seed()
+    const { rows: [{ id: rentId }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
+                             status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',440,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
+                             status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'utility',84,'pending','UTILITY',CURRENT_DATE)`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    const res = await request(buildApp())
+      .post(`/api/payments/${rentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT type, status FROM payments WHERE lease_id=$1 AND type IN ('rent','utility')`,
+      [f.lease1Id])
+    expect(rows.every((r: any) => r.status === 'settled')).toBe(true)
+  })
+})
+
 describe('S636 a manual payment settles the whole balance', () => {
   /** One lease carrying rent + two utility charges, the shape Nic was looking at. */
   async function seedBalance(f: any, opts: { suspendUtilities?: boolean } = {}) {

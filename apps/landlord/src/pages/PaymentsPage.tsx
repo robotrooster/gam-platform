@@ -102,14 +102,25 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   const change = cash && paid > due ? paid - due : 0
   const short = cash && tendered.trim() !== '' && paid < due
 
+  // ── S637: THE ANCHOR HAS TO BE THE RENT CHARGE ──────────────────────
+  //
+  // Nic: "submit button to record payment doesnt click and do anything."
+  //
+  // record-manual settles the household's WHOLE balance, but it is anchored on
+  // one charge and the route refuses anything that is not rent
+  // (routes/payments.ts: "Only rent charges can be recorded as a manual
+  // payment", 409). This posted charges[0], and charges are pushed in whatever
+  // order the payments list arrives — for Russ Fuller that first row is a
+  // utility, so the button hit a 409 every time.
+  const anchor = group.charges.find((c: any) => c.type === 'rent') ?? null
   // A check or money order is identified by its number — that number IS the
   // receipt if the payment is ever questioned, so it is required, not optional.
   const needsNumber = method === 'check' || method === 'money_order'
   const numberLabel = method === 'check' ? 'Check number' : 'Money order number'
-  const ready = !short && (!needsNumber || reference.trim().length > 0)
+  const ready = !!anchor && !short && (!needsNumber || reference.trim().length > 0)
 
   const mut = useMutation(
-    () => apiPost(`/payments/${group.charges[0].id}/record-manual`,
+    () => apiPost(`/payments/${anchor.id}/record-manual`,
       { method, reference: reference.trim() || undefined }),
     {
       onSuccess: () => onRecorded(
@@ -182,6 +193,13 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           </div>
         )}
 
+        {!anchor && (
+          <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>
+            This household has no outstanding rent charge, and an off-platform
+            payment is recorded against rent. Charge the rent first, or take
+            this one through the tenant&rsquo;s portal.
+          </div>
+        )}
         {err && <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>{err}</div>}
 
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
