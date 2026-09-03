@@ -198,10 +198,28 @@ export function TypedDateInput({
               prev.current?.focus()
             }
           }}
-          onBlur={() => {
-            // "7" is a perfectly reasonable thing to type for July.
-            if (which !== 'yyyy' && val.length === 1) set(val.padStart(2, '0'))
-          }}
+          // ── S637: LEAVING A BOX NEVER GUESSES THE DATE ────────────────
+          //
+          // The Fierro household, still stuck after the S636 pass. Nic: "the
+          // birth date is still messing up hardcore."
+          //
+          // This used to pad a lone digit on blur — "7" → "07" for July. The
+          // S636 settle rule made that dead code for every digit it can help
+          // with: day 4-9 and month 2-9 already pad and advance on the
+          // KEYSTROKE, so they never reach a blur holding one digit.
+          //
+          // What still reached it was exactly the ambiguous digits — month "1"
+          // (10/11/12) and day "1", "2", "3" (1x, 2x, 30/31). For those, padding
+          // is not a convenience, it is a GUESS, and it always guessed the
+          // shorter date. Type 3 for the day of March 31st, reach for the year,
+          // and the 31st became the 3rd on the way past — silently, on a lease
+          // she was about to sign.
+          //
+          // So: no padding here at all. A half-typed day stays half-typed, the
+          // date stays incomplete, the component emits '' as it always has for
+          // an incomplete date, and the read-back underneath says so out loud.
+          // Incomplete and visible beats complete and wrong, on a birthdate
+          // that goes onto a signed document.
         />
       </div>
     )
@@ -225,7 +243,12 @@ export function TypedDateInput({
       <div style={{ fontSize: '.7rem', color: iso ? '#7c8899' : '#4a5568', marginTop: 5 }}>
         {iso && age != null
           ? `${Number(iso[3])} ${MONTH_NAMES[Number(iso[2]) - 1]} ${iso[1]} · age ${age}`
-          : 'Type it — month, day, year.'}
+          /* S637: name the box that is short. A lone "3" in the day is no longer
+             quietly padded, so the signer has to be told it is unfinished —
+             otherwise the date simply never takes and nothing says why. */
+          : (mm.length === 1 || dd.length === 1)
+            ? `Finish the ${mm.length === 1 ? 'month' : 'day'} — two digits (03 for the 3rd, 31 for the 31st).`
+            : 'Type it — month, day, year.'}
       </div>
     </div>
   )

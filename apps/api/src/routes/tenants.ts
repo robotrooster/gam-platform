@@ -68,60 +68,112 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     if (password.length < 12) return res.status(400).json({ success: false, error: 'Password must be at least 12 characters' })
     if (acceptedTerms !== true) return res.status(400).json({ success: false, error: 'You must accept the Terms of Service and Privacy Policy to activate your account' })
 
-    // S410 (S377): read the purpose-scoped column with 7-day expiry
-    // gate. Pre-S410 this query joined to email_verify_token (overloaded
-    // across email verification + invites). Expiry-NULL rows (pre-S410
-    // legacy) are accepted to keep dev seed data usable; new tokens
-    // always carry expires_at.
-    const user = await queryOne<any>(
-      `SELECT * FROM users
-        WHERE tenant_invite_token = $1
-          AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())`,
-      [token])
-    if (!user) return res.status(404).json({ success: false, error: 'Invalid or expired invite link' })
-
-    const bcrypt = require('bcryptjs')
-    const hash = await bcrypt.hash(password, 10)
-
-    // S29X: stamp terms acceptance on activation. Landlord-created users
-    // are inserted with NULL acceptance timestamps; the tenant accepts
-    // here when they take over their account for the first time.
-    // S410: clear tenant_invite_token AND expiry on accept (single-use).
-    await query(`UPDATE users SET password_hash=$1,
-                                  tenant_invite_token=NULL,
-                                  tenant_invite_expires_at=NULL,
-                                  email_verified=TRUE,
-                                  phone=COALESCE($2,phone),
-                                  accepted_tos_at=NOW(), accepted_privacy_at=NOW()
-                 WHERE id=$3`,
-      [hash, phone || null, user.id])
-
-    if (ssiSsdi !== undefined) {
-      await query('UPDATE tenants SET ssi_ssdi=$1 WHERE user_id=$2', [!!ssiSsdi, user.id])
-    }
-
-    // S616 (Nic): a UTILITY-SERVICE payer agreeing to be billed.
+    // ── S637: ACTIVATION IS ONE TRANSACTION, AND THE TOKEN GOES LAST ────────
     //
-    // A serviced space's payer has no lease, no application and no prior
-    // relationship with GAM — accepting this invite is the only moment they
-    // ever consent to anything. Until it happens (or the landlord attests they
-    // agreed off-platform) their charges accrue but no invoice is issued, so
-    // this stamp is what actually releases the billing.
-    await query(
-      `UPDATE utility_service_agreements sa
-          SET payer_accepted_at = NOW(), updated_at = NOW()
-         FROM tenants t
-        WHERE t.user_id = $1
-          AND sa.tenant_id = t.id
-          AND sa.status = 'active'
-          AND sa.payer_accepted_at IS NULL`,
-      [user.id])
+    // Laurel Rhoades, MH 02 Mountain View, 2026-09-02 19:18. She set a password
+    // and a phone number, the page told her it failed, and her retry said
+    // "invalid or expired invite link". Both were true at once: her password,
+    // phone and terms acceptance were SAVED, and her invite token was already
+    // gone — cleared by the same statement, two lines in — while her invite was
+    // never marked accepted and her lease was never drafted. She was stranded
+    // between having an account and not having one, with the only way back in
+    // already spent.
+    //
+    // The route ran with no transaction at all, and three statements after that
+    // UPDATE were unguarded while every other side effect in it sat in a
+    // try/catch. One of them threw. Which one hardly matters: the shape was
+    // that a single-use credential was consumed BEFORE the work it authorised
+    // was done, so any failure anywhere after it cost the tenant their only
+    // route in.
+    //
+    // Now: everything that defines the account lands together or not at all,
+    // and the token is cleared in the SAME transaction as the work it pays for.
+    // A rollback leaves the token intact, so the tenant simply tries again and
+    // the link still works. Everything after the commit — lease drafting, the
+    // landlord notification, the 2FA code — is best-effort by design and can
+    // never un-activate an account that already exists.
+    //
+    // SELECT ... FOR UPDATE, because two taps on a slow phone are two requests:
+    // the second blocks until the first commits, then finds no token and is
+    // refused, rather than both racing through and double-drafting a lease.
+    const client = await getClient()
+    let user: any
+    let tenant: any
+    try {
+      await client.query('BEGIN')
 
-    // S568: role-aware — activate the account under the user's ACTUAL role.
-    // Real tenants keep role='tenant' (unchanged); an e-sign 'contact' (customer
-    // pool, no tenant profile) activates as 'contact' with a null profileId so
-    // they're never mis-issued a tenant identity.
-    const tenant = await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [user.id])
+      user = (await client.query(
+        `SELECT * FROM users
+          WHERE tenant_invite_token = $1
+            AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
+          FOR UPDATE`,
+        [token])).rows[0]
+      if (!user) {
+        await client.query('ROLLBACK')
+        return res.status(404).json({ success: false, error: 'Invalid or expired invite link' })
+      }
+
+      const bcrypt = require('bcryptjs')
+      const hash = await bcrypt.hash(password, 10)
+
+      // S29X: stamp terms acceptance on activation. Landlord-created users are
+      // inserted with NULL acceptance timestamps; the tenant accepts here when
+      // they take over their account for the first time.
+      //
+      // S578: email-2FA is switched on as part of the SAME write. It used to be
+      // a separate UPDATE near the end of the route, which is how Laurel ended
+      // up with a password but email_2fa_enabled still false — a half-built
+      // account whose state depended on how far the request happened to get.
+      //
+      // S637: the token is cleared HERE, in the transaction, so it is spent only
+      // if the activation it authorises actually commits.
+      await client.query(
+        `UPDATE users SET password_hash=$1,
+                          tenant_invite_token=NULL,
+                          tenant_invite_expires_at=NULL,
+                          email_verified=TRUE,
+                          email_2fa_enabled=TRUE,
+                          phone=COALESCE($2,phone),
+                          accepted_tos_at=NOW(), accepted_privacy_at=NOW()
+           WHERE id=$3`,
+        [hash, phone || null, user.id])
+
+      if (ssiSsdi !== undefined) {
+        await client.query('UPDATE tenants SET ssi_ssdi=$1 WHERE user_id=$2', [!!ssiSsdi, user.id])
+      }
+
+      // S616 (Nic): a UTILITY-SERVICE payer agreeing to be billed.
+      //
+      // A serviced space's payer has no lease, no application and no prior
+      // relationship with GAM — accepting this invite is the only moment they
+      // ever consent to anything. Until it happens (or the landlord attests they
+      // agreed off-platform) their charges accrue but no invoice is issued, so
+      // this stamp is what actually releases the billing.
+      await client.query(
+        `UPDATE utility_service_agreements sa
+            SET payer_accepted_at = NOW(), updated_at = NOW()
+           FROM tenants t
+          WHERE t.user_id = $1
+            AND sa.tenant_id = t.id
+            AND sa.status = 'active'
+            AND sa.payer_accepted_at IS NULL`,
+        [user.id])
+
+      // S568: role-aware — activate the account under the user's ACTUAL role.
+      // Real tenants keep role='tenant' (unchanged); an e-sign 'contact'
+      // (customer pool, no tenant profile) activates as 'contact' with a null
+      // profileId so they're never mis-issued a tenant identity.
+      tenant = (await client.query('SELECT id FROM tenants WHERE user_id=$1', [user.id])).rows[0] ?? null
+
+      await client.query('COMMIT')
+    } catch (e) {
+      // The token is still on the user, so the link the tenant already has in
+      // their inbox keeps working. That is the whole point.
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+      throw e
+    }
+    client.release()
 
     // S558 (Flow B): stamp this person's unit-bound intent as accepted, then
     // auto-draft the lease(s) if the unit's roster is now ready. Best-effort in
@@ -222,17 +274,34 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
     // /api/auth/email-otp/verify for the real token; that verify step also marks
     // the email verified. The lease auto-draft + landlord notify above still run
     // at accept time (activation), independent of the 2FA gate.
-    await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+    // S637: the 2FA flag is now set inside the activation transaction above —
+    // it is part of what the account IS, not a step that may or may not be
+    // reached. What remains here is the code SEND, which talks to an email
+    // provider and is therefore the single most likely thing in this route to
+    // fail on a bad day.
+    //
+    // It is guarded, and its failure does NOT fail the request. The account is
+    // already committed and the token is already spent; throwing here would
+    // hand back an error for an activation that genuinely happened — which is
+    // exactly how Laurel ended up locked out. The client is told whether the
+    // code actually went, so it can say "we couldn't send your code, tap
+    // resend" instead of "invalid link".
     const emailOtpSession = signEmailOtpSessionToken({
       userId: user.id, role: user.role, email: user.email, profileId: tenant?.id ?? null,
       landlordId: null, landlordIds: null, businessId: null, staffRole: null, permissions: null,
     })
-    await issueEmailOtp(user.id, user.email)
+    let otpSent = true
+    try {
+      await issueEmailOtp(user.id, user.email)
+    } catch (e) {
+      otpSent = false
+      logger.error({ err: e, ctx: user.id }, '[accept-invite] activation committed but the 2FA code could not be sent')
+    }
 
     res.json({
       success: true,
       data: {
-        requiresEmailOtp: true, emailOtpSession,
+        requiresEmailOtp: true, emailOtpSession, otpSent,
         user: { id: user.id, email: user.email, role: user.role, firstName: user.first_name, lastName: user.last_name }
       }
     })

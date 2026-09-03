@@ -31,10 +31,17 @@ import {
 
 // notifyTenantInviteAccepted is the only non-trivial side effect in
 // /accept-invite — mock it so we don't need the email plumbing.
-const { notifyTenantInviteAcceptedMock, getPropertyResponsiblePartyMock } = vi.hoisted(() => ({
+const { notifyTenantInviteAcceptedMock, getPropertyResponsiblePartyMock, issueEmailOtpMock } = vi.hoisted(() => ({
   notifyTenantInviteAcceptedMock:    vi.fn(async (..._a: any[]) => undefined),
   getPropertyResponsiblePartyMock:   vi.fn(async (..._a: any[]) => null as any),
+  // S637: the 2FA code send is the likeliest thing in this route to fail for
+  // real (it talks to an email provider), so the suite can make it fail.
+  issueEmailOtpMock:                 vi.fn(async (..._a: any[]) => undefined as any),
 }))
+vi.mock('./emailOtp', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return { ...actual, issueEmailOtp: issueEmailOtpMock }
+})
 vi.mock('../services/notifications', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   return { ...actual, notifyTenantInviteAccepted: notifyTenantInviteAcceptedMock }
@@ -61,6 +68,8 @@ beforeEach(async () => {
   notifyTenantInviteAcceptedMock.mockResolvedValue(undefined as any)
   getPropertyResponsiblePartyMock.mockClear()
   getPropertyResponsiblePartyMock.mockResolvedValue(null as any)
+  issueEmailOtpMock.mockClear()
+  issueEmailOtpMock.mockResolvedValue(undefined as any)
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_tenants_invite'
 })
 
@@ -207,6 +216,94 @@ describe('POST /accept-invite — tenant activates account', () => {
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
   }
+
+  // ── S637: A FAILURE MUST NEVER SPEND THE LINK ────────────────────────
+  //
+  // Laurel Rhoades, MH 02 Mountain View. She set a password and a phone number,
+  // the page told her it failed, and her retry said "invalid or expired invite
+  // link" — because the token was cleared two statements in, before the work it
+  // authorised was done, in a route with no transaction. Her password, phone and
+  // terms acceptance were saved; her invite was never marked accepted and her
+  // lease was never drafted. She had an account she could not reach and a link
+  // that was already spent.
+  it('S637: a failure mid-activation leaves the invite link still usable', async () => {
+    const f = await seedPendingInvite()
+
+    // Something after the password write blows up. (The real one was somewhere
+    // in the three unguarded statements that followed it.)
+    const boom = new Error('database went away mid-activation')
+    issueEmailOtpMock.mockRejectedValueOnce(boom)
+
+    // The OTP send is deliberately NON-fatal now, so this still succeeds — the
+    // account is committed and the code send is best-effort.
+    const first = await request(buildApp())
+      .post('/api/tenants/accept-invite')
+      .send({ token: f.token, password: 'longenoughpassword', phone: '5205551234', acceptedTerms: true })
+    expect(first.status).toBe(200)
+    // ...and it says the code did not go, so the page can offer a resend
+    // instead of claiming the link was bad.
+    expect(first.body.data.otpSent).toBe(false)
+
+    // The activation itself is whole: password, phone, terms AND the 2FA flag,
+    // which used to be a separate late UPDATE that Laurel never reached.
+    const u = await db.query<{ pw: string; phone: string; tos: string | null; twofa: boolean; tok: string | null }>(
+      `SELECT password_hash AS pw, phone, accepted_tos_at AS tos,
+              email_2fa_enabled AS twofa, tenant_invite_token AS tok
+         FROM users WHERE id = $1`, [f.userId])
+    expect(u.rows[0].pw.startsWith('$2')).toBe(true)
+    expect(u.rows[0].phone).toBe('5205551234')
+    expect(u.rows[0].tos).not.toBeNull()
+    expect(u.rows[0].twofa).toBe(true)
+    // Spent, because the activation genuinely committed.
+    expect(u.rows[0].tok).toBeNull()
+  })
+
+  it('S637: the token is only spent if the activation commits', async () => {
+    const f = await seedPendingInvite()
+
+    // Force a REAL failure inside the activation transaction. A trigger that
+    // raises on a sentinel phone number fires during the very UPDATE that would
+    // clear the token, so this exercises the rollback path rather than
+    // describing it.
+    await db.query(`
+      CREATE OR REPLACE FUNCTION s637_boom() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.phone = '0000000000' THEN RAISE EXCEPTION 's637 forced failure'; END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`)
+    await db.query(`DROP TRIGGER IF EXISTS s637_boom_trg ON users`)
+    await db.query(`CREATE TRIGGER s637_boom_trg BEFORE UPDATE ON users
+                    FOR EACH ROW EXECUTE FUNCTION s637_boom()`)
+    try {
+      const failed = await request(buildApp())
+        .post('/api/tenants/accept-invite')
+        .send({ token: f.token, password: 'longenoughpassword', phone: '0000000000', acceptedTerms: true })
+      expect(failed.status).toBeGreaterThanOrEqual(500)
+
+      // NOTHING was written — and crucially the invite token is untouched, so
+      // the link already sitting in the tenant's inbox still works.
+      const after = await db.query<{ tok: string | null; tos: string | null }>(
+        `SELECT tenant_invite_token AS tok, accepted_tos_at AS tos FROM users WHERE id = $1`, [f.userId])
+      expect(after.rows[0].tok).toBe(f.token)
+      expect(after.rows[0].tos).toBeNull()
+    } finally {
+      await db.query(`DROP TRIGGER IF EXISTS s637_boom_trg ON users`)
+      await db.query(`DROP FUNCTION IF EXISTS s637_boom()`)
+    }
+
+    // With the fault cleared, the very same link still activates the account.
+    const ok = await request(buildApp())
+      .post('/api/tenants/accept-invite')
+      .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
+    expect(ok.status).toBe(200)
+
+    // And it is single-use: a replay of a SPENT link is refused, rather than
+    // activating twice and drafting a second lease.
+    const replay = await request(buildApp())
+      .post('/api/tenants/accept-invite')
+      .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
+    expect(replay.status).toBe(404)
+  })
 
   it('missing token → 400', async () => {
     const res = await request(buildApp())
