@@ -65,6 +65,142 @@ const STATUS_COLORS: Record<string, string> = {
   returned: 'var(--red)',
 }
 
+// ── TAKE A PAYMENT AT THE COUNTER (S637) ─────────────────────
+//
+// Nic: "manually recording a payment is for cash or check only. You have
+// everything as different line items, which is fine for a breakdown of the
+// bill, but it's showing processed, settled, retry count, payment ID, charge
+// ID, ACH trace number, metadata — all that stuff is inapplicable to cash or
+// check payments... In reality, the window shouldn't need to scroll. You have
+// too much information on there. Nobody's going to manually record a payment
+// for an ACH clearing."
+//
+// Recording cash used to open the Payment Detail modal — a forensic view of
+// one processed transaction, with Stripe ids, ACH trace numbers, retry counts
+// and metadata. None of that exists for money handed across a counter. It was
+// also so tall it had to scroll, and the previous fix made it scrollable
+// rather than asking why a cash drawer needed an ACH trace number.
+//
+// What somebody taking money actually needs: who is paying, what for, the
+// total, how they are paying, and what change to hand back. Nothing else, and
+// no scrolling.
+function TakePaymentModal({ group, onClose, onRecorded }: {
+  group: any
+  onClose: () => void
+  onRecorded: (msg: string) => void
+}) {
+  const [method, setMethod] = useState<ManualPaymentMethod>('cash')
+  const [tendered, setTendered] = useState('')
+  const [reference, setReference] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+
+  const due = Number(group.total)
+  const cash = method === 'cash'
+  const paid = Number(tendered.replace(/[^\d.]/g, '')) || 0
+  // Change is the arithmetic nobody should be doing in their head with a
+  // queue at the desk. Only cash has it; a check is written for the amount.
+  const change = cash && paid > due ? paid - due : 0
+  const short = cash && tendered.trim() !== '' && paid < due
+
+  // A check or money order is identified by its number — that number IS the
+  // receipt if the payment is ever questioned, so it is required, not optional.
+  const needsNumber = method === 'check' || method === 'money_order'
+  const numberLabel = method === 'check' ? 'Check number' : 'Money order number'
+  const ready = !short && (!needsNumber || reference.trim().length > 0)
+
+  const mut = useMutation(
+    () => apiPost(`/payments/${group.charges[0].id}/record-manual`,
+      { method, reference: reference.trim() || undefined }),
+    {
+      onSuccess: () => onRecorded(
+        `Recorded ${fmt(due)} from ${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim()),
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not record that payment'),
+    },
+  )
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title" style={{ marginBottom: 2 }}>
+          {`${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim() || 'Record payment'}
+        </div>
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 14 }}>
+          {group.unitNumber ? `Unit ${group.unitNumber}` : ''}
+          {group.propertyName ? ` · ${group.propertyName}` : ''}
+        </div>
+
+        {/* What they owe, itemised — the breakdown is the useful part. */}
+        {/* Capped rather than left to grow: a household with a long tail of
+            charges must not push the total and the buttons off the screen,
+            which is the whole complaint this dialog exists to answer. Its own
+            scroll, not the window's. */}
+        <div style={{ background: 'var(--bg-2)', borderRadius: 10, padding: '10px 12px',
+          marginBottom: 14, maxHeight: '32vh', overflowY: 'auto' }}>
+          {group.charges.map((c: any) => (
+            <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between',
+              fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>
+              <span>{chargeLabel(c)}</span>
+              <span className="mono">{fmt(c.amount)}</span>
+            </div>
+          ))}
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 800,
+            color: 'var(--text-0)', borderTop: '1px solid var(--border-0)', paddingTop: 7, marginTop: 5 }}>
+            <span>Total due</span><span className="mono">{fmt(due)}</span>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+          {MANUAL_PAYMENT_METHODS.map(m => (
+            <button key={m} onClick={() => { setMethod(m); setReference(''); setTendered('') }}
+              className={`btn btn-sm ${method === m ? 'btn-primary' : 'btn-ghost'}`}
+              style={{ flex: 1 }}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</button>
+          ))}
+        </div>
+
+        {cash ? (
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Cash received</label>
+            <input className="form-input" inputMode="decimal" placeholder={due.toFixed(2)}
+              value={tendered} onChange={e => setTendered(e.target.value)}
+              style={{ width: '100%', marginTop: 4 }} />
+            {short && (
+              <div style={{ fontSize: '.76rem', color: 'var(--red)', marginTop: 6 }}>
+                {fmt(due - paid)} short — rent is paid in full or not at all.
+              </div>
+            )}
+            {change > 0 && (
+              <div style={{ fontSize: '.9rem', fontWeight: 800, color: 'var(--gold)', marginTop: 8 }}>
+                Change to give back: {fmt(change)}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{numberLabel}</label>
+            <input className="form-input" value={reference} placeholder="e.g. 1042"
+              onChange={e => setReference(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
+          </div>
+        )}
+
+        {err && <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>{err}</div>}
+
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+          Settles all {group.charges.length} charge{group.charges.length === 1 ? '' : 's'} in full.
+          You already hold the funds, so GAM disburses nothing. No fee.
+        </div>
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-primary" style={{ flex: 1 }} disabled={!ready || mut.isLoading}
+            onClick={() => mut.mutate()}>
+            {mut.isLoading ? 'Recording…' : `Record ${fmt(due)}`}
+          </button>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
   payment: any; onClose: () => void; canRecord: boolean; onRecorded: () => void
 }) {
@@ -415,6 +551,11 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
 export function PaymentsPage() {
   const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
   const [selected, setSelected] = useState<any>(null)
+  // S637: taking money at the counter is its own dialog — see TakePaymentModal.
+  // Payment Detail stays what it is: the forensic view of one processed
+  // transaction, which is the wrong thing to hand somebody holding cash.
+  const [taking, setTaking] = useState<any>(null)
+  const [tookMsg, setTookMsg] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [propertyName, setPropertyName] = useState('')
   // S637: which household rows are expanded to show what makes up the balance.
@@ -555,6 +696,12 @@ export function PaymentsPage() {
             payment settles the whole balance — the same all-or-nothing a card
             payment does. The chevron opens the charges that make the balance
             up, so the detail is one click away instead of a second table. */}
+        {tookMsg && (
+          <div className="alert" style={{ marginBottom: 12, fontSize: '.84rem',
+            borderColor: 'var(--green)', color: 'var(--text-0)' }}>
+            {tookMsg} — settled in full.
+          </div>
+        )}
         {outstandingGroups.length > 0 && (
           <div className="card" style={{ padding: 0, marginBottom: 18, overflowX: 'auto' }}>
             <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
@@ -603,7 +750,7 @@ export function PaymentsPage() {
                     <td className="mono" style={{ fontWeight: 700 }}>{fmt(g.total)}</td>
                     <td style={{ textAlign: 'right' }}>
                       <button className="btn btn-primary btn-sm"
-                        onClick={e => { e.stopPropagation(); setSelected({ ...g.charges[0], _groupTotal: g.total, _groupCount: g.charges.length }) }}>
+                        onClick={e => { e.stopPropagation(); setTaking(g) }}>
                         Record payment
                       </button>
                     </td>
@@ -757,6 +904,8 @@ export function PaymentsPage() {
       {selected && <PaymentDetailModal payment={selected} onClose={() => setSelected(null)}
         canRecord={can('take_payment')}
         onRecorded={() => queryClient.invalidateQueries('payments')} />}
+      {taking && <TakePaymentModal group={taking} onClose={() => setTaking(null)}
+        onRecorded={(msg) => { setTaking(null); setTookMsg(msg); queryClient.invalidateQueries('payments') }} />}
       {creditOpen && <IssueCreditModal onClose={() => setCreditOpen(false)}
         onDone={(msg) => { setCreditOpen(false); setCreditNotice(msg) }} />}
     </div>
