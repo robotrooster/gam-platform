@@ -654,6 +654,32 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       ? landlordScopeIds(req.user!)
       : [req.params.id]
     const id = meAggregate ? scopeIds[0] : req.params.id
+
+    // ── S637: NARROW THE WHOLE DASHBOARD TO ONE PROPERTY ────────────────
+    //
+    // Nic: "I need to be able to filter from the dashboard to see what other
+    // co-owners are seeing. Right now, all properties are blended on the
+    // dashboard. And when a co-owner only sees one property because they
+    // don't own all the properties together with me, they're seeing different
+    // information on the cards."
+    //
+    // Scope is by ENTITY (landlordScopeIds) and each entity owns properties,
+    // so a co-owner's view is a subset of this one. Filtering to a single
+    // property reproduces what they see without impersonating anybody.
+    //
+    // Validated against the caller's own scope before it is used: this is a
+    // query-string id, and an unchecked one would read another landlord's
+    // portfolio through an endpoint that has already passed its auth check.
+    // NULL means the blended view, exactly as before.
+    const rawPropertyId = typeof req.query.propertyId === 'string' ? req.query.propertyId.trim() : ''
+    let propertyFilter: string | null = null
+    if (rawPropertyId) {
+      const owned = await queryOne<{ id: string }>(
+        `SELECT id FROM properties WHERE id = $1 AND landlord_id = ANY($2)`,
+        [rawPropertyId, scopeIds])
+      if (!owned) throw new AppError(404, 'Property not found')
+      propertyFilter = owned.id
+    }
     // Dashboard surfaces revenue + disbursement totals — financial view.
     // Landlord/admin only; team roles don't get the financial rollup.
     if (!canViewLandlordFinances(req.user, id)) {
@@ -681,7 +707,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = ANY($1)`, [scopeIds])
+      WHERE u.landlord_id = ANY($1)
+        AND ($2::uuid IS NULL OR p.id = $2)`, [scopeIds, propertyFilter])
     // S605 (Nic): the dashboard never said that payouts were unverified, so a
     // landlord could add units and tenants for days without learning that NO
     // RENT CAN MOVE until Stripe Connect verification is done. It was only
@@ -696,6 +723,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COALESCE(SUM(d.amount),0) AS amount
       FROM disbursements d
       WHERE d.landlord_id = ANY($1) AND d.status='pending'`, [scopeIds])
+    // disbursements carry no unit or property — a payout is an entity-level
+    // movement of money, so it stays blended even when a property is chosen.
     // Real monthly revenue trend (last 6 months)
     const trend = await query<any>(`
       SELECT 
@@ -705,8 +734,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       WHERE p.landlord_id = ANY($1)
         AND p.status IN ('completed','settled')
         AND p.created_at >= NOW() - INTERVAL '6 months'
+        AND ($2::uuid IS NULL OR p.unit_id IN (
+              SELECT id FROM units WHERE property_id = $2))
       GROUP BY DATE_TRUNC('month', p.created_at)
-      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [scopeIds])
+      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [scopeIds, propertyFilter])
 
     // Real maintenance stats
     const [maintenance] = await query<any>(`
@@ -714,22 +745,29 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status='open')::int as open_requests,
         COUNT(*) FILTER (WHERE status='in_progress')::int as in_progress,
         COUNT(*) FILTER (WHERE status='completed' AND created_at > NOW()-INTERVAL '30 days')::int as completed_30d
-      FROM maintenance_requests
-      WHERE landlord_id = ANY($1)`, [scopeIds])
+      FROM maintenance_requests m
+      WHERE m.landlord_id = ANY($1)
+        AND ($2::uuid IS NULL OR m.unit_id IN (
+              SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
 
     // Recent background checks pending review
     const [bgPending] = await query<any>(`
       SELECT COUNT(*)::int as count
-      FROM background_checks
-      WHERE landlord_id = ANY($1) AND status = 'submitted'`, [scopeIds])
+      FROM background_checks b
+      WHERE b.landlord_id = ANY($1) AND b.status = 'submitted'
+        AND ($2::uuid IS NULL OR b.property_id = $2
+             OR b.unit_id IN (SELECT id FROM units WHERE property_id = $2))`,
+      [scopeIds, propertyFilter])
 
     // S536 (Nic): needs-review leases belong on the main dashboard, not
     // just the Leases page banner. Current leases only (active+pending) —
     // the Leases page's default view — so the two counts always agree.
     const [leaseReview] = await query<any>(`
       SELECT COUNT(*)::int AS count
-      FROM leases
-      WHERE landlord_id = ANY($1) AND needs_review = TRUE AND status IN ('active','pending')`, [scopeIds])
+      FROM leases l
+      WHERE l.landlord_id = ANY($1) AND l.needs_review = TRUE AND l.status IN ('active','pending')
+        AND ($2::uuid IS NULL OR l.unit_id IN (
+              SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
 
     const [otpStats] = await query<any>(`
       SELECT
@@ -766,7 +804,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       SELECT COALESCE(SUM(amount), 0)::float AS collected_mtd
         FROM payments
        WHERE landlord_id = ANY($1) AND status='settled' AND type='rent'
-         AND settled_at >= date_trunc('month', NOW())`, [scopeIds])
+         AND settled_at >= date_trunc('month', NOW())
+         AND ($2::uuid IS NULL OR unit_id IN (
+               SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
     const [outstandingRow] = await query<any>(`
       SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::float AS outstanding
         FROM invoices i
@@ -775,7 +815,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
             FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
            GROUP BY invoice_id
         ) p ON p.invoice_id = i.id
-       WHERE i.landlord_id = ANY($1) AND i.status IN ('pending', 'partial')`, [scopeIds])
+       WHERE i.landlord_id = ANY($1) AND i.status IN ('pending', 'partial')
+         AND ($2::uuid IS NULL OR i.unit_id IN (
+               SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
 
     // Leases expiring soon — active leases whose end_date falls inside the next
     // 30 / 60 days. Drives the renewal-action KPI. Scoped by leases.landlord_id.
@@ -783,8 +825,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       SELECT
         COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days')::int AS leases_expiring_30d,
         COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days')::int AS leases_expiring_60d
-      FROM leases
-      WHERE landlord_id = ANY($1) AND status = 'active' AND end_date IS NOT NULL`, [scopeIds])
+      FROM leases l
+      WHERE l.landlord_id = ANY($1) AND l.status = 'active' AND l.end_date IS NOT NULL
+        AND ($2::uuid IS NULL OR l.unit_id IN (
+              SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
 
     // S616 (Nic): occupancy counts SHORT STAYS too — "aggregate thirty nights
     // of bookings as well." Before this, a park running on nightly bookings
@@ -801,11 +845,12 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
        WHERE u.landlord_id = ANY($1)
+         AND ($2::uuid IS NULL OR u.property_id = $2)
          AND u.status <> 'utility_service'
          AND b.lease_type IN ('nightly','weekly')
          AND b.status NOT IN ('cancelled','no_show')
          AND b.check_in  < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
-         AND b.check_out > date_trunc('month', CURRENT_DATE)`, [scopeIds])
+         AND b.check_out > date_trunc('month', CURRENT_DATE)`, [scopeIds, propertyFilter])
     const totalUnits = stats?.total_units || 0
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)

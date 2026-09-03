@@ -5,6 +5,7 @@ import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
+import { PropertySelect } from '../components/ListControls'
 // KPI cards show full dollars without cents (fmtWhole). Tables below keep this
 // exact, with-cents `fmt` — precise figures belong in the tables.
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -34,10 +35,27 @@ export function DashboardPage() {
   const navigate = useNavigate()
   const [showFeeModal, setShowFeeModal] = useState(false)
 
+  // ── S637: SEE ONE PROPERTY AT A TIME ────────────────────────────────
+  //
+  // Nic: "I need to be able to filter from the dashboard to see what other
+  // co-owners are seeing. Right now, all properties are blended on the
+  // dashboard. And when a co-owner only sees one property because they don't
+  // own all the properties together with me, they're seeing different
+  // information on the cards."
+  //
+  // Scope is by entity and each entity owns properties, so a co-owner's view
+  // is a subset of this one. Narrowing to a single property reproduces what
+  // they see without impersonating anybody. Empty string is the blended view,
+  // which stays the default.
+  const [propertyId, setPropertyId] = useState('')
+
+  const { data: properties = [] } = useQuery<any[]>(
+    'properties', () => apiGet<any[]>('/properties'), { staleTime: 60_000 })
+
   const { data: stats, isLoading } = useQuery<DashStats>(
-    'dashboard',
-    () => apiGet('/landlords/me/dashboard'),
-    { staleTime: Infinity }
+    ['dashboard', propertyId],
+    () => apiGet(`/landlords/me/dashboard${propertyId ? `?propertyId=${propertyId}` : ''}`),
+    { staleTime: Infinity, keepPreviousData: true }
   )
 
   const { data: disbursements } = useQuery(
@@ -145,6 +163,24 @@ export function DashboardPage() {
         </div>
       )}
 
+
+      {/* S637: one property at a time. PropertySelect hides itself for a
+          single-property landlord, so this costs nothing for most accounts. */}
+      {properties.length > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          <PropertySelect
+            value={propertyId}
+            onChange={setPropertyId}
+            properties={(properties as any[]).map(p => ({ id: p.id, name: p.name }))}
+            allLabel="All properties"
+          />
+          {propertyId && (
+            <span style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>
+              Showing one property — this is the view a co-owner of it sees.
+            </span>
+          )}
+        </div>
+      )}
 
       {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
       <div className="kpi-grid" style={{gridTemplateColumns:"repeat(12, 1fr)"}}>
