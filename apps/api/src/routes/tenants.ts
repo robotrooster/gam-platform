@@ -8,7 +8,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { emailLandlordBankingNudge, emailTenantInvite } from '../services/email'
+import { emailTenantInvite } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
@@ -304,115 +304,38 @@ tenantsRouter.get('/avatar-files/:filename', async (req: any, res: any, next: an
 // ──────────────────────────────────────────────────────────────
 tenantsRouter.use(requireAuth)
 
-// S162: tenant-scoped read of the landlord's Connect-readiness state.
-// Tenants need this to know whether paying rent online will succeed
-// (the destination charge requires the landlord's Connect account to
-// be payout-eligible). Response is intentionally minimal — just a
-// boolean — so no other landlord PII leaks across the trust boundary.
-tenantsRouter.get('/me/landlord-banking-status', async (req: any, res, next) => {
-  try {
-    const row = await queryOne<{
-      connect_payouts_enabled: boolean
-      connect_details_submitted: boolean
-    }>(`
-      SELECT u.connect_payouts_enabled, u.connect_details_submitted
-        FROM tenants t
-        JOIN v_lease_active_tenants vlat ON vlat.tenant_id = t.id
-        JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
-        JOIN units un ON un.id = l.unit_id
-        JOIN properties pr ON pr.id = un.property_id
-        JOIN landlords ll ON ll.id = pr.landlord_id
-        JOIN users u ON u.id = ll.user_id
-       WHERE t.id = $1
-       ORDER BY (vlat.role = 'primary') DESC
-       LIMIT 1
-    `, [req.user!.profileId!])
-
-    // No active lease → unable to pay anyway, but report ready=false so
-    // the UI shows the same blocked state.
-    const ready = !!row?.connect_payouts_enabled && !!row?.connect_details_submitted
-    res.json({ success: true, data: { ready } })
-  } catch (e) { next(e) }
-})
-
-// S163: tenant nudges landlord to finish Connect onboarding. Rate-limited
-// to one nudge per 24 hours per tenant via email_send_log lookup. We don't
-// add a dedicated table for this; the audit trail naturally lives in the
-// existing log table that captures every send (success and failure).
-tenantsRouter.post('/me/nudge-landlord-banking', async (req: any, res, next) => {
-  try {
-    const tenantId = req.user!.profileId!
-
-    const recent = await queryOne<{ id: string }>(`
-      SELECT id FROM email_send_log
-       WHERE related_entity_type = 'tenant_landlord_nudge'
-         AND related_entity_id = $1
-         AND created_at > NOW() - INTERVAL '24 hours'
-       LIMIT 1
-    `, [tenantId])
-    if (recent) {
-      throw new AppError(429, 'You can send another nudge in 24 hours.')
-    }
-
-    const ctx = await queryOne<{
-      landlord_id: string
-      landlord_email: string
-      landlord_first_name: string | null
-      landlord_last_name: string | null
-      tenant_first_name: string
-      tenant_last_name: string
-      property_name: string
-      unit_number: string
-      connect_payouts_enabled: boolean
-      connect_details_submitted: boolean
-    }>(`
-      SELECT
-        ll.id          AS landlord_id,
-        u_landlord.email      AS landlord_email,
-        u_landlord.first_name AS landlord_first_name,
-        u_landlord.last_name  AS landlord_last_name,
-        u_tenant.first_name   AS tenant_first_name,
-        u_tenant.last_name    AS tenant_last_name,
-        pr.name        AS property_name,
-        un.unit_number AS unit_number,
-        u_landlord.connect_payouts_enabled,
-        u_landlord.connect_details_submitted
-      FROM tenants t
-      JOIN users u_tenant ON u_tenant.id = t.user_id
-      JOIN v_lease_active_tenants vlat ON vlat.tenant_id = t.id
-      JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
-      JOIN units un ON un.id = l.unit_id
-      JOIN properties pr ON pr.id = un.property_id
-      JOIN landlords ll ON ll.id = pr.landlord_id
-      JOIN users u_landlord ON u_landlord.id = ll.user_id
-      WHERE t.id = $1
-      ORDER BY (vlat.role = 'primary') DESC
-      LIMIT 1
-    `, [tenantId])
-
-    if (!ctx) throw new AppError(404, 'No active lease found')
-    if (ctx.connect_payouts_enabled && ctx.connect_details_submitted) {
-      throw new AppError(409, 'Landlord banking is already complete; no nudge needed.')
-    }
-
-    const landlordName = [ctx.landlord_first_name, ctx.landlord_last_name].filter(Boolean).join(' ') || 'there'
-    const tenantName   = [ctx.tenant_first_name,   ctx.tenant_last_name].filter(Boolean).join(' ').trim()
-
-    const bankingUrl = `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/banking`
-
-    await emailLandlordBankingNudge({
-      to: ctx.landlord_email,
-      landlordName,
-      tenantName,
-      propertyName: ctx.property_name,
-      unitNumber: ctx.unit_number,
-      bankingUrl,
-      ctx: { landlordId: ctx.landlord_id, tenantId },
-    })
-
-    res.json({ success: true })
-  } catch (e) { next(e) }
-})
+// ── S637: NOTHING TENANT-FACING SAYS ANYTHING ABOUT THE LANDLORD'S BANK ──
+//
+// Nic (DIRECTIVE, verbatim): "as long as there's nothing that tells the tenants
+// that they can't pay yet, that's fine. The tenants need to be able to pay. I
+// don't want any forward facing messages that tell them anything about our bank
+// account."
+//
+// Two endpoints lived here and both are deleted:
+//
+//   GET  /me/landlord-banking-status  (S162) — reported the landlord's Connect
+//        readiness to the tenant as a `ready` boolean. No client ever called it.
+//   POST /me/nudge-landlord-banking   (S163) — let a tenant email their landlord
+//        a reminder to finish setting up their bank details.
+//
+// Both rested on a premise that is false: that a landlord without a payout-ready
+// Connect account stops their tenant paying. routes/payments.ts:389 does the
+// opposite on purpose — it falls back to a standard charge, holds the money on
+// GAM's platform balance (platform_held), and services/landlordPassthrough.ts
+// releases it when Connect completes. Rent collects the entire time.
+//
+// So the nudge told a tenant their landlord had not finished their banking AND
+// blamed a payment failure that never happened. The tenant agent carried it as
+// a described action (services/agents/portalActions.ts, removed with this), which
+// meant a tenant asking "why can't I pay?" would have been told about their
+// landlord's bank account. That is a disclosure across the audience boundary,
+// and it was not even true.
+//
+// The landlord is still prompted to finish Connect — on THEIR side, through
+// /landlords/me/todos. A tenant is not the right messenger for it.
+//
+// Do not reintroduce either endpoint. If a tenant genuinely cannot pay, the
+// reason will be about THEIR payment method, and it belongs in that error.
 
 tenantsRouter.get('/me', async (req, res, next) => {
   try {

@@ -223,7 +223,7 @@ const TENANT_ENTRY: AgentProfile = {
     'cancel_my_screening', 'withdraw_from_renter_pool', 'give_utility_moveout_notice',
     'send_feature_request',
     // S628: their own details, and the products offered to them.
-    'update_my_profile', 'nudge_landlord_banking', 'answer_income_questionnaire',
+    'update_my_profile', 'answer_income_questionnaire',
     'dismiss_questionnaire', 'register_flexpay_interest', 'change_flexpay_pull_day',
     'cancel_flexpay', 'cancel_flexdeposit', 'register_flexcredit_interest',
     // S628 (Nic): the agent may take the payment, after quoting the real
@@ -273,7 +273,7 @@ const TENANT_ESCALATION: AgentProfile = {
     'cancel_my_screening', 'withdraw_from_renter_pool', 'give_utility_moveout_notice',
     'send_feature_request',
     // S628: their own details, and the products offered to them.
-    'update_my_profile', 'nudge_landlord_banking', 'answer_income_questionnaire',
+    'update_my_profile', 'answer_income_questionnaire',
     'dismiss_questionnaire', 'register_flexpay_interest', 'change_flexpay_pull_day',
     'cancel_flexpay', 'cancel_flexdeposit', 'register_flexcredit_interest',
     // S628 (Nic): the agent may take the payment, after quoting the real

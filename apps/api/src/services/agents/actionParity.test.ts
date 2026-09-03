@@ -116,8 +116,15 @@ describe('action parity — what a person can do, the agent should be able to do
     // account... even when a landlord wants to issue the credit, they need to be
     // manually going in and doing it."
     //
+    // S637 DIRECTIVE (Nic): 233 → 232. ONE action was deliberately taken away —
+    // nudge_landlord_banking, which let a tenant email their landlord about the
+    // landlord's unfinished bank setup. "I don't want any forward facing
+    // messages that tell them anything about our bank account." Its endpoint
+    // (POST /tenants/me/nudge-landlord-banking) is deleted too, so this is a
+    // capability removed on purpose, not a tool that quietly stopped resolving.
+    //
     // The ratchet is doing its job by making this visible: it must only ever move
     // down for a stated reason, never because something quietly stopped working.
-    expect(writes.size).toBeGreaterThanOrEqual(233)
+    expect(writes.size).toBeGreaterThanOrEqual(232)
   })
 })

@@ -4,8 +4,6 @@
  *
  * Covered routes (5):
  *   - GET /me — full tenant profile + active-lease + deposit summary
- *   - GET /me/landlord-banking-status — Connect-readiness for paying
- *   - POST /me/nudge-landlord-banking — rate-limited landlord nudge
  *   - GET /me/deposit-interest — statutory rate + accruals
  *   - POST /verify-ach — mock ACH verification + OTP-qualified stamp
  *
@@ -29,14 +27,9 @@ import {
   seedLease, seedLeaseTenant, seedSecurityDeposit, seedRentPayment,
 } from '../test/dbHelpers'
 
-const { emailLandlordBankingNudgeMock, getAccrualHistoryMock } = vi.hoisted(() => ({
-  emailLandlordBankingNudgeMock: vi.fn(async (..._args: any[]) => 'msg_mock'),
-  getAccrualHistoryMock:         vi.fn(async (..._args: any[]) => [] as any[]),
+const { getAccrualHistoryMock } = vi.hoisted(() => ({
+  getAccrualHistoryMock: vi.fn(async (..._args: any[]) => [] as any[]),
 }))
-vi.mock('../services/email', async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>()
-  return { ...actual, emailLandlordBankingNudge: emailLandlordBankingNudgeMock }
-})
 vi.mock('../services/depositInterest', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
   return { ...actual, getAccrualHistory: getAccrualHistoryMock }
@@ -55,7 +48,6 @@ function buildApp() {
 
 beforeEach(async () => {
   await cleanupAllSchema()
-  emailLandlordBankingNudgeMock.mockClear()
   getAccrualHistoryMock.mockClear()
   getAccrualHistoryMock.mockResolvedValue([])
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_tenants_profile'
@@ -116,67 +108,14 @@ async function seedTFixture(opts: {
   finally { client.release() }
 }
 
-describe('GET /api/tenants/me/landlord-banking-status', () => {
-  it('tenant with no active lease → ready:false (degenerate state, same blocked UI)', async () => {
-    const f = await seedTFixture({ withActiveLease: false })
-    const res = await request(buildApp())
-      .get('/api/tenants/me/landlord-banking-status')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.ready).toBe(false)
-  })
-
-  it('tenant with active lease + landlord Connect ready → ready:true', async () => {
-    const f = await seedTFixture({ landlordConnectReady: true })
-    const res = await request(buildApp())
-      .get('/api/tenants/me/landlord-banking-status')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.ready).toBe(true)
-  })
-})
-
-describe('POST /api/tenants/me/nudge-landlord-banking', () => {
-  it('happy: fires email nudge with landlord/tenant/property context', async () => {
-    const f = await seedTFixture()
-    const res = await request(buildApp())
-      .post('/api/tenants/me/nudge-landlord-banking')
-      .set('Authorization', `Bearer ${f.tenantToken}`).send({})
-    expect(res.status).toBe(200)
-    expect(emailLandlordBankingNudgeMock).toHaveBeenCalledTimes(1)
-    const args = emailLandlordBankingNudgeMock.mock.calls[0]![0]
-    expect(args.propertyName).toBe('Sunset Apts')
-    expect(args.ctx).toMatchObject({ landlordId: f.landlordId, tenantId: f.tenantId })
-  })
-
-  it('recent nudge in last 24h → 429 rate limit', async () => {
-    const f = await seedTFixture()
-    // Seed a recent nudge entry in email_send_log
-    await db.query(
-      `INSERT INTO email_send_log (to_email, subject, category, status,
-                                   related_entity_type, related_entity_id, created_at)
-       VALUES ('ll@x.dev', 'nudge', 'landlord_banking_nudge', 'sent',
-               'tenant_landlord_nudge', $1, NOW() - INTERVAL '1 hour')`,
-      [f.tenantId])
-
-    const res = await request(buildApp())
-      .post('/api/tenants/me/nudge-landlord-banking')
-      .set('Authorization', `Bearer ${f.tenantToken}`).send({})
-    expect(res.status).toBe(429)
-    expect(res.body.error).toMatch(/another nudge in 24 hours/)
-    expect(emailLandlordBankingNudgeMock).not.toHaveBeenCalled()
-  })
-
-  it('landlord banking already complete → 409 "no nudge needed"', async () => {
-    const f = await seedTFixture({ landlordConnectReady: true })
-    const res = await request(buildApp())
-      .post('/api/tenants/me/nudge-landlord-banking')
-      .set('Authorization', `Bearer ${f.tenantToken}`).send({})
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/already complete/)
-    expect(emailLandlordBankingNudgeMock).not.toHaveBeenCalled()
-  })
-})
+// S637: the two landlord-banking describes that lived here are gone with their
+// endpoints. GET /me/landlord-banking-status told a tenant whether their
+// landlord's Connect was ready; POST /me/nudge-landlord-banking let them email
+// the landlord about it. Both asserted a premise that is false — a landlord
+// without payout-ready Connect does not stop their tenant paying; the charge
+// falls back to GAM's platform balance (routes/payments.ts:389). Nic
+// (DIRECTIVE): no forward-facing message tells a tenant anything about the
+// landlord's bank account. See routes/tenants.ts.
 
 describe('GET /api/tenants/me', () => {
   it('happy: full shape with property + unit + deposit summary', async () => {

@@ -98,26 +98,29 @@ export function DashboardPage() {
   return (
     <div>
       {/* Alerts */}
-      {/* S605 (Nic): FIRST alert, above everything else — until Stripe
-          verification is done NO RENT CAN MOVE, and nothing used to say so. A
-          landlord could spend days adding units and inviting tenants before
-          discovering the blocker buried in Financials → Banking. "If I don't
-          know how to do what I need to do, that's where the friction lives." */}
-      {stats && (stats as any).connectPayoutsEnabled === false && (
-        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/banking')}>
-          <AlertTriangle size={16} />
-          <div>
-            <strong>Tenants can’t pay rent yet</strong> — you need to verify your business with Stripe
-            and add the account rent deposits into.{' '}
-            {(stats as any).connectDetailsSubmitted
-              ? 'Your details are submitted and Stripe is reviewing them.'
-              : 'Takes about 10 minutes; have your EIN and bank details handy.'}
-          </div>
-          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>
-            {(stats as any).connectDetailsSubmitted ? 'Check status →' : 'Set up →'}
-          </span>
-        </div>
-      )}
+      {/* ── S637: THE CONNECT BANNER IS GONE ────────────────────────────
+          S605 put a banner here reading "Tenants can't pay rent yet". It was
+          wrong on the facts and wrong to show.
+
+          Wrong on the facts: routes/payments.ts:389 does not block a tenant
+          whose landlord has no payout-ready Connect account. It falls back to
+          a standard charge, the money lands on GAM's platform balance as
+          platform_held, and services/landlordPassthrough.ts releases it the
+          moment Connect completes. Its own comment says why — "Otherwise
+          tenants hit a wall and spend the rent before we can collect." Rent
+          collects the whole time. Only the PAYOUT waits.
+
+          Wrong to show: Nic (DIRECTIVE) — "we don't want other landlords to see
+          that banner. I've gotta think about it from that perspective." A
+          landlord's dashboard is a screen they open in front of staff and
+          co-owners; a red bar announcing their bank is not set up is not
+          information they asked to broadcast.
+
+          The prompt to finish Connect is NOT lost — GET /landlords/me/todos
+          still carries the bank/KYC task, scoped across every entity the
+          account owns, and Settings still shows bank_account_ready. Those are
+          places the landlord goes to look, rather than a claim shouted at them
+          on arrival. Do not restore this banner. */}
       {(stats?.evictionModeUnits || 0) > 0 && (
         <div className="alert alert-danger" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=eviction')}>
           <AlertTriangle size={16} />

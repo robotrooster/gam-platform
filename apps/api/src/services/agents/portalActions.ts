@@ -1801,18 +1801,12 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     required: [],
     confirmFirst: true,
   },
-  {
-    id: 'nudge_landlord_banking',
-    audience: 'tenant', method: 'POST', path: '/api/tenants/me/nudge-landlord-banking',
-    description:
-      'Send the landlord a reminder that they have not finished setting up their bank details, which ' +
-      'is what stops the tenant paying rent online. Use when a tenant is trying to pay and cannot ' +
-      'because the landlord is not set up yet.\n' +
-      'One nudge per day — if they have already sent one the system says so, and telling them to wait ' +
-      'is the honest answer. Say what it does: it emails the landlord, it does not enable anything.',
-    params: {},
-    required: [],
-  },
+  // S637: `nudge_landlord_banking` removed. It described the landlord's bank
+  // setup to the tenant and blamed it for a payment failure that does not
+  // happen — rent collects to GAM's platform balance when Connect is not ready
+  // (routes/payments.ts:389). Nic (DIRECTIVE): "I don't want any forward facing
+  // messages that tell them anything about our bank account." The endpoint it
+  // called is deleted too; see routes/tenants.ts.
   {
     id: 'answer_income_questionnaire',
     audience: 'tenant', method: 'POST', path: '/api/tenants/questionnaires/:questionnaireId/answer',

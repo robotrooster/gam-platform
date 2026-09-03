@@ -57,6 +57,10 @@ describe('action parity — the gap stays closed', () => {
   it('does not shrink — coverage may rise, never fall', () => {
     // S626 ended at 98 of 341 by the old area-level count. S628 ends at 228 of
     // 328 counted per endpoint, with the remaining 100 named.
-    expect(gap.covered.length).toBeGreaterThanOrEqual(228)
+    // S637: 228 → 227. The covered endpoint POST /tenants/me/nudge-landlord-banking
+    // was DELETED (Nic, DIRECTIVE: nothing forward-facing tells a tenant about the
+    // landlord's bank account), taking its agent tool with it. Coverage fell
+    // because the surface shrank, not because a gap opened.
+    expect(gap.covered.length).toBeGreaterThanOrEqual(227)
   })
 })
