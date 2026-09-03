@@ -861,6 +861,93 @@ describe('GET /api/stripe/tenant/payment-methods', () => {
 })
 
 // ─── S571: default + one-of-each swap ─────────────────────────
+// ── S637: A BANK MID-VERIFICATION MUST STILL APPEAR ──────────────────
+//
+// Randall Cox set up ACH, believed he had paid, and his saved-methods list
+// showed only a card — no sign the bank existed at all. paymentMethods.list
+// returns ATTACHED methods, and in the descriptor-code microdeposit flow
+// Stripe does not attach the bank until the code is confirmed. So the bank
+// was invisible, `hasPendingBank` in the tenant portal was always false, and
+// the "Your bank is still verifying" line — the one thing that tells a tenant
+// they have NOT paid — could never fire on the commonest ACH path.
+describe('S637 a pending microdeposit bank is listed', () => {
+  async function tenantWithCustomer() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const tenantId = await seedTenant(c)
+      const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
+        `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await c.query(
+        `UPDATE tenants SET stripe_customer_id='cus_mock_tenant', ach_verified=FALSE WHERE id=$1`,
+        [tenantId])
+      await c.query('COMMIT')
+      return { tenantId, userId: user_id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const pendingSetupIntent = {
+    id: 'seti_pending_micro',
+    status: 'requires_action',
+    next_action: { type: 'verify_with_microdeposits' },
+    payment_method: {
+      id: 'pm_bank_unverified',
+      type: 'us_bank_account',
+      us_bank_account: { bank_name: 'Wells Fargo', last4: '9988' },
+    },
+  }
+
+  it('lists it as an UNVERIFIED ach method, so the portal can say so', async () => {
+    const { tenantId, userId } = await tenantWithCustomer()
+    const m = (globalThis as any).__stripeMocks
+    m.setupIntentsList.mockResolvedValueOnce({ data: [pendingSetupIntent] })
+    m.paymentMethodsList.mockImplementation(async (args: any) =>
+      args.type === 'us_bank_account'
+        ? { data: [] }                       // Stripe has NOT attached it yet
+        : { data: [{ id: 'pm_card_1', card: { brand: 'visa', last4: '1111', exp_month: 12, exp_year: 2030, country: 'US' } }] })
+
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId, permissions: {} })
+    const res = await request(buildApp()).get('/api/stripe/tenant/payment-methods')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    const bank = res.body.data.find((x: any) => x.type === 'ach')
+    expect(bank).toBeTruthy()
+    expect(bank.verified).toBe(false)        // payShared refuses to charge this
+    expect(bank.last4).toBe('9988')
+    // And the card is still there — the tenant CAN pay today.
+    expect(res.body.data.some((x: any) => x.type === 'card')).toBe(true)
+  })
+
+  it('does not duplicate a bank Stripe has since attached', async () => {
+    const { tenantId, userId } = await tenantWithCustomer()
+    const m = (globalThis as any).__stripeMocks
+    m.setupIntentsList.mockResolvedValueOnce({ data: [pendingSetupIntent] })
+    m.paymentMethodsList.mockImplementation(async (args: any) =>
+      args.type === 'us_bank_account'
+        ? { data: [{ id: 'pm_bank_unverified', us_bank_account: { bank_name: 'Wells Fargo', last4: '9988' } }] }
+        : { data: [] })
+
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId, permissions: {} })
+    const res = await request(buildApp()).get('/api/stripe/tenant/payment-methods')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.body.data.filter((x: any) => x.type === 'ach')).toHaveLength(1)
+  })
+
+  it('ignores a setup intent that is not awaiting microdeposits', async () => {
+    const { tenantId, userId } = await tenantWithCustomer()
+    const m = (globalThis as any).__stripeMocks
+    m.setupIntentsList.mockResolvedValueOnce({ data: [
+      { ...pendingSetupIntent, status: 'succeeded', next_action: null },
+    ] })
+    m.paymentMethodsList.mockImplementation(async () => ({ data: [] }))
+
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId, permissions: {} })
+    const res = await request(buildApp()).get('/api/stripe/tenant/payment-methods')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.body.data.filter((x: any) => x.type === 'ach')).toHaveLength(0)
+  })
+})
+
 describe('S571 payment-method default + swap', () => {
   async function seedStripeTenant() {
     const c = await db.connect()

@@ -433,7 +433,7 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
       return res.json({ success: true, data: [] })
     }
     const stripe = getStripe()
-    const [achList, cardList, customer] = await Promise.all([
+    const [achList, cardList, customer, setupIntents] = await Promise.all([
       stripe.paymentMethods.list({
         customer: tenant.stripe_customer_id,
         type: 'us_bank_account',
@@ -445,6 +445,22 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
         limit: 20,
       }),
       stripe.customers.retrieve(tenant.stripe_customer_id),
+      // ── S637: A BANK MID-VERIFICATION IS NOT ATTACHED YET ──────────────
+      //
+      // Randall Cox set up ACH, believed he had paid, and his saved-methods
+      // list showed only a card — no sign the bank existed. paymentMethods
+      // .list returns ATTACHED methods, and in the descriptor-code microdeposit
+      // flow Stripe does not attach the bank until the code is confirmed. So
+      // the bank was invisible here, `hasPendingBank` was always false, and the
+      // "Your bank is still verifying" banner — the one line that tells a
+      // tenant they have NOT paid yet — could never fire on the commonest ACH
+      // path. The comment below this call asserted the opposite ("attached but
+      // NOT yet verified"); that is true of the amounts flow, not this one.
+      stripe.setupIntents.list({
+        customer: tenant.stripe_customer_id,
+        limit: 20,
+        expand: ['data.payment_method'],
+      }),
     ])
     // S571: which method is the tenant's default (ACH by default; overridable).
     const defaultPmId = (customer && !('deleted' in customer && customer.deleted))
@@ -464,6 +480,30 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
       verified:  !!tenant.ach_verified,
       isDefault: pm.id === defaultPmId,
     }))
+    // The same bank, still waiting on its code. Emitted as an unverified ach
+    // method so every existing consumer treats it correctly without changing:
+    // payShared already refuses to pre-select or charge `verified === false`,
+    // and the banner keys off exactly that.
+    const attachedBankIds = new Set(achList.data.map((pm) => pm.id))
+    const pendingAch = setupIntents.data
+      .filter((si) =>
+        si.status === 'requires_action' &&
+        (si.next_action as any)?.type === 'verify_with_microdeposits' &&
+        si.payment_method && typeof si.payment_method !== 'string' &&
+        (si.payment_method as any).type === 'us_bank_account' &&
+        !attachedBankIds.has((si.payment_method as any).id))
+      .map((si) => {
+        const pm = si.payment_method as any
+        return {
+          id:        pm.id,
+          type:      'ach' as const,
+          bankName:  pm.us_bank_account?.bank_name ?? null,
+          last4:     pm.us_bank_account?.last4 ?? null,
+          verified:  false,
+          isDefault: false,
+        }
+      })
+
     const card = cardList.data.map((pm) => ({
       id:        pm.id,
       type:      'card' as const,
@@ -475,7 +515,7 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
       verified:  true,   // cards are chargeable immediately
       isDefault: pm.id === defaultPmId,
     }))
-    res.json({ success: true, data: [...ach, ...card] })
+    res.json({ success: true, data: [...ach, ...pendingAch, ...card] })
   } catch (e) { next(e) }
 })
 
