@@ -197,7 +197,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
             </div>
           </div>
           <button className="btn btn-primary" onClick={link} disabled={linking}>
-            <Plus size={16} /> {linking ? 'Linking…' : 'Connect a bank'}
+            <Plus size={16} /> {linking ? 'Linking…' : 'Connect feed'}
           </button>
         </div>
       ) : (
@@ -210,7 +210,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
             </p>
           </div>
           <button className="btn btn-primary" onClick={link} disabled={linking}>
-            <Plus size={16} /> {linking ? 'Linking…' : 'Connect a bank'}
+            <Plus size={16} /> {linking ? 'Linking…' : 'Connect feed'}
           </button>
         </div>
       )}
@@ -263,7 +263,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                 a different permission, so your bank has to approve it even if it's the same account.
               </div>
               <div style={{ marginTop: 8 }}>
-                Hit <strong>Connect a bank</strong> above and sign in to your bank. Read-only —
+                Hit <strong>Connect feed</strong> above and sign in to your bank. Read-only —
                 nothing can move money from here.
               </div>
             </div>

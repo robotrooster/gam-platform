@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 4D9Lc9j8iO4wFRwU8D7iD8H181BfoabOGkUT4qAoxcUCUQefnN0aRZlZO1DBZu1
+\restrict WiaulHyZy2Eq9TVzLtU3WaQiMiYuD2ODrvTLedSvg1AohxL8BAIbZrsNaqgo5Ae
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9587,6 +9587,7 @@ CREATE TABLE public.users (
     pending_email_expires_at timestamp with time zone,
     theme_accent text,
     font_style text,
+    tenant_invite_accepted_at timestamp with time zone,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -9680,6 +9681,13 @@ COMMENT ON COLUMN public.users.theme_accent IS 'S633: portal accent colour, per 
 --
 
 COMMENT ON COLUMN public.users.font_style IS 'S633: portal font, per ACCOUNT. See users.theme_accent.';
+
+
+--
+-- Name: COLUMN users.tenant_invite_accepted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.tenant_invite_accepted_at IS 'S637: when a tenant invite was activated. Set = the token is spent and authorises nothing; it is kept only so a returning tenant can be told they are already set up rather than "expired".';
 
 
 --
@@ -17306,6 +17314,13 @@ CREATE INDEX idx_users_email ON public.users USING btree (email);
 --
 
 CREATE UNIQUE INDEX idx_users_stripe_connect_account_id ON public.users USING btree (stripe_connect_account_id) WHERE (stripe_connect_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_users_tenant_invite_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_users_tenant_invite_token ON public.users USING btree (tenant_invite_token) WHERE (tenant_invite_token IS NOT NULL);
 
 
 --
@@ -25474,5 +25489,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 4D9Lc9j8iO4wFRwU8D7iD8H181BfoabOGkUT4qAoxcUCUQefnN0aRZlZO1DBZu1
+\unrestrict WiaulHyZy2Eq9TVzLtU3WaQiMiYuD2ODrvTLedSvg1AohxL8BAIbZrsNaqgo5Ae
 

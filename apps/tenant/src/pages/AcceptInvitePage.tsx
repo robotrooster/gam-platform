@@ -11,6 +11,8 @@ export function AcceptInvitePage() {
   const [inviteInfo, setInviteInfo] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // S637: they finished this already and came back to the same email.
+  const [alreadyDone, setAlreadyDone] = useState(false)
   const [form, setForm] = useState({ password: '', confirmPassword: '', phone: '', acceptedTerms: false })
   const [showPw, setShowPw] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -45,6 +47,9 @@ export function AcceptInvitePage() {
       setEmailOtpSession(res.data.emailOtpSession)
       setCode(''); setResent(false); setStep(2); setSubmitting(false)
     } catch (e: any) {
+      // S637: an already-accepted invite is a DIFFERENT outcome from a broken
+      // one — they have an account and simply need to sign in.
+      if (e?.response?.data?.code === 'ALREADY_ACCEPTED') setAlreadyDone(true)
       setError(e?.response?.data?.error || 'Something went wrong. Please try again.')
       setSubmitting(false)
     }
@@ -81,13 +86,54 @@ export function AcceptInvitePage() {
     </div>
   )
 
+  // ── S637: THEY ARE NOT LOCKED OUT ───────────────────────────────────
+  //
+  // Nic: "Several more people tell me that their invite expired when they
+  // already accepted it. They tried to go back to that email only to find out
+  // that it's expired because they used it, and they think that it locked them
+  // out, and they need a new invite."
+  //
+  // This is the screen that told them so. It said "Invalid Invite" and
+  // "Contact your landlord for a new invite link" — advice that sends a tenant
+  // with a perfectly good account back to the landlord for something they do
+  // not need. Say what actually happened, and point at the door.
+  if (alreadyDone) return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#060809', padding: 24, fontFamily: 'system-ui' }}>
+      <div style={{ maxWidth: 430, textAlign: 'center', color: '#b8c4d8' }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
+        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>
+          You&rsquo;re already set up
+        </div>
+        <div style={{ fontSize: '.88rem', lineHeight: 1.65 }}>
+          This invite link has already been used — that&rsquo;s why it won&rsquo;t open again.
+          Nothing is wrong with your account and you don&rsquo;t need a new invite.
+        </div>
+        <a href="/login" style={{ display: 'inline-block', marginTop: 18, padding: '11px 26px',
+          background: '#c9a227', color: '#060809', borderRadius: 10, fontWeight: 800,
+          textDecoration: 'none', fontSize: '.9rem' }}>Sign in</a>
+        <div style={{ fontSize: '.8rem', color: '#8a96b0', marginTop: 18, lineHeight: 1.6 }}>
+          Signing your lease? That comes as a <strong style={{ color: '#c9a227' }}>separate email</strong> —
+          look for &ldquo;please sign&rdquo; in your inbox rather than reopening this one.
+        </div>
+      </div>
+    </div>
+  )
+
   if (error && !inviteInfo) return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#060809', padding: 24, fontFamily: 'system-ui' }}>
       <div style={{ maxWidth: 400, textAlign: 'center', color: '#b8c4d8' }}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
         <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>Invalid Invite</div>
         <div style={{ fontSize: '.85rem', lineHeight: 1.6 }}>{error}</div>
-        <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 12 }}>Contact your landlord for a new invite link.</div>
+        {/* S637: the commonest reason this screen appears is a link that was
+            already used successfully — so lead with that, and only then offer
+            the landlord. */}
+        <div style={{ fontSize: '.8rem', color: '#8a96b0', marginTop: 14, lineHeight: 1.6 }}>
+          If you already set a password with this link, you&rsquo;re done —{' '}
+          <a href="/login" style={{ color: '#c9a227', fontWeight: 700 }}>sign in</a> instead.
+          Your lease comes as a <strong style={{ color: '#c9a227' }}>separate email</strong>.
+        </div>
+        <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 10 }}>Still stuck? Ask your landlord to resend it.</div>
       </div>
     </div>
   )

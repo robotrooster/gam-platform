@@ -108,6 +108,30 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
             AND (tenant_invite_expires_at IS NULL OR tenant_invite_expires_at > NOW())
           FOR UPDATE`,
         [token])).rows[0]
+
+      // ── S637: "ALREADY DONE" IS NOT "EXPIRED" ──────────────────────────
+      //
+      // Nic: "Several more people tell me that their invite expired when they
+      // already accepted it... they think that it locked them out, and they
+      // need a new invite."
+      //
+      // They were right to be confused: activation used to clear the token, so
+      // a tenant reopening their own email looked identical to someone holding
+      // a bad link, and both were told the link was invalid or expired. For
+      // somebody who had just successfully set a password, that is false and it
+      // reads as being locked out of an account that exists and works.
+      //
+      // The token is kept now and marked accepted instead. It authorises
+      // nothing once accepted — this branch refuses it — so a forwarded link is
+      // not a way in. It exists only so we can tell them the truth.
+      if (user?.tenant_invite_accepted_at) {
+        await client.query('ROLLBACK')
+        return res.status(409).json({
+          success: false,
+          code: 'ALREADY_ACCEPTED',
+          error: 'You have already set up your account with this link. Sign in with your email and password — you do not need a new invite.',
+        })
+      }
       if (!user) {
         await client.query('ROLLBACK')
         return res.status(404).json({ success: false, error: 'Invalid or expired invite link' })
@@ -125,11 +149,13 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // up with a password but email_2fa_enabled still false — a half-built
       // account whose state depended on how far the request happened to get.
       //
-      // S637: the token is cleared HERE, in the transaction, so it is spent only
-      // if the activation it authorises actually commits.
+      // S637: the token is spent HERE, in the transaction, so it is spent only
+      // if the activation it authorises actually commits. It is MARKED rather
+      // than deleted — see the ALREADY_ACCEPTED branch above. The expiry is
+      // cleared so an accepted invite never also reports as timed out.
       await client.query(
         `UPDATE users SET password_hash=$1,
-                          tenant_invite_token=NULL,
+                          tenant_invite_accepted_at=NOW(),
                           tenant_invite_expires_at=NULL,
                           email_verified=TRUE,
                           email_2fa_enabled=TRUE,

@@ -522,7 +522,14 @@ function StripeConnectSection() {
           </div>
           <button className="btn btn-primary" onClick={startOnboarding}
             disabled={isOwner && !entityId}>
-            {statusQ.data?.exists ? 'Continue verification' : 'Start verification'}
+            {/* S637 (Nic): "I'd relabel the one to connect feed, and then the
+                other one would be connect account. That way, they see what's
+                going on."
+                Two people in a row linked the read-only transaction FEED when
+                they meant to set up payouts, because both screens said
+                "connect a bank" and only one moves money. The feed button now
+                says Connect feed; this one names the account rent lands in. */}
+            {statusQ.data?.exists ? 'Continue connecting account' : 'Connect account for payouts'}
           </button>
           {initErr && (
             <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #dc4c4c)' }}>{initErr}</div>
