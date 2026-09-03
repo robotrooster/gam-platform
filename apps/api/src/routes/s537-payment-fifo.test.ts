@@ -234,7 +234,14 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     expect(full.status).toBe(200)
   })
 
-  it('invoice generation consumes prepaid credit oldest-first', async () => {
+  it('S637: a credit too small for the rent leaves the charge whole', async () => {
+    // Was: "consumes prepaid credit oldest-first", asserting a $100 credit
+    // split the $440 rent into a $100 settled slice and a $340 remainder.
+    //
+    // S637 (Nic, DIRECTIVE): "Credits do not fucking split charges... It's a
+    // credit against the overall ledger, not fucking settling partial
+    // payments. We don't do partial payments." The split also invented a
+    // SETTLED payment row that no money ever arrived for.
     const f = await fixture()
     await db.query(
       `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
@@ -248,20 +255,19 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     const result = await generateInvoices()
     expect(result.invoicesInserted).toBeGreaterThanOrEqual(1)
 
-    // $100 credit against the generated rent: a $100 slice settled via
-    // credit, its $340 remainder pending, credit fully drawn. (Generation
-    // may produce more than one invoice depending on the lease window —
-    // assert the credit-specific rows rather than a global count.)
+    // No settled row: nothing was paid.
     const settled = await db.query<any>(
       `SELECT amount::float AS amount FROM payments
         WHERE lease_id=$1 AND type='rent' AND status='settled'`, [f.leaseId])
-    expect(settled.rows.map((r: any) => r.amount)).toEqual([100])
+    expect(settled.rows).toHaveLength(0)
+    // And no remainder row — the charge was never cut in two.
     const remainder = await db.query<any>(
       `SELECT amount::float AS amount FROM payments
         WHERE lease_id=$1 AND type='rent' AND status='pending' AND is_remainder`, [f.leaseId])
-    expect(remainder.rows.map((r: any) => r.amount)).toEqual([340])
+    expect(remainder.rows).toHaveLength(0)
+    // The credit is still there, waiting for a charge it can actually clear.
     const credit = await db.query<any>(`SELECT amount_remaining::float AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [f.leaseId])
-    expect(credit.rows[0].r).toBe(0)
+    expect(credit.rows[0].r).toBe(100)
   })
 })
 

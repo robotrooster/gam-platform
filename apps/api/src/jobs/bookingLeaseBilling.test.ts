@@ -171,7 +171,7 @@ describe('Master Schedule → lease sync', () => {
     expect(Number(credit.rows[0].r)).toBe(348.33)
   })
 
-  it('credit is consumed by the next generated invoice (existing netting rail)', async () => {
+  it('S637: a credit too small for the rent leaves the charge whole', async () => {
     const s = await seedStack()
     await db.query(
       `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
@@ -180,13 +180,17 @@ describe('Master Schedule → lease sync', () => {
     const pay = await db.query<any>(
       `SELECT amount::numeric AS a, status, notes FROM payments
         WHERE lease_id=$1 AND type='rent' ORDER BY amount DESC`, [s.leaseId])
-    // 950 rent: 300 settled by credit, 650 remainder pending.
-    const settled = pay.rows.find((p: any) => p.status === 'settled')
-    expect(settled).toBeTruthy()
-    expect(settled.notes).toContain('prepaid credit')
+    // S637 (Nic, DIRECTIVE): "Credits do not fucking split charges... We don't
+    // do partial payments." This used to assert 950 rent becoming a 300
+    // settled slice plus a 650 remainder — a partial payment, banned
+    // platform-wide, and a settled row no money arrived for.
+    //
+    // A $300 credit cannot clear $950, so the charge is left whole and the
+    // credit keeps waiting for one it can cover.
+    expect(pay.rows.find((p: any) => p.status === 'settled')).toBeFalsy()
     const credit = await db.query<any>(
       `SELECT amount_remaining::numeric AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
-    expect(Number(credit.rows[0].r)).toBe(0)
+    expect(Number(credit.rows[0].r)).toBe(300)
   })
 })
 
