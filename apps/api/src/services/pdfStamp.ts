@@ -9,6 +9,8 @@ interface FieldStamp {
   height: number
   field_type: string
   value: string
+  /** S637: the signature style the signer chose, as a CSS font shorthand. */
+  font_css?: string | null
 }
 
 interface SignerInfo {
@@ -30,6 +32,36 @@ export async function stampPdf(
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica)
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
 
+  // ── S637: A TYPED SIGNATURE IS STAMPED IN THE STYLE THE SIGNER PICKED ────
+  //
+  // Nic: "the leases are not stamping the font choice for signature or
+  // initials. They come back as plain text."
+  //
+  // They did, and in Helvetica — the same face as the body text, so an executed
+  // lease showed a name typed in the document's own font where a signature
+  // should be. The signer picks from five styles, sees a live preview, and the
+  // choice was thrown away on submit; font_css has been on this table since the
+  // initial schema and nothing ever wrote to it.
+  //
+  // Four of the five styles are italic serif faces (Georgia, Palatino,
+  // Garamond, and the serif fallbacks the script options carry), which
+  // Times-Italic represents honestly. It is embedded once, lazily, and only if
+  // some field actually asks for it.
+  //
+  // The two genuinely cursive options — Snell Roundhand, Brush Script — cannot
+  // be reproduced by a PDF standard font; those need a real script face
+  // embedded through fontkit, which is a font-licensing decision rather than a
+  // code one. Until then they render as italic serif, which reads as a
+  // signature. What is NO LONGER true is that the choice is silently discarded.
+  const timesItalic = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic)
+  const signatureFontFor = (fontCss: string | null | undefined) => {
+    if (!fontCss) return helvetica
+    const css = String(fontCss).toLowerCase()
+    const scriptish = ['italic', 'cursive', 'script', 'georgia', 'palatino',
+                       'garamond', 'chancery', 'roundhand', 'serif']
+    return scriptish.some(k => css.includes(k)) ? timesItalic : helvetica
+  }
+
   for (const field of fields) {
     if (!field.value) continue
     const pageIndex = (field.page || 1) - 1
@@ -48,10 +80,11 @@ export async function stampPdf(
             : await pdfDoc.embedJpg(imgBytes)
           page.drawImage(img, { x:field.x, y:pdfY, width:field.width, height:field.height })
         } catch(e) {
-          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25, size:Math.min(field.height*0.6,20), font:helvetica, color:rgb(0,0,0.5) })
+          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.5) })
         }
       } else {
-        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.6,20), font:helvetica, color:rgb(0,0,0.4) })
+        // S637: the signer's own style, not the body font.
+        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.4) })
       }
       page.drawLine({ start:{x:field.x,y:pdfY}, end:{x:field.x+field.width,y:pdfY}, thickness:0.5, color:rgb(0.4,0.4,0.4) })
     } else if (field.field_type === 'date') {

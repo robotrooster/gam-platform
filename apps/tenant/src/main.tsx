@@ -524,7 +524,19 @@ function Layout() {
   // cannot use is a dead end; a hidden portal is a tenant who cannot pay rent.
   // The screen was never the security boundary — the API response is.
   const tenantMeUnknown = tenantMeLoading || tenantMeFailed || tenantMe === undefined
-  const showFullNav = tenantMeUnknown || bgApproved || isExistingTenant || isUtilityServicePayer
+  // S637 (Nic, the Fierro household): SIGNING IS NOT APPLYING.
+  //
+  // Mireya signed her lease and so did the landlord, but the document waits at
+  // in_progress until her co-tenant signs too — and no lease row exists until it
+  // completes. unitId was therefore null, and the portal told a woman who had
+  // just signed her lease to go take a background check, because somebody ELSE
+  // had not signed yet.
+  //
+  // A person a lease document has been sent to is inside the tenancy, not
+  // applying for one. The nav opens from the moment it reaches them.
+  const isMidSigning = !!(tenantMe as any)?.pendingLeaseDocumentId
+  const showFullNav = tenantMeUnknown || bgApproved || isExistingTenant
+    || isUtilityServicePayer || isMidSigning
   // …and only what applies to them. Someone who buys electricity from this
   // landlord has no lease to read, no maintenance to request, no amenities to
   // reserve and no deposit — a nav full of doors that open onto nothing is its

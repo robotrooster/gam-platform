@@ -4287,13 +4287,16 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     //     fields you yourself previously signed.
     // Spoof attempts silently no-op (filtered out by the WHERE).
     for (const fv of (fieldValues || [])) {
+      // S637: font_css carries the signature style the signer actually picked.
+      // COALESCE so a submission without one never wipes a template's own font.
       await client.query(`
         UPDATE lease_document_fields
-        SET value=$1, signed_at=NOW(), signer_id=$2
+        SET value=$1, signed_at=NOW(), signer_id=$2,
+            font_css = COALESCE($6, font_css)
         WHERE id=$3 AND document_id=$4
           AND signer_role=$5
           AND (signed_at IS NULL OR signer_id=$2)`,
-        [fv.value, signer.id, fv.fieldId, doc.id, signer.role])
+        [fv.value, signer.id, fv.fieldId, doc.id, signer.role, fv.fontCss ?? null])
     }
 
     // S556: clear any conditional child whose parent is no longer at its

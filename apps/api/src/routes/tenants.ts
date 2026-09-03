@@ -411,6 +411,20 @@ tenantsRouter.get('/me', async (req, res, next) => {
     const tenant = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         u.stripe_connect_account_id,
+        -- S637 (Nic, the Fierro household at MH 07): a lease document that this
+        -- person is a signer on and that is still moving. Mireya signed her
+        -- lease, the landlord signed it, and the document sat at 'in_progress'
+        -- because her CO-TENANT had not signed yet — so no lease row exists, so
+        -- unit_id is NULL, so the portal decided she was an applicant and showed
+        -- her nothing but a background check. She had already done her part.
+        --
+        -- Signing is not applying. This is the signal that says so, and it holds
+        -- from the moment a document reaches them until the lease exists.
+        (SELECT d.id FROM lease_document_signers lds
+           JOIN lease_documents d ON d.id = lds.document_id
+          WHERE lds.user_id = u.id
+            AND d.status IN ('sent','in_progress')
+          ORDER BY d.created_at DESC LIMIT 1) AS pending_lease_document_id,
         un.id AS unit_id, un.unit_number, un.rent_amount, un.status AS unit_status,
         pr.name AS property_name, pr.street1, pr.city, pr.state,
         sd.total_amount AS deposit_total, sd.collected_amount AS deposit_collected,

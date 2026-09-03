@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, Download, Printer } from 'lucide-react'
+import { downloadAuthedFile, printAuthedFile } from '../lib/downloadFile'
+import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
@@ -72,6 +74,28 @@ export function PdfViewerPage() {
           <ArrowLeft size={14} /> Back
         </button>
         <h1 className="page-title" style={{ margin: 0, fontSize: '1.1rem' }}>{title}</h1>
+        {/* S637 (Nic): "there's no option to print or download from this
+            screen." The page rendered the PDF to canvases and stopped there, so
+            the one thing a landlord needs from an executed lease — a copy, on
+            paper or on disk — was the one thing it would not do. Printing the
+            PAGE would print portal chrome around a canvas; these fetch the PDF
+            itself with the session token and hand the real bytes to the browser. */}
+        {!error && (
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <button className="btn btn-ghost btn-sm" title="Print"
+              onClick={async () => {
+                try { await printAuthedFile(`/api${src}`) }
+                catch (e: any) { toast.error(`Could not print this document (${e?.message || 'unknown error'}).`) }
+              }}><Printer size={14} /> Print</button>
+            <button className="btn btn-primary btn-sm" title="Download"
+              onClick={async () => {
+                try {
+                  await downloadAuthedFile(`/api${src}`,
+                    `${title.replace(/[^\w\-. ]+/g, '_')}.pdf`)
+                } catch (e: any) { toast.error(`Could not download this document (${e?.message || 'unknown error'}).`) }
+              }}><Download size={14} /> Download</button>
+          </div>
+        )}
       </div>
       {error ? (
         <div className="card" style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>{error}</div>

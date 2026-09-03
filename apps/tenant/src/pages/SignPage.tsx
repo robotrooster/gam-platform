@@ -350,7 +350,14 @@ export function SignPage() {
   // S535: surface API sign failures (mirrors landlord SignPage) — a
   // {success:false} response previously showed the success screen.
   const submitMut = useMutation(
-    () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) })
+    () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues)
+        // S637 (Nic): "what's the point of even picking it if it's not gonna
+        // save?" The font the signer chose lived only in component state and
+        // the localStorage draft — it styled the on-screen preview and was
+        // then dropped on submit, so every executed PDF came back in plain
+        // Helvetica. lease_document_fields.font_css has existed the whole
+        // time and nothing ever filled it. It travels with the value now.
+        .map(([fieldId,value])=>({ fieldId, value, fontCss: fieldFonts[fieldId] || null })) }) })
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
     { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },

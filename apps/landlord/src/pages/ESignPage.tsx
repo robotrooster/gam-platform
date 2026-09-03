@@ -12,9 +12,10 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
-import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
+import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
+import { downloadAuthedFile, printAuthedFile } from '../lib/downloadFile'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -1727,7 +1728,32 @@ export function ESignPage() {
                             <PenLine size={12} /> Sign
                           </button>
                         )}
-                        {can('esign.download') && d.executedPdfUrl && <a href={d.executedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
+                        {/* S637: was a bare <a href={d.executedPdfUrl}>. That URL is
+                            stored relative, so it resolved against the LANDLORD host
+                            and the SPA answered with its own "this page doesn't
+                            exist" screen; and the API route behind it is authed, so
+                            an anchor would have 401'd even on the right host. Fetch
+                            with the token, then save. */}
+                        {can('esign.download') && d.executedPdfUrl && (
+                          <button className="btn btn-ghost btn-sm" title="Download the signed PDF"
+                            onClick={async e => {
+                              e.stopPropagation()
+                              try {
+                                await downloadAuthedFile(d.executedPdfUrl,
+                                  `${(d.title || 'lease').replace(/[^\w\-. ]+/g, '_')}.pdf`)
+                              } catch (err: any) {
+                                toast.error(`Could not download that lease (${err?.message || 'unknown error'}).`)
+                              }
+                            }}><Download size={12} /></button>
+                        )}
+                        {can('esign.download') && d.executedPdfUrl && (
+                          <button className="btn btn-ghost btn-sm" title="Print the signed PDF"
+                            onClick={async e => {
+                              e.stopPropagation()
+                              try { await printAuthedFile(d.executedPdfUrl) }
+                              catch (err: any) { toast.error(`Could not print that lease (${err?.message || 'unknown error'}).`) }
+                            }}><Printer size={12} /></button>
+                        )}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>
                         )}

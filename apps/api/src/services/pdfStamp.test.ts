@@ -142,3 +142,38 @@ describe('stampPdf', () => {
     expect(parsed.getPageCount()).toBe(2)
   })
 })
+
+// ── S637: the signature style the signer picked reaches the paper ─────────
+//
+// Nic: "the leases are not stamping the font choice for signature or initials.
+// They come back as plain text." They did — Helvetica, the body font — because
+// the chooser's selection was dropped on submit and font_css was never written,
+// despite having been on the table since the initial schema.
+describe('S637 — a typed signature is stamped in the chosen style', () => {
+  const base = {
+    page: 1, x: 50, y: 50, width: 200, height: 40,
+    field_type: 'signature', signer_role: 'primary',
+  }
+
+  it('an italic/script choice does not render in the body font', async () => {
+    const src = await makeSourcePdf(1)
+    const styled = path.join(os.tmpdir(), `s637-styled-${randomUUID()}.pdf`)
+    const plain  = path.join(os.tmpdir(), `s637-plain-${randomUUID()}.pdf`)
+    cleanupPaths.push(styled, plain)
+
+    await stampPdf(src, [{ ...base, value: 'Mireya Fierro',
+      font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [], styled)
+    await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [], plain)
+
+    // Different embedded faces produce different bytes for the same name.
+    expect(fs.readFileSync(styled).length).not.toBe(fs.readFileSync(plain).length)
+  })
+
+  it('a missing choice still stamps, and never throws', async () => {
+    const src = await makeSourcePdf(1)
+    const out = path.join(os.tmpdir(), `s637-nofont-${randomUUID()}.pdf`)
+    cleanupPaths.push(out)
+    await stampPdf(src, [{ ...base, value: 'Mireya Fierro' } as any], [], out)
+    expect(fs.existsSync(out)).toBe(true)
+  })
+})
