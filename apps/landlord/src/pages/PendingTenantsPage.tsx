@@ -541,7 +541,10 @@ function ReviewIntentModal({ intent, onClose, onConfirm }: {
             <FlagsDetail intent={intent} />
           </div>
           {/* Right: document with highlights */}
-          <div ref={pdfContainerRef} style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-2)', borderRadius: 10, padding: 8 }}>
+          {/* S637: minHeight 0 — a flex child defaults to min-height:auto and will
+              not shrink below its content, so overflow-y never engages and the
+              bottom of the list sits unreachable past the container's cap. */}
+          <div ref={pdfContainerRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', background: 'var(--bg-2)', borderRadius: 10, padding: 8 }}>
             {loadError && (
               <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)' }}>
                 <AlertCircle size={20} style={{ color: COLOR_DANGER }} />

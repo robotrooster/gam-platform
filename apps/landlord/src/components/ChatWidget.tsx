@@ -182,7 +182,7 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
         )}
       </div>
 
-      <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <Bubble role="agent" text={GREETING} agent={agent} />
         {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} agent={agent} />)}
         {indicator === 'sent' && <SentMarker />}

@@ -418,7 +418,10 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
 
         {/* Scrollable form body. S511 #15: a single <fieldset disabled> makes
             every control inside read-only in one shot for view mode. */}
-        <div style={{ overflowY: 'auto', flex: 1, paddingRight: 4 }}>
+        {/* S637: minHeight 0 — a flex child defaults to min-height:auto and will
+              not shrink below its content, so overflow-y never engages and the
+              bottom of the list sits unreachable past the container's cap. */}
+        <div style={{ overflowY: 'auto', flex: 1, minHeight: 0, paddingRight: 4 }}>
         <fieldset disabled={readOnly} style={{ border: 'none', margin: 0, padding: 0, minWidth: 0 }}>
 
           {/* PARTIES */}

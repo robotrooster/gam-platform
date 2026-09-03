@@ -919,8 +919,10 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 // path requires platform_held=TRUE — so the landlord, who already physically
 // holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
 // so the fee below stays GAM revenue (same as RETURNFEE). The amount is
-// MANUAL_PAYMENT_FEE — $6, matching ACH exactly since S607. This comment said
-// $10 until S628; read the constant, not the prose.
+// MANUAL_PAYMENT_FEE, which is ZERO — cash is the cheapest way to pay, per
+// S630. (This prose has been wrong twice, claiming $10 and then $6 after the
+// constant had already moved. The constant is the truth; it is now named here
+// rather than quoted, so the two cannot drift again.)
 //
 // Each manual payment carries a flat fee (a tenant-owed 'fee' row,
 // entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the

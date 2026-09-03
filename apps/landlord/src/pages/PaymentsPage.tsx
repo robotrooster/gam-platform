@@ -158,8 +158,16 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
           )}
         </div>
 
-        {/* Scrollable body */}
-        <div style={{ overflowY: 'auto', flex: 1 }}>
+        {/* Scrollable body.
+            S637 (Nic): "it pops up a little window that is not scrollable...
+            I can't scroll down to see anything else. I don't know how to
+            actually zero out it when he brings cash in."
+            `flex: 1` alone does not make a flex child scroll. Its default
+            min-height is `auto`, which refuses to shrink below the content —
+            so the child grew past the 90vh cap, overflow-y never engaged, and
+            the charge list and the Record Payment button sat below the fold
+            with no way to reach them. minHeight: 0 is what lets it shrink. */}
+        <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
 
           {/* Basics */}
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '8px 0 4px 0' }}>
