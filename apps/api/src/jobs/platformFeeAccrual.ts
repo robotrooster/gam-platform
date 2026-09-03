@@ -54,6 +54,7 @@
  */
 
 import { getClient, query } from '../db'
+import { activateBillingForOccupancy } from '../services/billingActivation'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
@@ -64,14 +65,41 @@ interface AccrualResult {
   skippedZero: number
   skippedAlreadyAccrued: number
   skippedPreBilling: number
+  /** S637: landlords whose onboarding grace ended because they had occupancy. */
+  graceEndedByOccupancy: number
   /** S630: payout groups that needed a top-up to reach the monthly floor. */
   connectMinimumsApplied: number
   errors: { property_id: string; error: string }[]
 }
 
 export async function processPlatformFeeAccrual(now: Date = new Date()): Promise<AccrualResult> {
-  // Accrual month = first day of the calendar month (UTC).
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  // ── S637: THE PLATFORM FEE IS BILLED IN ARREARS ─────────────────────
+  //
+  // Nic (DIRECTIVE): "The platform needs to bill in arrears for occupied units
+  // from the month before... Billing has always been designed to be in arrears
+  // for the platform fee, because on short-term stays you don't know how many
+  // aggregate nights in an RV park spots were filled up. There could be two
+  // hundred nights between a bunch of spots divided by thirty... It was never
+  // designed to be billed for the upcoming month."
+  //
+  // This job fires on the 1st and used to stamp accrual_month as the month it
+  // was RUNNING IN — so the 1 October run billed for October, counting leases
+  // active at 00:01 on the 1st. Two things are wrong with that.
+  //
+  // Short stays cannot be counted in advance at all. The nights/30 aggregation
+  // needs a finished month; on day one there are no nights yet, so every
+  // nightly and weekly space billed zero and the fee was permanently short.
+  //
+  // And a month billed on its first day cannot reflect what happened in it. A
+  // lease ending mid-October reduced OCTOBER's fee, which had already been
+  // charged. Billed in arrears it reduces November's, which is when the vacancy
+  // actually cost the landlord nothing — Nic: "if a lease ends in October and
+  // we bill in November, they would see a reduced platform fee unless they've
+  // refilled the spot before the billing cycle."
+  //
+  // So the run bills the month that just ENDED. Money still moves once: the
+  // fee comes out of rent that is being disbursed to the landlord anyway.
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
   const monthIso   = monthStart.toISOString().slice(0, 10)
 
   const result: AccrualResult = {
@@ -81,6 +109,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
     skippedZero: 0,
     skippedAlreadyAccrued: 0,
     skippedPreBilling: 0,
+    graceEndedByOccupancy: 0,
     connectMinimumsApplied: 0,
     errors: [],
   }
@@ -91,6 +120,18 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   // conduit — is flagged is_system precisely "so it stays out of" billing, but
   // this job never checked it, so GAM invoiced itself $10 a month and wrote it
   // into platform_revenue_ledger as revenue that does not exist.
+  // S637: a landlord who had somebody in a spot last month is live, whatever
+  // way they were paid. Runs BEFORE the per-property gate below, so the month
+  // that proves occupancy is the month that gets billed.
+  try {
+    const c = await getClient()
+    try {
+      result.graceEndedByOccupancy = await activateBillingForOccupancy(c, monthIso)
+    } finally { c.release() }
+  } catch (e: any) {
+    result.errors.push({ property_id: 'occupancy_activation', error: e?.message ?? String(e) })
+  }
+
   const properties = await query<{ id: string; landlord_id: string }>(`
     SELECT p.id, p.landlord_id FROM properties p
       JOIN landlords l ON l.id = p.landlord_id

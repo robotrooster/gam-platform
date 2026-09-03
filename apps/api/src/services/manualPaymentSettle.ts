@@ -19,6 +19,7 @@
 // why a corroborated tenant declaration beats the bank's own posting.
 
 import type { PoolClient } from 'pg'
+import { activateBillingForSettledRent } from './billingActivation'
 import { MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { chargeLandlord } from './landlordGamAccount'
 import type { ManualPaymentMethod } from '@gam/shared'
@@ -96,6 +97,23 @@ export async function settleManualRentPayment(
 
   const landlordCovers = payment.manual_fee_payer === 'landlord'
   const firstPayment = await isFirstSatisfiedRent(client, payment)
+
+  // ── S637 (Nic, DIRECTIVE): CASH IS GOING LIVE, TOO ──────────────────
+  //
+  // "You need to count manual logged transactions as well. It's not only money
+  // flowing through the system. It's money logged in the system."
+  //
+  // activateBillingForSettledRent was called from ONE place — the Stripe
+  // webhook. A landlord collecting cash never triggered it, so their
+  // onboarding grace never ended and the platform fee was never billed. Oak
+  // Park is the live example: three signed leases and Russ Fuller's rent
+  // settled in cash, with billing_starts_at still NULL.
+  //
+  // Same call the card path makes, in the same transaction that settles.
+  // The route refuses anything that is not rent before reaching here
+  // ("Only rent charges can be recorded as a manual payment"), and the helper
+  // re-checks type itself, so passing the id is enough.
+  await activateBillingForSettledRent(client, [payment.id])
 
   // S620 (Nic): the free first payment exists to help a landlord MIGRATE the
   // tenants they already have, not as a perk for everyone who signs up. The

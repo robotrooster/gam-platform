@@ -46,6 +46,9 @@ beforeEach(async () => {
     landlordId = l.landlordId
     propId = await seedProperty(c, { landlordId, ownerUserId: l.userId, managedByUserId: l.userId })
     await c.query(`UPDATE properties SET created_at = '2026-08-01' WHERE id = $1`, [propId])
+    // S637: past the onboarding grace, so these months are billable at all.
+    // The grace rule itself is covered separately below.
+    await c.query(`UPDATE landlords SET billing_starts_at = '2026-08-01' WHERE id = $1`, [landlordId])
     await c.query('COMMIT')
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 })
@@ -71,12 +74,14 @@ describe('a full-year figure is a RUNNING TOTAL, not a monthly charge', () => {
     expect(fees.get(propId)).toBe(20)
   })
 
-  it('eight units across Aug+Sep is $26 — $10 floored, then $16', async () => {
-    // Occupied from mid-August, so August bills the floor and September bills
-    // the full eight. Exactly the shape Nic was reading as one month.
+  it('an EMPTY August adds nothing — the $26 Nic saw was a phantom floor', async () => {
+    // The tenancies begin 1 September, so August had nobody in a spot. It used
+    // to be floored to $10 regardless, which is where Mountain View's \$26 came
+    // from: \$10 for a month it had no tenants, plus September's \$16. Under
+    // S631 an empty month bills nothing, so the running total is just \$16.
     await occupy(8, '2026-09-01')
     const fees = await platformFeesByProperty(landlordId, ['2026-08-01', '2026-09-01'])
-    expect(fees.get(propId)).toBe(26)
+    expect(fees.get(propId)).toBe(16)
   })
 })
 
@@ -87,5 +92,30 @@ describe('periodMonths is what decides which of the two you get', () => {
 
   it('no month means every elapsed month of the year', () => {
     expect(periodMonths(2026, null, new Date('2026-09-15'))).toHaveLength(9)
+  })
+})
+
+
+describe('S637 onboarding grace and the "only when money moves" floor', () => {
+  it('bills nothing while the landlord is still in grace', async () => {
+    await occupy(3, '2026-08-01')
+    await db.query(`UPDATE landlords SET billing_starts_at = NULL WHERE id = $1`, [landlordId])
+    const fees = await platformFeesByProperty(landlordId, ['2026-09-01'])
+    expect(fees.get(propId) ?? 0).toBe(0)
+  })
+
+  it('bills nothing for months before billing began', async () => {
+    await occupy(3, '2026-08-01')
+    await db.query(`UPDATE landlords SET billing_starts_at = '2026-09-01' WHERE id = $1`, [landlordId])
+    expect(await platformFeesByProperty(landlordId, ['2026-08-01']).then(f => f.get(propId) ?? 0)).toBe(0)
+    expect(await platformFeesByProperty(landlordId, ['2026-09-01']).then(f => f.get(propId) ?? 0)).toBe(10)
+  })
+
+  it('does NOT floor a month with nothing occupied — S631', async () => {
+    // No leases at all. The floor is what a transacting account pays when
+    // $2/unit lands under $10, never a subscription for an empty record.
+    await db.query(`UPDATE landlords SET billing_starts_at = '2026-08-01' WHERE id = $1`, [landlordId])
+    const fees = await platformFeesByProperty(landlordId, ['2026-09-01'])
+    expect(fees.get(propId) ?? 0).toBe(0)
   })
 })

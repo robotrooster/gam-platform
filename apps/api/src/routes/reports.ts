@@ -561,12 +561,32 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
                          AND EXTRACT(YEAR FROM i.due_date) = $2), 0) > 0`,
       [landlordId, year])
 
-    // Security deposits held
+    // ── S637: DEPOSITS HELD MEANS MONEY WE HOLD ────────────────────────
+    //
+    // Nic: "when I select Mountain View RV, the deposits held shows eight
+    // hundred dollars, and on Oak Park, it shows a thousand and fifty dollars
+    // for deposits held. We aren't holding any deposits at either property so
+    // far. So where is that pulling data from?"
+    //
+    // It summed units.security_deposit — the amount CONFIGURED on each
+    // occupied unit, which is what a deposit would be if one were taken. Not a
+    // penny of it had been collected. On a TAX page that is the worst possible
+    // place to state a number nobody is holding: a deposit is a liability, and
+    // this one was invented from a setting.
+    //
+    // security_deposits is the ledger of actual custody. Only rows that are
+    // genuinely held count — a refunded or forfeited deposit is no longer held,
+    // and a pending one was never collected.
     const depositStats = await queryOne<any>(`
-      SELECT COALESCE(SUM(security_deposit), 0) as total_deposits
-      FROM units WHERE landlord_id=$1 AND id IN (
-        SELECT unit_id FROM v_unit_occupancy WHERE is_occupied
-      )`, [landlordId])
+      SELECT COALESCE(SUM(sd.collected_amount), 0) AS total_deposits
+        FROM security_deposits sd
+        JOIN units u ON u.id = sd.unit_id
+       WHERE u.landlord_id = $1
+         -- The schema's own vocabulary: pending was never collected,
+         -- disbursed went back to the tenant, claimed was applied to damages.
+         -- Only funded and partial are still money in custody.
+         AND sd.status IN ('funded', 'partial')
+         AND sd.collected_amount > 0`, [landlordId])
 
     // Monthly breakdown
     const monthlyBreakdown = await query<any>(`

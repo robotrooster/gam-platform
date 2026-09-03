@@ -93,12 +93,22 @@ async function buildPlatformStack(opts: {
   }
 }
 
+// S637: the fee is billed IN ARREARS — the run on the 1st bills the month that
+// just ENDED (Nic: "we bill in arrears for all the active leases you had in
+// September"). Short stays make anything else impossible: nights/30 cannot be
+// counted before the month is over, so an advance run billed every nightly and
+// weekly space at zero.
+//
+// Every fixture below still describes MAY 2026. What moved is the day the job
+// runs: 1 June, billing May.
+const RUN_DATE = new Date('2026-06-01T08:00:00Z')
+
 describe('processPlatformFeeAccrual', () => {
   it('landlord-payer happy: 1 LT unit × $2 floored at $10 min, posts accrual + revenue ledger', async () => {
     const stack = await buildPlatformStack({
       unitCount: 1, platformFeePayer: 'landlord',
     })
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
     expect(result.errors).toHaveLength(0)
 
@@ -166,7 +176,7 @@ describe('processPlatformFeeAccrual', () => {
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.errors).toHaveLength(0)
 
     const rows = await db.query<{ total_amount: string; connect_min_topup: string }>(
@@ -186,7 +196,7 @@ describe('processPlatformFeeAccrual', () => {
     const stack = await buildPlatformStack({ unitCount: 3, platformFeePayer: 'landlord' })
     await db.query(`UPDATE landlords SET is_system = TRUE WHERE id = $1`, [stack.landlordId])
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.errors).toHaveLength(0)
 
     const accrual = await db.query<any>(
@@ -201,7 +211,7 @@ describe('processPlatformFeeAccrual', () => {
     const stack = await buildPlatformStack({
       unitCount: 6, platformFeePayer: 'landlord',
     })
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<{ total_billable: number; total_amount: string }>(
@@ -230,7 +240,7 @@ describe('processPlatformFeeAccrual', () => {
 
   it('every accrual posts against the landlord', async () => {
     const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
     const accrual = await db.query<{ payer: string }>(
       `SELECT payer FROM platform_fee_accruals WHERE property_id=$1`, [stack.propertyId])
@@ -241,9 +251,9 @@ describe('processPlatformFeeAccrual', () => {
     const stack = await buildPlatformStack({
       unitCount: 1, platformFeePayer: 'landlord',
     })
-    const r1 = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const r1 = await processPlatformFeeAccrual(RUN_DATE)
     expect(r1.feesAccrued).toBe(1)
-    const r2 = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const r2 = await processPlatformFeeAccrual(RUN_DATE)
     expect(r2.feesAccrued).toBe(0)
     expect(r2.skippedAlreadyAccrued).toBe(1)
 
@@ -312,7 +322,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<{
@@ -372,7 +382,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     // Nothing earned, nothing billable — so neither pass writes anything.
     expect(result.feesAccrued).toBe(0)
     expect(result.connectMinimumsApplied).toBe(0)
@@ -406,7 +416,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.connectMinimumsApplied).toBe(0)
     const accrual = await db.query(
       `SELECT id FROM platform_fee_accruals WHERE property_id=$1`, [propertyId!])
@@ -456,7 +466,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<any>(
@@ -494,7 +504,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<any>(
@@ -529,7 +539,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<any>(
@@ -566,7 +576,7 @@ describe('processPlatformFeeAccrual', () => {
       client.release()
     }
 
-    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
 
     const accrual = await db.query<any>(
@@ -644,7 +654,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   it('charges $2 for a space the landlord only supplies utilities to', async () => {
     const { propertyId } = await stackWithServicedSpace()
 
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
 
     const { rows } = await db.query<any>(
       `SELECT long_term_unit_count, utility_service_unit_count, total_billable
@@ -662,7 +672,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   it('stops charging once a lease supersedes the agreement', async () => {
     const { propertyId } = await stackWithServicedSpace({ superseded: true })
 
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
 
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count FROM platform_fee_accruals
@@ -673,7 +683,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   it('stops charging once the agreement has ended', async () => {
     const { propertyId } = await stackWithServicedSpace({ endDate: '2026-02-01' })
 
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
 
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
@@ -687,7 +697,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   // Park is paying the two dollars on that until the other landlord onboards."
   it('two utilities on one space is still $2, not $4', async () => {
     const { propertyId } = await stackWithServicedSpace({ meters: 2 })
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals WHERE property_id = $1`, [propertyId])
@@ -700,7 +710,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
   // agreement existing IS the statement that this space is on a utility charge.
   it('is charged even with no meter attached — trash is a flat rate', async () => {
     const { propertyId } = await stackWithServicedSpace({ meters: 0 })
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count FROM platform_fee_accruals
         WHERE property_id = $1`, [propertyId])
@@ -713,7 +723,7 @@ describe('utility-service spaces accrue the per-unit fee (S615)', () => {
     const { propertyId } = await stackWithServicedSpace()
     await db.query(
       `UPDATE utility_service_agreements SET payer_attested_at = NULL, payer_accepted_at = NULL`)
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT utility_service_unit_count FROM platform_fee_accruals
         WHERE property_id = $1`, [propertyId])
@@ -760,7 +770,7 @@ describe('short-stay nights bill in whole $2 blocks (S616)', () => {
 
   it('30 nights is one $2 block', async () => {
     const stack = await parkWithNights(30)
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT short_stay_nights, short_stay_equivalent FROM platform_fee_accruals
         WHERE property_id = $1`, [stack.propertyId])
@@ -771,7 +781,7 @@ describe('short-stay nights bill in whole $2 blocks (S616)', () => {
   // THE RULE. Not 32/30 of a block — two blocks.
   it('32 nights is TWO $2 blocks, not one and a fraction', async () => {
     const stack = await parkWithNights(32)
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT short_stay_nights, short_stay_equivalent FROM platform_fee_accruals
         WHERE property_id = $1`, [stack.propertyId])
@@ -781,7 +791,7 @@ describe('short-stay nights bill in whole $2 blocks (S616)', () => {
 
   it('a single night is a whole block — there is no proration downward either', async () => {
     const stack = await parkWithNights(1)
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT short_stay_equivalent FROM platform_fee_accruals WHERE property_id = $1`,
       [stack.propertyId])
@@ -790,7 +800,7 @@ describe('short-stay nights bill in whole $2 blocks (S616)', () => {
 
   it('61 nights is three blocks', async () => {
     const stack = await parkWithNights(61)
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows } = await db.query<any>(
       `SELECT short_stay_equivalent FROM platform_fee_accruals WHERE property_id = $1`,
       [stack.propertyId])
@@ -824,7 +834,7 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
       agreementId = sa.id
     } finally { client.release() }
 
-    await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    await processPlatformFeeAccrual(RUN_DATE)
     const { rows: before } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals WHERE property_id = $1`, [A.propertyId])
@@ -850,8 +860,9 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
         [agreementId, bLeaseId])
     } finally { c2.release() }
 
-    // A fresh cycle, so both properties accrue again.
-    await processPlatformFeeAccrual(new Date('2026-06-01T08:00:00Z'))
+    // A fresh cycle, so both properties accrue again. In arrears the 1 July
+    // run is the one that bills June — RUN_DATE above already billed May.
+    await processPlatformFeeAccrual(new Date('2026-07-01T08:00:00Z'))
 
     const { rows: aAfter } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable

@@ -103,6 +103,29 @@ export async function platformFeesByProperty(
      LIMIT 1`, [landlordId])
   const rate   = parseFloat(cfg?.rate ?? '2')
   const min    = parseFloat(cfg?.min ?? '10')
+
+  // ── S637: THE ESTIMATE MUST NOT BILL WHAT THE ACCRUAL WOULD NOT ─────
+  //
+  // Nic: "the full year is wrong because we didn't have anybody in the
+  // platform in August. So why would it show anything?"
+  //
+  // Two rules the accrual job obeys and this estimate did not, so reports
+  // quoted fees that were never going to be charged.
+  //
+  // ONBOARDING GRACE (S600). billing_starts_at is NULL while a landlord is
+  // still free — they pay nothing until they go live or hit the two-cycle cap.
+  // The accrual path gates on `billing_starts_at IS NOT NULL AND <= month`
+  // (jobs/platformFeeAccrual.ts:180). This estimated straight through it, so a
+  // landlord who owes nothing at all was quoted a fee.
+  // to_char, not a JS Date: node-postgres hands DATE back as a Date object, and
+  // String(...).slice(0,10) on one yields "Sat Jan 01" — which compares as
+  // LATER than every 'YYYY-MM-01' month string, so every month looked
+  // pre-billing and every fee came back zero. Format it in SQL and the two
+  // sides are the same shape by construction.
+  const grace = await queryOne<{ starts: string | null }>(
+    `SELECT to_char(billing_starts_at, 'YYYY-MM-01') AS starts
+       FROM landlords WHERE id = $1`, [landlordId])
+  const billingStarts = grace?.starts ?? null
   // S616 (Nic): 3%, down from 5%. The live figure comes from
   // platform_fee_config; this fallback only applies when no config row exists
   // at all, and it must not disagree with the seeded default or a fresh
@@ -178,6 +201,10 @@ export async function platformFeesByProperty(
   for (const r of est) {
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
+    // Still in onboarding grace, or this month predates the day billing began.
+    // An ACTUAL accrual (billed, above) is always honoured — if it was charged,
+    // it is owed, whatever the grace column says now.
+    if (!billingStarts || r.m < billingStarts) continue
     // S614: a serviced space counts exactly once, like any occupied unit.
     const billable = parseInt(r.long_term, 10)
       + parseInt(r.utility_service ?? '0', 10)
@@ -198,7 +225,14 @@ export async function platformFeesByProperty(
     for (const [k, v] of billed) if (k.endsWith(`|${m}`)) monthBilled = round2(monthBilled + v)
     const earned = round2(bucket.total + monthBilled)
     const shortfall = round2(min - earned)
-    if (shortfall > 0 && bucket.rows.length > 0) {
+    // S631 (Nic, DIRECTIVE): "We do ten dollars a month minimum, but only when
+    // money's moving through the system. Leaving it vacant forever as a ghost
+    // in the system is okay." The floor is what a TRANSACTING account pays when
+    // $2/unit lands under $10 — never a subscription for holding an empty
+    // record. applyConnectAccountMinimums already skips a group with nothing
+    // billable; this estimated a $10 floor onto months with zero occupied
+    // units, which is how an empty August acquired a fee.
+    if (shortfall > 0 && earned > 0 && bucket.rows.length > 0) {
       // Largest earner carries it, same rule as applyConnectAccountMinimums.
       const anchor = bucket.rows.reduce((a, b) => (b.fee > a.fee ? b : a), bucket.rows[0])
       anchor.fee = round2(anchor.fee + shortfall)
