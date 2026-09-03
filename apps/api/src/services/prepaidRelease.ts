@@ -137,7 +137,6 @@ async function releaseInner(
   for (const row of fresh.rows) {
     if (available <= 0.005) break
     const rowAmt = Number(row.amount)
-    const apply = Math.min(rowAmt, available)
     // S609: the landlord's money is anything owed under the lease — rent,
     // utilities, late fees, fees they billed. GAM's own charges are stamped at
     // creation and stay with GAM; a row with no unit has no property to resolve
@@ -147,35 +146,31 @@ async function releaseInner(
       row.revenue_owner === 'landlord' &&
       !!row.unit_id
 
-    if (apply >= rowAmt - 0.005) {
-      await client.query(
-        `UPDATE payments
-            SET status='settled', settled_at=NOW(), platform_held = $2,
-                notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
-          WHERE id = $1`, [row.id, landlordsMoney])
-      if (landlordsMoney) earned.push(row.id)
-    } else {
-      // Partly covered: the covered slice settles and a fresh row carries the
-      // remainder, so the ledger keeps saying what was paid ahead versus what is
-      // still owed rather than quietly rewriting the original amount.
-      const remainder = Math.round((rowAmt - apply) * 100) / 100
-      await client.query(
-        `UPDATE payments
-            SET amount = $2::numeric, status='settled', settled_at=NOW(), platform_held = $3,
-                notes = COALESCE(notes || ' — ', '') || 'partially covered by prepaid credit'
-          WHERE id = $1`, [row.id, apply.toFixed(2), landlordsMoney])
-      await client.query(
-        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                               type, amount, status, due_date, entry_description, notes, is_remainder)
-         SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                type, $2::numeric, 'pending', due_date, entry_description,
-                'Remainder after prepaid credit application', TRUE
-           FROM payments WHERE id = $1`,
-        [row.id, remainder.toFixed(2)])
-      if (landlordsMoney) earned.push(row.id)
-    }
-    available -= apply
-    consumed += apply
+    // S637 — MONEY PAID AHEAD DOES NOT SPLIT A CHARGE EITHER.
+    //
+    // Nic (DIRECTIVE): "we don't do partial payments." This did the same split
+    // as the landlord-credit path — covered slice settled, `Remainder after…`
+    // row inserted — and defended it in a comment as keeping "the ledger"
+    // honest, which is backwards: it rewrote the rent row instead of leaving
+    // the balance to carry.
+    //
+    // Prepaid money differs from a landlord credit in one way that matters: the
+    // tenant really did hand it over and GAM is holding it, so settling a bill
+    // out of it IS a real settlement and the landlord genuinely earns that
+    // month's share. That part is untouched. What changes is that a bill is
+    // cleared WHOLE or left alone, with the rest staying on the account as the
+    // tenant's money — exactly what a year's prepayment is supposed to do while
+    // it waits for next month's bill.
+    if (rowAmt > available + 0.005) continue
+
+    await client.query(
+      `UPDATE payments
+          SET status='settled', settled_at=NOW(), platform_held = $2,
+              notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
+        WHERE id = $1`, [row.id, landlordsMoney])
+    if (landlordsMoney) earned.push(row.id)
+    available -= rowAmt
+    consumed += rowAmt
     rowsCovered++
   }
 

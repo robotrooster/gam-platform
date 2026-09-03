@@ -28,7 +28,16 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
         u.unit_number,
         pr.id                                       AS property_id,
         pr.name                                     AS property_name,
-        SUM(i.total_amount - COALESCE(pd.paid, 0))::numeric AS balance,
+        -- S637 (Nic, DIRECTIVE): "It's a credit against the overall ledger."
+        -- Owed is charges MINUS what the landlord owes back. Credits used to
+        -- reach this number by faking a settled payment (the split), so the paid
+        -- column picked them up; now they are netted honestly and nothing pretends a
+        -- payment happened. GREATEST(...,0) because a credit larger than the
+        -- open balance leaves the tenant owing nothing, never a negative.
+        GREATEST(
+          SUM(i.total_amount - COALESCE(pd.paid, 0)) - COALESCE(MAX(cr.credit), 0),
+          0)::numeric                               AS balance,
+        COALESCE(MAX(cr.credit), 0)::numeric        AS credit_on_account,
         COUNT(*)::int                               AS open_invoices,
         MIN(i.due_date)                             AS oldest_due_date
       FROM invoices i
@@ -42,12 +51,21 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
          WHERE status = 'settled' AND invoice_id IS NOT NULL
          GROUP BY invoice_id
       ) pd ON pd.invoice_id = i.id
+      -- Credit balance is per TENANT, while this groups many invoices per
+      -- tenant — so it joins on tenant and is read with MAX (one value repeated
+      -- across the group), never SUM, which would subtract it once per invoice.
+      LEFT JOIN (
+        SELECT tenant_id, SUM(amount_remaining) AS credit
+          FROM tenant_credits
+         WHERE status = 'active' AND amount_remaining > 0
+         GROUP BY tenant_id
+      ) cr ON cr.tenant_id = t.id
       WHERE i.landlord_id = ANY($1::uuid[])
         AND i.status IN ('pending', 'partial')
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
       GROUP BY t.id, tu.first_name, tu.last_name, tu.phone, tu.email,
                u.unit_number, pr.id, pr.name
-      HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) > 0
+      HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) - COALESCE(MAX(cr.credit), 0) > 0
       ORDER BY balance DESC
     `, [landlordIds, scopedIds])
     res.json({ success: true, data: rows })

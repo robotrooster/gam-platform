@@ -278,6 +278,55 @@ describe('S622 carried-forward balance', () => {
     }
   })
 
+  // ── S637: A CREDIT REDUCES WHAT THE TENANT IS ASKED FOR ──────────────────
+  //
+  // Nic (DIRECTIVE): "It's a credit against the overall ledger." Credits stopped
+  // pre-settling charges, so the charge row stays whole and the credit sits on
+  // the account. If the pay-in-full gate did not net it, a tenant holding a
+  // credit would be told to pay the gross, refused when they paid what they
+  // actually owe, and take a late fee for a debt the LANDLORD owed THEM.
+  it('S637: a credit lowers the pay-in-full figure — paying the net is accepted', async () => {
+    await seedCharge(f, 800, '2026-09-01')
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'other')`,
+      [f.landlordId, f.tenantId, f.leaseId])
+
+    // Owed is 800 − 300 = 500. The gross would have been refused before netting.
+    const r = await charge(f, 500)
+    expect(r.appliedTotal).toBeGreaterThan(0)
+
+    // END STATE: the $800 is covered WHOLE by $500 cash + $300 credit, in one
+    // transaction. Nothing is left owed and the credit is spent — the tenant
+    // does not pay exactly what they owe and still show a balance.
+    const owed = await db.query<{ owed: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS owed FROM payments
+        WHERE lease_id=$1 AND status='pending'`, [f.leaseId])
+    expect(Number(owed.rows[0].owed)).toBe(0)
+
+    const credit = await db.query<{ r: string }>(
+      `SELECT amount_remaining::text AS r FROM tenant_credits WHERE lease_id=$1`, [f.leaseId])
+    expect(Number(credit.rows[0].r)).toBe(0)
+
+    // The one remainder row here is the ALLOCATION splitting $800 against $500
+    // of cash — not a credit splitting a charge. It is settled by the credit
+    // immediately, in the same transaction, so it is never an open partial.
+    const rem = await db.query<{ status: string }>(
+      `SELECT status FROM payments WHERE lease_id=$1 AND is_remainder = TRUE`, [f.leaseId])
+    for (const r of rem.rows) expect(r.status).toBe('settled')
+  })
+
+  it('S637: still refuses below the CREDITED figure — the rule holds, the number moved', async () => {
+    await seedCharge(f, 800, '2026-09-01')
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,300,300,'other')`,
+      [f.landlordId, f.tenantId, f.leaseId])
+    // 499.99 is still short of the 500 they owe. Pay-in-full is not softened by
+    // a credit — it is measured against the right number.
+    await expect(charge(f, 499.99)).rejects.toMatchObject({ statusCode: 422 })
+  })
+
   it('refuses every amount below the current charges, however close', async () => {
     await seedCarried(f, 1000, '2026-01-01')
     await seedCharge(f, 800, '2026-09-01')

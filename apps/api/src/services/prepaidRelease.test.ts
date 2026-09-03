@@ -151,24 +151,40 @@ describe('S609 prepaid release', () => {
     expect(Number(left.rows[0].remaining)).toBeCloseTo(11000, 2)
   })
 
-  it('a partly covered month settles the covered slice and leaves the rest owed', async () => {
+  // S637 (Nic, DIRECTIVE): "we don't do partial payments." This used to assert
+  // the SPLIT — $400 of prepaid carved a $1,000 month into a $400 settled slice
+  // and a $600 pending remainder, and the landlord was paid the slice.
+  //
+  // A month is now covered WHOLE or left alone, and $400 that cannot clear a
+  // $1,000 month stays banked as the tenant's money. Nothing is lost: the pay
+  // path nets prepaid off what the tenant is asked for (services/rentCharge.ts),
+  // so they are billed $600 and the $400 is spent settling the rest in the same
+  // transaction. The landlord is paid when the month is actually covered, not
+  // for a fraction of it.
+  it('S637: a month the prepaid cannot cover in full is left whole, and stays banked', async () => {
     await bankPrepaid(f, 400)
     const { invoiceId, paymentId } = await makeInvoiceWithRent(f, 1000)
-    await release(f, invoiceId)
+    const r = await release(f, invoiceId)
 
-    const covered = await db.query<{ amount: string; status: string }>(
+    // Nothing consumed, nothing settled, nothing split.
+    expect(r.consumed).toBeCloseTo(0, 2)
+    const charge = await db.query<{ amount: string; status: string }>(
       `SELECT amount::text, status FROM payments WHERE id = $1`, [paymentId])
-    expect(Number(covered.rows[0].amount)).toBeCloseTo(400, 2)
-    expect(covered.rows[0].status).toBe('settled')
+    expect(Number(charge.rows[0].amount)).toBeCloseTo(1000, 2)
+    expect(charge.rows[0].status).toBe('pending')
 
-    const remainder = await db.query<{ amount: string; status: string }>(
-      `SELECT amount::text, status FROM payments WHERE lease_id = $1 AND is_remainder = TRUE`,
+    const remainder = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE lease_id = $1 AND is_remainder = TRUE`,
       [f.leaseId])
-    expect(Number(remainder.rows[0].amount)).toBeCloseTo(600, 2)
-    expect(remainder.rows[0].status).toBe('pending')
+    expect(Number(remainder.rows[0].n)).toBe(0)
 
-    // The landlord earned only the covered slice.
-    expect(await ownerShare(paymentId)).toBeCloseTo(400, 2)
+    // Still the tenant's money, still held, and the landlord has earned nothing
+    // from a month nobody has paid for.
+    const left = await db.query<{ remaining: string }>(
+      `SELECT SUM(amount_remaining)::text AS remaining FROM lease_prepaid_credits WHERE lease_id = $1`,
+      [f.leaseId])
+    expect(Number(left.rows[0].remaining)).toBeCloseTo(400, 2)
+    expect(await ownerShare(paymentId)).toBeCloseTo(0, 2)
   })
 
   it('no prepaid credit is a clean no-op', async () => {

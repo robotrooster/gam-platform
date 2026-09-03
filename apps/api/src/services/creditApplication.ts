@@ -42,10 +42,26 @@ export interface CreditApplicationResult {
  *   'lease'   — every open row on the lease, whatever invoice it belongs to
  *               (what a landlord means by "forgive that late fee")
  *
- * A charge covered in full is marked settled. A charge covered in part is split:
- * the covered portion settles and a new pending row carries the remainder, so
- * the ledger keeps showing what was paid by credit versus what is still owed
- * rather than silently rewriting the original amount.
+ * S637 — A CREDIT NEVER SPLITS A CHARGE.
+ *
+ * Nic (DIRECTIVE, verbatim): "Credits do not fucking split charges. I just
+ * fucking said that. It's a credit against the overall ledger, not fucking
+ * settling partial payments. That's... we don't do partial payments."
+ *
+ * This used to cover a charge PARTLY: it rewrote the charge down to the covered
+ * slice, marked that slice settled, and inserted a fresh pending row for the
+ * remainder. Applying $37.60 to $440 of rent turned one rent charge into a
+ * $37.60 settled payment plus a $402.40 remainder — which is a split rent
+ * payment, the exact thing banned platform-wide, produced by the code meant to
+ * help. It also invented a settled rent payment that no money arrived for, and
+ * the dashboard's Collected MTD counts settled rent without asking whether cash
+ * moved, so a credit inflated collected rent.
+ *
+ * Now: a charge is covered in FULL or it is not touched. Whatever the credit
+ * cannot fully cover stays on the account as a balance — money the landlord
+ * owes the tenant — and the owed figures net it off (see routes/balances.ts).
+ * That is the rolling ledger: credits and debits in and out, and the balance
+ * moves. Nothing is settled until it is genuinely settled.
  */
 export async function applyCreditsToOpenCharges(
   client: PoolClient,
@@ -83,30 +99,21 @@ export async function applyCreditsToOpenCharges(
   for (const row of charges.rows) {
     if (available <= 0.005) break
     const rowAmt = Number(row.amount)
-    const apply = Math.min(rowAmt, available)
 
-    if (apply >= rowAmt - 0.005) {
-      await client.query(
-        `UPDATE payments SET status='settled', settled_at=NOW(),
-                notes = COALESCE(notes || ' — ', '') || 'covered by account credit'
-          WHERE id = $1`, [row.id])
-    } else {
-      const remainder = Math.round((rowAmt - apply) * 100) / 100
-      await client.query(
-        `UPDATE payments SET amount = $2::numeric, status='settled', settled_at=NOW(),
-                notes = COALESCE(notes || ' — ', '') || 'partially covered by account credit'
-          WHERE id = $1`, [row.id, apply.toFixed(2)])
-      await client.query(
-        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                               type, amount, status, due_date, entry_description, notes, is_remainder)
-         SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                type, $2::numeric, 'pending', due_date, entry_description,
-                'Remainder after account credit application', TRUE
-           FROM payments WHERE id = $1`,
-        [row.id, remainder.toFixed(2)])
-    }
-    available -= apply
-    consumed += apply
+    // S637: in FULL or not at all. A charge the credit cannot completely cover
+    // is skipped — not carved up — and the credit keeps looking for one it can
+    // clear. Anything left over stays on the account as a balance the owed
+    // figures net off, which is what "a credit against the overall ledger"
+    // means. `continue`, not `break`: a $40 credit that cannot clear this
+    // month's rent can still clear a $35 late fee sitting behind it.
+    if (rowAmt > available + 0.005) continue
+
+    await client.query(
+      `UPDATE payments SET status='settled', settled_at=NOW(),
+              notes = COALESCE(notes || ' — ', '') || 'covered by account credit'
+        WHERE id = $1`, [row.id])
+    available -= rowAmt
+    consumed += rowAmt
     rowsTouched++
   }
 

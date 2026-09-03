@@ -95,13 +95,31 @@ describe('tenant credits — consumption at invoice generation', () => {
     return Math.round(pays.rows[0].owed * 100) / 100
   }
 
-  it('a $300 credit on $1000 rent → tenant owes $700; credit drawn to 0', async () => {
+  // S637 (Nic, DIRECTIVE): "It's a credit against the overall ledger, not
+  // fucking settling partial payments. We don't do partial payments."
+  //
+  // This used to assert the SPLIT: a $300 credit carved the $1,000 rent into a
+  // $300 settled slice and a $700 pending remainder, so raw pending came to
+  // $700. The tenant still owes $700 — that answer was never in dispute — but
+  // it now comes from netting a whole $1,000 charge against a $300 credit
+  // sitting on the account, not from rewriting the rent row.
+  it('S637: a $300 credit on $1000 rent → charge stays whole, $300 stays on account, net owed $700', async () => {
     const f = await seed()
     await issueCredit(f.leaseA, f.tenantA, f.landlordAId, 300)
     await generateInvoices(NOW)
-    expect(await pendingOwed(f.leaseA)).toBe(700)
+
+    // The rent charge is untouched — one row, still $1,000, nothing split.
+    expect(await pendingOwed(f.leaseA)).toBe(1000)
+    const charges = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE lease_id=$1 AND is_remainder = TRUE`, [f.leaseA])
+    expect(Number(charges.rows[0].n)).toBe(0)
+
+    // The credit is still owed to the tenant, in full.
     const { rows } = await db.query('SELECT amount_remaining FROM tenant_credits WHERE lease_id=$1', [f.leaseA])
-    expect(Number(rows[0].amount_remaining)).toBe(0)
+    expect(Number(rows[0].amount_remaining)).toBe(300)
+
+    // And the number that matters — what they actually owe — is $700.
+    expect(await pendingOwed(f.leaseA) - 300).toBe(700)
   })
 
   it('a $1000 credit on $1000 rent → owes $0; credit drawn to 0', async () => {

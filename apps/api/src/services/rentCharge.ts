@@ -51,6 +51,7 @@ import type { PoolClient } from 'pg'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { applyCreditsToOpenCharges } from './creditApplication'
 import { allocateOldestFirst } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computePlatformCut, createRentPlatformCharge } from './stripeConnect'
@@ -280,7 +281,44 @@ export async function chargeLeaseBalance(
     const carriedOutstanding = Math.round(
       rows.filter((r: any) => r.type === 'carried_balance')
           .reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
-    const requiredInFull = Math.round((totalOutstanding - carriedOutstanding) * 100) / 100
+
+    // ── S637: A CREDIT IS MONEY THE LANDLORD OWES BACK, SO IT REDUCES THE ASK ──
+    //
+    // Nic (DIRECTIVE): "It's a credit against the overall ledger, not fucking
+    // settling partial payments." Credits no longer pre-settle or split charges,
+    // so a $1,000 rent charge stays a whole $1,000 row while a $300 credit sits
+    // on the account. Netted here, the tenant is asked for $700 — which is what
+    // they owe.
+    //
+    // THIS IS LOAD-BEARING, not cosmetic. Rent is pay-in-full, and the check
+    // below rejects anything under `requiredInFull`. Without this subtraction a
+    // tenant holding a credit would be told to pay the gross, refused when they
+    // paid the net, and take a late fee for a debt the landlord owed THEM.
+    // Netting must therefore happen before the pay-in-full gate, not after.
+    // BOTH kinds of credit count. A landlord-issued credit and money the tenant
+    // paid ahead are the same thing from the tenant's side — a balance the
+    // landlord owes back — and they live in two tables only because they were
+    // built months apart. Netting one and not the other would ask a tenant who
+    // prepaid to pay the gross, which is the exact bug being fixed here.
+    const creditRow = await client.query<{ credit: string }>(
+      `SELECT (
+         COALESCE((SELECT SUM(amount_remaining) FROM tenant_credits
+                    WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+                      AND (lease_id = $2 OR lease_id IS NULL)), 0)
+       + COALESCE((SELECT SUM(amount_remaining) FROM lease_prepaid_credits
+                    WHERE tenant_id = $1 AND amount_remaining > 0
+                      AND ($2::uuid IS NULL OR lease_id = $2)), 0)
+       )::text AS credit`,
+      [tenantId, leaseId ?? null])
+    const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
+
+    // The credit covers the lease's own charges first — those are what the
+    // pay-in-full rule and the eviction clock run on. Never below zero: a credit
+    // bigger than the bill leaves the rest on the account, it does not hand out
+    // change.
+    const requiredBeforeCredit = Math.round((totalOutstanding - carriedOutstanding) * 100) / 100
+    const creditToRequired = Math.min(creditAvailable, requiredBeforeCredit)
+    const requiredInFull = Math.round((requiredBeforeCredit - creditToRequired) * 100) / 100
 
     // UNDER-PAYMENT IS BLOCKED (Nic, standing directive). Rent is pay-in-full:
     // a partial can reset a landlord's eviction clock. This branch is the
@@ -526,6 +564,22 @@ export async function chargeLeaseBalance(
           WHERE id = ANY($2::uuid[]) AND tenant_charge_id IS NULL`,
         [fullyCoveredIds[0], unpaidAccruals.map(r => r.id)])
     }
+    // ── S637: SPEND THE CREDIT AS PART OF THIS PAYMENT ──────────────────────
+    //
+    // Netting the credit at the pay-in-full gate above is only half the job. The
+    // tenant was asked for $500 against an $800 charge because a $300 credit
+    // covers the rest — so allocation applies $500 of cash and leaves $300
+    // still open. Left there, the tenant would have paid exactly what they owed
+    // and STILL show a balance, with the credit sitting unspent beside it.
+    //
+    // The remainder is now something the credit CAN cover in full, so the same
+    // in-full-or-not-at-all rule clears it and draws the credit down. Cash and
+    // credit are one payment event; this is the second half of it, inside the
+    // same transaction so a tenant is never briefly both charged and credited.
+    if (leaseId && creditAvailable > 0) {
+      await applyCreditsToOpenCharges(client, { leaseId, scope: 'lease' })
+    }
+
     await client.query('COMMIT')
 
     if (!landlordConnectReady) {
