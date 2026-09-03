@@ -458,12 +458,24 @@ function Layout() {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
     }).then(r=>r.json()).then(r=>r.data)
   )
-  const { data: tenantMe } = useQuery('tenant-me-theme', () =>
-    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me', {
-      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
-    }).then(r=>r.json()).then(r=>r.data),
-    { staleTime: 60000 }
-  )
+  // S637: this one response decides the whole left nav, so a failure to fetch it
+  // cannot be allowed to look like an answer. It used to swallow everything —
+  // a 401, a 500, or the API simply being mid-restart during a deploy all came
+  // back as `undefined` from `.then(r => r.data)`, which read as "no unit, not
+  // approved" and collapsed a paying tenant's portal to a background-check
+  // screen. staleTime then held them there for a minute with no error and no
+  // way back. Throwing makes react-query treat a failure as a failure: it
+  // retries, and isError below keeps the nav open meanwhile.
+  const { data: tenantMe, isError: tenantMeFailed, isLoading: tenantMeLoading } =
+    useQuery('tenant-me-theme', async () => {
+      const r = await fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me', {
+        headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+      })
+      if (!r.ok) throw new Error(`tenants/me ${r.status}`)
+      const body = await r.json()
+      if (!body?.success) throw new Error(body?.error || 'tenants/me failed')
+      return body.data
+    }, { staleTime: 60000, retry: 3, refetchOnWindowFocus: true })
   const accent = tenantMe?.themeAccent || '#c9a227'
   const fontKey = tenantMe?.fontStyle || 'default'
   const fontFamily = FONTS[fontKey] || FONTS.default
@@ -496,7 +508,23 @@ function Layout() {
   // to take, for a tenancy that does not exist. They are here to look at a
   // utility bill and pay it.
   const isUtilityServicePayer = !!(tenantMe as any)?.utilityServiceAgreementId
-  const showFullNav = bgApproved || isExistingTenant || isUtilityServicePayer
+  // ── S637: THE NAV FAILS OPEN, NEVER CLOSED ──────────────────────────────
+  //
+  // Nic, with tenants who had already signed and already paid: "on the left
+  // column, it's only showing the application tab... everything's locked behind
+  // the application wall now."
+  //
+  // Collapsing to Application is a statement — "you are an applicant, go do a
+  // background check". It may only be made when the server has actually SAID
+  // so. While the answer is unknown (still loading, or the request failed) the
+  // honest state is the full nav, not the most restrictive one.
+  //
+  // Failing open costs nothing that matters: the nav is a list of links, and
+  // every page behind it authorises itself against the API. A link someone
+  // cannot use is a dead end; a hidden portal is a tenant who cannot pay rent.
+  // The screen was never the security boundary — the API response is.
+  const tenantMeUnknown = tenantMeLoading || tenantMeFailed || tenantMe === undefined
+  const showFullNav = tenantMeUnknown || bgApproved || isExistingTenant || isUtilityServicePayer
   // …and only what applies to them. Someone who buys electricity from this
   // landlord has no lease to read, no maintenance to request, no amenities to
   // reserve and no deposit — a nav full of doors that open onto nothing is its
