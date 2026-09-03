@@ -4785,20 +4785,20 @@ function OutreachHistory({ email }: { email: string }) {
         <div key={m.id} style={{ borderTop: '1px solid var(--border, #1e2530)', padding: '9px 0' }}>
           <button onClick={() => setOpen(open === m.id ? null : m.id)}
             style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none',
-              border: 'none', padding: 0, cursor: m.body_text ? 'pointer' : 'default', color: 'var(--t0)' }}>
+              border: 'none', padding: 0, cursor: m.bodyText ? 'pointer' : 'default', color: 'var(--t0)' }}>
             <div style={{ fontSize: '.83rem', fontWeight: 600 }}>{m.subject || '(no subject)'}</div>
             <div style={{ fontSize: '.73rem', color: 'var(--t3)' }}>
-              {when(m.created_at)}
+              {when(m.createdAt)}
               {m.status !== 'sent' && <span style={{ color: 'var(--red, #ef4444)' }}> · {m.status}</span>}
-              {m.last_event && <span> · {m.last_event}</span>}
+              {m.lastEvent && <span> · {m.lastEvent}</span>}
               {m.category === 'landlord_welcome_outreach' && <span> · automatic</span>}
-              {m.body_text && <span style={{ color: 'var(--gold)' }}> · {open === m.id ? 'hide' : 'read'}</span>}
+              {m.bodyText && <span style={{ color: 'var(--gold)' }}> · {open === m.id ? 'hide' : 'read'}</span>}
             </div>
           </button>
-          {open === m.id && m.body_text && (
+          {open === m.id && m.bodyText && (
             <div style={{ whiteSpace: 'pre-wrap', fontSize: '.8rem', color: 'var(--t2)',
               marginTop: 8, padding: '10px 12px', background: 'var(--bg3, #141a22)', borderRadius: 8,
-              lineHeight: 1.6 }}>{m.body_text}</div>
+              lineHeight: 1.6 }}>{m.bodyText}</div>
           )}
         </div>
       ))}
