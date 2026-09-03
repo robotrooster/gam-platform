@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -4592,6 +4592,30 @@ function VersionWatch() {
   )
 }
 
+
+// ── S637: EVERY OUT-OF-SHELL PAGE CAN SCROLL ────────────────────────
+//
+// The tenant shell is `.shell { height:100vh; overflow:hidden }` on a body
+// that is also locked, so a page rendered OUTSIDE it inherits a document that
+// cannot scroll and offers no scrolling ancestor of its own. Anything below
+// the fold is unreachable — invisible on desktop, fatal on a phone.
+//
+// S633 fixed the tenant signing page and named the reason it kept recurring:
+// "Fixing the file in front of me instead of asking where else that page
+// exists is what produced a one-off." It was still a one-off. Nine routes
+// render outside the shell here — login, signup, both password pages, email
+// verify, invite accept, POS onboarding, signing, and /background-check,
+// which is the screening flow every new applicant walks on a phone.
+//
+// Fixed for the class at the router. unlockScrollIfStandalone re-checks the
+// DOM for the shell on every navigation and is a no-op inside it, so signed-in
+// pages keep their own scrolling exactly as before.
+function ScrollUnlock() {
+  const location = useLocation()
+  useEffect(() => unlockScrollIfStandalone(), [location.pathname])
+  return null
+}
+
 function App() {
   const { token, loading } = useAuth()
   if (loading) return <div className="loading">Loading…</div>
@@ -4599,6 +4623,7 @@ function App() {
     <BrowserRouter>
       <VersionWatch/>
       <TelemetryPing />
+      <ScrollUnlock />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />

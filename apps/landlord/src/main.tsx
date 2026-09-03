@@ -13,7 +13,7 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
-import { installDatePickerAutoClose, startVersionWatch } from '@gam/shared'
+import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
@@ -188,13 +188,45 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
   return token ? <>{children}</> : <Navigate to="/login" replace />
 }
 
-export default function App() {
+export default 
+// ── S637: EVERY OUT-OF-SHELL PAGE CAN SCROLL ────────────────────────
+//
+// Nic, live: "I have invited another owner to Mountain View RV. They're in
+// there trying to fill out the thing right now, but they're saying they can't
+// scroll down or submit anything."
+//
+// Both portals lock the document on purpose — the app shell (.page-content
+// here) is the scrolling region. A page reached from an emailed link renders
+// OUTSIDE that shell, inherits a body that cannot scroll, and offers no
+// scrolling ancestor of its own, so anything below the fold is unreachable.
+// Desktop hides it entirely; it only ever shows up on a phone.
+//
+// S629 fixed this on the landlord signing page. S633 fixed it again on the
+// tenant one and said plainly why it kept coming back: "Fixing the file in
+// front of me instead of asking where else that page exists is what produced
+// a one-off." It was still a one-off — of the nine routes rendered outside
+// the shell (login, register, both password pages, email confirm, both invite
+// accepts, shelf labels, signing) exactly one had the unlock, and the
+// co-owner invite is the page an owner was sitting on unable to submit.
+//
+// So it is fixed for the CLASS, once, at the router. unlockScrollIfStandalone
+// checks the DOM for the shell at call time and is a no-op inside it, so an
+// authenticated route is untouched — and a page added next month inherits the
+// fix without anyone remembering to ask.
+function ScrollUnlock() {
+  const location = useLocation()
+  useEffect(() => unlockScrollIfStandalone(), [location.pathname])
+  return null
+}
+
+function App() {
   return (
     <QueryClientProvider client={qc}>
       <AuthProvider>
         <BrowserRouter>
           <TelemetryPing />
           <VersionWatch />
+          <ScrollUnlock />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
