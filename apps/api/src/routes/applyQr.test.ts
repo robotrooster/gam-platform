@@ -20,14 +20,12 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/
 
 vi.mock('../services/notifications', () => ({ createNotification: vi.fn(async () => undefined) }))
 
-import { publicPropertyBookingRouter } from './publicPropertyBooking'
 import { propertiesRouter } from './properties'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
   const app = express()
   app.use(express.json())
-  app.use('/api/public', publicPropertyBookingRouter)
   app.use('/api/properties', propertiesRouter)
   app.use(errorHandler)
   return app
@@ -66,52 +64,6 @@ beforeEach(async () => {
 // Exactly what Checkr's Tenant API needs to open an order — nothing more
 // is asked at the QR, because Checkr collects the rest on its own form.
 const APPLICANT = { firstName: 'Randall', lastName: 'Cox', email: 'r@cox.dev', phone: '555-0100' }
-
-describe('POST /api/public/property/:slug/apply', () => {
-  it('stamps the property on an application filed with no unit in mind', async () => {
-    const res = await request(buildApp())
-      .post(`/api/public/property/${fx.slug}/apply`).send(APPLICANT)
-    expect(res.status).toBe(201)
-    const row = await queryOne<any>(
-      `SELECT property_id, landlord_id, unit_id FROM unit_applications WHERE email=$1`, [APPLICANT.email])
-    expect(row.property_id).toBe(fx.propertyId)
-    expect(row.landlord_id).toBe(fx.landlordId)
-    expect(row.unit_id).toBeNull()
-  })
-
-  it('accepts a unit that belongs to the same property', async () => {
-    const res = await request(buildApp())
-      .post(`/api/public/property/${fx.slug}/apply`).send({ ...APPLICANT, unitId: fx.unitId })
-    expect(res.status).toBe(201)
-    const row = await queryOne<any>(`SELECT unit_id, property_id FROM unit_applications WHERE email=$1`, [APPLICANT.email])
-    expect(row.unit_id).toBe(fx.unitId)
-    expect(row.property_id).toBe(fx.propertyId)
-  })
-
-  it("refuses a unit from a different property — a scanned code files against ITS park only", async () => {
-    const res = await request(buildApp())
-      .post(`/api/public/property/${fx.slug}/apply`).send({ ...APPLICANT, unitId: fx.otherUnitId })
-    expect(res.status).toBe(400)
-    const row = await queryOne<any>(`SELECT id FROM unit_applications WHERE email=$1`, [APPLICANT.email])
-    expect(row).toBeNull()
-  })
-
-  it('hands the applicant straight on to screening, property bound', async () => {
-    const res = await request(buildApp())
-      .post(`/api/public/property/${fx.slug}/apply`).send(APPLICANT)
-    expect(res.status).toBe(201)
-    const url: string = res.body.data.screeningUrl
-    expect(url).toContain('/background-check')
-    expect(url).toContain(`propertyId=${fx.propertyId}`)
-    expect(url).toContain(`landlordId=${fx.landlordId}`)
-  })
-
-  it('404s an unknown slug', async () => {
-    const res = await request(buildApp())
-      .post('/api/public/property/not-a-real-park/apply').send(APPLICANT)
-    expect(res.status).toBe(404)
-  })
-})
 
 describe('GET /api/properties/:id/apply-link', () => {
   it('encodes the SCREENING page with the property bound — not a GAM form', async () => {

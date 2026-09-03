@@ -832,10 +832,20 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
     const rentRollIds = req.params.id === 'me' && req.user!.role === 'landlord'
       ? landlordScopeIds(req.user!)
       : [req.params.id]
-    const id = rentRollIds[0]
     if (!rentRollIds.every(x => canViewLandlordFinances(req.user, x))) {
       throw new AppError(403, 'Forbidden')
     }
+    // S637 (Nic): "The rent roll page has nothing... there's active leases on
+    // both properties at this point, so it should be showing something."
+    //
+    // The S633 conversion was done HALFWAY here, which is worse than not at
+    // all: it built the full entity set, authorised EVERY id in it — and then
+    // queried with `rentRollIds[0]`. So the permission check said "you may see
+    // both companies" and the query returned one, whichever sorted first. On an
+    // account with two companies the roll silently lost half the portfolio, and
+    // the Expected Monthly Rent KPI it exists to explain disagreed with it.
+    //
+    // A rent roll is a list of what is rented. It spans the account.
     const rows = await query<any>(`
       SELECT u.id AS unit_id, u.unit_number, u.status, u.rent_amount,
         p.id AS property_id, p.name AS property_name,
@@ -853,9 +863,9 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
         ORDER BY start_date DESC LIMIT 1
       ) l ON TRUE
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
-      WHERE u.landlord_id = $1
+      WHERE u.landlord_id = ANY($1::uuid[])
         AND u.status IN ('active','delinquent','suspended')
-      ORDER BY p.name, u.unit_number`, [id])
+      ORDER BY p.name, u.unit_number`, [rentRollIds])
     const total = rows.reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
     res.json({ success: true, data: { rows, total: Math.round(total * 100) / 100 } })
   } catch (e) { next(e) }

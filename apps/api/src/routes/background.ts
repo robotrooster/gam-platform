@@ -726,11 +726,20 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         bc.risk_score, bc.risk_level, bc.risk_flags,
         bc.provider_name, bc.provider_ref, bc.report_summary,
         u.email, u.phone,
-        un.unit_number, p.name as property_name
+        un.unit_number,
+        -- S636: a walk-up who scanned a property's QR code has NO unit — that
+        -- is the point of the code, they have not picked a space yet. This
+        -- resolved the property only through the unit, so every scanned
+        -- applicant showed a blank "Property / Unit" on the landlord's review
+        -- page and the binding the code exists to create was invisible.
+        -- The unit still wins when there is one; bc.property_id is what a
+        -- scan (and a pool intake) actually carries.
+        COALESCE(p.name, bcp.name) AS property_name
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
       LEFT JOIN units un ON un.id = bc.unit_id
       LEFT JOIN properties p ON p.id = un.property_id
+      LEFT JOIN properties bcp ON bcp.id = bc.property_id
       WHERE bc.landlord_id = $1
       ORDER BY bc.created_at DESC`, [req.user!.profileId])
     // S561: surface the landlord's per-check screening charge (Checkr cost +
