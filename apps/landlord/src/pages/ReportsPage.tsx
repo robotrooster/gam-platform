@@ -448,7 +448,7 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
         </div>
 
-        <div style={{ overflowY: 'auto', padding: '4px 2px 8px' }}>
+        <div style={{ overflowY: 'auto', minHeight: 0, padding: '4px 2px 8px' }}>
           {isLoading || !data ? (
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
@@ -791,9 +791,22 @@ const timeLabel = (iso: string) =>
 
 function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void }) {
   const [year, mo] = month.split('-').map(Number)
-  const { data, isLoading } = useQuery<MonthlyPL>(
-    ['monthly-pl', month],
-    () => apiGet(`/reports/monthly-pl?year=${year}&month=${mo}`),
+  // ── S637: A P&L BELONGS TO ONE COMPANY ──────────────────────────────
+  //
+  // Nic: "I can click on the line item down below that shows September's
+  // profit and loss. It just says loading. It doesn't show me which people
+  // made payments."
+  //
+  // /reports/monthly-pl refuses to answer for an account owning more than one
+  // company — a P&L is a per-entity artifact, so it will not silently blend
+  // two of them (reportEntity, S633). This modal never sent one, so for any
+  // multi-company account it 400'd on open. Every other report tab already
+  // carries the picker; this one was missed.
+  const [companyId, setCompanyId] = useState<string>('')
+  const { data, isLoading, error } = useQuery<MonthlyPL>(
+    ['monthly-pl', month, companyId],
+    () => apiGet(`/reports/monthly-pl?year=${year}&month=${mo}`
+      + (companyId ? `&landlordId=${companyId}` : '')),
   )
 
   // Group settled payments by their actual payment date.
@@ -818,8 +831,17 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
         </div>
 
-        <div style={{ overflowY: 'auto', padding: '4px 2px 8px' }}>
-          {isLoading || !data ? (
+        <div style={{ overflowY: 'auto', minHeight: 0, padding: '4px 2px 8px' }}>
+          <EntityPicker value={companyId} onChange={setCompanyId}
+            note="A profit and loss statement belongs to one company." />
+          {/* S637: a failure used to render as "Loading…" forever, because this
+              branch tested `!data` and an errored query has no data. That hid
+              the actual reason — here, a 400 naming exactly what was wrong. */}
+          {error ? (
+            <div className="alert alert-warning" style={{ margin: 12, fontSize: '.82rem' }}>
+              {(error as any)?.response?.data?.error || 'Could not load this statement.'}
+            </div>
+          ) : isLoading || !data ? (
             <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
           ) : (
             <>
