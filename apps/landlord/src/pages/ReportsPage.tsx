@@ -329,7 +329,22 @@ function OverviewTab() {
 function ByPropertyTab() {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
-  const [month, setMonth] = useState<number | null>(null) // null = full year
+  // ── S637: DEFAULT TO THIS MONTH, LIKE EVERY OTHER REPORT ────────────
+  //
+  // Nic: "we're showing platform fees that don't match the occupied total.
+  // We're showing a twenty dollar flat platform fee for three occupied units
+  // for Oak Park... it would be six dollars, but our minimum property amount
+  // is ten dollars, so it should be showing ten dollars."
+  //
+  // The arithmetic was right. This tab alone opened on the FULL YEAR, so the
+  // platform fee was a running total — Oak Park's \$20 is August's \$10 floor
+  // plus September's \$10, and Mountain View's \$26 is \$10 + \$16. Read as a
+  // current charge, both look inflated, and "Platform Fee" reads as a charge.
+  //
+  // The card header did say "Full year", but the owner statement and every
+  // other tab open on the current month, so this one was the surprise. Full
+  // year is still one click away in the picker.
+  const [month, setMonth] = useState<number | null>(now.getMonth() + 1)
   const [openProp, setOpenProp] = useState<{ id: string; name: string } | null>(null)
   const { can } = usePerms()
   const qs = `year=${year}${month ? `&month=${month}` : ''}`
