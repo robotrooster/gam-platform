@@ -643,7 +643,15 @@ describe('GET /api/reports/property-detail', () => {
     // A property that onboarded May 15, 2026 (real data — NOT backdated).
     const propId = await seedProperty(db as any, { landlordId: f.aLid, ownerUserId: f.aUid, managedByUserId: f.aUid })
     await db.query(`UPDATE properties SET created_at = '2026-05-15' WHERE id = $1`, [propId])
-    await seedUnit(db as any, { propertyId: propId, landlordId: f.aLid })
+    const onbUnit = await seedUnit(db as any, { propertyId: propId, landlordId: f.aLid })
+    // S637: give it a real tenancy from the day it onboarded. This used to be a
+    // bare unit, and May's $10 came from the floor being applied to a month
+    // with nobody in it — the behaviour S631 removed. The point of the test is
+    // that months BEFORE onboarding bill nothing; occupancy is what makes the
+    // month after it bill at all.
+    const onbLease = await seedLease(db as any, {
+      unitId: onbUnit, landlordId: f.aLid, status: 'active', startDate: '2026-05-15' })
+    await db.query(`UPDATE leases SET end_date = NULL WHERE id = $1`, [onbLease])
     // April — before onboarding → $0 (nothing in expenses).
     const apr = await request(buildApp())
       .get(`/api/reports/property-detail?propertyId=${propId}&year=2026&month=4`)
