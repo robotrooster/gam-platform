@@ -42,6 +42,61 @@ async function seed() {
 const mk = (over: any) => ({ category: 'repairs', amount: 100, expenseDate: '2026-08-10', ...over })
 
 describe('landlord expenses', () => {
+  // S637 (Nic, whose account owns Oak Park Motel and RV LLC AND Mountain View
+  // RV Park Ranch LLC): GET /expenses answered "You own more than one company.
+  // Choose which one this record belongs to." — on a LIST. The tab could not be
+  // opened at all by the only kind of account S633 exists to support, because
+  // the WRITE resolver was scoping the read.
+  //
+  // Reads span; writes name. Both halves are asserted here.
+  it('S637: an account owning TWO entities lists expenses from both', async () => {
+    const c = await db.connect()
+    let userId = '', llA = '', llB = ''
+    try {
+      await c.query('BEGIN')
+      const a = await seedLandlord(c); userId = a.userId; llA = a.landlordId
+      const propA = await seedProperty(c, { landlordId: llA, ownerUserId: userId, managedByUserId: userId })
+      await seedUnit(c, { propertyId: propA, landlordId: llA })
+      const b = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`, [userId])
+      llB = b.rows[0].id
+      const propB = await seedProperty(c, { landlordId: llB, ownerUserId: userId, managedByUserId: userId })
+      await seedUnit(c, { propertyId: propB, landlordId: llB })
+      await c.query(
+        `INSERT INTO landlord_expenses (landlord_id, property_id, category, amount, expense_date, description, status)
+         VALUES ($1,$2,'repairs',100,'2026-08-10','Company A roof','active'),
+                ($3,$4,'repairs',200,'2026-08-11','Company B fence','active')`,
+        [llA, propA, llB, propB])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    // profileId null — what auth.ts mints for a landlord since S633.
+    const token = jwt.sign({ userId, role: 'landlord', email: 'two@t.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    const all = await request(buildApp()).get('/api/expenses').set('Authorization', `Bearer ${token}`)
+    expect(all.status).toBe(200)
+    expect((all.body.data as any[]).map(e => e.description).sort())
+      .toEqual(['Company A roof', 'Company B fence'])
+
+    // ?entityId= still narrows — and still authorises through the same resolver.
+    const justB = await request(buildApp()).get(`/api/expenses?entityId=${llB}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(justB.status).toBe(200)
+    expect((justB.body.data as any[]).map(e => e.description)).toEqual(['Company B fence'])
+
+    // An entity the account does NOT own is still refused.
+    const foreign = await request(buildApp()).get(`/api/expenses?entityId=${randomUUID()}`)
+      .set('Authorization', `Bearer ${token}`)
+    expect(foreign.status).toBe(403)
+
+    // The WRITE half is unchanged: two companies, no target named → asked which.
+    const write = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${token}`)
+      .send(mk({ category: 'repairs', amount: 50, description: 'Ambiguous' }))
+    expect(write.status).toBe(400)
+    expect(String(write.body.error)).toMatch(/more than one company/i)
+  })
+
   it('creates a unit-linked expense', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${f.token}`)

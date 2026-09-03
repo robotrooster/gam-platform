@@ -8,7 +8,7 @@ import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { resolveLandlordTarget } from '../lib/landlordScope'
+import { resolveLandlordTarget, landlordScopeIds } from '../lib/landlordScope'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { queryOne } from '../db'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
@@ -41,14 +41,34 @@ function scope(req: any): string {
   // account's only company is used, and an account that owns several is asked
   // which rather than being silently put on whichever one the session sat on.
   // resolveLandlordTarget does the ownership check either way.
+  //
+  // WRITES ONLY. See readScope() for the read side — S633's two rules are
+  // "reads span, writes name", and using this resolver for a GET breaks the
+  // first one.
   return resolveLandlordTarget(req.user, req.query?.entityId ?? req.body?.landlordId, 'record')
+}
+
+/**
+ * S637 (Nic, on a two-company account): GET /expenses answered
+ * "You own more than one company. Choose which one this record belongs to."
+ * — on a LIST. The Expenses tab could not be opened at all by the only kind of
+ * account the S633 refactor existed to support.
+ *
+ * The write resolver was doing double duty here. A read spans every entity the
+ * account owns, narrowing only when `?entityId=` names one (and then only to an
+ * entity they actually own — the same authorisation, via the same resolver).
+ */
+function readScope(req: any): string[] {
+  const explicit = req.query?.entityId
+  if (explicit) return [resolveLandlordTarget(req.user, explicit, 'record')]
+  return landlordScopeIds(req.user)
 }
 
 // GET /api/expenses?from=&to=&propertyId=&unitId=
 expensesRouter.get('/', requireLandlord, async (req: any, res, next) => {
   try {
     const q = req.query
-    res.json({ success: true, data: await listLandlordExpenses(scope(req), {
+    res.json({ success: true, data: await listLandlordExpenses(readScope(req), {
       from: q.from, to: q.to, propertyId: q.propertyId, unitId: q.unitId,
     }) })
   } catch (e) { next(e) }

@@ -57,9 +57,19 @@ export async function createLandlordExpense(input: CreateExpenseInput) {
   return row
 }
 
-export async function listLandlordExpenses(landlordId: string, opts: { from?: string; to?: string; propertyId?: string; unitId?: string } = {}) {
-  const conds = ['e.landlord_id = $1', `e.status = 'active'`]
-  const params: any[] = [landlordId]
+/**
+ * S637: takes ONE entity id or the whole set the account owns.
+ *
+ * The read side of "an account is not an entity" (S633): a landlord who owns
+ * two companies has one book, and this list is a read. It was reached through
+ * resolveLandlordTarget, a WRITE resolver, which answers "you own more than one
+ * company, choose which" — correct when creating an expense, a 400 that blanks
+ * the Expenses tab when merely opening it.
+ */
+export async function listLandlordExpenses(landlordId: string | string[], opts: { from?: string; to?: string; propertyId?: string; unitId?: string } = {}) {
+  const ids = Array.isArray(landlordId) ? landlordId : [landlordId]
+  const conds = ['e.landlord_id = ANY($1::uuid[])', `e.status = 'active'`]
+  const params: any[] = [ids]
   if (opts.from) { params.push(opts.from); conds.push(`e.expense_date >= $${params.length}`) }
   if (opts.to)   { params.push(opts.to);   conds.push(`e.expense_date <= $${params.length}`) }
   if (opts.propertyId) { params.push(opts.propertyId); conds.push(`e.property_id = $${params.length}`) }
