@@ -232,7 +232,14 @@ export function LeasePage() {
               Your landlord has already signed. Open it to read the terms and add your signature.
             </div>
           </div>
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].token)}
+          {/* S637: was `.token`, a field GET /esign/pending has never returned —
+              it selects `d.id AS document_id`, so this navigated to
+              /sign/undefined and the API answered 500 ("invalid input syntax for
+              type uuid"). Eleven of those in one evening, which is what "people
+              have been waiting all day to sign" actually was. The identical bug
+              was fixed on the LANDLORD banner in S535 and this copy of it was
+              missed. */}
+          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Review &amp; Sign →
           </button>
@@ -317,7 +324,7 @@ export function LeasePage() {
             <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Document Awaiting Your Signature</div>
             <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{(pendingDocs as any[])[0].title} · {(pendingDocs as any[])[0].propertyName}</div>
           </div>
-          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].token)}
+          <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].documentId)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
             Sign Now →
           </button>

@@ -3948,8 +3948,20 @@ export function signingUrlFor(signer: { role: string; token?: string | null }, d
  * access to ONE document, which is precisely what was emailed to them.
  */
 const SIGNER_TOKEN_RE = /^[a-f0-9]{64}$/i
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 async function authOrSignerToken(req: any, res: any, next: any) {
   const supplied = String(req.params.documentId || '')
+  // S637: the path segment is either a document UUID or a 64-hex signer token.
+  // Anything else went straight through to a uuid-typed query and came back a
+  // 500 — "invalid input syntax for type uuid". Eleven of those in one evening,
+  // every one of them the literal string "undefined", from a Review & Sign
+  // button reading a field its endpoint does not return. The frontend bug is
+  // fixed; this makes the shape unreachable rather than merely unused, and a
+  // malformed link now says so instead of looking like the server fell over.
+  if (!SIGNER_TOKEN_RE.test(supplied) && !UUID_RE.test(supplied)) {
+    return res.status(404).json({ success: false, error: 'That signing link is not valid.' })
+  }
   if (!SIGNER_TOKEN_RE.test(supplied)) return requireAuth(req, res, next)
   try {
     const signer = await queryOne<any>(

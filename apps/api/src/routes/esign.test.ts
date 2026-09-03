@@ -3653,3 +3653,25 @@ describe('S636 GET /sign gives every signer the whole document', () => {
     expect(fields.some(x => x.mine === true)).toBe(true)
   })
 })
+
+// ── S637: a malformed signing link is a 404, not a 500 ────────────────────
+//
+// The tenant portal's "Review & Sign" button read `.token` off GET
+// /esign/pending, which returns `d.id AS document_id` and has never carried a
+// token — so it navigated to /sign/undefined. That string reached a uuid-typed
+// query and the API answered 500, "invalid input syntax for type uuid",
+// eleven times in one evening while people were trying to sign.
+//
+// The button is fixed. This makes the shape unreachable rather than merely
+// unused: anything that is neither a document UUID nor a 64-hex signer token is
+// refused up front, so the next caller that gets an id wrong sees a bad link
+// instead of a server error.
+describe('S637 — GET /esign/sign/:id rejects a malformed id cleanly', () => {
+  for (const bad of ['undefined', 'null', 'not-a-uuid', '12345']) {
+    it(`"${bad}" → 404, never 500`, async () => {
+      const res = await request(buildApp()).get(`/api/esign/sign/${bad}`)
+      expect(res.status).toBe(404)
+      expect(String(res.body.error)).toMatch(/not valid/i)
+    })
+  }
+})
