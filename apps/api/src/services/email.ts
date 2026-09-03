@@ -2019,6 +2019,48 @@ ${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
   )
 }
 
+// ── S636: A PLAIN NOTE FROM SUPPORT ──────────────────────────────────
+//
+// Nic: "How do I send an email from the GAM support? How do I type one up
+// and have it be sent from that? Last time I did it, I had you do it."
+//
+// Every other email in this file is triggered by an event, so there was no
+// way to send a person a one-off — which is why a human being had to ask an
+// assistant to do it. This is the primitive underneath that: a subject, some
+// paragraphs, out through `support@` so a reply reaches a person, and logged
+// in email_send_log exactly like every automated send.
+//
+// Deliberately no template, no branding, no footer beyond the signature. The
+// whole point is that it reads like a person wrote it, because one did.
+export async function emailSupportMessage(args: {
+  to: string
+  subject: string
+  /** One string per paragraph, in order. Plain text — escaped on the way in. */
+  paragraphs: string[]
+  /** Defaults to Nic; a compose UI would pass the sender's own name. */
+  signature?: string
+  ctx?: { landlordId?: string | null; userId?: string | null }
+}): Promise<string | null> {
+  const body = args.paragraphs
+    .filter(p => p.trim().length > 0)
+    .map(p => `  <p style="margin:0 0 16px">${escapeHtml(p)}</p>`)
+    .join('\n')
+  const sig = escapeHtml(args.signature || 'Nic Rhoades')
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:560px">
+${body}
+  <p style="margin:24px 0 0">${sig}<br>Gold Asset Management</p>
+</div>`
+  return send(args.to, args.subject, html,
+    {
+      category: 'support_message',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'user',
+      relatedEntityId: args.ctx?.userId ?? null,
+    },
+    'support',
+  )
+}
+
 // S631 (Nic): "Let's make a way to invite other admins to admin portal."
 //
 // Deliberately the plainest invitation GAM sends. No product pitch, no feature

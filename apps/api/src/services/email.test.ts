@@ -572,3 +572,65 @@ describe('S636 invite and activation emails include a copyable link', () => {
     expect(html).toContain('word-break:break-all')    // a 64-char token must wrap
   })
 })
+
+// ── S636: the one-off note from support ──────────────────────────────
+//
+// Nic: "How do I send an email from the GAM support? ... Last time I did
+// it, I had you do it." Every other sender here fires off an event, so a
+// human had to ask an assistant to send a person a message. This is the
+// primitive that ends that.
+describe('emailSupportMessage', () => {
+  it('goes out from support so a reply reaches a person', async () => {
+    await email.emailSupportMessage({
+      to: 'nancy@mailer-test.co', subject: 'Following up',
+      paragraphs: ['Hi Nancy,', 'Just checking in.'],
+    })
+    const call = (resendSendMock.mock.calls.at(-1) as any[])[0] as any
+    expect(String(call.from)).toContain('support@')
+    expect(call.subject).toBe('Following up')
+  })
+
+  it('renders one paragraph per line and drops empties', async () => {
+    await email.emailSupportMessage({
+      to: 'nancy@mailer-test.co', subject: 'S',
+      paragraphs: ['First.', '   ', 'Second.'],
+    })
+    const html = String(((resendSendMock.mock.calls.at(-1) as any[])[0] as any).html)
+    expect((html.match(/<p style="margin:0 0 16px">/g) || []).length).toBe(2)
+    expect(html).toContain('First.')
+    expect(html).toContain('Second.')
+  })
+
+  it('escapes what the sender typed — a stray < must not become markup', async () => {
+    await email.emailSupportMessage({
+      to: 'nancy@mailer-test.co', subject: 'S',
+      paragraphs: ['Rent is < 500 & due Friday'],
+    })
+    const html = String(((resendSendMock.mock.calls.at(-1) as any[])[0] as any).html)
+    expect(html).toContain('&lt; 500 &amp; due Friday')
+    expect(html).not.toContain('< 500 & due')
+  })
+
+  it('signs as Nic unless told otherwise', async () => {
+    // Distinct provider ids: email_send_log has a unique index on them, and
+    // reusing the default mock id makes the second write collide.
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_sig_a' }, error: null } as any)
+    await email.emailSupportMessage({ to: 'n@mailer-test.co', subject: 'S', paragraphs: ['Hi'] })
+    let html = String(((resendSendMock.mock.calls.at(-1) as any[])[0] as any).html)
+    expect(html).toContain('Nic Rhoades')
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_sig_b' }, error: null } as any)
+    await email.emailSupportMessage({
+      to: 'n@mailer-test.co', subject: 'S', paragraphs: ['Hi'], signature: 'Tyler Rhoades' })
+    html = String(((resendSendMock.mock.calls.at(-1) as any[])[0] as any).html)
+    expect(html).toContain('Tyler Rhoades')
+  })
+
+  it('logs the send like every automated one', async () => {
+    await email.emailSupportMessage({
+      to: 'logged@mailer-test.co', subject: 'Following up', paragraphs: ['Hi'] })
+    const { rows } = await db.query<any>(
+      `SELECT category, status FROM email_send_log WHERE to_email=$1`, ['logged@mailer-test.co'])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].category).toBe('support_message')
+  })
+})

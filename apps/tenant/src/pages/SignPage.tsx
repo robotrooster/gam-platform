@@ -4,7 +4,7 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso } from '@gam/shared'
+import { humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso, startVersionWatch } from '@gam/shared'
 import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -356,6 +356,35 @@ export function SignPage() {
     { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },
       onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
+  // ── S636: A SIGNING PAGE HEALS ITSELF, IT DOES NOT ASK ──────────────
+  //
+  // Mireya Fierro, MH 07 at Mountain View: she opened this page at 12:13 and
+  // the date-input fix deployed at 16:29. Her tab sat open in between, still
+  // running the old bundle, so every reminder we sent led back to code that
+  // could not work. Nic: "I don't know if they're still stuck on an
+  // unrefreshed version."
+  //
+  // The app-wide watch (S605) only OFFERS a reload on the poll — deliberately,
+  // because a landlord mid-way through adding 19 units must not have the page
+  // yanked. That reasoning does not hold here: every field and font on this
+  // page is already written to localStorage on each keystroke and restored on
+  // load, so a reload costs a signer nothing. And the offer banner sits at the
+  // bottom of the screen, behind the field-entry modal a signer is usually
+  // looking at — so in practice it was invisible to exactly the person who
+  // needed it.
+  //
+  // The one moment a reload WOULD destroy something is a signature already in
+  // flight, so that is the only case it waits for.
+  const submitInFlight = submitMut.isLoading || stage === 'done'
+  const inFlightRef = useRef(submitInFlight)
+  inFlightRef.current = submitInFlight
+  useEffect(() => startVersionWatch({
+    onUpdateAvailable: () => {
+      if (inFlightRef.current) return   // never interrupt a signature mid-send
+      window.location.reload()
+    },
+  }), [])
+
   // S234: decline path. The tenant can refuse a sent doc with a reason.
   // Backend voids the document on success — no path back.
   const [showDeclineModal, setShowDeclineModal] = useState(false)
