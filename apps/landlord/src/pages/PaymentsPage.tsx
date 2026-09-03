@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
@@ -7,11 +7,29 @@ import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
-import { X, AlertTriangle, CheckCircle, Clock, XCircle, Gift } from 'lucide-react'
+import { X, AlertTriangle, CheckCircle, Clock, XCircle, Gift, ChevronRight, ChevronDown } from 'lucide-react'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
+
+// S637 (Nic): "you have Jonathan Covey for rent, Jonathan Covey for trash,
+// Jonathan Covey for electricity, Jonathan Covey for water, Jonathan Covey for
+// another trash can... They're only supposed to have one trash can."
+//
+// Those two $25 rows are two MONTHS of trash (Aug + Sep), not two cans — but
+// the table showed `entry_description`, a wire-format literal that reads
+// "UTILITY" for every one of them, so the only thing distinguishing them was
+// the amount. Two identical amounts therefore read as a duplicate bill. The
+// period was in `notes` the whole time and no column showed it.
+//
+// One description for a charge, everywhere it is listed: the note the biller
+// wrote, else the humanised type. Never the wire literal.
+function chargeLabel(p: any): string {
+  const note = String(p.notes ?? '').trim()
+  if (note) return note.split(' — work trade')[0]
+  return humanize(p.type)
+}
 
 // S262: actual amount the landlord received (gross - amount retained
 // by GAM for the tenant's outstanding balances). When supersedence
@@ -391,6 +409,13 @@ export function PaymentsPage() {
   const [selected, setSelected] = useState<any>(null)
   const [search, setSearch] = useState('')
   const [propertyName, setPropertyName] = useState('')
+  // S637: which household rows are expanded to show what makes up the balance.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggleExpanded = (k: string) => setExpanded(prev => {
+    const next = new Set(prev)
+    next.has(k) ? next.delete(k) : next.add(k)
+    return next
+  })
   const [creditOpen, setCreditOpen] = useState(false)
   const [creditNotice, setCreditNotice] = useState<string | null>(null)
   const navigate = useNavigate()
@@ -451,6 +476,37 @@ export function PaymentsPage() {
       String(a.earliestDue ?? '').localeCompare(String(b.earliestDue ?? '')))
   })()
 
+  // S637 (Nic): "you are showing the outstanding balances of tenants near the
+  // top... But then down below, you're showing each line item as a separate
+  // charge."
+  //
+  // S636 consolidated what is OWED into one row per household and then left the
+  // full itemised table underneath untouched — so every charge that had just
+  // been summed into a household row was listed again below it, individually.
+  // The consolidation did not replace the duplication, it sat on top of it.
+  //
+  // The two tables answer different questions and must not overlap: the top one
+  // is WHAT IS OWED (grouped, actionable, expandable to its line items); the
+  // bottom is WHAT HAPPENED (itemised, historical, read-only). A charge belongs
+  // to exactly one of them, and anything the grouping deliberately skipped
+  // gets its own band rather than being dropped into whichever table is left.
+  const groupedIds = new Set<string>(
+    outstandingGroups.flatMap((g: any) => g.charges.map((c: any) => c.id)))
+
+  // S637: a work-trade-suspended charge is neither. The grouping skips it
+  // because it is NOT money owed (the hours cover it — see the covered_charges
+  // set carried in from the invite), and it has not happened yet either, so
+  // listing it as history would be a lie in the other direction. It gets said
+  // out loud, in its own band, rather than being quietly filed under a heading
+  // that misdescribes it.
+  const workTradeCharges = filteredPayments.filter((p: any) =>
+    !groupedIds.has(p.id) && p.workTradeSuspendedAt && OUTSTANDING.has(p.status))
+  const workTradeIds = new Set<string>(workTradeCharges.map((p: any) => p.id))
+  const historyPayments = filteredPayments.filter((p: any) =>
+    !groupedIds.has(p.id) && !workTradeIds.has(p.id))
+  const totalOutstanding = outstandingGroups.reduce((sum: number, g: any) => sum + g.total, 0)
+  const totalWorkTrade = workTradeCharges.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
+
   return (
     <div>
       <div className="page-header">
@@ -482,61 +538,140 @@ export function PaymentsPage() {
         <PropertySelect value={propertyName} onChange={setPropertyName} properties={propertyOptions} />
       </div>
 
-      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-        {isLoading ? (
-          <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
-        ) : (
-          <>
-          {/* S636 (Nic): what each household OWES, as one line. Clicking it
-              records against the whole balance — the same all-or-nothing a card
-              payment does. The itemised table below is history. */}
-          {outstandingGroups.length > 0 && (
-            <div className="card" style={{ padding: 0, marginBottom: 16 }}>
-              <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
-                            fontSize: '.78rem', fontWeight: 700, color: 'var(--text-2)' }}>
-                Outstanding balances — {outstandingGroups.length} household{outstandingGroups.length === 1 ? '' : 's'}
-                <span style={{ fontWeight: 400, color: 'var(--text-3)', marginLeft: 8 }}>
-                  recording a payment settles the whole balance
-                </span>
-              </div>
-              <table className="data-table" style={{ minWidth: 720 }}>
-                <thead>
-                  <tr>
-                    <th>Oldest due</th><th>Unit</th><th>Tenant</th>
-                    <th>Charges</th><th>Balance</th><th></th>
+      {isLoading ? (
+        <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
+      ) : (
+        <>
+        {/* ── WHAT IS OWED ────────────────────────────────────────────────
+            S636/S637 (Nic): one line per household, and clicking Record
+            payment settles the whole balance — the same all-or-nothing a card
+            payment does. The chevron opens the charges that make the balance
+            up, so the detail is one click away instead of a second table. */}
+        {outstandingGroups.length > 0 && (
+          <div className="card" style={{ padding: 0, marginBottom: 18, overflowX: 'auto' }}>
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
+                          display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-1)' }}>
+                Outstanding balances
+              </span>
+              <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+                {outstandingGroups.length} household{outstandingGroups.length === 1 ? '' : 's'} · recording a payment settles the whole balance
+              </span>
+              <span className="mono" style={{ marginLeft: 'auto', fontSize: '.9rem', fontWeight: 700 }}>
+                {fmt(totalOutstanding)}
+              </span>
+            </div>
+            <table className="data-table" style={{ minWidth: 760 }}>
+              <thead>
+                <tr>
+                  <th style={{ width: 32 }}></th>
+                  <th>Oldest due</th><th>Unit</th><th>Tenant</th>
+                  <th>Charges</th><th>Balance</th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {outstandingGroups.map((g: any) => {
+                  const isOpen = expanded.has(g.key)
+                  return (
+                  <Fragment key={g.key}>
+                  <tr onClick={() => toggleExpanded(g.key)} style={{ cursor: 'pointer' }}>
+                    <td style={{ color: 'var(--text-3)' }}>
+                      {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    </td>
+                    <td className="mono" style={{ fontSize: '.78rem' }}>
+                      {g.earliestDue ? new Date(g.earliestDue).toLocaleDateString() : '—'}
+                    </td>
+                    <td className="mono">{g.unitNumber || '—'}</td>
+                    <td style={{ fontSize: '.8rem' }}>
+                      {`${g.tenantFirst ?? ''} ${g.tenantLast ?? ''}`.trim() || '—'}
+                      {/* Unit numbers repeat across parks — name the property. */}
+                      {g.propertyName && (
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{g.propertyName}</div>
+                      )}
+                    </td>
+                    <td style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+                      {g.charges.length} charge{g.charges.length === 1 ? '' : 's'}
+                    </td>
+                    <td className="mono" style={{ fontWeight: 700 }}>{fmt(g.total)}</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <button className="btn btn-primary btn-sm"
+                        onClick={e => { e.stopPropagation(); setSelected({ ...g.charges[0], _groupTotal: g.total, _groupCount: g.charges.length }) }}>
+                        Record payment
+                      </button>
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {outstandingGroups.map((g: any) => (
-                    <tr key={g.key}>
-                      <td className="mono" style={{ fontSize: '.78rem' }}>
-                        {g.earliestDue ? new Date(g.earliestDue).toLocaleDateString() : '—'}
+                  {isOpen && g.charges.map((c: any) => (
+                    <tr key={c.id} style={{ background: 'var(--bg-3)' }}>
+                      <td></td>
+                      <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+                        {c.dueDate ? new Date(c.dueDate).toLocaleDateString() : '—'}
                       </td>
-                      <td className="mono">{g.unitNumber || '—'}</td>
-                      <td style={{ fontSize: '.8rem' }}>
-                        {`${g.tenantFirst ?? ''} ${g.tenantLast ?? ''}`.trim() || '—'}
-                        {/* Unit numbers repeat across parks — name the property. */}
-                        {g.propertyName && (
-                          <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{g.propertyName}</div>
-                        )}
+                      <td colSpan={3} style={{ fontSize: '.76rem', color: 'var(--text-2)' }}>
+                        {chargeLabel(c)}
                       </td>
-                      <td style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
-                        {g.charges.map((c: any) => humanize(c.type)).join(', ')}
-                      </td>
-                      <td style={{ fontWeight: 700 }}>{fmt(g.total)}</td>
-                      <td style={{ textAlign: 'right' }}>
-                        <button className="btn btn-primary btn-sm"
-                          onClick={() => setSelected({ ...g.charges[0], _groupTotal: g.total, _groupCount: g.charges.length })}>
-                          Record payment
-                        </button>
-                      </td>
+                      <td className="mono" style={{ fontSize: '.78rem' }}>{fmt(c.amount)}</td>
+                      <td></td>
                     </tr>
                   ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                  </Fragment>
+                )})}
+              </tbody>
+            </table>
+          </div>
+        )}
 
+        {/* ── COVERED BY WORK TRADE ───────────────────────────────────────
+            Not owed, not paid. Shown so the landlord can see the hours are
+            doing their job instead of wondering why a charge vanished. */}
+        {workTradeCharges.length > 0 && (
+          <div className="card" style={{ padding: 0, marginBottom: 18, overflowX: 'auto' }}>
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
+                          display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-1)' }}>
+                Covered by work trade
+              </span>
+              <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+                suspended until month close — not owed by the tenant
+              </span>
+              <span className="mono" style={{ marginLeft: 'auto', fontSize: '.9rem', fontWeight: 700, color: 'var(--text-3)' }}>
+                {fmt(totalWorkTrade)}
+              </span>
+            </div>
+            <table className="data-table" style={{ minWidth: 720 }}>
+              <thead>
+                <tr><th>Due</th><th>Unit</th><th>Tenant</th><th>Description</th><th>Amount</th></tr>
+              </thead>
+              <tbody>
+                {workTradeCharges.map((p: any) => (
+                  <tr key={p.id} onClick={() => setSelected(p)} style={{ cursor: 'pointer' }}>
+                    <td className="mono" style={{ fontSize: '.78rem' }}>
+                      {p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}
+                    </td>
+                    <td className="mono">{p.unitNumber || '—'}</td>
+                    <td style={{ fontSize: '.8rem' }}>
+                      {`${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() || '—'}
+                      {p.propertyName && (
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{p.propertyName}</div>
+                      )}
+                    </td>
+                    <td style={{ fontSize: '.74rem', color: 'var(--text-3)', maxWidth: 320 }}>{chargeLabel(p)}</td>
+                    <td className="mono" style={{ color: 'var(--text-3)' }}>{fmt(p.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* ── WHAT HAPPENED ───────────────────────────────────────────────
+            History only. Every charge summed into a household row above is
+            excluded here (S637) — it is the same money, and listing it twice
+            is what made this page unreadable. */}
+        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
+                        fontSize: '.82rem', fontWeight: 700, color: 'var(--text-1)' }}>
+            Payment history
+          </div>
           <table className="data-table" style={{ minWidth: 880 }}>
             <thead>
               <tr>
@@ -544,14 +679,14 @@ export function PaymentsPage() {
                 <th>Unit</th>
                 <th>Tenant</th>
                 <th>Type</th>
+                <th>Description</th>
                 <th>Amount</th>
                 <th>Status</th>
-                <th>Entry Desc</th>
                 <th>Return</th>
               </tr>
             </thead>
             <tbody>
-              {filteredPayments.length ? filteredPayments.map((p: any) => {
+              {historyPayments.length ? historyPayments.map((p: any) => {
                 const partial = isPartial(p)
                 const net = netToBank(p)
                 return (
@@ -564,6 +699,10 @@ export function PaymentsPage() {
                   <td className="mono">{p.unitNumber || '—'}</td>
                   <td style={{ fontSize: '.8rem' }}>{(p.tenantFirst || p.tenantLast) ? `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() : '—'}</td>
                   <td><span className="badge badge-muted">{humanize(p.type)}</span></td>
+                  {/* S637: the note the biller wrote — "Trash — 2026-08" — not
+                      the `UTILITY` wire literal that made every utility row
+                      look identical. */}
+                  <td style={{ fontSize: '.74rem', color: 'var(--text-3)', maxWidth: 320 }}>{chargeLabel(p)}</td>
                   <td className="mono" style={{ color: 'var(--text-0)' }}>
                     {/* S262: when supersedence diverted part of the gross,
                         show the NET (what landed in the landlord's bank)
@@ -584,7 +723,6 @@ export function PaymentsPage() {
                       <span className="badge badge-amber" style={{ marginLeft: 6 }}>partial</span>
                     )}
                   </td>
-                  <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{p.entryDescription}</td>
                   <td>
                     {p.returnCode
                       ? <span className={'badge ' + (p.zeroToleranceFlag ? 'badge-red' : 'badge-amber')}>{p.returnCode}</span>
@@ -594,15 +732,19 @@ export function PaymentsPage() {
               )}) : (
                 <tr>
                   <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
-                    {(payments as any[]).length ? 'No payments match your filters.' : 'No payments yet.'}
+                    {(payments as any[]).length
+                      ? ((outstandingGroups.length || workTradeCharges.length)
+                          ? 'Nothing settled yet — every open charge is listed above.'
+                          : 'No payments match your filters.')
+                      : 'No payments yet.'}
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
-          </>
-        )}
-      </div>
+        </div>
+        </>
+      )}
 
       {selected && <PaymentDetailModal payment={selected} onClose={() => setSelected(null)}
         canRecord={can('take_payment')}

@@ -7,6 +7,7 @@ import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQU
          RENT_COMPONENT_KINDS } from '@gam/shared'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { logger } from '../lib/logger'
@@ -230,8 +231,20 @@ leasesRouter.get('/', async (req, res, next) => {
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isTeamRole = role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance'
-    if (role === 'landlord') {
-      rows = await query<any>(`
+    if (role === 'landlord' || isTeamRole) {
+      // S637 (Nic): "why the fuck is it only showing the Oak Park leases...
+      // it's not showing any of the Mountain View ones."
+      //
+      // This branch filtered on `l.landlord_id = req.user.profileId` — the
+      // pre-S633 "the session IS one company" assumption. An account that owns
+      // two companies saw exactly one of them, and a post-S633 landlord (whose
+      // profileId is now NULL by design) would see none at all. Reads span
+      // every entity the account owns; landlordScopeIds() is that set, and it
+      // is refreshed from landlord_members on every request so an entity added
+      // after login still resolves. Team roles keep their single scope through
+      // the same helper.
+      const scope = landlordScopeIds(req.user!)
+      rows = scope.length === 0 ? [] : await query<any>(`
         SELECT l.*,
           (SELECT amount FROM lease_fees lf
             WHERE lf.lease_id = l.id
@@ -251,32 +264,8 @@ leasesRouter.get('/', async (req, res, next) => {
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
         LEFT JOIN tenant_autopay ap ON ap.lease_id = l.id
-        WHERE l.landlord_id = $1
-        ORDER BY l.start_date DESC`, [req.user!.profileId])
-    } else if (isTeamRole && req.user!.landlordId) {
-      // Team members see leases under the landlord they're scoped to.
-      rows = await query<any>(`
-        SELECT l.*,
-          (SELECT amount FROM lease_fees lf
-            WHERE lf.lease_id = l.id
-              AND lf.fee_type = 'security_deposit'
-              AND lf.due_timing = 'move_in'
-            LIMIT 1) AS security_deposit,
-          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name,
-          -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
-          -- payment is scheduled and on which day, so a quiet lease does not
-          -- read as a tenant who stopped paying. They can never CHANGE it — a
-          -- landlord able to move the date could manufacture late fees, which
-          -- is why the setting lives on its own tenant-owned table and no
-          -- landlord route writes to it. Do not add one.
-          ap.enabled AS autopay_enabled,
-          ap.pull_day AS autopay_pull_day
-        FROM leases l
-        JOIN units u ON u.id = l.unit_id
-        JOIN properties p ON p.id = u.property_id
-        LEFT JOIN tenant_autopay ap ON ap.lease_id = l.id
-        WHERE l.landlord_id = $1
-        ORDER BY l.start_date DESC`, [req.user!.landlordId])
+        WHERE l.landlord_id = ANY($1::uuid[])
+        ORDER BY l.start_date DESC`, [scope])
     } else if (role === 'tenant') {
       rows = await query<any>(`
         SELECT DISTINCT l.*, u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name

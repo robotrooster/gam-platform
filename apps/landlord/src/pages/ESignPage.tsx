@@ -1578,6 +1578,25 @@ export function ESignPage() {
   const [docPropertyName, setDocPropertyName] = useState('')
   const docPropertyOptions = (documents as any[]).map(d => ({ id: d.propertyName, name: d.propertyName }))
   const dq = docSearch.trim().toLowerCase()
+
+  // S637 (Nic, DIRECTIVE): "all the ones that are completed need to be bumped
+  // to the bottom. The in progress ones need to be in the middle, and the ones
+  // that are sent and need to be signed by me first need to be at the top."
+  //
+  // This is a WORK QUEUE, and it was sorted newest-first — so the row he had to
+  // act on sat wherever its creation date happened to land, under a pile of
+  // finished leases. Ordering by what is OWED puts his own signature at the
+  // top every time. Voided sits below completed (deader than done); drafts sit
+  // between awaiting-others and completed, since they are still open work but
+  // nobody is waiting on a countersignature yet. Newest-first is preserved
+  // WITHIN each band, so the old ordering still reads through.
+  const queueRank = (d: any): number => {
+    if (d.status === 'voided') return 4
+    if (d.status === 'completed') return 3
+    if (d.status === 'draft') return 2
+    // sent / in_progress — the landlord's own signature outranks everything.
+    return d.landlordMustSign ? 0 : 1
+  }
   const filteredDocs = (documents as any[]).filter(d => {
     const matchProperty = docPropertyName === '' || d.propertyName === docPropertyName
     if (!matchProperty) return false
@@ -1586,6 +1605,10 @@ export function ESignPage() {
       || (d.unitNumber || '').toLowerCase().includes(dq)
       || (d.propertyName || '').toLowerCase().includes(dq)
       || (d.documentType ? humanize(d.documentType).toLowerCase().includes(dq) : false)
+  }).sort((a, b) => {
+    const r = queueRank(a) - queueRank(b)
+    if (r !== 0) return r
+    return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
   })
 
   const deleteTemplateMut = useMutation(

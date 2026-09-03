@@ -306,6 +306,64 @@ describe('GET /leases — list scoping', () => {
     expect(res.body.data).toEqual([])
   })
 
+  // S637 (Nic): "why the fuck is it only showing the Oak Park leases that are
+  // signed? It's not showing any of the Mountain View ones."
+  //
+  // He owns two companies — Oak Park Motel and RV LLC and Mountain View RV Park
+  // Ranch LLC — under ONE account. This list filtered on `profileId`, the
+  // pre-S633 "the session IS one company" id, so it answered for whichever
+  // entity the token happened to name and silently dropped the other. Post-S633
+  // a landlord's profileId is NULL by design, so the same query would have
+  // returned nothing at all once his token refreshed.
+  //
+  // Reads span every entity the account owns. This is the test that says so.
+  it('S637: an account owning TWO entities sees the leases of both', async () => {
+    const client = await db.connect()
+    let leaseA = '', leaseB = '', userId = ''
+    try {
+      await client.query('BEGIN')
+      // Entity A, with its own property/unit/lease.
+      const a = await seedLandlord(client)
+      userId = a.userId
+      const propA = await seedProperty(client, { landlordId: a.landlordId, ownerUserId: a.userId, managedByUserId: a.userId })
+      const unitA = await seedUnit(client, { propertyId: propA, landlordId: a.landlordId })
+      leaseA = await seedLease(client, { unitId: unitA, landlordId: a.landlordId, status: 'active' })
+
+      // Entity B — SAME user, second company. This is the shape that broke:
+      // one login, two `landlords` rows.
+      const bRes = await client.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, billing_starts_at) VALUES ($1, DATE '2000-01-01') RETURNING id`,
+        [a.userId])
+      const landlordB = bRes.rows[0].id
+      const propB = await seedProperty(client, { landlordId: landlordB, ownerUserId: a.userId, managedByUserId: a.userId })
+      const unitB = await seedUnit(client, { propertyId: propB, landlordId: landlordB })
+      leaseB = await seedLease(client, { unitId: unitB, landlordId: landlordB, status: 'active' })
+      // seedProperty names every property 'Test Property'; the page's filter
+      // keys on the name, so give them the two he actually has.
+      await client.query(`UPDATE properties SET name='Oak Park Motel and RV' WHERE id=$1`, [propA])
+      await client.query(`UPDATE properties SET name='Mountain View RV Ranch' WHERE id=$1`, [propB])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // profileId is NULL — exactly what auth.ts mints for a landlord since S633.
+    const token = jwt.sign(
+      { userId, role: 'landlord', email: 'two@test.dev', profileId: null, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get('/api/leases')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    const ids = (res.body.data as any[]).map(l => l.id).sort()
+    expect(ids).toEqual([leaseA, leaseB].sort())
+    // And each lease names its own property, so the page's property dropdown
+    // has two options to offer instead of one. (This suite's app has no
+    // camelCase middleware — the wire format the frontend reads is
+    // propertyId/propertyName; see index.ts.)
+    const names = new Set((res.body.data as any[]).map(l => l.property_name))
+    expect(names).toEqual(new Set(['Oak Park Motel and RV', 'Mountain View RV Ranch']))
+  })
+
   it('unknown role (bookkeeper) gets empty list, not 500', async () => {
     await seedFixture()
     const bkToken = jwt.sign(

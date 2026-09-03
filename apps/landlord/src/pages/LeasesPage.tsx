@@ -9,7 +9,7 @@ import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { usePerms } from '../lib/permissions'
-import { SearchBox, PropertySelect } from '../components/ListControls'
+import { PropertySelect } from '../components/ListControls'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -56,7 +56,6 @@ export function LeasesPage() {
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
-  const [search, setSearch] = useState('')
   const [propertyId, setPropertyId] = useState('')
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
@@ -175,19 +174,14 @@ export function LeasesPage() {
         })
       : baseLeases
 
-  // S576: property dropdown + free-text search over the visible leases (unit,
-  // tenant names, property). Options derive from the full lease set.
+  // S637 (Nic, DIRECTIVE): "I don't want the search bar. I want the filter.
+  // Choose a property from a drop down list." The free-text search went with
+  // it — one control, and it answers the question the landlord actually asks
+  // of this page ("show me this park"). Options derive from the full lease set
+  // so the History toggle never changes what the dropdown offers.
   const propertyOptions = (leases as any[]).map(l => ({ id: l.propertyId, name: l.propertyName }))
-  const q = search.trim().toLowerCase()
-  const displayLeases = visibleLeases.filter((l: any) => {
-    const matchProperty = propertyId === '' || l.propertyId === propertyId
-    if (!matchProperty) return false
-    if (q === '') return true
-    const tenantStr = (l.tenants || []).map((t: any) => `${t.firstName || ''} ${t.lastName || ''}`).join(' ').toLowerCase()
-    return (l.unitNumber || '').toLowerCase().includes(q)
-      || (l.propertyName || '').toLowerCase().includes(q)
-      || tenantStr.includes(q)
-  })
+  const displayLeases = visibleLeases.filter((l: any) =>
+    propertyId === '' || l.propertyId === propertyId)
 
   return (
     <div>
@@ -246,7 +240,6 @@ export function LeasesPage() {
       )}
 
       <div className="filter-bar">
-        <SearchBox value={search} onChange={setSearch} placeholder="Search unit, tenant, property…" />
         <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
       </div>
 

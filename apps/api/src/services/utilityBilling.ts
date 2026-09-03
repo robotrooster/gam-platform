@@ -1473,9 +1473,32 @@ export async function generateBillsForLandlord(
 
 
 /** YYYY-MM for a cycle, whether it arrives as a Date or a string. */
+/**
+ * The billing cycle, as a landlord reads it.
+ *
+ * S637 (Nic, on his Payments page): "you have Jonathan Covey for rent,
+ * Jonathan Covey for trash... Jonathan Covey for another trash can. They're
+ * only supposed to have one trash can."
+ *
+ * They have one can. The two rows were Aug and Sep — but this returned the raw
+ * ISO prefix ("2026-09") while the move-in bundle, writing the SAME sentence
+ * for the SAME kind of charge, used `to_char(..., 'Mon YYYY')` ("Aug 2026").
+ * One tenant's charges therefore carried both formats, which reads as two
+ * unrelated systems billing the same thing rather than two months of one.
+ *
+ * "Sep 2026" here, matching jobs/moveInBundle.ts:465. Display only — nothing
+ * keys, sorts, or compares on this string.
+ */
+const CYCLE_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 function cycleLabel(cycle: unknown): string {
-  if (cycle instanceof Date) return cycle.toISOString().slice(0, 7)
-  return String(cycle).slice(0, 7)
+  // billing_cycle_month is a DATE; node-pg hands it back as a local-midnight
+  // Date, so read the LOCAL parts. toISOString() would shift a 1st-of-month
+  // west of UTC back into the previous month and mislabel every cycle.
+  if (cycle instanceof Date) return `${CYCLE_MONTHS[cycle.getMonth()]} ${cycle.getFullYear()}`
+  const iso = String(cycle).slice(0, 7)          // 'YYYY-MM'
+  const m = /^(\d{4})-(\d{2})$/.exec(iso)
+  if (!m) return iso                              // unparseable — say what we have
+  return `${CYCLE_MONTHS[Number(m[2]) - 1] ?? m[2]} ${m[1]}`
 }
 
 /**

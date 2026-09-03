@@ -217,13 +217,48 @@ backgroundRouter.get('/price', async (req, res) => {
   // (mock) or on Checkr's hosted consent flow (checkr → GAM never collects).
   // S577 (Nic): the APPLICANT pays on BOTH routes, so return the real fee +
   // breakdown; the intake form shows the payment step accordingly.
-  let provider = 'mock'
+  // ── S636: NEVER FALL BACK TO 'mock' IN PRODUCTION ───────────────────
+  //
+  // Nic, opening the screening link: "That link is still showing a six
+  // fucking page process before doing the application... It's a whole page
+  // just for putting in my fucking address."
+  //
+  // 'mock' selects GAM's LEGACY six-step intake, which collects the
+  // applicant's SSN, home address, employment and previous landlord on our
+  // own form. Under Checkr none of that is even sent — Checkr collects
+  // DOB/SSN/consent on its own hosted flow and takes only name, email and
+  // the PROPERTY's address from us.
+  //
+  // This resolved 'mock' for any request without a valid landlordId. That
+  // is not a dev-only path: it is what a renter-pool applicant hits (no
+  // landlord by definition), and what anyone opening /background-check with
+  // a bad or missing id hits. They were shown an SSN field for a check that
+  // would never carry it, and the form disagreed with what /submit would
+  // actually do — /submit resolves the pool shell's provider, this did not.
+  //
+  // Now it mirrors /submit: a named landlord, else the pool shell, and in
+  // production a failure to resolve is an ERROR rather than a silent
+  // downgrade into the SSN-collecting flow.
+  let provider: string | null = null
   const landlordId = (req.query.landlordId as string) || null
   if (landlordId) {
     const row = await queryOne<{ background_provider: string }>(
       'SELECT background_provider FROM landlords WHERE id=$1', [landlordId]
     ).catch(() => null)
     if (row) provider = row.background_provider
+  }
+  if (!provider) {
+    // Speculative / renter-pool: same anchor /submit uses, so the form the
+    // applicant fills matches the order that gets placed.
+    const shell = await getPoolIntakeShell().catch(() => null)
+    if (shell) provider = shell.backgroundProvider
+  }
+  if (!provider) {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({ success: false,
+        error: 'Screening is not available right now. Please try again shortly.' })
+    }
+    provider = 'mock'
   }
   const fee = await screeningIntakeFee((req.query.state as string) || null)
   res.json({
