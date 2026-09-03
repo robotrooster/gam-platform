@@ -50,10 +50,22 @@ function authFetch(path: string, opts: RequestInit = {}) {
 // string directly. Named fonts have generic fallbacks (cursive / serif)
 // so every OS renders something signature-shaped even if the specific
 // font isn't installed.
+// S637 (Nic): "the ones that need something that's a licensing pick, just
+// remove those." Script and Cursive are gone.
+//
+// They were the two options a PDF could not honour. Every style here is stamped
+// into the executed lease by services/pdfStamp.ts, which can only use fonts the
+// PDF standard already carries — the remaining three are italic serif faces and
+// Times-Italic represents them faithfully. Snell Roundhand and Brush Script are
+// genuinely cursive and would need a licensed script face embedded through
+// fontkit, so offering them meant showing a signer a preview the document could
+// never reproduce. Better to offer three styles that survive to paper than five
+// where two quietly change on the way.
+//
+// If a script face is ever licensed and embedded, add it back HERE and in
+// pdfStamp's signatureFontFor together — never one without the other.
 const SIG_FONTS = [
   { id:'elegant',  name:'Elegant',  css:"italic 42px Georgia, 'Times New Roman', serif" },
-  { id:'script',   name:'Script',   css:"40px 'Snell Roundhand', 'Edwardian Script ITC', 'Apple Chancery', cursive" },
-  { id:'cursive',  name:'Cursive',  css:"40px 'Brush Script MT', 'Lucida Handwriting', cursive" },
   { id:'classic',  name:'Classic',  css:"italic 40px 'Palatino Linotype', 'Book Antiqua', Palatino, serif" },
   { id:'modern',   name:'Modern',   css:"italic 38px Garamond, 'Times New Roman', serif" },
 ]

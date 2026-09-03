@@ -48,11 +48,12 @@ export async function stampPdf(
   // Times-Italic represents honestly. It is embedded once, lazily, and only if
   // some field actually asks for it.
   //
-  // The two genuinely cursive options — Snell Roundhand, Brush Script — cannot
-  // be reproduced by a PDF standard font; those need a real script face
-  // embedded through fontkit, which is a font-licensing decision rather than a
-  // code one. Until then they render as italic serif, which reads as a
-  // signature. What is NO LONGER true is that the choice is silently discarded.
+  // S637: the two genuinely cursive options were REMOVED from the chooser
+  // rather than approximated — Nic: "the ones that need something that's a
+  // licensing pick, just remove those." Every style a signer can now pick is an
+  // italic serif face that Times-Italic reproduces faithfully, so the preview
+  // and the executed PDF agree. The cursive keywords stay in the matcher below
+  // to keep any already-signed document rendering as it did.
   const timesItalic = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic)
   const signatureFontFor = (fontCss: string | null | undefined) => {
     if (!fontCss) return helvetica
