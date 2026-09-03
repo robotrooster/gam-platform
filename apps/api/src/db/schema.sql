@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ufHahJ5VYg48wiPhM4gKQJtvCC2cafdhMGoc6F7qBye7dMxXbzsGMiV8LpCsuL2
+\restrict 4D9Lc9j8iO4wFRwU8D7iD8H181BfoabOGkUT4qAoxcUCUQefnN0aRZlZO1DBZu1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -138,6 +138,62 @@ BEGIN
   END IF;
   RETURN NULL;
 END;
+$$;
+
+
+--
+-- Name: email_log_block_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.email_log_block_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF email_log_is_permanent(OLD.category) THEN
+    RAISE EXCEPTION
+      'email_send_log row % is correspondence (category=%) and cannot be deleted — the log is the log',
+      OLD.id, OLD.category;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+
+--
+-- Name: email_log_freeze_content(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.email_log_freeze_content() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF email_log_is_permanent(OLD.category) THEN
+    IF NEW.to_email   IS DISTINCT FROM OLD.to_email
+    OR NEW.subject    IS DISTINCT FROM OLD.subject
+    OR NEW.body_text  IS DISTINCT FROM OLD.body_text
+    OR NEW.category   IS DISTINCT FROM OLD.category
+    OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+      RAISE EXCEPTION
+        'email_send_log row % is correspondence — recipient, subject, body, category and timestamp are frozen',
+        OLD.id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: email_log_is_permanent(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.email_log_is_permanent(p_category text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+  SELECT COALESCE(p_category, '') IN (
+    'support_message',            -- an admin wrote this by hand
+    'landlord_welcome_outreach'   -- our first reach-out to a new signup
+  )
 $$;
 
 
@@ -3263,6 +3319,7 @@ CREATE TABLE public.email_send_log (
     provider_message_id text,
     last_event text,
     last_event_at timestamp with time zone,
+    body_text text,
     CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text])))
 );
 
@@ -3282,6 +3339,13 @@ COMMENT ON COLUMN public.email_send_log.last_event IS 'S605: latest Resend lifec
 
 
 --
+-- Name: COLUMN email_send_log.body_text; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.email_send_log.body_text IS 'S637: the words that were sent, for human correspondence. NULL for templated machine mail, whose content lives in services/email.ts.';
+
+
+--
 -- Name: email_send_log_archive; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3298,6 +3362,7 @@ CREATE TABLE public.email_send_log_archive (
     metadata jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     archived_at timestamp with time zone DEFAULT now() NOT NULL,
+    body_text text,
     CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text])))
 );
 
@@ -14689,6 +14754,13 @@ CREATE INDEX idx_email_send_log_landlord_status_created ON public.email_send_log
 
 
 --
+-- Name: idx_email_send_log_outreach; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_email_send_log_outreach ON public.email_send_log USING btree (lower(to_email), created_at DESC) WHERE public.email_log_is_permanent(category);
+
+
+--
 -- Name: idx_email_send_log_provider_msg; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19082,6 +19154,20 @@ CREATE TRIGGER trg_depots_updated_at BEFORE UPDATE ON public.depots FOR EACH ROW
 --
 
 CREATE TRIGGER trg_dump_locations_updated_at BEFORE UPDATE ON public.dump_locations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: email_send_log trg_email_log_block_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_email_log_block_delete BEFORE DELETE ON public.email_send_log FOR EACH ROW EXECUTE FUNCTION public.email_log_block_delete();
+
+
+--
+-- Name: email_send_log trg_email_log_freeze_content; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_email_log_freeze_content BEFORE UPDATE ON public.email_send_log FOR EACH ROW EXECUTE FUNCTION public.email_log_freeze_content();
 
 
 --
@@ -25388,5 +25474,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ufHahJ5VYg48wiPhM4gKQJtvCC2cafdhMGoc6F7qBye7dMxXbzsGMiV8LpCsuL2
+\unrestrict 4D9Lc9j8iO4wFRwU8D7iD8H181BfoabOGkUT4qAoxcUCUQefnN0aRZlZO1DBZu1
 

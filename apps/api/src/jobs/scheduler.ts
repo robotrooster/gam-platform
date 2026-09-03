@@ -894,10 +894,26 @@ export async function processTenantEvents() {
 // Failed rows survive 365 days — adverse-action / FCRA-adjacent
 // failures should outlive any reasonable audit window.
 //
+// S637 (Nic, DIRECTIVE): "no way to be deleted by any super admin, even me.
+// The log is the log." CORRESPONDENCE IS EXEMPT — a letter a person wrote to
+// a customer, and our reach-out to a new signup, are kept forever. The reason
+// this prune exists is that sign-in codes and rent receipts inflate the table
+// without bound, and neither of those is a conversation.
+//
+// The predicate is email_log_is_permanent(category), the same one the DELETE
+// trigger enforces. Filtering here as well is not redundant: without it every
+// run would throw against the trigger and log a failure for rows it was never
+// meant to touch.
+//
 // Defensive cap of 10k deletes per status per run keeps a runaway
 // backlog from pinning the table; subsequent daily runs catch up.
 // In steady state each run deletes whatever crossed the threshold
 // on the previous day — typically tens to low hundreds of rows.
+// Exported under a test-explicit name: the prune's exemption for
+// correspondence is a directive ("the log is the log"), so it is held by a
+// test rather than by reading the query.
+export const pruneEmailSendLogForTest = () => pruneEmailSendLog()
+
 async function pruneEmailSendLog() {
   const SENT_RETENTION_DAYS = 90
   const FAILED_RETENTION_DAYS = 365
@@ -911,6 +927,7 @@ async function pruneEmailSendLog() {
           SELECT id FROM email_send_log
           WHERE status = 'sent'
             AND created_at < NOW() - ($1::int * INTERVAL '1 day')
+            AND NOT email_log_is_permanent(category)
           LIMIT $2
         )
         RETURNING 1
@@ -924,6 +941,7 @@ async function pruneEmailSendLog() {
           SELECT id FROM email_send_log
           WHERE status = 'failed'
             AND created_at < NOW() - ($1::int * INTERVAL '1 day')
+            AND NOT email_log_is_permanent(category)
           LIMIT $2
         )
         RETURNING 1

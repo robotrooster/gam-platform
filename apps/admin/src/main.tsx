@@ -4755,6 +4755,57 @@ const STAGE_STYLE: Record<string, { label: string; color: string }> = {
   failed:        { label: 'Send failed',   color: '#c9635b' },
 }
 
+// Every reach-out at one person, newest first. Correspondence only — the
+// sign-in codes in the same table are not attempts to reach anybody.
+//
+// The log is append-only at the database level (S637 triggers), so what shows
+// here is what was sent, not what somebody later wished had been sent.
+function OutreachHistory({ email }: { email: string }) {
+  const [open, setOpen] = useState<string | null>(null)
+  const { data = [], isLoading } = useQuery<any[]>(
+    ['email-history', email],
+    () => get<any[]>(`/admin/email/history?email=${encodeURIComponent(email)}`),
+    { enabled: !!email },
+  )
+  const when = (d: any) => new Date(d).toLocaleString('en-US',
+    { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
+
+  if (isLoading) return null
+  return (
+    <div className="card" style={{ marginTop: 12, padding: 16 }}>
+      <div style={{ fontSize: '.72rem', textTransform: 'uppercase', letterSpacing: '.06em',
+        color: 'var(--t3)', marginBottom: 8 }}>
+        Reach-out history {data.length > 0 && `· ${data.length}`}
+      </div>
+      {data.length === 0 ? (
+        <div style={{ fontSize: '.8rem', color: 'var(--t3)' }}>
+          Nothing has been sent to this person yet.
+        </div>
+      ) : data.map((m: any) => (
+        <div key={m.id} style={{ borderTop: '1px solid var(--border, #1e2530)', padding: '9px 0' }}>
+          <button onClick={() => setOpen(open === m.id ? null : m.id)}
+            style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none',
+              border: 'none', padding: 0, cursor: m.body_text ? 'pointer' : 'default', color: 'var(--t0)' }}>
+            <div style={{ fontSize: '.83rem', fontWeight: 600 }}>{m.subject || '(no subject)'}</div>
+            <div style={{ fontSize: '.73rem', color: 'var(--t3)' }}>
+              {when(m.created_at)}
+              {m.status !== 'sent' && <span style={{ color: 'var(--red, #ef4444)' }}> · {m.status}</span>}
+              {m.last_event && <span> · {m.last_event}</span>}
+              {m.category === 'landlord_welcome_outreach' && <span> · automatic</span>}
+              {m.body_text && <span style={{ color: 'var(--gold)' }}> · {open === m.id ? 'hide' : 'read'}</span>}
+            </div>
+          </button>
+          {open === m.id && m.body_text && (
+            <div style={{ whiteSpace: 'pre-wrap', fontSize: '.8rem', color: 'var(--t2)',
+              marginTop: 8, padding: '10px 12px', background: 'var(--bg3, #141a22)', borderRadius: 8,
+              lineHeight: 1.6 }}>{m.body_text}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ── SEND EMAIL (S637) ────────────────────────────────────────
 //
 // Nic: "let's add a way in the administrative portal for an admin to send
@@ -4774,6 +4825,7 @@ const STAGE_STYLE: Record<string, { label: string; color: string }> = {
 // to write to somebody, not a mailing list.
 function SendEmail() {
   const { user } = useAuth()
+  const qc = useQueryClient()
   const [q, setQ] = useState('')
   const [picked, setPicked] = useState<any>(null)
   const [templateId, setTemplateId] = useState<string | null>(null)
@@ -4796,7 +4848,7 @@ function SendEmail() {
 
   const applyTemplate = (t: any) => {
     setTemplateId(t.id)
-    const name = (picked?.first_name || '').trim() || 'there'
+    const name = (picked?.firstName || '').trim() || 'there'
     const fill = (x: string) => x.replace(/\{\{firstName\}\}/g, name)
     setSubject(fill(t.subject))
     setBody(t.paragraphs.map(fill).join('\n\n'))
@@ -4808,12 +4860,13 @@ function SendEmail() {
     if (!subject.trim() || paragraphs.length === 0) { toast('Give it a subject and a message first'); return }
     const ok = await appConfirm(
       `This goes to ${picked.email} right now, from GAM Support. There is no undo.`,
-      { title: `Send to ${picked.first_name} ${picked.last_name}?`, confirmLabel: 'Send it' },
+      { title: `Send to ${picked.firstName} ${picked.lastName}?`, confirmLabel: 'Send it' },
     )
     if (!ok) return
     setSending(true)
     try {
       await post('/admin/email/send', { to: picked.email, subject: subject.trim(), paragraphs, templateId })
+      qc.invalidateQueries(['email-history', picked.email])
       setSentTo(picked.email)
       setPicked(null); setTemplateId(null); setSubject(''); setBody(''); setQ('')
     } catch (e: any) {
@@ -4848,7 +4901,7 @@ function SendEmail() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div>
               <div style={{ fontWeight: 700, color: 'var(--t0)' }}>
-                {picked.first_name} {picked.last_name}
+                {picked.firstName} {picked.lastName}
                 <span style={{ fontSize: '.7rem', fontWeight: 600, color: 'var(--gold)', marginLeft: 8,
                   textTransform: 'uppercase', letterSpacing: '.05em' }}>{picked.kind}</span>
               </div>
@@ -4865,11 +4918,11 @@ function SendEmail() {
               <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginTop: 8 }}>Nobody by that name.</div>
             )}
             {results.map((r: any) => (
-              <button key={r.user_id} onClick={() => setPicked(r)}
+              <button key={r.userId} onClick={() => setPicked(r)}
                 style={{ display: 'block', width: '100%', textAlign: 'left', marginTop: 8,
                   padding: '9px 12px', background: 'var(--bg3, #141a22)', border: '1px solid var(--border, #1e2530)',
                   borderRadius: 8, cursor: 'pointer', color: 'var(--t0)' }}>
-                <span style={{ fontWeight: 600 }}>{r.first_name} {r.last_name}</span>
+                <span style={{ fontWeight: 600 }}>{r.firstName} {r.lastName}</span>
                 <span style={{ fontSize: '.7rem', color: 'var(--gold)', marginLeft: 8,
                   textTransform: 'uppercase' }}>{r.kind}</span>
                 <div className="mono" style={{ fontSize: '.74rem', color: 'var(--t3)' }}>{r.email}</div>
@@ -4878,6 +4931,11 @@ function SendEmail() {
           </>
         )}
       </div>
+
+      {/* What we have already tried. S637 (Nic): "we should be tracking our
+          reach out attempts." Shown BEFORE the drafts, so a third note to
+          somebody who has ignored two is a decision and not an accident. */}
+      {picked && <OutreachHistory email={picked.email} />}
 
       {/* 2 — which draft. Only after a person is chosen, so the drafts arrive
           with their name already in them and the wrong-audience ones are hidden. */}
@@ -4914,7 +4972,7 @@ function SendEmail() {
             Blank line between paragraphs. Signed with your name automatically — don't sign it yourself.
           </div>
           <button className="btn btn-primary" disabled={sending} onClick={send}>
-            {sending ? 'Sending…' : `Send to ${picked.first_name}`}
+            {sending ? 'Sending…' : `Send to ${picked.firstName}`}
           </button>
         </div>
       )}

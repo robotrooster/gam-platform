@@ -137,3 +137,103 @@ describe('POST /admin/email/send', () => {
     expect(rows[0].new_value.template_id).toBe('landlord_never_started')
   })
 })
+
+// ── S637: THE LOG IS THE LOG ──────────────────────────────────────────
+//
+// Nic (DIRECTIVE): "We should keep a log of any emails sent, with no way to
+// be deleted by any super admin, even me. The log is the log. Any
+// conversations with landlords through that email chain, or reaching out to
+// these ghost landlords that signed up and did nothing — we should be
+// tracking our reach out attempts."
+//
+// Two things had to change for that to be true: the log held no BODY, and a
+// daily prune deleted it at 90 days. These hold both, plus the DB triggers
+// that make a delete impossible through the application by any role.
+describe('the email log is permanent', () => {
+  const seedLog = (email: string, category: string, extra: Record<string, any> = {}) =>
+    db.query(
+      `INSERT INTO email_send_log (to_email, subject, category, status, body_text, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [email, extra.subject ?? 'Following up', category, extra.status ?? 'sent',
+       extra.body ?? 'Hi there,\n\nChecking in.',
+       extra.createdAt ?? new Date().toISOString()])
+
+  it('refuses to delete correspondence — even raw SQL as the app role', async () => {
+    await seedLog('ghost@mailer-test.co', 'support_message')
+    await expect(
+      db.query(`DELETE FROM email_send_log WHERE to_email='ghost@mailer-test.co'`)
+    ).rejects.toThrow(/cannot be deleted/)
+  })
+
+  it('refuses to delete the automatic welcome outreach either', async () => {
+    await seedLog('ghost2@mailer-test.co', 'landlord_welcome_outreach')
+    await expect(
+      db.query(`DELETE FROM email_send_log WHERE to_email='ghost2@mailer-test.co'`)
+    ).rejects.toThrow(/cannot be deleted/)
+  })
+
+  it('still lets machine chatter be pruned — that is what the prune is for', async () => {
+    await seedLog('code@mailer-test.co', 'login_2fa_code')
+    await db.query(`DELETE FROM email_send_log WHERE to_email='code@mailer-test.co'`)
+    const { rows } = await db.query<any>(
+      `SELECT 1 FROM email_send_log WHERE to_email='code@mailer-test.co'`)
+    expect(rows).toHaveLength(0)
+  })
+
+  it('freezes what was said — the body cannot be rewritten after the fact', async () => {
+    await seedLog('frozen@mailer-test.co', 'support_message')
+    await expect(
+      db.query(`UPDATE email_send_log SET body_text='something else' WHERE to_email='frozen@mailer-test.co'`)
+    ).rejects.toThrow(/frozen/)
+    await expect(
+      db.query(`UPDATE email_send_log SET subject='different' WHERE to_email='frozen@mailer-test.co'`)
+    ).rejects.toThrow(/frozen/)
+  })
+
+  it('still accepts delivery events from the provider webhook', async () => {
+    await seedLog('events@mailer-test.co', 'support_message')
+    await db.query(
+      `UPDATE email_send_log SET last_event='delivered', last_event_at=NOW()
+        WHERE to_email='events@mailer-test.co'`)
+    const { rows } = await db.query<any>(
+      `SELECT last_event FROM email_send_log WHERE to_email='events@mailer-test.co'`)
+    expect(rows[0].last_event).toBe('delivered')
+  })
+
+  it('the daily prune leaves correspondence alone, however old', async () => {
+    const old = new Date(Date.now() - 400 * 24 * 3600 * 1000).toISOString()
+    await seedLog('ancient@mailer-test.co', 'support_message', { createdAt: old })
+    await seedLog('ancient-code@mailer-test.co', 'login_2fa_code', { createdAt: old })
+    const { pruneEmailSendLogForTest } = await import('../jobs/scheduler')
+    await pruneEmailSendLogForTest()
+    const kept = await db.query<any>(
+      `SELECT to_email FROM email_send_log WHERE to_email LIKE 'ancient%'`)
+    expect(kept.rows.map((r: any) => r.to_email)).toEqual(['ancient@mailer-test.co'])
+  })
+})
+
+describe('GET /admin/email/history', () => {
+  it('shows what we have already tried, newest first, with the words', async () => {
+    await db.query(
+      `INSERT INTO email_send_log (to_email, subject, category, status, body_text, created_at)
+       VALUES ($1,'First try','landlord_welcome_outreach','sent','Hello there', NOW() - INTERVAL '3 days'),
+              ($1,'Second try','support_message','sent','Following up again', NOW())`,
+      [landlordEmail])
+    const res = await request(buildApp())
+      .get(`/api/admin/email/history?email=${encodeURIComponent(landlordEmail)}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((m: any) => m.subject)).toEqual(['Second try', 'First try'])
+    expect(res.body.data[0].body_text).toBe('Following up again')
+  })
+
+  it('leaves sign-in codes out — those are not reach-out attempts', async () => {
+    await db.query(
+      `INSERT INTO email_send_log (to_email, subject, category, status)
+       VALUES ($1,'Your GAM sign-in code: 123456','login_2fa_code','sent')`, [landlordEmail])
+    const res = await request(buildApp())
+      .get(`/api/admin/email/history?email=${encodeURIComponent(landlordEmail)}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+    expect(res.body.data).toHaveLength(0)
+  })
+})

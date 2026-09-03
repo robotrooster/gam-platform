@@ -77,6 +77,13 @@ function senderFor(kind: SenderKind): string {
 // individual senders get ctx threaded through.
 export interface EmailSendContext {
   category?: string
+  /**
+   * S637: the words that were sent, in plain text, for mail a PERSON wrote.
+   * The log recorded who and what subject but never what was said, so it
+   * could show that we reached out and never what we reached out with.
+   * Templated machine mail leaves this null — its content lives in this file.
+   */
+  bodyText?: string | null
   landlordId?: string | null
   relatedEntityType?: string | null
   relatedEntityId?: string | null
@@ -186,13 +193,14 @@ async function send(
       `INSERT INTO email_send_log (
          to_email, subject, category, status, error_message,
          landlord_id, related_entity_type, related_entity_id, metadata,
-         provider_message_id
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+         provider_message_id, body_text
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
         to, subject, ctx.category ?? null, status, errorMessage,
         ctx.landlordId ?? null, ctx.relatedEntityType ?? null, ctx.relatedEntityId ?? null,
         ctx.metadata ? JSON.stringify(ctx.metadata) : null,
         messageId,
+        ctx.bodyText ?? null,
       ]
     )
   } catch (logErr) {
@@ -2010,6 +2018,8 @@ ${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
   return send(args.to, 'Getting you set up on GAM', html,
     {
       category: 'landlord_welcome_outreach',
+      // S637: our first reach-out is a reach-out attempt worth reading back.
+      bodyText: paras.join('\n\n').replace(/<[^>]+>/g, ''),
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: 'user',
       relatedEntityId: args.ctx?.userId ?? null,
@@ -2053,6 +2063,8 @@ ${body}
   return send(args.to, args.subject, html,
     {
       category: 'support_message',
+      // S637: the log is the conversation, so it keeps the words.
+      bodyText: args.paragraphs.filter(p => p.trim().length > 0).join('\n\n'),
       landlordId: args.ctx?.landlordId ?? null,
       relatedEntityType: 'user',
       relatedEntityId: args.ctx?.userId ?? null,

@@ -92,7 +92,19 @@ export async function cleanupAllSchema(): Promise<void> {
   // scope-deterministic.
   await db.query(`DELETE FROM connect_payouts`)
   // S364: email_send_log FK landlords (SET NULL) — same posture.
-  await db.query(`DELETE FROM email_send_log`)
+  //
+  // S637: TRUNCATE, not DELETE. Correspondence rows carry a BEFORE DELETE
+  // trigger that refuses removal ("the log is the log"), so a DELETE here
+  // fails the moment any test has written one — which is every test that
+  // sends a support message. TRUNCATE does not fire row triggers, so the
+  // production guarantee is untouched while the fixture still resets.
+  //
+  // Nothing references email_send_log, so no CASCADE is needed. That the
+  // guard is bypassable by TRUNCATE is the same class of hole as disabling
+  // the trigger: both need table-owner rights, neither is reachable through
+  // the application, and the directive is about what a super_admin can do
+  // in the product.
+  await db.query(`TRUNCATE email_send_log`)
   // S631: admin_invitations FKs users three ways (inviter, acceptor, revoker)
   // with NO ACTION — that reference IS the audit trail for who granted console
   // access, so it restricts rather than cascades. Clear it before users.

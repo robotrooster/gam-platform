@@ -330,6 +330,30 @@ adminRouter.get('/email/recipients', requireAdmin, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// GET /api/admin/email/history?email= — every reach-out attempt at one person.
+//
+// Nic (DIRECTIVE): "Any conversations with landlords through that email chain,
+// or reaching out to these ghost landlords that signed up and did nothing — we
+// should be tracking our reach out attempts."
+//
+// Shown before you write, so the third note to somebody who has ignored two is
+// a decision rather than an accident. Correspondence only: the sign-in codes
+// and rent receipts in the same table are not attempts to reach anybody.
+adminRouter.get('/email/history', requireAdmin, async (req, res, next) => {
+  try {
+    const email = z.string().email().max(200).parse(req.query.email)
+    const rows = await query<any>(`
+      SELECT id, subject, body_text, category, status, last_event,
+             created_at, last_event_at
+        FROM email_send_log
+       WHERE LOWER(to_email) = LOWER($1)
+         AND email_log_is_permanent(category)
+       ORDER BY created_at DESC
+       LIMIT 100`, [email])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // POST /api/admin/email/send — one note, from support@, logged like any other.
 adminRouter.post('/email/send', requireAdmin, async (req, res, next) => {
   try {
