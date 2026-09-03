@@ -669,6 +669,37 @@ export function PaymentsPage() {
   const workTradeCharges = filteredPayments.filter((p: any) =>
     !groupedIds.has(p.id) && p.workTradeSuspendedAt && OUTSTANDING.has(p.status))
   const workTradeIds = new Set<string>(workTradeCharges.map((p: any) => p.id))
+
+  // S637 (Nic): "You have separate line items for Tyler still, and it needs to
+  // just all be one item. It needs to be one line for the suspended amount.
+  // When I add electricity or propane to the Nicholas Rhoades one, it needs to
+  // show that increased total that's being suspended."
+  //
+  // Same shape as the outstanding table above, for the same reason: a
+  // household is the unit somebody thinks in. Four rows reading rent, electric,
+  // water, trash is a breakdown of one fact — what the hours are covering this
+  // month — and the total is the fact. Adding a utility to a covered agreement
+  // grows that number rather than adding another row to scan.
+  const workTradeGroups = (() => {
+    const groups = new Map<string, any>()
+    for (const p of workTradeCharges) {
+      const key = p.leaseId || `t:${p.tenantId}`
+      let g = groups.get(key)
+      if (!g) {
+        g = {
+          key, charges: [] as any[], total: 0, earliestDue: p.dueDate,
+          unitNumber: p.unitNumber, propertyName: p.propertyName,
+          tenantFirst: p.tenantFirst, tenantLast: p.tenantLast,
+        }
+        groups.set(key, g)
+      }
+      g.charges.push(p)
+      g.total += Number(p.amount || 0)
+      if (p.dueDate && (!g.earliestDue || p.dueDate < g.earliestDue)) g.earliestDue = p.dueDate
+    }
+    return [...groups.values()].sort((a, b) =>
+      String(a.unitNumber ?? '').localeCompare(String(b.unitNumber ?? ''), undefined, { numeric: true }))
+  })()
   const historyPayments = filteredPayments.filter((p: any) =>
     !groupedIds.has(p.id) && !workTradeIds.has(p.id))
   const totalOutstanding = outstandingGroups.reduce((sum: number, g: any) => sum + g.total, 0)
@@ -812,25 +843,51 @@ export function PaymentsPage() {
             </div>
             <table className="data-table" style={{ minWidth: 720 }}>
               <thead>
-                <tr><th>Due</th><th>Unit</th><th>Tenant</th><th>Description</th><th>Amount</th></tr>
+                <tr>
+                  <th style={{ width: 32 }}></th>
+                  <th>Due</th><th>Unit</th><th>Tenant</th><th>Covering</th><th>Suspended</th>
+                </tr>
               </thead>
               <tbody>
-                {workTradeCharges.map((p: any) => (
-                  <tr key={p.id} onClick={() => setSelected(p)} style={{ cursor: 'pointer' }}>
-                    <td className="mono" style={{ fontSize: '.78rem' }}>
-                      {p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}
-                    </td>
-                    <td className="mono">{p.unitNumber || '—'}</td>
-                    <td style={{ fontSize: '.8rem' }}>
-                      {`${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() || '—'}
-                      {p.propertyName && (
-                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{p.propertyName}</div>
-                      )}
-                    </td>
-                    <td style={{ fontSize: '.74rem', color: 'var(--text-3)', maxWidth: 320 }}>{chargeLabel(p)}</td>
-                    <td className="mono" style={{ color: 'var(--text-3)' }}>{fmt(p.amount)}</td>
-                  </tr>
-                ))}
+                {workTradeGroups.map((g: any) => {
+                  const isOpen = expanded.has(`wt:${g.key}`)
+                  return (
+                  <Fragment key={g.key}>
+                    {/* One line per household. The breakdown is still there —
+                        it just stops being the first thing you read. */}
+                    <tr onClick={() => toggleExpanded(`wt:${g.key}`)} style={{ cursor: 'pointer' }}>
+                      <td style={{ color: 'var(--text-3)' }}>
+                        {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </td>
+                      <td className="mono" style={{ fontSize: '.78rem' }}>
+                        {g.earliestDue ? new Date(g.earliestDue).toLocaleDateString() : '—'}
+                      </td>
+                      <td className="mono">{g.unitNumber || '—'}</td>
+                      <td style={{ fontSize: '.8rem' }}>
+                        {`${g.tenantFirst ?? ''} ${g.tenantLast ?? ''}`.trim() || '—'}
+                        {g.propertyName && (
+                          <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{g.propertyName}</div>
+                        )}
+                      </td>
+                      <td style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+                        {g.charges.length} charge{g.charges.length === 1 ? '' : 's'}
+                      </td>
+                      <td className="mono" style={{ fontWeight: 700, color: 'var(--text-3)' }}>{fmt(g.total)}</td>
+                    </tr>
+                    {isOpen && g.charges.map((c: any) => (
+                      <tr key={c.id} style={{ background: 'var(--bg-3)' }}>
+                        <td></td>
+                        <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+                          {c.dueDate ? new Date(c.dueDate).toLocaleDateString() : '—'}
+                        </td>
+                        <td colSpan={3} style={{ fontSize: '.76rem', color: 'var(--text-2)' }}>
+                          {chargeLabel(c)}
+                        </td>
+                        <td className="mono" style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmt(c.amount)}</td>
+                      </tr>
+                    ))}
+                  </Fragment>
+                )})}
               </tbody>
             </table>
           </div>
