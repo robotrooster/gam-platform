@@ -18,11 +18,11 @@ last row is done and folded into a handoff.
 | 8 | Dashboard "Tenants can't pay rent yet" banner | ✅ removed, committed, **not deployed** |
 | 9 | Tenant-facing landlord-bank disclosure (2 endpoints + agent tool) | ✅ removed, committed, **not deployed** |
 | 10 | Russ Fuller $37.60 carried-forward credit | ✅ applied in prod, credit sits on account |
-| 11 | **Deploy everything above** | ⛔ BLOCKED — needs Nic's green light |
-| 12 | **August trash cleanup** ($75 billed + $325 held) | ⛔ BLOCKED — run only AFTER #11 |
-| 13 | **Financials: property filter on all 8 sub-tabs** | ⬜ TODO |
-| 14 | **Disbursements: show who and where** | ⬜ TODO |
-| 15 | **Credits must not split charges — ledger model** | ⬜ TODO |
+| 11 | Deploy rows 1–9 | ✅ shipped 18:29 by the other window; verified live |
+| 12 | August trash cleanup ($75 billed + $325 held) | ✅ RUN — 16 holds, 3 bills, 3 charges removed |
+| 13 | Financials property filters (+ Lot Rent was 400ing, same bug as Expenses) | ✅ done, committed, **not deployed** |
+| 14 | Disbursements: who + company (payouts have no property) | ✅ done, committed, **not deployed** |
+| 15 | Credits are ledger entries, never split charges | ✅ done, committed, **not deployed** |
 
 ---
 
@@ -130,3 +130,29 @@ ENTITY. Nic's account reads false while Oak Park reads true. The money path
 (`routes/payments.ts:389`) correctly uses the entity. The removed tenant-facing
 endpoint used the account one. Nothing reads it wrongly today, but the split is
 still there and will catch the next thing that touches it.
+
+
+---
+
+## Status as of the end of S637
+
+Everything on the list above is done. Four commits sit unshipped: 4d4cc88
+(Financials filters + Lot Rent), ea505cf (credit ledger), plus the earlier
+b9388d5 and 204f060 which the 18:29 deploy already carried.
+
+**A deploy is currently blocked by someone else's red tests.**
+`apps/api/src/services/allocation.test.ts` fails 3 ACH-fee assertions
+(994.00 vs 990.00, 894.60 vs 891.00). Verified pre-existing: they fail
+identically with every S637 change stashed. They belong to the other window's
+in-flight work, along with modified email.ts / email.test.ts /
+screeningNoLandlordGate.test.ts / SignPage.tsx / BackgroundCheckPage.tsx.
+deploy.sh gates on the full suite, so it will refuse to ship until those pass.
+
+## Still open, not code
+
+- Mountain View RV Park Ranch LLC has no Stripe Connect. Nic: "I will work on
+  that bank account thing tomorrow."
+- Fuller's credit is dated 2026-08-12, taken from "going on three weeks now."
+  Confirm the real overpayment date.
+- Two sources of truth for Connect readiness (users.* per account vs
+  landlords.* per entity). Nothing reads it wrongly today; the split remains.
