@@ -396,12 +396,32 @@ export async function emailSigningRequest(to: string, signerName: string, docume
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
-    }
+    },
+    // ── S637: SIGNING MAIL COMES FROM A REPLYABLE ADDRESS ──────────────────
+    //
+    // Nic, after his own lease sat unsigned all day: "That's in my Gmail spam
+    // folder. It went to spam." He was the PRIMARY signer, so nothing moved —
+    // and his wife, next in the order, was never emailed at all and spent the
+    // day being told her link had expired.
+    //
+    // These went from noreply@. A no-reply From is one of the oldest bulk
+    // signals a mailbox provider has, and it is the wrong choice on its own
+    // terms here: this is a legally binding request under UETA that a signer
+    // may genuinely need to answer. reply_to already pointed at support (see
+    // send()), but From is the header Gmail shows the human and weighs the
+    // hardest, and the two disagreeing helps nobody.
+    //
+    // Deliverability is not one switch — domain reputation carries most of it,
+    // and SPF/DKIM/DMARC are already passing on this domain. This is the piece
+    // that is ours to get right and was wrong.
+    'support',
   )
 }
 
 export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string }, pdfBytes?: Buffer) {
-  await send(to, `✅ Document fully signed: ${documentTitle}`,
+  // S637: no leading emoji in a transactional subject — it is a spam signal
+  // and this one goes out at the moment a lease becomes legally binding.
+  await send(to, `Document fully signed: ${documentTitle}`,
     base(
       h('Document Fully Executed') +
       p(`Hi ${signerName},`) +
@@ -458,7 +478,8 @@ export async function emailSigningReminder(to: string, signerName: string, docum
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.documentId ? 'document' : null,
       relatedEntityId: ctx?.documentId ?? null,
-    }
+    },
+    'support',   // S637: same reasoning as the request above.
   )
 }
 

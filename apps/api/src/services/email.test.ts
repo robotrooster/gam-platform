@@ -634,3 +634,40 @@ describe('emailSupportMessage', () => {
     expect(rows[0].category).toBe('support_message')
   })
 })
+
+// ── S637: signing mail comes from a replyable address ─────────────────────
+//
+// Nic's own lease sat unsigned all day in his Gmail spam folder. He was the
+// PRIMARY signer, so the document never moved, and his wife — next in the
+// signing order — was never emailed at all and spent the day being told her
+// link had expired. One message in a spam folder stalled a household.
+//
+// These went from noreply@, one of the oldest bulk signals a mailbox provider
+// has, on a legally binding request under UETA that a signer may need to
+// answer. reply_to already pointed at support; From did not, and From is the
+// header Gmail shows the human.
+describe('S637 — signing email deliverability', () => {
+  it('a signature request is From support@, not noreply@', async () => {
+    await email.emailSigningRequest(
+      's637a@mailer-test.co', 'Laurel', 'Lease — MH 02', 'MH 02', 'Mountain View',
+      'https://tenant.test/sign/abc')
+    const call = (resendSendMock.mock.calls.at(-1) as any[])[0]
+    expect(String(call.from)).toMatch(/support@/)
+    expect(String(call.from)).not.toMatch(/noreply@/)
+  })
+
+  it('a signing reminder is From support@ too', async () => {
+    await email.emailSigningReminder(
+      's637b@mailer-test.co', 'Laurel', 'Lease — MH 02', 'MH 02', 'Mountain View',
+      'https://tenant.test/sign/abc')
+    const call = (resendSendMock.mock.calls.at(-1) as any[])[0]
+    expect(String(call.from)).toMatch(/support@/)
+  })
+
+  it('the fully-signed subject carries no leading emoji', async () => {
+    await email.emailSigningCompleted(
+      's637c@mailer-test.co', 'Laurel', 'Lease — MH 02', 'MH 02')
+    const call = (resendSendMock.mock.calls.at(-1) as any[])[0]
+    expect(String(call.subject)).toMatch(/^Document fully signed/)
+  })
+})
