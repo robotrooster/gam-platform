@@ -536,8 +536,6 @@ export function SignPage() {
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
-  const currentPageRequired = pageFields.filter((f:any)=>f.required && isMine(f))
-  const currentPageComplete = currentPageRequired.every((f:any)=>fieldValues[f.id]?.trim())
   const allFilled = unfilledRequired.length === 0
 
   const handleFieldClick = (field:any) => {
@@ -648,8 +646,11 @@ export function SignPage() {
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>
           {pdfPageCount>1 && <>
             <button className="btn btn-ghost btn-sm" disabled={currentPage===1} onClick={()=>setCurrentPage(p=>p-1)}><ChevronLeft size={13}/></button>
-            <span style={{ fontSize:'.75rem', color:'var(--text-3)', alignSelf:'center' }}>{currentPage}/{pdfPageCount}{!currentPageComplete&&pdfPageCount>1?' 🔒':''}</span>
-            <button className="btn btn-ghost btn-sm" disabled={currentPage===pdfPageCount||!currentPageComplete} onClick={()=>setCurrentPage(p=>p+1)} title={!currentPageComplete?'Complete all fields on this page first':''}><ChevronRight size={13}/></button>
+            {/* Paging is never gated on field completion: a signer must be able
+                to read every page, including ones with nothing to fill. Required
+                fields are enforced by the Review & Sign gate, not navigation. */}
+            <span style={{ fontSize:'.75rem', color:'var(--text-3)', alignSelf:'center' }}>{currentPage}/{pdfPageCount}</span>
+            <button className="btn btn-ghost btn-sm" disabled={currentPage===pdfPageCount} onClick={()=>setCurrentPage(p=>p+1)}><ChevronRight size={13}/></button>
           </>}
           {!allFilled && nextField && <button onClick={goToNextField} className="btn btn-primary btn-sm">Next Field <ArrowRight size={13}/></button>}
           {allFilled && <button onClick={()=>setStage('review')} className="btn btn-primary">Review & Sign <ArrowRight size={14}/></button>}
