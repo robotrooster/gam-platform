@@ -11,7 +11,7 @@ import { canAccessLandlordResource, canManageLandlordResource } from '../middlew
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification, notifyMaintenanceUpdated, createNotification } from '../services/notifications'
 import { createMaintenanceRequest } from '../services/maintenanceRequests'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename, uploadStagingDir } from '../lib/storage'
 import { PLATFORM_FEES, MAINTENANCE_PRIORITIES, MAINTENANCE_CATEGORIES } from '@gam/shared'
 import {
   classifyMaintenanceTier,
@@ -454,14 +454,9 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
 // A receipt is a documents row (type='receipt') AUTO-LINKED to the request's
 // unit — no manual linking where the source is known — and threaded back via
 // documents.maintenance_request_id. It shows up on the Documents tab too.
-const receiptDir = path.join(process.cwd(), 'uploads', 'docs')
-if (!fs.existsSync(receiptDir)) fs.mkdirSync(receiptDir, { recursive: true })
+// A1: memory-staged (≤25MB) then storage.save into docs/.
 const receiptUpload = multer({
-  storage: multer.diskStorage({
-    destination: receiptDir,
-    filename: (_req: any, file: any, cb: any) =>
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     if (['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'].includes(file.mimetype)) cb(null, true)
@@ -473,15 +468,14 @@ const receiptUpload = multer({
 // Photos and videos share ONE dir + one authed serve route; unguessable
 // filenames + the router-level requireAuth are the guard (same posture as the
 // inspection media routes). Landlord-immutable: there is NO delete endpoint.
-const maintMediaDir = path.join(process.cwd(), 'uploads', 'maintenance-media')
-if (!fs.existsSync(maintMediaDir)) fs.mkdirSync(maintMediaDir, { recursive: true })
 const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic']
 const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/webm']
+// A1: 500MB videos must never transit memory — multer stages to the OS temp
+// dir and storage.saveFromFile moves the staged file into the driver.
 const mediaUpload = multer({
   storage: multer.diskStorage({
-    destination: maintMediaDir,
-    filename: (_req: any, file: any, cb: any) =>
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+    destination: uploadStagingDir(),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
   }),
   limits: { fileSize: 500 * 1024 * 1024 }, // videos up to 500MB; images far smaller
   fileFilter: (_req: any, file: any, cb: any) => {
@@ -529,6 +523,7 @@ maintenanceRouter.post('/:id/media', mediaUpload.single('file'), async (req: any
     const mediaType = VIDEO_MIMES.includes(req.file.mimetype) ? 'video' : 'photo'
     const uploaderRole = ['landlord', 'property_manager', 'onsite_manager'].includes(req.user!.role)
       ? 'landlord' : req.user!.role === 'maintenance' ? 'maintenance' : req.user!.role === 'tenant' ? 'tenant' : req.user!.role
+    await storage.saveFromFile(req.file.path, `maintenance-media/${req.file.filename}`)
     const fileUrl = '/api/maintenance/media-files/' + req.file.filename
     const capturedLive = req.body.capturedLive === 'false' ? false : true
     const row = await queryOne<any>(
@@ -542,10 +537,9 @@ maintenanceRouter.post('/:id/media', mediaUpload.single('file'), async (req: any
 // GET /api/maintenance/media-files/:filename — stream a photo/video (authed).
 maintenanceRouter.get('/media-files/:filename', async (req, res, next) => {
   try {
-    const fp = resolveUploadPath(maintMediaDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.sendFile(fp)
+    const key = uploadKeyFromStored('maintenance-media', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 
@@ -565,6 +559,8 @@ maintenanceRouter.get('/:id/receipts', async (req, res, next) => {
 maintenanceRouter.post('/:id/receipts', requirePerm('maintenance.update'), receiptUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
+    const storedName = newStoredFilename(req.file.originalname)
+    await storage.save(`docs/${storedName}`, req.file.buffer)
     const mr = await queryOne<any>(
       'SELECT id, landlord_id, unit_id FROM maintenance_requests WHERE id=$1', [req.params.id])
     if (!mr) throw new AppError(404, 'Request not found')
@@ -574,7 +570,7 @@ maintenanceRouter.post('/:id/receipts', requirePerm('maintenance.update'), recei
        VALUES ($1,$2,$3,'receipt',$4,$5,$6,$7) RETURNING *`,
       [mr.landlord_id, mr.unit_id, mr.id,
        (req.body.name || req.file.originalname).slice(0, 200),
-       `/uploads/docs/${req.file.filename}`, req.file.size, req.file.mimetype])
+       `/uploads/docs/${storedName}`, req.file.size, req.file.mimetype])
     res.status(201).json({ success: true, data: doc })
   } catch (e) { next(e) }
 })

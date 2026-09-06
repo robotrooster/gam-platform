@@ -1,15 +1,12 @@
 // Landlord-entered expenses (S568, Nic). Unit-linked or common; feeds the P&L.
 import { Router } from 'express'
-import path from 'path'
-import fs from 'fs'
-import crypto from 'crypto'
 import multer from 'multer'
 import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordTarget, landlordScopeIds } from '../lib/landlordScope'
-import { resolveUploadPath } from '../lib/uploadPaths'
 import { queryOne } from '../db'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
 import { createLandlordExpense, listLandlordExpenses, voidLandlordExpense, attachExpenseReceipt } from '../services/landlordExpenses'
@@ -21,14 +18,9 @@ expensesRouter.use(requireAuth)
 // filenames + the router-level requireAuth are the guard (same posture as the
 // maintenance/inspection media routes — gam-nothing-public-rule, no static
 // /uploads). PDF or image only.
-const receiptDir = path.join(process.cwd(), 'uploads', 'expense-receipts')
-if (!fs.existsSync(receiptDir)) fs.mkdirSync(receiptDir, { recursive: true })
+// A1: memory-staged (≤25MB) then storage.save — no direct uploads/ access.
 const receiptUpload = multer({
-  storage: multer.diskStorage({
-    destination: receiptDir,
-    filename: (_req: any, file: any, cb: any) =>
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     if (['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'].includes(file.mimetype)) cb(null, true)
@@ -107,8 +99,10 @@ expensesRouter.post('/', requireLandlord, async (req: any, res, next) => {
 expensesRouter.post('/:id/receipt', requireLandlord, receiptUpload.single('receipt'), async (req: any, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
+    const storedName = newStoredFilename(req.file.originalname)
+    await storage.save(`expense-receipts/${storedName}`, req.file.buffer)
     const row = await attachExpenseReceipt(req.params.id, scope(req), {
-      url: '/api/expenses/receipt-files/' + req.file.filename,
+      url: '/api/expenses/receipt-files/' + storedName,
       name: (req.file.originalname || 'receipt').slice(0, 200),
       mime: req.file.mimetype,
       size: req.file.size,
@@ -130,10 +124,9 @@ expensesRouter.get('/receipt-files/:filename', async (req, res, next) => {
       `SELECT landlord_id FROM landlord_expenses WHERE receipt_url = $1`, [receiptUrl])
     if (!exp) throw new AppError(404, 'Not found')
     if (!canAccessLandlordResource(req.user, exp.landlord_id)) throw new AppError(403, 'Forbidden')
-    const fp = resolveUploadPath(receiptDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.sendFile(fp)
+    const key = uploadKeyFromStored('expense-receipts', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 

@@ -9,22 +9,15 @@ import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
-import { streamStoredFile } from '../lib/fileServe'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 
 export const documentsRouter = Router()
 documentsRouter.use(requireAuth)
 
-// W-45 (S529): upload directory for the catch-all Documents tab. Same
-// disk-storage pattern as inspections/avatars.
-const docsDir = path.join(process.cwd(), 'uploads', 'docs')
-if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true })
-const docStorage = multer.diskStorage({
-  destination: docsDir,
-  filename: (_req: any, file: any, cb: any) =>
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-})
+// W-45 (S529): catch-all Documents tab uploads.
+// A1: memory-staged (≤25MB) then storage.save.
 const docUpload = multer({
-  storage: docStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     const ok = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp',
@@ -86,8 +79,10 @@ documentsRouter.get('/:id/file', async (req, res, next) => {
       [...scope.params, req.params.id],
     )
     if (!doc) throw new AppError(404, 'Document not found')
-    // Authorized above (scopeFor); the helper owns path-safety + streaming.
-    streamStoredFile(res, doc.url, doc.mime_type)
+    // Authorized above (scopeFor); the driver owns path-safety + streaming.
+    // documents.url is the one column storing legacy '/uploads/docs/...' urls;
+    // uploadKeyFromStored keys off the basename, so old and new rows both work.
+    await sendStoredFile(res, uploadKeyFromStored('docs', doc.url), { mimeType: doc.mime_type })
   } catch (e) { next(e) }
 })
 
@@ -104,6 +99,8 @@ const uploadMetaSchema = z.object({
 documentsRouter.post('/', requirePerm('documents.upload'), docUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
+    const storedName = newStoredFilename(req.file.originalname)
+    await storage.save(`docs/${storedName}`, req.file.buffer)
     const meta = uploadMetaSchema.parse(req.body)
     // S633: a document tagged to a unit belongs to the company that owns THAT
     // unit — derived, and authorised by the same lookup that used to be a
@@ -117,7 +114,7 @@ documentsRouter.post('/', requirePerm('documents.upload'), docUpload.single('fil
       `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, type, name, url, file_size, mime_type)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [landlordId, meta.unitId ?? null, meta.tenantId ?? null, meta.leaseId ?? null, meta.type,
-       meta.name || req.file.originalname, `/uploads/docs/${req.file.filename}`,
+       meta.name || req.file.originalname, `/uploads/docs/${storedName}`,
        req.file.size, req.file.mimetype],
     )
     res.status(201).json({ success: true, data: doc })
