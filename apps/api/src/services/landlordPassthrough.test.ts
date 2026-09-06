@@ -28,7 +28,7 @@ vi.mock('./adminNotifications', () => ({
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers } from './landlordPassthrough'
+import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser } from './landlordPassthrough'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -305,5 +305,45 @@ describe('tryReconcileForLandlordUserId', () => {
     // Should NOT throw — the function is the webhook entry point.
     await expect(tryReconcileForLandlordUserId(ctx.landlordUserId))
       .resolves.toBeUndefined()
+  })
+})
+
+describe('heldOwnerShareForUser (S639 — display twin of the RESERVE sum)', () => {
+  it('sums unfired owner-share on settled platform-held payments', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(950)
+  })
+
+  it('ignores rows already stamped with a transfer id', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    await db.query(
+      `UPDATE user_balance_ledger SET stripe_transfer_id='tr_already' WHERE user_id=$1`,
+      [ctx.landlordUserId])
+    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(0)
+  })
+
+  it('ignores non-platform-held payments (cash recorded manually)', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    await db.query(
+      `UPDATE payments SET platform_held=FALSE WHERE id=$1`, [ctx.paymentId])
+    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(0)
+  })
+
+  it('unknown user → 0, no throw', async () => {
+    expect(await heldOwnerShareForUser('00000000-0000-0000-0000-000000000000')).toBe(0)
+  })
+
+  it('stays in lockstep with RESERVE: held drains to 0 the moment a batch reserves it', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(950)
+    await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    // The batch stamped the ledger rows (sentinel, then real id) and flipped
+    // platform_held — the displayed held balance must read 0 immediately, not
+    // double-count money already on its way out.
+    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(0)
   })
 })
