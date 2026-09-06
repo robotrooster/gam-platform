@@ -15,20 +15,18 @@ import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename, uploadStagingDir } from '../lib/storage'
 
 export const tenantWalkthroughsRouter = Router()
 tenantWalkthroughsRouter.use(requireAuth)
 
-const dir = path.join(process.cwd(), 'uploads', 'tenant-walkthroughs')
-if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic']
 const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/webm']
+// A1: 500MB clips disk-stage to the OS temp dir, then saveFromFile.
 const upload = multer({
   storage: multer.diskStorage({
-    destination: dir,
-    filename: (_req: any, file: any, cb: any) =>
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+    destination: uploadStagingDir(),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
   }),
   limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
@@ -57,6 +55,7 @@ tenantWalkthroughsRouter.post('/media', upload.single('file'), async (req: any, 
     const tenantId = req.user!.profileId
     const unitId = await currentUnitId(tenantId)
     const mediaType = VIDEO_MIMES.includes(req.file.mimetype) ? 'video' : 'photo'
+    await storage.saveFromFile(req.file.path, `tenant-walkthroughs/${req.file.filename}`)
     const fileUrl = '/api/tenant-walkthroughs/media-files/' + req.file.filename
     const capturedLive = req.body.capturedLive === 'false' ? false : true
     const row = await queryOne<any>(
@@ -103,9 +102,8 @@ tenantWalkthroughsRouter.get('/media-files/:filename', async (req, res, next) =>
       ? m.tenant_id === req.user!.profileId
       : (m.landlord_id != null && canAccessLandlordResource(req.user, m.landlord_id))
     if (!allowed) throw new AppError(403, 'Forbidden')
-    const fp = resolveUploadPath(dir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.sendFile(fp)
+    const key = uploadKeyFromStored('tenant-walkthroughs', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })

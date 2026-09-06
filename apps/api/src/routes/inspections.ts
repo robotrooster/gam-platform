@@ -17,7 +17,7 @@ import {
 } from '../services/notifications'
 import { addBusinessDays } from '../services/moveOutInspections'
 import { logger } from '../lib/logger'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename, uploadStagingDir } from '../lib/storage'
 import { insertInspectionWithChecklist } from '../services/inspections'
 import { generateInspectionReportPdf } from '../services/inspectionReport'
 import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS, INSPECTION_CONDITION_RANK, buildInspectionChecklist } from '@gam/shared'
@@ -45,17 +45,9 @@ import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS, INSPECTION_CONDITION_RANK
 export const inspectionsRouter = Router()
 inspectionsRouter.use(requireAuth)
 
-// ── photo upload setup (mirror avatar pattern) ─────────────────
-const inspectionPhotoDir = path.join(process.cwd(), 'uploads', 'inspections')
-if (!fs.existsSync(inspectionPhotoDir)) fs.mkdirSync(inspectionPhotoDir, { recursive: true })
-
-const photoStorage = multer.diskStorage({
-  destination: inspectionPhotoDir,
-  filename: (_req: any, file: any, cb: any) =>
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-})
+// ── photo upload setup — A1: memory-staged then storage.save ───
 const photoUpload = multer({
-  storage: photoStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     if (['image/jpeg', 'image/png', 'image/webp', 'image/heic'].includes(file.mimetype)) cb(null, true)
@@ -63,17 +55,13 @@ const photoUpload = multer({
   },
 })
 
-// ── walkthrough video upload (GAM in-house storage) ────────────
-const inspectionVideoDir = path.join(process.cwd(), 'uploads', 'inspection-videos')
-if (!fs.existsSync(inspectionVideoDir)) fs.mkdirSync(inspectionVideoDir, { recursive: true })
-
-const videoStorage = multer.diskStorage({
-  destination: inspectionVideoDir,
-  filename: (_req: any, file: any, cb: any) =>
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-})
+// ── walkthrough video upload — A1: 500MB clips disk-stage to the OS
+// temp dir, then saveFromFile moves them into the driver ───────
 const videoUpload = multer({
-  storage: videoStorage,
+  storage: multer.diskStorage({
+    destination: uploadStagingDir(),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
+  }),
   limits: { fileSize: 500 * 1024 * 1024 }, // 500MB — phone walkthrough clips
   fileFilter: (_req: any, file: any, cb: any) => {
     if (['video/mp4', 'video/quicktime', 'video/webm'].includes(file.mimetype)) cb(null, true)
@@ -394,7 +382,9 @@ inspectionsRouter.post('/:id/photos', photoUpload.single('file'), async (req: an
     if (insp.status === 'finalized' || insp.status === 'cancelled') {
       throw new AppError(409, `cannot add photos in status ${insp.status}`)
     }
-    const photoUrl = '/api/inspections/photo-files/' + req.file.filename
+    const photoStoredName = newStoredFilename(req.file.originalname)
+    await storage.save(`inspections/${photoStoredName}`, req.file.buffer)
+    const photoUrl = '/api/inspections/photo-files/' + photoStoredName
     const r = await queryOne<{ id: string }>(
       `INSERT INTO unit_inspection_photos (
          inspection_id, item_id, photo_url, caption, captured_live, uploaded_by
@@ -443,14 +433,11 @@ inspectionsRouter.get('/photo-files/:filename', async (req, res, next) => {
       const scoped = await getScopedPropertyIds(u)
       if (scoped && !scoped.includes(p.property_id)) throw new AppError(403, 'Forbidden')
     }
-    // S535: resolveUploadPath, not a raw path.join — an encoded slash
-    // (%2F) decodes into the route param, so '..%2F..%2F...' would
-    // traverse out of the photos dir. Same class as the S380 avatar
-    // finding; the other file routes already use it.
-    const fp = resolveUploadPath(inspectionPhotoDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.sendFile(fp)
+    // S535: guarded key derivation, not a raw path.join — an encoded slash
+    // (%2F) decodes into the route param; the storage key guard refuses it.
+    const key = uploadKeyFromStored('inspections', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) {
     next(e)
   }
@@ -479,6 +466,7 @@ inspectionsRouter.post('/:id/videos', videoUpload.single('file'), async (req: an
     if (insp.status === 'finalized' || insp.status === 'cancelled') {
       throw new AppError(409, `cannot add videos in status ${insp.status}`)
     }
+    await storage.saveFromFile(req.file.path, `inspection-videos/${req.file.filename}`)
     const videoUrl = '/api/inspections/video-files/' + req.file.filename
     const durationRaw = Number(req.body.durationSeconds)
     const r = await queryOne<{ id: string }>(
@@ -575,10 +563,9 @@ inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
     }
     if (!allowed) throw new AppError(403, 'Forbidden')
 
-    const fp = resolveUploadPath(inspectionVideoDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.sendFile(fp)
+    const key = uploadKeyFromStored('inspection-videos', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) {
     next(e)
   }
@@ -605,11 +592,11 @@ inspectionsRouter.get('/report-files/:filename', async (req, res, next) => {
       const scoped = await getScopedPropertyIds(u)
       if (scoped && !scoped.includes(r.property_id)) throw new AppError(403, 'Forbidden')
     }
-    const fp = resolveUploadPath(inspectionPhotoDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.setHeader('Content-Type', 'application/pdf')
-    res.sendFile(fp)
+    // Report PDFs share the inspections/ prefix with photos — deliberate,
+    // the inventory's dual-use-dir callout. Do not split the key scheme.
+    const key = uploadKeyFromStored('inspections', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key, { mimeType: 'application/pdf' })
   } catch (e) {
     next(e)
   }

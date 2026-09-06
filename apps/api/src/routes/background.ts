@@ -16,7 +16,7 @@ import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import crypto from 'crypto'
 import multer from 'multer'
 import path from 'path'
@@ -143,16 +143,9 @@ function encrypt(text: string): string {
   return iv.toString('hex') + ':' + enc.toString('hex')
 }
 
-// ── ID DOCUMENT UPLOAD STORAGE ───────────────────────────────
-const idDir = path.join(process.cwd(), 'uploads', 'id-documents')
-if (!fs.existsSync(idDir)) fs.mkdirSync(idDir, { recursive: true })
-const idStorage = multer.diskStorage({
-  destination: idDir,
-  filename: (_req, file, cb) =>
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-})
+// ── ID DOCUMENT UPLOAD STORAGE — A1: memory-staged, storage.save ──
 const idUpload = multer({
-  storage: idStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (['image/jpeg', 'image/png', 'application/pdf'].includes(file.mimetype)) cb(null, true)
@@ -972,15 +965,17 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
 backgroundRouter.post('/upload-id', requireAuth, idUpload.single('file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file')
-    res.json({ success: true, data: { url: '/api/background/id-files/' + req.file.filename, filename: req.file.originalname } })
+    const storedName = newStoredFilename(req.file.originalname)
+    await storage.save(`id-documents/${storedName}`, req.file.buffer)
+    res.json({ success: true, data: { url: '/api/background/id-files/' + storedName, filename: req.file.originalname } })
   } catch (e) { next(e) }
 })
 
 // Auth gate per S58 /files/:filename pattern: applicant or owning landlord only.
 backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) => {
   try {
-    const fp = resolveUploadPath(idDir, req.params.filename)
-    if (!fp || !fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    const key = uploadKeyFromStored('id-documents', req.params.filename)
+    if (!key) throw new AppError(404, 'Not found')
     const url = '/api/background/id-files/' + req.params.filename
     const owner = await queryOne<any>(
       'SELECT user_id, landlord_id FROM background_checks WHERE id_document_url=$1',
@@ -990,9 +985,7 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     const isApplicant = owner.user_id === req.user!.userId
     const isLandlord = owner.landlord_id && owner.landlord_id === req.user!.profileId
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
-    res.removeHeader('Content-Security-Policy')
-    res.removeHeader('Cross-Origin-Resource-Policy')
-    res.sendFile(fp)
+    await sendStoredFile(res, key, { stripEmbedBlockers: true })
   } catch (e) { next(e) }
 })
 
