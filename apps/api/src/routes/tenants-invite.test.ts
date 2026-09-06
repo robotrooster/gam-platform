@@ -246,16 +246,20 @@ describe('POST /accept-invite — tenant activates account', () => {
 
     // The activation itself is whole: password, phone, terms AND the 2FA flag,
     // which used to be a separate late UPDATE that Laurel never reached.
-    const u = await db.query<{ pw: string; phone: string; tos: string | null; twofa: boolean; tok: string | null }>(
+    const u = await db.query<{ pw: string; phone: string; tos: string | null; twofa: boolean; tok: string | null; accepted: string | null }>(
       `SELECT password_hash AS pw, phone, accepted_tos_at AS tos,
-              email_2fa_enabled AS twofa, tenant_invite_token AS tok
+              email_2fa_enabled AS twofa, tenant_invite_token AS tok,
+              tenant_invite_accepted_at AS accepted
          FROM users WHERE id = $1`, [f.userId])
     expect(u.rows[0].pw.startsWith('$2')).toBe(true)
     expect(u.rows[0].phone).toBe('5205551234')
     expect(u.rows[0].tos).not.toBeNull()
     expect(u.rows[0].twofa).toBe(true)
-    // Spent, because the activation genuinely committed.
-    expect(u.rows[0].tok).toBeNull()
+    // S637 (b51aa57): spent means MARKED accepted, not deleted — the token is
+    // kept so a tenant reopening their own invite is told "already set up"
+    // instead of "expired". It authorises nothing once accepted.
+    expect(u.rows[0].tok).toBe(f.token)
+    expect(u.rows[0].accepted).not.toBeNull()
   })
 
   it('S637: the token is only spent if the activation commits', async () => {
@@ -298,11 +302,13 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(ok.status).toBe(200)
 
     // And it is single-use: a replay of a SPENT link is refused, rather than
-    // activating twice and drafting a second lease.
+    // activating twice and drafting a second lease. S637 (b51aa57): refused
+    // with 409 "already set up" — the token survives, marked accepted, so the
+    // tenant is told the truth instead of "invalid or expired".
     const replay = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
-    expect(replay.status).toBe(404)
+    expect(replay.status).toBe(409)
   })
 
   it('missing token → 400', async () => {
@@ -374,7 +380,10 @@ describe('POST /accept-invite — tenant activates account', () => {
          FROM users WHERE id=$1`, [userId])
     expect(u.rows[0].password_hash).not.toBe('$2b$10$placeholder_invite_pending')
     expect(u.rows[0].password_hash).toMatch(/^\$2[aby]\$/)  // bcrypt envelope
-    expect(u.rows[0].tenant_invite_token).toBeNull()
+    // S637 (b51aa57): the token is retained (marked accepted) so a reopened
+    // invite reads "already set up"; only the EXPIRY is cleared, so an
+    // accepted invite can never also report as timed out.
+    expect(u.rows[0].tenant_invite_token).not.toBeNull()
     expect(u.rows[0].tenant_invite_expires_at).toBeNull()
     expect(u.rows[0].email_verified).toBe(true)
     expect(u.rows[0].phone).toBe('5555550199')
