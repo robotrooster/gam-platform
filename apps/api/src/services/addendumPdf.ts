@@ -60,7 +60,6 @@ interface LeaseContext {
   recorded_by:     string
 }
 
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'leases')
 
 async function loadLeaseContext(leaseId: string, recordedByUserId: string): Promise<LeaseContext> {
   const lease = await queryOne<{

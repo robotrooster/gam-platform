@@ -49,9 +49,8 @@ async function main() {
   const bytes = await doc.save()
 
   const filename = `${Date.now()}-demolease01.pdf`
-  const dir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
-  fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, filename), bytes)
+  const { storage } = await import('../lib/storage')
+  await storage.save(`lease-pdfs-pending/${filename}`, Buffer.from(bytes))
 
   // ── ParserOutput (shared shape) ────────────────────────────────────
   const f = (value: any, confidence: number, rawText?: string) => ({ value, confidence, ...(rawText ? { rawText } : {}) })

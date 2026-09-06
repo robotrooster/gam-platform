@@ -135,8 +135,9 @@ dotenv.config(process.env.GAM_ENV_FILE ? { path: process.env.GAM_ENV_FILE } : un
 validateEnv()
 
 const app  = express()
-const uploadsDir = path.join(process.cwd(), 'uploads')
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true })
+// A1: no boot-time uploads/ mkdir — lib/storage's local driver creates
+// parents on write, and a gcs deployment has no directory to make. This
+// used to crash a read-only container filesystem before the first request.
 const PORT = process.env.PORT || 4000
 
 // ── MIDDLEWARE ──────────────────────────────────────────────
@@ -460,6 +461,13 @@ app.use(errorHandler)
 // (GCP: gam-api sets 0, gam-scheduler runs the crons) turns it off.
 // Hard rule either way: exactly one process anywhere runs with crons on.
 const runScheduler = process.env.RUN_SCHEDULER !== '0'
+
+// A5: rate limiters / agent caches / turn gates are in-process. One replica
+// is correct by design (Cloud Run max-instances=1); a scaled-out deployment
+// needs a shared store first. Warn where that mistake would be made.
+if (process.env.K_SERVICE) {
+  logger.warn('running on Cloud Run: in-memory rate limits and caches are per-instance — keep max-instances=1 until a shared store exists')
+}
 
 const server = app.listen(PORT, () => {
   logger.info({

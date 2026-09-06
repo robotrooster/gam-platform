@@ -70,10 +70,9 @@ async function main() {
   blank(300, 680, 120, 24, 'DATE')
 
   const bytes = await doc.save()
-  const out = path.join(process.cwd(), 'uploads', 'leases', 'demo-lease.pdf')
-  fs.mkdirSync(path.dirname(out), { recursive: true })
-  fs.writeFileSync(out, bytes)
-  console.log('Wrote', out, bytes.length, 'bytes')
+  const { storage } = await import('../lib/storage')
+  await storage.save('leases/demo-lease.pdf', Buffer.from(bytes))
+  console.log('Wrote leases/demo-lease.pdf', bytes.length, 'bytes')
 }
 
 main().catch(e => { console.error(e); process.exit(1) })

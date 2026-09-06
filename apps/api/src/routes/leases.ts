@@ -9,7 +9,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, readStoredFile } from '../lib/storage'
 import { logger } from '../lib/logger'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
@@ -72,7 +72,6 @@ async function isTenantOnLease(leaseId: string, tenantProfileId: string): Promis
 //      (services/leasePdf) so every lease is still viewable.
 // Auth: tenant on the lease, or landlord/team with access to the lease.
 // ─────────────────────────────────────────────────────────────
-const LEASE_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'leases')
 
 // S534 (Nic): the lease view is the CURRENT contract — the signed lease
 // followed by every recorded addendum, one continuous PDF. Addendum
@@ -93,10 +92,10 @@ async function appendLeaseAddendums(leaseId: string, mainBytes: Uint8Array): Pro
   const { PDFDocument } = await import('pdf-lib')
   const merged = await PDFDocument.load(mainBytes)
   for (const fn of files) {
-    const fp = resolveUploadPath(LEASE_UPLOAD_DIR, fn)
-    if (!fp || !fs.existsSync(fp)) continue
+    const key = uploadKeyFromStored('leases', fn)
+    if (!key || !(await storage.exists(key))) continue
     try {
-      const addendum = await PDFDocument.load(fs.readFileSync(fp))
+      const addendum = await PDFDocument.load(await readStoredFile(key))
       const pages = await merged.copyPages(addendum, addendum.getPageIndices())
       pages.forEach(p => merged.addPage(p))
     } catch (e) {
@@ -129,15 +128,15 @@ leasesRouter.get('/:id/pdf', async (req, res, next) => {
        LIMIT 1`, [lease.id])
     const executedFilename = executed?.executed_pdf_url?.split('/').pop()
     if (executedFilename) {
-      const filePath = resolveUploadPath(LEASE_UPLOAD_DIR, executedFilename)
-      if (filePath && fs.existsSync(filePath)) baseBytes = fs.readFileSync(filePath)
+      const key = uploadKeyFromStored('leases', executedFilename)
+      if (key && (await storage.exists(key))) baseBytes = await readStoredFile(key)
     }
 
     // 2. Imported original (S395: stores the bare multer filename).
     if (!baseBytes && lease.imported_pdf_url) {
       const importedFilename = lease.imported_pdf_url.split('/').pop()!
-      const filePath = resolveUploadPath(LEASE_UPLOAD_DIR, importedFilename)
-      if (filePath && fs.existsSync(filePath)) baseBytes = fs.readFileSync(filePath)
+      const key = uploadKeyFromStored('leases', importedFilename)
+      if (key && (await storage.exists(key))) baseBytes = await readStoredFile(key)
     }
 
     // 3. Generated terms rendering.
@@ -489,7 +488,6 @@ leasesRouter.get('/:id/addendums', async (req, res, next) => {
 // for this lease so a leaked filename can't be used to fish other
 // PDFs from the uploads directory. Path traversal blocked by
 // resolveUploadPath.
-const ADDENDUM_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'leases')
 leasesRouter.get('/:id/addendum-pdf/:filename', async (req, res, next) => {
   try {
     const lease = await queryOne<{ id: string; landlord_id: string }>(
@@ -524,11 +522,9 @@ leasesRouter.get('/:id/addendum-pdf/:filename', async (req, res, next) => {
     )
     if (!eventMatch) throw new AppError(404, 'Addendum PDF not found for this lease')
 
-    const filePath = resolveUploadPath(ADDENDUM_UPLOAD_DIR, req.params.filename)
-    if (!filePath) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(filePath)) throw new AppError(404, 'File not on disk')
-
-    res.sendFile(filePath)
+    const key = uploadKeyFromStored('leases', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 

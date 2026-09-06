@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
+import { extractUploadFilename } from '../lib/uploadPaths'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import {
   LeaseDocumentType,

@@ -27,7 +27,6 @@ import type {
 } from '@gam/shared'
 import { logger } from '../../lib/logger'
 
-const pendingPdfDir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
 
 interface IntentRow {
   id: string

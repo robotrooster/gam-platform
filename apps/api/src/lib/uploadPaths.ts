@@ -26,11 +26,4 @@ export function extractUploadFilename(url: string | null | undefined): string | 
  * Belt + suspenders: extractUploadFilename strips path components, and
  * path.relative confirms the join did not escape.
  */
-export function resolveUploadPath(uploadDir: string, url: string | null | undefined): string | null {
-  const filename = extractUploadFilename(url)
-  if (!filename) return null
-  const resolved = path.join(uploadDir, filename)
-  const rel = path.relative(uploadDir, resolved)
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return null
-  return resolved
-}
+// A1: resolveUploadPath removed — path resolution is lib/storage's job now.

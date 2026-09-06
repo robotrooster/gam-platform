@@ -21,7 +21,6 @@ import { storage } from '../lib/storage'
 import { query, queryOne } from '../db'
 import { humanize, INSPECTION_ITEM_CONDITION_LABEL, INSPECTION_CONDITION_RANK } from '@gam/shared'
 
-const REPORT_DIR = path.join(process.cwd(), 'uploads', 'inspections')
 
 const TYPE_LABEL: Record<string, string> = {
   move_in: 'Move-in', move_out: 'Move-out', periodic: 'Periodic', turnover: 'Turnover',

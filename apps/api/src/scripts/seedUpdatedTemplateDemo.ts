@@ -81,9 +81,8 @@ async function main() {
   const bytes = await buildPdf()
   // S535 lockdown: template demo assets live in uploads/public — the only
   // statically-served subdir besides unit-photos.
-  const out = path.join(process.cwd(), 'uploads', 'public', 'updated-form-2026.pdf')
-  fs.mkdirSync(path.dirname(out), { recursive: true })
-  fs.writeFileSync(out, bytes)
+  const { storage } = await import('../lib/storage')
+  await storage.save('public/updated-form-2026.pdf', Buffer.from(bytes))
 
   // 2. Template + fields (idempotent by name).
   const landlord = await queryOne<{ id: string }>(
