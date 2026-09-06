@@ -4,7 +4,7 @@ import { z } from 'zod'
 import path from 'path'
 import { DateTime } from 'luxon'
 import { query, queryOne, getClient } from '../db'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { sendStoredFile, uploadKeyFromStored } from '../lib/storage'
 import { AppError } from '../middleware/errorHandler'
 import {
   computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, UnitFullError,
@@ -130,7 +130,7 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
 // Streams a site photo from disk. Only rows belonging to a PUBLISHED site
 // resolve (resolveProperty 404s otherwise), and only from the site-photo
 // dir — internal unit/inspection photos are unreachable by construction.
-const SITE_PHOTO_DIR = path.join(process.cwd(), 'uploads', 'property-site-photos')
+
 publicPropertyBookingRouter.get('/property/:slug/photo/:photoId', async (req, res, next) => {
   try {
     const prop = await resolveProperty(req.params.slug)
@@ -139,13 +139,11 @@ publicPropertyBookingRouter.get('/property/:slug/photo/:photoId', async (req, re
       `SELECT filename FROM property_site_photos WHERE id=$1 AND property_id=$2`,
       [req.params.photoId, prop.id])
     if (!row) throw new AppError(404, 'Photo not found')
-    const fp = resolveUploadPath(SITE_PHOTO_DIR, row.filename)
-    if (!fp) throw new AppError(404, 'Photo not found')
-    res.setHeader('Cache-Control', 'public, max-age=3600')
+    const key = uploadKeyFromStored('property-site-photos', row.filename)
+    if (!key) throw new AppError(404, 'Photo not found')
     // Helmet defaults CORP to same-origin, which blocks the storefront's
     // cross-origin <img> embeds — this image is public by definition.
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
-    res.sendFile(fp, err => { if (err && !res.headersSent) next(new AppError(404, 'Photo not found')) })
+    await sendStoredFile(res, key, { cacheControl: 'public, max-age=3600', exposeCrossOrigin: true })
   } catch (e) { next(e) }
 })
 

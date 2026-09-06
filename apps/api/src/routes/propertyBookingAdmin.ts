@@ -8,7 +8,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored } from '../lib/storage'
 import { importSite, downloadImage } from '../services/siteImport'
 
 // ============================================================
@@ -207,16 +207,9 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
 // ── S547: property-website photos ──
 // Public-site gallery shots — separate from unit_photos (internal listing
 // media) so the public serving route can never reach internal photos.
-const sitePhotoDir = path.join(process.cwd(), 'uploads', 'property-site-photos')
-if (!fs.existsSync(sitePhotoDir)) fs.mkdirSync(sitePhotoDir, { recursive: true })
+// A1: memory-staged then storage.save.
 const sitePhotoUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, sitePhotoDir),
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
-      cb(null, `${crypto.randomBytes(16).toString('hex')}${ext}`)
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true)
@@ -245,10 +238,13 @@ propertyBookingAdminRouter.post('/properties/:id/site-photos', requireAuth, requ
       `SELECT COALESCE(MAX(sort_order), -1) AS mx FROM property_site_photos WHERE property_id=$1`, [prop.id])
     const out = []
     for (let i = 0; i < files.length; i++) {
+      const ext = path.extname(files[i].originalname).toLowerCase() || '.jpg'
+      const storedName = `${crypto.randomBytes(16).toString('hex')}${ext}`
+      await storage.save(`property-site-photos/${storedName}`, files[i].buffer)
       const row = await queryOne<any>(
         `INSERT INTO property_site_photos (property_id, landlord_id, filename, sort_order)
          VALUES ($1,$2,$3,$4) RETURNING id, caption, sort_order, created_at`,
-        [prop.id, prop.landlord_id, files[i].filename, Number(base?.mx ?? -1) + 1 + i])
+        [prop.id, prop.landlord_id, storedName, Number(base?.mx ?? -1) + 1 + i])
       out.push(row)
     }
     res.status(201).json({ success: true, data: out })
@@ -268,11 +264,11 @@ propertyBookingAdminRouter.get('/properties/:id/site-photos/:photoId/file', requ
       `SELECT filename FROM property_site_photos WHERE id=$1 AND property_id=$2`,
       [req.params.photoId, prop.id])
     if (!row) throw new AppError(404, 'Photo not found')
-    const fp = resolveUploadPath(sitePhotoDir, row.filename)
-    if (!fp || !fs.existsSync(fp)) throw new AppError(404, 'Photo not found')
-    res.setHeader('Content-Type', SITE_PHOTO_MIME[path.extname(fp).toLowerCase()] ?? 'image/jpeg')
+    const key = uploadKeyFromStored('property-site-photos', row.filename)
+    if (!key) throw new AppError(404, 'Photo not found')
+    res.setHeader('Content-Type', SITE_PHOTO_MIME[path.extname(key).toLowerCase()] ?? 'image/jpeg')
     res.setHeader('X-Content-Type-Options', 'nosniff')
-    res.sendFile(fp)
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 
@@ -327,7 +323,7 @@ propertyBookingAdminRouter.delete('/properties/:id/site-photos/:photoId', requir
       `DELETE FROM property_site_photos WHERE id=$1 AND property_id=$2 RETURNING filename`,
       [req.params.photoId, prop.id])
     if (!row) throw new AppError(404, 'Photo not found')
-    fs.promises.unlink(path.join(sitePhotoDir, path.basename(row.filename))).catch(() => {})
+    { const k = uploadKeyFromStored('property-site-photos', row.filename); if (k) await storage.remove(k).catch(() => {}) }
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -375,7 +371,7 @@ propertyBookingAdminRouter.post('/properties/:id/site-import/:importId/photos', 
       try {
         const { buffer, ext } = await downloadImage(u)
         const filename = `${crypto.randomBytes(16).toString('hex')}${ext}`
-        await fs.promises.writeFile(path.join(sitePhotoDir, filename), buffer)
+        await storage.save(`property-site-photos/${filename}`, buffer)
         order += 1
         const photo = await queryOne<any>(
           `INSERT INTO property_site_photos (property_id, landlord_id, filename, sort_order)

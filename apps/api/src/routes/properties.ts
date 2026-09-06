@@ -7,7 +7,7 @@ import { normalizeAddress } from '../lib/address'
 import { formatPropertyInput, formatName, formatStreet, formatStreet2, formatCity, formatState, formatZip } from '../lib/format'
 import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
-import { resolveUploadPath } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { suggestBookingSlug } from './propertyBookingAdmin'
 import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from '../services/onboardingWindow'
@@ -1746,9 +1746,6 @@ propertiesRouter.get('/:id/eligible-managers', async (req, res, next) => {
 // PUBLIC LISTINGS
 // ════════════════════════════════════════
 
-const uploadDir = path.join(process.cwd(), 'uploads', 'unit-photos')
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
-
 // S399 fix: force safe extension from MIME instead of taking
 // path.extname(originalname) — XSS extension-mismatch class (S380
 // avatar + S394 esign upload + S395 pending-tenants + this). S535:
@@ -1761,14 +1758,8 @@ const MIME_TO_EXT: Record<string, string> = {
   'image/webp': '.webp',
   'image/gif':  '.gif',
 }
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const ext = MIME_TO_EXT[file.mimetype] ?? '.bin'
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`)
-  }
-})
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => {
+// A1: memory-staged then storage.save; extension still forced from MIME.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => {
   if (file.mimetype.startsWith('image/')) cb(null, true)
   else cb(new Error('Images only'))
 }})
@@ -1822,8 +1813,8 @@ const LISTABLE_FILTER = `
 // /unit-photo-files route. Path traversal guarded by resolveUploadPath.
 publicPropertiesRouter.get('/listing-photo/:filename', async (req, res, next) => {
   try {
-    const fp = resolveUploadPath(uploadDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
+    const key = uploadKeyFromStored('unit-photos', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
     const row = await queryOne<{ id: string }>(
       `SELECT up.id FROM unit_photos up
          JOIN units u ON u.id = up.unit_id
@@ -1833,12 +1824,10 @@ publicPropertiesRouter.get('/listing-photo/:filename', async (req, res, next) =>
       [[`/api/properties/unit-photo-files/${req.params.filename}`,
         `/uploads/unit-photos/${req.params.filename}`]])
     if (!row) throw new AppError(404, 'Photo not found')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Photo not found')
-    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(fp).toLowerCase()] ?? 'image/jpeg')
+    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(key).toLowerCase()] ?? 'image/jpeg')
     res.setHeader('X-Content-Type-Options', 'nosniff')
     // Public marketing image — allow the listings storefront's cross-origin <img>.
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
-    res.sendFile(fp)
+    await sendStoredFile(res, key, { exposeCrossOrigin: true })
   } catch (e) { next(e) }
 })
 
@@ -2011,12 +2000,11 @@ const EXT_TO_MIME: Record<string, string> = {
 }
 propertiesRouter.get('/unit-photo-files/:filename', async (req, res, next) => {
   try {
-    const fp = resolveUploadPath(uploadDir, req.params.filename)
-    if (!fp) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
-    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(fp).toLowerCase()] ?? 'image/jpeg')
+    const key = uploadKeyFromStored('unit-photos', req.params.filename)
+    if (!key) throw new AppError(400, 'Invalid filename')
+    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(key).toLowerCase()] ?? 'image/jpeg')
     res.setHeader('X-Content-Type-Options', 'nosniff')
-    res.sendFile(fp)
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 
@@ -2058,7 +2046,9 @@ propertiesRouter.post('/units/:id/photos', requirePerm('units.edit_listing'), up
     let sortOrder = +existing[0].count
     const inserted = []
     for (const file of files) {
-      const url = `/api/properties/unit-photo-files/${file.filename}`
+      const storedName = newStoredFilename('photo' + (MIME_TO_EXT[file.mimetype] ?? '.bin'))
+      await storage.save(`unit-photos/${storedName}`, file.buffer)
+      const url = `/api/properties/unit-photo-files/${storedName}`
       const { rows: [photo] } = await db.query(
         'INSERT INTO unit_photos (unit_id, landlord_id, url, sort_order) VALUES ($1,$2,$3,$4) RETURNING *',
         [req.params.id, unit.landlord_id, url, sortOrder++]
@@ -2083,8 +2073,8 @@ propertiesRouter.delete('/units/:id/photos/:photoId', requirePerm('units.edit_li
     // photo.url is '/api/properties/unit-photo-files/<f>' (S535) or the
     // legacy '/uploads/unit-photos/<f>' — resolveUploadPath basenames
     // either form into the photos dir (and blocks traversal).
-    const filePath = resolveUploadPath(uploadDir, photo.url)
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath)
+    const key = uploadKeyFromStored('unit-photos', photo.url)
+    if (key) await storage.remove(key).catch(() => {})
     await db.query('DELETE FROM unit_photos WHERE id=$1', [photo.id])
     res.json({ success: true })
   } catch (e) { next(e) }
