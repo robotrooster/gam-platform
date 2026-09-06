@@ -22,6 +22,12 @@
     <string>/opt/homebrew/opt/node@22/bin:/opt/homebrew/opt/postgresql@16/bin:/usr/bin:/bin</string>
     <key>NODE_ENV</key>
     <string>production</string>
+    <!-- The scheduler defaults ON, so this line is documentation of the
+         invariant, not a switch: THIS process is the one place crons run.
+         Any second deployment (staging, GCP) must set RUN_SCHEDULER=0 on
+         its web instances or jobs double-fire (double late fees/emails). -->
+    <key>RUN_SCHEDULER</key>
+    <string>1</string>
   </dict>
   <key>KeepAlive</key>
   <true/>

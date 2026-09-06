@@ -1,33 +1,60 @@
+import { AppError } from '../../middleware/errorHandler'
+import { logger } from '../../lib/logger'
+
 /**
  * Agent engine — model connection config.
  *
- * The engine talks to a self-hosted, OpenAI-compatible LLM endpoint
- * ONLY. No third-party AI API, no per-token cost, no tenant data
- * leaving GAM-controlled hardware (CLAUDE.md hard rule). Dev runs
- * Hermes-4-14B (4-bit) via MLX on localhost:8080; prod swaps a larger
- * Hermes behind the same endpoint. Because BOTH the URL and the model
- * name are env-driven, dev->prod and machine->machine is a config
- * change, never an engine rebuild.
+ * The engine talks to any OpenAI-compatible endpoint. Historically that
+ * was self-hosted ONLY ("no third-party AI API, no tenant data leaving
+ * GAM-controlled hardware" — the old CLAUDE.md hard rule). That rule was
+ * DELIBERATELY overridden for the GCP migration (2026-09-06, leadership
+ * decision): hosted providers are now permitted, contingent on a signed
+ * vendor DPA and updated tenant-facing privacy disclosures — see
+ * GCP_MIGRATION_PLAN.md Phase A4. Dev still runs Hermes via MLX on
+ * localhost:8080; a hosted provider is a config change (endpoint + model
+ * id + LLM_API_KEY), never an engine rebuild.
  *
  * Required env:
  *   - LLM_ENDPOINT  OpenAI-compatible base, e.g. http://localhost:8080/v1
  *   - LLM_MODEL     served model id, e.g. mlx-community/Hermes-4-14B-4bit
  * Optional env:
- *   - LLM_TIMEOUT_MS  per-request timeout; defaults to 60s (a local
+ *   - LLM_API_KEY     bearer token for a hosted provider (absent = no header)
+ *   - LLM_TIMEOUT_MS  per-request timeout; defaults to 180s (a local
  *                     model on modest hardware can be slow to first token)
  */
+
+/**
+ * Bearer auth for a hosted OpenAI-compatible provider (GCP migration Phase
+ * A4). The self-hosted MLX fleet takes no auth, so an absent key means no
+ * header — behavior unchanged on GAM hardware. EMBEDDINGS_API_KEY falls
+ * back to LLM_API_KEY because both usually point at the same provider.
+ */
+export function llmAuthHeaders(keyVar: 'LLM_API_KEY' | 'EMBEDDINGS_API_KEY'): Record<string, string> {
+  const key = process.env[keyVar] || process.env.LLM_API_KEY
+  return key ? { Authorization: `Bearer ${key}` } : {}
+}
 
 /** Parse a comma-separated endpoint list (preferred, for a worker fleet)
  *  falling back to a single endpoint var. Trailing slashes stripped,
  *  blanks dropped. Throws if neither is set. */
 function parseEndpoints(listVar: string, singleVar: string): string[] {
   const raw = process.env[listVar] || process.env[singleVar]
-  if (!raw) throw new Error(`${listVar} (or ${singleVar}) not set`)
+  // AppError(503), not a plain Error: an unconfigured model endpoint means
+  // "the assistant is unavailable on this deployment", not a server bug —
+  // agent routes must answer 503, never 500 (GCP migration Phase A4). The
+  // env-var specifics stay in the log, not the client message.
+  if (!raw) {
+    logger.warn({ var: listVar }, 'agent engine unconfigured — endpoint env not set')
+    throw new AppError(503, 'The assistant is not available right now.')
+  }
   const endpoints = raw
     .split(',')
     .map((s) => s.trim().replace(/\/+$/, ''))
     .filter(Boolean)
-  if (endpoints.length === 0) throw new Error(`${listVar} (or ${singleVar}) is empty`)
+  if (endpoints.length === 0) {
+    logger.warn({ var: listVar }, 'agent engine unconfigured — endpoint env empty')
+    throw new AppError(503, 'The assistant is not available right now.')
+  }
   return endpoints
 }
 
@@ -53,7 +80,10 @@ export interface LlmConfig {
 export function getLlmConfig(): LlmConfig {
   const endpoints = parseEndpoints('LLM_ENDPOINTS', 'LLM_ENDPOINT')
   const model = process.env.LLM_MODEL
-  if (!model) throw new Error('LLM_MODEL not set')
+  if (!model) {
+    logger.warn('agent engine unconfigured — LLM_MODEL not set')
+    throw new AppError(503, 'The assistant is not available right now.')
+  }
 
   // 180s default: a 36B at 6-bit can take >60s on a long generation (e.g. a full
   // portal walkthrough), which previously timed out and surfaced an error.
@@ -67,9 +97,11 @@ export function getLlmConfig(): LlmConfig {
 }
 
 /**
- * Embedding model connection — a SECOND self-hosted, OpenAI-compatible
- * endpoint (separate from the chat model). Dev runs bge-large-en-v1.5
- * via llama.cpp on localhost:8081. Same no-third-party rule applies.
+ * Embedding model connection — a SECOND OpenAI-compatible endpoint
+ * (separate from the chat model). Dev runs bge-large-en-v1.5 via
+ * llama.cpp on localhost:8081. Hosted providers permitted per the same
+ * override as the chat model above; keep the SAME embedding model
+ * wherever it runs — see EMBEDDING_DIM.
  *
  * Required env:
  *   - EMBEDDINGS_ENDPOINT  e.g. http://localhost:8081/v1
@@ -94,7 +126,10 @@ export interface EmbeddingsConfig {
 export function getEmbeddingsConfig(): EmbeddingsConfig {
   const endpoints = parseEndpoints('EMBEDDINGS_ENDPOINTS', 'EMBEDDINGS_ENDPOINT')
   const model = process.env.EMBEDDINGS_MODEL
-  if (!model) throw new Error('EMBEDDINGS_MODEL not set')
+  if (!model) {
+    logger.warn('agent engine unconfigured — EMBEDDINGS_MODEL not set')
+    throw new AppError(503, 'The assistant is not available right now.')
+  }
 
   const rawTimeout = Number(process.env.EMBEDDINGS_TIMEOUT_MS)
   const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 30_000

@@ -15,7 +15,7 @@
  * interaction logging (step 6).
  */
 
-import { getLlmConfig, HERMES_SAMPLER_DEFAULTS, type SamplerSettings } from './config'
+import { getLlmConfig, llmAuthHeaders, HERMES_SAMPLER_DEFAULTS, type SamplerSettings } from './config'
 import { getPool, RetryableEndpointError, isRetryableStatus } from './endpointPool'
 import { logger } from '../../lib/logger'
 import type { ChatMessage, RunAgentInput, RunAgentResult, ToolCall } from './types'
@@ -169,7 +169,7 @@ export async function chatCompletion(
     try {
       res = await fetch(`${endpoint}/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...llmAuthHeaders('LLM_API_KEY') },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
       })

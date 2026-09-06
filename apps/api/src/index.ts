@@ -5,7 +5,9 @@ import './instrument'
 import * as Sentry from '@sentry/node'
 
 import express from 'express'
+import cron from 'node-cron'
 import { db } from './db'
+import { propertiesDb } from './db/propertiesDb'
 import path from 'path'
 import fs from 'fs'
 // S86: scheduleOtpCron import removed. The cron's INSERT references the
@@ -260,7 +262,12 @@ app.use(httpLogger)
 // public request behind the tunnel counts against ONE shared
 // 127.0.0.1 rate bucket — ~14 visitors/min would 429 the whole
 // platform at launch. Dev (direct connection, no XFF) is unaffected.
-app.set('trust proxy', 1)
+// TRUST_PROXY_HOPS exists because the hop count is a property of the
+// deployment, not the code: 1 behind cloudflared, more behind a load
+// balancer chain (GCP migration Phase A3). Getting it wrong breaks
+// rate limiting quietly — too low buckets everyone as the proxy IP,
+// too high lets clients spoof X-Forwarded-For.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
 
 // Rate limiting. General limit sized for AUTHENTICATED PORTAL USE:
 // the portals poll in the background (notification bell + pending-
@@ -445,15 +452,55 @@ Sentry.setupExpressErrorHandler(app)
 app.use(errorHandler)
 
 // ── START ────────────────────────────────────────────────────
-app.listen(PORT, () => {
+// RUN_SCHEDULER gates the in-process cron runner so the API can scale past
+// one replica without double-running 69 jobs (double late fees, double
+// emails). Default ON: the Mac's launchd service predates this flag and
+// silently losing every cron on a redeploy would be catastrophic — so the
+// flag is opt-OUT ('0' disables), and only the multi-replica deployment
+// (GCP: gam-api sets 0, gam-scheduler runs the crons) turns it off.
+// Hard rule either way: exactly one process anywhere runs with crons on.
+const runScheduler = process.env.RUN_SCHEDULER !== '0'
+
+const server = app.listen(PORT, () => {
   logger.info({
     port: PORT,
+    scheduler: runScheduler,
     landlordApp:  process.env.LANDLORD_APP_URL || 'http://localhost:3001',
     tenantApp:    process.env.TENANT_APP_URL   || 'http://localhost:3002',
     adminApp:     process.env.ADMIN_APP_URL    || 'http://localhost:3003',
     marketing:    process.env.MARKETING_URL    || 'http://localhost:3004',
   }, 'GAM API listening')
-  schedulerInit()
+  if (runScheduler) schedulerInit()
+  else logger.info('RUN_SCHEDULER=0 — cron scheduler disabled on this instance')
 })
+
+// Graceful shutdown (Cloud Run sends SIGTERM with ~10s grace; launchd sends
+// SIGTERM on unload). Order matters: stop taking work (crons, listener),
+// let in-flight requests finish, then close the pools. The backstop exits
+// hard if anything hangs — a wedged shutdown must not outlive the grace
+// period holding DB connections.
+let shuttingDown = false
+async function shutdown(signal: string) {
+  if (shuttingDown) return
+  shuttingDown = true
+  logger.info({ signal }, 'shutting down')
+  for (const task of cron.getTasks().values()) task.stop()
+  const backstop = setTimeout(() => {
+    logger.error('shutdown backstop hit — exiting hard')
+    process.exit(1)
+  }, 8000)
+  backstop.unref()
+  server.close(async () => {
+    try {
+      await db.end()
+      await propertiesDb.end()
+    } catch (e) {
+      logger.error({ err: e }, 'pool close failed during shutdown')
+    }
+    process.exit(0)
+  })
+}
+process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+process.on('SIGINT',  () => { void shutdown('SIGINT') })
 
 export default app

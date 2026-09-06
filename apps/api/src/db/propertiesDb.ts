@@ -13,11 +13,19 @@ import { Pool } from 'pg'
 import { logger } from '../lib/logger'
 
 export const propertiesDb = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  database: process.env.PROPERTIES_DB_NAME || 'gam_properties',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || '',
+  // PROPERTIES_DB_* override per-field so this pool can point at a different
+  // instance than the operational DB (GCP migration Phase A3); each falls back
+  // to the main DB_* var, preserving the same-host default. PROPERTIES_DATABASE_URL
+  // wins outright when set.
+  ...(process.env.PROPERTIES_DATABASE_URL
+    ? { connectionString: process.env.PROPERTIES_DATABASE_URL }
+    : {
+        host: process.env.PROPERTIES_DB_HOST || process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.PROPERTIES_DB_PORT || process.env.DB_PORT || '5432'),
+        database: process.env.PROPERTIES_DB_NAME || 'gam_properties',
+        user: process.env.PROPERTIES_DB_USER || process.env.DB_USER || 'postgres',
+        password: process.env.PROPERTIES_DB_PASSWORD || process.env.DB_PASSWORD || '',
+      }),
   max: Number(process.env.PROPERTIES_DB_POOL_MAX) || 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,

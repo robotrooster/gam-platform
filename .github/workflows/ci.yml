@@ -49,7 +49,9 @@ jobs:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 22 matches prod (launchd pins /opt/homebrew/opt/node@22) and the
+          # root engines field — CI was quietly testing a different major.
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies

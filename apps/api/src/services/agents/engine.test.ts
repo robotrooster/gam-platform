@@ -147,9 +147,10 @@ describe('runAgent', () => {
     )
   })
 
-  it('throws when no LLM endpoint is configured', async () => {
+  it('throws a 503 AppError when no LLM endpoint is configured (unconfigured ≠ server bug)', async () => {
     delete process.env.LLM_ENDPOINT
     delete process.env.LLM_ENDPOINTS
-    await expect(runAgent({ profile: PROFILE, message: 'Hi' })).rejects.toThrow(/LLM_ENDPOINTS.*not set/)
+    await expect(runAgent({ profile: PROFILE, message: 'Hi' }))
+      .rejects.toMatchObject({ statusCode: 503, message: 'The assistant is not available right now.' })
   })
 })

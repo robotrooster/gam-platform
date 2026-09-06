@@ -39,6 +39,11 @@ import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
 
 const MODEL_URL = process.env.AUTO_FIELD_MODEL_URL || 'http://localhost:8080'
+// The default is the Mac's local MLX path because prod's .env may not set the
+// var and losing auto-place silently would break the lease flow. Every OTHER
+// deployment must set AUTO_FIELD_MODEL_NAME (a hosted catalog id) — or leave
+// it unset on a host without the local model, where the empty/absent endpoint
+// makes the model pass skip cleanly (see the MODEL_NAME guard below).
 const MODEL_NAME =
   process.env.AUTO_FIELD_MODEL_NAME || '/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx'
 // S582: placement now runs as a DETACHED job (services/autoFieldJobs.ts), so the
@@ -708,7 +713,14 @@ async function classifyChunk(targets: RawTarget[]): Promise<Map<number, Classifi
   try {
     const res = await fetch(`${MODEL_URL}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // AUTO_FIELD_MODEL_API_KEY (falling back to LLM_API_KEY) for hosted
+      // providers; no key = no header, matching the local MLX server.
+      headers: {
+        'Content-Type': 'application/json',
+        ...((process.env.AUTO_FIELD_MODEL_API_KEY || process.env.LLM_API_KEY)
+          ? { Authorization: `Bearer ${process.env.AUTO_FIELD_MODEL_API_KEY || process.env.LLM_API_KEY}` }
+          : {}),
+      },
       body: JSON.stringify({
         model: MODEL_NAME,
         temperature: 0,
@@ -749,7 +761,11 @@ async function modelClassify(
   totalPages: number,
   onProgress?: AutoPlaceProgress,
 ): Promise<Map<number, Classification> | null> {
-  if (!MODEL_ENABLED || targets.length === 0) return null
+  // An empty MODEL_NAME disables the model pass the same way the kill switch
+  // does: better no assist than a request the endpoint will reject. (The old
+  // default was a Mac-absolute MLX path; deployments must now name their
+  // model explicitly via AUTO_FIELD_MODEL_NAME.)
+  if (!MODEL_ENABLED || !MODEL_NAME || targets.length === 0) return null
   const byPage = new Map<number, RawTarget[]>()
   for (const t of targets) {
     const arr = byPage.get(t.page)

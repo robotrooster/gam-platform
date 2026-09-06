@@ -10,7 +10,7 @@
  * Plain fetch, localhost only — no SDK, no external network.
  */
 
-import { getEmbeddingsConfig, EMBEDDING_DIM } from './config'
+import { getEmbeddingsConfig, llmAuthHeaders, EMBEDDING_DIM } from './config'
 import { getPool, RetryableEndpointError, isRetryableStatus } from './endpointPool'
 import { logger } from '../../lib/logger'
 
@@ -39,7 +39,7 @@ export async function embedBatch(texts: string[]): Promise<number[][]> {
     try {
       res = await fetch(`${endpoint}/embeddings`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...llmAuthHeaders('EMBEDDINGS_API_KEY') },
         body: JSON.stringify({ model, input: texts }),
         signal: AbortSignal.timeout(timeoutMs),
       })

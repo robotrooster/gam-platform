@@ -9,21 +9,32 @@ import { logger } from '../lib/logger'
 // the sales-demo API to the PRODUCTION database. Caught by
 // validateEnv.assertDemoIsolation() refusing to boot, not by anything here.
 //
-// GAM_ENV_FILE is honoured first; the absolute default is kept because launchd
-// starts the service with a cwd that is not guaranteed to be apps/api.
+// GAM_ENV_FILE is honoured first. The default resolves RELATIVE TO THIS FILE
+// (src/db → apps/api/.env, and dist/db → the same apps/api/.env once built),
+// because launchd starts the service with a cwd that is not guaranteed to be
+// apps/api — and a machine-absolute path here once made every other checkout
+// silently read no env at all (GCP migration Phase A3). Real environment
+// variables always win: dotenv never overrides what the process already has.
 dotenv.config({
   path: process.env.GAM_ENV_FILE
-    || path.join('/Users/nicholasrhoades/gam/apps/api', '.env'),
+    || path.resolve(__dirname, '..', '..', '.env'),
 })
 
 import { Pool, PoolClient } from 'pg'
 
 export const db = new Pool({
-  host:     process.env.DB_HOST     || 'localhost',
-  port:     parseInt(process.env.DB_PORT || '5432'),
-  database: process.env.DB_NAME     || 'gam',
-  user:     process.env.DB_USER     || 'postgres',
-  password: process.env.DB_PASSWORD || '',
+  // DATABASE_URL wins when set (managed hosts hand out one string). DB_HOST
+  // also accepts a unix-socket directory (e.g. Cloud SQL's /cloudsql/<conn>),
+  // which node-pg handles natively — no SSL config needed on that path.
+  ...(process.env.DATABASE_URL
+    ? { connectionString: process.env.DATABASE_URL }
+    : {
+        host:     process.env.DB_HOST     || 'localhost',
+        port:     parseInt(process.env.DB_PORT || '5432'),
+        database: process.env.DB_NAME     || 'gam',
+        user:     process.env.DB_USER     || 'postgres',
+        password: process.env.DB_PASSWORD || '',
+      }),
   // Env-tunable so the dev team can raise the ceiling for a multi-instance
   // / high-concurrency deployment (front with PgBouncer) without a redeploy.
   // Default 20 preserves prior behavior.
