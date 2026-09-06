@@ -200,12 +200,13 @@ describe('POST /api/bank-accounts', () => {
     expect(res.status).toBe(400)
   })
 
-  it('nickname required → 400', async () => {
+  it('S637: nickname optional — a blank one gets a generated label', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
       .send({ ...happyPayload(), nickname: '' })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(201)
+    expect(res.body.data.nickname).toBe('Checking ••7890')
   })
 
   it('invalid accountType enum → 400', async () => {

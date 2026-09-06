@@ -213,11 +213,29 @@ function BalanceWithdrawSection() {
 
   const balance = Number(data.currentBalance ?? 0)
   const pending = Number(data.pendingBalance ?? 0)
+  const held = Number(data.heldBalance ?? 0)
+  const nextPayout = data.nextPayout ?? null
   const connectReady = data.connectReady === true
 
   return (
     <div style={{ marginBottom: 24 }}>
       <div className="kpi-grid">
+        {/* S639: under platform-holds, rent sits with GAM until the batch —
+            the Connect balance below is ~$0 by design, so this card is the
+            one that says where the money actually is. */}
+        {held > 0 && (
+          <div className="kpi-card">
+            <div className="kpi-label">Collected — Held for Payout</div>
+            <div className="kpi-value gold">{fmt(held)}</div>
+            <div className="kpi-sub">
+              {nextPayout
+                ? `Payout scheduled for ${new Date(nextPayout.scheduledFor + 'T00:00:00').toLocaleDateString()}`
+                : connectReady
+                  ? 'Pays out on your next automatic batch'
+                  : 'Held until your bank is linked'}
+            </div>
+          </div>
+        )}
         <div className="kpi-card">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value gold">{fmt(balance)}</div>

@@ -118,6 +118,32 @@ interface ReservedBatch {
 }
 
 /**
+ * Read-only twin of the RESERVE sum, for display (GET /me/finances): how much
+ * platform-held rent GAM currently owes this user, in DOLLARS, before reversal
+ * and GAM-charge netting. The WHERE clause must stay in lockstep with
+ * reservePlatformHeldBatch below — the number a landlord is shown as "held"
+ * must be exactly the pool the next batch can reserve, or the two will drift
+ * and read as a missing-money bug. Sums across every landlords row the user
+ * owns (RESERVE runs per landlord row; the display is per user).
+ */
+export async function heldOwnerShareForUser(landlordUserId: string): Promise<number> {
+  const row = await queryOne<{ owed_amount: string }>(
+    `SELECT COALESCE(SUM(ubl.amount), 0)::numeric AS owed_amount
+       FROM payments p
+       JOIN landlords l ON l.id = p.landlord_id
+       JOIN user_balance_ledger ubl
+         ON ubl.reference_id = p.id
+        AND ubl.reference_type = 'payment'
+        AND ubl.type = 'allocation_owner_share'
+        AND ubl.stripe_transfer_id IS NULL
+      WHERE l.user_id = $1
+        AND p.platform_held = true
+        AND p.status = 'settled'`,
+    [landlordUserId])
+  return Math.round(parseFloat(row?.owed_amount ?? '0') * 100) / 100
+}
+
+/**
  * RESERVE — claim the landlord's unfired owner-share into a durable pending
  * intent inside one transaction, then commit. Returns null when there is
  * nothing to do (unknown user, no Connect account, nothing owed).

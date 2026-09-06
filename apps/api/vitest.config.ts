@@ -21,6 +21,11 @@ export default defineConfig({
     env: {
       RESEND_API_KEY: 're_test_never_sends',
       BANK_ENCRYPTION_KEY: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+      // S637's deliverability tests assert which SENDER a message uses; without
+      // these the support sender silently falls back to onboarding@resend.dev
+      // and the assertions only passed where a real .env supplied them.
+      EMAIL_FROM_NOREPLY: 'GAM <noreply@gam.test>',
+      EMAIL_FROM_SUPPORT: 'GAM Support <support@gam.test>',
     },
     globalSetup: ['./src/test/globalSetup.ts'],
     pool: 'forks',
