@@ -2465,10 +2465,11 @@ adminRouter.get('/flexpay/inquiries/:id/proof-file', requireSuperAdmin, async (r
     if (!inq) throw new AppError(404, 'Inquiry not found')
     if (!inq.proof_file_path) throw new AppError(404, 'No proof uploaded')
     const { flexpayProofContentType } = await import('./tenants')
-    const fp = path.join(process.cwd(), 'uploads', 'flexpay-proofs', path.basename(inq.proof_file_path))
-    if (!fs.existsSync(fp)) throw new AppError(404, 'File missing')
-    res.setHeader('Content-Type', flexpayProofContentType(fp))
-    fs.createReadStream(fp).pipe(res)
+    const { sendStoredFile, uploadKeyFromStored } = await import('../lib/storage')
+    const key = uploadKeyFromStored('flexpay-proofs', inq.proof_file_path)
+    if (!key) throw new AppError(404, 'File missing')
+    res.setHeader('Content-Type', flexpayProofContentType(inq.proof_file_path))
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 

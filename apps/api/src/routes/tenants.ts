@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import multer from 'multer'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
@@ -374,8 +375,8 @@ tenantsRouter.get('/avatar-files/:filename', async (req: any, res: any, next: an
     // filenames as Date.now()-randomHex+ext, so a legit filename
     // is always already a basename.
     const safe = path.basename(req.params.filename)
-    const fp = path.join(process.cwd(), 'uploads', 'avatars', safe)
-    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    const key = uploadKeyFromStored('avatars', safe)
+    if (!key) throw new AppError(404, 'Not found')
     // S409 (S398 Nic-locked decision): "strong fix" — always serve
     // avatars with image/* Content-Type regardless of on-disk extension.
     // Belt-and-suspenders defense against the XSS extension-mismatch
@@ -392,7 +393,7 @@ tenantsRouter.get('/avatar-files/:filename', async (req: any, res: any, next: an
       'image/jpeg'  // .jpg/.jpeg/anything else
     res.setHeader('Content-Type', contentType)
     res.setHeader('X-Content-Type-Options', 'nosniff')
-    res.sendFile(fp)
+    await sendStoredFile(res, key)
   } catch(e) { next(e) }
 })
 
@@ -996,16 +997,10 @@ const FLEXPAY_PROOF_MIME_TO_EXT: Record<string, string> = {
   'image/png':  '.png',
   'image/webp': '.webp',
 }
-const flexpayProofDir = path.join(process.cwd(), 'uploads', 'flexpay-proofs')
-if (!fs.existsSync(flexpayProofDir)) fs.mkdirSync(flexpayProofDir, { recursive: true })
+// A1: memory-staged; the stored name's extension is derived from the
+// verified MIME (never client input), same rule as before.
 const flexpayProofUpload = multer({
-  storage: multer.diskStorage({
-    destination: flexpayProofDir,
-    filename: (_req: any, file: any, cb: any) => {
-      const ext = FLEXPAY_PROOF_MIME_TO_EXT[file.mimetype] ?? '.pdf'
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext)
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     if (FLEXPAY_PROOF_MIME_TO_EXT[file.mimetype]) cb(null, true)
@@ -1022,16 +1017,20 @@ tenantsRouter.post('/flexpay/inquiry/proof', flexpayProofUpload.single('file'), 
       [req.user!.profileId!])
     if (!inq) throw new AppError(409, 'No FlexPay request on file — tap "I’m interested" first')
     if (inq.status !== 'pending') throw new AppError(409, 'Your request has already been reviewed')
-    // Replace semantics: one active document; unlink the old one.
+    // Replace semantics: one active document; remove the old one.
     if (inq.proof_file_path) {
-      fs.unlink(path.join(flexpayProofDir, path.basename(inq.proof_file_path)), () => {})
+      const oldKey = uploadKeyFromStored('flexpay-proofs', inq.proof_file_path)
+      if (oldKey) await storage.remove(oldKey).catch(() => {})
     }
+    const proofExt = FLEXPAY_PROOF_MIME_TO_EXT[req.file.mimetype] ?? '.pdf'
+    const proofName = newStoredFilename('proof' + proofExt)
+    await storage.save(`flexpay-proofs/${proofName}`, req.file.buffer)
     await query(
       `UPDATE flexpay_inquiries
           SET proof_file_path = $2, proof_original_name = $3,
               proof_uploaded_at = NOW(), updated_at = NOW()
         WHERE id = $1`,
-      [inq.id, req.file.filename, String(req.file.originalname || 'proof').slice(0, 200)])
+      [inq.id, proofName, String(req.file.originalname || 'proof').slice(0, 200)])
 
     // S546: automated verification — reads the PDF, matches lease-
     // holder names, scans for benefit language. Mismatch/unreadable →
@@ -1058,10 +1057,10 @@ tenantsRouter.get('/flexpay/inquiry/proof-file', async (req: any, res, next) => 
       `SELECT proof_file_path FROM flexpay_inquiries WHERE tenant_id = $1`,
       [req.user!.profileId!])
     if (!inq?.proof_file_path) throw new AppError(404, 'No proof on file')
-    const fp = path.join(flexpayProofDir, path.basename(inq.proof_file_path))
-    if (!fs.existsSync(fp)) throw new AppError(404, 'File missing')
-    res.setHeader('Content-Type', flexpayProofContentType(fp))
-    fs.createReadStream(fp).pipe(res)
+    const key = uploadKeyFromStored('flexpay-proofs', inq.proof_file_path)
+    if (!key) throw new AppError(404, 'File missing')
+    res.setHeader('Content-Type', flexpayProofContentType(inq.proof_file_path))
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 
@@ -2089,16 +2088,8 @@ const AVATAR_MIME_TO_EXT: Record<string, string> = {
   'image/png':  '.png',
   'image/webp': '.webp',
 }
-const avatarDir = path.join(process.cwd(), 'uploads', 'avatars')
-if (!fs.existsSync(avatarDir)) fs.mkdirSync(avatarDir, { recursive: true })
-const avatarStorage = multer.diskStorage({
-  destination: avatarDir,
-  filename: (_req: any, file: any, cb: any) => {
-    const ext = AVATAR_MIME_TO_EXT[file.mimetype] ?? '.jpg'
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext)
-  }
-})
-const avatarUpload = multer({ storage: avatarStorage, limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (req: any, file: any, cb: any) => {
+// A1: memory-staged; extension from verified MIME.
+const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (req: any, file: any, cb: any) => {
   if (['image/jpeg','image/png','image/webp'].includes(file.mimetype)) cb(null, true)
   else cb(new Error('JPEG PNG WEBP only'))
 }})
@@ -2106,7 +2097,9 @@ const avatarUpload = multer({ storage: avatarStorage, limits: { fileSize: 5 * 10
 tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file')
-    const url = '/api/tenants/avatar-files/' + req.file.filename
+    const avatarName = newStoredFilename('avatar' + (AVATAR_MIME_TO_EXT[req.file.mimetype] ?? '.jpg'))
+    await storage.save(`avatars/${avatarName}`, req.file.buffer)
+    const url = '/api/tenants/avatar-files/' + avatarName
     if (req.user!.profileId!) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId!])
     res.json({ success: true, data: { url } })
   } catch(e) { next(e) }

@@ -205,6 +205,15 @@ function buildDriver(): StorageDriver {
 
 export const storage: StorageDriver = buildDriver()
 
+/** Whole-file read for parse/merge paths (pdf merges, proof verification).
+ *  Throws StorageNotFoundError when absent. */
+export async function readStoredFile(key: string): Promise<Buffer> {
+  const { stream } = await storage.open(key)
+  const chunks: Buffer[] = []
+  for await (const c of stream) chunks.push(c as Buffer)
+  return Buffer.concat(chunks)
+}
+
 /** Directory for multer disk-staging of large uploads before saveFromFile. */
 export function uploadStagingDir(): string {
   const dir = path.join(os.tmpdir(), 'gam-upload-staging')

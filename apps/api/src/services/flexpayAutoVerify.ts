@@ -50,16 +50,17 @@ export interface AutoVerification {
 }
 
 /** Extract flat text from a proof PDF; null = not machine-readable. */
-async function extractProofText(filePath: string): Promise<string | null> {
-  if (!filePath.endsWith('.pdf')) return null
+async function extractProofText(storageKey: string): Promise<string | null> {
+  if (!storageKey.endsWith('.pdf')) return null
   try {
-    const buf = fs.readFileSync(filePath)
+    const { readStoredFile } = await import('../lib/storage')
+    const buf = await readStoredFile(storageKey)
     const { extractPositionedText } = await import('../lib/pdfText')
     const doc = await extractPositionedText(buf)
     const text = doc.pages.map(p => p.items.map(i => i.text).join(' ')).join('\n')
     return text.trim().length > 0 ? text : null
   } catch (e) {
-    logger.warn({ err: e, filePath }, '[flexpay-auto-verify] pdf extraction failed')
+    logger.warn({ err: e, storageKey }, '[flexpay-auto-verify] pdf extraction failed')
     return null
   }
 }
@@ -89,8 +90,9 @@ export async function verifyProofDocument(inquiryId: string): Promise<AutoVerifi
           AND l.status IN ('active', 'pending')`,
       [inq.tenant_id])
 
-    const fp = path.join(process.cwd(), 'uploads', 'flexpay-proofs', path.basename(inq.proof_file_path))
-    const raw = await extractProofText(fp)
+    const { uploadKeyFromStored } = await import('../lib/storage')
+    const key = uploadKeyFromStored('flexpay-proofs', inq.proof_file_path)
+    const raw = key ? await extractProofText(key) : null
 
     let result: AutoVerification
     if (raw === null) {
