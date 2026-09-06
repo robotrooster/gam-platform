@@ -17,6 +17,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { PDFDocument, StandardFonts, rgb, type PDFPage, type PDFFont } from 'pdf-lib'
+import { storage } from '../lib/storage'
 import { query, queryOne } from '../db'
 import { humanize, INSPECTION_ITEM_CONDITION_LABEL, INSPECTION_CONDITION_RANK } from '@gam/shared'
 
@@ -32,7 +33,7 @@ const CONDITION_RANK = INSPECTION_CONDITION_RANK
 
 export interface InspectionReportResult {
   filename: string
-  filePath: string
+  storageKey: string
   fileUrl: string
   fileSize: number
   pageCount: number
@@ -106,7 +107,6 @@ export async function generateInspectionReportPdf(inspectionId: string): Promise
     }
   }
 
-  if (!fs.existsSync(REPORT_DIR)) fs.mkdirSync(REPORT_DIR, { recursive: true })
   const pdfDoc = await PDFDocument.create()
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
   const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
@@ -224,11 +224,11 @@ export async function generateInspectionReportPdf(inspectionId: string): Promise
 
   const bytes = await pdfDoc.save()
   const filename = `inspection-report-${inspectionId.slice(0, 8)}-${crypto.randomBytes(4).toString('hex')}.pdf`
-  const filePath = path.join(REPORT_DIR, filename)
-  fs.writeFileSync(filePath, bytes)
+  const storageKey = `inspections/${filename}`
+  await storage.save(storageKey, Buffer.from(bytes))
   return {
     filename,
-    filePath,
+    storageKey,
     fileUrl: `/api/inspections/report-files/${filename}`,
     fileSize: bytes.length,
     pageCount: pdfDoc.getPageCount(),

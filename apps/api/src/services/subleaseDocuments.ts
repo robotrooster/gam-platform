@@ -25,12 +25,12 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import { storage } from '../lib/storage'
 import { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'subleases')
 
 export interface GenerateSubleaseDocumentResult {
   documentId:  string
@@ -99,7 +99,6 @@ async function loadSubleaseContext(subleaseId: string): Promise<SubleaseContext>
 }
 
 async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: string; fileUrl: string; pageCount: number }> {
-  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 
   const pdfDoc = await PDFDocument.create()
   const helvetica     = await pdfDoc.embedFont(StandardFonts.Helvetica)
@@ -216,7 +215,7 @@ async function generateDefaultPdf(ctx: SubleaseContext): Promise<{ filename: str
 
   const pdfBytes = await pdfDoc.save()
   const filename = 'sublease-' + ctx.id + '-' + crypto.randomBytes(4).toString('hex') + '.pdf'
-  fs.writeFileSync(path.join(UPLOAD_DIR, filename), pdfBytes)
+  await storage.save(`subleases/${filename}`, Buffer.from(pdfBytes))
   return { filename, fileUrl: '/api/esign/files/' + filename, pageCount: pdfDoc.getPageCount() }
 }
 

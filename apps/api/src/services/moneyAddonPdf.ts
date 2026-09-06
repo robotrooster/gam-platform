@@ -28,6 +28,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'pdf-lib'
+import { storage } from '../lib/storage'
 import { query, queryOne } from '../db'
 
 export type MoneyAddonMode = 'agreement' | 'notice'
@@ -68,7 +69,6 @@ export interface GenerateMoneyAddonPdfResult {
   fields:    MoneyAddonFieldBox[]
 }
 
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'leases')
 
 // Tenant-facing labels for a recurring fee (no raw enums in the printed doc).
 // Kept in sync with services/scheduledLeaseChanges.ts RECURRING_FEE_LABEL.
@@ -165,7 +165,6 @@ export async function generateMoneyAddonPdf(
   if (input.signers.length === 0) throw new Error('money add-on PDF requires at least one signer')
 
   const ctx = await loadContext(input.leaseId)
-  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 
   const pdf = await PDFDocument.create()
   const font     = await pdf.embedFont(StandardFonts.Helvetica)
@@ -284,7 +283,7 @@ export async function generateMoneyAddonPdf(
 
   const bytes = await pdf.save()
   const filename = 'addendum-money-' + new Date().toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomBytes(4).toString('hex') + '.pdf'
-  fs.writeFileSync(path.join(UPLOAD_DIR, filename), bytes)
+  await storage.save(`leases/${filename}`, Buffer.from(bytes))
 
   return {
     filename,

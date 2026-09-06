@@ -72,6 +72,9 @@ const sampleChange = (overrides: Partial<import('./addendumPdf').AddendumChange>
 
 // ─── happy paths ─────────────────────────────────────────────
 
+const absOf = (r: { storageKey: string }) =>
+  path.join(process.cwd(), 'uploads', r.storageKey)
+
 describe('generateAddendumPdf', () => {
   it('happy: writes file with correct filename + URL convention; PDF round-trips', async () => {
     const ctx = await seedCtx()
@@ -81,13 +84,13 @@ describe('generateAddendumPdf', () => {
       recordedByUserId: ctx.landlordUserId,
       recordedAt: new Date('2026-06-08T12:00:00Z'),
     })
-    cleanupPaths.push(res.filePath)
+    cleanupPaths.push(absOf(res))
     // Filename pattern: addendum-<isoDate>-<random8>.pdf
     expect(res.filename).toMatch(/^addendum-2026-06-08T12-00-00-000Z-[0-9a-f]{8}\.pdf$/)
     expect(res.fileUrl).toBe('/api/esign/files/' + res.filename)
-    expect(fs.existsSync(res.filePath)).toBe(true)
+    expect(fs.existsSync(absOf(res))).toBe(true)
     // PDF parses + has at least one page.
-    const bytes = fs.readFileSync(res.filePath)
+    const bytes = fs.readFileSync(absOf(res))
     const parsed = await PDFDocument.load(bytes)
     expect(parsed.getPageCount()).toBe(res.pageCount)
     expect(parsed.getPageCount()).toBeGreaterThanOrEqual(1)
@@ -117,12 +120,12 @@ describe('generateAddendumPdf', () => {
       changes: [sampleChange()],
       recordedByUserId: ctx.landlordUserId,
     })
-    cleanupPaths.push(res.filePath)
+    cleanupPaths.push(absOf(res))
     // Round-trip parse; 4 signature blocks (1 landlord + 3 tenants) all
     // fit on one page given the boilerplate space; assert no crash and
     // sane page count.
     expect(res.pageCount).toBeGreaterThanOrEqual(1)
-    const parsed = await PDFDocument.load(fs.readFileSync(res.filePath))
+    const parsed = await PDFDocument.load(fs.readFileSync(absOf(res)))
     expect(parsed.getPageCount()).toBe(res.pageCount)
   })
 
@@ -137,8 +140,8 @@ describe('generateAddendumPdf', () => {
       ],
       recordedByUserId: ctx.landlordUserId,
     })
-    cleanupPaths.push(res.filePath)
-    expect(fs.existsSync(res.filePath)).toBe(true)
+    cleanupPaths.push(absOf(res))
+    expect(fs.existsSync(absOf(res))).toBe(true)
   })
 
   it('uses recordedByUserId for the "Recorded by" line when user exists', async () => {
@@ -148,10 +151,10 @@ describe('generateAddendumPdf', () => {
       changes: [sampleChange()],
       recordedByUserId: ctx.landlordUserId,
     })
-    cleanupPaths.push(res.filePath)
+    cleanupPaths.push(absOf(res))
     // We can't easily verify the text contents without OCR, but we can
     // assert the file was written (the loadLeaseContext branch ran).
-    expect(fs.readFileSync(res.filePath).length).toBeGreaterThan(0)
+    expect(fs.readFileSync(absOf(res)).length).toBeGreaterThan(0)
   })
 
   it('unknown recordedByUserId still produces a PDF (uses "(unknown user)" fallback)', async () => {
@@ -161,8 +164,8 @@ describe('generateAddendumPdf', () => {
       changes: [sampleChange()],
       recordedByUserId: randomUUID(),  // doesn't exist
     })
-    cleanupPaths.push(res.filePath)
-    expect(fs.existsSync(res.filePath)).toBe(true)
+    cleanupPaths.push(absOf(res))
+    expect(fs.existsSync(absOf(res))).toBe(true)
   })
 
   it('uploads/leases directory is created if missing', async () => {
@@ -174,7 +177,7 @@ describe('generateAddendumPdf', () => {
       leaseId: ctx.leaseId,
       changes: [sampleChange()],
       recordedByUserId: ctx.landlordUserId,
-    }).then(res => cleanupPaths.push(res.filePath))
+    }).then(res => cleanupPaths.push(absOf(res)))
     expect(fs.existsSync(uploadDir)).toBe(true)
   })
 
@@ -186,7 +189,7 @@ describe('generateAddendumPdf', () => {
       changes: [sampleChange()],
       recordedByUserId: ctx.landlordUserId,
     })
-    cleanupPaths.push(res.filePath)
+    cleanupPaths.push(absOf(res))
     const after = Date.now()
     // Filename embeds the ISO timestamp; verify it's within the call window.
     const tsMatch = res.filename.match(/^addendum-(.*?)-[0-9a-f]{8}\.pdf$/)

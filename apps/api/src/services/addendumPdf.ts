@@ -27,6 +27,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import { storage } from '../lib/storage'
 import { ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
 import { query, queryOne } from '../db'
 
@@ -45,7 +46,7 @@ export interface GenerateAddendumPdfInput {
 
 export interface GenerateAddendumPdfResult {
   filename:    string
-  filePath:    string   // absolute filesystem path
+  storageKey:  string   // driver key, e.g. leases/<filename>
   fileUrl:     string   // /api/esign/files/<filename>
   pageCount:   number
 }
@@ -115,8 +116,6 @@ export async function generateAddendumPdf(
 
   const ctx = await loadLeaseContext(input.leaseId, input.recordedByUserId)
   const recordedAt = input.recordedAt ?? new Date()
-
-  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 
   const pdfDoc = await PDFDocument.create()
   const helvetica     = await pdfDoc.embedFont(StandardFonts.Helvetica)
@@ -236,12 +235,12 @@ export async function generateAddendumPdf(
 
   const pdfBytes = await pdfDoc.save()
   const filename = 'addendum-' + recordedAt.toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomBytes(4).toString('hex') + '.pdf'
-  const filePath = path.join(UPLOAD_DIR, filename)
-  fs.writeFileSync(filePath, pdfBytes)
+  const storageKey = `leases/${filename}`
+  await storage.save(storageKey, Buffer.from(pdfBytes))
 
   return {
     filename,
-    filePath,
+    storageKey,
     fileUrl:   '/api/esign/files/' + filename,
     pageCount: pdfDoc.getPageCount(),
   }
