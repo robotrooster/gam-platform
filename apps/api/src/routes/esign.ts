@@ -30,6 +30,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
+import { storage, sendStoredFile, uploadKeyFromStored, readStoredFile } from '../lib/storage'
 import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../services/lateFeePolicy'
 import { suggestUnitPrefill } from '../services/leasePrefill'
 import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
@@ -2034,7 +2035,7 @@ esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.t
     if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
     const filename = extractUploadFilename(template.base_pdf_url)
     if (!filename) throw new AppError(400, 'Template PDF path is not a local upload')
-    if (!fs.existsSync(path.join(uploadDir, filename))) throw new AppError(404, 'Template PDF file not found on disk')
+    if (!(await storage.exists(`leases/${filename}`))) throw new AppError(404, 'Template PDF not found in storage')
 
     const { createAutoFieldJob, runAutoFieldJob } = await import('../services/autoFieldJobs')
     const jobId = await createAutoFieldJob(template.id, template.landlord_id)
@@ -4494,22 +4495,23 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
 
       // Stamp PDF
       let executedUrl: string | null = null
+      let stampedBytes: Buffer | null = null
       try {
         if (doc.base_pdf_url) {
           const allFields = await query<any>('SELECT * FROM lease_document_fields WHERE document_id=$1', [doc.id])
           const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
           const sourcePdfPath = extractUploadFilename(doc.base_pdf_url)
           if (sourcePdfPath) {
-          const sourcePath = path.join(uploadDir, sourcePdfPath)
-          if (fs.existsSync(sourcePath)) {
+          const sourceKey = `leases/${sourcePdfPath}`
+          if (await storage.exists(sourceKey)) {
             const executedFilename = 'executed-' + doc.id + '.pdf'
-            const outputPath = path.join(uploadDir, executedFilename)
             const signerInfo = (allSigners as any[]).map(s => ({ name:s.name, email:s.email, role:s.role, signed_at:s.signed_at }))
-            await stampPdf(sourcePath, (allFields as any[]).map(f => ({
+            stampedBytes = await stampPdf(await readStoredFile(sourceKey), (allFields as any[]).map(f => ({
               page: parseInt(f.page)||1, x: parseFloat(f.x)||0, y: parseFloat(f.y)||0,
               width: parseFloat(f.width)||100, height: parseFloat(f.height)||30,
               field_type: f.field_type, value: f.value, font_css: f.font_css
-            })), signerInfo, outputPath)
+            })), signerInfo)
+            await storage.save(`leases/${executedFilename}`, stampedBytes)
             executedUrl = '/api/esign/files/' + executedFilename
             await query('UPDATE lease_documents SET executed_pdf_url=$1 WHERE id=$2', [executedUrl, doc.id])
           }
@@ -4522,14 +4524,8 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // S636 (Nic): the executed copy goes out as an ATTACHMENT — read once for
       // every signer. Best-effort: a missing or unreadable file must never stop
       // the completion email, which is also how the parties learn it is done.
-      let executedBytes: Buffer | null = null
-      if (executedUrl) {
-        try {
-          const fname = executedUrl.split('/').pop()!
-          const fpath = resolveUploadPath(uploadDir, fname)
-          if (fpath && fs.existsSync(fpath)) executedBytes = fs.readFileSync(fpath)
-        } catch (e) { logger.error({ err: e, documentId: doc.id }, '[ESIGN] could not attach the executed PDF') }
-      }
+      // A1: the stamped bytes are still in hand — no storage round-trip.
+      const executedBytes: Buffer | null = executedUrl ? stampedBytes : null
       for (const s of allSigners as any[]) {
         // S636 (Nic): "It says click to download and view your lease, and it
         // provides a link that does absolutely nothing from the tenant portal."
@@ -4775,27 +4771,10 @@ esignRouter.get('/landlord-pending', requireAuth, requirePerm('leases.sign'), as
 // FILE UPLOAD
 // ─────────────────────────────────────────────────────────────
 
-const uploadDir = path.join(process.cwd(), 'uploads', 'leases')
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
-
-const storage = multer.diskStorage({
-  destination: uploadDir,
-  filename: (req: any, file: any, cb: any) => {
-    // S394 fix: force .pdf extension based on MIME, NOT from attacker-
-    // controlled originalname. Pre-fix, a caller could upload a file
-    // with mimetype=application/pdf (passes fileFilter) and
-    // originalname=evil.html, and the saved filename would carry the
-    // .html extension. GET /files/:filename serves via res.sendFile
-    // which auto-detects Content-Type from extension → text/html →
-    // XSS in the authorized viewer's browser (signer or landlord).
-    // Same class as the S380 avatar-upload finding.
-    const unique = Date.now() + '-' + Math.random().toString(36).slice(2)
-    cb(null, unique + '.pdf')
-  }
-})
-
+// S394 posture unchanged under A1: the stored name is generated with a
+// forced .pdf extension, never from attacker-controlled originalname.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req: any, file: any, cb: any) => {
     if (file.mimetype === 'application/pdf') cb(null, true)
@@ -4806,18 +4785,19 @@ const upload = multer({
 esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.single('file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
-    const fileUrl = '/api/esign/files/' + req.file.filename
+    const uploadedName = `${Date.now()}-${Math.random().toString(36).slice(2)}.pdf`
+    await storage.save(`leases/${uploadedName}`, req.file.buffer)
+    const fileUrl = '/api/esign/files/' + uploadedName
     let pageCount = 1
     try {
-      const fileBuffer = fs.readFileSync(req.file.path).toString('binary')
-      const matches = fileBuffer.match(/\/Type\s*\/Page[^s]/g)
+      const matches = req.file.buffer.toString('binary').match(/\/Type\s*\/Page[^s]/g)
       if (matches) pageCount = matches.length
     } catch(e) { /* fallback to 1 */ }
     // S535: read the PDF's text for the landlord's property name/address —
     // lease forms usually carry it, and a unique match auto-locks the
     // template to that property in the create modal. Best-effort.
     const detectedProperty = await detectPropertyFromPdf(
-      landlordScopeIds(req.user!), fs.readFileSync(req.file.path))
+      landlordScopeIds(req.user!), req.file.buffer)
     res.json({ success: true, data: { url: fileUrl, filename: req.file.originalname, size: req.file.size, pageCount, detectedProperty } })
   } catch (e) { next(e) }
 })
@@ -4854,12 +4834,11 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
     // subleases dir). Pre-S535 the subleases lookup was missing, so
     // every generated sublease agreement 404'd here before the auth
     // check ever ran.
-    let filePath = resolveUploadPath(uploadDir, req.params.filename)
-    if (!filePath) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(filePath)) {
-      const subleasePath = resolveUploadPath(
-        path.join(process.cwd(), 'uploads', 'subleases'), req.params.filename)
-      if (subleasePath && fs.existsSync(subleasePath)) filePath = subleasePath
+    let fileKey = uploadKeyFromStored('leases', req.params.filename)
+    if (!fileKey) throw new AppError(400, 'Invalid filename')
+    if (!(await storage.exists(fileKey))) {
+      const subleaseKey = uploadKeyFromStored('subleases', req.params.filename)
+      if (subleaseKey && (await storage.exists(subleaseKey))) fileKey = subleaseKey
       else throw new AppError(404, 'File not found')
     }
 
@@ -4900,7 +4879,7 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
       LIMIT 1`, [urlSuffix, scopeLandlordIds, userId])
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 
-    res.sendFile(filePath)
+    await sendStoredFile(res, fileKey)
   } catch (e) { next(e) }
 })
 

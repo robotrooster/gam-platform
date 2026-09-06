@@ -1,9 +1,9 @@
 /**
  * S428 services-audit slice 5a (of 3): pdfStamp.ts.
  *
- * `stampPdf(sourcePath, fields, signers, outputPath)` reads a PDF,
- * draws field stamps + signature lines, appends an "ELECTRONIC
- * SIGNATURE CERTIFICATE" page, and writes to outputPath.
+ * A1: `stampPdf(sourceBytes, fields, signers)` takes and returns Buffers —
+ * draws field stamps + signature lines and appends an "ELECTRONIC
+ * SIGNATURE CERTIFICATE" page.
  *
  * Tests verify:
  *   - Round-trip: parses input PDF, writes output PDF, output has
@@ -14,39 +14,18 @@
  *   - Empty value and out-of-range page index skip silently
  */
 
-import { describe, it, expect, afterAll } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
-import { randomUUID } from 'crypto'
 import { stampPdf } from './pdfStamp'
 
-const cleanupPaths: string[] = []
-afterAll(() => {
-  for (const p of cleanupPaths) {
-    try { fs.unlinkSync(p) } catch { /* best effort */ }
-  }
-})
-
-async function makeSourcePdf(pageCount = 2): Promise<string> {
+async function makeSourcePdf(pageCount = 2): Promise<Buffer> {
   const doc = await PDFDocument.create()
   const font = await doc.embedFont(StandardFonts.Helvetica)
   for (let i = 0; i < pageCount; i++) {
     const page = doc.addPage([612, 792])
     page.drawText(`Source page ${i + 1}`, { x: 50, y: 750, size: 20, font })
   }
-  const bytes = await doc.save()
-  const p = path.join(os.tmpdir(), `s428-src-${randomUUID()}.pdf`)
-  fs.writeFileSync(p, bytes)
-  cleanupPaths.push(p)
-  return p
-}
-
-function outputPath(): string {
-  const p = path.join(os.tmpdir(), `s428-out-${randomUUID()}.pdf`)
-  cleanupPaths.push(p)
-  return p
+  return Buffer.from(await doc.save())
 }
 
 const signerOne = {
@@ -57,10 +36,7 @@ const signerOne = {
 describe('stampPdf', () => {
   it('round-trip: writes output that parses + has source pages + 1 cert page', async () => {
     const src = await makeSourcePdf(2)
-    const out = outputPath()
-    await stampPdf(src, [], [signerOne], out)
-    expect(fs.existsSync(out)).toBe(true)
-    const bytes = fs.readFileSync(out)
+    const bytes = await stampPdf(src, [], [signerOne])
     expect(bytes.length).toBeGreaterThan(0)
     const parsed = await PDFDocument.load(bytes)
     // 2 source pages + 1 cert page
@@ -69,7 +45,6 @@ describe('stampPdf', () => {
 
   it('handles text + date + checkbox + signature field types without throwing', async () => {
     const src = await makeSourcePdf(1)
-    const out = outputPath()
     const fields = [
       { page: 1, x: 50,  y: 100, width: 200, height: 20, field_type: 'text', value: 'Hello' },
       { page: 1, x: 50,  y: 130, width: 100, height: 20, field_type: 'date', value: '2026-06-08' },
@@ -77,29 +52,26 @@ describe('stampPdf', () => {
       { page: 1, x: 50,  y: 200, width: 200, height: 50, field_type: 'signature', value: 'Jane Doe' },
       { page: 1, x: 50,  y: 270, width: 200, height: 50, field_type: 'initials',  value: 'JD' },
     ]
-    await stampPdf(src, fields, [signerOne], out)
-    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    const parsed = await PDFDocument.load(await stampPdf(src, fields, [signerOne]))
     expect(parsed.getPageCount()).toBe(2)
   })
 
   it('empty value field is skipped silently', async () => {
     const src = await makeSourcePdf(1)
-    const out = outputPath()
-    await stampPdf(src, [
+    const bytes = await stampPdf(src, [
       { page: 1, x: 50, y: 100, width: 200, height: 20, field_type: 'text', value: '' },
-    ], [signerOne], out)
-    expect(fs.existsSync(out)).toBe(true)
+    ], [signerOne])
+    expect(bytes.length).toBeGreaterThan(0)
   })
 
   it('out-of-range page index is skipped silently', async () => {
     const src = await makeSourcePdf(1)
-    const out = outputPath()
-    await stampPdf(src, [
+    const bytes = await stampPdf(src, [
       // Page 5 doesn't exist on a 1-page source.
       { page: 5, x: 50, y: 100, width: 200, height: 20, field_type: 'text', value: 'late' },
-    ], [signerOne], out)
+    ], [signerOne])
     // Should still produce a valid output with 1 source + 1 cert page.
-    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    const parsed = await PDFDocument.load(bytes)
     expect(parsed.getPageCount()).toBe(2)
   })
 
@@ -110,35 +82,32 @@ describe('stampPdf', () => {
       'base64')
     const dataUrl = 'data:image/png;base64,' + png1x1.toString('base64')
     const src = await makeSourcePdf(1)
-    const out = outputPath()
-    await stampPdf(src, [
+    const bytes = await stampPdf(src, [
       { page: 1, x: 50, y: 200, width: 100, height: 30,
         field_type: 'signature', value: dataUrl },
-    ], [signerOne], out)
-    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    ], [signerOne])
+    const parsed = await PDFDocument.load(bytes)
     expect(parsed.getPageCount()).toBe(2)
   })
 
   it('signature with invalid base64 falls back to text drawing (does not throw)', async () => {
     const src = await makeSourcePdf(1)
-    const out = outputPath()
-    await stampPdf(src, [
+    const bytes = await stampPdf(src, [
       { page: 1, x: 50, y: 200, width: 100, height: 30,
         field_type: 'signature', value: 'data:image/png;base64,@@@not-valid@@@' },
-    ], [signerOne], out)
-    expect(fs.existsSync(out)).toBe(true)
+    ], [signerOne])
+    expect(bytes.length).toBeGreaterThan(0)
   })
 
   it('certificate page renders multiple signers stacked', async () => {
     const src = await makeSourcePdf(1)
-    const out = outputPath()
-    await stampPdf(src, [], [
+    const bytes = await stampPdf(src, [], [
       { name: 'A',  email: 'a@t.dev', role: 'tenant',   signed_at: '2026-06-01T00:00:00Z' },
       { name: 'B',  email: 'b@t.dev', role: 'landlord', signed_at: '2026-06-02T00:00:00Z' },
       { name: 'CC', email: 'c@t.dev', role: 'co_tenant', signed_at: '2026-06-03T00:00:00Z' },
-    ], out)
+    ])
     // Output still parses; page count = 1 source + 1 cert.
-    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    const parsed = await PDFDocument.load(bytes)
     expect(parsed.getPageCount()).toBe(2)
   })
 })
@@ -157,23 +126,17 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
 
   it('an italic/script choice does not render in the body font', async () => {
     const src = await makeSourcePdf(1)
-    const styled = path.join(os.tmpdir(), `s637-styled-${randomUUID()}.pdf`)
-    const plain  = path.join(os.tmpdir(), `s637-plain-${randomUUID()}.pdf`)
-    cleanupPaths.push(styled, plain)
-
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro',
-      font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [], styled)
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [], plain)
+    const styled = await stampPdf(src, [{ ...base, value: 'Mireya Fierro',
+      font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [])
+    const plain = await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [])
 
     // Different embedded faces produce different bytes for the same name.
-    expect(fs.readFileSync(styled).length).not.toBe(fs.readFileSync(plain).length)
+    expect(styled.length).not.toBe(plain.length)
   })
 
   it('a missing choice still stamps, and never throws', async () => {
     const src = await makeSourcePdf(1)
-    const out = path.join(os.tmpdir(), `s637-nofont-${randomUUID()}.pdf`)
-    cleanupPaths.push(out)
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro' } as any], [], out)
-    expect(fs.existsSync(out)).toBe(true)
+    const bytes = await stampPdf(src, [{ ...base, value: 'Mireya Fierro' } as any], [])
+    expect(bytes.length).toBeGreaterThan(0)
   })
 })

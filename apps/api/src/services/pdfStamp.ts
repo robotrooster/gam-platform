@@ -20,14 +20,15 @@ interface SignerInfo {
   signed_at: string
 }
 
+// A1: bytes in, bytes out — no filesystem. Callers read the source from
+// storage and save the result; the write-then-re-read for the completion
+// email attachment disappears with it.
 export async function stampPdf(
-  sourcePath: string,
+  sourceBytes: Buffer,
   fields: FieldStamp[],
   signers: SignerInfo[],
-  outputPath: string
-): Promise<void> {
-  const existingPdfBytes = fs.readFileSync(sourcePath)
-  const pdfDoc = await PDFDocument.load(existingPdfBytes)
+): Promise<Buffer> {
+  const pdfDoc = await PDFDocument.load(sourceBytes)
   const pages = pdfDoc.getPages()
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica)
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
@@ -124,6 +125,5 @@ export async function stampPdf(
   certPage.drawText('GAM Platform · '+new Date().toISOString(), { x:40, y:45, size:8, font:helvetica, color:rgb(0.6,0.6,0.6) })
   certPage.drawText('UETA Compliant · E-SIGN Act Compliant · Legally Binding', { x:40, y:32, size:8, font:helvetica, color:rgb(0.6,0.6,0.6) })
 
-  const pdfBytes = await pdfDoc.save()
-  fs.writeFileSync(outputPath, pdfBytes)
+  return Buffer.from(await pdfDoc.save())
 }

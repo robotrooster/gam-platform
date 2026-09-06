@@ -75,7 +75,7 @@ const {
     depositInserted:     false,
   })),
   firePmTransfersMock:        vi.fn(async () => ({ fired: 0, failed: 0 })),
-  stampPdfMock:               vi.fn(async () => {}),
+  stampPdfMock:               vi.fn(async () => Buffer.from('%PDF-1.7 stamped')),
 }))
 vi.mock('../services/email', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
