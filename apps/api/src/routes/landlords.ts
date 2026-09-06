@@ -17,6 +17,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { extractUploadFilename } from '../lib/uploadPaths'
+import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from '../lib/storage'
 import {
   applyMapping, buildTemplateCsv, isCsvImportPlatform, isPlatformEnabled,
   applyPropertyMapping, buildPropertyTemplateCsv, getPropertyPlatformConfig,
@@ -2778,19 +2779,10 @@ landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onbo
 // the parser resolves an intent into a real lease (S29c-2-C), the PDF is
 // promoted to uploads/leases/ and leases.imported_pdf_url is set.
 
-const pendingPdfDir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
-if (!fs.existsSync(pendingPdfDir)) fs.mkdirSync(pendingPdfDir, { recursive: true })
-
-const pendingPdfStorage = multer.diskStorage({
-  destination: pendingPdfDir,
-  filename: (_req: any, file: any, cb: any) => {
-    const unique = Date.now() + '-' + Math.random().toString(36).slice(2)
-    cb(null, unique + path.extname(file.originalname))
-  },
-})
-
+// A1: memory-staged (20MB PDFs) then storage.save AFTER validation — the
+// reject paths no longer have a stray disk file to clean up.
 const pendingPdfUpload = multer({
-  storage: pendingPdfStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
     if (file.mimetype === 'application/pdf') cb(null, true)
@@ -2827,24 +2819,21 @@ landlordsRouter.post(
         [intentId, landlordIds]
       )
       if (!intent) {
-        // Clean up the uploaded file before rejecting.
-        try { fs.unlinkSync(req.file.path) } catch { /* best effort */ }
         throw new AppError(404, 'Pending tenant not found, already resolved, or not owned by you')
       }
       if (!['not_uploaded', 'error', 'mismatch'].includes(intent.parser_status)) {
-        try { fs.unlinkSync(req.file.path) } catch { /* best effort */ }
         throw new AppError(409, `Cannot upload while parser_status='${intent.parser_status}'. Wait for the current parse to finish.`)
       }
 
       // If there was a previous PDF (re-upload case), delete the old file.
       // Best effort — orphaning is annoying but not a correctness problem.
       if (intent.imported_pdf_url) {
-        const oldFilename = extractUploadFilename(intent.imported_pdf_url)
-        if (oldFilename) {
-          const oldPath = path.join(pendingPdfDir, oldFilename)
-          try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath) } catch { /* best effort */ }
-        }
+        const oldKey = uploadKeyFromStored('lease-pdfs-pending', intent.imported_pdf_url)
+        if (oldKey) await storage.remove(oldKey).catch(() => {})
       }
+
+      const pendingStoredName = newStoredFilename(req.file.originalname)
+      await storage.save(`lease-pdfs-pending/${pendingStoredName}`, req.file.buffer)
 
       // S395 fix: store the actual multer filename (e.g.
       // `1234567890-abc.pdf`) in imported_pdf_url so the GET route
@@ -2868,7 +2857,7 @@ landlordsRouter.post(
              parser_finished_at=NULL,
              updated_at=NOW()
          WHERE id=$2`,
-        [req.file.filename, intentId]
+        [pendingStoredName, intentId]
       )
 
       scheduleParserJob(intentId)
@@ -2911,14 +2900,10 @@ landlordsRouter.get(
         throw new AppError(404, 'Document not found for this pending tenant')
       }
 
-      const filename = extractUploadFilename(intent.imported_pdf_url)
-      if (!filename) throw new AppError(500, 'Stored document path is malformed')
-
-      const filePath = path.join(pendingPdfDir, filename)
-      if (!fs.existsSync(filePath)) throw new AppError(404, 'File missing on disk')
-
+      const key = uploadKeyFromStored('lease-pdfs-pending', intent.imported_pdf_url)
+      if (!key) throw new AppError(500, 'Stored document path is malformed')
       res.setHeader('Content-Type', 'application/pdf')
-      res.sendFile(filePath)
+      await sendStoredFile(res, key)
     } catch (e) { next(e) }
   }
 )

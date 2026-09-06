@@ -21,6 +21,7 @@
 
 import { Router, Request } from 'express'
 import multer from 'multer'
+import { storage, sendStoredFile } from '../lib/storage'
 import path from 'path'
 import fs from 'fs'
 import { z } from 'zod'
@@ -34,7 +35,10 @@ export const businessAttachmentsRouter = Router()
 
 // ── Storage config ────────────────────────────────────────────
 
-const UPLOAD_ROOT = path.join(process.cwd(), 'uploads', 'business-attachments')
+// A1: keys are business-attachments/<businessId>/<file> — the one
+// two-segment prefix in the key universe.
+const bizKey = (businessId: string, storedFilename: string) =>
+  `business-attachments/${businessId}/${storedFilename}`
 const MAX_FILE_SIZE = 20 * 1024 * 1024   // 20MB
 
 // Allowed MIMEs — images + PDFs in v1. Word/Excel could come later but
@@ -115,13 +119,9 @@ businessAttachmentsRouter.post('/', requireAuth, upload.single('file'),
         || fields.isInternal === 'true'
         || fields.isInternal === '1'
 
-      // Write to disk: uploads/business-attachments/<businessId>/<uuid>.<ext>
       const ext = path.extname(file.originalname).slice(0, 8)  // cap pathological ext lengths
       const storedFilename = `${crypto.randomUUID()}${ext}`
-      const bizDir = path.join(UPLOAD_ROOT, access.businessId)
-      fs.mkdirSync(bizDir, { recursive: true })
-      const finalPath = path.join(bizDir, storedFilename)
-      fs.writeFileSync(finalPath, file.buffer)
+      await storage.save(bizKey(access.businessId, storedFilename), file.buffer)
 
       try {
         const row = await queryOne<any>(
@@ -138,9 +138,8 @@ businessAttachmentsRouter.post('/', requireAuth, upload.single('file'),
            access.staffUserRowId === null ? req.user!.userId : req.user!.userId])
         res.status(201).json({ success: true, data: row })
       } catch (e) {
-        // DB insert failed — best-effort cleanup of the disk file so we
-        // don't leak storage.
-        fs.unlink(finalPath, () => {})
+        // DB insert failed — best-effort cleanup so we don't leak storage.
+        await storage.remove(bizKey(access.businessId, storedFilename)).catch(() => {})
         throw e
       }
     } catch (e) { next(e) }
@@ -200,13 +199,13 @@ businessAttachmentsRouter.get('/:id/download', requireAuth, async (req, res, nex
     if (access.businessId !== att.business_id) {
       throw new AppError(404, 'Attachment not found')
     }
-    const filePath = path.join(UPLOAD_ROOT, att.business_id, att.stored_filename)
-    if (!fs.existsSync(filePath)) {
-      throw new AppError(410, 'File no longer on disk')
+    const key = bizKey(att.business_id, att.stored_filename)
+    if (!(await storage.exists(key))) {
+      throw new AppError(410, 'File no longer in storage')
     }
     res.setHeader('Content-Type', att.mime_type)
     res.setHeader('Content-Disposition', `inline; filename="${att.file_name.replace(/"/g, '')}"`)
-    fs.createReadStream(filePath).pipe(res)
+    await sendStoredFile(res, key)
   } catch (e) { next(e) }
 })
 
@@ -230,9 +229,8 @@ businessAttachmentsRouter.delete('/:id', requireAuth, async (req, res, next) => 
       throw new AppError(404, 'Attachment not found')
     }
     await db.query(`DELETE FROM business_attachments WHERE id = $1`, [att.id])
-    // Best-effort disk cleanup.
-    const filePath = path.join(UPLOAD_ROOT, att.business_id, att.stored_filename)
-    fs.unlink(filePath, () => {})
+    // Best-effort storage cleanup.
+    await storage.remove(bizKey(att.business_id, att.stored_filename)).catch(() => {})
     res.json({ success: true, data: { id: att.id } })
   } catch (e) { next(e) }
 })
