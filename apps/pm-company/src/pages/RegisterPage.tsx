@@ -18,6 +18,7 @@ import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { apiPost } from '../lib/api'
+import { BUSINESS_TERMS_URL, BUSINESS_PRIVACY_URL } from '../lib/marketing'
 
 export function RegisterPage() {
   const { user, login, refresh } = useAuth()
@@ -135,10 +136,17 @@ export function RegisterPage() {
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
                 <input type="checkbox" checked={acceptedTerms} onChange={e => setAcceptedTerms(e.target.checked)} style={{ marginTop: 2 }} />
                 <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+                  {/* S636/S640: stopPropagation because the links live inside the
+                      checkbox <label>; URLs from lib/marketing so a missing build
+                      var can't ship a localhost link. */}
                   I agree to the{' '}
-                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/business/terms`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--gold)' }}>Terms of Service</a>
+                  <a href={BUSINESS_TERMS_URL} target="_blank" rel="noopener noreferrer"
+                     onClick={e => e.stopPropagation()}
+                     style={{ color: 'var(--gold)' }}>Terms of Service</a>
                   {' '}and{' '}
-                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/business/privacy`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--gold)' }}>Privacy Policy</a>.
+                  <a href={BUSINESS_PRIVACY_URL} target="_blank" rel="noopener noreferrer"
+                     onClick={e => e.stopPropagation()}
+                     style={{ color: 'var(--gold)' }}>Privacy Policy</a>.
                 </div>
               </label>
             </div>
