@@ -13,9 +13,8 @@ import path from 'path'
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { autoPlaceFields } from './autoFieldPlacement'
-import { extractUploadFilename } from '../lib/uploadPaths'
+import { storage, uploadKeyFromStored, readStoredFile } from '../lib/storage'
 
-const uploadDir = path.join(process.cwd(), 'uploads', 'leases')
 
 export interface AutoFieldJob {
   id:          string
@@ -65,12 +64,11 @@ export async function runAutoFieldJob(jobId: string): Promise<void> {
 
     const tmpl = await queryOne<{ base_pdf_url: string | null }>(
       `SELECT base_pdf_url FROM lease_templates WHERE id = $1`, [job.template_id])
-    const filename = tmpl?.base_pdf_url ? extractUploadFilename(tmpl.base_pdf_url) : null
-    const pdfPath = filename ? path.join(uploadDir, filename) : null
-    if (!pdfPath || !fs.existsSync(pdfPath)) {
+    const key = tmpl?.base_pdf_url ? uploadKeyFromStored('leases', tmpl.base_pdf_url) : null
+    if (!key || !(await storage.exists(key))) {
       await query(
         `UPDATE auto_field_jobs SET status='error', error=$2, updated_at=now() WHERE id=$1`,
-        [jobId, 'Template PDF not found on disk'])
+        [jobId, 'Template PDF not found in storage'])
       return
     }
 
@@ -78,7 +76,7 @@ export async function runAutoFieldJob(jobId: string): Promise<void> {
     // "page 3 of 8". Detached like the job itself — a failed progress write must
     // never fail the placement, so it is swallowed. Progress is advisory; the
     // result is what matters.
-    const result = await autoPlaceFields(fs.readFileSync(pdfPath), (done, total) => {
+    const result = await autoPlaceFields(await readStoredFile(key), (done, total) => {
       void query(
         `UPDATE auto_field_jobs SET pages_done=$2, pages_total=$3, updated_at=now() WHERE id=$1`,
         [jobId, done, total]).catch(() => {})

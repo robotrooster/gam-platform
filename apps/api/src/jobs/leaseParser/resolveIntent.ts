@@ -26,6 +26,7 @@ import { emailTenantOnboarded } from '../../services/email'
 import { AppError } from '../../middleware/errorHandler'
 import { assertLateFeeDecisionForUnit } from '../../services/lateFeePolicy'
 import { extractUploadFilename } from '../../lib/uploadPaths'
+import { storage } from '../../lib/storage'
 import type {
   ParserOutput, ParserExtractedField,
   ParserExtractedVehicle, ParserExtractedRv, ParserExtractedMobileHome,
@@ -36,10 +37,6 @@ import type {
 import { isScreeningFeeText } from '@gam/shared'
 import { logger } from '../../lib/logger'
 
-const pendingPdfDir = path.join(process.cwd(), 'uploads', 'lease-pdfs-pending')
-const leasesPdfDir  = path.join(process.cwd(), 'uploads', 'leases')
-
-if (!fs.existsSync(leasesPdfDir)) fs.mkdirSync(leasesPdfDir, { recursive: true })
 
 interface IntentRow {
   id: string
@@ -449,15 +446,15 @@ export async function resolveIntent(
 
     await client.query('COMMIT')
 
-    // 6. Promote PDF from pending dir -> leases dir (post-commit because
-    //    rolling back a rename is messier than rolling back a DB write).
+    // 6. Promote PDF from pending -> leases (post-commit because rolling
+    //    back a move is messier than rolling back a DB write). Under gcs the
+    //    move is copy+delete, not atomic — tolerable for the same reason.
     if (intent.imported_pdf_url) {
       try {
         const filename = extractUploadFilename(intent.imported_pdf_url)
         if (filename) {
-          const fromPath = path.join(pendingPdfDir, filename)
-          const toPath = path.join(leasesPdfDir, filename)
-          if (fs.existsSync(fromPath)) fs.renameSync(fromPath, toPath)
+          const fromKey = `lease-pdfs-pending/${filename}`
+          if (await storage.exists(fromKey)) await storage.move(fromKey, `leases/${filename}`)
         }
       } catch (e) {
         // Non-fatal: the lease is real, the PDF reference may be broken

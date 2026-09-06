@@ -21,7 +21,7 @@ import fs from 'fs'
 import path from 'path'
 import { query, queryOne } from '../../db'
 import { parseLease } from './index'
-import { extractUploadFilename } from '../../lib/uploadPaths'
+import { uploadKeyFromStored, readStoredFile } from '../../lib/storage'
 import type {
   ParserOutput, ParserStatus, ParserFlag,
 } from '@gam/shared'
@@ -88,20 +88,15 @@ export async function runParserJob(intentId: string): Promise<void> {
     return
   }
 
-  // 2. Load PDF from disk. Same filename derivation the GET handler uses.
-  const filename = extractUploadFilename(intent.imported_pdf_url)
-  if (!filename) {
+  // 2. Load PDF from storage. Same key derivation the GET handler uses.
+  const key = uploadKeyFromStored('lease-pdfs-pending', intent.imported_pdf_url)
+  if (!key) {
     await markError(intentId, 'Stored document path is malformed')
-    return
-  }
-  const filePath = path.join(pendingPdfDir, filename)
-  if (!fs.existsSync(filePath)) {
-    await markError(intentId, 'PDF file missing on disk at parse time')
     return
   }
   let buf: Buffer
   try {
-    buf = fs.readFileSync(filePath)
+    buf = await readStoredFile(key)
   } catch (e: any) {
     await markError(intentId, `Failed to read PDF: ${e?.message || String(e)}`)
     return
