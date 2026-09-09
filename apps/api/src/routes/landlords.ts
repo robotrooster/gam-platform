@@ -2762,13 +2762,22 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- dead account surfaced as a person to chase.
          --
          -- A waiver row is an audit record of a screening decision, never a work
-         -- item. If the person has a unit-bound invite at all — open, resolved or
-         -- cancelled — that row is the work item and this one has nothing to add.
-         -- The record itself is untouched; it is only not a queue entry.
-         AND NOT (pti.unit_id IS NULL AND pti.screening_waived AND EXISTS (
-                   SELECT 1 FROM pending_tenant_intents o
-                    WHERE o.tenant_id = pti.tenant_id
-                      AND o.unit_id IS NOT NULL))
+         -- item — so it is not a queue entry, full stop. The record itself is
+         -- untouched; this list simply is not where it belongs.
+         --
+         -- The condition used to require the person to ALSO have a unit-bound
+         -- invite, which held for 55 of the 56 live waiver rows and failed on the
+         -- 56th. Kevin Black was onboarded twice on 2026-08-29, at kjblack1@
+         -- hotmail and kjblack1@gmail. The hotmail account accepted and holds
+         -- MH 04 and MH 05 at Oak Park. The gmail shell holds no lease, no
+         -- document and no payment — only a waiver record pointing at MH 05, the
+         -- unit his real account already has. With no unit-bound invite of its
+         -- own to hide behind, that shell surfaced as a person to chase.
+         --
+         -- A waiver always names the unit it was granted for
+         -- (screening_waived_unit_id), and that unit's own invite is the work
+         -- item. There is no case where the audit row is the thing to act on.
+         AND NOT (pti.unit_id IS NULL AND pti.screening_waived)
        ORDER BY pti.created_at DESC`,
       [landlordIds]
     )
