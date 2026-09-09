@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 2tjPNez7P0SqhUyMETYxiojyDuyI25NMPp0hH5Pwg2JGzPrjTAa2cAhgwDlUhRD
+\restrict eEQORTaCs8eb7EK6LhYITFGmaAeKlcsJw9a1XmHQgmMMQXL3FlmLNXy24URdDUT
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -625,6 +625,26 @@ BEGIN
   IF u_status = 'owner_use' THEN
     RAISE EXCEPTION 'Unit % is marked owner-occupied and cannot hold a lease. Change its status first.', NEW.unit_id
       USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: stamp_tenant_invite_sent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stamp_tenant_invite_sent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Only on the transition to a live token, and only the FIRST one: this is
+  -- "have we ever written to them", not "when was the most recent resend".
+  IF NEW.tenant_invite_token IS NOT NULL
+     AND (TG_OP = 'INSERT' OR OLD.tenant_invite_token IS DISTINCT FROM NEW.tenant_invite_token)
+     AND NEW.tenant_invite_sent_at IS NULL THEN
+    NEW.tenant_invite_sent_at := NOW();
   END IF;
   RETURN NEW;
 END;
@@ -4749,8 +4769,16 @@ CREATE TABLE public.lease_document_signers (
     reminder_sent_at timestamp with time zone,
     declined_at timestamp with time zone,
     decline_reason text,
+    reminder_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT lease_document_signers_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'viewed'::text, 'signed'::text, 'declined'::text])))
 );
+
+
+--
+-- Name: COLUMN lease_document_signers.reminder_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_document_signers.reminder_count IS 'S639: how many signing reminders this signer has been sent. Capped so a document that is never signed stops mailing the person instead of nudging forever.';
 
 
 --
@@ -9644,6 +9672,7 @@ CREATE TABLE public.users (
     theme_accent text,
     font_style text,
     tenant_invite_accepted_at timestamp with time zone,
+    tenant_invite_sent_at timestamp with time zone,
     CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text, 'fitness_user'::text, 'contact'::text, 'portfolio_manager'::text])))
 );
 
@@ -9744,6 +9773,13 @@ COMMENT ON COLUMN public.users.font_style IS 'S633: portal font, per ACCOUNT. Se
 --
 
 COMMENT ON COLUMN public.users.tenant_invite_accepted_at IS 'S637: when a tenant invite was activated. Set = the token is spent and authorises nothing; it is kept only so a returning tenant can be told they are already set up rather than "expired".';
+
+
+--
+-- Name: COLUMN users.tenant_invite_sent_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.tenant_invite_sent_at IS 'S639: when a tenant invite token was first issued to this user. Survives the token being consumed or cleared, so the pending pool can tell "we have written to them" from "we never have".';
 
 
 --
@@ -19474,6 +19510,13 @@ CREATE TRIGGER trg_seasonal_tenancies_updated_at BEFORE UPDATE ON public.seasona
 
 
 --
+-- Name: users trg_stamp_tenant_invite_sent; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_stamp_tenant_invite_sent BEFORE INSERT OR UPDATE OF tenant_invite_token ON public.users FOR EACH ROW EXECUTE FUNCTION public.stamp_tenant_invite_sent();
+
+
+--
 -- Name: subleases trg_subleases_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25560,5 +25603,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 2tjPNez7P0SqhUyMETYxiojyDuyI25NMPp0hH5Pwg2JGzPrjTAa2cAhgwDlUhRD
+\unrestrict eEQORTaCs8eb7EK6LhYITFGmaAeKlcsJw9a1XmHQgmMMQXL3FlmLNXy24URdDUT
 

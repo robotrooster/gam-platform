@@ -153,23 +153,50 @@ describe('S636 — window B: waiting on the tenant', () => {
   })
 })
 
-describe('S636 — tenant reminders every 2 hours', () => {
-  it('nudges a tenant again once 2 hours have passed since the last one', async () => {
+// S639: the cadence below was "every 2 hours, forever". On the live database
+// that had produced 952 reminder emails to 39 people over eight days — about
+// eighty to one resident — and was the shortest path to our own domain being
+// treated as a spam sender, which would have taken the invites and receipts
+// down with it. Now: once a day, five times, then stop.
+describe('S639 — tenant reminders once a day, and they stop', () => {
+  it('nudges a tenant again once a day has passed since the last one', async () => {
     await seedDoc({
-      status: 'in_progress', sentHoursAgo: 10,
-      landlordSignedHoursAgo: 9, tenantInvitedHoursAgo: 9, tenantRemindedHoursAgo: 3,
+      status: 'in_progress', sentHoursAgo: 40,
+      landlordSignedHoursAgo: 39, tenantInvitedHoursAgo: 39, tenantRemindedHoursAgo: 25,
     })
     await processEsignTimeouts()
     expect(emailSigningReminder).toHaveBeenCalledTimes(1)
   })
 
-  it('holds off when the last nudge was under 2 hours ago', async () => {
+  it('holds off when the last nudge was under a day ago', async () => {
     await seedDoc({
       status: 'in_progress', sentHoursAgo: 10,
-      landlordSignedHoursAgo: 9, tenantInvitedHoursAgo: 9, tenantRemindedHoursAgo: 1,
+      landlordSignedHoursAgo: 9, tenantInvitedHoursAgo: 9, tenantRemindedHoursAgo: 3,
     })
     await processEsignTimeouts()
     expect(emailSigningReminder).not.toHaveBeenCalled()
+  })
+
+  it('stops after five — somebody who ignored five is not signing because of a sixth', async () => {
+    await seedDoc({
+      status: 'in_progress', sentHoursAgo: 200,
+      landlordSignedHoursAgo: 199, tenantInvitedHoursAgo: 199, tenantRemindedHoursAgo: 25,
+    })
+    await db.query(
+      `UPDATE lease_document_signers SET reminder_count = 5 WHERE role <> 'landlord'`)
+    await processEsignTimeouts()
+    expect(emailSigningReminder).not.toHaveBeenCalled()
+  })
+
+  it('counts each nudge, so the cap can be reached', async () => {
+    await seedDoc({
+      status: 'in_progress', sentHoursAgo: 40,
+      landlordSignedHoursAgo: 39, tenantInvitedHoursAgo: 39, tenantRemindedHoursAgo: 25,
+    })
+    await processEsignTimeouts()
+    const { rows } = await db.query<any>(
+      `SELECT reminder_count FROM lease_document_signers WHERE role <> 'landlord'`)
+    expect(Number(rows[0].reminder_count)).toBe(1)
   })
 
   it('keeps the landlord-side nudge one-shot', async () => {

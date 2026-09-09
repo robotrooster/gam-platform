@@ -7,7 +7,7 @@ import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
 // owns; writes name their target and are authorised against it.
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
-import { emailTenantOnboarded, emailTenantInvite} from '../services/email'
+import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue } from '../services/email'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
@@ -2686,9 +2686,20 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- lands in no property's list and is chased by nobody.
          COALESCE(pr.id, wpr.id)     AS filter_property_id,
          COALESCE(pr.name, wpr.name) AS filter_property_name,
+         -- S639 (Nic): "you still have it listed as eight people not invited
+         -- yet... We have literally sent invites to every single person."
+         --
+         -- This used to read one column, and a token that had been consumed or
+         -- cleared looked identical to one that was never issued — so everyone
+         -- who activated before S637 (which stopped clearing the token) was
+         -- reported as never invited, while logging in daily. tenant_invite_sent_at
+         -- outlives the token, so "not invited yet" now means nothing was ever
+         -- sent. A logged-in tenant is accepted whatever the columns say.
          CASE
            WHEN u.tenant_invite_accepted_at IS NOT NULL THEN 'accepted'
-           WHEN u.tenant_invite_token IS NOT NULL        THEN 'invited'
+           WHEN u.last_login_at IS NOT NULL             THEN 'accepted'
+           WHEN u.tenant_invite_token IS NOT NULL       THEN 'invited'
+           WHEN u.tenant_invite_sent_at IS NOT NULL     THEN 'invited'
            ELSE 'not_invited'
          END                     AS invite_state,
          u.tenant_invite_expires_at AS invite_expires_at
@@ -5865,6 +5876,95 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
         firstName: body.firstName ?? intent.first_name,
         lastName: body.lastName ?? intent.last_name,
         resent: sent,
+      } })
+    } catch (e) { next(e) }
+  })
+
+// ── S639: REMIND A RESIDENT WHAT THEY OWE ────────────────────────────────────
+//
+// Nic: "send Jeremy Parker's email a reminder that there's a new charge for
+// electricity, or just send the reminder that there's an outstanding balance
+// due."
+//
+// Nothing tenant-facing existed. sendLatePaymentNotice emails the LANDLORD; the
+// person who owes the money was told nothing unless they opened the portal,
+// which is a poor way to collect a utility charge that landed mid-month and
+// that nobody was expecting.
+//
+// The figure is computed here, from the ledger, under the SAME rules as the
+// outstanding-balances page — never passed in by the caller. Specifically:
+//   · work-trade suspended rows are excluded. They are settled in hours at
+//     month close, not cash, and Nic has already had to say twice that showing
+//     them as owing is "a false number". Emailing one would be worse.
+//   · in-flight ACH ('processing') is excluded — they have already paid.
+//   · credit on account comes off the TOTAL, not off individual lines. Nic:
+//     "The credit doesn't settle individual items. It takes just the total
+//     down. It's not separatable."
+// A resident who nets to zero is not emailed at all, and the caller is told so.
+landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
+  requirePerm('payments.view'), async (req, res, next) => {
+    try {
+      const tenantId = z.string().uuid().parse(req.params.tenantId)
+      const rows = await query<any>(`
+        SELECT p.id, p.type, p.amount::float AS amount, p.notes, p.landlord_id,
+               to_char(p.due_date, 'Mon D, YYYY') AS due_label,
+               u.email, u.first_name,
+               TRIM(CONCAT_WS(' ', u.first_name, u.last_name)) AS tenant_name,
+               un.unit_number, pr.name AS property_name,
+               COALESCE(NULLIF(la.business_name, ''),
+                        NULLIF(TRIM(lu.first_name || ' ' || lu.last_name), ''),
+                        'Your landlord') AS landlord_name
+          FROM payments p
+          JOIN tenants t  ON t.id = p.tenant_id
+          JOIN users   u  ON u.id = t.user_id
+          JOIN units   un ON un.id = p.unit_id
+          JOIN properties pr ON pr.id = un.property_id
+          JOIN landlords la ON la.id = p.landlord_id
+          JOIN users lu ON lu.id = la.user_id
+         WHERE p.tenant_id = $1
+           AND p.status IN ('pending', 'overdue', 'failed')
+           AND p.work_trade_suspended_at IS NULL
+         ORDER BY p.due_date`, [tenantId])
+      if (!rows.length) {
+        return res.json({ success: true, data: { sent: false, reason: 'They do not owe anything right now.' } })
+      }
+      if (!canAccessLandlordResource(req.user, rows[0].landlord_id)) throw new AppError(403, 'Forbidden')
+      if (!rows[0].email) {
+        return res.json({ success: true, data: { sent: false, reason: 'No email address on file for them.' } })
+      }
+
+      const gross = Math.round(rows.reduce((s: number, r: any) => s + Number(r.amount), 0) * 100) / 100
+      const creditRow = await queryOne<{ credit: string }>(
+        `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
+           FROM tenant_credits
+          WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0`, [tenantId])
+      const creditApplied = Math.min(Number(creditRow?.credit ?? 0), gross)
+      const total = Math.round((gross - creditApplied) * 100) / 100
+      if (total <= 0) {
+        return res.json({ success: true, data: { sent: false,
+          reason: 'Their credit on account covers everything owed.' } })
+      }
+
+      const label = (r: any) => {
+        const note = String(r.notes ?? '').split(' — ')[0].trim()
+        if (r.type === 'utility') return note || 'Utilities'
+        if (r.type === 'rent') return 'Rent'
+        if (r.type === 'deposit') return 'Security deposit'
+        return note || r.type
+      }
+      const unitLabel = `${rows[0].property_name} — ${rows[0].unit_number}`
+      const id = await emailBalanceDue(rows[0].email, {
+        tenantName: rows[0].first_name || rows[0].tenant_name || 'there',
+        unitLabel,
+        total,
+        creditApplied,
+        lines: rows.map((r: any) => ({ label: label(r), amount: Number(r.amount), dueDate: r.due_label })),
+        portalUrl: `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/payments`,
+        landlordName: rows[0].landlord_name,
+      }, { landlordId: rows[0].landlord_id, tenantId })
+
+      res.json({ success: true, data: {
+        sent: !!id, to: rows[0].email, total, creditApplied, lines: rows.length,
       } })
     } catch (e) { next(e) }
   })

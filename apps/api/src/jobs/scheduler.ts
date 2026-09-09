@@ -427,9 +427,20 @@ export async function processEsignTimeouts() {
                   WHERE ls2.document_id = d.id
                     AND ls2.role = 'landlord'
                     AND ls2.status <> 'signed')
-               -- landlord is done: nudge this tenant every 2 hours
-               THEN s.reminder_sent_at IS NULL
-                 OR s.reminder_sent_at < NOW() - INTERVAL '2 hours'
+               -- S639: the landlord is done and we are waiting on this tenant.
+               -- This used to read "nudge every 2 hours" with no ceiling, which
+               -- on the live database meant 952 emails to 39 people over eight
+               -- days — about eighty to one resident. A reminder that arrives
+               -- every couple of hours forever is not a reminder, and it is the
+               -- fastest route to our domain being treated as a spam sender,
+               -- which would take the invites and receipts down with it.
+               --
+               -- Once a day, five times, then stop. Somebody who has ignored
+               -- five daily reminders is not going to sign because of a sixth;
+               -- they need a phone call, and the document auto-voids anyway.
+               THEN (s.reminder_sent_at IS NULL
+                     OR s.reminder_sent_at < NOW() - INTERVAL '24 hours')
+                AND COALESCE(s.reminder_count, 0) < 5
                -- still waiting on the landlord: one nudge, as before
                ELSE s.reminder_sent_at IS NULL
           END)
@@ -455,7 +466,10 @@ export async function processEsignTimeouts() {
           : (process.env.TENANT_APP_URL || 'http://localhost:3002')
         const signingUrl = `${appUrl}/sign/${r.token || r.doc_id}`
         await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id })
-        await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
+        await query(
+          `UPDATE lease_document_signers
+              SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
+            WHERE id = $1`, [r.id])
       } catch(e) {
         logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] reminder failed for signer')
       }
@@ -695,6 +709,9 @@ export async function processEsignTimeouts() {
           AND d.status IN ('sent','in_progress')
           AND s.status IN ('sent','viewed')
           AND (s.reminder_sent_at IS NULL OR s.reminder_sent_at < NOW() - INTERVAL '${landlordPass ? '20 hours' : '5 hours'}')
+          -- S639: same ceiling as the main pass. Renewals nudge faster (a
+          -- renewal has a deadline), but they still have to stop.
+          AND COALESCE(s.reminder_count, 0) < 8
           AND ${landlordPass
             ? `s.role = 'landlord'`
             : `s.role != 'landlord' AND NOT EXISTS (
@@ -709,7 +726,10 @@ export async function processEsignTimeouts() {
             : (process.env.TENANT_APP_URL || 'http://localhost:3002')
           // S629: the signer's token, not the document id — see the reminder above.
           await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, `${appUrl}/sign/${r.token || r.doc_id}`, { landlordId: r.landlord_id, documentId: r.doc_id })
-          await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
+          await query(
+            `UPDATE lease_document_signers
+                SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
+              WHERE id = $1`, [r.id])
         } catch(e) {
           logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] renewal reminder failed')
         }

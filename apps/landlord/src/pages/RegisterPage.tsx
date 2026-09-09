@@ -4,6 +4,39 @@ import { apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Eye, EyeOff, Check, AlertCircle } from 'lucide-react'
 
+// ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
+//
+// Nic: "on mobile browser, as soon as they leave the page to check the email to
+// get the two factor authentication code, it signs them out or it takes them
+// back to the sign in page."
+//
+// Right, and it is not a sign-out — nothing was ever signed in. The pending OTP
+// session lived in React state only. Switching to the mail app to read the code
+// lets a phone browser discard and reload the page, and the component came back
+// with a fresh empty state: the email/password form again, with the code they
+// are now holding useless. Every tenant hits this, because email 2FA is on for
+// every login.
+//
+// sessionStorage survives that reload, so they return to the code box they left.
+// It holds the short-lived PRE-auth OTP session, never a real session token —
+// and that is worthless without the code from their inbox, the same trust level
+// as the page holding it in memory. Cleared as soon as the code is accepted or
+// the step is abandoned.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  const [v, setV] = useState<string | null>(() => {
+    try { return sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) sessionStorage.setItem(key, next)
+      else sessionStorage.removeItem(key)
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
+
 function PasswordStrength({ password }: { password: string }) {
   const checks = [
     { label: '12+ characters', pass: password.length >= 12 },
@@ -79,7 +112,7 @@ export function RegisterPage() {
   // S578: mandatory email-2FA at signup — /auth/register returns a pending
   // session + emails a 6-digit code; we verify it here before the account is
   // usable (a landlord account controls every tenant's PII + banking).
-  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.landlord.register')
   const [code, setCode] = useState('')
   const [resent, setResent] = useState(false)
 
@@ -113,6 +146,7 @@ export function RegisterPage() {
     setLoading(true); setErr('')
     try {
       await loginWithEmailOtp(emailOtpSession!, code.trim())
+      setEmailOtpSession(null)
       navigate(afterSignup)
     } catch (e: any) {
       const msg = e.response?.data?.error || 'Invalid code.'

@@ -3,13 +3,46 @@ import { useNavigate, Link } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { useAuth } from '../context/AuthContext'
 
+// ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
+//
+// Nic: "on mobile browser, as soon as they leave the page to check the email to
+// get the two factor authentication code, it signs them out or it takes them
+// back to the sign in page."
+//
+// Right, and it is not a sign-out — nothing was ever signed in. The pending OTP
+// session lived in React state only. Switching to the mail app to read the code
+// lets a phone browser discard and reload the page, and the component came back
+// with a fresh empty state: the email/password form again, with the code they
+// are now holding useless. Every tenant hits this, because email 2FA is on for
+// every login.
+//
+// sessionStorage survives that reload, so they return to the code box they left.
+// It holds the short-lived PRE-auth OTP session, never a real session token —
+// and that is worthless without the code from their inbox, the same trust level
+// as the page holding it in memory. Cleared as soon as the code is accepted or
+// the step is abandoned.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  const [v, setV] = useState<string | null>(() => {
+    try { return sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) sessionStorage.setItem(key, next)
+      else sessionStorage.removeItem(key)
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
+
 export function LoginPage() {
   const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
   const navigate = useNavigate()
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string | null>(null)
-  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.landlord.login')
   const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
   const { register, handleSubmit } = useForm<{email:string;password:string}>()
@@ -52,7 +85,7 @@ export function LoginPage() {
   // S574: email-code 2FA (mandatory for landlords). Verify the emailed code.
   const onEmailOtpSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); navigate('/') }
+    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); setEmailOtpSession(null); navigate('/') }
     catch (ex: any) {
       const msg = ex.response?.data?.error || 'Invalid code.'
       setErr(msg)

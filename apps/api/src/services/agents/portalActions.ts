@@ -1261,6 +1261,24 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'send_balance_reminder',
+    audience: 'landlord', method: 'POST', path: '/api/landlords/me/tenants/:tenantId/balance-reminder',
+    pathParams: ['tenantId'],
+    description:
+      'Email a resident a reminder of what they currently owe. Use for "remind Jeremy he owes for '
+      + 'the electric" or "send RV 49 a balance reminder".\n'
+      + 'The amount is read from the ledger here — never quote or pass one. Work-trade charges and '
+      + 'payments already in flight are left out, and any credit on their account comes off the total, '
+      + 'so the figure matches what the resident sees in their portal.\n'
+      + 'It is a reminder, not a late notice: it does not mention lateness or fees. Somebody who owes '
+      + 'nothing is not emailed, and you are told that instead.',
+    params: {
+      tenantId: { type: 'string', description: 'The tenant id, from a lookup.' },
+    },
+    required: ['tenantId'],
+    confirmFirst: true,
+  },
+  {
     id: 'cancel_one_off_charge',
     audience: 'landlord', method: 'PATCH', path: '/api/one-off-charges/:chargeId/cancel',
     pathParams: ['chargeId'],

@@ -2233,3 +2233,74 @@ export async function emailPaymentReceipt(
     'support',
   )
 }
+
+// ── S639: A TENANT-FACING BALANCE REMINDER ───────────────────────────────────
+//
+// Nic: "send Jeremy Parker's email a reminder that there's a new charge for
+// electricity, or just send the reminder that there's an outstanding balance
+// due."
+//
+// There was no such email. The only thing the system sent about an overdue
+// balance was sendLatePaymentNotice, which goes to the LANDLORD — the resident
+// who owes the money heard nothing at all unless they opened the portal. A
+// utility charge landing mid-month is exactly the kind of thing nobody expects
+// and nobody sees.
+//
+// Deliberately not a late notice: it never says "late", never names a fee, and
+// never threatens. It says what is owed, what it is for, and where to pay. The
+// same email works the day a charge lands and three weeks later, and a
+// work-trade resident who owes nothing never receives it (the caller filters
+// suspended rows out, the same rule the balances page uses).
+export async function emailBalanceDue(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    total: number
+    lines: Array<{ label: string; amount: number; dueDate?: string | null }>
+    /** Credit on account, already netted out of `total`. Shown so the figure adds up. */
+    creditApplied?: number
+    portalUrl?: string
+    landlordName?: string
+  },
+  ctx?: { landlordId?: string; tenantId?: string },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+
+  const rows = args.lines.map(l =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+       <span>${l.label}${l.dueDate ? `<span style="color:#7a8aaa"> &middot; due ${l.dueDate}</span>` : ''}</span>
+       <span>${money(l.amount)}</span>
+     </div>`).join('')
+
+  return await send(to, `Balance due — ${money(args.total)} for ${args.unitLabel}`,
+    base(
+      h('You Have a Balance Due') +
+      p(`Hi ${args.tenantName},`) +
+      p(`This is a reminder that <strong style="color:#eef1f8">${money(args.total)}</strong> is currently owed on your account.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${args.unitLabel}</div>
+         ${rows}` +
+      (args.creditApplied && args.creditApplied > 0
+        ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+             <span>Credit on your account</span><span>-${money(args.creditApplied)}</span>
+           </div>`
+        : '') +
+      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>Total due</span><span>${money(args.total)}</span>
+         </div>
+       </div>` +
+      (args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
+      p(`If any of this looks wrong, reply to this email and ${args.landlordName || 'your landlord'} will take a look.`)
+    ),
+    {
+      category: 'balance_due_reminder',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+    },
+    'support',
+  )
+}

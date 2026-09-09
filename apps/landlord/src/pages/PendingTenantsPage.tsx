@@ -730,6 +730,13 @@ export function PendingTenantsPage() {
   // them are actually waiting on the resident.
   const [poolProperty, setPoolProperty] = useState<string>('all')
   const [poolState, setPoolState] = useState<'all' | 'invited' | 'accepted' | 'not_invited'>('all')
+  // S639 (Nic): "Pending pool also needs a search bar so I can type in
+  // somebody's name when I'm onboarding a shitload of people, and I don't know
+  // what state they're necessarily in. I need to be able to type their name and
+  // see where they're at." So the search deliberately IGNORES the state chips
+  // and the property filter — you type a name to find out where they are, which
+  // cannot work if you have to already know.
+  const [poolSearch, setPoolSearch] = useState('')
 
   const { data: intents = [], isLoading, error } = useQuery<PendingIntent[]>(
     'pending-tenants',
@@ -820,12 +827,21 @@ export function PendingTenantsPage() {
 
   const poolProperties = [...new Set(
     (intents as any[]).map(i => i.propertyName).filter(Boolean))].sort()
+  const q = poolSearch.trim().toLowerCase()
+  const matchesSearch = (i: any) => !q || [
+    i.firstName, i.lastName, `${i.firstName ?? ''} ${i.lastName ?? ''}`,
+    i.email, i.phone, i.heldUnitNumber, i.propertyName,
+  ].some(v => String(v ?? '').toLowerCase().includes(q))
   const byProperty = poolProperty === 'all'
     ? (intents as any[])
     : (intents as any[]).filter(i => i.propertyName === poolProperty)
-  const shown = poolState === 'all'
-    ? byProperty
-    : byProperty.filter(i => i.inviteState === poolState)
+  // A search overrides both filters — typing a name finds that person wherever
+  // they are and whatever state they are in.
+  const shown = q
+    ? (intents as any[]).filter(matchesSearch)
+    : poolState === 'all'
+      ? byProperty
+      : byProperty.filter(i => i.inviteState === poolState)
 
   return (
     <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
@@ -852,9 +868,18 @@ export function PendingTenantsPage() {
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16, alignItems: 'center' }}>
+        <input className="input" value={poolSearch} onChange={e => setPoolSearch(e.target.value)}
+          placeholder="Search name, email, phone, unit…" style={{ maxWidth: 260 }} />
+        {q ? (
+          <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+            searching everyone · {shown.length} match{shown.length === 1 ? '' : 'es'}
+            <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft: 6 }}
+              onClick={() => setPoolSearch('')}>Clear</button>
+          </span>
+        ) : null}
         <select className="input" value={poolProperty} onChange={e => setPoolProperty(e.target.value)}
-          style={{ maxWidth: 250 }}>
+          style={{ maxWidth: 250 }} disabled={!!q}>
           <option value="all">All properties</option>
           {poolProperties.map(p => <option key={p} value={p}>{p}</option>)}
         </select>
@@ -864,11 +889,11 @@ export function PendingTenantsPage() {
           { v: 'accepted' as const,    t: 'Accepted' },
           { v: 'not_invited' as const, t: 'Not invited yet' },
         ]).map(o => {
-          const on = poolState === o.v
+          const on = poolState === o.v && !q
           const n = o.v === 'all' ? byProperty.length
                                   : byProperty.filter(i => i.inviteState === o.v).length
           return (
-            <button key={o.v} type="button" onClick={() => setPoolState(o.v)}
+            <button key={o.v} type="button" onClick={() => { setPoolSearch(''); setPoolState(o.v) }}
               className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`}>
               {o.t} ({n})
             </button>
