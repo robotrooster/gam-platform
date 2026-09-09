@@ -1771,7 +1771,12 @@ export function ESignPage() {
             placeholder="Unit or person — try “MH 5” or “mobile home 5”" />
           {dq !== '' && (
             <span style={{ fontSize:'.76rem', color:'var(--text-3)' }}>
-              {filteredDocs.length} match{filteredDocs.length === 1 ? '' : 'es'} across {docGroups.length} propert{docGroups.length === 1 ? 'y' : 'ies'}
+              {/* S639: say LEASES, not "matches". This page lists lease
+                  documents, and there are far more spaces than leases — 74 RV
+                  spaces against 25 RV leases, 45 mobile homes against 18. A
+                  bare count invites the reading that a search for "rv" found
+                  every RV space, which is not what this page holds. */}
+              {filteredDocs.length} lease{filteredDocs.length === 1 ? '' : 's'} at {docGroups.length} propert{docGroups.length === 1 ? 'y' : 'ies'}
               <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft:6 }}
                 onClick={() => setDocSearch('')}>Clear</button>
             </span>
@@ -1796,8 +1801,18 @@ export function ESignPage() {
             </div>
           ) : (
             docGroups.length === 0 ? (
-              <div style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>
-                No documents match your search.
+              // S639: an empty result here is nearly always "that space has no
+              // lease yet", not "your search is broken" — there are three MH 05s
+              // across the portfolio and only one of them has ever been leased.
+              // Saying so turns a dead end into an answer.
+              <div style={{ textAlign:'center', color:'var(--text-3)', padding:32, lineHeight:1.6 }}>
+                <div style={{ fontWeight:600, color:'var(--text-2)' }}>
+                  No lease matches “{docSearch.trim()}”.
+                </div>
+                <div style={{ fontSize:'.82rem', marginTop:6 }}>
+                  This page lists units that have a lease. A space with no lease drafted yet
+                  will not appear here — check it on the Units page for that property.
+                </div>
               </div>
             ) : <>{docGroups.map(g => (
               <div key={g.name} style={{ borderTop:'1px solid var(--border-0)' }}>
