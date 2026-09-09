@@ -497,7 +497,28 @@ tenantsRouter.get('/me', async (req, res, next) => {
         sa.moveout_notice_at,
         to_char(sa.moveout_expected_on, 'YYYY-MM-DD') AS moveout_expected_on,
         sau.unit_number      AS utility_service_space,
-        sap.name             AS utility_service_property_name
+        sap.name             AS utility_service_property_name,
+        -- ── S639: ACCEPTED THE INVITE, WAITING ON THE HOUSEHOLD ─────────────
+        --
+        -- Nic: "I have people trying to log in and sign their lease when other
+        -- household members have not accepted the portal invite yet, and it's
+        -- trying to offer them to pay for a background check, and I've told
+        -- them, no, you don't have to do that... a lot of people think that is
+        -- about to happen to them."
+        --
+        -- A lease only drafts once EVERY invited person on the unit has
+        -- accepted, so whoever accepts first waits — with no lease, no lease
+        -- document, and no background-check approval. Every existing signal was
+        -- therefore false for them, the nav collapsed to Application, and a
+        -- grandfathered resident who owes nothing was shown a $44.99 screening
+        -- and reasonably concluded it was being demanded of them.
+        --
+        -- They are inside a tenancy, not applying for one. This says so, and
+        -- carries what they are waiting on so the portal can tell them.
+        ob.unit_number       AS onboarding_unit_number,
+        ob.property_name     AS onboarding_property_name,
+        ob.household_pending AS onboarding_household_pending,
+        ob.screening_waived  AS onboarding_screening_waived
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN LATERAL (
@@ -528,6 +549,29 @@ tenantsRouter.get('/me', async (req, res, next) => {
       ) sa ON TRUE
       LEFT JOIN units sau      ON sau.id = sa.unit_id
       LEFT JOIN properties sap ON sap.id = sau.property_id
+      -- S639: their accepted, unit-bound, still-open invite — and how many
+      -- people on that same space have not accepted yet, which is the only
+      -- thing standing between them and a lease.
+      LEFT JOIN LATERAL (
+        SELECT obu.unit_number, obp.name AS property_name,
+               (SELECT COUNT(*)::int FROM pending_tenant_intents o
+                 WHERE o.unit_id = ob2.unit_id
+                   AND o.cancelled_at IS NULL AND o.resolved_at IS NULL
+                   AND o.accepted_at IS NULL) AS household_pending,
+               EXISTS (SELECT 1 FROM pending_tenant_intents w
+                        WHERE w.tenant_id = t.id AND w.screening_waived
+                          AND w.cancelled_at IS NULL) AS screening_waived
+          FROM pending_tenant_intents ob2
+          JOIN units obu      ON obu.id = ob2.unit_id
+          JOIN properties obp ON obp.id = obu.property_id
+         WHERE ob2.tenant_id = t.id
+           AND ob2.unit_id IS NOT NULL
+           AND ob2.accepted_at IS NOT NULL
+           AND ob2.cancelled_at IS NULL
+           AND ob2.resolved_at IS NULL
+         ORDER BY ob2.created_at DESC
+         LIMIT 1
+      ) ob ON TRUE
       WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })

@@ -535,8 +535,22 @@ function Layout() {
   // A person a lease document has been sent to is inside the tenancy, not
   // applying for one. The nav opens from the moment it reaches them.
   const isMidSigning = !!(tenantMe as any)?.pendingLeaseDocumentId
+  // S639 (Nic): ACCEPTING IS NOT APPLYING EITHER.
+  //
+  // "I have people trying to log in and sign their lease when other household
+  // members have not accepted the portal invite yet, and it's trying to offer
+  // them to pay for a background check."
+  //
+  // A lease only drafts once everyone invited to the space has accepted, so
+  // whoever accepts first sits with no lease, no document and no screening
+  // result — every other signal here false — and the nav collapsed to
+  // Application. Somebody who has already been onboarded by their landlord was
+  // then shown a $44.99 background check and quite reasonably read it as a bill.
+  // Same principle as the two cases above: a person the landlord has invited to
+  // a specific space is inside the tenancy.
+  const isOnboarding = !!(tenantMe as any)?.onboardingUnitNumber
   const showFullNav = tenantMeUnknown || bgApproved || isExistingTenant
-    || isUtilityServicePayer || isMidSigning
+    || isUtilityServicePayer || isMidSigning || isOnboarding
   // …and only what applies to them. Someone who buys electricity from this
   // landlord has no lease to read, no maintenance to request, no amenities to
   // reserve and no deposit — a nav full of doors that open onto nothing is its
@@ -1105,6 +1119,52 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
   )
 }
 
+// ── S639: WHAT HAPPENS NEXT, AND WHAT YOU DO NOT OWE ─────────────────────────
+//
+// Nic: "when people accept the invite, it needs to say, please watch for your
+// lease to be drafted as soon as all members of your household accept the portal
+// invite... I have people trying to log in and sign their lease when other
+// household members have not accepted yet, and it's trying to offer them to pay
+// for a background check, and I've told them no, you don't have to do that...
+// a lot of people think that is about to happen to them."
+//
+// Somebody who accepts first lands in a portal with no lease and nothing to do,
+// and silence there reads as "something is wrong" or "something is being asked
+// of me". Two sentences fix both: what they are waiting on, and that they are
+// not about to be charged. The money sentence is unconditional for an invited
+// resident — the landlord onboarded them, and a screening they were never asked
+// to take is not something to leave ambiguous.
+function OnboardingWaitingNotice({ me }: { me: any }) {
+  if (!me?.onboardingUnitNumber) return null
+  const waiting = Number(me.onboardingHouseholdPending || 0)
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.32)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+    }}>
+      <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 4 }}>
+        You're all set — your lease is on its way
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+        {waiting > 0 ? (
+          <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is drafted and sent for
+          signature as soon as {waiting === 1 ? 'the other person' : `all ${waiting} other people`} on
+          your household {waiting === 1 ? 'accepts' : 'accept'} their portal invite. We'll email
+          you the moment it's ready to sign.</>
+        ) : (
+          <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is being prepared. We'll
+          email you the moment it's ready to sign — nothing else is needed from you right now.</>
+        )}
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)', marginTop: 8 }}>
+        <strong style={{ color: 'var(--green)' }}>You do not owe anything for a background
+        check.</strong> Your landlord has already onboarded you, so there is nothing to pay
+        and nothing to apply for.
+      </div>
+    </div>
+  )
+}
+
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
@@ -1128,11 +1188,16 @@ function HomePage() {
       <div className="ph">
         <div>
           <h1 className="pt">Hi, {user?.firstName} 👋</h1>
-          <p className="ps">{me?.propertyName} · Unit {me?.unitNumber}</p>
+          <p className="ps">
+            {me?.propertyName || me?.onboardingPropertyName}
+            {(me?.unitNumber || me?.onboardingUnitNumber)
+              ? ` · Unit ${me?.unitNumber || me?.onboardingUnitNumber}` : ''}
+          </p>
         </div>
       </div>
 
       <ServiceOutageBanner />
+      <OnboardingWaitingNotice me={me} />
       <HomeAlerts />
 
       {/* S542: private platform questionnaire — landlord never sees it. */}

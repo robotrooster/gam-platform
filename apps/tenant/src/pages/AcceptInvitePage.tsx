@@ -157,8 +157,20 @@ export function AcceptInvitePage() {
         {step === 0 && (
           <div style={{ background: '#0a0d10', border: '1px solid #1e2530', borderRadius: 16, padding: 28 }}>
             <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#eef1f8', marginBottom: 6 }}>Welcome, {user?.firstName}! 👋</div>
+            {/* S639 (Nic): "when people accept the invite, it needs to say,
+                please watch for your lease to be drafted as soon as all members
+                of your household accept the portal invite." Said here, before
+                they set a password, and again on the home page they land on —
+                the wait is the part nobody warned them about, and silence there
+                is what makes people think a background check is being demanded
+                of them. */}
             <div style={{ fontSize: '.82rem', color: '#7a8aaa', marginBottom: 20, lineHeight: 1.6 }}>
-              Your landlord has invited you to manage your tenancy through GAM.
+              Your landlord has invited you to manage your tenancy through GAM. Once everyone
+              in your household has accepted their invite, your lease is drafted and sent to
+              you for signature — we&rsquo;ll email you the moment it&rsquo;s ready.
+              <span style={{ display: 'block', marginTop: 6, color: '#5fbf7f' }}>
+                There is nothing to pay and no application to fill out.
+              </span>
             </div>
 
             {unit && (

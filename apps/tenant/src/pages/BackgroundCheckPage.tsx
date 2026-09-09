@@ -339,9 +339,36 @@ export function BackgroundCheckPage() {
       </div>
     )
   }
+  // ── S639 (Nic): TELL THEM BEFORE THEY WORRY ────────────────────────────────
+  //
+  // "It's trying to offer them to pay for a background check, and I've told
+  // them, no, you don't have to do that... a lot of people think that is about
+  // to happen to them."
+  //
+  // An invited resident who lands here is not applying for anything — their
+  // landlord onboarded them and their lease is waiting on the rest of the
+  // household. The page still works (nobody is locked out of a screening they
+  // genuinely want), but it says so at the top, before the fee is anywhere on
+  // screen. The subtitle lies to them too — nothing here gates their portal —
+  // so it goes for this case.
+  const invitedResident = !!(me as any)?.onboardingUnitNumber || !!(me as any)?.unitId
   return(
     <div style={{maxWidth:540,margin:'0 auto'}}>
-      <div style={{textAlign:'center',marginBottom:24}}><div style={{width:52,height:52,borderRadius:'50%',background:'rgba(201,162,39,.1)',border:'2px solid #c9a227',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 10px'}}><Shield size={22} style={{color:'#c9a227'}}/></div><h1 style={{color:'#eef1f8',fontSize:'1.2rem',fontWeight:800,margin:'0 0 4px'}}>Background Check Application</h1><p style={{color:'#4a5568',fontSize:'.82rem',margin:0}}>Required before accessing your tenant portal</p></div>
+      {invitedResident && (
+        <div style={{background:'rgba(38,167,90,.08)', border:'1px solid rgba(38,167,90,.35)',
+                     borderRadius:10, padding:'13px 15px', marginBottom:18, lineHeight:1.6}}>
+          <div style={{fontWeight:700, color:'var(--green, #5fbf7f)', marginBottom:3}}>
+            You don't need to do this.
+          </div>
+          <div style={{fontSize:'.86rem', color:'#b8c4d8'}}>
+            Your landlord has already onboarded you
+            {(me as any)?.onboardingUnitNumber ? ` for ${(me as any).onboardingUnitNumber}` : ''}, so
+            there is no application to complete and nothing to pay. Your lease is drafted and sent
+            for signature once everyone in your household accepts their portal invite.
+          </div>
+        </div>
+      )}
+      <div style={{textAlign:'center',marginBottom:24}}><div style={{width:52,height:52,borderRadius:'50%',background:'rgba(201,162,39,.1)',border:'2px solid #c9a227',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 10px'}}><Shield size={22} style={{color:'#c9a227'}}/></div><h1 style={{color:'#eef1f8',fontSize:'1.2rem',fontWeight:800,margin:'0 0 4px'}}>Background Check Application</h1><p style={{color:'#4a5568',fontSize:'.82rem',margin:0}}>{invitedResident ? 'Optional — your tenancy does not depend on this' : 'Required before accessing your tenant portal'}</p></div>
       <div style={{display:'flex',gap:4,marginBottom:8}}>{STEPS.map((_,i)=><div key={i} style={{flex:1,height:3,borderRadius:2,background:i<=step?'#c9a227':'#141a22',transition:'background .2s'}}/>)}</div>
       <div style={{fontSize:'.7rem',color:'#4a5568',textAlign:'center',marginBottom:20}}>Step {step+1} of {STEPS.length} — {STEPS[step]}</div>
       <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12,padding:24,marginBottom:16}}>
