@@ -1157,7 +1157,7 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
     })
     if (inserted) billed = true
   }
-  if (billed) await invoiceEndedLeaseBills(meterId, cycleIso)
+  if (billed) await invoiceEndedLeaseBills(meterId, cycleIso, { moveOut: true })
   // S639: a silent `billed: false` left the person at the meter with nothing to
   // act on. The common cause is that this cycle was ALREADY billed off the
   // monthly run — the run opens on the last business day, so a tenant who pulls
@@ -1185,18 +1185,22 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
 // unplug and drive away. It's immediately so they can be billed. It's not the
 // next day or the day after that."
 //
-// The old gate here only invoiced when the lease was ALREADY expired/terminated
-// or its end_date had passed — so the ordinary case (tenant pulls out Dec 28, the
-// lease runs on paper through Dec 31) created the bill and then left it sitting
-// `unbilled` until the January 1 invoice run. That is exactly the wait Nic says
-// must not happen, and it also strands the charge past the deposit return.
+// The lease-ended test below is what keeps the FOUR ordinary billing paths that
+// call this (monthly submeter, RUBS, dollar-master, ensureBillsForUnit) from
+// cutting a separate same-day invoice for every tenant the moment their meter is
+// read — their charge belongs on the normal monthly invoice. So it stays.
 //
-// The gate was redundant caution: this function has exactly ONE caller,
-// billMoveOutRead, which only ever runs off a `move_out_final` read. Somebody
-// standing at the meter recording a final read IS the move-out — the lease's
-// paper end date has no say in whether the departing tenant can be billed today.
-// So every uninvoiced bill from that read is invoiced now, dated and due today.
-async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promise<void> {
+// But it was wrong for the move-out path, which is the one case where "the lease
+// has already ended on paper" is the wrong question. A tenant who pulls out on
+// the 28th while the lease runs to the 31st failed that test, so the charge was
+// created and then sat `unbilled` until the next monthly run — past the deposit
+// return, and exactly the wait Nic says must not happen. Somebody standing at the
+// meter recording a FINAL read IS the move-out; the paper end date has no say.
+// `moveOut` is passed only from billMoveOutRead, which only ever runs off a
+// `move_out_final` read.
+async function invoiceEndedLeaseBills(
+  meterId: string, cycleIso: string, opts: { moveOut?: boolean } = {},
+): Promise<void> {
   try {
     const ended = await query<{ lease_id: string }>(`
       SELECT DISTINCT ub.lease_id
@@ -1205,7 +1209,10 @@ async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promis
        WHERE ub.meter_id = $1 AND ub.billing_cycle_month = $2
          AND ub.payment_id IS NULL AND ub.status IN ('unbilled', 'billed')
          AND ub.lease_id IS NOT NULL
-    `, [meterId, cycleIso])
+         AND ($3::boolean
+              OR l.status IN ('expired', 'terminated')
+              OR (l.end_date IS NOT NULL AND l.end_date <= CURRENT_DATE))
+    `, [meterId, cycleIso, opts.moveOut === true])
     if (ended.length === 0) return
     const { generateFinalUtilityInvoice } = await import('../jobs/invoiceGeneration')
     for (const r of ended) {
