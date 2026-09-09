@@ -7,11 +7,11 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL,
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
   SCREENING_FEE_EXCLUSION_REASON,
-  isAutoFilledLeaseColumn,
+  isAutoFilledLeaseColumn, matchesUnitQuery,
 } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
-import { SearchBox, PropertySelect } from '../components/ListControls'
+import { SearchBox } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, Printer, MoreVertical, Undo2, Redo2, PenLine } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { toast, appConfirm } from '../components/dialogs'
@@ -1602,8 +1602,24 @@ export function ESignPage() {
   // propertyName (the docs payload has no propertyId); standalone contracts
   // have no property and fall out of a property-filtered view by design.
   const [docSearch, setDocSearch] = useState('')
-  const [docPropertyName, setDocPropertyName] = useState('')
-  const docPropertyOptions = (documents as any[]).map(d => ({ id: d.propertyName, name: d.propertyName }))
+  // ── S639 (Nic): ONE PARK AT A TIME ─────────────────────────────────────────
+  //
+  //   "each lease should be in a sub window. Like, if I click Mountain View,
+  //    it'll expand the window to show the status of all the leases. And if I
+  //    close that and click Oak Park, it'll expand that view as well... between
+  //    adding a whole portfolio in here, you don't wanna have five hundred, you
+  //    know, leases or thousands of leases, and have to scroll down forever just
+  //    to figure out what's going on."
+  //
+  // The dropdown made you choose between one park and ALL of them, and "all" is
+  // the option that stops working the moment there is more than one park. A park
+  // is a section you open, and the header carries the counts so the page answers
+  // "what is going on" before anything is expanded at all.
+  //
+  // Which sections are open, not which one: two parks side by side is a
+  // legitimate thing to want, and forcing a single choice is the dropdown's
+  // mistake in a different shape.
+  const [openProps, setOpenProps] = useState<Record<string, boolean>>({})
   const dq = docSearch.trim().toLowerCase()
 
   // S637 (Nic, DIRECTIVE): "all the ones that are completed need to be bumped
@@ -1624,19 +1640,59 @@ export function ESignPage() {
     // sent / in_progress — the landlord's own signature outranks everything.
     return d.landlordMustSign ? 0 : 1
   }
+  // ── S639 (Nic): SEARCH THE UNIT, NOT THE PARK ──────────────────────────────
+  //
+  //   "The search bar doesn't search very good, especially for RV spots, because
+  //    the word RV is usually in the park name, and so it pulls up all the mobile
+  //    home spaces too... If there's a way to just filter that search bar so it
+  //    only searches the unit number."
+  //
+  // It matched the document TITLE ("Lease — Unit RV 41 — Mountain View RV Ranch")
+  // and the property name, so at an RV park the letters "RV" were in every row
+  // and the search did nothing. The park name is never the thing being searched
+  // for — the accordion below already says which park you are in.
+  //
+  // matchesUnitQuery normalises both sides, so "mobile home 5", "mh5" and "MH 05"
+  // are one query. Signer and tenant names still match: a name cannot collide
+  // with a park the way a unit type can, and looking somebody up by name is the
+  // other reason to use this box.
   const filteredDocs = (documents as any[]).filter(d => {
-    const matchProperty = docPropertyName === '' || d.propertyName === docPropertyName
-    if (!matchProperty) return false
     if (dq === '') return true
-    return (d.title || '').toLowerCase().includes(dq)
-      || (d.unitNumber || '').toLowerCase().includes(dq)
-      || (d.propertyName || '').toLowerCase().includes(dq)
-      || (d.documentType ? humanize(d.documentType).toLowerCase().includes(dq) : false)
+    if (matchesUnitQuery(dq, d.unitNumber)) return true
+    const people = [
+      ...(Array.isArray(d.signers) ? d.signers.map((x: any) => x?.name) : []),
+      d.tenantName,
+    ].filter(Boolean).join(' ').toLowerCase()
+    return people.includes(dq)
   }).sort((a, b) => {
     const r = queueRank(a) - queueRank(b)
     if (r !== 0) return r
     return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
   })
+
+  // S639: filtered rows, grouped into one section per park and ordered by the
+  // work owed — a park with a signature waiting on Nic sorts above a park where
+  // everything is done, for the same reason the rows inside it do.
+  const docGroups = (() => {
+    const m = new Map<string, any[]>()
+    for (const d of filteredDocs) {
+      const k = d.propertyName || 'No property'
+      if (!m.has(k)) m.set(k, [])
+      m.get(k)!.push(d)
+    }
+    return [...m.entries()]
+      .map(([name, docs]) => ({
+        name,
+        docs,
+        needsYou:   docs.filter(d => d.landlordMustSign && d.status !== 'completed' && d.status !== 'voided').length,
+        awaiting:   docs.filter(d => !d.landlordMustSign && (d.status === 'sent' || d.status === 'in_progress')).length,
+        completed:  docs.filter(d => d.status === 'completed').length,
+      }))
+      .sort((a, b) => (b.needsYou - a.needsYou) || a.name.localeCompare(b.name))
+  })()
+  // A search is a hunt for one row — opening every match beats making the user
+  // expand each park to find out whether their match is in it.
+  const sectionOpen = (name: string) => (dq !== '' ? true : !!openProps[name])
 
   const deleteTemplateMut = useMutation(
     (id: string) => apiDelete('/esign/templates/' + id),
@@ -1711,8 +1767,19 @@ export function ESignPage() {
       {/* Documents */}
       {tab === 'documents' && (documents as any[]).length > 0 && (
         <div className="filter-bar">
-          <SearchBox value={docSearch} onChange={setDocSearch} placeholder="Search document, unit, property…" />
-          <PropertySelect value={docPropertyName} onChange={setDocPropertyName} properties={docPropertyOptions} />
+          <SearchBox value={docSearch} onChange={setDocSearch}
+            placeholder="Unit or person — try “MH 5” or “mobile home 5”" />
+          {dq !== '' && (
+            <span style={{ fontSize:'.76rem', color:'var(--text-3)' }}>
+              {filteredDocs.length} match{filteredDocs.length === 1 ? '' : 'es'} across {docGroups.length} propert{docGroups.length === 1 ? 'y' : 'ies'}
+              <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft:6 }}
+                onClick={() => setDocSearch('')}>Clear</button>
+            </span>
+          )}
+          <button type="button" className="btn btn-ghost btn-sm"
+            onClick={() => setOpenProps(Object.fromEntries(docGroups.map(g => [g.name, true])))}>Expand all</button>
+          <button type="button" className="btn btn-ghost btn-sm"
+            onClick={() => setOpenProps({})}>Collapse all</button>
         </div>
       )}
 
@@ -1728,12 +1795,48 @@ export function ESignPage() {
               {can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={14} /> Send Document</button>}
             </div>
           ) : (
-            <table className="data-table">
-              <thead><tr><th>Document</th><th>Unit</th><th>Status</th><th>Signers</th><th>Sent</th><th>Completed</th><th></th></tr></thead>
-              <tbody>
-                {filteredDocs.length === 0 ? (
-                  <tr><td colSpan={7} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No documents match your filters.</td></tr>
-                ) : filteredDocs.map(d => (
+            docGroups.length === 0 ? (
+              <div style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>
+                No documents match your search.
+              </div>
+            ) : <>{docGroups.map(g => (
+              <div key={g.name} style={{ borderTop:'1px solid var(--border-0)' }}>
+                {/* S639: the park header answers "what is going on" before
+                    anything is opened, so a portfolio of thousands of leases
+                    does not have to be scrolled to be understood. */}
+                <button type="button"
+                  onClick={() => setOpenProps(o => ({ ...o, [g.name]: !o[g.name] }))}
+                  style={{ width:'100%', display:'flex', alignItems:'center', gap:10,
+                           background:'transparent', border:'none', cursor:'pointer',
+                           padding:'12px 16px', textAlign:'left', color:'var(--text-0)' }}>
+                  <span style={{ color:'var(--text-3)', fontSize:'.8rem', width:12 }}>
+                    {sectionOpen(g.name) ? '▾' : '▸'}
+                  </span>
+                  <span style={{ fontWeight:700, fontSize:'.95rem' }}>{g.name}</span>
+                  <span style={{ fontSize:'.78rem', color:'var(--text-3)' }}>
+                    {g.docs.length} lease{g.docs.length === 1 ? '' : 's'}
+                  </span>
+                  {g.needsYou > 0 && (
+                    <span style={{ fontSize:'.76rem', fontWeight:700, color:'var(--gold)' }}>
+                      {g.needsYou} waiting on you
+                    </span>
+                  )}
+                  {g.awaiting > 0 && (
+                    <span style={{ fontSize:'.76rem', color:'var(--text-2)' }}>
+                      {g.awaiting} out for signature
+                    </span>
+                  )}
+                  {g.completed > 0 && (
+                    <span style={{ fontSize:'.76rem', color:'var(--green)' }}>
+                      {g.completed} signed
+                    </span>
+                  )}
+                </button>
+                {sectionOpen(g.name) && (
+                <table className="data-table">
+                  <thead><tr><th>Document</th><th>Unit</th><th>Status</th><th>Signers</th><th>Sent</th><th>Completed</th><th></th></tr></thead>
+                  <tbody>
+                    {g.docs.map((d: any) => (
                   <Fragment key={d.id}>
                   <tr onClick={() => setOpenDoc(openDoc === d.id ? null : d.id)}
                       style={{ cursor:'pointer' }}
@@ -1844,9 +1947,12 @@ export function ESignPage() {
                     </tr>
                   )}
                   </Fragment>
-                ))}
-              </tbody>
-            </table>
+                    ))}
+                  </tbody>
+                </table>
+                )}
+              </div>
+            ))}</>
           )}
         </div>
       )}

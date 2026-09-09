@@ -6526,3 +6526,60 @@ export function normalizePersonName(input: string | null | undefined): string {
       (_m, sep: string, ch: string) => sep + ch.toUpperCase())
   }).join(' ')
 }
+
+// ── S639: SEARCHING FOR A UNIT, NOT FOR A PARK ───────────────────────────────
+//
+// Nic: "The search bar doesn't search very good, especially for RV spots,
+// because the word RV is usually in the park name, and so it pulls up all the
+// mobile home spaces too... MH abbreviation for mobile home is fine. RV
+// abbreviation for a unit type doesn't really abbreviate it when RV parks have
+// the word RV in the name."
+//
+// Exactly the problem: the e-sign search matched the document TITLE ("Lease —
+// Unit RV 41 — Mountain View RV Ranch") and the property name, so typing "RV"
+// at Mountain View RV Ranch returned every mobile home there too. The park name
+// is never what you are searching for — you already know which park you are in.
+//
+// This matches the UNIT NUMBER only, and normalises both sides so the spoken
+// form and the written form land in the same place:
+//   "mobile home five", "mobile home 5", "MH5", "mh 05"  → all find MH 05
+//   "rv 9", "RV9", "space 9"                             → all find RV 09
+const UNIT_NUMBER_WORDS: Record<string, string> = {
+  one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7',
+  eight: '8', nine: '9', ten: '10', eleven: '11', twelve: '12', thirteen: '13',
+  fourteen: '14', fifteen: '15', sixteen: '16', seventeen: '17', eighteen: '18',
+  nineteen: '19', twenty: '20',
+}
+
+/** Reduce a unit number or a search phrase to a comparable key: "MH 05" → "mh5". */
+export function normalizeUnitKey(input: string | null | undefined): string {
+  let s = String(input ?? '').toLowerCase().trim()
+  if (!s) return ''
+  // Spoken/typed long forms of the two type prefixes.
+  s = s.replace(/\bmobile\s*homes?\b/g, 'mh').replace(/\brecreational\s*vehicles?\b/g, 'rv')
+  // Words that describe the slot rather than name it — they carry no meaning
+  // here, and people use them interchangeably.
+  s = s.replace(/\b(space|spaces|lot|lots|site|sites|spot|spots|unit|units|apartment|apt|number|no|#)\b/g, ' ')
+  // "five" → "5", so a dictated search behaves like a typed one.
+  s = s.replace(/\b[a-z]+\b/g, w => UNIT_NUMBER_WORDS[w] ?? w)
+  // Everything else is noise: spaces, dashes, punctuation.
+  s = s.replace(/[^a-z0-9]/g, '')
+  // "mh05" and "mh5" are the same space.
+  s = s.replace(/([a-z])0+(\d)/g, '$1$2')
+  return s.replace(/^0+(\d)/, '$1')
+}
+
+/**
+ * Does this unit match what the user typed? Prefix-based, so "mh" lists every
+ * mobile home and "mh5" narrows to MH 5 (and MH 50-59, which is the useful
+ * behaviour while still typing).
+ *
+ * Deliberately ignores the property name — that is the whole bug being fixed.
+ */
+export function matchesUnitQuery(query: string | null | undefined, unitNumber: string | null | undefined): boolean {
+  const q = normalizeUnitKey(query)
+  if (!q) return true
+  const u = normalizeUnitKey(unitNumber)
+  if (!u) return false
+  return u.startsWith(q) || u === q
+}
