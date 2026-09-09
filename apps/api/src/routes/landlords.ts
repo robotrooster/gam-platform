@@ -2686,18 +2686,42 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- lands in no property's list and is chased by nobody.
          COALESCE(pr.id, wpr.id)     AS filter_property_id,
          COALESCE(pr.name, wpr.name) AS filter_property_name,
-         -- S639 (Nic): "you still have it listed as eight people not invited
-         -- yet... We have literally sent invites to every single person."
+         -- S639 (Nic): "you still have it listed as eight people not invited yet...
+         -- We have literally sent invites to every single person."
          --
-         -- This used to read one column, and a token that had been consumed or
-         -- cleared looked identical to one that was never issued — so everyone
-         -- who activated before S637 (which stopped clearing the token) was
-         -- reported as never invited, while logging in daily. tenant_invite_sent_at
-         -- outlives the token, so "not invited yet" now means nothing was ever
-         -- sent. A logged-in tenant is accepted whatever the columns say.
+         -- Two rounds of getting this wrong, so here is the whole rule.
+         --
+         -- The state used to come from users.tenant_invite_token alone, and a
+         -- token that had been consumed looked identical to one never issued —
+         -- so everyone who activated before S637 stopped clearing tokens read as
+         -- never invited while logging in daily.
+         --
+         -- The first fix reached for proxies (a login, an entry in the email
+         -- send log) and still missed the obvious: THIS ROW already records it.
+         -- pending_tenant_intents.accepted_at is stamped the moment the person
+         -- activates, and Glenda Greek and Dakota Lane both had it set while the
+         -- pool called them uninvited, because the answer was being read off the
+         -- user instead of off the invite in front of it.
+         --
+         -- Nic (verbatim): "the creation of that lease tells me that she accepted
+         -- the invite." Exactly right, and it is enforced in code —
+         -- leaseOnboarding only drafts when roster.every(m => m.accepted_at) — so
+         -- a lease document naming somebody is proof they accepted. It is the
+         -- last resort here rather than the first only because accepted_at says
+         -- the same thing more cheaply.
+         --
+         -- Acceptance is a fact about the PERSON, not about one invite row: two
+         -- invites (a unit and a screening waiver) must not disagree about
+         -- whether they ever got in.
          CASE
+           WHEN pti.accepted_at IS NOT NULL             THEN 'accepted'
            WHEN u.tenant_invite_accepted_at IS NOT NULL THEN 'accepted'
            WHEN u.last_login_at IS NOT NULL             THEN 'accepted'
+           WHEN EXISTS (SELECT 1 FROM pending_tenant_intents a
+                         WHERE a.tenant_id = pti.tenant_id
+                           AND a.accepted_at IS NOT NULL) THEN 'accepted'
+           WHEN EXISTS (SELECT 1 FROM lease_document_signers lds
+                         WHERE lds.user_id = u.id)      THEN 'accepted'
            WHEN u.tenant_invite_token IS NOT NULL       THEN 'invited'
            WHEN u.tenant_invite_sent_at IS NOT NULL     THEN 'invited'
            ELSE 'not_invited'
@@ -2727,11 +2751,24 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- Hidden only when the same person ALSO has a real unit-bound invite, so
          -- a genuine property-level invite (no unit yet) still shows, and anyone
          -- actually renting two spaces still shows twice.
+         --
+         -- S639 (Nic: "you're still showing... Iliana Gonzalez"): the unit-bound
+         -- invite used to have to be OPEN for the waiver row to be hidden, and
+         -- Illyana Gonzalez showed how that fails. Her address was corrected on
+         -- 2026-09-02: the MH 09 invite was cancelled and a fresh account made a
+         -- minute later, which accepted, signed and now holds the lease. The
+         -- cancel closed the unit row and left the waiver row behind it open, so
+         -- with no OPEN unit invite left to hide behind, an audit record from a
+         -- dead account surfaced as a person to chase.
+         --
+         -- A waiver row is an audit record of a screening decision, never a work
+         -- item. If the person has a unit-bound invite at all — open, resolved or
+         -- cancelled — that row is the work item and this one has nothing to add.
+         -- The record itself is untouched; it is only not a queue entry.
          AND NOT (pti.unit_id IS NULL AND pti.screening_waived AND EXISTS (
                    SELECT 1 FROM pending_tenant_intents o
                     WHERE o.tenant_id = pti.tenant_id
-                      AND o.unit_id IS NOT NULL
-                      AND o.resolved_at IS NULL AND o.cancelled_at IS NULL))
+                      AND o.unit_id IS NOT NULL))
        ORDER BY pti.created_at DESC`,
       [landlordIds]
     )
@@ -2807,11 +2844,32 @@ landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onbo
       throw new AppError(404, 'Pending tenant not found, already resolved/cancelled, or not owned by you')
     }
 
+    // S639: cancel the paired screening-waiver row with it. A waive writes a
+    // SECOND, unit-less intent purely to hold the audit (who waived, when,
+    // attested). Cancelling the real invite left that one open, and once its
+    // partner was gone it had nothing to hide behind — Illyana Gonzalez's
+    // corrected-address cancellation on 2026-09-02 left a ghost of a dead
+    // account sitting in Nic's pending pool for a week.
+    //
+    // Stamped, never deleted: the screening decision stays on the record (the
+    // 79 waivers wrongly cancelled earlier in this session are why that
+    // distinction is written down). It stops being something to chase, and the
+    // audit survives.
+    const closedWaivers = await query<{ id: string }>(
+      `UPDATE pending_tenant_intents
+          SET cancelled_at = NOW(), updated_at = NOW()
+        WHERE tenant_id = (SELECT tenant_id FROM pending_tenant_intents WHERE id = $1)
+          AND unit_id IS NULL AND screening_waived
+          AND resolved_at IS NULL AND cancelled_at IS NULL
+        RETURNING id`,
+      [intentId])
+
     res.json({
       success: true,
       data: {
         intentId,
         cancelled: true,
+        waiverRowsClosed: closedWaivers.length,
         // Retained on purpose — the person and their PDF stay on our server.
         tenantDeleted: false,
         userDeleted: false,

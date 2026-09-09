@@ -339,6 +339,99 @@ describe('GET /me/pending-tenants', () => {
   })
 })
 
+// ── S639: WHAT "NOT INVITED YET" MEANS ───────────────────────────────────────
+//
+// Nic, twice: "you still have it listed as eight people not invited yet... We
+// have literally sent invites to every single person", then "you're still
+// showing the pending pool as three people not invited yet... the creation of
+// that lease tells me that she accepted the invite."
+//
+// Both rounds were the same mistake in different clothes: reading acceptance
+// off a column that had been cleared, or off the USER when the invite row in
+// front of us already recorded it. These hold the rule where it is cheap to
+// check.
+describe('S639 pending pool — invite state tells the truth', () => {
+  async function pendingIntent(f: any, email: string) {
+    const r = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'P', lastName: 'P', email, phone: '555' })
+    return r.body.data.intentId as string
+  }
+  const poolFor = async (f: any) => (await request(buildApp())
+    .get('/api/landlords/me/pending-tenants')
+    .set('Authorization', `Bearer ${f.landlordToken}`)).body.data
+
+  it('an invite whose token was consumed still reads as sent, not as never invited', async () => {
+    const f = await seedTOFixture()
+    const email = `s639a-${randomUUID().slice(0, 6)}@test.dev`
+    await pendingIntent(f, email)
+    // Exactly the pre-S637 shape: activation cleared the token and the newer
+    // accepted marker was never written. This read 'not_invited' for a week.
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              last_login_at = NULL, tenant_invite_sent_at = NOW() - INTERVAL '8 days'
+        WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).not.toBe('not_invited')
+  })
+
+  it("the invite row's own accepted_at is what decides — not the user record", async () => {
+    const f = await seedTOFixture()
+    const email = `s639b-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    // Glenda Greek and Dakota Lane exactly: accepted on the intent, nothing on
+    // the user, and the pool called them uninvited.
+    await db.query(`UPDATE pending_tenant_intents SET accepted_at = NOW() WHERE id = $1`, [intentId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              last_login_at = NULL WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).toBe('accepted')
+  })
+
+  it('somebody genuinely never written to still reads as not invited', async () => {
+    const f = await seedTOFixture()
+    const email = `s639c-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    await db.query(`UPDATE pending_tenant_intents SET accepted_at = NULL WHERE id = $1`, [intentId])
+    await db.query(
+      `UPDATE users SET tenant_invite_token = NULL, tenant_invite_accepted_at = NULL,
+              tenant_invite_sent_at = NULL, last_login_at = NULL
+        WHERE lower(email) = $1`, [email])
+    const pool = await poolFor(f)
+    expect(pool.find((i: any) => i.email === email)?.inviteState).toBe('not_invited')
+  })
+
+  it('a waiver audit row left behind by a cancelled invite is not a person to chase', async () => {
+    const f = await seedTOFixture()
+    const email = `s639d-${randomUUID().slice(0, 6)}@test.dev`
+    const intentId = await pendingIntent(f, email)
+    const { rows } = await db.query<any>(
+      `SELECT tenant_id, landlord_id FROM pending_tenant_intents WHERE id = $1`, [intentId])
+    // Bind the real invite to a unit first — only one live unit-less row per
+    // person is allowed, and the waiver row is the one that has to be it.
+    await db.query(
+      `UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [intentId, f.unitId])
+    // The screening waive writes a second, unit-less row purely to hold the audit.
+    await db.query(
+      `INSERT INTO pending_tenant_intents (tenant_id, landlord_id, unit_id, screening_waived)
+       VALUES ($1, $2, NULL, TRUE)`, [rows[0].tenant_id, rows[0].landlord_id])
+    // Illyana Gonzalez: her address was corrected, the unit invite cancelled,
+    // and the orphaned waiver row surfaced as a ghost in the pool for a week.
+    await request(buildApp())
+      .delete(`/api/landlords/me/pending-tenants/${intentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    const pool = await poolFor(f)
+    expect(pool.filter((i: any) => i.email === email)).toHaveLength(0)
+    // The audit record itself survives — it is hidden, never erased.
+    const kept = await db.query<any>(
+      `SELECT cancelled_at FROM pending_tenant_intents
+        WHERE tenant_id = $1 AND screening_waived`, [rows[0].tenant_id])
+    expect(kept.rows).toHaveLength(1)
+  })
+})
+
 describe('DELETE /me/pending-tenants/:intentId', () => {
   it('not found / wrong landlord → 404', async () => {
     const f = await seedTOFixture()
