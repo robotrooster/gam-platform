@@ -4,6 +4,7 @@ import { appendEvent } from './creditLedger'
 import { ensureBillsForUnit } from './utilityBilling'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 // ============================================================
 // Deposit-return service.
@@ -1102,7 +1103,7 @@ async function attemptGapAutoCharge(
 
   // Lazy-import Stripe to avoid loading the SDK in non-charge code paths.
   const Stripe = (await import('stripe')).default
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' as any })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' as any })
 
   // Read the customer's default payment method.
   let paymentMethodId: string | null = null

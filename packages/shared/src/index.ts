@@ -6491,3 +6491,38 @@ export function dateDigitSettles(which: 'mm' | 'dd', digits: string): boolean {
   if (!Number.isFinite(n)) return false
   return which === 'mm' ? n > 1 : n > 3
 }
+
+// ── S639: PEOPLE'S NAMES GET TYPED IN A HURRY ────────────────────────────────
+//
+// Nic: "On the tenant portal invites, I want to have it be title case on the
+// names. I accidentally put Gerald Logue as a lower case, and I have no way to
+// change that invite."
+//
+// A tenant's name is typed once, at speed, during a bulk onboarding — and then
+// printed on their lease, their invoices and every email they get. "gerald" is
+// not a name anybody would choose to send.
+//
+// Deliberately conservative: it fixes a name typed in ONE case (all lower or all
+// upper) and otherwise leaves it exactly alone. That is the mistake being
+// reported, and it is the only one that can be corrected without guessing.
+// McDonald, O'Brien, DeLuca and van der Berg already carry internal capitals
+// that say the writer meant them, and a general title-caser would ruin all four
+// — so anything with a capital already in it is left untouched.
+export function normalizePersonName(input: string | null | undefined): string {
+  const raw = String(input ?? '').trim().replace(/\s+/g, ' ')
+  if (!raw) return raw
+  const hasLower = /[a-z]/.test(raw)
+  const hasUpper = /[A-Z]/.test(raw)
+  // Mixed case is a deliberate spelling — McDonald, O'Brien, JJ. Leave it.
+  if (hasLower && hasUpper) return raw
+  // Word by word, because initials are their own case. "JJ" and "TJ" are how
+  // people write their names, not shouting — a blanket lower-then-capitalise
+  // turns them into "Jj".
+  return raw.split(' ').map(word => {
+    if (/^[A-Z]{1,3}$/.test(word)) return word
+    // Capitalise the first letter of the word and after an internal hyphen or
+    // apostrophe: mary-jane o'neill → Mary-Jane O'Neill.
+    return word.toLowerCase().replace(/(^|[\-'’])([a-z])/g,
+      (_m, sep: string, ch: string) => sep + ch.toUpperCase())
+  }).join(' ')
+}

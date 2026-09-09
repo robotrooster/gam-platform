@@ -220,11 +220,24 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
 // the only way to fix a mistyped address was to cancel and start over — losing
 // the held space and any work-trade or screening state along with it. Correcting
 // it in place keeps all of that and issues a fresh link.
-function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, onConfirm }: {
+// S639 (Nic): "I accidentally put Gerald Logue as a lower case, and I have no
+// way to change that invite." The route has always accepted a name; this modal
+// only ever offered the address, so a mistyped name had no fix at all short of
+// cancelling the invite and losing the held space. Names are normalised on save
+// (gerald → Gerald), so most of the time there is nothing to retype.
+function FixEmailModal({
+  name, current, value, onChange,
+  firstName, lastName, onFirstName, onLastName,
+  error, busy, onCancel, onConfirm,
+}: {
   name: string
   current: string
   value: string
   onChange: (v: string) => void
+  firstName: string
+  lastName: string
+  onFirstName: (v: string) => void
+  onLastName: (v: string) => void
   error: string | null
   busy: boolean
   onCancel: () => void
@@ -248,9 +261,25 @@ function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, 
             onKeyDown={e => { if (e.key === 'Enter' && changed && !busy) onConfirm() }}
             style={{ width: '100%' }}
           />
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+                First name
+              </label>
+              <input className="input" value={firstName} style={{ width: '100%' }}
+                onChange={e => onFirstName(e.target.value)} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+                Last name
+              </label>
+              <input className="input" value={lastName} style={{ width: '100%' }}
+                onChange={e => onLastName(e.target.value)} />
+            </div>
+          </div>
           <p style={{ marginBottom: 0, marginTop: 12, fontSize: '.78rem', color: 'var(--text-3)' }}>
             They keep their place in the queue and any space held for them. A fresh invite
-            goes to the new address and the old link stops working.
+            goes to the address above and the old link stops working.
           </p>
           {error && (
             <div style={{ marginTop: 10, color: COLOR_DANGER, fontSize: '.8rem' }}>{error}</div>
@@ -258,8 +287,9 @@ function FixEmailModal({ name, current, value, onChange, error, busy, onCancel, 
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
-          <button className="btn btn-primary" onClick={onConfirm} disabled={busy || !changed}>
-            {busy ? 'Sending...' : 'Save and re-send'}
+          <button className="btn btn-primary" onClick={onConfirm}
+            disabled={busy || (!changed && !firstName.trim() && !lastName.trim())}>
+            {busy ? 'Sending...' : changed ? 'Save and re-send' : 'Save'}
           </button>
         </div>
       </div>
@@ -707,6 +737,8 @@ export function PendingTenantsPage() {
   // person or the space they are held on.
   const [fixTarget, setFixTarget] = useState<PendingIntent | null>(null)
   const [fixEmail, setFixEmail] = useState('')
+  const [fixFirst, setFixFirst] = useState('')
+  const [fixLast, setFixLast] = useState('')
   const [fixError, setFixError] = useState<string | null>(null)
   const [fixDone, setFixDone] = useState<string | null>(null)
   const [uploadingId, setUploadingId] = useState<string | null>(null)
@@ -766,14 +798,19 @@ export function PendingTenantsPage() {
   )
 
   const fixEmailMut = useMutation(
-    (v: { intentId: string; email: string }) =>
-      apiPatch(`/landlords/me/pending-intents/${v.intentId}/contact`,
-               { email: v.email, resend: true }),
+    (v: { intentId: string; email?: string; firstName?: string; lastName?: string; resend: boolean }) =>
+      apiPatch(`/landlords/me/pending-intents/${v.intentId}/contact`, {
+        ...(v.email ? { email: v.email } : {}),
+        ...(v.firstName ? { firstName: v.firstName } : {}),
+        ...(v.lastName ? { lastName: v.lastName } : {}),
+        resend: v.resend,
+      }),
     {
       onSuccess: (_d, v) => {
         qc.invalidateQueries('pending-tenants')
         qc.invalidateQueries('pending-tenants-count')
-        setFixDone(`Invite re-sent to ${v.email}`)
+        // S639: correcting only a spelling must not tell them an invite went out.
+        setFixDone(v.resend ? `Invite re-sent to ${v.email}` : 'Name updated')
         setFixTarget(null)
         setTimeout(() => setFixDone(null), 6000)
       },
@@ -971,7 +1008,9 @@ export function PendingTenantsPage() {
                 name: `${intent.firstName} ${intent.lastName}`.trim() || intent.email,
               })}
               onDelete={() => setDeleteTarget(intent)}
-              onFixEmail={() => { setFixTarget(intent); setFixEmail(intent.email); setFixError(null) }}
+              onFixEmail={() => { setFixTarget(intent); setFixEmail(intent.email);
+                                  setFixFirst(intent.firstName || ''); setFixLast(intent.lastName || '');
+                                  setFixError(null) }}
               uploading={uploadingId === intent.intentId}
             />
           ))}
@@ -1040,12 +1079,26 @@ export function PendingTenantsPage() {
           current={fixTarget.email}
           value={fixEmail}
           onChange={setFixEmail}
+          firstName={fixFirst}
+          lastName={fixLast}
+          onFirstName={setFixFirst}
+          onLastName={setFixLast}
           error={fixError}
           busy={fixEmailMut.isLoading}
           onCancel={() => { setFixTarget(null); setFixError(null) }}
           onConfirm={() => {
             setFixError(null)
-            fixEmailMut.mutate({ intentId: fixTarget.intentId, email: fixEmail.trim() })
+            const email = fixEmail.trim()
+            const addressChanged = !!email && email.toLowerCase() !== fixTarget.email.toLowerCase()
+            fixEmailMut.mutate({
+              intentId: fixTarget.intentId,
+              email: addressChanged ? email : undefined,
+              firstName: fixFirst.trim() || undefined,
+              lastName: fixLast.trim() || undefined,
+              // Only a NEW address needs a fresh link; a spelling fix does not
+              // invalidate the one they are already holding.
+              resend: addressChanged,
+            })
           }}
         />
       )}

@@ -14,6 +14,7 @@
 import Stripe from 'stripe'
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 function isMockIntentId(id: string): boolean {
   return id.startsWith('pi_intake_mock_') || id.startsWith('pi_pool_mock_')
@@ -55,7 +56,7 @@ export async function refundBackgroundCheckPayment(backgroundCheckId: string): P
     return { refunded: false, reason: 'Stripe not configured' }
   }
 
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' })
   const refund = await stripe.refunds.create({ payment_intent: pi })
   await query(
     `UPDATE background_checks SET stripe_refund_id = $1, refunded_at = NOW() WHERE id = $2`,

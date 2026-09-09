@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { appendEvent } from './creditLedger'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 // ============================================================
 // Early-termination service.
@@ -256,7 +257,7 @@ async function chargeAndTerminate(
   if (!req) return { charged: false, reason: 'Request not found' }
 
   const Stripe = (await import('stripe')).default
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' as any })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' as any })
 
   let paymentMethodId: string | null = null
   try {

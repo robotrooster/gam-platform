@@ -23,13 +23,18 @@ import path from 'path'
 import fs from 'fs'
 import Stripe from 'stripe'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
 // credentials) the helpers fall back to mock IDs so the dev server still
 // boots — verifyPaymentIntent then accepts the mock prefix in non-production.
-const stripeForBgc: Stripe | null = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+// S639: stripeSecretKeyOrNull refuses a LIVE key under vitest. This module is
+// why the guard exists — six test files exercise the intake path without
+// mocking Stripe, and each one minted real PaymentIntents on the live account.
+const _bgcKey = stripeSecretKeyOrNull()
+const stripeForBgc: Stripe | null = _bgcKey
+  ? new Stripe(_bgcKey, { apiVersion: '2023-10-16' })
   : null
 const STRIPE_LIVE = !!stripeForBgc
 

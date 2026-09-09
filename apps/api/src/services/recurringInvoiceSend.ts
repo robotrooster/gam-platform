@@ -22,6 +22,7 @@
 import Stripe from 'stripe'
 import { db, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 export type RecurringSendResult = 'auto_paid' | 'email_sent' | 'no_email'
 
@@ -178,7 +179,7 @@ interface OffSessionArgs {
 }
 
 async function tryOffSessionCharge(args: OffSessionArgs): Promise<boolean> {
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' })
+  const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' })
   try {
     const pi = await stripe.paymentIntents.create({
       amount:         args.amountCents,

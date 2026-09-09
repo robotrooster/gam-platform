@@ -3,6 +3,7 @@ import Stripe from 'stripe'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
+import { stripeSecretKeyOrNull } from '../lib/stripe'
 
 // S94: Stripe Terminal card-present POS flow. Five steps end-to-end:
 //
@@ -22,7 +23,7 @@ import { AppError } from '../middleware/errorHandler'
 export const terminalRouter = Router()
 terminalRouter.use(requireAuth)
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' })
+const stripe = new Stripe(stripeSecretKeyOrNull()!, { apiVersion: '2023-10-16' })
 
 // POST /api/terminal/connection-token
 terminalRouter.post('/connection-token', requirePerm('pos.ring_sale'), async (req, res, next) => {

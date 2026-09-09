@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict cpaFpeDRa9gjRRnd3zjgp89Eu0Cegw5myNIxVIsTV9BBMqrhiJ6JzcavyRvUs2j
+\restrict WqUL65gby66v634rhtWWzPyFcjYiKCW9SFSpWdzO3qcgSxweTwaChoDg8jANfTc
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -478,6 +478,42 @@ $$;
 
 
 --
+-- Name: normalize_person_name(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.normalize_person_name(raw text) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE
+    AS $_$
+DECLARE
+  s text;
+  word text;
+  out_words text[] := '{}';
+BEGIN
+  s := btrim(regexp_replace(COALESCE(raw, ''), '\s+', ' ', 'g'));
+  IF s = '' THEN RETURN s; END IF;
+  -- Mixed case is deliberate. Leave it untouched.
+  IF s ~ '[a-z]' AND s ~ '[A-Z]' THEN RETURN s; END IF;
+  FOREACH word IN ARRAY string_to_array(s, ' ') LOOP
+    IF word ~ '^[A-Z]{1,3}$' THEN
+      out_words := out_words || word;            -- initials: JJ, TJ
+    ELSE
+      out_words := out_words || regexp_replace(
+        lower(word), '(^|[-''’])([a-z])', '\1\2', 'g');
+      -- upper-case the first letter and any letter after - or '
+      out_words[array_length(out_words, 1)] := (
+        SELECT string_agg(
+          CASE WHEN i = 1 OR substr(lower(word), i - 1, 1) IN ('-', '''', '’')
+               THEN upper(substr(lower(word), i, 1))
+               ELSE substr(lower(word), i, 1) END, '' ORDER BY i)
+        FROM generate_series(1, length(word)) AS i);
+    END IF;
+  END LOOP;
+  RETURN array_to_string(out_words, ' ');
+END;
+$_$;
+
+
+--
 -- Name: occupy_unit_on_active_lease(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -626,6 +662,21 @@ BEGIN
     RAISE EXCEPTION 'Unit % is marked owner-occupied and cannot hold a lease. Change its status first.', NEW.unit_id
       USING ERRCODE = 'check_violation';
   END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: stamp_normalized_user_name(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stamp_normalized_user_name() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  NEW.first_name := normalize_person_name(NEW.first_name);
+  NEW.last_name  := normalize_person_name(NEW.last_name);
   RETURN NEW;
 END;
 $$;
@@ -19391,6 +19442,13 @@ CREATE TRIGGER trg_mobile_homes_updated_at BEFORE UPDATE ON public.mobile_homes 
 
 
 --
+-- Name: users trg_normalize_user_name; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_normalize_user_name BEFORE INSERT OR UPDATE OF first_name, last_name ON public.users FOR EACH ROW EXECUTE FUNCTION public.stamp_normalized_user_name();
+
+
+--
 -- Name: notification_preferences trg_notification_preferences_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25603,5 +25661,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict cpaFpeDRa9gjRRnd3zjgp89Eu0Cegw5myNIxVIsTV9BBMqrhiJ6JzcavyRvUs2j
+\unrestrict WqUL65gby66v634rhtWWzPyFcjYiKCW9SFSpWdzO3qcgSxweTwaChoDg8jANfTc
 
