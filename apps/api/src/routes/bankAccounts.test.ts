@@ -200,12 +200,28 @@ describe('POST /api/bank-accounts', () => {
     expect(res.status).toBe(400)
   })
 
-  it('nickname required → 400', async () => {
+  // S637 (Nic): the nickname is OPTIONAL and derived when blank. It was a
+  // required field with no asterisk and no error text, so Dusty Rhoades — adding
+  // the Wells Fargo account that Mountain View's rent pays into — clicked "Add
+  // account" and the form silently did nothing. Nic: "He's old school, and he
+  // may not have named the account."
+  it('blank nickname is accepted and derived from the account', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
       .send({ ...happyPayload(), nickname: '' })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(201)
+    expect(res.body.data.nickname).toMatch(/^(Checking|Savings) ••\d{4}$/)
+  })
+
+  it('an omitted nickname is accepted too', async () => {
+    const f = await seed()
+    const { nickname, ...rest } = happyPayload() as any
+    const res = await request(buildApp()).post('/api/bank-accounts')
+      .set('Authorization', `Bearer ${f.userATok}`)
+      .send(rest)
+    expect(res.status).toBe(201)
+    expect(res.body.data.nickname).toBeTruthy()
   })
 
   it('invalid accountType enum → 400', async () => {

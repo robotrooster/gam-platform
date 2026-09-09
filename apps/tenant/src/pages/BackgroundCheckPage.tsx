@@ -145,7 +145,20 @@ export function BackgroundCheckPage() {
         firstName:form.firstName, lastName:form.lastName,
         zip: isSpeculative ? form.zip : null,
         consentPool:form.consentPool,
-        landlordId:(me as any)?.landlordId||null,
+        // ── S637 (Nic): THE QR'S LANDLORD HAS TO SURVIVE TO THE SUBMIT ──
+        //
+        // "I thought the check was linked to the QR code locked to the
+        //  property. That should be locked to us."
+        //
+        // It is — in two of the three places that needed it. The price lookup
+        // and the payment intent both fall back to the landlordId in the URL,
+        // which is why Anastacio Erreguin's $44.99 charge carried Mountain View
+        // in its metadata. This line did not, so a walk-up with no account
+        // linkage submitted with landlordId null, the server read that as a
+        // SPECULATIVE renter-pool intake, and his screening filed itself under
+        // the GAM shell landlord instead of the park he was standing in. Nic
+        // saw no notification because it was never his check.
+        landlordId:(me as any)?.landlordId||new URLSearchParams(window.location.search).get('landlordId')||null,
         unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null,
         // S636: carried in by the property's QR code, so a walk-up's check
         // binds to the park they scanned at.

@@ -668,6 +668,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
   // active lease and cannot exist until they sign — by which point the first
   // invoice is already written, and already chargeable.
   const [isWorkTrade, setIsWorkTrade] = useState(false)
+  const [wtTracksHours, setWtTracksHours] = useState(true)   // S637: parent switch
   const [wtHours, setWtHours] = useState('')
   const [wtDuties, setWtDuties] = useState('')
 
@@ -680,6 +681,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
       existingResident: !!unitId && windowOpen && attestExisting,
       // Work trade is per unit — it trades labour for THAT tenancy's rent.
       isWorkTrade: !!unitId && isWorkTrade,
+      workTradeTracksHours: isWorkTrade ? wtTracksHours : undefined,
       workTradeHoursTarget: isWorkTrade && wtHours ? Number(wtHours) : undefined,
       workTradeDuties: isWorkTrade ? (wtDuties.trim() || undefined) : undefined,
     }),
@@ -854,13 +856,31 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
               </label>
               {isWorkTrade && (
                 <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                  {/* S637 (Nic): the parent switch, above the hours it governs.
+                      Off is for someone the landlord trusts to get the work done
+                      without counting it. */}
+                  <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={wtTracksHours}
+                      onChange={e => setWtTracksHours(e.target.checked)}
+                      style={{ marginTop: 3, flexShrink: 0 }} />
+                    <div>
+                      <div style={{ fontSize: '.78rem', color: 'var(--text-0)' }}>Track hours</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+                        {wtTracksHours
+                          ? 'They log hours and you approve them each month.'
+                          : 'Trusted — covered charges clear every month with no hours logged.'}
+                      </div>
+                    </div>
+                  </label>
                   <div>
                     <label style={{ fontSize: '.72rem', color: 'var(--text-2)', display: 'block', marginBottom: 3 }}>
                       Hours per month
                     </label>
                     <input className="form-input" type="number" min={1} max={400}
                       style={{ maxWidth: 140 }} placeholder="property default"
-                      value={wtHours} onChange={e => setWtHours(e.target.value)} />
+                      disabled={!wtTracksHours}
+                      value={wtTracksHours ? wtHours : ''}
+                      onChange={e => setWtHours(e.target.value)} />
                   </div>
                   <div>
                     <label style={{ fontSize: '.72rem', color: 'var(--text-2)', display: 'block', marginBottom: 3 }}>

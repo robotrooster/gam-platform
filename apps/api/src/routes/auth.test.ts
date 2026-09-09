@@ -626,3 +626,37 @@ describe('POST /api/auth/register-prospect', () => {
     expect(otps.length).toBeGreaterThanOrEqual(1)
   })
 })
+
+// ─── S637: a sign-in code must not be readable in the email log ──────────────
+//
+// email_send_log is PERMANENT by design — triggers refuse UPDATE and DELETE so
+// an outreach record cannot be rewritten after the fact. Putting the code in the
+// subject therefore wrote 183 live second factors into a table any admin can
+// read and every nightly backup carries. A second factor that anyone with
+// database access can read is not a second factor.
+describe('S637 login codes stay out of the permanent log', () => {
+  it('logs the send without logging the code', async () => {
+    const { emailLoginCode } = await import('../services/email')
+    await emailLoginCode('code-check@test.dev', '424242', 10, { userId: undefined })
+
+    const { rows } = await db.query<{ subject: string; body_text: string | null }>(
+      `SELECT subject, body_text FROM email_send_log
+        WHERE to_email = 'code-check@test.dev' ORDER BY created_at DESC LIMIT 1`)
+    expect(rows).toHaveLength(1)
+    // The send is still recorded — we know a code went out, and when.
+    expect(rows[0].subject).toMatch(/sign-in code/i)
+    // But the code itself is nowhere in the row.
+    expect(rows[0].subject).not.toMatch(/424242/)
+    expect(rows[0].body_text ?? '').not.toMatch(/424242/)
+  })
+
+  it('no six-digit code sits in any logged subject', async () => {
+    const { emailLoginCode } = await import('../services/email')
+    await emailLoginCode('code-check2@test.dev', '987654', 10, { userId: undefined })
+    const { rows } = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM email_send_log
+        WHERE category = 'login_2fa_code' AND subject ~ '[0-9]{6}'
+          AND created_at > NOW() - INTERVAL '1 minute'`)
+    expect(Number(rows[0].n)).toBe(0)
+  })
+})

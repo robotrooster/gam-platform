@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { hourRateFor } from '../services/workTradeSettlement'
 import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 
@@ -525,8 +526,13 @@ export async function generateMoveInInvoice(
       const basis = (rentSuspended ? rentForMoveIn : 0) + wtUtilityBasis
       if (basis > 0) {
         const monthStart = invoiceDueDate.slice(0, 8) + '01'
+        // S637: tracks_hours is the parent switch. A trusted agreement reports
+        // an effective target of 0 — nothing is asked, and settlement credits
+        // the whole basis.
         const wtRow = await client.query<{ monthly_hours_target: string | null }>(
-          `SELECT monthly_hours_target FROM work_trade_agreements WHERE id = $1`,
+          `SELECT CASE WHEN tracks_hours THEN monthly_hours_target ELSE 0 END
+                    AS monthly_hours_target
+             FROM work_trade_agreements WHERE id = $1`,
           [wtAgreement.id])
         const fullTarget = Number(wtRow.rows[0]?.monthly_hours_target ?? 0)
         // Prorate the hours by how much of the month the rent covers: a half
@@ -535,15 +541,17 @@ export async function generateMoveInInvoice(
         const target = fullTarget > 0 && fullMonthRent > 0 && rentForMoveIn > 0
           ? Math.round((fullTarget * (rentForMoveIn / fullMonthRent)) * 100) / 100
           : fullTarget
-        if (target > 0) {
-          await client.query(
-            `INSERT INTO work_trade_settlements
-               (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount)
-             VALUES ($1, $2, $3::date, $4, $5, $6)
-             ON CONFLICT (agreement_id, period_month) DO NOTHING`,
-            [wtAgreement.id, invoiceId, monthStart, target.toFixed(2),
-             (basis / target).toFixed(4), basis.toFixed(2)])
-        }
+        // S637: a ZERO-hour agreement still opens a period. It has nothing to
+        // settle, but the period is what carries the credit onto the invoice —
+        // skipping it would leave the move-in charges suspended forever with
+        // nothing to release them.
+        await client.query(
+          `INSERT INTO work_trade_settlements
+             (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount)
+           VALUES ($1, $2, $3::date, $4, $5, $6)
+           ON CONFLICT (agreement_id, period_month) DO NOTHING`,
+          [wtAgreement.id, invoiceId, monthStart, target.toFixed(2),
+           hourRateFor(basis, target).toFixed(4), basis.toFixed(2)])
       }
     }
 

@@ -144,6 +144,17 @@ export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope
         -- leaving the tenant paying rent in full and the other landlord unpaid.
         -- That is the two-operator partial Nic ruled out as unallocatable.
         AND ${scopeSql}
+        -- ── S637 (Nic): WORK-TRADE SUSPENDED ROWS ARE NOT OWED ──────────────
+        --
+        --   "Work trade is still showing people they owe a full balance."
+        --
+        -- A suspended row is a charge somebody's labour is paying — it settles
+        -- at month close against approved hours, not in cash. Four other places
+        -- already know this (the settlement job, the move-in bundle, the manual
+        -- settle, utility billing) and skip them. This one did not, so a
+        -- work-trade tenant was shown the gross bill and asked to pay it: Tyler
+        -- Rhoades' whole $687.57 at Oak Park RV 03, every dollar of it covered.
+        AND p.work_trade_suspended_at IS NULL
         AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
              OR p.status = 'failed')
       ORDER BY p.due_date ASC, p.created_at ASC`,

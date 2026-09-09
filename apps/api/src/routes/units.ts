@@ -1902,6 +1902,13 @@ unitsRouter.get('/schedule/master', requirePerm(
     const { from, to, unitType } = req.query
     const fromDate = from || new Date().toISOString().split('T')[0]
     const toDate = to || new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]
+    // S639 (Nic): "Master schedule needs to be scoped to a property, not having
+    // all the different properties on one schedule." Unit numbers repeat across
+    // parks, so a merged timeline shows several rows labelled the same spot —
+    // unreadable, and a way to book the wrong one. Filtered here rather than in
+    // the browser so a fifteen-park account is not shipped every unit it owns.
+    const oneProperty = typeof req.query.propertyId === 'string' && req.query.propertyId
+      ? z.string().uuid().parse(req.query.propertyId) : null
 
     // S400 fix: same class as GET / above. For team-role callers (PM /
     // maintenance_worker / onsite_manager) req.user.profileId is the user_id,
@@ -1926,9 +1933,11 @@ unitsRouter.get('/schedule/master', requirePerm(
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE u.landlord_id = ANY($1::uuid[])
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
-        ${unitType ? "AND u.unit_type=$3" : ""}
+        AND ($3::uuid IS NULL OR u.property_id = $3)
+        ${unitType ? "AND u.unit_type=$4" : ""}
       ORDER BY u.unit_type, p.name, u.unit_number`,
-      unitType ? [callerLandlordIds, scopedIds, unitType] : [callerLandlordIds, scopedIds])
+      unitType ? [callerLandlordIds, scopedIds, oneProperty, unitType]
+               : [callerLandlordIds, scopedIds, oneProperty])
 
     // Get all bookings in range. S200: include the property's
     // requires_booking_acknowledgment flag so the schedule tile can
@@ -1943,7 +1952,8 @@ unitsRouter.get('/schedule/master', requirePerm(
       WHERE b.landlord_id = ANY($1::uuid[]) AND b.status NOT IN ('cancelled')
         AND b.check_out >= $2 AND b.check_in <= $3
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
-      ORDER BY b.check_in`, [callerLandlordIds, fromDate, toDate, scopedIds])
+        AND ($5::uuid IS NULL OR u.property_id = $5)
+      ORDER BY b.check_in`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
     // Get active leases in range
     const leases = await query<any>(`
@@ -1967,7 +1977,8 @@ unitsRouter.get('/schedule/master', requirePerm(
         -- them — "conflict on an empty spot" reports).
         AND (l.end_date IS NULL OR l.end_date >= $2) AND l.start_date <= $3
         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
-      ORDER BY l.start_date`, [callerLandlordIds, fromDate, toDate, scopedIds])
+        AND ($5::uuid IS NULL OR u.property_id = $5)
+      ORDER BY l.start_date`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }

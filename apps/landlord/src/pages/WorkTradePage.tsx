@@ -92,8 +92,11 @@ export function WorkTradePage() {
                   <td style={{ fontWeight: 500, color: a.leaseId ? 'var(--gold)' : undefined }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{a.unitNumber || '—'}</td>
                   <td>{a.propertyName || '—'}</td>
-                  <td className="mono">{Number(a.hoursThisMonth || 0).toFixed(1)} / {a.target} hrs</td>
-                  <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)} /></td>
+                  <td className="mono">{a.tracksHours === false
+                    ? <span style={{ color:'var(--text-3)' }}>Trusted — no hours</span>
+                    : `${Number(a.hoursThisMonth || 0).toFixed(1)} / ${a.target} hrs`}</td>
+                  <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)}
+                    tracksHours={a.tracksHours !== false} /></td>
                   <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} /></td>
                   <td onClick={e => e.stopPropagation()}><AgreementCoversCell agreement={a} /></td>
                   <td className="mono">{Number(a.pendingCount) > 0
@@ -278,21 +281,33 @@ function AgreementCoversCell({ agreement }: { agreement: any }) {
 }
 
 // W-56: per-person monthly hours target, edited inline on the roster row.
-function AgreementTargetCell({ agreementId, target }: { agreementId: string; target: number }) {
+// S637: the target sits UNDER a parent switch — when the agreement doesn't track
+// hours the box is disabled rather than hidden, so the stored figure stays
+// visible and comes straight back if tracking is switched on again.
+function AgreementTargetCell(
+  { agreementId, target, tracksHours }:
+  { agreementId: string; target: number; tracksHours: boolean },
+) {
   const qc = useQueryClient()
   const [value, setValue] = useState<string | null>(null)
   const shown = value ?? String(target)
+  const done = { onSuccess: () => { qc.invalidateQueries('work-trade'); setValue(null) } }
   const save = useMutation(
-    (t: number) => apiPatch(`/work-trade/${agreementId}`, { monthlyHoursTarget: t }),
-    { onSuccess: () => { qc.invalidateQueries('work-trade'); setValue(null) } }
-  )
+    (t: number) => apiPatch(`/work-trade/${agreementId}`, { monthlyHoursTarget: t }), done)
+  const toggle = useMutation(
+    (on: boolean) => apiPatch(`/work-trade/${agreementId}`, { tracksHours: on }), done)
   const dirty = value != null && Number(value) !== target && Number(value) > 0
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <input type="number" min={1} value={shown} onChange={e => setValue(e.target.value)}
-        style={{ width: 64, padding: '4px 6px', textAlign: 'right' }} className="input" />
+      <input type="checkbox" checked={tracksHours} disabled={toggle.isLoading}
+        onChange={e => toggle.mutate(e.target.checked)}
+        title={tracksHours ? 'Tracking hours — uncheck for a trusted trade' : 'Trusted — no hours logged'} />
+      <input type="number" min={1} value={shown} disabled={!tracksHours}
+        onChange={e => setValue(e.target.value)}
+        style={{ width: 64, padding: '4px 6px', textAlign: 'right', opacity: tracksHours ? 1 : .4 }}
+        className="input" />
       <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>hrs</span>
-      {dirty && (
+      {dirty && tracksHours && (
         <button className="btn btn-primary btn-sm" disabled={save.isLoading}
           onClick={() => save.mutate(Number(shown))}>
           {save.isLoading ? '…' : 'Save'}
@@ -367,6 +382,7 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient()
   const [leaseKey, setLeaseKey] = useState('')
   const [hours, setHours] = useState('')
+  const [tracksHours, setTracksHours] = useState(true)   // S637: parent switch
   const [duties, setDuties] = useState('')
   const [startDate, setStartDate] = useState(new Date().toISOString().slice(0, 10))
   const [covers, setCovers] = useState<string[]>([])
@@ -396,6 +412,7 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
       tenantId: picked!.tenantId,
       startDate,
       duties: duties.trim() || undefined,
+      tracksHours,
       monthlyHoursTarget: hours.trim() ? Number(hours) : undefined,
       // Omitted = covers everything, which is what every agreement before S613 did.
       coveredCharges: covers.length ? covers : undefined,
@@ -433,6 +450,23 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
+        {/* S637 (Nic): the parent switch. "Do we track hours for this work trade?
+            If yes, then set the hours. If no, no hours." Off is for someone the
+            landlord trusts to get the work done without counting — their covered
+            charges clear every month with nothing to log or approve. */}
+        <label style={{ display:'flex', alignItems:'flex-start', gap:8, marginBottom:12, fontSize:'.8rem' }}>
+          <input type="checkbox" checked={tracksHours}
+            onChange={e => setTracksHours(e.target.checked)} style={{ marginTop:2 }} />
+          <span>
+            Track hours for this agreement
+            <span style={{ display:'block', color:'var(--text-3)', fontSize:'.72rem' }}>
+              {tracksHours
+                ? 'They log hours and you approve them each month.'
+                : 'Trusted — covered charges clear every month with no hours logged.'}
+            </span>
+          </span>
+        </label>
+
         <div style={{ display:'flex', gap:12, marginBottom:12 }}>
           <div style={{ flex:1 }}>
             <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Start date</label>
@@ -440,8 +474,10 @@ function NewAgreementModal({ onClose }: { onClose: () => void }) {
           </div>
           <div style={{ flex:1 }}>
             <label style={{ fontSize:'.72rem', color:'var(--text-3)', display:'block', marginBottom:4 }}>Monthly hours target</label>
-            <input className="input" inputMode="numeric" placeholder="property default" value={hours}
-              onChange={e => setHours(e.target.value.replace(/[^0-9]/g, ''))} style={{ width:'100%' }} />
+            <input className="input" inputMode="numeric" placeholder="property default"
+              value={hours} disabled={!tracksHours}
+              onChange={e => setHours(e.target.value.replace(/[^0-9]/g, ''))}
+              style={{ width:'100%', opacity: tracksHours ? 1 : .4 }} />
           </div>
         </div>
 

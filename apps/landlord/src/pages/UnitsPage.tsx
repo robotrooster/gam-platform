@@ -5,7 +5,7 @@ import { useNavigate, Link, useSearchParams, useLocation } from 'react-router-do
 import { humanize, UNIT_STATUS_LABEL, type UnitStatus } from '@gam/shared'
 import { apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { PropertySelect } from '../components/ListControls'
+import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { Search, AlertTriangle, Shield, DoorOpen, Pencil, Trash2, Archive } from 'lucide-react'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -39,7 +39,12 @@ export function UnitsPage() {
   // into a specific property, and then click into units." Onboarding a park is
   // one unit after another, so the invite flow returns here with the property
   // already selected.
-  const [propertyId, setPropertyId] = useState(() => params.get('property') ?? '')
+  // S639 (Nic, DIRECTIVE): "There should never be a way to look up a specific
+  // unit unless you are inside the window to that property. I don't wanna be
+  // looking up all the freaking mobile home number fives between all fifteen of
+  // my properties." MH 5 exists at every park — a portfolio-wide unit list is
+  // how you act on the wrong space. The park is chosen first and remembered,
+  // and everything below (search, status chips, counts) lives inside it.
   // S605: retired units are excluded by the API unless asked for, so the working
   // list stays the live units. Turning this on shows the history alongside.
   const [showRetired, setShowRetired] = useState(false)
@@ -53,6 +58,11 @@ export function UnitsPage() {
   const { can } = usePerms()
 
   const propertyOptions = units.map((u: any) => ({ id: u.propertyId, name: u.propertyName }))
+  const [propertyId, setPropertyId] = usePropertyScope(
+    'gam.scope.property', propertyOptions, params.get('property'))
+  const scoped = units.filter((u: any) => u.propertyId === propertyId)
+  const propertyName = scoped[0]?.propertyName
+    || propertyOptions.find((p: any) => p.id === propertyId)?.name || ''
 
   const setStatusMut = useMutation(
     ({ id, status }: { id: string; status: string }) => apiPatch(`/units/${id}/status`, { status }),
@@ -111,24 +121,27 @@ export function UnitsPage() {
     }
   }
 
-  const filtered = units.filter((u: any) => {
+  // Search runs INSIDE the chosen park only — searching a unit number across
+  // parks is the exact thing this page no longer does. Property name is out of
+  // the search fields for the same reason: the park is already decided.
+  const filtered = scoped.filter((u: any) => {
     const matchSearch = search === '' ||
       u.unitNumber.toLowerCase().includes(search.toLowerCase()) ||
-      u.propertyName?.toLowerCase().includes(search.toLowerCase()) ||
       `${u.tenantFirst} ${u.tenantLast}`.toLowerCase().includes(search.toLowerCase())
     const matchFilter = filter === 'all' || u.status === filter
-    const matchProperty = propertyId === '' || u.propertyId === propertyId
-    return matchSearch && matchFilter && matchProperty
+    return matchSearch && matchFilter
   })
 
-  const evictionUnits = units.filter((u: any) => u.paymentBlock)
+  // The eviction banner stays scoped too — it drives action on a specific
+  // unit, so it must not name spaces in a park the user is not looking at.
+  const evictionUnits = scoped.filter((u: any) => u.paymentBlock)
 
   return (
     <div>
       <div className="page-header">
         <div>
-          <h1 className="page-title">Units</h1>
-          <p className="page-subtitle" style={{ display:"flex", alignItems:"center", gap:6 }}>{units.length} total units · <Link to="/properties" style={{ fontSize:'.72rem', color:'var(--gold)', fontWeight:600 }}>+ Add Units Here</Link> · {units.filter((u: any) => u.status === 'active').length} active</p>
+          <h1 className="page-title">Units{propertyName ? ` · ${propertyName}` : ''}</h1>
+          <p className="page-subtitle" style={{ display:"flex", alignItems:"center", gap:6 }}>{scoped.length} units · <Link to="/properties" style={{ fontSize:'.72rem', color:'var(--gold)', fontWeight:600 }}>+ Add Units Here</Link> · {scoped.filter((u: any) => u.status === 'active').length} active</p>
         </div>
       </div>
 
@@ -152,7 +165,7 @@ export function UnitsPage() {
           <Search className="search-icon" />
           <input className="search-input" placeholder="Search units, properties, tenants..." value={search} onChange={e => setSearch(e.target.value)} />
         </div>
-        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
+        <RequiredPropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
         {['all', 'active', 'vacant', 'delinquent', 'suspended'].map(s => (
           <button key={s} className={`btn btn-sm ${filter === s ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setFilter(s)}>
             {s === 'all' ? 'All' : humanize(s)}
@@ -167,6 +180,27 @@ export function UnitsPage() {
 
       {isLoading ? (
         <div className="card"><div style={{ color: 'var(--text-3)', textAlign: 'center', padding: 32 }}>Loading units...</div></div>
+      ) : !propertyId ? (
+        // No park chosen yet — offer the parks themselves, not a merged list.
+        <div className="card" style={{ padding: 0 }}>
+          <div style={{ padding: '16px 18px 6px', color: 'var(--text-2)', fontSize: '.85rem' }}>
+            Pick a property to work in. Unit numbers repeat across properties, so units are
+            only listed inside the property they belong to.
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, padding: 16 }}>
+            {Array.from(new Map(propertyOptions.filter((p: any) => p?.id)
+              .map((p: any) => [p.id, p])).values())
+              .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''))
+              .map((p: any) => (
+                <button key={p.id} className="btn btn-primary" onClick={() => setPropertyId(p.id)}>
+                  {p.name}
+                  <span style={{ opacity: .75, marginLeft: 8, fontWeight: 500 }}>
+                    {units.filter((u: any) => u.propertyId === p.id).length} units
+                  </span>
+                </button>
+              ))}
+          </div>
+        </div>
       ) : filtered.length === 0 ? (
         <div className="empty-state"><DoorOpen size={48} /><h3>No units found</h3><p>Add your first unit to get started.</p></div>
       ) : (

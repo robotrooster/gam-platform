@@ -31,9 +31,17 @@ describe('workTradeFraction', () => {
     expect(workTradeFraction(80, 80)).toBe(1)
     expect(workTradeFraction(160, 80)).toBe(1)
   })
-  it('zero hours or bad target → 0', () => {
+  it('no hours worked against a real target → 0', () => {
     expect(workTradeFraction(0, 80)).toBe(0)
-    expect(workTradeFraction(40, 0)).toBe(0)
+    expect(workTradeFraction(-5, 80)).toBe(0)
+  })
+
+  // S637: a target of 0 is how an agreement that does NOT track hours reaches
+  // the credit math. It asks for nothing, so the month is covered outright —
+  // reading it as "0% covered" would hand the tenant the full gross bill.
+  it('a target of zero is fully covered, not uncovered', () => {
+    expect(workTradeFraction(0, 0)).toBe(1)
+    expect(workTradeFraction(40, 0)).toBe(1)
   })
 })
 

@@ -78,7 +78,9 @@ export function WorkTradePage() {
   const logs = data.logs || []
   const stats = data.stats || {}
   const pending = logs.filter((l: any) => l.status === 'pending')
-  const target = Number(stats.target || 0)
+  // S637: the parent switch decides whether hours are asked for at all.
+  const tracksHours = agreement.tracksHours !== false
+  const target = tracksHours ? Number(stats.target || 0) : 0
   const hours = Number(stats.hoursApprovedThisMonth || 0)
   const creditPct = Number(stats.creditPct || 0)
   const progress = target > 0 ? Math.min(100, (hours / target) * 100) : 0
@@ -153,9 +155,16 @@ export function WorkTradePage() {
                 bill. Rent is paid forward, so the work that pays for a month now
                 happens DURING it: your invoice sits open and unchased while you
                 work, and settles at month end from that month's own hours. */}
-            Each approved hour covers <b>1/{target}</b> of your monthly bill (rent + utilities + fees).
-            Work the full <b>{target} hours</b> during the month and <b>that month</b> is
-            covered. Your bill stays open while you work it off — no late fees.
+            {/* S637: a zero-hour agreement asks for no hours at all. The
+                fraction copy below would read "1/0" and ask for "0 hours". */}
+            {target === 0 ? (
+              <>Your covered charges (rent + utilities + fees) are cleared each month
+              under this agreement. There are no hours to log and nothing to submit.</>
+            ) : (
+              <>Each approved hour covers <b>1/{target}</b> of your monthly bill (rent + utilities + fees).
+              Work the full <b>{target} hours</b> during the month and <b>that month</b> is
+              covered. Your bill stays open while you work it off — no late fees.</>
+            )}
           </div>
         </div>
 
@@ -167,7 +176,9 @@ export function WorkTradePage() {
         )}
       </div>
 
-      {/* This month progress */}
+      {/* This month progress — S637: meaningless at a zero-hour target, where
+          there is no bar to fill and nothing to be short of. */}
+      {target > 0 && (
       <div style={style.card}>
         <div style={{ fontSize: '.8rem', fontWeight: 700, color: '#eef1f8', marginBottom: 12 }}>This Month's Progress</div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.78rem', marginBottom: 6 }}>
@@ -182,11 +193,14 @@ export function WorkTradePage() {
           <span>{pending.length > 0 ? `${pending.length} pending approval` : (hoursLeft > 0 ? `${hoursLeft.toFixed(1)} hrs to full` : '✓ Fully covered')}</span>
         </div>
       </div>
+      )}
 
       {/* Log hours button */}
+      {target > 0 && (
       <button onClick={() => setShowLog(true)} style={{ width: '100%', padding: 13, borderRadius: 10, border: 'none', background: 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, fontSize: '.9rem', cursor: 'pointer', marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
         <Clock size={16} /> Log Hours
       </button>
+      )}
 
       {/* Log hours form */}
       {showLog && (

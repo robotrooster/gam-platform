@@ -283,6 +283,23 @@ function fitFontSize(text: string, boxW: number, boxH: number): number {
 const isDateSignedField = (f: any) =>
   f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
 
+// S637: canvas scale for a crisp page on a high-density screen. Past the
+// device's own pixel ratio we add zoom headroom, then clamp total canvas area —
+// mobile Safari silently returns a BLANK canvas past its size limit, which
+// would turn a blurry lease into a missing one.
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
+
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
@@ -431,15 +448,24 @@ export function SignPage() {
     const containerWidth = containerRef.current.clientWidth
     const vp = page.getViewport({ scale:1 })
     const scale = containerWidth / vp.width
+    // CSS scale stays exactly as it was — every signature/initial box on this
+    // page is positioned with it, so it must keep meaning "CSS pixels".
     scaleRef.current = scale
-    const sv = page.getViewport({ scale })
+    const cssVp = page.getViewport({ scale })
+    // S637 (Nic): "the lease is blurry when people zoom in on phone." The
+    // canvas was sized in CSS pixels, so a phone at devicePixelRatio 3 showed a
+    // third-resolution render of the document someone is about to SIGN. Only
+    // the backing store grows; the drawn size and the field overlay are
+    // unchanged.
+    const sv = page.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     canvas.width = sv.width
     canvas.height = sv.height
     canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     canvas.style.display = 'block'
     await page.render({ canvasContext:canvas.getContext('2d')!, viewport:sv }).promise
-    setPdfDims({ width:sv.width, height:sv.height })
+    setPdfDims({ width:cssVp.width, height:cssVp.height })
   }, [])
 
   const loadPdf = useCallback(async (url:string) => {
@@ -491,7 +517,7 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly } = data
+  const { signer, document:doc, fields, readOnly, waitingOn } = data
   const allFields = fields || []
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
@@ -521,7 +547,8 @@ export function SignPage() {
   // standalone view with the PDF + a status banner; no editable
   // fields, no Sign button, no draft persistence.
   if (readOnly) {
-    return <ReadOnlyView doc={doc} signer={signer} fields={allFields} onBack={()=>navigate('/')} />
+    return <ReadOnlyView doc={doc} signer={signer} fields={allFields}
+             waitingOn={waitingOn} onBack={()=>navigate('/')} />
   }
 
   const activeFields = allFields.filter(isFieldActive)
@@ -956,11 +983,13 @@ function DeclineModal({
 // — surfaced inline below the PDF for context, since not every viewer
 // has a PDF reader plugin available in-browser.
 function ReadOnlyView({
-  doc, signer, fields, onBack,
+  doc, signer, fields, waitingOn, onBack,
 }: {
   doc: any
   signer: any
   fields: any[]
+  /** S637: set when the document simply is not this signer's turn yet. */
+  waitingOn?: string | null
   onBack: () => void
 }) {
   const status = doc?.status as string
@@ -971,6 +1000,11 @@ function ReadOnlyView({
     status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Contact your landlord for details.' } :
     signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
     signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
+    // S637 (Nic): say plainly that it is not their turn. People were filling
+    // the whole document in before the landlord had signed, being refused at
+    // the end, and then telling him they had signed it.
+    waitingOn                      ? { tone:'gold',  label:`Waiting on ${waitingOn}`,
+                                       sub:'You can read the lease now. We\u2019ll email you the moment it\u2019s your turn to sign — there is nothing to do until then.' } :
                                      { tone:'muted', label:'Read-only',       sub:'' }
   const pdfUrl = doc?.executedPdfUrl || doc?.basePdfUrl
   const filledFields = (fields || []).filter((f:any) => f.value != null && String(f.value).trim() !== '')

@@ -63,9 +63,25 @@ const openBalance = async (leaseId: string) => Number((await db.query<{ t: strin
   `SELECT COALESCE(SUM(amount),0)::text AS t FROM payments
     WHERE lease_id = $1 AND status = 'pending'`, [leaseId])).rows[0].t)
 
-describe('issuing a credit clears the open balance now', () => {
-  it('zeroes out accrued late fees the moment it is posted', async () => {
-    // Nic's example: 4 days past grace — an initial fee plus a few daily ticks.
+// ─── S638 (Nic, DIRECTIVE) — REWRITTEN. A CREDIT SETTLES NOTHING. ───────────
+//
+//   "The credit doesn't settle individual items. It takes just the total down.
+//    It's not separatable. It's her rent, her trash, her water are line items
+//    that combine to one bill. That one total charge has the credit applied
+//    against it... The credit has to be applied and visible before they pay."
+//
+// Every test below used to assert the opposite: that posting a credit closed
+// open charges one at a time, oldest first. That is what happened to Kim
+// Harland — a $450 Move In Special was issued and instantly spent settling a
+// $10.45 water row, a $25 trash row and five $5 late fees. Her credit read
+// $389.55, her landlord saw settled charges no money had arrived for, and she
+// was still shown the full rent.
+//
+// S637 had already banned SPLITTING a charge. This goes further: a credit does
+// not touch a charge at all. It sits whole on the account and nets against the
+// one total wherever a balance is shown or paid.
+describe('S638 posting a credit changes no charge', () => {
+  it('leaves every open charge exactly as it was', async () => {
     const f = await seedLeaseWithCharges([25, 5, 5])
     expect(await openBalance(f.leaseId)).toBeCloseTo(35, 2)
 
@@ -73,83 +89,45 @@ describe('issuing a credit clears the open balance now', () => {
       .set('Authorization', `Bearer ${f.token}`)
       .send({ leaseId: f.leaseId, amount: 35, category: 'late_fee_refund', reason: 'waived' })
     expect(res.status).toBe(201)
-    expect(Number(res.body.data.appliedToBalance)).toBeCloseTo(35, 2)
 
-    // The books are square immediately — not next month.
-    expect(await openBalance(f.leaseId)).toBeCloseTo(0, 2)
+    // The charges stand. Nothing was settled, nothing was split, nothing was
+    // invented — the ledger still says what the resident was billed.
+    expect(await openBalance(f.leaseId)).toBeCloseTo(35, 2)
+    const { rows } = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments
+        WHERE lease_id = $1 AND status = 'settled'`, [f.leaseId])
+    expect(Number(rows[0].n)).toBe(0)
   })
 
-  // S637 (Nic, DIRECTIVE): "Credits do not fucking split charges. It's a credit
-  // against the overall ledger, not fucking settling partial payments. We don't
-  // do partial payments."
-  //
-  // This test used to assert the split — a $20 credit against a $50 charge left
-  // TWO payment rows, a $20 settled and a $30 remainder. That is a partial
-  // payment, banned platform-wide, and it also invented a settled payment no
-  // money arrived for.
-  it('S637: leaves a charge it cannot fully cover ALONE — no split, no remainder row', async () => {
-    const f = await seedLeaseWithCharges([50])
-    await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 20, category: 'goodwill' })
-
-    // The charge is untouched: still one row, still $50, still pending.
-    const rows = await db.query<{ status: string; amount: string; is_remainder: boolean }>(
-      `SELECT status, amount::text, is_remainder FROM payments WHERE lease_id=$1`, [f.leaseId])
-    expect(rows.rows).toHaveLength(1)
-    expect(rows.rows[0].status).toBe('pending')
-    expect(Number(rows.rows[0].amount)).toBeCloseTo(50, 2)
-    expect(rows.rows.some(r => r.is_remainder)).toBe(false)
-
-    // The $20 stays on the account as a balance the landlord owes back.
-    const credit = await db.query<{ remaining: string }>(
-      `SELECT amount_remaining::text AS remaining FROM tenant_credits WHERE lease_id=$1`, [f.leaseId])
-    expect(Number(credit.rows[0].remaining)).toBeCloseTo(20, 2)
-  })
-
-  // A credit that cannot clear the row in front of it must still clear one it
-  // can reach — `continue`, not `break`.
-  it('S637: skips past a charge too big for it and clears a smaller one behind', async () => {
-    const f = await seedLeaseWithCharges([500, 35])
-    await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 40, category: 'late_fee_refund' })
-
-    const rows = await db.query<{ status: string; amount: string }>(
-      `SELECT status, amount::text FROM payments WHERE lease_id=$1 ORDER BY amount::numeric`, [f.leaseId])
-    expect(rows.rows).toHaveLength(2)                    // still two, nothing split
-    expect(rows.rows[0].status).toBe('settled')          // the $35 cleared
-    expect(rows.rows[1].status).toBe('pending')          // the $500 untouched
-    expect(Number(rows.rows[1].amount)).toBeCloseTo(500, 2)
-  })
-
-  it('keeps the unused remainder on the credit for later', async () => {
-    const f = await seedLeaseWithCharges([10])
+  it('keeps the credit whole, at its full face value', async () => {
+    const f = await seedLeaseWithCharges([25, 5, 5])
     const res = await request(buildApp()).post('/api/tenant-credits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 100, category: 'overcharge' })
-    expect(Number(res.body.data.appliedToBalance)).toBeCloseTo(10, 2)
-    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining)).toBeCloseTo(90, 2)
-    expect(await openBalance(f.leaseId)).toBeCloseTo(0, 2)
+      .send({ leaseId: f.leaseId, amount: 35, category: 'goodwill' })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
+      .toBeCloseTo(35, 2)
   })
 
-  it('does nothing when there is no open balance, and banks the whole credit', async () => {
+  // A credit bigger than the bill is not change — the rest stays on account.
+  it('a credit larger than the balance stays whole too', async () => {
+    const f = await seedLeaseWithCharges([50])
+    const res = await request(buildApp()).post('/api/tenant-credits')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ leaseId: f.leaseId, amount: 500, category: 'goodwill' })
+    expect(res.status).toBe(201)
+    expect(await openBalance(f.leaseId)).toBeCloseTo(50, 2)
+    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
+      .toBeCloseTo(500, 2)
+  })
+
+  it('posts fine against a lease with nothing open', async () => {
     const f = await seedLeaseWithCharges([])
     const res = await request(buildApp()).post('/api/tenant-credits')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 40, category: 'goodwill' })
-    expect(Number(res.body.data.appliedToBalance)).toBe(0)
-    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining)).toBeCloseTo(40, 2)
-  })
-
-  it('pays the oldest charge first', async () => {
-    const f = await seedLeaseWithCharges([25, 5])
-    await request(buildApp()).post('/api/tenant-credits')
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ leaseId: f.leaseId, amount: 25, category: 'late_fee_refund' })
-    const still = await db.query<{ amount: string }>(
-      `SELECT amount::text FROM payments WHERE lease_id=$1 AND status='pending'`, [f.leaseId])
-    expect(still.rows).toHaveLength(1)
-    expect(Number(still.rows[0].amount)).toBeCloseTo(5, 2)   // the $25 went first
+      .send({ leaseId: f.leaseId, amount: 100, category: 'goodwill' })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.amountRemaining ?? res.body.data.amount_remaining))
+      .toBeCloseTo(100, 2)
   })
 })

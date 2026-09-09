@@ -1468,12 +1468,17 @@ utilityRouter.post('/meters/:id/reads', requirePerm('properties.edit', 'utility.
       [meter.id, body.readingValue, req.user!.userId, body.reason, body.reasonNote ?? null])
 
     let billed = false
+    let billingNote: string | undefined
     if (body.reason === 'move_out_final') {
       const r = await billMoveOutRead(meter.id, reading.id)
       billed = r.billed
+      // S639: say WHY it did not bill. Rollover refusals, an unattached meter
+      // and an already-billed cycle all looked identical (a bare false) to the
+      // person standing at the meter.
+      if (!billed) billingNote = r.reason
     }
-    // Blind response — id + reason + whether it billed, never the values.
-    res.status(201).json({ success: true, data: { id: reading.id, reason: body.reason, billed } })
+    // Blind response — id + reason + whether it billed (and why not), never the values.
+    res.status(201).json({ success: true, data: { id: reading.id, reason: body.reason, billed, billingNote } })
   } catch (e) { next(e) }
 })
 

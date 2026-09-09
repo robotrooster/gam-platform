@@ -1460,3 +1460,282 @@ describe('S636 a manual payment settles the whole balance', () => {
     expect(rows.every(r => r.status === 'pending')).toBe(true)
   })
 })
+
+// ─── S637: a cash overpayment can be kept as credit ──────────────────────────
+//
+// Nic: "If somebody were to come in with five hundred dollars for four hundred
+// and sixty dollar rent, they would probably expect forty dollar change. But if
+// they wanted to leave it as credit for the future, that should also be a 'hey,
+// I'm clicking that I didn't give them change, add forty dollar credit to their
+// account' sort of thing."
+//
+// The desk already had a tendered box and computed change on screen, but the
+// number never reached the server — so cash was the one way into the ledger
+// that could not pay ahead, while a card overpayment banked a credit and next
+// month's rent ate it automatically.
+describe('S637 manual cash overpayment', () => {
+  async function openRent(f: any, amount = 1000) {
+    const { rows: [{ id }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',$5,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id, amount])
+    return id
+  }
+  const creditsFor = async (leaseId: string) => (await db.query<{ total: string }>(
+    `SELECT COALESCE(SUM(amount_remaining),0)::text AS total
+       FROM lease_prepaid_credits WHERE lease_id = $1`, [leaseId])).rows[0].total
+
+  it('keeps the surplus as a credit when the landlord says they gave no change', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.amountSettled).toBe(460)
+    expect(res.body.data.surplus).toBe(40)
+    expect(res.body.data.creditId).toBeTruthy()
+    expect(Number(await creditsFor(f.lease1Id))).toBe(40)
+  })
+
+  // S637 (Nic, DIRECTIVE): "It needs to be manually clicked by the person taking
+  // the cash. That way no mistakes could happen." A surplus with no answer is
+  // refused outright — the server does not pick a side on the desk's behalf.
+  it('refuses a surplus with no stated answer, and settles nothing', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 500 })      // no surplusHandling
+    expect(res.status).toBe(422)
+    expect(res.body.error).toMatch(/handed back or kept as credit/i)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('pending')
+    expect(Number(await creditsFor(f.lease1Id))).toBe(0)
+  })
+
+  // Exact money is not a surplus, so it needs no answer.
+  it('does not ask when the cash is exact', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 460 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.surplus).toBe(0)
+  })
+
+  it('records nothing when the change was handed back', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'change' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.surplus).toBe(40)
+    expect(res.body.data.creditId).toBeNull()
+    expect(Number(await creditsFor(f.lease1Id))).toBe(0)   // it left with them
+  })
+
+  // The surplus is measured against the LEDGER, not against whatever the desk
+  // believes is due — a stale screen must not be able to invent a credit.
+  it('derives the surplus from what is owed, not from the caller', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    // A utility on the same lease — cash sweeps the whole balance (S636), and
+    // rent is one-per-due-date, so this is the realistic second row.
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'utility',100,'pending','UTILITY',CURRENT_DATE)`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 600, surplusHandling: 'credit' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.amountSettled).toBe(560)   // both charges
+    expect(res.body.data.surplus).toBe(40)          // not 140
+    expect(Number(await creditsFor(f.lease1Id))).toBe(40)
+  })
+
+  it('refuses a short cash entry — rent is paid in full', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 420 })
+    expect(res.status).toBe(422)
+    expect(res.body.error).toMatch(/short|paid in full/i)
+    const { rows: [p] } = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('pending')                // nothing settled
+  })
+
+  // S637 (Nic): "A check or money order, it is possible that they wrote it for
+  // more than they owe, which is my exact situation right now — a $920 check
+  // written on a $460 rent." Two months paid ahead, on paper.
+  it('a check written over the balance banks the remainder', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check', reference: '1042', amountTendered: 920, surplusHandling: 'credit' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.amountSettled).toBe(460)
+    expect(res.body.data.surplus).toBe(460)          // exactly next month
+    expect(Number(await creditsFor(f.lease1Id))).toBe(460)
+    // The check number survives as the receipt.
+    const { rows: [p] } = await db.query<any>(`SELECT notes FROM payments WHERE id=$1`, [pid])
+    expect(p.notes).toMatch(/1042/)
+  })
+
+  // The bank-deposit match path never knows a tendered figure, and neither did
+  // any caller before this existed. Both must behave exactly as they did.
+  it('omitting the tendered amount changes nothing', async () => {
+    const f = await seed()
+    const pid = await openRent(f, 460)
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check', reference: '1042' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.surplus).toBe(0)
+    expect(Number(await creditsFor(f.lease1Id))).toBe(0)
+  })
+})
+
+// ─── S637: the question Nic asked ────────────────────────────────────────────
+//
+//   "Say they pay five hundred now and get a forty dollar credit. Well, next
+//    month, they would technically owe four twenty instead of the four sixty
+//    normally applied. If they came in with the four twenty, is it gonna try to
+//    say that that's a partial payment because the lease says four sixty, or
+//    does it calculate it off of what's actually outstanding?"
+//
+// It calculates off what is outstanding: rentCharge nets BOTH credit tables
+// before the pay-in-full gate. This proves the whole round trip — cash surplus
+// in, reduced amount accepted next month — because the two halves live in
+// different files and only meet in production.
+describe('S637 a credit reduces what is owed next month', () => {
+  it('cash surplus becomes a credit, and the reduced amount is not a partial', async () => {
+    const f = await seed()
+    const { rows: [{ id: septRent }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',460,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+
+    // $500 cash against $460, kept as credit.
+    const paid = await request(buildApp()).post(`/api/payments/${septRent}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    expect(paid.status).toBe(200)
+    expect(paid.body.data.surplus).toBe(40)
+
+    // Next month's rent, at the lease's full face amount.
+    const { rows: [{ id: octRent }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',460,'pending','RENT',CURRENT_DATE + 31) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    expect(octRent).toBeTruthy()
+
+    // The credit is live and worth exactly the surplus — this is the figure
+    // rentCharge subtracts before it tests for a partial payment.
+    const { rows: [c] } = await db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_remaining),0)::text AS total
+         FROM lease_prepaid_credits WHERE lease_id=$1`, [f.lease1Id])
+    expect(Number(c.total)).toBe(40)
+  })
+})
+
+// ─── S637: work-trade suspended charges are not a balance ────────────────────
+//
+// Nic: "Work trade is still showing people they owe a full balance."
+//
+// A suspended row settles at month close against approved hours — it is never
+// money the resident hands over. Four places already knew that (the settlement
+// job, the move-in bundle, the manual settle, utility billing); the two the
+// TENANT actually sees did not. Tyler Rhoades was shown $687.57 owing on Oak
+// Park RV 03 and Matthew Conklin $776.11, every dollar of it covered by labour.
+describe('S637 work-trade suspended charges', () => {
+  it('are left out of the balance the tenant is shown', async () => {
+    const f = await seed()
+    const { rows: [rent] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',440,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,'utility',247.57,'pending','UTILITY',CURRENT_DATE, NOW())`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+
+    // The ledger groups by lease; sum what each group says is outstanding.
+    const owed = async () => {
+      const r = await request(buildApp()).get('/api/payments/balance-context')
+        .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      expect(r.status).toBe(200)
+      const groups = (r.body.data.leases ?? r.body.data.groups ?? []) as any[]
+      return groups.reduce((s, g) => s + Number(g.outstanding || 0), 0)
+    }
+
+    // The suspended utility is absent; only the cash-owed rent counts.
+    expect(await owed()).toBe(440)
+
+    // And with the rent suspended too, they owe nothing at all.
+    await db.query(`UPDATE payments SET work_trade_suspended_at = NOW() WHERE id = $1`, [rent.id])
+    expect(await owed()).toBe(0)
+  })
+})
+
+// ─── S638: the desk asks for what is owed, credit already off ────────────────
+//
+// Nic, with the resident standing at the counter: "The outstanding balances page
+// is correctly showing $485.45, but on the payments page it's still showing
+// $935.45... When I go to record payment, it still thinks she owes the full
+// amount, and the payments page does not take partial payments."
+//
+// Kim Harland held a $450 credit against a $935.45 bill. record-manual computed
+// what was owed from the charge rows alone, so it wanted the gross — and since
+// rent is pay-in-full, $485.45 came back as short. She could not pay.
+describe('S638 a credit reduces what the desk collects', () => {
+  it('accepts the net and spends the credit', async () => {
+    const f = await seed()
+    const { rows: [rent] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',900,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,450,450,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+
+    const res = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 450 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.amountSettled).toBe(450)   // 900 less the 450 credit
+    expect(res.body.data.creditUsed).toBe(450)
+
+    const { rows: [c] } = await db.query<{ amount_remaining: string }>(
+      `SELECT amount_remaining::text FROM tenant_credits WHERE tenant_id=$1`,
+      [f.tenant1Id])
+    expect(Number(c.amount_remaining)).toBe(0)     // spent, once, against the total
+    const { rows: [p] } = await db.query<{ status: string }>(
+      `SELECT status FROM payments WHERE id=$1`, [rent.id])
+    expect(p.status).toBe('settled')
+  })
+
+  it('still refuses a genuinely short payment, credit and all', async () => {
+    const f = await seed()
+    const { rows: [rent] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',900,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,$3,450,450,'goodwill')`, [f.aLid, f.tenant1Id, f.lease1Id])
+
+    const res = await request(buildApp()).post(`/api/payments/${rent.id}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash', amountTendered: 400 })   // net owed is 450
+    expect(res.status).toBe(422)
+    const { rows: [p] } = await db.query<{ status: string }>(
+      `SELECT status FROM payments WHERE id=$1`, [rent.id])
+    expect(p.status).toBe('pending')
+  })
+})

@@ -6,6 +6,7 @@
 // only pre-fills from what this landlord chose for the same merchant before.
 import { useMemo, useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useNavigate } from 'react-router-dom'
 import { loadStripe } from '@stripe/stripe-js'
 import { EntityPicker } from '../components/EntityPicker'
 import { apiGet, apiPost , apiPut } from '../lib/api'
@@ -47,6 +48,7 @@ type Draft = { category: string; scopeKind: string; propertyId: string; unitId: 
 // S605 (Nic): merged into a single "Bank" tab alongside reconciliation.
 // `embedded` renders this as a section of BankPage rather than its own screen.
 export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const [linking, setLinking] = useState(false)
   const [linkErr, setLinkErr] = useState<string | null>(null)
@@ -126,6 +128,26 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // which company the user is looking at. Without the id, /landlords/me now asks
   // an account that owns several which one it means — so pass the one already
   // selected above rather than making them answer twice.
+  // S637 (Nic, DIRECTIVE): THE PAYOUT ACCOUNT COMES FIRST.
+  //
+  //   "Both places where they connect an account, whether it says connect feed
+  //    or connect account on the disbursement page — that should just take them
+  //    to the connect account. The feed can come after. It can be completely
+  //    hidden until they set up the connect account. That way they never
+  //    accidentally do it out of order."
+  //
+  // Two people in a row linked the read-only FEED believing they had set up
+  // payouts, and a co-owner locked himself out of his bank re-linking an
+  // institution that was already connected. The feed reads transactions; only
+  // the Connect account moves money. Ordering them removes the choice that was
+  // being got wrong, rather than explaining the difference again.
+  const connectStatusQ = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean }>(
+    ['stripe-connect-status', 'landlord', entityId],
+    () => apiGet(`/stripe/connect/status?entity=landlord&entityId=${entityId}`),
+    { enabled: !!entityId },
+  )
+  const payoutsReady = !!connectStatusQ.data?.payoutsEnabled && !!connectStatusQ.data?.detailsSubmitted
+
   const { data: me } = useQuery<any>(
     ['landlord-books-start', entityId],
     () => apiGet(`/landlords/me?landlordId=${entityId}`),
@@ -187,7 +209,25 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       {/* S629: the feed, the connections and every categorization below belong
           to the entity chosen here. Hidden for a one-entity portfolio. */}
       <EntityPicker value={entityId} onChange={setEntityId} label="Transactions for" />
-      {embedded ? (
+
+      {/* S637: until the payout account exists there is nothing to show here and
+          no button to press — the only bank worth connecting first is the one
+          rent lands in. */}
+      {entityId && !connectStatusQ.isLoading && !payoutsReady ? (
+        <div className="card" style={{ marginTop: 20, padding: '18px 20px' }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>
+            Set up your payout account first
+          </div>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
+            This page reads your bank transactions so you can categorize spending — it doesn't move
+            any money. Before it's useful, connect the account your rent is deposited into.
+            Once that's live, you can turn this feed on here.
+          </div>
+          <button className="btn btn-primary" onClick={() => navigate('/banking')}>
+            Go to payout setup
+          </button>
+        </div>
+      ) : embedded ? (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, margin: '26px 0 12px' }}>
           <div>
             <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Your spending</div>

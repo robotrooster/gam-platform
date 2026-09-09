@@ -603,6 +603,23 @@ function IntentCard({
                 Holding Unit {(intent as any).heldUnitNumber}{(intent as any).heldPropertyName ? ` — ${(intent as any).heldPropertyName}` : ''}
               </span>
             )}
+            {/* S638: which of these three states the person is in decides
+                whether anybody needs to phone them. */}
+            {(() => {
+              const st = (intent as any).inviteState
+              if (st === 'invited') return (
+                <span style={{ color: 'var(--gold)', fontWeight: 600 }}>
+                  Invite sent — waiting on them
+                </span>
+              )
+              if (st === 'accepted') return (
+                <span style={{ color: 'var(--green)' }}>Accepted — lease to come</span>
+              )
+              if (st === 'not_invited') return (
+                <span style={{ color: 'var(--red)', fontWeight: 600 }}>No invite sent yet</span>
+              )
+              return null
+            })()}
             <span style={{ color: 'var(--text-3)' }}>
               Added {new Date(intent.createdAt).toLocaleDateString()}
             </span>
@@ -701,6 +718,19 @@ export function PendingTenantsPage() {
 
   // List with stop-when-idle polling. refetchInterval returns false when no
   // row is parsing — react-query then idles until something else invalidates.
+  // ── S638 (Nic): FILTER THE POOL BY PROPERTY AND BY INVITE STATE ──────────
+  //
+  //   "The pending pool should be filterable by property that they're invited
+  //    to, because you're showing me a pool of sixty people where I have
+  //    different people at different properties to reach out to... they need to
+  //    know who to contact."
+  //
+  // Sixty names in one undifferentiated list is not a work queue. Whoever runs
+  // Oak Park should be able to see Oak Park's, and see at a glance which of
+  // them are actually waiting on the resident.
+  const [poolProperty, setPoolProperty] = useState<string>('all')
+  const [poolState, setPoolState] = useState<'all' | 'invited' | 'accepted' | 'not_invited'>('all')
+
   const { data: intents = [], isLoading, error } = useQuery<PendingIntent[]>(
     'pending-tenants',
     () => apiGet<PendingIntent[]>('/landlords/me/pending-tenants'),
@@ -788,6 +818,15 @@ export function PendingTenantsPage() {
     }
   }
 
+  const poolProperties = [...new Set(
+    (intents as any[]).map(i => i.propertyName).filter(Boolean))].sort()
+  const byProperty = poolProperty === 'all'
+    ? (intents as any[])
+    : (intents as any[]).filter(i => i.propertyName === poolProperty)
+  const shown = poolState === 'all'
+    ? byProperty
+    : byProperty.filter(i => i.inviteState === poolState)
+
   return (
     <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <button
@@ -809,8 +848,32 @@ export function PendingTenantsPage() {
           </p>
         </div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
-          {intents.length} pending
+          {shown.length}{shown.length !== intents.length ? ` of ${intents.length}` : ''} pending
         </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+        <select className="input" value={poolProperty} onChange={e => setPoolProperty(e.target.value)}
+          style={{ maxWidth: 250 }}>
+          <option value="all">All properties</option>
+          {poolProperties.map(p => <option key={p} value={p}>{p}</option>)}
+        </select>
+        {([
+          { v: 'all' as const,         t: 'Everyone' },
+          { v: 'invited' as const,     t: 'Waiting on them' },
+          { v: 'accepted' as const,    t: 'Accepted' },
+          { v: 'not_invited' as const, t: 'Not invited yet' },
+        ]).map(o => {
+          const on = poolState === o.v
+          const n = o.v === 'all' ? byProperty.length
+                                  : byProperty.filter(i => i.inviteState === o.v).length
+          return (
+            <button key={o.v} type="button" onClick={() => setPoolState(o.v)}
+              className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`}>
+              {o.t} ({n})
+            </button>
+          )
+        })}
       </div>
 
       <input
@@ -856,7 +919,7 @@ export function PendingTenantsPage() {
             {(error as any)?.response?.data?.message || 'Try refreshing the page.'}
           </div>
         </div>
-      ) : intents.length === 0 ? (
+      ) : shown.length === 0 ? (
         <div style={{
           padding: 40, textAlign: 'center', background: 'var(--bg-1)',
           borderRadius: 10, border: '1px dashed var(--border-0)',
@@ -872,7 +935,7 @@ export function PendingTenantsPage() {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {intents.map(intent => (
+          {shown.map(intent => (
             <IntentCard
               key={intent.intentId}
               intent={intent}

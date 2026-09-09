@@ -5,6 +5,7 @@ import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -388,14 +389,26 @@ export function SchedulePage() {
   const [preview, setPreview] = useState<{unitId:string; checkIn:string; checkOut:string; mismatch:boolean}|null>(null)
   const [dragging, setDragging] = useState<string|null>(null)
 
+  // S639 (Nic, DIRECTIVE): "Master schedule needs to be scoped to a property,
+  // not having all the different properties on one schedule." Spot numbers
+  // repeat across parks, so a merged timeline stacks several identically
+  // labelled rows — unreadable, and a way to book the wrong space. The park is
+  // picked once and remembered (shared with the Units page), and the fetch
+  // itself is scoped so a big account never pulls the whole portfolio.
+  const { data: allProperties = [] } = useQuery<any[]>(
+    'properties', () => apiGet('/properties'), { staleTime: 60000 })
+  const schedulePropertyOptions = allProperties.map((p: any) => ({ id: p.id, name: p.name }))
+  const [schedulePropertyId, setSchedulePropertyId] =
+    usePropertyScope('gam.scope.property', schedulePropertyOptions)
+
   const { data: schedule, isLoading } = useQuery(
-    ['schedule', fromDate, toDate, filterType],
-    () => apiGet(`/units/schedule/master?from=${fromDate}&to=${toDate}${filterType!=='all'?'&unitType='+filterType:''}`),
+    ['schedule', fromDate, toDate, filterType, schedulePropertyId],
+    () => apiGet(`/units/schedule/master?from=${fromDate}&to=${toDate}${filterType!=='all'?'&unitType='+filterType:''}&propertyId=${schedulePropertyId}`),
     // keepPreviousData: when the perpetual-calendar window extends (from/to
     // change → new query key), keep showing the current grid instead of
     // flashing the "Loading schedule…" state and losing scroll position. The
     // appended day columns pop in when the wider fetch resolves.
-    { staleTime: 30000, keepPreviousData: true }
+    { staleTime: 30000, keepPreviousData: true, enabled: !!schedulePropertyId }
   )
 
   const { data: history = [] } = useQuery(
@@ -1302,15 +1315,36 @@ export function SchedulePage() {
 
         {/* Stats + New Reservation */}
         <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+          <RequiredPropertySelect value={schedulePropertyId} onChange={setSchedulePropertyId}
+            properties={schedulePropertyOptions} />
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} reservations</span>
           {can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>}
         </div>
       </div>
 
-      {isLoading && <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>Loading schedule...</div>}
+      {/* S639: no park chosen — offer the parks, never a merged timeline. */}
+      {!schedulePropertyId && (
+        <div style={{padding:'32px 24px'}}>
+          <div style={{color:'var(--text-2)',fontSize:'.85rem',marginBottom:14}}>
+            Pick a property to see its schedule. Spot and unit numbers repeat across
+            properties, so each property keeps its own schedule.
+          </div>
+          <div style={{display:'flex',flexWrap:'wrap',gap:10}}>
+            {schedulePropertyOptions
+              .slice()
+              .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''))
+              .map((p: any) => (
+                <button key={p.id} className="btn btn-primary"
+                  onClick={() => setSchedulePropertyId(p.id)}>{p.name}</button>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {schedulePropertyId && isLoading && <div style={{padding:48,textAlign:'center',color:'var(--text-3)'}}>Loading schedule...</div>}
 
       {/* ── TIMELINE VIEW ── */}
-      {!isLoading && view==='timeline' && (
+      {schedulePropertyId && !isLoading && view==='timeline' && (
         <div style={{display:'flex',flexDirection:'column',minWidth:0,flex:1,minHeight:0}}>
         {/* S575: the old JS row-snap (round scrollTop to a fixed 72px) was removed —
             it rounded DOWN below max-scroll at the bottom (cutting off the last row)
@@ -1617,7 +1651,7 @@ export function SchedulePage() {
       )}
 
       {/* ── LIST VIEW ── */}
-      {!isLoading && view==='list' && (() => {
+      {schedulePropertyId && !isLoading && view==='list' && (() => {
         // S527 W-23: next incoming at the top; longer-term / already-arrived
         // below a divider. (Dates dayOnly-sliced per the ISO-timestamp rule —
         // the old rows built Invalid Dates.)
@@ -1692,7 +1726,7 @@ export function SchedulePage() {
       })()}
 
       {/* ── UNITS VIEW ── */}
-      {!isLoading && view==='units' && (
+      {schedulePropertyId && !isLoading && view==='units' && (
         <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(280px,1fr))',gap:12}}>
           {filteredUnits.map(unit => (
             <div key={unit.id} className="card">

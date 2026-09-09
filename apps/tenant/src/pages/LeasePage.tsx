@@ -42,6 +42,26 @@ function post<T>(path: string, body: any): Promise<T> {
     .then(r => r.json()).then(r => r.data ?? r)
 }
 
+
+// S637: pick the canvas scale for a crisp page on a high-density screen.
+//
+// Beyond the device's own pixel ratio we add zoom headroom, then clamp the
+// total canvas area: mobile Safari refuses to paint a canvas past its size
+// limit and silently hands back a BLANK one, which would turn "blurry lease"
+// into "no lease at all".
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
+
 // ── SIGNATURE CANVAS ─────────────────────────────────────────
 function SignatureCanvas({ onSign }: { onSign: (dataUrl: string) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -140,10 +160,20 @@ function PdfViewer({ url, token }: { url:string; token:string }) {
     const p2 = await pdf.getPage(pageNum)
     const vp = p2.getViewport({ scale:1 })
     const scale = containerRef.current.clientWidth / vp.width
-    const sv = p2.getViewport({ scale })
+    // S637 (Nic): "the lease is blurry when people zoom in on phone."
+    //
+    // The canvas was sized in CSS pixels, so on a phone at devicePixelRatio 3
+    // the tenant was reading a one-third-resolution image stretched to fit —
+    // soft before they touched it, and properly blurry once they pinched in to
+    // read a clause. Render at the screen's real density, with headroom on top
+    // so zooming has detail to reveal rather than magnifying the same pixels.
+    const sv = p2.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')!
     canvas.width = sv.width; canvas.height = sv.height
+    // Backing store grew; the drawn size must stay the container width.
+    canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     ctx.clearRect(0, 0, canvas.width, canvas.height)
     const task = p2.render({ canvasContext:ctx, viewport:sv })
     renderTaskRef.current = task

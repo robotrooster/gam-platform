@@ -433,9 +433,30 @@ export async function createDocumentRecord(client: any, opts: {
         // prefilled fields clickable), and whatever is signed wins and writes
         // back to the unit at execution. Skipped when the sender already supplied
         // a value, so an explicit send always beats the unit's figure.
+        //
+        // S637: the DEPOSIT is seeded only for a genuinely new tenancy.
+        //
+        // Seeding it from the unit alongside the rent (S636) charged Cameron
+        // Gaefcke $350 on a lease that papers a tenancy already in place — the
+        // unit carries a standing deposit figure for NEW residents, and every
+        // Oak Park space carries $350, so every existing resident signing an
+        // onboarding lease would be billed a deposit they never owed and in
+        // most cases already paid the landlord years ago. Fifteen leases signed
+        // before this behaved correctly because nothing prefilled the box.
+        //
+        // Rent is different and stays unconditional: it is what they pay every
+        // month either way, and the unit record is the authority for it (S636).
+        // A deposit is a one-time charge that an existing tenancy does not
+        // generate at all. The landlord can still type one into the document.
+        const existingTenancy = await client.query(
+          `SELECT bool_or(COALESCE(is_existing_tenancy, false)) AS existing
+             FROM pending_tenant_intents
+            WHERE unit_id = $1 AND cancelled_at IS NULL AND resolved_at IS NULL`,
+          [opts.unitId]).then((r: any) => r.rows[0]?.existing === true)
+
         for (const [col, val] of Object.entries({
           rent_amount:      ctx.rent_amount,
-          security_deposit: ctx.security_deposit,
+          security_deposit: existingTenancy ? null : ctx.security_deposit,
         })) {
           if (val != null && Number(val) > 0 && prefillValues[col] == null) {
             prefillValues[col] = Number(val).toFixed(2)
@@ -897,6 +918,31 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     }
   }
 
+  // ── S638 (Nic): A SIGNED LEASE CLOSES THE INVITE ────────────────────────
+  //
+  //   "Stuff doesn't go away after it's completed. Like, Tyler Rhoades is still
+  //    on there even though he's accepted his tenant portal invite."
+  //
+  // Only the PDF-IMPORT path ever set resolved_at. Every lease signed
+  // electronically left its intent open forever, so the pending pool kept
+  // showing residents who had finished months of onboarding — 34 of them, each
+  // with a live lease. The invite has done its job the moment the lease exists.
+  {
+    const closed = await client.query(
+      `UPDATE pending_tenant_intents
+          SET resolved_at = NOW(), resolved_lease_id = $1,
+              parser_status = 'resolved', updated_at = NOW()
+        WHERE tenant_id = ANY($2::uuid[])
+          AND unit_id = $3
+          AND cancelled_at IS NULL AND resolved_at IS NULL
+        RETURNING id`,
+      [lease.id, tenantSigners.map((t: any) => t.tenant_id), doc.unit_id])
+    if (closed.rowCount) {
+      logger.info({ leaseId: lease.id, intents: closed.rowCount },
+        '[esign] invite(s) closed by the signed lease')
+    }
+  }
+
   // S631 (Nic, DIRECTIVE): "Let's flag on invite so that no matter when they
   // accept it, the work-trade agreement has inserted it slightly before the
   // invoice is created... That way it's automatically in a suspended state."
@@ -912,7 +958,8 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // precisely the gap this is here to close.
   {
     const wtIntent = await client.query(
-      `SELECT work_trade_hours_target, work_trade_duties, work_trade_covered_charges
+      `SELECT work_trade_hours_target, work_trade_duties, work_trade_covered_charges,
+              work_trade_tracks_hours
          FROM pending_tenant_intents
         WHERE unit_id = $1 AND is_work_trade = TRUE AND cancelled_at IS NULL
           AND (resolved_at IS NULL OR resolved_lease_id = $2)
@@ -932,17 +979,22 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       // intent still means "not stated" and still takes the table default, so an
       // invite flagged before this existed behaves exactly as it did.
       const covers: string[] | null = wtIntent.rows[0].work_trade_covered_charges ?? null
+      // S637: the parent switch rides in too. NULL on the intent means "not
+      // stated" and creates a normal tracked agreement, so invites written
+      // before this behave exactly as they did.
+      const tracksHours = wtIntent.rows[0].work_trade_tracks_hours !== false
       await client.query(
         `INSERT INTO work_trade_agreements
            (unit_id, tenant_id, landlord_id, duties, start_date, monthly_hours_target,
-            covered_charges)
-         VALUES ($1, $2, $3, $4, $5, $6,
-                 COALESCE($7::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))`,
+            tracks_hours, covered_charges)
+         VALUES ($1, $2, $3, $4, $5, $6, $7,
+                 COALESCE($8::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))`,
         [doc.unit_id, primarySigner.tenant_id, doc.landlord_id,
          wtIntent.rows[0].work_trade_duties || null,
          startDate,
          wtIntent.rows[0].work_trade_hours_target
            ?? propDefault.rows[0]?.work_trade_hours_target ?? 80,
+         tracksHours,
          covers])
     }
   }
@@ -2115,7 +2167,26 @@ esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (
            WHERE ms.document_id = d.id
              AND ms.role = 'landlord'
              AND ms.status IS DISTINCT FROM 'signed'
-        ) AS landlord_must_sign
+        ) AS landlord_must_sign,
+        -- ── S638 (Nic): WHO IS IN IT, AND WHO ARE WE WAITING ON ──────────────
+        --
+        --   "From this screen I can't see who's in what unit and who we're
+        --    waiting on for signature... these people don't show up in the
+        --    master schedule until after they're completed. Even if I remember
+        --    the people in the spot, I might not remember the signing order."
+        --
+        -- A row said "2/3 signed" and stopped there, so chasing a lease meant
+        -- opening it to find out whose turn it was. The whole roster comes back
+        -- in signing order, plus the one person it currently sits with.
+        (SELECT json_agg(json_build_object(
+                  'name', x.name, 'role', x.role, 'status', x.status,
+                  'email', x.email,
+                  'signedAt', x.signed_at, 'invitedAt', x.invite_sent_at)
+                ORDER BY x.order_index)
+           FROM lease_document_signers x WHERE x.document_id = d.id) AS signers,
+        (SELECT x.name FROM lease_document_signers x
+          WHERE x.document_id = d.id AND x.status <> 'signed'
+          ORDER BY x.order_index LIMIT 1) AS waiting_on
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
       LEFT JOIN properties p ON p.id = u.property_id
@@ -4006,7 +4077,37 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     const docTerminal =
       doc.status === 'completed' || doc.status === 'voided' || doc.status === 'execution_failed'
     const signerTerminal = signer.status === 'signed' || signer.status === 'declined'
-    const readOnly = docTerminal || signerTerminal
+
+    // ── S637 (Nic, DIRECTIVE): YOU CANNOT FILL IN A DOCUMENT THAT ISN'T YOURS YET ──
+    //
+    //   "I've had multiple people today tell me they signed the lease, and I
+    //    know they didn't... it's letting them fill it all out, but they just
+    //    can't complete it for signature until after I do. Completion is the
+    //    only thing gated on a signing order, not actually receiving the email."
+    //
+    // He is right about the symptom and half right about the cause. The EMAILS
+    // are strictly sequential — the relay only invites the next signer once the
+    // previous one signs, and the data bears that out. What was not gated is
+    // this READ: any signer holding a link or reaching the document from their
+    // portal got a fully fillable page whether or not it was their turn, and
+    // only the submit refused them. So they filled everything in, hit a wall at
+    // the end, and told Nic they had signed.
+    //
+    // Same two rules the submit enforces (S535), applied here: an earlier
+    // order_index still unsigned, or any unsigned landlord on a tenant's view.
+    // Not a new restriction — it is the existing restriction, made visible
+    // before someone wastes their time instead of after.
+    let waitingOn: string | null = null
+    if (!docTerminal && !signerTerminal) {
+      const blocker = await queryOne<{ name: string; role: string }>(
+        `SELECT name, role FROM lease_document_signers
+          WHERE document_id = $1 AND status != 'signed'
+            AND (order_index < $2 OR (role = 'landlord' AND $3::boolean))
+          ORDER BY order_index LIMIT 1`,
+        [doc.id, signer.order_index, isTenantRole(signer.role)])
+      if (blocker) waitingOn = blocker.role === 'landlord' ? 'the landlord' : blocker.name
+    }
+    const readOnly = docTerminal || signerTerminal || waitingOn !== null
 
     // S636 (Nic): THE SIGNER SEES THE WHOLE DOCUMENT, not just their own slots.
     //
@@ -4042,7 +4143,9 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       }
     }
 
-    if (!readOnly && signer.status === 'sent') {
+    // S637: stamp the view even when it is not yet their turn — they really did
+    // open it, and that is worth knowing. Only a terminal state suppresses it.
+    if (!docTerminal && !signerTerminal && signer.status === 'sent') {
       await query("UPDATE lease_document_signers SET status='viewed', viewed_at=NOW() WHERE id=$1", [signer.id])
     }
 
@@ -4143,7 +4246,10 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       }
     }
 
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly } })
+    // S637: `waitingOn` names who the document is with, so the page can say
+    // "waiting on the landlord" instead of showing a form that cannot be
+    // submitted. readOnly already covers the mechanics; this covers the telling.
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly, waitingOn } })
   } catch (e) { next(e) }
 })
 
@@ -4580,6 +4686,24 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           sendEmail: false
         })
         await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1", [nextSigner.id])
+        // S637 (Nic): STAMP THE DOCUMENT TOO, if nothing has yet.
+        //
+        // "I have three completed ones that don't even show when they were
+        //  sent... the only dates that should be blank are the ones that have
+        //  yet to complete."
+        //
+        // Only the two /send routes set sent_at, so a draft the landlord opens
+        // and signs HIMSELF never passes through either: he has no invite, the
+        // tenant is emailed from right here as the next signer, and the document
+        // completes having never been marked sent. Three Oak Park leases read
+        // that way — RV 02, RV 03 and RV 36.
+        //
+        // This IS the moment it went out for such a document, so record it —
+        // and only when empty, so a real send date is never overwritten by a
+        // later signer in the chain.
+        await query(
+          "UPDATE lease_documents SET sent_at = COALESCE(sent_at, NOW()), updated_at=NOW() WHERE id=$1",
+          [doc.id])
       }
       res.json({ success: true, data: { completed: false, nextSigner: nextSigner?.email } })
     }

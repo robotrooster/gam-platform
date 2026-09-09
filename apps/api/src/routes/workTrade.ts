@@ -118,6 +118,10 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       renewalTerms: z.string().optional(),
       // W-56: per-person target; the property value is only the default.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      // S637 (Nic): the parent switch. False = a trusted trade — covered charges
+      // clear every month and nobody logs or approves hours. The target above is
+      // still stored so switching tracking back on restores it.
+      tracksHours: z.boolean().optional(),
       // S613 (Nic): what this agreement trades for. Omitted = everything, which
       // is what every agreement written before this did.
       coveredCharges: z.array(z.enum(
@@ -151,13 +155,14 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     const agreement = await queryOne<any>(`
       INSERT INTO work_trade_agreements
         (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms,
-         monthly_hours_target, covered_charges)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
-              COALESCE($9::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))
+         monthly_hours_target, tracks_hours, covered_charges)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
+              COALESCE($10::text[], ARRAY['rent','fees','water','sewer','electric','gas','trash','propane']))
       RETURNING *`,
       [body.unitId, body.tenantId, landlordId, body.duties || null,
        body.startDate, body.endDate || null, body.renewalTerms || null,
        body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80,
+       body.tracksHours ?? true,
        body.coveredCharges ?? null]
     )
 
@@ -282,7 +287,10 @@ workTradeRouter.get('/:id', async (req, res, next) => {
       const wd = new Date(d)
       return wd.getMonth() === now.getMonth() && wd.getFullYear() === now.getFullYear()
     }
-    const target = Number(agreement.target)
+    // S637: tracks_hours is the parent switch — a trusted agreement asks for no
+    // hours, so its effective target is 0 and workTradeFraction reads that as
+    // fully covered.
+    const target = agreement.tracks_hours === false ? 0 : Number(agreement.target)
     const approvedThisMonth = logs.filter(l => l.status === 'approved' && inThisMonth(l.work_date))
     const hoursApprovedThisMonth = approvedThisMonth.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
     const pendingLogs = logs.filter(l => l.status === 'pending')
@@ -437,13 +445,14 @@ workTradeRouter.get('/:id/standing', async (req, res, next) => {
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate, monthlyHoursTarget, coveredCharges, carryForwardMonths } = z.object({
+    const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths } = z.object({
       coveredCharges: z.array(z.enum(
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
       // W-56: per-person target is editable on the agreement.
       monthlyHoursTarget: z.number().int().positive().optional(),
+      tracksHours: z.boolean().optional(),   // S637: parent switch
       // S624 (Nic): how long a shortfall may carry before it is billed in cash
       // and the agreement ends. "My two month rule was just an example. If a
       // landlord wants to give leniency for six months, they may choose to do
@@ -464,10 +473,11 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         monthly_hours_target=COALESCE($4,monthly_hours_target),
         covered_charges=COALESCE($5::text[], covered_charges),
         carry_forward_months=COALESCE($6,carry_forward_months),
+        tracks_hours=COALESCE($7,tracks_hours),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
-       coveredCharges ?? null, carryForwardMonths ?? null]
+       coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null]
     )
 
     // S624 (Nic): "when the landlord marks the work trade agreement as over, any

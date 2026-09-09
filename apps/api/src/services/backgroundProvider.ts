@@ -240,13 +240,22 @@ class CheckrProvider implements BackgroundProvider {
   }
 
   async initiate(req: BackgroundProviderInitiateRequest): Promise<BackgroundProviderInitiateResult> {
-    if (!req.consentCredit || !req.consentCriminal) {
-      return {
-        providerRef: '',
-        status: 'failed',
-        failureReason: 'Provider rejected: missing required consents',
-      }
-    }
+    // S637: NO CONSENT GATE HERE — Checkr collects FCRA consent itself.
+    //
+    // This guard was written when GAM's own intake gathered consent, and it
+    // outlived that. S578 moved DOB, SSN, address AND the FCRA disclosure and
+    // authorization onto Checkr's hosted apply flow, so the intake form stopped
+    // rendering those checkboxes and the route stopped requiring them — but
+    // this line kept demanding them. Three layers, and the middle one changed.
+    //
+    // The result was a screening product that failed 100% of the time AFTER
+    // taking the applicant's money: Anastacio Erreguin paid $44.99, the order
+    // was rejected here before Checkr was ever called, and nothing told anyone.
+    // He was the first person to use the link.
+    //
+    // Consent is still obtained — on Checkr's page, by Checkr, which is what
+    // makes them the CRA of record for it. The mock provider below keeps its
+    // own gate, because that path really does collect consent in GAM.
     // S564 (Nic): ONE package platform-wide, hardcoded — never env- or
     // landlord-configurable. A single Essential screen for every applicant on
     // every route/state removes any lever for a landlord to order a lighter or
@@ -283,9 +292,18 @@ class CheckrProvider implements BackgroundProvider {
       },
     }
 
+    // S637: Checkr's Tenant API REQUIRES an Idempotency-Key on order create —
+    // without it the call is rejected 422 "Header is required" before any
+    // validation of the order itself. Nothing in our stack sent one, so no
+    // order could ever be placed.
+    //
+    // Keyed on the background check id, which is the right idempotency unit:
+    // a retry of the SAME check (this one was retried by hand after being
+    // wrongly rejected) must never create a second order the applicant is
+    // charged for or asked to complete twice.
     const res = await fetch(`${this.baseUrl}/orders`, {
       method: 'POST',
-      headers: this.headers(),
+      headers: { ...this.headers(), 'Idempotency-Key': `gam-bgc-${req.backgroundCheckId}` },
       body: JSON.stringify(body),
     })
     if (!res.ok) {

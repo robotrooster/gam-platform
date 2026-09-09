@@ -2,7 +2,7 @@ import cron from 'node-cron'
 import { DateTime } from 'luxon'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
-  emailSigningReminder, emailDocumentAutoVoided,
+  emailSigningReminder, emailDocumentAutoVoided, emailSigningRequest,
   sendLatePaymentNotice,
 } from '../services/email'
 import { query, queryOne } from '../db'
@@ -408,6 +408,14 @@ export async function processEsignTimeouts() {
         AND s.invite_sent_at < NOW() - INTERVAL '2 hours'
         AND d.status NOT IN ('completed','voided','execution_failed')
         AND d.renews_lease_id IS NULL
+        -- S638: never chase somebody whose turn has not come. A co-tenant that
+        -- the old resend wrongly stamped would otherwise be reminded every two
+        -- hours about a document they cannot submit.
+        AND NOT EXISTS (
+          SELECT 1 FROM lease_document_signers earlier
+           WHERE earlier.document_id = d.id
+             AND earlier.order_index < s.order_index
+             AND earlier.status <> 'signed')
         AND (
           CASE WHEN s.role <> 'landlord' AND EXISTS (
                  SELECT 1 FROM lease_document_signers ls
@@ -494,7 +502,8 @@ export async function processEsignTimeouts() {
                 WHERE ls.document_id = d.id
                   AND ls.role = 'landlord'
                   AND ls.status = 'signed'
-                  AND GREATEST(ls.signed_at, $1::timestamptz) < NOW() - INTERVAL '48 hours')
+                  AND GREATEST(ls.signed_at, d.signing_window_restarted_at, $1::timestamptz)
+                        < NOW() - INTERVAL '48 hours')
              AND EXISTS (
                SELECT 1 FROM lease_document_signers ps
                 WHERE ps.document_id = d.id
@@ -503,6 +512,80 @@ export async function processEsignTimeouts() {
     `, [esign48hCutover()])
     for (const d of expired as any[]) {
       try {
+        // ── S637 (Nic, DIRECTIVE): RESEND, DON'T VOID, WHEN HE HAS SIGNED ──
+        //
+        //   "I'm not gonna fucking sign it every time somebody fails to do
+        //    their part on time. It needs to be resent to them for signature."
+        //
+        // Voiding here destroyed the landlord's completed signature because a
+        // tenant was slow — and on MH 25 it destroyed a co-tenant's too, where
+        // two of three had signed. The people who did their part paid for the
+        // one who didn't.
+        //
+        // So: if the landlord has signed and everyone outstanding is a TENANT,
+        // nudge exactly those people again and restart the window. The document
+        // survives with every signature on it. It repeats every 48 hours until
+        // it is signed or the landlord voids it by hand.
+        // ── S638 (Nic, DIRECTIVE): RESEND TO ONE PERSON, NOT THE HOUSEHOLD ────
+        //
+        //   "I don't want it to send to them at all out of order because I have
+        //    several people that think they already did it when they actually
+        //    haven't."
+        //
+        // This used to take EVERY outstanding signer and email them all in one
+        // pass, stamping invite_sent_at on each. So a co-tenant two places down
+        // the order got a "please sign" for a document that was not yet theirs:
+        // Brandon Valdez and Yesenia Sanchez were both mailed at 15:15:02 on the
+        // 7th, Ruben Chavarin and Obed Parra both at 13:45:02 on the 8th. They
+        // opened it, filled it in, could not submit, and told Nic they had
+        // signed.
+        //
+        // Only the person whose turn it actually is — lowest order_index still
+        // unsigned. The same rule the submit gate and the signing view use.
+        const outstanding = await query<any>(`
+          SELECT s.id, s.name, s.email, s.role, s.token, s.user_id
+            FROM lease_document_signers s
+           WHERE s.document_id = $1 AND s.status <> 'signed'
+           ORDER BY s.order_index
+           LIMIT 1`, [d.id])
+        const landlordSigned = await query<any>(`
+          SELECT 1 FROM lease_document_signers
+           WHERE document_id = $1 AND role = 'landlord' AND status = 'signed'`, [d.id])
+        const onlyTenantsLeft = (outstanding as any[]).length > 0
+          && (outstanding as any[]).every(s => s.role !== 'landlord')
+
+        if (landlordSigned.length > 0 && onlyTenantsLeft) {
+          const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+          const ll = await queryOne<any>(`
+            SELECT (lu.first_name || ' ' || lu.last_name) AS name
+              FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $1`,
+            [d.landlord_id])
+          for (const s of outstanding as any[]) {
+            try {
+              // Same shape the reminder uses — the token IS the identity, so
+              // the link works without a login (S629).
+              const appUrl = s.role === 'landlord'
+                ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
+                : (process.env.TENANT_APP_URL || 'http://localhost:3002')
+              const url = `${appUrl}/sign/${s.token || d.id}`
+              await emailSigningRequest(s.email, s.name, d.title, unitLabel,
+                ll?.name || 'Your landlord', url,
+                { landlordId: d.landlord_id, documentId: d.id })
+              await query(
+                `UPDATE lease_document_signers
+                    SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1`, [s.id])
+            } catch (e) {
+              logger.error({ err: e, signer_id: s.id }, '[ESIGN-TIMEOUTS] resend failed')
+            }
+          }
+          await query(
+            `UPDATE lease_documents SET signing_window_restarted_at=NOW(), updated_at=NOW() WHERE id=$1`,
+            [d.id])
+          logger.info({ document_id: d.id, resent: (outstanding as any[]).length },
+            '[ESIGN-TIMEOUTS] window restarted — resent rather than voided')
+          continue
+        }
+
         await cascadeLeaseTenantsOnVoid(query, d)
         await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
           ['auto-voided: signers did not respond within 48 hours', d.id])
@@ -2137,6 +2220,16 @@ export function schedulerInit() {
           AND p.status IN ('pending','failed')
           AND p.due_date <= NOW() - INTERVAL '5 days'
           AND u.payment_block = FALSE
+          -- ── S638 (Nic): WORK TRADE IS NOT LATE ────────────────────────────
+          --
+          --   "It shouldn't be emailing the landlord about work trade people."
+          --
+          -- A suspended row settles at month close against approved hours, not
+          -- in cash. Nothing about it is overdue, yet this job read it as unpaid
+          -- rent: it emailed Nic a late alert about HIMSELF on his own MH 02
+          -- work-trade unit at 7am, marked the unit delinquent, and bumped the
+          -- resident's late-payment count — every single morning.
+          AND p.work_trade_suspended_at IS NULL
       `)
 
       for (const payment of overdue) {
@@ -2172,6 +2265,35 @@ export function schedulerInit() {
             })
           } catch (e) { logger.error({ err: e }, '[EMAIL late_payment]') }
         }
+      }
+
+      // ── S638 (Nic): DELINQUENCY HAS TO BE ABLE TO END ─────────────────────
+      //
+      //   "The current unit overview list shows several people being delinquent
+      //    that are not delinquent... It also has the work trade people as
+      //    delinquent."
+      //
+      // One line above flips a unit to 'delinquent' and, until now, nothing
+      // anywhere flipped it back — so a unit marked once stayed marked however
+      // much the resident paid. Thirteen units were showing delinquent, four of
+      // them work-trade households who owe nothing at all and never did.
+      //
+      // Cleared here, in the same pass that sets it, against the same
+      // definition of owed: a genuine cash charge, past due, not suspended, not
+      // covered by a credit. If it is not owed, the unit is not delinquent.
+      const cleared = await query<{ id: string }>(`
+        UPDATE units u SET status = 'active', updated_at = NOW()
+         WHERE u.status = 'delinquent'
+           AND NOT EXISTS (
+             SELECT 1 FROM payments p
+              WHERE p.unit_id = u.id
+                AND p.type = 'rent'
+                AND p.status IN ('pending','failed')
+                AND p.work_trade_suspended_at IS NULL
+                AND p.due_date <= NOW() - INTERVAL '5 days')
+        RETURNING u.id`)
+      if (cleared.length > 0) {
+        logger.info(`[Scheduler] ${cleared.length} unit(s) no longer delinquent`)
       }
 
       if (overdue.length > 0) {

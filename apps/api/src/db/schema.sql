@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict WiaulHyZy2Eq9TVzLtU3WaQiMiYuD2ODrvTLedSvg1AohxL8BAIbZrsNaqgo5Ae
+\restrict 2tjPNez7P0SqhUyMETYxiojyDuyI25NMPp0hH5Pwg2JGzPrjTAa2cAhgwDlUhRD
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -660,6 +660,46 @@ $$;
 --
 
 COMMENT ON FUNCTION public.supersede_utility_service_agreement() IS 'S615: a lease going active on a serviced space stamps the agreement so the $2 platform fee follows the tenancy and is never charged twice for one space. The agreement keeps billing utilities — only the fee moves.';
+
+
+--
+-- Name: sync_unit_delinquency(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.sync_unit_delinquency() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  target_unit uuid := COALESCE(NEW.unit_id, OLD.unit_id);
+  owed        numeric;
+  credit      numeric;
+BEGIN
+  IF target_unit IS NULL THEN RETURN COALESCE(NEW, OLD); END IF;
+
+  SELECT COALESCE(SUM(p.amount), 0) INTO owed
+    FROM payments p
+   WHERE p.unit_id = target_unit
+     AND p.type = 'rent'
+     AND p.status IN ('pending', 'failed')
+     AND p.work_trade_suspended_at IS NULL
+     AND p.due_date <= NOW() - INTERVAL '5 days';
+
+  SELECT COALESCE(SUM(c.amount_remaining), 0) INTO credit
+    FROM tenant_credits c
+    JOIN lease_tenants lt ON lt.tenant_id = c.tenant_id AND lt.status = 'active'
+    JOIN leases l ON l.id = lt.lease_id AND l.unit_id = target_unit AND l.status = 'active'
+   WHERE c.status = 'active' AND c.amount_remaining > 0;
+
+  IF owed - credit > 0 THEN
+    UPDATE units SET status = 'delinquent', updated_at = NOW()
+     WHERE id = target_unit AND status = 'active';
+  ELSE
+    UPDATE units SET status = 'active', updated_at = NOW()
+     WHERE id = target_unit AND status = 'delinquent';
+  END IF;
+
+  RETURN COALESCE(NEW, OLD);
+END $$;
 
 
 --
@@ -4744,6 +4784,7 @@ CREATE TABLE public.lease_documents (
     finalized_at timestamp with time zone,
     delivery_mode text DEFAULT 'agreement'::text NOT NULL,
     deposit_already_held boolean DEFAULT false NOT NULL,
+    signing_window_restarted_at timestamp with time zone,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_delivery_mode_check CHECK ((delivery_mode = ANY (ARRAY['agreement'::text, 'notice'::text]))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text]))),
@@ -4756,6 +4797,13 @@ CREATE TABLE public.lease_documents (
 --
 
 COMMENT ON COLUMN public.lease_documents.deposit_already_held IS 'S604: TRUE = the landlord already holds this tenant''s security deposit (migration onboarding). The lease still states the deposit amount, but it is excluded from the move-in invoice and the security_deposits row is created funded + held_by=landlord. Default false — new tenants are billed normally.';
+
+
+--
+-- Name: COLUMN lease_documents.signing_window_restarted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.signing_window_restarted_at IS 'S637: when the 48h signing window was last restarted by resending to outstanding tenant signers. Anchors the auto-void clock alongside the landlord signature.';
 
 
 --
@@ -5835,6 +5883,7 @@ CREATE TABLE public.pending_tenant_intents (
     work_trade_hours_target integer,
     work_trade_duties text,
     work_trade_covered_charges text[],
+    work_trade_tracks_hours boolean,
     CONSTRAINT pending_intent_work_trade_covered_check CHECK (((work_trade_covered_charges IS NULL) OR ((array_length(work_trade_covered_charges, 1) > 0) AND (work_trade_covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text])))),
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text]))),
     CONSTRAINT pti_work_trade_hours_positive CHECK (((work_trade_hours_target IS NULL) OR (work_trade_hours_target > 0)))
@@ -5860,6 +5909,13 @@ COMMENT ON COLUMN public.pending_tenant_intents.is_existing_tenancy IS 'S631: th
 --
 
 COMMENT ON COLUMN public.pending_tenant_intents.is_work_trade IS 'S631: this resident trades work for rent. A work_trade_agreement is created from this the moment their lease exists, BEFORE the move-in invoice, so the first invoice is late-fee exempt from birth.';
+
+
+--
+-- Name: COLUMN pending_tenant_intents.work_trade_tracks_hours; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pending_tenant_intents.work_trade_tracks_hours IS 'S637: false = create the agreement as a trusted trade (no hours logged). NULL = not stated, tracked.';
 
 
 --
@@ -10200,6 +10256,7 @@ CREATE TABLE public.work_trade_agreements (
     covered_charges text[] DEFAULT ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text] NOT NULL,
     banked_hours numeric(8,2) DEFAULT 0 NOT NULL,
     carry_forward_months integer DEFAULT 1 NOT NULL,
+    tracks_hours boolean DEFAULT true NOT NULL,
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
     CONSTRAINT work_trade_banked_hours_nonneg CHECK ((banked_hours >= (0)::numeric)),
@@ -10234,6 +10291,13 @@ COMMENT ON COLUMN public.work_trade_agreements.banked_hours IS 'S624: hours work
 --
 
 COMMENT ON COLUMN public.work_trade_agreements.carry_forward_months IS 'S624: how many further month-closes a deficit may survive before it is billed in cash and the agreement ends. 0 = bill at the first close. Landlord-set.';
+
+
+--
+-- Name: COLUMN work_trade_agreements.tracks_hours; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.work_trade_agreements.tracks_hours IS 'S637: false = trusted trade. Covered charges clear each month with no hours logged; monthly_hours_target is retained but not asked for.';
 
 
 --
@@ -19424,6 +19488,13 @@ CREATE TRIGGER trg_supersede_utility_service_agreement AFTER INSERT OR UPDATE OF
 
 
 --
+-- Name: payments trg_sync_unit_delinquency; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_sync_unit_delinquency AFTER INSERT OR DELETE OR UPDATE OF status, amount, due_date, work_trade_suspended_at ON public.payments FOR EACH ROW EXECUTE FUNCTION public.sync_unit_delinquency();
+
+
+--
 -- Name: tenant_complaints trg_tenant_complaints_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25489,5 +25560,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict WiaulHyZy2Eq9TVzLtU3WaQiMiYuD2ODrvTLedSvg1AohxL8BAIbZrsNaqgo5Ae
+\unrestrict 2tjPNez7P0SqhUyMETYxiojyDuyI25NMPp0hH5Pwg2JGzPrjTAa2cAhgwDlUhRD
 

@@ -140,3 +140,52 @@ describe('S634 GET /api/balances/:tenantId/invoices — the breakdown', () => {
     expect(res.body.data).toEqual([])
   })
 })
+
+// ─── S637: an in-flight ACH is not an outstanding balance ────────────────────
+//
+// Nic: "I thought we decided that it was gonna be marked settled or paid in the
+// system, or at least not outstanding, at the time the attempt is made to pay...
+// I'm just trying to narrow down my outstanding balance list, and I'm unable to
+// do that because he did an ACH payment."
+//
+// An ACH debit sits 'processing' for about four business days. Counting it as
+// owed the whole time meant the list could never be worked to zero and Randall
+// Cox — who had paid $520.20 — read as delinquent for days.
+describe('S637 outstanding excludes money in flight', () => {
+  const balanceFor = async (f: any) => {
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.status).toBe(200)
+    const row = res.body.data.find((r: any) => (r.tenant_id ?? r.tenantId) === f.tenantId)
+    return row ? Number(row.balance) : 0
+  }
+
+  it('a processing payment nets off the balance', async () => {
+    const f = await seedOwedTenant()
+    const owed = await balanceFor(f)
+    expect(owed).toBe(616.40)
+
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                             type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,(SELECT lease_id FROM invoices WHERE id=$1),$3,$4,
+               'rent', $5, 'processing', CURRENT_DATE, 'RENT')`,
+      [f.invoiceId, f.unitId, f.tenantId, f.landlordId, owed])
+
+    expect(await balanceFor(f)).toBe(0)
+  })
+
+  // A failure is not silent: the row flips to 'failed' and the debt returns.
+  it('a failed payment leaves the balance owed', async () => {
+    const f = await seedOwedTenant()
+    const owed = await balanceFor(f)
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                             type, amount, status, due_date, entry_description)
+       VALUES ($1,$2,(SELECT lease_id FROM invoices WHERE id=$1),$3,$4,
+               'rent', $5, 'failed', CURRENT_DATE, 'RENT')`,
+      [f.invoiceId, f.unitId, f.tenantId, f.landlordId, owed])
+
+    expect(await balanceFor(f)).toBe(owed)
+  })
+})

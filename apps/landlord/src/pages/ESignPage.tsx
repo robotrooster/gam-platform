@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -229,6 +229,22 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   )
 }
 
+// S637: canvas scale for a crisp page on a high-density screen — device pixel
+// ratio plus zoom headroom, clamped so mobile Safari never hits its canvas-area
+// limit (past which it returns a blank canvas).
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
+
 // ── PDF CANVAS RENDERER ──────────────────────────────────────
 function PDFCanvas({ url, page, width, height }: { url:string; page:number; width:number; height:number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -251,7 +267,15 @@ function PDFCanvas({ url, page, width, height }: { url:string; page:number; widt
         const canvas = canvasRef.current
         if (!canvas) return
         const ctx = canvas.getContext('2d')!
-        const viewport = pdfPage.getViewport({ scale: width / pdfPage.getViewport({ scale:1 }).width })
+        // S637: size the backing store by real screen density, not CSS pixels.
+        // The canvas is stretched to width/height by CSS, so at devicePixelRatio
+        // 2–3 this was drawing a half- or third-resolution page and letting the
+        // browser upscale it. Field boxes are positioned off `width`/`height`
+        // props, which are untouched.
+        const base = pdfPage.getViewport({ scale:1 })
+        const viewport = pdfPage.getViewport({
+          scale: renderScaleFor(width / base.width, base.width, base.height),
+        })
         canvas.width  = viewport.width
         canvas.height = viewport.height
         await pdfPage.render({ canvasContext: ctx, viewport }).promise
@@ -1568,6 +1592,8 @@ export function ESignPage() {
   // reloaded on navigation or on returning to the tab. That is defensible for
   // reference data and wrong for a WORK QUEUE: the whole point of coming back
   // here is to see what is left, and signing a lease changes it every time.
+  // S638: which document's signing order is expanded on the list.
+  const [openDoc, setOpenDoc] = useState<string | null>(null)
   const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',
     () => apiGet('/esign/documents'),
     { staleTime: 0, refetchOnMount: 'always', refetchOnWindowFocus: true, refetchInterval: 60000 })
@@ -1708,11 +1734,28 @@ export function ESignPage() {
                 {filteredDocs.length === 0 ? (
                   <tr><td colSpan={7} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No documents match your filters.</td></tr>
                 ) : filteredDocs.map(d => (
-                  <tr key={d.id}>
-                    <td style={{ fontWeight:600, color:'var(--text-0)' }}>{d.title}</td>
+                  <Fragment key={d.id}>
+                  <tr onClick={() => setOpenDoc(openDoc === d.id ? null : d.id)}
+                      style={{ cursor:'pointer' }}
+                      title="Show who has signed and who it is waiting on">
+                    <td style={{ fontWeight:600, color:'var(--text-0)' }}>
+                      <span style={{ color:'var(--text-3)', marginRight:6, fontSize:'.7rem' }}>
+                        {openDoc === d.id ? '▾' : '▸'}
+                      </span>
+                      {d.title}
+                    </td>
                     <td style={{ fontSize:'.75rem' }}>{d.unitNumber ? `${d.propertyName} · Unit ${d.unitNumber}` : (d.documentType ? humanize(d.documentType) : '—')}</td>
                     <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{humanize(d.status)}</span></td>
-                    <td style={{ fontSize:'.75rem' }}>{d.signedCount}/{d.signerCount} signed</td>
+                    <td style={{ fontSize:'.75rem' }}>
+                      {d.signedCount}/{d.signerCount} signed
+                      {/* S638: the name is the useful half — a count does not
+                          tell you who to phone. */}
+                      {d.waitingOn && d.status !== 'completed' && d.status !== 'voided' && (
+                        <div style={{ fontSize:'.7rem', color:'var(--gold)', marginTop:2 }}>
+                          waiting on {d.waitingOn}
+                        </div>
+                      )}
+                    </td>
                     <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sentAt ? new Date(d.sentAt).toLocaleDateString() : '—'}</td>
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
@@ -1760,6 +1803,47 @@ export function ESignPage() {
                       </div>
                     </td>
                   </tr>
+                  {openDoc === d.id && (
+                    <tr>
+                      <td colSpan={7} style={{ background:'var(--bg-2)', padding:'10px 14px' }}>
+                        <div style={{ fontSize:'.7rem', color:'var(--text-3)', textTransform:'uppercase',
+                          letterSpacing:'.06em', marginBottom:6 }}>Signing order</div>
+                        {(d.signers ?? []).map((sg: any, i: number) => {
+                          const done = sg.status === 'signed'
+                          const isNext = !done && (d.signers ?? [])
+                            .slice(0, i).every((e: any) => e.status === 'signed')
+                          return (
+                            <div key={i} style={{ display:'flex', alignItems:'center', gap:10,
+                              padding:'5px 0', fontSize:'.8rem',
+                              borderBottom: i < (d.signers.length - 1) ? '1px solid var(--border-0)' : 'none' }}>
+                              <span style={{ width:18, textAlign:'center',
+                                color: done ? 'var(--green)' : isNext ? 'var(--gold)' : 'var(--text-3)' }}>
+                                {done ? '✓' : isNext ? '→' : '·'}
+                              </span>
+                              <span style={{ minWidth:170, color:'var(--text-0)', fontWeight: isNext ? 700 : 400 }}>
+                                {sg.name}
+                              </span>
+                              <span style={{ minWidth:96, color:'var(--text-3)', fontSize:'.72rem' }}>
+                                {humanize(sg.role)}
+                              </span>
+                              <span style={{ color: done ? 'var(--green)' : isNext ? 'var(--gold)' : 'var(--text-3)',
+                                fontSize:'.72rem' }}>
+                                {done ? `signed ${new Date(sg.signedAt).toLocaleDateString()}`
+                                      : isNext ? (sg.invitedAt ? 'waiting on them now' : 'about to be asked')
+                                      : 'waits their turn'}
+                              </span>
+                              {isNext && sg.email && (
+                                <span style={{ marginLeft:'auto', color:'var(--text-3)', fontSize:'.72rem' }}>
+                                  {sg.email}
+                                </span>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>

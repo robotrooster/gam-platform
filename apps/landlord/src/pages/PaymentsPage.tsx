@@ -92,15 +92,26 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   const [method, setMethod] = useState<ManualPaymentMethod>('cash')
   const [tendered, setTendered] = useState('')
   const [reference, setReference] = useState('')
+  // S637 (Nic, DIRECTIVE): starts UNSET, and the person taking the cash has to
+  // click one. "That way no mistakes could happen." Both defaults are wrong in
+  // a way nobody notices until the resident complains — one loses their money,
+  // the other says change was kept when it was handed back.
+  const [surplusHandling, setSurplusHandling] = useState<'change' | 'credit' | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   const due = Number(group.total)
   const cash = method === 'cash'
   const paid = Number(tendered.replace(/[^\d.]/g, '')) || 0
-  // Change is the arithmetic nobody should be doing in their head with a
-  // queue at the desk. Only cash has it; a check is written for the amount.
-  const change = cash && paid > due ? paid - due : 0
-  const short = cash && tendered.trim() !== '' && paid < due
+  // Change is the arithmetic nobody should be doing in their head with a queue
+  // at the desk.
+  //
+  // S637 (Nic): this used to be cash-only, on the reasoning that "a check is
+  // written for the amount". Checks get written for MORE — Nic is holding a
+  // $920 check against $460 of rent, which is two months paid ahead. So every
+  // method takes an amount, and every method can run over.
+  const entered = tendered.trim() !== ''
+  const change = entered && paid > due ? paid - due : 0
+  const short = entered && paid < due
 
   // ── S637: THE ANCHOR HAS TO BE THE RENT CHARGE ──────────────────────
   //
@@ -117,14 +128,27 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   // receipt if the payment is ever questioned, so it is required, not optional.
   const needsNumber = method === 'check' || method === 'money_order'
   const numberLabel = method === 'check' ? 'Check number' : 'Money order number'
-  const ready = !!anchor && !short && (!needsNumber || reference.trim().length > 0)
+  const ready = !!anchor && entered && !short
+    && (!needsNumber || reference.trim().length > 0)
+    // Money over the balance has to be accounted for before this can be saved.
+    && (change === 0 || surplusHandling !== null)
 
   const mut = useMutation(
-    () => apiPost(`/payments/${anchor.id}/record-manual`,
-      { method, reference: reference.trim() || undefined }),
+    () => apiPost(`/payments/${anchor.id}/record-manual`, {
+      method,
+      reference: reference.trim() || undefined,
+      // Every method carries its amount now — a check can be written over.
+      ...(entered ? { amountTendered: paid } : {}),
+      ...(change > 0 && surplusHandling ? { surplusHandling } : {}),
+    }),
     {
-      onSuccess: () => onRecorded(
-        `Recorded ${fmt(due)} from ${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim()),
+      onSuccess: (r: any) => {
+        const name = `${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim()
+        const extra = Number(r?.data?.surplus ?? 0)
+        onRecorded(extra > 0 && r?.data?.creditId
+          ? `Recorded ${fmt(due)} from ${name} — ${fmt(extra)} held as credit`
+          : `Recorded ${fmt(due)} from ${name}`)
+      },
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not record that payment'),
     },
   )
@@ -158,6 +182,15 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
             color: 'var(--text-0)', borderTop: '1px solid var(--border-0)', paddingTop: 7, marginTop: 5 }}>
             <span>Total due</span><span className="mono">{fmt(due)}</span>
           </div>
+          {Number(group.creditApplied) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between',
+              fontSize: '.76rem', color: 'var(--text-3)', marginTop: 4 }}>
+              <span>Account credit applied</span>
+              <span className="mono">−{fmt(group.creditApplied)} of {fmt(group.gross)}</span>
+            </div>
+          )}
+          <div style={{ display: 'none' }}>
+          </div>
         </div>
 
         <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
@@ -168,9 +201,11 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           ))}
         </div>
 
-        {cash ? (
+        <>
           <div style={{ marginBottom: 12 }}>
-            <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Cash received</label>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
+              {cash ? 'Cash received' : method === 'check' ? 'Check amount' : 'Money order amount'}
+            </label>
             <input className="form-input" inputMode="decimal" placeholder={due.toFixed(2)}
               value={tendered} onChange={e => setTendered(e.target.value)}
               style={{ width: '100%', marginTop: 4 }} />
@@ -180,18 +215,51 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
               </div>
             )}
             {change > 0 && (
-              <div style={{ fontSize: '.9rem', fontWeight: 800, color: 'var(--gold)', marginTop: 8 }}>
-                Change to give back: {fmt(change)}
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: '.9rem', fontWeight: 800, color: 'var(--gold)' }}>
+                  {fmt(change)} over the balance
+                </div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                  Choose one — this can&apos;t be saved until you do.
+                </div>
+                {/* S637 (Nic): "if they wanted to leave it as credit for the
+                    future, that should also be a 'hey, I'm clicking that I
+                    didn't give them change, add forty dollar credit to their
+                    account' sort of thing." */}
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  {([
+                    { v: 'change' as const,
+                      t: cash ? 'Gave change' : 'Gave it back',
+                      d: `Handed ${fmt(change)} back` },
+                    { v: 'credit' as const, t: 'Keep as credit', d: 'Comes off next month' },
+                  ]).map(opt => {
+                    const on = surplusHandling === opt.v
+                    return (
+                      <button key={opt.v} type="button" onClick={() => setSurplusHandling(opt.v)}
+                        style={{ flex: 1, textAlign: 'left', padding: '9px 11px', borderRadius: 9,
+                          cursor: 'pointer',
+                          background: on ? 'rgba(201,162,39,.1)' : 'var(--bg-1)',
+                          border: on ? '1.5px solid var(--gold)' : '1px solid var(--border-0)' }}>
+                        <div style={{ fontSize: '.8rem', fontWeight: 700, color: on ? 'var(--gold)' : 'var(--text-0)' }}>{opt.t}</div>
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 1 }}>{opt.d}</div>
+                      </button>
+                    )
+                  })}
+                </div>
               </div>
             )}
           </div>
-        ) : (
-          <div style={{ marginBottom: 12 }}>
-            <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{numberLabel}</label>
-            <input className="form-input" value={reference} placeholder="e.g. 1042"
-              onChange={e => setReference(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
-          </div>
-        )}
+
+          {/* The number IS the receipt if a check is ever questioned, so it sits
+              beside the amount rather than replacing it. */}
+          {needsNumber && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{numberLabel}</label>
+              <input className="form-input" value={reference} placeholder="e.g. 1042"
+                onChange={e => setReference(e.target.value)} style={{ width: '100%', marginTop: 4 }} />
+            </div>
+          )}
+        </>
 
         {!anchor && (
           <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>
@@ -625,9 +693,11 @@ export function PaymentsPage() {
   const OUTSTANDING = new Set(['pending', 'failed'])
   const outstandingGroups = (() => {
     const groups = new Map<string, any>()
+    const creditByTenant = new Map<string, number>()
     for (const p of filteredPayments) {
       if (!OUTSTANDING.has(p.status)) continue
       if (p.workTradeSuspendedAt) continue   // worked off, not owed
+      if (p.creditOnAccount != null) creditByTenant.set(p.tenantId, Number(p.creditOnAccount))
       const key = p.leaseId || `tenant:${p.tenantId}`
       const g = groups.get(key) ?? {
         key, unitNumber: p.unitNumber, propertyName: p.propertyName,
@@ -638,6 +708,23 @@ export function PaymentsPage() {
       g.total += Number(p.amount || 0)
       if (p.dueDate && (!g.earliestDue || p.dueDate < g.earliestDue)) g.earliestDue = p.dueDate
       groups.set(key, g)
+    }
+    // ── S638 (Nic): THE DESK ASKS FOR WHAT IS OWED, NOT THE GROSS ──────────
+    //
+    //   "The outstanding balances page is correctly showing $485.45, but on the
+    //    payments page it's still showing $935.45. It's not showing the credit.
+    //    When I go to record payment, it still thinks she owes the full amount,
+    //    and the payments page does not take partial payments."
+    //
+    // Kim Harland was at the desk with a $450 credit and this screen demanded
+    // the whole bill — and since rent is pay-in-full, anything less was refused.
+    // The credit reduces the ONE total here exactly as it does on the balances
+    // page; the gross stays visible so the desk can see where it came from.
+    for (const g of groups.values()) {
+      const credit = creditByTenant.get(g.charges[0]?.tenantId) ?? 0
+      g.creditApplied = Math.min(credit, g.total)
+      g.gross = g.total
+      g.total = Math.round((g.total - g.creditApplied) * 100) / 100
     }
     return [...groups.values()].sort((a, b) =>
       String(a.earliestDue ?? '').localeCompare(String(b.earliestDue ?? '')))

@@ -1035,3 +1035,56 @@ describe('generateLateFeesForTimezone', () => {
     expect(lf.rows[0].amount).toBe('50.00')
   })
 })
+
+// ─── S638: onboarded after the 20th → first cycle carries no late fee ────────
+//
+// Nic: "We onboarded too close to the end of the month for people to be able to
+// be set up and paid on time. So system wide, if onboarding happens after the
+// twentieth of the month, they are exempt from late fees, so they have time to
+// get set up."
+//
+// A resident signing on the 29th has days to accept an invite, verify an email,
+// set a password, link a bank and clear an ACH before rent falls due — and ACH
+// alone takes about four business days. Nine residents each took nine daily $5
+// fees this cycle, $405 in total, every one of them still onboarding.
+describe('S638 late-start onboarding is exempt from late fees', () => {
+  it('exempts the first cycle for a lease that started after the 20th', async () => {
+    const stack = await buildLeaseStack({
+      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-29',
+    })
+    await generateInvoices(new Date('2026-05-05T12:00:00Z'))
+    const { rows } = await db.query<{ late_fee_exempt: boolean; due_date: string }>(
+      `SELECT late_fee_exempt, due_date::text FROM invoices
+        WHERE lease_id=$1 ORDER BY due_date`, [stack.leaseId])
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows[0].late_fee_exempt).toBe(true)
+  })
+
+  it('does not exempt a lease that started early in the month', async () => {
+    const stack = await buildLeaseStack({
+      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-05',
+    })
+    await generateInvoices(new Date('2026-05-05T12:00:00Z'))
+    const { rows } = await db.query<{ late_fee_exempt: boolean }>(
+      `SELECT late_fee_exempt FROM invoices WHERE lease_id=$1 ORDER BY due_date`,
+      [stack.leaseId])
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.every(r => r.late_fee_exempt === false)).toBe(true)
+  })
+
+  // The exemption buys setup time, not a standing discount — by the second
+  // cycle they have had a full month.
+  it('covers the FIRST cycle only', async () => {
+    const stack = await buildLeaseStack({
+      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-29',
+    })
+    await generateInvoices(new Date('2026-05-05T12:00:00Z'))   // first cycle
+    await generateInvoices(new Date('2026-06-05T12:00:00Z'))   // second
+    const { rows } = await db.query<{ late_fee_exempt: boolean; due_date: string }>(
+      `SELECT late_fee_exempt, due_date::text FROM invoices
+        WHERE lease_id=$1 ORDER BY due_date`, [stack.leaseId])
+    expect(rows.length).toBeGreaterThan(1)
+    expect(rows[0].late_fee_exempt).toBe(true)
+    expect(rows[rows.length - 1].late_fee_exempt).toBe(false)
+  })
+})

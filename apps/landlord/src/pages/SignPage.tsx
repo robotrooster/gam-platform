@@ -42,6 +42,22 @@ const SIG_FONTS = [
   { id:'modern',   name:'Modern',   css:"italic 38px Garamond, 'Times New Roman', serif" },
 ]
 
+// S637: canvas scale for a crisp page on a high-density screen. Past the
+// device's pixel ratio we add zoom headroom, then clamp total canvas area —
+// mobile Safari hands back a BLANK canvas past its size limit.
+// 8M keeps a full-width desktop retina page at true 2x while staying well
+// under mobile Safari's ~16.7M canvas-area limit. A phone never approaches it:
+// a 390pt-wide page renders about 3.2M.
+const MAX_CANVAS_PIXELS = 8_000_000
+
+function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number): number {
+  const dpr = window.devicePixelRatio || 1
+  let scale = cssScale * Math.min(dpr * 1.5, 4)
+  const area = (baseWidth * scale) * (baseHeight * scale)
+  if (area > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+  return scale
+}
+
 // Canvas-rendered signature preview — visually distinct styles regardless of system fonts
 function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; small?:boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -334,15 +350,20 @@ export function SignPage() {
     const containerWidth = containerRef.current.clientWidth
     const vp = page.getViewport({ scale:1 })
     const scale = containerWidth / vp.width
+    // CSS scale is what positions every field box — unchanged.
     scaleRef.current = scale
-    const sv = page.getViewport({ scale })
+    const cssVp = page.getViewport({ scale })
+    // S637: render at real screen density with zoom headroom. Sized in CSS
+    // pixels, a phone at devicePixelRatio 3 drew a third-resolution lease.
+    const sv = page.getViewport({ scale: renderScaleFor(scale, vp.width, vp.height) })
     const canvas = canvasRef.current
     canvas.width = sv.width
     canvas.height = sv.height
     canvas.style.width = '100%'
+    canvas.style.height = 'auto'
     canvas.style.display = 'block'
     await page.render({ canvasContext:canvas.getContext('2d')!, viewport:sv }).promise
-    setPdfDims({ width:sv.width, height:sv.height })
+    setPdfDims({ width:cssVp.width, height:cssVp.height })
   }, [])
 
   const loadPdf = useCallback(async (url:string) => {

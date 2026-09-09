@@ -1,7 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { applyCreditsToOpenCharges } from '../services/creditApplication'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -74,8 +73,20 @@ tenantCreditsRouter.post('/', async (req, res, next) => {
          VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
          RETURNING id, amount_original, amount_remaining, category, reason, status, created_at`,
         [lease.landlord_id, lease.tenant_id, lease.id, amt.toFixed(2), body.category, body.reason ?? null, req.user!.userId])).rows[0]
-      const r = await applyCreditsToOpenCharges(client, { leaseId: lease.id, scope: 'lease' })
-      applied = r.applied
+      // ── S638 (Nic, DIRECTIVE): ISSUING A CREDIT SPENDS NOTHING ────────────
+      //
+      //   "The credit doesn't settle individual items. It takes just the total
+      //    down. It's not separatable."
+      //
+      // This used to walk the open charges and close them one by one. Kim
+      // Harland's $450 Move In Special was issued and instantly consumed a
+      // $10.45 water row, a $25 trash row and five $5 late fees — so her credit
+      // read $389.55, her landlord saw settled charges no money arrived for,
+      // and she was still asked for the full rent. The credit now sits whole on
+      // the account and nets against the ONE total wherever a balance is shown
+      // (routes/balances.ts for the landlord, /balance-context for the tenant)
+      // and is drawn down when a payment actually settles that balance.
+      applied = 0
       const fresh = await client.query<{ amount_remaining: string }>(
         `SELECT amount_remaining::text FROM tenant_credits WHERE id = $1`, [row.id])
       row.amount_remaining = fresh.rows[0].amount_remaining

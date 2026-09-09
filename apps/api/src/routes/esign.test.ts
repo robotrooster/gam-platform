@@ -3675,3 +3675,115 @@ describe('S637 — GET /esign/sign/:id rejects a malformed id cleanly', () => {
     })
   }
 })
+
+
+// ─── S637: an existing tenancy is never prefilled a deposit ──────────────────
+//
+// S636 seeded the unit's rent onto a new document (Nic wanted a per-unit rent
+// arrangement to reach the paper). The same loop also seeded the unit's
+// SECURITY DEPOSIT — and every Oak Park space carries a standing $350 for new
+// residents. Cameron Gaefcke signed an onboarding lease that papers a tenancy
+// already in place and was billed $350 he never owed; the fifteen residents who
+// signed before the change were billed nothing, because nothing prefilled the
+// box. ~50 more onboarding invites were outstanding when it was caught.
+//
+// Rent stays unconditional — it is owed either way. A deposit is a one-time
+// charge an existing tenancy does not generate.
+describe('S637 deposit prefill skips an existing tenancy', () => {
+  async function draftOffUnit(f: any, cols: string[]) {
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1,'DepGate',1) RETURNING id`,
+      [f.landlordId])
+    for (const col of cols) {
+      await db.query(
+        `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+         VALUES ($1,'text','landlord',$2,1,10,10,100,20)`, [t.rows[0].id, col])
+    }
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Onboarding Lease', templateId: t.rows[0].id, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const r = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [res.body.data.id])
+    return Object.fromEntries(r.rows.map(x => [x.lease_column, x.value])) as Record<string, string | null>
+  }
+
+  it('leaves the deposit blank when the invite says the tenancy already exists', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET security_deposit = 350 WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,TRUE)`, [f.landlordId, f.tenantId, f.unitId])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit ?? '').toBe('')     // nothing to bill
+    expect(vals.rent_amount).toBe('1000.00')         // rent still seeds
+  })
+
+  // A real new move-in, months after onboarding. `trg_intent_default_existing_tenancy`
+  // force-flags every invite written in a landlord's first 28 days as an existing
+  // tenancy, so the landlord has to be aged past that window for this branch to
+  // exist at all — which is exactly the shape Nic described: nothing during
+  // onboarding, deposits on new people once the park is running.
+  it('still seeds the deposit for a genuinely new tenancy', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE landlords SET created_at = now() - INTERVAL '200 days' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE units SET security_deposit = 350 WHERE id = $1`, [f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, is_existing_tenancy)
+       VALUES ($1,$2,'not_uploaded',$3,FALSE)`, [f.landlordId, f.tenantId, f.unitId])
+
+    const vals = await draftOffUnit(f, ['rent_amount', 'security_deposit'])
+    expect(vals.security_deposit).toBe('350.00')
+  })
+})
+
+// ─── S637: you cannot fill in a document that is not your turn ───────────────
+//
+// Nic: "I've had multiple people today tell me they signed the lease, and I
+// know they didn't... it's letting them fill it all out, but they just can't
+// complete it for signature until after I do."
+//
+// The invite relay was already strictly sequential — the next signer is only
+// emailed once the previous one signs. What was ungated was the READ: any
+// signer reaching the document early got a fully editable page, filled it in,
+// hit the submit wall, and reported themselves as done.
+describe('S637 the signing view respects the turn', () => {
+  const tokenOf = async (signerId: string) => (await db.query<{ token: string }>(
+    `SELECT token FROM lease_document_signers WHERE id=$1`, [signerId])).rows[0].token
+
+  it('a tenant before the landlord gets a read-only page naming who it waits on', async () => {
+    const f = await seedFixture()
+    const { landlordSignerId, tenantSignerId } = await seedCompleteableDoc(f)
+    // Put the landlord back to unsigned: this is a document sent out where the
+    // landlord has not yet done his pass.
+    await db.query(
+      `UPDATE lease_document_signers SET status='sent', signed_at=NULL WHERE id=$1`,
+      [landlordSignerId])
+
+    const res = await request(buildApp()).get(`/api/esign/sign/${await tokenOf(tenantSignerId)}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.readOnly).toBe(true)
+    expect(res.body.data.waitingOn).toBe('the landlord')
+    // Nothing on the page is theirs to fill while they wait.
+    expect((res.body.data.fields as any[]).every(x => x.mine === false)).toBe(true)
+  })
+
+  it('once the landlord has signed, the same tenant gets an editable page', async () => {
+    const f = await seedFixture()
+    const { tenantSignerId } = await seedCompleteableDoc(f)   // landlord pre-signed
+    const res = await request(buildApp()).get(`/api/esign/sign/${await tokenOf(tenantSignerId)}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.readOnly).toBe(false)
+    expect(res.body.data.waitingOn).toBeNull()
+    // The page is live for them. (Which individual boxes are theirs depends on
+    // the template's roles — this fixture's fields are all the landlord's.)
+  })
+})

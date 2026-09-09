@@ -690,6 +690,31 @@ async function runGeneration(
         // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
         // total_amount is NET of the work-trade credit; the credit + driving
         // agreement are stamped for audit + tenant/landlord display.
+        // ── S638 (Nic, DIRECTIVE): ONBOARDED LATE IN THE MONTH, NO LATE FEE ──
+        //
+        //   "We onboarded too close to the end of the month for people to be
+        //    able to be set up and paid on time. So system wide, if onboarding
+        //    happens after the twentieth of the month, they are exempt from late
+        //    fees, so they have time to get set up."
+        //
+        // A resident who signs on the 29th has days to accept a portal invite,
+        // verify an email, set a password, link a bank and have an ACH clear
+        // before rent falls due on the 1st. ACH alone takes about four business
+        // days. Charging them for that is charging them for our own timing —
+        // nine residents each collected nine daily $5 fees this cycle, $405 in
+        // total, every one of them onboarding.
+        //
+        // Platform-wide rather than a per-landlord switch: the reason is the
+        // calendar, not a landlord's generosity, and it is true at every park
+        // on the platform. It applies to the FIRST cycle only — by the second,
+        // they have had a full month to get set up.
+        const startedAfter20th = DateTime
+          .fromISO(lease.start_date, { zone: lease.property_tz }).day > 20
+        const priorInvoice = await client.query<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date`,
+          [lease.id, dueDate])
+        const lateStartExempt = startedAfter20th && Number(priorInvoice.rows[0].n) === 0
+
         const invoiceRes = await client.query(
           `INSERT INTO invoices (
              landlord_id, tenant_id, lease_id, unit_id,
@@ -710,7 +735,7 @@ async function runGeneration(
              -- from ITS OWN hours at month close, instead of from the previous
              -- month at generation — is a real billing change and is written up
              -- in the handoff rather than rushed in overnight.
-             $13::uuid IS NOT NULL)
+             $13::uuid IS NOT NULL OR $14::boolean)
            ON CONFLICT (lease_id, due_date) DO NOTHING
            RETURNING id`,
           [
@@ -718,6 +743,7 @@ async function runGeneration(
             invoiceNumber, dueDate,
             effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, netTotalNum.toFixed(2),
             dist.creditApplied.toFixed(2), (wt ? wt.verifiedHours : 0).toFixed(2), wt ? wt.agreementId : null,
+            lateStartExempt,
           ]
         )
 

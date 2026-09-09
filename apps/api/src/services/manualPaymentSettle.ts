@@ -22,6 +22,7 @@ import type { PoolClient } from 'pg'
 import { activateBillingForSettledRent } from './billingActivation'
 import { MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { chargeLandlord } from './landlordGamAccount'
+import { AppError } from '../middleware/errorHandler'
 import type { ManualPaymentMethod } from '@gam/shared'
 
 export interface ManualSettleInput {
@@ -53,6 +54,27 @@ export interface ManualSettleInput {
    * narrow behaviour keeps every existing caller as it was.
    */
   settleWholeBalance?: boolean
+  /**
+   * S637 (Nic): what the resident actually handed over, when it is known.
+   *
+   * "If somebody were to come in with five hundred dollars for four hundred and
+   * sixty dollar rent, they would probably expect forty dollar change. But if
+   * they wanted to leave it as credit for the future, that should also be a
+   * 'hey, I'm clicking that I didn't give them change, add forty dollar credit
+   * to their account' sort of thing."
+   *
+   * The desk already computed change on screen and threw the number away, so a
+   * cash overpayment could never become a credit the way a card one does.
+   *
+   * Omitted keeps the old behaviour exactly — the bank-deposit match path never
+   * knows a tendered amount, and check/money order are written for the amount.
+   */
+  amountTendered?: number | null
+  /**
+   * What to do with anything over the balance. REQUIRED once there is a
+   * surplus — see the check below for why there is no default.
+   */
+  surplusHandling?: 'change' | 'credit'
 }
 
 export interface ManualSettleResult {
@@ -67,6 +89,14 @@ export interface ManualSettleResult {
   feeAmount: number
   feeBilledTo: 'none' | 'landlord' | 'tenant'
   feePaymentId: string | null
+  /** S637: the rows this settled — what the receipt itemises. */
+  settledPaymentIds: string[]
+  /** S637: what this settled, and what became of any surplus. */
+  amountSettled: number
+  /** S638: how much of the bill a credit covered, so the receipt can say so. */
+  creditUsed: number
+  surplus: number
+  creditId: string | null
 }
 
 /**
@@ -133,7 +163,79 @@ export async function settleManualRentPayment(
 
   const refNote = input.reference ? ` (ref ${input.reference})` : ''
   const provenance = input.provenance ? ` — ${input.provenance}` : ''
-  await client.query(
+  // ── S637: WHAT IS ACTUALLY OWED, measured BEFORE the settle ────────────
+  //
+  // The surplus is derived here, from the same predicate the UPDATE below uses,
+  // rather than trusted from the caller. The desk types what was handed over;
+  // what it is owed against is the ledger's business, and after the UPDATE
+  // every one of these rows reads 'settled' so the figure is gone.
+  const owedRow = await client.query<{ owed: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS owed
+       FROM payments
+      WHERE CASE WHEN $2::boolean THEN
+              (status IN ('pending', 'failed')
+               AND work_trade_suspended_at IS NULL
+               AND (CASE WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
+                         THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
+                         ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
+            ELSE id = $1 END`,
+    [payment.id, input.settleWholeBalance === true])
+  const chargesOpen = Math.round(Number(owedRow.rows[0]?.owed ?? 0) * 100) / 100
+
+  // ── S638 (Nic): THE CREDIT COMES OFF BEFORE THE DESK ASKS FOR MONEY ──────
+  //
+  //   "On the payments page it's still showing the $935.45. It's not showing
+  //    the credit. When I go to record payment, it still thinks she owes the
+  //    full amount, and the payments page does not take partial payments."
+  //
+  // Kim Harland stood at the desk holding a $450 credit while this route
+  // demanded the gross bill and refused $485.45 as short. A credit is money the
+  // landlord already owes back — it reduces the ask, exactly as it does in the
+  // tenant's own pay flow (services/rentCharge.ts) and on the landlord's
+  // outstanding list (routes/balances.ts). This was the one place that had not
+  // been taught.
+  const creditRow = await client.query<{ credit: string }>(
+    `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
+       FROM tenant_credits
+      WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+        AND (lease_id IS NULL OR lease_id = $2)`,
+    [payment.tenant_id, payment.lease_id])
+  const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
+  const creditUsed = Math.min(creditAvailable, chargesOpen)
+  const amountSettled = Math.round((chargesOpen - creditUsed) * 100) / 100
+
+  // Rent is pay-in-full platform-wide — a partial can reset a landlord's
+  // eviction clock (standing directive). The desk blocks a short cash entry in
+  // the UI; this is the same rule on the server, and it only applies when a
+  // tendered amount was supplied at all.
+  const tendered = input.amountTendered == null
+    ? null : Math.round(Number(input.amountTendered) * 100) / 100
+  if (tendered != null && tendered < amountSettled - 0.005) {
+    throw new AppError(422,
+      `That is $${(amountSettled - tendered).toFixed(2)} short — $${tendered.toFixed(2)} against ` +
+      `$${amountSettled.toFixed(2)} owed. Rent is paid in full.`)
+  }
+  const surplus = tendered == null
+    ? 0 : Math.round(Math.max(0, tendered - amountSettled) * 100) / 100
+
+  // S637 (Nic, DIRECTIVE): THE CHOICE IS MADE, NEVER ASSUMED.
+  //
+  //   "They either have to pick handed back change or keep his credit. Leaving
+  //    it vaguely defaulted on one side when the person was like, hey, you were
+  //    supposed to add credit — it needs to be manually clicked by the person
+  //    taking the cash. That way no mistakes could happen."
+  //
+  // A default is a silent answer to a question only the person holding the
+  // money can answer, and both wrong answers are expensive: defaulting to
+  // change loses a resident's money, defaulting to credit says a landlord kept
+  // cash they handed back. Refuse instead of guessing.
+  if (surplus > 0 && input.surplusHandling !== 'change' && input.surplusHandling !== 'credit') {
+    throw new AppError(422,
+      `That is $${surplus.toFixed(2)} over the $${amountSettled.toFixed(2)} owed. ` +
+      'Say whether the change was handed back or kept as credit.')
+  }
+
+  const settledRows = await client.query<{ id: string }>(
     // S636 (Nic, DIRECTIVE): CASH SETTLES THE WHOLE BALANCE, LIKE A CARD DOES.
     //
     // "When I apply a manual payment, it needs to be the same as a card payment.
@@ -166,7 +268,8 @@ export async function settleManualRentPayment(
                AND (CASE WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
                          THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
                          ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
-            ELSE id = $1 END`,
+            ELSE id = $1 END
+    RETURNING id`,
     [payment.id, method,
      `Recorded as manual ${method} payment${refNote}${provenance}`,
      input.settledAt, input.settleWholeBalance === true])
@@ -229,11 +332,66 @@ export async function settleManualRentPayment(
     )).rows[0].id
   }
 
+  // ── S637: BANK THE SURPLUS, when the landlord says they kept it ────────
+  //
+  // Same row the card path writes (routes/webhooks.ts banks an over-remittance
+  // identically), so everything downstream is already built: rentCharge.ts nets
+  // both credit tables off the balance BEFORE the pay-in-full gate, which is
+  // what lets the resident pay the reduced amount next month without it reading
+  // as a partial.
+  //
+  // 'change' is a real answer, not a no-op — the money left with the resident,
+  // so there is nothing to record. Defaulting to it means a landlord who never
+  // touches the choice cannot accidentally credit cash they handed back.
+  // Spend the credit that just covered part of this bill. Drawn oldest first,
+  // and only by what was actually used — never by settling a line item, which
+  // is what chopped Kim's $450 into a water row, a trash row and five late fees.
+  if (creditUsed > 0) {
+    let left = creditUsed
+    const open = await client.query<{ id: string; amount_remaining: string }>(
+      `SELECT id, amount_remaining::text FROM tenant_credits
+        WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+          AND (lease_id IS NULL OR lease_id = $2)
+        ORDER BY created_at`, [payment.tenant_id, payment.lease_id])
+    for (const c of open.rows) {
+      if (left <= 0) break
+      const take = Math.min(left, Number(c.amount_remaining))
+      await client.query(
+        // Status stays 'active' at zero — the only other value is 'void', which
+        // means the credit was cancelled, not used up. A spent credit is a real
+        // record of money that was given and applied; amount_remaining = 0 says
+        // that plainly and the queries already filter on it.
+        `UPDATE tenant_credits
+            SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
+          WHERE id = $1`, [c.id, take.toFixed(2)])
+      left = Math.round((left - take) * 100) / 100
+    }
+  }
+
+  let creditId: string | null = null
+  if (surplus > 0 && input.surplusHandling === 'credit') {
+    if (!payment.lease_id || !payment.tenant_id) {
+      throw new AppError(409,
+        'This charge has no lease attached, so a credit has nowhere to sit. Hand the difference back as change.')
+    }
+    const credit = await client.query<{ id: string }>(
+      `INSERT INTO lease_prepaid_credits
+         (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $2, $3, $3) RETURNING id`,
+      [payment.lease_id, payment.tenant_id, surplus.toFixed(2)])
+    creditId = credit.rows[0].id
+  }
+
   return {
     firstPayment,
     feeWaived,
     feeAmount: feeWaived ? 0 : MANUAL_PAYMENT_FEE,
     feeBilledTo: feeWaived ? 'none' : (landlordCovers ? 'landlord' : 'tenant'),
     feePaymentId,
+    settledPaymentIds: settledRows.rows.map(r => r.id),
+    amountSettled,
+    creditUsed,
+    surplus,
+    creditId,
   }
 }

@@ -1991,7 +1991,8 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
   const client = await getClient()
   try {
     const { firstName, lastName, email, phone, unitId,
-            isWorkTrade, workTradeHoursTarget, workTradeDuties } = req.body
+            isWorkTrade, workTradeHoursTarget, workTradeDuties,
+            workTradeTracksHours } = req.body
     // S629 (Nic): "I don't have everybody's phone number, just emails. Email has
     // to be mandatory for the invite to work, I get that, and the electronic
     // signature. Phone number, the tenant can update it on their contact
@@ -2266,7 +2267,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
   const client = await getClient()
   try {
     const { firstName, lastName, email, phone, unitId,
-            isWorkTrade, workTradeHoursTarget, workTradeDuties } = req.body
+            isWorkTrade, workTradeHoursTarget, workTradeDuties,
+            workTradeTracksHours } = req.body
 
     if (!firstName || !lastName || !email || !phone) {
       throw new AppError(400, 'firstName, lastName, email, phone required')
@@ -2354,6 +2356,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       if (held) throw new AppError(409, 'That unit is already held by another pending tenant')
     }
 
+
     await client.query('BEGIN')
 
     // 1. User row (create or reuse). NO email_verify_token — that's set when the
@@ -2393,14 +2396,18 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     const intent = await client.query(
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
-          is_work_trade, work_trade_hours_target, work_trade_duties)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6)
+          is_work_trade, work_trade_hours_target, work_trade_duties,
+          work_trade_tracks_hours)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7)
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
        isWorkTrade === true && Number(workTradeHoursTarget) > 0
          ? Math.floor(Number(workTradeHoursTarget)) : null,
-       isWorkTrade === true ? (workTradeDuties || null) : null]
+       isWorkTrade === true ? (workTradeDuties || null) : null,
+       // S637: only meaningful on a work-trade invite; NULL elsewhere reads as
+       // "not stated", which the signing path treats as tracked.
+       isWorkTrade === true ? workTradeTracksHours !== false : null]
     )
 
     await client.query('COMMIT')
@@ -2665,12 +2672,33 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          u.phone,
          un.id                   AS held_unit_id,
          un.unit_number          AS held_unit_number,
-         pr.name                 AS held_property_name
+         pr.id                   AS held_property_id,
+         pr.name                 AS held_property_name,
+         -- ── S638 (Nic): WHERE ARE THEY, AND WHAT STATE IS THE INVITE IN ─────
+         --
+         --   "The pending pool should be filterable by property that they're
+         --    invited to, because you're showing me a pool of sixty people
+         --    where I have different people at different properties to reach
+         --    out to... they need to know who to contact."
+         --
+         -- A grandfathering row carries no unit of its own, so it took the
+         -- property from screening_waived_unit_id — otherwise a waived resident
+         -- lands in no property's list and is chased by nobody.
+         COALESCE(pr.id, wpr.id)     AS filter_property_id,
+         COALESCE(pr.name, wpr.name) AS filter_property_name,
+         CASE
+           WHEN u.tenant_invite_accepted_at IS NOT NULL THEN 'accepted'
+           WHEN u.tenant_invite_token IS NOT NULL        THEN 'invited'
+           ELSE 'not_invited'
+         END                     AS invite_state,
+         u.tenant_invite_expires_at AS invite_expires_at
        FROM pending_tenant_intents pti
        JOIN tenants t  ON t.id = pti.tenant_id
        JOIN users   u  ON u.id = t.user_id
        LEFT JOIN units un ON un.id = pti.unit_id
        LEFT JOIN properties pr ON pr.id = un.property_id
+       LEFT JOIN units wun ON wun.id = pti.screening_waived_unit_id
+       LEFT JOIN properties wpr ON wpr.id = wun.property_id
        WHERE pti.landlord_id = ANY($1::uuid[])
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
@@ -2716,6 +2744,18 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
         parserFinishedAt: r.parser_finished_at,
         createdAt: r.created_at,
         updatedAt: r.updated_at,
+        // S638: the list never returned where the person actually is, so it
+        // could not be filtered or split between whoever chases each park.
+        heldUnitId: r.held_unit_id,
+        heldUnitNumber: r.held_unit_number,
+        heldPropertyId: r.held_property_id,
+        heldPropertyName: r.held_property_name,
+        propertyId: r.filter_property_id,
+        propertyName: r.filter_property_name,
+        // 'invited' — sent, waiting on them. 'accepted' — in, lease still to
+        // come. 'not_invited' — nothing has gone out yet.
+        inviteState: r.invite_state,
+        inviteExpiresAt: r.invite_expires_at,
       })),
     })
   } catch (e) { next(e) }
@@ -5671,6 +5711,11 @@ landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants
         // against the all-inclusive default. Omitted/null keeps that default.
         coveredCharges: z.array(z.enum(WORK_TRADE_COVERABLE))
           .min(1).nullable().optional(),
+        // S637 (Nic): the parent switch — "do we track hours for this work
+        // trade? If yes, then set the hours. If no, no hours." Decided with the
+        // invite for the same reason coveredCharges is: the agreement is born at
+        // signing, and the first invoice is written against whatever it says.
+        tracksHours: z.boolean().optional(),
       }).parse(req.body)
 
       const intent = await queryOne<any>(
@@ -5697,12 +5742,14 @@ landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants
                 work_trade_duties       = CASE WHEN $2 THEN $4::text ELSE NULL END,
                 work_trade_covered_charges =
                   CASE WHEN $2 THEN $5::text[] ELSE NULL END,
+                work_trade_tracks_hours =
+                  CASE WHEN $2 THEN $6::boolean ELSE NULL END,
                 updated_at = NOW()
           WHERE id = $1
         RETURNING id, is_work_trade, work_trade_hours_target, work_trade_duties,
-                  work_trade_covered_charges`,
+                  work_trade_covered_charges, work_trade_tracks_hours`,
         [intent.id, body.isWorkTrade, body.hoursTarget ?? null, body.duties ?? null,
-         body.coveredCharges ?? null])
+         body.coveredCharges ?? null, body.tracksHours ?? null])
       res.json({ success: true, data: updated })
     } catch (e) { next(e) }
   })

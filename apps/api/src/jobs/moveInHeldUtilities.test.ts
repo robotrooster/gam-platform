@@ -217,3 +217,71 @@ describe('attaching a bill stranded by the monthly run', () => {
     expect(Number(inv.subtotal_utilities)).toBe(25.20)
   })
 })
+
+// ─── S638: signing a lease bills the cycle it arrives into ──────────────────
+//
+// Nic: "The onboarding phase needs to run the utilities as each lease is
+// generated and the initial charge is generated. After that, it's just a
+// monthly cycle."
+//
+// Releasing HELD charges only rescues a unit that had a hold. A unit with
+// nobody invited at billing time gets no hold — the run passes straight over
+// it — so a resident invited afterwards was invisible to that cycle forever.
+// Blanca Avalos was invited to Mountain View RV 36 three hours after the Sept 2
+// run and had no electric on her bill at all; the same for Jeremy Parker at
+// RV 49 and Julie Kenyon at RV 04.
+describe('S638 a lease bills the cycle it arrives into', () => {
+  it('creates the charge for a cycle the run skipped', async () => {
+    const f = await seedStack()
+    // Wipe the hold — this unit is the case where none was ever made.
+    await db.query(`DELETE FROM suspended_utility_charges WHERE unit_id=$1`, [f.unitId])
+    await db.query(`UPDATE utility_meters SET rate_per_unit=0.21 WHERE id=$1`, [f.meterId])
+    await db.query(
+      `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)
+       ON CONFLICT DO NOTHING`, [f.meterId, f.unitId])
+    for (const [d, v, reason] of [
+      ['2026-08-01', 54137, 'baseline'],
+      ['2026-09-02', 54524, 'monthly_cycle'],
+    ] as const) {
+      await db.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+         VALUES ($1,$2,$3,'2026-08-01',$4,$5)`, [f.meterId, d, v, f.userId, reason])
+    }
+    expect((await db.query(`SELECT 1 FROM utility_bills WHERE meter_id=$1`, [f.meterId])).rows)
+      .toHaveLength(0)
+
+    await releaseSuspendedChargesForLease({
+      unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId, landlordId: f.landlordId,
+    })
+
+    const { rows } = await db.query<{ usage_amount: string; charge_amount: string }>(
+      `SELECT usage_amount, charge_amount FROM utility_bills WHERE meter_id=$1`, [f.meterId])
+    expect(rows).toHaveLength(1)
+    expect(Number(rows[0].usage_amount)).toBe(387)            // 54524 − 54137
+    expect(Number(rows[0].charge_amount)).toBeCloseTo(81.27, 2)
+  })
+
+  it('does not bill the same cycle twice', async () => {
+    const f = await seedStack()
+    await db.query(`DELETE FROM suspended_utility_charges WHERE unit_id=$1`, [f.unitId])
+    await db.query(`UPDATE utility_meters SET rate_per_unit=0.21 WHERE id=$1`, [f.meterId])
+    await db.query(
+      `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)
+       ON CONFLICT DO NOTHING`, [f.meterId, f.unitId])
+    for (const [d, v, reason] of [
+      ['2026-08-01', 1000, 'baseline'],
+      ['2026-09-02', 1100, 'monthly_cycle'],
+    ] as const) {
+      await db.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+         VALUES ($1,$2,$3,'2026-08-01',$4,$5)`, [f.meterId, d, v, f.userId, reason])
+    }
+    const args = { unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId, landlordId: f.landlordId }
+    await releaseSuspendedChargesForLease(args)
+    await releaseSuspendedChargesForLease(args)
+    expect((await db.query(`SELECT 1 FROM utility_bills WHERE meter_id=$1`, [f.meterId])).rows)
+      .toHaveLength(1)
+  })
+})

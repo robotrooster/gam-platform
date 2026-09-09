@@ -151,6 +151,24 @@ export function hourRateFor(basisAmount: number, targetHours: number): number {
  * Rounded UP to the quarter hour, and never to zero: a month that bills
  * anything at all asks for some work.
  */
+/**
+ * Dollars a period's applied hours have bought, capped at the bill.
+ *
+ * S637 (Nic): a ZERO-hour agreement covers the month outright. The landlord
+ * approves it for someone they trust to get the work done without counting —
+ * "I wanna only track hours on people that I can't trust to get enough done."
+ * No hours are expected, so there is nothing to fall short of and the whole
+ * basis is credited. Pricing it the normal way (applied x rate) would credit
+ * zero and leave the tenant the full gross bill, which is the exact opposite of
+ * what the agreement says.
+ */
+export function periodCredit(
+  basisAmount: number, targetHours: number, appliedHours: number, hourRate: number,
+): number {
+  if (!(targetHours > 0)) return round2(basisAmount)
+  return Math.min(round2(basisAmount), round2(appliedHours * hourRate))
+}
+
 export function proratedTarget(
   monthlyTarget: number, billedAmount: number, fullMonthAmount: number,
 ): number {
@@ -248,9 +266,8 @@ export function settleMonth(input: SettlementInput): SettlementResult {
     // frozen rate. Computed from the rate rather than from basis × fraction so
     // that a period always prices its hours the way it promised to — and capped
     // at basis so rounding can never credit more than the bill.
-    const creditTotal = Math.min(
-      round2(s.src.basisAmount),
-      round2(s.applied * s.src.hourRate),
+    const creditTotal = periodCredit(
+      s.src.basisAmount, s.src.targetHours, s.applied, s.src.hourRate,
     )
     const uncovered = round2(Math.max(0, s.src.basisAmount - creditTotal))
 
@@ -319,7 +336,7 @@ export function settleOnEnd(
       bank = round2h(bank - drawn)
     }
     const outstanding = Math.max(0, round2h(p.targetHours - applied))
-    const creditTotal = Math.min(round2(p.basisAmount), round2(applied * p.hourRate))
+    const creditTotal = periodCredit(p.basisAmount, p.targetHours, applied, p.hourRate)
     const uncovered = round2(Math.max(0, p.basisAmount - creditTotal))
     const status: PeriodOutcome['status'] = outstanding <= 0 ? 'settled' : 'billed'
     if (status === 'billed') {

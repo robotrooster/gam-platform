@@ -104,11 +104,35 @@ describe('S636 — window A: waiting on the landlord', () => {
 })
 
 describe('S636 — window B: waiting on the tenant', () => {
-  it('voids when the landlord signed 48h ago and the tenant never did', async () => {
+  // S637 (Nic, DIRECTIVE) — REVERSES the S636 behaviour this test asserted.
+  //
+  //   "I'm not gonna fucking sign it every time somebody fails to do their part
+  //    on time. It needs to be resent to them for signature."
+  //
+  // Voiding here threw away the landlord's finished signature because a tenant
+  // was slow. Two live leases were destroyed that way — Oak Park RV 24 and
+  // Mountain View MH 25, the latter with two of three already signed.
+  it('resends instead of voiding when only the tenant is outstanding', async () => {
     const id = await seedDoc({
       status: 'in_progress', sentHoursAgo: 50,
       landlordSignedHoursAgo: 49, tenantInvitedHoursAgo: 49,
     })
+    await processEsignTimeouts()
+    expect(await statusOf(id)).toBe('in_progress')      // survives, with signatures
+
+    // The window restarts from the resend, so the very next run must not fire
+    // again — otherwise it would mail the tenant every 15 minutes forever.
+    const { rows } = await db.query<{ restarted: Date | null }>(
+      `SELECT signing_window_restarted_at AS restarted FROM lease_documents WHERE id=$1`, [id])
+    expect(rows[0].restarted).not.toBeNull()
+    await processEsignTimeouts()
+    expect(await statusOf(id)).toBe('in_progress')
+  })
+
+  // The landlord's own inaction is still his problem: nothing of his is at
+  // stake, so the original window stands.
+  it('still voids when the LANDLORD is the one who has not signed', async () => {
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 50 })
     await processEsignTimeouts()
     expect(await statusOf(id)).toBe('voided')
   })
@@ -154,5 +178,53 @@ describe('S636 — tenant reminders every 2 hours', () => {
     await seedDoc({ status: 'sent', sentHoursAgo: 10, tenantInvitedHoursAgo: 9, tenantRemindedHoursAgo: 5 })
     await processEsignTimeouts()
     expect(emailSigningReminder).not.toHaveBeenCalled()
+  })
+})
+
+// ─── S638: a resend goes to ONE person, never the whole household ────────────
+//
+// Nic: "I don't want it to send to them at all out of order because I have
+// several people that think they already did it when they actually haven't."
+//
+// The resend-instead-of-void path (S637) looped over EVERY outstanding signer
+// and mailed them all in one pass, stamping invite_sent_at on each. Brandon
+// Valdez and Yesenia Sanchez were both mailed at 15:15:02 on the 7th; Ruben
+// Chavarin and Obed Parra both at 13:45:02 on the 8th. The one behind opened
+// it, filled it in, could not submit, and reported themselves as done.
+describe('S638 a timeout resend targets only the current signer', () => {
+  it('mails the primary and leaves the co-tenant untouched', async () => {
+    const docId = await seedDoc({
+      status: 'in_progress',
+      landlordSignedHoursAgo: 60,      // past the 48h window → triggers the resend
+      tenantInvitedHoursAgo: 59,
+    })
+    // A co-tenant sitting behind the primary, never invited.
+    const c = await db.connect()
+    try {
+      // Reuse the document's landlord user — the signer row only needs a
+      // valid user_id; which person it is does not matter for turn order.
+      const { rows: [any0] } = await c.query<{ user_id: string }>(
+        `SELECT user_id FROM lease_document_signers WHERE document_id=$1 LIMIT 1`, [docId])
+      await c.query(
+        `INSERT INTO lease_document_signers
+           (document_id, user_id, role, name, email, order_index, token, status, invite_sent)
+         VALUES ($1,$2,'co_tenant_1','CT',$3,3,$4,'pending',FALSE)`,
+        [docId, any0.user_id, `ct-${randomUUID()}@t.dev`, randomUUID()])
+    } finally { c.release() }
+
+    await processEsignTimeouts()
+
+    const { rows } = await db.query<{ role: string; status: string; invite_sent_at: string | null }>(
+      `SELECT role, status, invite_sent_at FROM lease_document_signers
+        WHERE document_id = $1 ORDER BY order_index`, [docId])
+    const primary = rows.find(r => r.role === 'primary')!
+    const co      = rows.find(r => r.role === 'co_tenant_1')!
+
+    // The person whose turn it is gets chased.
+    expect(primary.status).toBe('sent')
+    expect(primary.invite_sent_at).not.toBeNull()
+    // The one behind them is still waiting — no mail, no stamp, no false start.
+    expect(co.status).toBe('pending')
+    expect(co.invite_sent_at).toBeNull()
   })
 })

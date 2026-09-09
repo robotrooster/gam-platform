@@ -379,6 +379,29 @@ webhooksRouter.post('/stripe', async (req, res) => {
         }
 
         await client.query('COMMIT')
+
+        // S637 (Nic): a receipt, for card and ACH exactly as for cash. Sent
+        // after the commit and never allowed to throw — Stripe retries a 500,
+        // and a retried webhook that has already settled the money must not be
+        // re-driven by a mail failure.
+        try {
+          const settled = await client.query<{ id: string }>(
+            `SELECT id FROM payments
+              WHERE stripe_payment_intent_id = $1 AND status = 'settled'`,
+            [pi.id])
+          if (settled.rows.length) {
+            // Stripe is the authority on how it was actually paid — payments
+            // records manual_method only, and carries nothing for card vs ACH.
+            const kind = (pi.payment_method_types ?? [])[0]
+            const { sendPaymentReceipt } = await import('../services/paymentReceipt')
+            await sendPaymentReceipt({
+              paymentIds: settled.rows.map(r => r.id),
+              method: kind === 'us_bank_account' ? 'bank transfer' : 'card',
+            })
+          }
+        } catch (e) {
+          logger.error({ err: e, stripe_payment_intent_id: pi.id }, '[receipt] card/ACH receipt failed')
+        }
       } catch (e) {
         await client.query('ROLLBACK')
         logger.error({ err: e, stripe_payment_intent_id: pi.id }, 'webhook payment_intent.succeeded handler failed')

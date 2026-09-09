@@ -183,6 +183,13 @@ async function send(
     }
   } else {
     logger.info(`[EMAIL SUPPRESSED — ${nodeEnv}] ${subject} -> ${to}`)
+    // S637: test logins used to recover the code from the SUBJECT in this log
+    // line (S571). The code is no longer there — it is in the body now — so
+    // print the body for this one category. Process log only; the database
+    // still never sees it.
+    if (ctx.category === 'login_2fa_code') {
+      logger.info(`[EMAIL SUPPRESSED BODY] ${htmlToPlainText(html)}`)
+    }
   }
   // Best-effort log — never let logging failure break a user-facing flow.
   try {
@@ -469,7 +476,10 @@ export async function emailSigningReminder(to: string, signerName: string, docum
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
       </div>` +
-      p('If the document is not signed within 24 hours of being sent, it will be automatically voided.') +
+      // S637 (Nic): the window became 48 hours in S636 and this copy did not
+      // follow. He read his own auto-void email and thought the rule had been
+      // reverted: "I thought we changed it to be forty eight hours."
+      p('If the document is not signed within 48 hours of being sent, it will be automatically voided.') +
       btn('Review & Sign Document', signingUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
     ),
@@ -520,7 +530,7 @@ export async function emailDocumentAutoVoided(to: string, recipientName: string,
     base(
       h('Document Has Been Auto-Voided') +
       p(`Hi ${recipientName},`) +
-      p('The following document was automatically voided because it was not signed by all parties within 24 hours of being sent:') +
+      p('The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
@@ -544,7 +554,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
     base(
       h("You've been invited") +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -669,7 +679,7 @@ export async function emailPmInvitation(
       h(`You've been invited to ${companyName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${companyName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${companyName} uses GAM (Gold Asset Management) to manage rental properties on behalf of property owners. As ${roleLabel.toLowerCase()}, you'll have access to the company's portfolio inside the GAM platform.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -714,7 +724,7 @@ export async function emailBusinessInvitation(
       h(`You've been invited to ${businessName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
-      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1235,9 +1245,19 @@ export async function emailLoginCode(
   ttlMinutes: number,
   ctx?: { userId?: string },
 ): Promise<string | null> {
+  // ── S637: THE CODE DOES NOT GO IN THE SUBJECT ───────────────────────────
+  //
+  // Every subject line is written to email_send_log, which is PERMANENT by
+  // design — triggers refuse UPDATE and DELETE so an outreach record cannot be
+  // rewritten. That made 183 live sign-in codes readable in plaintext by any
+  // admin, and put them in every nightly backup. A second factor anybody with
+  // database access can read is not a second factor.
+  //
+  // The code lives in the body only. The body is not logged (body_text is null
+  // for this category), so it never lands anywhere durable.
   return send(
     to,
-    `Your GAM sign-in code: ${code}`,
+    'Your GAM sign-in code',
     base(
       h('Your sign-in code') +
       p('Use this code to finish signing in to GAM:') +
@@ -2125,6 +2145,91 @@ export async function emailAdminInvitation(
       relatedEntityId: ctx?.invitationId ?? null,
       metadata: { role: roleLabel },
     },
+    'support',
+  )
+}
+
+/**
+ * S637 (Nic): a receipt for money received. There wasn't one.
+ *
+ * "When people make their payment, does it email them confirmation of that
+ * payment?" It did not — on any method. A resident paid cash at the desk, or
+ * put a card through the portal, and heard nothing back. The only receipt in
+ * the system was the POS one for counter sales.
+ *
+ * Deliberately method-agnostic: cash, check, money order, card and ACH all
+ * produce the same document, because to the person who paid it is the same
+ * event. The METHOD is stated on it (with the check number where there is one)
+ * since that is what they will look for if they ever have to prove it.
+ *
+ * `pending` is a real and important state to send: an ACH debit takes about
+ * four business days, and a resident who sees nothing for four days assumes it
+ * failed and pays twice. Saying "we have it, it clears in a few days" is the
+ * whole point of the mail.
+ */
+export async function emailPaymentReceipt(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    amount: number
+    method: string          // 'cash' | 'check' | 'money order' | 'card' | 'bank transfer'
+    reference?: string | null
+    paidAt: Date
+    lines: Array<{ label: string; amount: number }>
+    /** Set when the money has not settled yet — ACH in flight. */
+    pending?: boolean
+    /** S637: surplus kept on account rather than handed back. */
+    creditBanked?: number
+    portalUrl?: string
+  },
+  ctx?: { landlordId?: string; tenantId?: string; paymentId?: string },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+  const when = args.paidAt.toLocaleDateString('en-US',
+    { month: 'long', day: 'numeric', year: 'numeric' })
+
+  const rows = args.lines.map(l =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+       <span>${l.label}</span><span>${money(l.amount)}</span>
+     </div>`).join('')
+
+  const subject = args.pending
+    ? `Payment received — ${money(args.amount)} for ${args.unitLabel}`
+    : `Receipt — ${money(args.amount)} for ${args.unitLabel}`
+
+  return await send(to, subject,
+    base(
+      h(args.pending ? 'Payment Received' : 'Payment Receipt') +
+      p(`Hi ${args.tenantName},`) +
+      p(args.pending
+        ? `We've received your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong>. Bank transfers take about four business days to clear — nothing more is needed from you, and we'll only be in touch if there's a problem.`
+        : `Thank you — your payment of <strong style="color:#eef1f8">${money(args.amount)}</strong> was received on ${when}.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:8px">${args.unitLabel}</div>
+         ${rows}
+         <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>${args.pending ? 'Total submitted' : 'Total paid'}</span><span>${money(args.amount)}</span>
+         </div>
+         <div style="font-size:.78rem;color:#7a8aaa;margin-top:9px">
+           Paid by ${args.method}${args.reference ? ` &middot; #${args.reference}` : ''} &middot; ${when}
+         </div>
+       </div>` +
+      (args.creditBanked && args.creditBanked > 0
+        ? p(`You paid <strong style="color:#eef1f8">${money(args.creditBanked)}</strong> more than was owed. It's being held on your account and comes off your next bill automatically.`)
+        : '') +
+      (args.portalUrl ? btn('View your account', args.portalUrl) : '') +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Keep this receipt for your records.</div>`
+    ),
+    {
+      category: 'payment_receipt',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.paymentId ? 'payment' : null,
+      relatedEntityId: ctx?.paymentId ?? null,
+    },
+    // A receipt is something people reply to when a figure looks wrong.
     'support',
   )
 }

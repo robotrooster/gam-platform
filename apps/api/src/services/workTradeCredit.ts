@@ -42,6 +42,11 @@ export function round2(value: number): number {
  * 40 verified hours against an 80 target → 0.5 (50% of the invoice).
  */
 export function workTradeFraction(verifiedHours: number, target: number): number {
+  // S637: an agreement that does not track hours asks for no work, so the month
+  // is fully covered no matter what was logged. It reaches here as target 0.
+  // Falling through to the ratio would read "0% covered" for an agreement that
+  // covers all of it.
+  if (target === 0) return 1
   if (!(target > 0) || !(verifiedHours > 0)) return 0
   return Math.min(1, verifiedHours / target)
 }
@@ -113,7 +118,16 @@ export function distributeWorkTradeCredit(
 
 export interface WorkTradeCreditContext {
   agreementId: string
+  /**
+   * EFFECTIVE hours asked of this agreement for the cycle. S637: an agreement
+   * with tracks_hours = false reports 0 here — its stored monthly_hours_target
+   * is retained but not asked for, and every downstream step (prorate, hour
+   * rate, settlement credit) already reads a zero target as "nothing owed,
+   * fully covered".
+   */
   target: number
+  /** S637: false = trusted trade, no hours logged or approved. */
+  tracksHours: boolean
   verifiedHours: number
   /** S613: what this agreement trades for. See the migration. */
   coveredCharges: string[]
@@ -145,7 +159,8 @@ export async function loadWorkTradeCreditContext(
 
   const r = await client.query<{ agreement_id: string; target: number; verified_hours: string }>(
     `SELECT wta.id AS agreement_id,
-            wta.monthly_hours_target AS target,
+            CASE WHEN wta.tracks_hours THEN wta.monthly_hours_target ELSE 0 END AS target,
+            wta.tracks_hours,
             wta.covered_charges,
             COALESCE((
               SELECT SUM(l.hours)
@@ -170,6 +185,7 @@ export async function loadWorkTradeCreditContext(
   return {
     agreementId: r.rows[0].agreement_id,
     target: Number(r.rows[0].target),
+    tracksHours: (r.rows[0] as any).tracks_hours !== false,
     verifiedHours: Number(r.rows[0].verified_hours),
     coveredCharges: (r.rows[0] as any).covered_charges ?? [],
   }

@@ -119,7 +119,16 @@ paymentsRouter.get('/', async (req, res, next) => {
             SELECT 1 FROM payments p2
              WHERE p2.lease_id = p.lease_id AND p2.type = 'rent'
                AND p2.status IN ('settled', 'paid_via_deposit') AND p2.id <> p.id)
-        ) AS prior_arrangement_eligible
+        ) AS prior_arrangement_eligible,
+        -- S638: what the landlord's desk must subtract before asking for money.
+        -- Kim Harland stood at the counter with a $450 credit while the record-
+        -- payment screen demanded the gross bill and, because rent is
+        -- pay-in-full, refused anything less.
+        COALESCE((SELECT SUM(tc.amount_remaining) FROM tenant_credits tc
+                   WHERE tc.tenant_id = p.tenant_id AND tc.status = 'active'
+                     AND tc.amount_remaining > 0
+                     AND (tc.lease_id IS NULL OR tc.lease_id = p.lease_id)), 0)
+          AS credit_on_account
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
@@ -152,7 +161,18 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
       JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       JOIN tenants t ON t.id = vuo.primary_tenant_id
       JOIN landlords l ON l.id = u.landlord_id
-      WHERE u.status = 'active'
+      -- ── S638: A DELINQUENT UNIT STILL OWES NEXT MONTH'S RENT ───────────────
+      --
+      -- This collected only from units marked 'active', so the moment a unit
+      -- flipped to 'delinquent' GAM stopped pulling its rent — the tenant who
+      -- was already behind became the one nobody billed. It was survivable
+      -- while delinquency was set once a day and never cleared; now that the
+      -- status tracks the ledger in real time it would have bitten immediately.
+      --
+      -- 'suspended' stays excluded on purpose: that is a unit taken out of
+      -- service, not a resident who is late. Matches how the rent roll counts
+      -- occupancy (services/reportEngine.ts).
+      WHERE u.status IN ('active', 'delinquent')
         AND u.payment_block = FALSE
         AND t.ach_verified = TRUE
         AND EXISTS (
@@ -671,6 +691,13 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
          LEFT JOIN invoices inv ON inv.id = p.invoice_id
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
+          -- S637 (Nic): "Work trade is still showing people they owe a full
+          -- balance." This is the number the TENANT sees on their own payments
+          -- page, and it summed suspended rows — so Tyler Rhoades was shown
+          -- $687.57 owing on charges his labour already covers, and Matthew
+          -- Conklin $776.11. A suspended row settles at month close against
+          -- approved hours; it is never money the resident hands over.
+          AND p.work_trade_suspended_at IS NULL
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
         ORDER BY p.due_date ASC, p.created_at ASC`,
@@ -719,12 +746,45 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // bill would be by payment method... that way they see all the avenues and
     // the price at the point the invoice comes out." Priced from the same
     // formula that charges (processingFeeFor), so the quote is honoured.
+    // ── S638 (Nic, DIRECTIVE): THE CREDIT COMES OFF THE ONE TOTAL ───────────
+    //
+    //   "When the line items are on an invoice, it becomes one total charge.
+    //    That one total charge has the credit applied against it... The credit
+    //    has to be applied and visible before they pay rent."
+    //
+    // Kim Harland held a $450 credit and her portal asked her for the whole
+    // bill, because this figure was a plain sum of the open rows with nothing
+    // netted. Credits are read here and subtracted from the lease's total —
+    // never by settling a line item, which is what chopped her credit into a
+    // water row, a trash row and five late fees.
+    const creditRows = await query<{ lease_id: string | null; credit: string }>(
+      `SELECT lease_id, SUM(amount_remaining)::text AS credit
+         FROM tenant_credits
+        WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+        GROUP BY lease_id`,
+      [req.user!.profileId])
+    const creditFor = (leaseId: string) => {
+      const scoped = creditRows.find(c => c.lease_id === leaseId)
+      const unscoped = creditRows.find(c => c.lease_id === null)
+      return Math.round(((Number(scoped?.credit ?? 0)) + Number(unscoped?.credit ?? 0)) * 100) / 100
+    }
+
     const leases = await Promise.all([...byLease.values()].map(async l => {
       const landlordCovers = l.manualFeePayer === 'landlord'
+      // Never below zero: a credit larger than the bill leaves the rest on the
+      // account for next month, it does not hand out change.
+      const creditApplied = Math.min(creditFor(l.leaseId), l.outstanding)
+      const grossOutstanding = l.outstanding
+      l.outstanding = Math.round((l.outstanding - creditApplied) * 100) / 100
       const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
       return {
         ...l,
         methodCosts: paymentMethodCosts(l.outstanding, { manualFee }),
+        // Shown as a line so the resident SEES the credit, not just a smaller
+        // number they have to take on faith.
+        grossOutstanding,
+        creditApplied,
+        creditRemaining: Math.round((creditFor(l.leaseId) - creditApplied) * 100) / 100,
         manualFeeCoveredByLandlord: landlordCovers,
         manualFeeFirstFree: l.manualFirstFree,
         // What the landlord is absorbing on their behalf, so the tenant can see
@@ -934,6 +994,12 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 const recordManualSchema = z.object({
   method:    z.enum(MANUAL_PAYMENT_METHODS),   // 'cash' | 'check' | 'money_order'
   reference: z.string().max(120).optional(),   // check # / money-order # for the audit trail
+  // S637 (Nic): what was actually handed over, and what happened to the extra.
+  // The desk computed change on screen and discarded the number, so a cash
+  // overpayment could never become a credit the way a card one does. Optional:
+  // a check is written for the amount, and the bank-match path never knows.
+  amountTendered:   z.number().nonnegative().optional(),
+  surplusHandling:  z.enum(['change', 'credit']).optional(),
 })
 
 paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (req: any, res, next) => {
@@ -986,17 +1052,35 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     // enter it, so it settles NOW. The deposit-match path passes the date the
     // money actually moved instead.
     const { settleManualRentPayment } = await import('../services/manualPaymentSettle')
-    const { feeWaived, feeBilledTo, feePaymentId, firstPayment } = await settleManualRentPayment(client, {
+    const { feeWaived, feeBilledTo, feePaymentId, firstPayment,
+            amountSettled, creditUsed, surplus, creditId,
+            settledPaymentIds } = await settleManualRentPayment(client, {
       payment: pmt,
       method: body.method,
       settledAt: null,
       reference: body.reference ?? null,
       // S636 (Nic): cash clears the whole balance, like a card does.
       settleWholeBalance: true,
+      amountTendered: body.amountTendered ?? null,
+      // S637: passed through as given. There is deliberately NO default — a
+      // surplus with no answer is refused, not guessed at.
+      surplusHandling: body.surplusHandling,
     })
     const landlordCovers = pmt.manual_fee_payer === 'landlord'
 
     await client.query('COMMIT')
+
+    // S637 (Nic): "Fix it so that people get an email confirmation of their
+    // receipt." Sent AFTER the commit — the money is recorded either way, and a
+    // mail failure must never roll back a payment that physically happened.
+    const { sendPaymentReceipt } = await import('../services/paymentReceipt')
+    await sendPaymentReceipt({
+      paymentIds: settledPaymentIds,
+      method: body.method === 'money_order' ? 'money order' : body.method,
+      reference: body.reference ?? null,
+      creditBanked: creditId ? surplus : 0,
+    })
+
     res.json({
       success: true,
       data: {
@@ -1016,6 +1100,14 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         // tenant, and only one of them stops being true next month.
         firstPayment,
         coveredByLandlord: landlordCovers,
+        // S637: what the ledger absorbed, and where the remainder went.
+        amountSettled,
+        // S638: how much of the bill an account credit covered, so the desk and
+        // the receipt can both say so rather than the money just going missing.
+        creditUsed,
+        surplus,
+        surplusHandling: surplus > 0 ? body.surplusHandling! : null,
+        creditId,
       },
     })
   } catch (e) {

@@ -83,12 +83,21 @@ describe('CheckrProvider.initiate (Tenant orders)', () => {
     expect(res.status).toBe(mapped)
   })
 
-  it('missing consents → failed without calling Checkr', async () => {
-    const spy = vi.spyOn(globalThis, 'fetch' as any)
-    const res = await provider.initiate({ ...happyIntake(), consentCriminal: false })
-    expect(res.status).toBe('failed')
-    expect(res.failureReason).toMatch(/consent/i)
-    expect(spy).not.toHaveBeenCalled()
+  // S637 — REVERSES the gate this test used to assert.
+  //
+  // Checkr collects the FCRA disclosure and authorization on its OWN hosted
+  // apply flow (S578), which is why GAM's intake stopped rendering consent
+  // boxes and the route stopped requiring them. This adapter kept demanding
+  // them anyway, so it rejected every order before Checkr was ever called —
+  // AFTER the applicant had paid. Anastacio Erreguin paid $44.99 and got
+  // nothing; he was the first person to use the link.
+  it('submits without GAM-side consent flags — Checkr collects consent itself', async () => {
+    mockOrderResponse({ id: 'ord_consent', status: 'pending', application_url: null })
+    const res = await provider.initiate({
+      ...happyIntake(), consentCredit: false, consentCriminal: false,
+    })
+    expect(res.status).not.toBe('failed')
+    expect(res.providerRef).toBe('ord_consent')
   })
 
   it('missing rental property → failed with explicit reason (Tenant orders require it)', async () => {

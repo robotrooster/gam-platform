@@ -254,8 +254,11 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(u.rows[0].phone).toBe('5205551234')
     expect(u.rows[0].tos).not.toBeNull()
     expect(u.rows[0].twofa).toBe(true)
-    // Spent, because the activation genuinely committed.
-    expect(u.rows[0].tok).toBeNull()
+    // S637: the token is RETAINED and the acceptance is stamped instead. A
+    // spent link used to be indistinguishable from a bad one, so tenants who had
+    // already set up their account were told the invite "expired" and asked Nic
+    // for a new one. The row now knows the difference.
+    expect(u.rows[0].tok).not.toBeNull()
   })
 
   it('S637: the token is only spent if the activation commits', async () => {
@@ -297,12 +300,16 @@ describe('POST /accept-invite — tenant activates account', () => {
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
     expect(ok.status).toBe(200)
 
-    // And it is single-use: a replay of a SPENT link is refused, rather than
-    // activating twice and drafting a second lease.
+    // Still single-use — it never activates twice or drafts a second lease —
+    // but a replay is now told WHICH thing happened. Nic (S637): "several more
+    // people tell me that their invite expired when they already accepted it...
+    // tell them to look for a separate email for their lease."
     const replay = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
-    expect(replay.status).toBe(404)
+    expect(replay.status).toBe(409)
+    expect(replay.body.code).toBe('ALREADY_ACCEPTED')
+    expect(replay.body.error).toMatch(/already set up|sign in/i)
   })
 
   it('missing token → 400', async () => {
@@ -362,20 +369,25 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(decoded.role).toBe('tenant')
     expect(decoded.purpose).toBe('email_otp_pending')
 
-    // S410 (S377): accept clears tenant_invite_token + expiry. Email
-    // verification column is independent.
+    // S410 (S377) / S637: accept clears the EXPIRY and stamps
+    // tenant_invite_accepted_at, but KEEPS the token so a second click can be
+    // told "you already set this up" instead of "expired". Email verification
+    // column is independent.
     const u = await db.query<{
       password_hash: string; tenant_invite_token: string | null;
-      tenant_invite_expires_at: Date | null; email_verified: boolean;
+      tenant_invite_expires_at: Date | null; tenant_invite_accepted_at: Date | null;
+      email_verified: boolean;
       phone: string | null; accepted_tos_at: Date | null; accepted_privacy_at: Date | null;
     }>(
       `SELECT password_hash, tenant_invite_token, tenant_invite_expires_at,
-              email_verified, phone, accepted_tos_at, accepted_privacy_at
+              tenant_invite_accepted_at, email_verified, phone,
+              accepted_tos_at, accepted_privacy_at
          FROM users WHERE id=$1`, [userId])
     expect(u.rows[0].password_hash).not.toBe('$2b$10$placeholder_invite_pending')
     expect(u.rows[0].password_hash).toMatch(/^\$2[aby]\$/)  // bcrypt envelope
-    expect(u.rows[0].tenant_invite_token).toBeNull()
+    expect(u.rows[0].tenant_invite_token).not.toBeNull()
     expect(u.rows[0].tenant_invite_expires_at).toBeNull()
+    expect(u.rows[0].tenant_invite_accepted_at).not.toBeNull()
     expect(u.rows[0].email_verified).toBe(true)
     expect(u.rows[0].phone).toBe('5555550199')
     expect(u.rows[0].accepted_tos_at).not.toBeNull()

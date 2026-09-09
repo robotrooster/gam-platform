@@ -72,7 +72,7 @@ function cycleUsageFromReadings(
  *  below every comparable neighbor, so there's nothing to dispute. Fallback:
  *  same property, any unit type. null when no comparable has real usage — we
  *  never invent a number with no basis. Rollover-negative comparables are
- *  excluded (usage >= 0 filter). */
+ *  excluded (usage > 0 filter), as are vacant spots — see the WHERE clause. */
 async function lowestComparableUsage(args: {
   brokenMeterId: string; propertyId: string; utilityType: string;
   unitType: string | null; rvAmpService: string | null; cycleIso: string;
@@ -101,7 +101,23 @@ async function lowestComparableUsage(args: {
        AND cm.billing_method = 'submeter' AND cm.out_of_service = false
        AND cm.id <> $4
        AND pri.reading_value IS NOT NULL
-       AND (cyc.reading_value - pri.reading_value) >= 0
+       -- S637 (Nic, DIRECTIVE): "match the lowest of any other OCCUPIED spot."
+       --
+       -- A vacant spot reads zero because nobody is there, and averaging that
+       -- in would estimate an occupied home at nothing — which is exactly the
+       -- bill Chris Ast got. Only a lived-in spot tells you what living there
+       -- costs. Zero-usage comparables are excluded for the same reason: a
+       -- stuck meter must not become the yardstick for the next stuck meter.
+       -- OCCUPIED MEANS SOMEBODY LIVES THERE — an active LEASE, not the unit's
+       -- status flag. A spot can be marked occupied while it waits for a signed
+       -- lease (RV 09 was, to hold it off the booking calendar), and such a spot
+       -- draws almost nothing: 2 kWh against a real household's 120. Taking the
+       -- unit flag at face value made that empty spot the yardstick and would
+       -- have billed Julie Kenyon 42 cents for a month of electricity — the
+       -- same near-zero bill this whole rule exists to prevent.
+       AND EXISTS (SELECT 1 FROM leases cl
+                    WHERE cl.unit_id = cu.id AND cl.status = 'active')
+       AND (cyc.reading_value - pri.reading_value) > 0
        ${matchType
          ? `AND cu.unit_type IS NOT DISTINCT FROM $5
             AND cu.rv_amp_service IS NOT DISTINCT FROM $6`
@@ -112,9 +128,56 @@ async function lowestComparableUsage(args: {
 
   let rows = await run(true)                       // same unit_type + amp
   if (rows.length === 0) rows = await run(false)   // fallback: same property
-  const usages = rows.map(r => Number(r.usage)).filter(u => u >= 0)
+  const usages = rows.map(r => Number(r.usage)).filter(u => u > 0).sort((a, b) => a - b)
   if (usages.length === 0) return null
-  return Math.floor(Math.min(...usages))
+
+  // ── S637 (Nic): "Exclude suspiciously low or negative amounts." ──────────
+  //
+  // Negatives are already gone (a rolled-back meter is its own problem). What
+  // remains is the near-zero comparable: a spot that is occupied on paper but
+  // barely drawing — someone away for the month, or a space held for a tenant
+  // who has not moved in. RV 09 read 2 kWh against a real household's 120, and
+  // taking the plain minimum would have estimated a month of electricity at 42
+  // cents. That is the same near-free bill this rule exists to prevent, arrived
+  // at from the other direction.
+  //
+  // The floor is RELATIVE to the property's own cycle rather than a fixed
+  // number, because "suspiciously low" for electricity in July is not the same
+  // as for water in a park half full — and a hardcoded threshold would be wrong
+  // somewhere the day it shipped. A quarter of the median is low enough to keep
+  // a genuinely frugal household in the pool and high enough to drop a spot
+  // that is effectively empty.
+  //
+  // A TENTH, not a quarter. At Mountain View the occupied spots ran 120, 461,
+  // 592, 891 and 1259 kWh — a quarter of the median would have discarded the
+  // 120 and estimated Julie Kenyon at $96.81 off the next one up. But 120 is
+  // Randall Cox, a real household that simply uses little. The empty spot read
+  // 2. A tenth separates those two cleanly; a quarter punishes frugality.
+  const median = usages[Math.floor(usages.length / 2)]
+  const floor = median * 0.10
+  const credible = usages.filter(u => u >= floor)
+
+  // ── NOT BUILT YET (Nic, S637) — a meter that dies MID-month ──────────────
+  //
+  //   "Randall Cox may also have a meter that stopped working mid month... It's
+  //    tough to tell until the next month when we know if his turns at all.
+  //    Eventually I'd like it to flag somewhat consistent usage versus... takes
+  //    the history of that spot and sees that, hey, it was a lot higher — that
+  //    it would flag that one as broken mid month and charge the right amount."
+  //
+  // Everything above compares a spot against its NEIGHBOURS this cycle. It
+  // cannot see a meter that ran for two weeks and then stopped: the reading
+  // moved, so nothing here calls it stuck, and a half-month of usage bills as a
+  // full month. Catching that needs the spot's OWN history — several cycles of
+  // its usage, and a flag when this cycle falls well outside its own range.
+  //
+  // Deliberately deferred: one cycle of history is not a baseline, and guessing
+  // at a threshold now would produce false flags on every seasonal swing. Nic's
+  // words: "That's something for later on."
+
+  // If everything looked suspicious, the median is the honest answer — better a
+  // typical bill than one drawn from the emptiest spot on the property.
+  return Math.floor(credible.length > 0 ? credible[0] : median)
 }
 
 
@@ -543,7 +606,44 @@ export async function generateBillsForMeter(
   // end-of-month flow. Only individual submeters bill this way — RUBS pools
   // / flat / master have no per-unit odometer to substitute. Placed BEFORE
   // the cycle-reading fetch so a stuck/absent read never holds billing.
-  if (meter.billing_method === 'submeter' && meter.out_of_service) {
+  // ── S637 (Nic, DIRECTIVE): A STUCK METER ON AN OCCUPIED SPOT IS OUT OF SERVICE ──
+  //
+  //   "A meter with identical values and flagged as occupied needs to... those
+  //    two need to correlate that it's out of service."
+  //
+  // The estimation below has always worked — but only for a meter somebody had
+  // marked out_of_service BY HAND, and in practice nobody ever has: not one
+  // meter in the system carries the flag. So a submeter reading the identical
+  // number two cycles running billed ZERO instead of estimating, and Chris Ast
+  // paid a month's rent at RV 07 with no electricity on it at all.
+  //
+  // Occupied plus no movement is the correlation. A vacant spot reading zero is
+  // simply a vacant spot — 33 of them read zero this cycle and every one of
+  // those is correct. An OCCUPIED one cannot use nothing.
+  const occupiedHere = units.some((u: any) => u.status === 'active')
+  let stuckOnOccupied = false
+  if (meter.billing_method === 'submeter' && !meter.out_of_service && occupiedHere) {
+    const move = await queryOne<{ usage: string | null }>(`
+      SELECT (cyc.reading_value - pri.reading_value)::text AS usage
+        FROM (SELECT reading_value, reading_date, created_at
+                FROM utility_meter_readings
+               WHERE meter_id = $1 AND billing_cycle_month = $2
+                 AND reason = 'monthly_cycle'
+               ORDER BY reading_date DESC LIMIT 1) cyc
+        JOIN LATERAL (
+             SELECT reading_value FROM utility_meter_readings
+              WHERE meter_id = $1
+                AND (reading_date, created_at) < (cyc.reading_date, cyc.created_at)
+              ORDER BY reading_date DESC, created_at DESC LIMIT 1) pri ON TRUE
+    `, [meterId, cycleIso])
+    // IDENTICAL, not merely non-positive. A NEGATIVE delta is a meter that
+    // rolled back — a misread or a replaced head — and has its own handling
+    // below. Swallowing it here would bill an estimate for what is really a
+    // data-entry problem somebody needs to look at.
+    stuckOnOccupied = move?.usage != null && Number(move.usage) === 0
+  }
+
+  if (meter.billing_method === 'submeter' && (meter.out_of_service || stuckOnOccupied)) {
     const brokenUnit = units[0]
     const compUsage = await lowestComparableUsage({
       brokenMeterId: meterId, propertyId: meter.property_id,
@@ -1058,6 +1158,18 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
     if (inserted) billed = true
   }
   if (billed) await invoiceEndedLeaseBills(meterId, cycleIso)
+  // S639: a silent `billed: false` left the person at the meter with nothing to
+  // act on. The common cause is that this cycle was ALREADY billed off the
+  // monthly run — the run opens on the last business day, so a tenant who pulls
+  // out on the 31st is usually read twice in the same cycle. That is not an
+  // error (they were billed through the run's read; the last days fall to the
+  // landlord), but the reader has to be told, not left guessing. Still blind:
+  // a reason names the situation, never a reading value.
+  if (!billed) {
+    return { billed, reason: units.length === 0
+      ? 'this meter is not attached to a unit — nothing to bill'
+      : 'no new charge — this cycle was already billed for the unit (the monthly run read it), or the tenant does not owe this utility' }
+  }
   return { billed }
 }
 
@@ -1067,6 +1179,23 @@ export async function billMoveOutRead(meterId: string, readingId: string): Promi
 // of pull-out. Best-effort: a failure here never unwinds bill generation
 // (the deposit-return sweep remains the backstop). Dynamic import because
 // invoiceGeneration imports this module (ensureBillsForUnit).
+//
+// S639 (Nic, verbatim): "Read is taken the last fucking business day of the
+// month. Or if they happen to move out on the thirty first, it's when they
+// unplug and drive away. It's immediately so they can be billed. It's not the
+// next day or the day after that."
+//
+// The old gate here only invoiced when the lease was ALREADY expired/terminated
+// or its end_date had passed — so the ordinary case (tenant pulls out Dec 28, the
+// lease runs on paper through Dec 31) created the bill and then left it sitting
+// `unbilled` until the January 1 invoice run. That is exactly the wait Nic says
+// must not happen, and it also strands the charge past the deposit return.
+//
+// The gate was redundant caution: this function has exactly ONE caller,
+// billMoveOutRead, which only ever runs off a `move_out_final` read. Somebody
+// standing at the meter recording a final read IS the move-out — the lease's
+// paper end date has no say in whether the departing tenant can be billed today.
+// So every uninvoiced bill from that read is invoiced now, dated and due today.
 async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promise<void> {
   try {
     const ended = await query<{ lease_id: string }>(`
@@ -1075,8 +1204,7 @@ async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promis
         JOIN leases l ON l.id = ub.lease_id
        WHERE ub.meter_id = $1 AND ub.billing_cycle_month = $2
          AND ub.payment_id IS NULL AND ub.status IN ('unbilled', 'billed')
-         AND (l.status IN ('expired', 'terminated')
-              OR (l.end_date IS NOT NULL AND l.end_date <= CURRENT_DATE))
+         AND ub.lease_id IS NOT NULL
     `, [meterId, cycleIso])
     if (ended.length === 0) return
     const { generateFinalUtilityInvoice } = await import('../jobs/invoiceGeneration')
@@ -1567,6 +1695,73 @@ export async function releaseSuspendedChargesForLease(args: {
   const c = args.client
   const q: ManyFn = c ? (async (t, p) => (await c.query(t, p)).rows) as ManyFn : query
   const q1: OneFn = c ? (async (t, p) => (await c.query(t, p)).rows[0] ?? null) as OneFn : queryOne
+  // ── S638 (Nic, DIRECTIVE): ONBOARDING BILLS THE CYCLE AS EACH LEASE LANDS ──
+  //
+  //   "The onboarding phase needs to run the utilities as each lease is
+  //    generated and the initial charge is generated. After that, it's just a
+  //    monthly cycle."
+  //
+  // Releasing HELD charges only helps a unit that had a hold. A unit with
+  // nobody invited to it at billing time gets no hold at all — the run passes
+  // over it — so a resident invited afterwards is invisible to that cycle
+  // forever. Blanca Avalos was invited to RV 36 three hours after the Sept 2
+  // run and had no electric on her bill at all; so did Jeremy Parker at RV 49
+  // and Julie Kenyon at RV 04.
+  //
+  // Now the lease itself triggers the billing for its own unit: any cycle that
+  // has reads but produced no bill for this unit is generated here, with the
+  // lease in place so the charge attributes to the person who just signed.
+  // Idempotent — a cycle already billed is left alone by tryInsertBill.
+  try {
+    // Create the hold this unit never got, then fall straight through to the
+    // release below — so there is ONE mechanism that attaches a pre-lease
+    // utility charge to a new tenancy, not two that can drift.
+    //
+    // Deliberately does not go through generateBillsForMeter: that refuses a
+    // cycle no lease covers, which is exactly this case — the reads span a
+    // period before the resident signed. A released hold has always carried
+    // that convention ("used before the lease was signed").
+    await q(`
+      INSERT INTO suspended_utility_charges
+        (meter_id, unit_id, landlord_id, billing_cycle_month, utility_type,
+         usage_amount, charge_amount)
+      SELECT m.id, mu.unit_id, $2, r.billing_cycle_month, m.utility_type,
+             (cyc.reading_value - base.reading_value) * m.reading_multiplier,
+             ROUND((cyc.reading_value - base.reading_value) * m.reading_multiplier
+                   * COALESCE(m.rate_per_unit, pur.rate_per_unit, 0), 2)
+        FROM utility_meters m
+        JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $1
+        JOIN LATERAL (
+          SELECT DISTINCT billing_cycle_month FROM utility_meter_readings
+           WHERE meter_id = m.id) r ON TRUE
+        LEFT JOIN property_utility_rates pur
+               ON pur.property_id = m.property_id AND pur.utility_type = m.utility_type
+        JOIN LATERAL (
+          SELECT reading_value FROM utility_meter_readings
+           WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
+             AND reason = 'monthly_cycle'
+           ORDER BY reading_date DESC LIMIT 1) cyc ON TRUE
+        JOIN LATERAL (
+          SELECT reading_value FROM utility_meter_readings
+           WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
+             AND reason <> 'monthly_cycle'
+           ORDER BY reading_date ASC LIMIT 1) base ON TRUE
+       WHERE m.billing_method = 'submeter'
+         AND (cyc.reading_value - base.reading_value) > 0
+         AND NOT EXISTS (SELECT 1 FROM utility_bills b
+                          WHERE b.meter_id = m.id
+                            AND b.billing_cycle_month = r.billing_cycle_month)
+         AND NOT EXISTS (SELECT 1 FROM suspended_utility_charges sc
+                          WHERE sc.meter_id = m.id
+                            AND sc.billing_cycle_month = r.billing_cycle_month)`,
+      [args.unitId, args.landlordId])
+  } catch (e) {
+    // Never block a signing on this — the lease and its rent matter more, and
+    // the monthly run is still there behind it.
+    logger.error({ err: e, unitId: args.unitId },
+      '[utility] could not raise the open cycle at lease signing')
+  }
+
   const held = await q<any>(`
     SELECT * FROM suspended_utility_charges
      WHERE unit_id = $1 AND released_at IS NULL AND cancelled_at IS NULL

@@ -48,7 +48,41 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
       LEFT JOIN (
         SELECT invoice_id, SUM(amount) AS paid
           FROM payments
-         WHERE status = 'settled' AND invoice_id IS NOT NULL
+         -- S637 (Nic): MONEY IN FLIGHT IS NOT OUTSTANDING.
+         --
+         --   "I thought we decided it was gonna be marked settled or paid in
+         --    the system, or at least not outstanding, at the time the attempt
+         --    is made to pay. And if it ever fails, it shows as outstanding and
+         --    reupdated with any late fees to that point in time."
+         --
+         -- An ACH debit sits 'processing' for about four business days. Counting
+         -- it as owed for those four days put Randall Cox's $520.20 on the
+         -- outstanding list the whole time he was waiting, so the list could not
+         -- be worked down to zero and a paid resident looked delinquent.
+         --
+         -- Safe to net out here because a failure is not silent: the row flips
+         -- to 'failed', the balance reappears, and jobs/lateFees.ts already
+         -- suppresses late fees only while a payment is genuinely in flight —
+         -- so fees resume from the real due date if the debit bounces.
+         -- ── S638 (Nic, DIRECTIVE): WORK TRADE IS NOT AN OUTSTANDING BALANCE ──
+         --
+         --   "The ones that are on work trade need to not show in the
+         --    outstanding balances list. That's a false number... while it's in
+         --    a suspended state, don't have it show on this table. Don't have it
+         --    be part of these calculations."
+         --
+         -- The invoice total DOES include suspended rows — RV 45 reads $776.11,
+         -- all of it suspended and none of it owed — so they have to be netted
+         -- here or the landlord is shown money nobody owes. (An earlier note
+         -- here claimed the totals already excluded them; that was read off an
+         -- older invoice and was wrong.)
+         --
+         -- A work-trade DEFICIT is different and still belongs on this list: at
+         -- month close, hours that were not worked bill in cash as an ordinary
+         -- charge with no suspension on it, so it lands here the moment it
+         -- becomes real money.
+         WHERE (status IN ('settled', 'processing') OR work_trade_suspended_at IS NOT NULL)
+           AND invoice_id IS NOT NULL
          GROUP BY invoice_id
       ) pd ON pd.invoice_id = i.id
       -- Credit balance is per TENANT, while this groups many invoices per
@@ -107,7 +141,41 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
         LEFT JOIN (
           SELECT invoice_id, SUM(amount) AS paid
             FROM payments
-           WHERE status = 'settled' AND invoice_id IS NOT NULL
+           -- S637 (Nic): MONEY IN FLIGHT IS NOT OUTSTANDING.
+         --
+         --   "I thought we decided it was gonna be marked settled or paid in
+         --    the system, or at least not outstanding, at the time the attempt
+         --    is made to pay. And if it ever fails, it shows as outstanding and
+         --    reupdated with any late fees to that point in time."
+         --
+         -- An ACH debit sits 'processing' for about four business days. Counting
+         -- it as owed for those four days put Randall Cox's $520.20 on the
+         -- outstanding list the whole time he was waiting, so the list could not
+         -- be worked down to zero and a paid resident looked delinquent.
+         --
+         -- Safe to net out here because a failure is not silent: the row flips
+         -- to 'failed', the balance reappears, and jobs/lateFees.ts already
+         -- suppresses late fees only while a payment is genuinely in flight —
+         -- so fees resume from the real due date if the debit bounces.
+         -- ── S638 (Nic, DIRECTIVE): WORK TRADE IS NOT AN OUTSTANDING BALANCE ──
+         --
+         --   "The ones that are on work trade need to not show in the
+         --    outstanding balances list. That's a false number... while it's in
+         --    a suspended state, don't have it show on this table. Don't have it
+         --    be part of these calculations."
+         --
+         -- The invoice total DOES include suspended rows — RV 45 reads $776.11,
+         -- all of it suspended and none of it owed — so they have to be netted
+         -- here or the landlord is shown money nobody owes. (An earlier note
+         -- here claimed the totals already excluded them; that was read off an
+         -- older invoice and was wrong.)
+         --
+         -- A work-trade DEFICIT is different and still belongs on this list: at
+         -- month close, hours that were not worked bill in cash as an ordinary
+         -- charge with no suspension on it, so it lands here the moment it
+         -- becomes real money.
+         WHERE (status IN ('settled', 'processing') OR work_trade_suspended_at IS NOT NULL)
+           AND invoice_id IS NOT NULL
            GROUP BY invoice_id
         ) pd ON pd.invoice_id = i.id
        WHERE i.tenant_id = $1
