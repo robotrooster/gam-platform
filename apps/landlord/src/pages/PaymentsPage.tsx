@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          type ManualPaymentMethod,
          TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
-import { apiGet, apiPost } from '../lib/api'
+import { api, apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle, Gift, ChevronRight, ChevronDown } from 'lucide-react'
@@ -635,7 +635,18 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
 }
 
 export function PaymentsPage() {
-  const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
+  // ── S639 (Nic): "the payments tab, his name is removed from" ───────────────
+  //
+  // This asked for the default page of 50 and threw away the `total` the server
+  // sent back, so with 52 payments two of them — Steven Starr's rent and his
+  // utilities — simply were not on the page the desk collects money from, with
+  // nothing on screen to say so. Ask for the whole set, and if there is ever
+  // more than that, SAY so rather than quietly showing part of the money.
+  const { data: paymentsRes } = useQuery<{ data: any[]; total: number }>(
+    'payments', () => api.get('/payments?limit=1000').then(r => r.data as any))
+  const payments: any[] = paymentsRes?.data ?? []
+  const paymentsTotal = Number(paymentsRes?.total ?? payments.length)
+  const isLoading = paymentsRes === undefined
   const [selected, setSelected] = useState<any>(null)
   // S637: taking money at the counter is its own dialog — see TakePaymentModal.
   // Payment Detail stays what it is: the forensic view of one processed
@@ -815,6 +826,19 @@ export function PaymentsPage() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(22,163,74,.1)', border: '1px solid #16a34a', borderRadius: 8, padding: '8px 12px', fontSize: '.8rem', marginBottom: 14 }}>
           <CheckCircle size={15} style={{ color: '#16a34a' }} /> {creditNotice}
           <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setCreditNotice(null)}><X size={13} /></button>
+        </div>
+      )}
+
+      {/* S639: if the list is ever cut short again, the page says so. A money
+          screen that quietly shows part of the money is worse than one that
+          errors — nobody goes looking for a row they do not know is missing. */}
+      {paymentsTotal > payments.length && (
+        <div className="alert alert-danger" style={{ marginBottom: 12 }}>
+          <AlertTriangle size={16} />
+          <div>
+            Showing {payments.length} of {paymentsTotal} payments — {paymentsTotal - payments.length} are
+            not on this page. Narrow the filters, or tell Nic so the page limit can be raised.
+          </div>
         </div>
       )}
 

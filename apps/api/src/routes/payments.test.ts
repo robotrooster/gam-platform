@@ -1739,3 +1739,90 @@ describe('S638 a credit reduces what the desk collects', () => {
     expect(p.status).toBe('pending')
   })
 })
+
+// ─── S639: A TIE IS NOT AN ORDER ────────────────────────────────────────────
+//
+// Nic: "on the outstanding balances tab six leases that are all overdue, and on
+// the payments tab it's only showing five... The outstanding balance still has
+// Steven Starr. The payments tab, his name is removed from."
+//
+// Rent and utilities are all billed on the 1st, so every one of Nic's 52
+// payments carried the SAME due_date. `ORDER BY due_date DESC` was therefore one
+// flat tie, LIMIT 50 dropped an arbitrary two of them, and Steven Starr's $589
+// rent and $264.39 utilities were missing from the screen the desk collects
+// money from — with nothing on the page to say so.
+describe('S639 GET /api/payments — paging is stable when every due_date ties', () => {
+  it('never loses or repeats a row across pages', async () => {
+    const f = await seed()
+    // Nic's real shape: everything due the same day. Utilities, because one
+    // active RENT charge per unit per due date is uniquely constrained — which
+    // is correct, and is not what broke.
+    const ids = new Set<string>()
+    for (let i = 0; i < 12; i++) {
+      ids.add(await seedPayment({
+        unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid,
+        type: 'utility', amount: 100 + i, dueOffsetMonths: 0,
+      }))
+    }
+    const app = buildApp()
+    const p1 = await request(app).get('/api/payments?limit=5&page=1')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    const p2 = await request(app).get('/api/payments?limit=5&page=2')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    const p3 = await request(app).get('/api/payments?limit=5&page=3')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(p1.status).toBe(200)
+    expect(p1.body.total).toBe(12)
+
+    const seen = [...p1.body.data, ...p2.body.data, ...p3.body.data].map((r: any) => r.id)
+    // Nothing shown twice…
+    expect(new Set(seen).size).toBe(seen.length)
+    // …and nothing missed. This is the assertion that was false before: two of
+    // Nic's rows existed and appeared on no page at all.
+    for (const id of ids) expect(seen).toContain(id)
+  })
+
+  it('the same request twice returns the same order', async () => {
+    const f = await seed()
+    for (let i = 0; i < 8; i++) {
+      await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid,
+                          type: 'utility', amount: 200 + i, dueOffsetMonths: 0 })
+    }
+    const app = buildApp()
+    const a = await request(app).get('/api/payments?limit=4&page=1')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    const b = await request(app).get('/api/payments?limit=4&page=1')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(a.body.data.map((r: any) => r.id)).toEqual(b.body.data.map((r: any) => r.id))
+  })
+
+  it('reports the true total so the page can tell it is not showing everything', async () => {
+    const f = await seed()
+    for (let i = 0; i < 7; i++) {
+      await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid,
+                          type: 'utility', amount: 300 + i, dueOffsetMonths: 0 })
+    }
+    const res = await request(buildApp()).get('/api/payments?limit=3')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.body.data.length).toBe(3)
+    expect(res.body.total).toBe(7)
+    expect(res.body.totalPages).toBe(3)
+  })
+
+  it('a caller can ask for the whole set, and the limit is clamped', async () => {
+    const f = await seed()
+    for (let i = 0; i < 6; i++) {
+      await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid,
+                          type: 'utility', amount: 400 + i, dueOffsetMonths: 0 })
+    }
+    const app = buildApp()
+    const all = await request(app).get('/api/payments?limit=1000')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(all.body.data.length).toBe(6)
+    // A query string must not be able to turn this into an unbounded scan.
+    const huge = await request(app).get('/api/payments?limit=999999')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(huge.status).toBe(200)
+    expect(huge.body.totalPages).toBe(1)
+  })
+})

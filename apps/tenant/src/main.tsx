@@ -1157,6 +1157,7 @@ function LeaseSigningTurnNotice({ me }: { me: any }) {
   const who = me?.pendingLeaseWaitingOnName
   if (!me?.pendingLeaseDocumentId || !who) return null
   const mine = !!me.pendingLeaseWaitingOnIsMe
+  const roster: any[] = Array.isArray(me.pendingLeaseSigners) ? me.pendingLeaseSigners : []
   const landlordTurn = me.pendingLeaseWaitingOnRole === 'landlord'
     || me.pendingLeaseWaitingOnRole === 'witness'
   return (
@@ -1181,6 +1182,32 @@ function LeaseSigningTurnNotice({ me }: { me: any }) {
           along faster than a call to the office.</>
         )}
       </div>
+      {/* S639 (Nic): "does the middle tenant project their name onto the first
+          and third tenant so that everybody can know full transparency where
+          everything's at?" The next name alone is only the front of the queue.
+          The whole roster, in signing order, lets any one of three adults see
+          the entire state of their own lease without calling the office. */}
+      {roster.length > 1 && (
+        <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {roster.map((r: any, i: number) => {
+            const isNext = !r.signed && roster.findIndex((x: any) => !x.signed) === i
+            return (
+              <span key={i} style={{
+                fontSize: '.78rem', padding: '3px 9px', borderRadius: 999,
+                border: `1px solid ${r.signed ? 'rgba(38,167,90,.35)' : isNext ? 'rgba(201,162,39,.45)' : 'var(--border-0)'}`,
+                background: r.signed ? 'rgba(38,167,90,.08)' : isNext ? 'rgba(201,162,39,.10)' : 'transparent',
+                color: r.signed ? 'var(--green, #5fbf7f)' : isNext ? 'var(--gold)' : 'var(--text-3)',
+                fontWeight: r.signed || isNext ? 600 : 500,
+              }}>
+                {r.signed ? '✓ ' : isNext ? '→ ' : ''}
+                {r.isMe ? 'You' : r.name}
+                {r.role === 'landlord' ? ' (landlord)' : r.role === 'witness' ? ' (witness)' : ''}
+                {r.signed ? ' signed' : isNext ? ' — signing now' : ' — after'}
+              </span>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

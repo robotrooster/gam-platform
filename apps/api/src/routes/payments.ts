@@ -60,8 +60,25 @@ paymentsRouter.post('/quote', async (req, res, next) => {
 // GET /api/payments — filtered by landlord or tenant
 paymentsRouter.get('/', async (req, res, next) => {
   try {
+    // ── S639: A TIE IS NOT AN ORDER ────────────────────────────────────────
+    //
+    // Nic: "on the outstanding balances tab six leases that are all overdue,
+    // and on the payments tab it's only showing five... The outstanding balance
+    // still has Steven Starr. The payments tab, his name is removed from."
+    //
+    // 52 payments, LIMIT 50, and every single one of them due 2026-09-01 —
+    // rent and utilities are all billed on the 1st, so `ORDER BY due_date DESC`
+    // was one flat tie across the whole table. Postgres may return a tie in any
+    // order it likes, so which two rows fell off the page was arbitrary and
+    // could differ between refreshes. Steven Starr's $589 rent and $264.39
+    // utilities were two of them, on the screen the desk collects money from.
+    //
+    // Two things were wrong and both are fixed: the sort now has a deterministic
+    // tiebreaker, and the caller can ask for the whole set (clamped, so a large
+    // portfolio cannot be turned into a table scan by a query string).
     const { status, type, from, to, page = '1', limit = '50' } = req.query as Record<string,string>
-    const offset = (parseInt(page) - 1) * parseInt(limit)
+    const limitN = Math.min(Math.max(parseInt(limit) || 50, 1), 1000)
+    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limitN
     const conditions: string[] = []
     const params: any[] = []
     let pi = 1
@@ -105,7 +122,7 @@ paymentsRouter.get('/', async (req, res, next) => {
     const [{ total }] = await query<any>(
       `SELECT COUNT(*)::int AS total FROM payments p ${where}`, params
     )
-    params.push(parseInt(limit), offset)
+    params.push(limitN, offset)
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name AS property_name,
         tu.first_name AS tenant_first, tu.last_name AS tenant_last,
@@ -136,10 +153,13 @@ paymentsRouter.get('/', async (req, res, next) => {
       LEFT JOIN tenants t ON t.id = p.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
       ${where}
-      ORDER BY p.due_date DESC
+      -- S639: created_at then id break the due-date tie, so the same query
+      -- returns the same rows in the same order every time. Without this a
+      -- paginated list can show one row twice and hide another entirely.
+      ORDER BY p.due_date DESC, p.created_at DESC, p.id
       LIMIT $${pi} OFFSET $${pi+1}`, params
     )
-    res.json({ success: true, data: payments, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) })
+    res.json({ success: true, data: payments, total, page: Math.max(parseInt(page) || 1, 1), totalPages: Math.ceil(total / limitN) })
   } catch (e) { next(e) }
 })
 

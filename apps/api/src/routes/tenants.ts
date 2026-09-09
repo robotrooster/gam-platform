@@ -532,7 +532,16 @@ tenantsRouter.get('/me', async (req, res, next) => {
         -- is three adults each phoning the office to ask the same question.
         sig.name             AS pending_lease_waiting_on_name,
         sig.role             AS pending_lease_waiting_on_role,
-        (sig.user_id = u.id) AS pending_lease_waiting_on_is_me
+        (sig.user_id = u.id) AS pending_lease_waiting_on_is_me,
+        -- S639 (Nic): "does the middle tenant project their name onto the first
+        -- and third tenant so that everybody can know full transparency where
+        -- everything's at?"
+        --
+        -- Yes — and the next name alone only tells you the front of the queue.
+        -- The whole roster in signing order, with who has signed, lets any one
+        -- of three adults see the entire state of their own lease: what is done,
+        -- who is holding it, and who comes after. Same view the landlord has.
+        roster.signers       AS pending_lease_signers
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN LATERAL (
@@ -613,6 +622,20 @@ tenantsRouter.get('/me', async (req, res, next) => {
          ORDER BY lds2.order_index
          LIMIT 1
       ) sig ON TRUE
+      -- S639: every signer on that same document, in signing order.
+      LEFT JOIN LATERAL (
+        SELECT JSON_AGG(JSON_BUILD_OBJECT(
+                 'name', r.name, 'role', r.role,
+                 'signed', r.status = 'signed',
+                 'isMe', r.user_id = u.id
+               ) ORDER BY r.order_index) AS signers
+          FROM lease_document_signers r
+         WHERE r.document_id = (
+                 SELECT d.id FROM lease_document_signers lds4
+                   JOIN lease_documents d ON d.id = lds4.document_id
+                  WHERE lds4.user_id = u.id AND d.status IN ('sent','in_progress')
+                  ORDER BY d.created_at DESC LIMIT 1)
+      ) roster ON TRUE
       WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })
