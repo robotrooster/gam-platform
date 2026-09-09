@@ -518,7 +518,21 @@ tenantsRouter.get('/me', async (req, res, next) => {
         ob.unit_number       AS onboarding_unit_number,
         ob.property_name     AS onboarding_property_name,
         ob.household_pending AS onboarding_household_pending,
-        ob.screening_waived  AS onboarding_screening_waived
+        ob.household_pending_names AS onboarding_household_pending_names,
+        ob.screening_waived  AS onboarding_screening_waived,
+        -- S639 (Nic): "does the person from that household get the name of who
+        -- the next signer is that it's waiting on?... That way the household can
+        -- help propel itself to completion instead of each individual person
+        -- keep trying to talk to the office."
+        --
+        -- Who the open lease document is actually waiting on — the lowest
+        -- unsigned signer in signing order, the same rule the e-sign page and
+        -- the reminder job use. Names only, and only people on this person's own
+        -- unit: a household already knows who lives there, and the alternative
+        -- is three adults each phoning the office to ask the same question.
+        sig.name             AS pending_lease_waiting_on_name,
+        sig.role             AS pending_lease_waiting_on_role,
+        (sig.user_id = u.id) AS pending_lease_waiting_on_is_me
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN LATERAL (
@@ -560,7 +574,20 @@ tenantsRouter.get('/me', async (req, res, next) => {
                    AND o.accepted_at IS NULL) AS household_pending,
                EXISTS (SELECT 1 FROM pending_tenant_intents w
                         WHERE w.tenant_id = t.id AND w.screening_waived
-                          AND w.cancelled_at IS NULL) AS screening_waived
+                          AND w.cancelled_at IS NULL) AS screening_waived,
+               -- S639: by name, so the household can chase each other rather
+               -- than the office. Excludes the person asking — telling somebody
+               -- they are waiting on themselves is how you lose them.
+               (SELECT COALESCE(
+                   ARRAY_AGG(TRIM(CONCAT_WS(' ', ou.first_name, ou.last_name))
+                             ORDER BY ou.first_name), '{}')
+                  FROM pending_tenant_intents o
+                  JOIN tenants ot ON ot.id = o.tenant_id
+                  JOIN users ou ON ou.id = ot.user_id
+                 WHERE o.unit_id = ob2.unit_id
+                   AND o.cancelled_at IS NULL AND o.resolved_at IS NULL
+                   AND o.accepted_at IS NULL
+                   AND ot.id <> t.id) AS household_pending_names
           FROM pending_tenant_intents ob2
           JOIN units obu      ON obu.id = ob2.unit_id
           JOIN properties obp ON obp.id = obu.property_id
@@ -572,6 +599,20 @@ tenantsRouter.get('/me', async (req, res, next) => {
          ORDER BY ob2.created_at DESC
          LIMIT 1
       ) ob ON TRUE
+      -- S639: the next person owed a signature on the lease document this
+      -- person is a signer on.
+      LEFT JOIN LATERAL (
+        SELECT lds2.name, lds2.role, lds2.user_id
+          FROM lease_document_signers lds2
+         WHERE lds2.document_id = (
+                 SELECT d.id FROM lease_document_signers lds3
+                   JOIN lease_documents d ON d.id = lds3.document_id
+                  WHERE lds3.user_id = u.id AND d.status IN ('sent','in_progress')
+                  ORDER BY d.created_at DESC LIMIT 1)
+           AND lds2.status <> 'signed'
+         ORDER BY lds2.order_index
+         LIMIT 1
+      ) sig ON TRUE
       WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })

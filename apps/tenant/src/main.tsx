@@ -1134,9 +1134,61 @@ function UtilityServiceHome({ me, firstName }: { me: any; firstName?: string }) 
 // not about to be charged. The money sentence is unconditional for an invited
 // resident — the landlord onboarded them, and a screening they were never asked
 // to take is not something to leave ambiguous.
+/** "Ana", "Ana and Luis", "Ana, Luis and Marta" — a sentence, not a list. */
+function joinNames(list: string[]): string {
+  if (list.length === 1) return list[0]
+  if (list.length === 2) return `${list[0]} and ${list[1]}`
+  return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`
+}
+
+// ── S639 (Nic): WHOSE TURN IS IT ─────────────────────────────────────────────
+//
+// "If there's, like, three adults in the system, they can see who is supposed to
+// be next. That way the household can help propel itself to completion instead
+// of each individual person keep trying to talk to the office."
+//
+// Signing runs in order, so at any moment exactly one person is holding the
+// lease up. The household could not see who, so each of them phoned the office
+// to ask — and the answer was always "one of the other people you live with".
+// Naming them hands the chase to the people who can actually do something about
+// it. A tenant who has already signed still sees this: knowing they are done and
+// who is next is the whole point.
+function LeaseSigningTurnNotice({ me }: { me: any }) {
+  const who = me?.pendingLeaseWaitingOnName
+  if (!me?.pendingLeaseDocumentId || !who) return null
+  const mine = !!me.pendingLeaseWaitingOnIsMe
+  const landlordTurn = me.pendingLeaseWaitingOnRole === 'landlord'
+    || me.pendingLeaseWaitingOnRole === 'witness'
+  return (
+    <div style={{
+      background: mine ? 'rgba(201,162,39,.10)' : 'rgba(38,167,90,.07)',
+      border: `1px solid ${mine ? 'rgba(201,162,39,.35)' : 'rgba(38,167,90,.28)'}`,
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+    }}>
+      <div style={{ fontWeight: 700, color: mine ? 'var(--gold)' : 'var(--text-0)', marginBottom: 4 }}>
+        {mine ? 'Your lease is ready for your signature' : 'Your lease is waiting on someone else'}
+      </div>
+      <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+        {mine ? (
+          <>You're next to sign. Everyone after you is waiting on this, so the sooner it's
+          done the sooner your lease is final.</>
+        ) : landlordTurn ? (
+          <>Your part is done. It's with your landlord now for their signature — nothing
+          further is needed from you.</>
+        ) : (
+          <>It's <strong>{who}</strong>'s turn to sign next. Signing goes in order, so the
+          lease reaches everyone after them once they're done — a nudge from you will move it
+          along faster than a call to the office.</>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function OnboardingWaitingNotice({ me }: { me: any }) {
   if (!me?.onboardingUnitNumber) return null
   const waiting = Number(me.onboardingHouseholdPending || 0)
+  const names: string[] = (me.onboardingHouseholdPendingNames || []).filter(Boolean)
   return (
     <div style={{
       background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.32)',
@@ -1147,10 +1199,16 @@ function OnboardingWaitingNotice({ me }: { me: any }) {
       </div>
       <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
         {waiting > 0 ? (
+          // S639 (Nic): "does the person from that household get the name of who
+          // the next signer is that it's waiting on?... That way the household
+          // can help propel itself to completion instead of each individual
+          // person keep trying to talk to the office." Naming them turns a
+          // dead wait into something the household can act on themselves.
           <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is drafted and sent for
-          signature as soon as {waiting === 1 ? 'the other person' : `all ${waiting} other people`} on
-          your household {waiting === 1 ? 'accepts' : 'accept'} their portal invite. We'll email
-          you the moment it's ready to sign.</>
+          signature as soon as {names.length > 0 ? <strong>{joinNames(names)}</strong>
+            : (waiting === 1 ? 'the other person on your household' : `all ${waiting} other people on your household`)}
+          {' '}{waiting === 1 ? 'accepts' : 'accept'} their portal invite. We'll email you the
+          moment it's ready to sign.</>
         ) : (
           <>Your lease for <strong>{me.onboardingUnitNumber}</strong> is being prepared. We'll
           email you the moment it's ready to sign — nothing else is needed from you right now.</>
@@ -1198,6 +1256,7 @@ function HomePage() {
 
       <ServiceOutageBanner />
       <OnboardingWaitingNotice me={me} />
+      <LeaseSigningTurnNotice me={me} />
       <HomeAlerts />
 
       {/* S542: private platform questionnaire — landlord never sees it. */}
