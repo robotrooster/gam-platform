@@ -77,7 +77,17 @@ export function DashboardPage() {
       return months[d.getMonth()]
     })
     const apiTrend: any[] = (stats as any)?.trend || []
-    return slots.map(m => ({ month: m, revenue: apiTrend.find((r:any) => r.month === m)?.revenue || 0 }))
+    return slots.map(m => {
+      const r = apiTrend.find((x:any) => x.month === m)
+      // S639: rent and everything else, so the tooltip can explain why a bar is
+      // taller than the Collected This Month card (which counts rent only).
+      return {
+        month: m,
+        revenue: r?.revenue || 0,
+        rentRevenue: r?.rentRevenue || 0,
+        otherRevenue: r?.otherRevenue || 0,
+      }
+    })
   })()
 
   // Platform fee: authoritative per-property number from the API — $2/billable
@@ -615,9 +625,22 @@ function PropertyHealthMonitor({ months, expected, collected }: { months: { mont
           </div>
         ) : (
           <div className="phm-tip" style={{ left: `clamp(62px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 62px))` }}>
+            {/* S639 (Nic): "when I hover over September's spike it says
+                $8,915.95, but the KPI card only shows $8,020. That's a nine
+                hundred dollar difference, and I'm trying to figure out why."
+                Both were right — this line is ALL money collected, the card is
+                rent only, and the $895.95 was utilities. Neither said which, so
+                the two numbers just looked broken. This one says. */}
             <div className="phm-tip-month">{data[hoverIdx].month || '—'}</div>
             <div className="phm-tip-val" style={{ color: status.color }}>{fmt(vals[hoverIdx])}</div>
-            <div className="phm-tip-sub">collected · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+            {(data[hoverIdx] as any).otherRevenue > 0 ? (
+              <div className="phm-tip-sub">
+                {fmt((data[hoverIdx] as any).rentRevenue)} rent
+                {' + '}{fmt((data[hoverIdx] as any).otherRevenue)} utilities &amp; fees
+              </div>
+            ) : (
+              <div className="phm-tip-sub">all collections · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+            )}
           </div>
         )}
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={190} preserveAspectRatio="none"

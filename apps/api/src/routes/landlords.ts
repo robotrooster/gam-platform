@@ -725,19 +725,43 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       WHERE d.landlord_id = ANY($1) AND d.status='pending'`, [scopeIds])
     // disbursements carry no unit or property — a payout is an entity-level
     // movement of money, so it stays blended even when a property is chosen.
-    // Real monthly revenue trend (last 6 months)
+    // ── S639: THE TREND AND THE KPI CARD HAVE TO AGREE ─────────────────────
+    //
+    // Nic: "my property health, when I hover over September's spike, says
+    // $8,915.95, but the KPI card only shows collected this month $8,020. That's
+    // a nine hundred dollar difference, and I'm trying to figure out why."
+    //
+    // Three separate disagreements with collected_mtd below, only one of which
+    // was biting: this summed EVERY payment type while the card counts rent
+    // only. The $895.95 was 14 settled utility payments — both figures right,
+    // neither one labelled. The trend is a REVENUE line and should keep counting
+    // everything; it now returns the split so the tooltip can say so instead of
+    // silently contradicting the card.
+    //
+    // The other two were latent and are fixed here:
+    //   · status IN ('completed','settled') — 'completed' is not a payment
+    //     status and never has been (settled / pending / processing are), so the
+    //     extra value did nothing but suggest a state that does not exist.
+    //   · bucketed by created_at — the month a charge ROW was made, not the
+    //     month the money arrived. ACH takes about four business days, so rent
+    //     created on the 30th and settled on the 3rd belongs to the next month
+    //     and was being drawn into this one. Nothing crosses a boundary in the
+    //     data today, which is luck rather than design; at month end it would
+    //     have inflated the closing month and hollowed out the new one.
     const trend = await query<any>(`
-      SELECT 
-        TO_CHAR(DATE_TRUNC('month', p.created_at), 'Mon') as month,
-        COALESCE(SUM(p.amount),0)::float as revenue
+      SELECT
+        TO_CHAR(DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at)), 'Mon') as month,
+        COALESCE(SUM(p.amount),0)::float as revenue,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.type = 'rent'), 0)::float as rent_revenue,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.type <> 'rent'), 0)::float as other_revenue
       FROM payments p
       WHERE p.landlord_id = ANY($1)
-        AND p.status IN ('completed','settled')
-        AND p.created_at >= NOW() - INTERVAL '6 months'
+        AND p.status = 'settled'
+        AND COALESCE(p.settled_at, p.created_at) >= NOW() - INTERVAL '6 months'
         AND ($2::uuid IS NULL OR p.unit_id IN (
               SELECT id FROM units WHERE property_id = $2))
-      GROUP BY DATE_TRUNC('month', p.created_at)
-      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [scopeIds, propertyFilter])
+      GROUP BY DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at))
+      ORDER BY DATE_TRUNC('month', COALESCE(p.settled_at, p.created_at)) ASC`, [scopeIds, propertyFilter])
 
     // Real maintenance stats
     const [maintenance] = await query<any>(`
