@@ -24,6 +24,7 @@ import fs from 'fs'
 import Stripe from 'stripe'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
+import { emailScreeningApplyLink } from '../services/email'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
@@ -609,6 +610,21 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         SET provider_ref=$1, applicant_redirect_url=$2, status=$3, failure_reason=$4, ssn_encrypted=NULL
         WHERE id=$5`,
         [initRes.providerRef || null, initRes.applicantRedirectUrl || null, initRes.status, initRes.failureReason || null, check!.id])
+      // S639: mail the applicant their own link. Checkr Tenant collects the SSN
+      // and the FCRA consent on its own hosted form, so an order is not a
+      // screening until the applicant opens it — and until now that link existed
+      // only in the browser response. Anyone who paid and then closed the tab had
+      // no way back to what they had just bought. Best-effort: a mail failure
+      // must not undo an order that exists.
+      if (initRes.applicantRedirectUrl) {
+        try {
+          await emailScreeningApplyLink((req as any).user.email, {
+            firstName,
+            propertyName: screeningProperty?.name || null,
+            applyUrl: initRes.applicantRedirectUrl,
+          }, { landlordId: landlordId || undefined, backgroundCheckId: check!.id })
+        } catch (e) { logger.error({ err: e }, '[EMAIL screening_apply_link]') }
+      }
     } catch (e) {
       logger.error({ err: e }, '[PROVIDER INITIATE]')
       await query("UPDATE background_checks SET status='failed', failure_reason=$1 WHERE id=$2",

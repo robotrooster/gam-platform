@@ -2304,3 +2304,51 @@ export async function emailBalanceDue(
     'support',
   )
 }
+
+// ── S639: THE APPLICANT NEEDS THEIR OWN SCREENING LINK ───────────────────────
+//
+// Checkr Tenant collects the SSN and the FCRA consent on its OWN hosted form,
+// so an order is not a screening until the applicant opens that link. We
+// returned the link to the browser for display and emailed nobody but the
+// landlord — so an applicant who paid, closed the tab, and walked away had no
+// route back to the thing they had just paid for.
+//
+// Anastacio Erreguin paid $44.99 on 2026-09-04. His order failed because Checkr
+// had no card on file, and when it was re-placed five days later the only email
+// he had ever received from GAM was a sign-in code. He could not have finished
+// if he wanted to.
+export async function emailScreeningApplyLink(
+  to: string,
+  args: {
+    firstName: string
+    propertyName?: string | null
+    applyUrl: string
+    /** Set when the order was placed some time after they paid. */
+    delayed?: boolean
+  },
+  ctx?: { landlordId?: string; backgroundCheckId?: string },
+): Promise<string | null> {
+  return await send(to, 'Finish your background check — one step left',
+    base(
+      h('One Step Left on Your Application') +
+      p(`Hi ${args.firstName || 'there'},`) +
+      p(args.delayed
+        ? `Your payment went through and your background check is now open${args.propertyName ? ` for <strong style="color:#eef1f8">${args.propertyName}</strong>` : ''}. Sorry for the wait — that was on our end, not yours, and there is nothing more to pay.`
+        : `Thanks — your payment went through and your background check is open${args.propertyName ? ` for <strong style="color:#eef1f8">${args.propertyName}</strong>` : ''}.`) +
+      p('Our screening partner Checkr handles the last step on their own secure form. They will ask for your Social Security number and your consent — we never see or store it.') +
+      btn('Finish my background check', args.applyUrl) +
+      `<div style="margin-top:14px;font-size:.78rem;color:#7a8aaa">
+         If the button does not work, paste this into your browser:<br/>
+         <span style="color:#b8c4d8;word-break:break-all">${args.applyUrl}</span>
+       </div>` +
+      p('Nothing happens until you complete it, so please do it when you have a couple of minutes.')
+    ),
+    {
+      category: 'screening_apply_link',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
+      relatedEntityId: ctx?.backgroundCheckId ?? null,
+    },
+    'support',
+  )
+}

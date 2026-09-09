@@ -643,12 +643,40 @@ function IntentCard({
                 </span>
               )
               if (st === 'accepted') return (
-                <span style={{ color: 'var(--green)' }}>Accepted — lease to come</span>
+                <span style={{ color: 'var(--green)' }}>Accepted</span>
               )
               if (st === 'not_invited') return (
                 <span style={{ color: 'var(--red)', fontWeight: 600 }}>No invite sent yet</span>
               )
               return null
+            })()}
+            {/* S639 (Nic): "me sending it and them accepting it is two different
+                states. I need you to mark it how it really was." Accepting is
+                not the end of the process, and one word was standing in for the
+                whole pipeline — Dakota Lane read "accepted" while what mattered
+                was that his lease had been signed by Nic and had sat unsigned by
+                Dakota for a week. The lease stage sits beside the invite state
+                rather than replacing it: one says whether we reached them, the
+                other says what the next move is. */}
+            {(() => {
+              const ds = (intent as any).leaseDocStatus
+              if (!ds) return null
+              if (ds === 'completed') return (
+                <span style={{ color: 'var(--green)', fontWeight: 600 }}>Lease signed</span>
+              )
+              if (ds === 'voided') return (
+                <span style={{ color: 'var(--red)', fontWeight: 600 }}>Lease voided — needs re-sending</span>
+              )
+              const role = (intent as any).leaseWaitingOnRole
+              const who = (intent as any).leaseWaitingOnName
+              if (!role) return <span style={{ color: 'var(--gold)' }}>Lease drafted</span>
+              return (
+                <span style={{ color: 'var(--gold)', fontWeight: 600 }}>
+                  {role === 'landlord' || role === 'witness'
+                    ? `Lease waiting on YOU to sign`
+                    : `Lease sent — waiting on ${who || 'them'} to sign`}
+                </span>
+              )
             })()}
             <span style={{ color: 'var(--text-3)' }}>
               Added {new Date(intent.createdAt).toLocaleDateString()}

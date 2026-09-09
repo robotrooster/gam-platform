@@ -2686,6 +2686,24 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- lands in no property's list and is chased by nobody.
          COALESCE(pr.id, wpr.id)     AS filter_property_id,
          COALESCE(pr.name, wpr.name) AS filter_property_name,
+         -- ── S639 (Nic): ACCEPTED IS NOT THE END OF THE STORY ───────────────
+         --
+         --   "me sending it and them accepting it is two different states. I
+         --    need you to mark it how it really was."
+         --
+         -- Three invite states cannot say where somebody actually is. Dakota
+         -- Lane read 'accepted' — correct, he activated on 09-02 — while what
+         -- Nic needed to know was that his lease had been drafted, Nic had
+         -- signed it, and it had been sitting unsigned by Dakota for a week.
+         -- One word was carrying a whole pipeline.
+         --
+         -- So the lease stage rides alongside the invite state instead of being
+         -- folded into it. Each answers its own question: did we reach them, and
+         -- what is the next move.
+         ld.status                   AS lease_doc_status,
+         ld.id                       AS lease_doc_id,
+         nxt.role                    AS lease_waiting_on_role,
+         nxt.name                    AS lease_waiting_on_name,
          -- S639 (Nic): "you still have it listed as eight people not invited yet...
          -- We have literally sent invites to every single person."
          --
@@ -2734,6 +2752,15 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
        LEFT JOIN properties pr ON pr.id = un.property_id
        LEFT JOIN units wun ON wun.id = pti.screening_waived_unit_id
        LEFT JOIN properties wpr ON wpr.id = wun.property_id
+       -- S639: the drafted lease, and whoever it is actually waiting on — the
+       -- lowest unsigned signer in signing order, which is the same rule the
+       -- e-sign page and the reminder job use.
+       LEFT JOIN lease_documents ld ON ld.id = pti.draft_document_id
+       LEFT JOIN LATERAL (
+         SELECT s.role, s.name FROM lease_document_signers s
+          WHERE s.document_id = ld.id AND s.status <> 'signed'
+          ORDER BY s.order_index LIMIT 1
+       ) nxt ON TRUE
        WHERE pti.landlord_id = ANY($1::uuid[])
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
@@ -2813,6 +2840,11 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
         // come. 'not_invited' — nothing has gone out yet.
         inviteState: r.invite_state,
         inviteExpiresAt: r.invite_expires_at,
+        // S639: where the LEASE is, separately from where the invite is.
+        leaseDocStatus: r.lease_doc_status,
+        leaseDocId: r.lease_doc_id,
+        leaseWaitingOnRole: r.lease_waiting_on_role,
+        leaseWaitingOnName: r.lease_waiting_on_name,
       })),
     })
   } catch (e) { next(e) }
