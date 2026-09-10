@@ -1,6 +1,7 @@
 import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
+import { useQueryClient } from 'react-query'
 
 interface AuthUser {
   id: string; email: string; role: string

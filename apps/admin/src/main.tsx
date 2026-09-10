@@ -3464,7 +3464,7 @@ function TotpEnrollPage(){
       // it (the api interceptor reads gam_admin_token) before refreshing.
       const cr=await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
       const fullTok=cr.data?.data?.token
-      if(fullTok)wipeCache(); localStorage.setItem('gam_admin_token',fullTok)
+      if(fullTok) localStorage.setItem('gam_admin_token',fullTok)
       await refresh()
       setState('done')
       // Small delay so the user sees the success state before nav.
