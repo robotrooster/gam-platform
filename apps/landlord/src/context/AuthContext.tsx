@@ -59,7 +59,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token,   setToken]   = useState<string | null>(() => localStorage.getItem('gam_token'))
   const [loading, setLoading] = useState(true)
 
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
   const logout = useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_token')
     setToken(null); setUser(null)
   }, [])
@@ -93,7 +102,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresEmailOtp) {
       return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
     }
-    localStorage.setItem('gam_token', data.token)
+    wipeCache(); localStorage.setItem('gam_token', data.token)
     setToken(data.token)
     setUser(data.user ?? data)
     return { kind: 'success' }
@@ -104,7 +113,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // session JWT, then loads /auth/me for accurate user state.
   const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/totp/verify', { totpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     // Setting token triggers the refresh() effect, but set it eagerly
     // here too so /auth/me carries the new bearer immediately.
     setToken(res.data!.token)
@@ -115,7 +124,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // JWT (from /login) plus the 6-digit emailed code for the full session JWT.
   const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }

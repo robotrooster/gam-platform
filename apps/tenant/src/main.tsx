@@ -162,10 +162,29 @@ const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
 function AuthProvider({children}:{children:React.ReactNode}) {
+  // ── S639 SECURITY: A NEW SESSION MUST NOT INHERIT THE OLD ONE'S DATA ───────
+  //
+  // Nick Platt clicked his fresh invite link on a browser where his wife Judy
+  // was already signed in, and landed in HER profile — her unit, her balance,
+  // her lease. Nic: "it fully signed into her profile. So you fucked something
+  // up."
+  //
+  // The token swap was correct: separate users, separate tenant rows, separate
+  // invite tokens, and the API resolved every request as Nick. What leaked was
+  // the CLIENT cache. logout() dropped the token and the React state and left
+  // react-query untouched, so 'tenant-me', 'tenant-payment-health' and the rest
+  // still held Judy's responses under the same keys — and react-query served
+  // them to Nick instantly, before any request went out. The 304s in the API log
+  // are the tell: the app was revalidating her cached entries, not fetching his.
+  //
+  // Any change of identity now empties the cache. Nothing that belonged to the
+  // previous person survives into the next session.
+  const qcRef = useQueryClient()
+  const wipeCache = useCallback(() => { try { qcRef.clear() } catch { /* no cache yet */ } }, [qcRef])
   const [user,setUser]=useState<AuthUser|null>(null)
   const [token,setToken]=useState<string|null>(()=>localStorage.getItem('gam_tenant_token'))
   const [loading,setLoading]=useState(true)
-  const logout = useCallback(()=>{localStorage.removeItem('gam_tenant_token');setToken(null);setUser(null)},[])
+  const logout = useCallback(()=>{wipeCache();localStorage.removeItem('gam_tenant_token');setToken(null);setUser(null)},[wipeCache])
   const refresh = useCallback(async()=>{
     const t = localStorage.getItem('gam_tenant_token')
     if(!t){setLoading(false);return}
@@ -188,7 +207,7 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     // S571: tenants with ACH set up get email-code 2FA (like admin).
     if(data.requiresEmailOtp){ return { kind:'email_otp_required', emailOtpSession:data.emailOtpSession as string } }
     const { token:tk, user:u } = data as { token:string; user:AuthUser }
-    localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
     return { kind:'success' }
   }
   // S289: TOTP second-step exchange. Trades the short-lived totp_session
@@ -197,7 +216,7 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const loginWithTotp = async(totpSession:string,code:string):Promise<void>=>{
     const res=await post<{token:string}>('/auth/totp/verify',{totpSession,code})
     const tk=res.data!.token
-    localStorage.setItem('gam_tenant_token',tk)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
     const u=await get<AuthUser>('/auth/me')
     setUser(u);setToken(tk)
@@ -207,7 +226,7 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const loginWithEmailOtp = async(emailOtpSession:string,code:string):Promise<void>=>{
     const res=await post<{token:string}>('/auth/email-otp/verify',{emailOtpSession,code})
     const tk=res.data!.token
-    localStorage.setItem('gam_tenant_token',tk)
+    wipeCache();localStorage.setItem('gam_tenant_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
     const u=await get<AuthUser>('/auth/me')
     setUser(u);setToken(tk)

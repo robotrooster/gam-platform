@@ -58,6 +58,10 @@ import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
 function buildApp() {
   const app = express()
   app.use(express.json())
+  // S639: mirrors the app-level no-store middleware in index.ts.
+  app.use('/api', (_q: any, r: any, n: any) => {
+    r.set('Cache-Control', 'no-store, no-cache, must-revalidate, private'); n()
+  })
   app.use('/api/auth', authRouter)
   app.use(errorHandler)
   return app
@@ -816,5 +820,21 @@ describe('S639 password reset link is routed by role when there is no Origin', (
     const url = await resetLinkFor('super_admin', 'https://evil.example.com')
     expect(url).toContain('https://admin.example.test/reset-password')
     expect(url).not.toContain('evil.example.com')
+  })
+})
+
+// ─── S639 SECURITY: PER-USER RESPONSES ARE NEVER CACHEABLE ──────────────────
+//
+// Nick Platt accepted his invite on a browser where another household member was
+// already signed in and landed in THEIR profile. The client query cache was the
+// main culprit and is fixed in every portal, but the API log showed the other
+// half: /api/tenants/me and /api/auth/me answering 304, which means a browser
+// revalidating a cached body rather than fetching a fresh one. On a shared
+// device with a changed identity that is a second route to the same leak.
+describe('S639 API responses are not cacheable', () => {
+  it('sends no-store on API responses, so no browser reuses one user for another', async () => {
+    const app = buildApp()
+    const res = await request(app).post('/api/auth/login').send({ email: 'nobody@test.dev', password: 'x' })
+    expect(String(res.headers['cache-control'] || '')).toMatch(/no-store/)
   })
 })

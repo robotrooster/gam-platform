@@ -33,6 +33,9 @@ interface ActiveLease {
   rent_due_day: number
   start_date: string        // YYYY-MM-DD
   end_date: string | null
+  // S639: already living there when the park came onto GAM — their first
+  // invoice is late-fee exempt however long they took to sign.
+  is_existing_tenancy?: boolean
   tenant_id: string | null
   property_tz: string
   lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
@@ -219,6 +222,10 @@ export async function generateInvoices(
   const leases = await query<ActiveLease>(`
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
            l.lease_source,
+           -- S639: somebody who was already living there when the park came onto
+           -- GAM. Their first bill here is late-fee exempt however long they
+           -- took to sign — see lateStartExempt below.
+           l.is_existing_tenancy,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
@@ -713,7 +720,27 @@ async function runGeneration(
         const priorInvoice = await client.query<{ n: string }>(
           `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id = $1 AND due_date < $2::date`,
           [lease.id, dueDate])
-        const lateStartExempt = startedAfter20th && Number(priorInvoice.rows[0].n) === 0
+        // ── S639 (Nic): THE WAIVER FOLLOWS THE PERSON, NOT THE CALENDAR ─────
+        //
+        // "The wipe needs to not be for existing leases. It needs to be for
+        // people onboarded as EXISTING TENANTS, to make it catch everybody
+        // depending on when they finally get around to getting signed."
+        //
+        // I had reached for a landlord-level holiday DATE, which is wrong in
+        // both directions: it expires while people are still signing, and it
+        // hands free lateness to a genuinely new applicant who signs during the
+        // window. is_existing_tenancy is the honest signal — somebody who was
+        // already living there when the park came onto GAM. Their first bill
+        // here was late because onboarding took time, which is our doing and not
+        // theirs, however long they take to get signed.
+        //
+        // FIRST invoice only. After one full cycle on the platform they are an
+        // ordinary resident and each lease's own late-fee terms apply, exactly
+        // as configured — Nic: "the late fee is set up correctly for future
+        // cycles."
+        const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
+        const lateStartExempt =
+          isFirstInvoice && (lease.is_existing_tenancy === true || startedAfter20th)
 
         const invoiceRes = await client.query(
           `INSERT INTO invoices (

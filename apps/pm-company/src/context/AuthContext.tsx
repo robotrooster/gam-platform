@@ -61,7 +61,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [pmCompanies, setPmCompanies] = useState<ActivePmCompany[]>([])
   const [activePmCompany, setActivePmCompanyState] = useState<ActivePmCompany | null>(null)
 
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
   const logout = useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_token')
     localStorage.removeItem('gam_active_pm_company')
     setToken(null); setUser(null)
@@ -117,7 +126,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresEmailOtp) {
       return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
     }
-    localStorage.setItem('gam_token', data.token)
+    wipeCache(); localStorage.setItem('gam_token', data.token)
     setToken(data.token)
     setUser(data.user ?? data)
     return { kind: 'success' }
@@ -126,7 +135,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // S578: email-code second-step exchange (universal 2FA).
   const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }
@@ -140,7 +149,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // loads /auth/me + the pm_staff memberships.
   const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
     const res = await apiPost<{ token: string }>('/auth/totp/verify', { totpSession, code })
-    localStorage.setItem('gam_token', res.data!.token)
+    wipeCache(); localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
     await refresh()
   }

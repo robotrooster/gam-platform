@@ -65,7 +65,16 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('gam_admin_token'))
   const [loading, setLoading] = useState(true)
 
+  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // accepted his invite on a browser where another household member was signed
+  // in and landed in THEIR profile — the token swapped correctly and react-query
+  // kept serving the previous person's cached responses under the same keys.
+  // Every portal had the same gap.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
   const logout = React.useCallback(() => {
+    wipeCache()
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
     setToken(null)
@@ -108,7 +117,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const { token: tk, user: u } = data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({
       id: u.id, email: u.email, role: u.role,
@@ -130,7 +139,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(API + '/api/auth/totp/verify', { totpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     // /verify doesn't currently return totpEnabled / mustEnrollTotp on
     // the user payload — fetch them from /me so the layout gate has
@@ -150,7 +159,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(API + '/api/auth/email-otp/verify', { emailOtpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
-    localStorage.setItem('gam_admin_token', tk)
+    wipeCache(); localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({
       id: u.id, email: u.email, role: u.role,
@@ -3455,7 +3464,7 @@ function TotpEnrollPage(){
       // it (the api interceptor reads gam_admin_token) before refreshing.
       const cr=await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
       const fullTok=cr.data?.data?.token
-      if(fullTok)localStorage.setItem('gam_admin_token',fullTok)
+      if(fullTok)wipeCache(); localStorage.setItem('gam_admin_token',fullTok)
       await refresh()
       setState('done')
       // Small delay so the user sees the success state before nav.

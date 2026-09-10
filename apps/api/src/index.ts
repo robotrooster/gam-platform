@@ -262,6 +262,26 @@ app.use(httpLogger)
 // platform at launch. Dev (direct connection, no XFF) is unaffected.
 app.set('trust proxy', 1)
 
+// ── S639 SECURITY: NEVER LET A BROWSER CACHE ONE PERSON'S DATA FOR ANOTHER ───
+//
+// Nick Platt accepted his invite on a browser where another household member was
+// already signed in and saw THEIR profile. The main culprit was the client-side
+// query cache (fixed in every portal), but the API log showed the other half of
+// the same hazard: `GET /api/tenants/me` and `/api/auth/me` answering 304, which
+// means a browser was revalidating a cached body rather than fetching a fresh
+// one. On a shared device, with a shared URL and a changed identity, that is a
+// second route to the same leak.
+//
+// Express's ETag is content-derived, so a correct revalidation returns 200 when
+// the body differs — but nothing about that guarantee is worth relying on for
+// per-user data. Authenticated API responses are simply never cacheable. It also
+// removes the conditional-request round trip that produced those 304s.
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+  res.set('Pragma', 'no-cache')
+  next()
+})
+
 // Rate limiting. General limit sized for AUTHENTICATED PORTAL USE:
 // the portals poll in the background (notification bell + pending-
 // sign every 30s per tab, move-in gate 5min, react-query refocus
