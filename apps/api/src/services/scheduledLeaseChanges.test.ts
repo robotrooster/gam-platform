@@ -194,3 +194,63 @@ describe('createLeaseNoticesForDocument (NOTICE mode)', () => {
     expect(notices.rows[0].eff).toBe('2026-09-01')
   })
 })
+
+// ─── S639: A RENT YEARS OUT IS NOT KNOWN TODAY ──────────────────────────────
+//
+// Nic: "April first twenty twenty eight — work trade ends on mobile home ten,
+// and rent will be whatever the current rate is for single wide mobile home
+// spaces. Have it just automatically match whatever mobile home eighteen is at
+// that point. I know it's a long term reminder, but have it do that
+// automatically."
+//
+// MH 10's work trade runs to March 2028. Writing today's $460 into that row
+// would hold the space at a two-year-stale rent; the reference unit carries the
+// market answer because it is the same kind of space at the same park.
+describe('S639 scheduled rent that matches another unit', () => {
+  it('reads the amount from the reference unit at APPLY time, not at schedule time', async () => {
+    const f = await seedLeaseCtx(460)
+    // A second space at the same park — the reference, sitting at 460 today.
+    const ref = await seedLeaseCtx(460)
+    const refUnitId = ref.unitId
+    await db.query(`UPDATE units SET rent_amount = 460 WHERE id = $1`, [refUnitId])
+    await db.query(
+      `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, match_unit_id, status)
+       VALUES ($1, 'rent', CURRENT_DATE, $2, 'scheduled')`, [f.leaseId, refUnitId])
+
+    // …and the market moves before it lands.
+    await db.query(`UPDATE units SET rent_amount = 615 WHERE id = $1`, [refUnitId])
+
+    const res = await applyDueScheduledChanges()
+    expect(res.applied).toBe(1)
+    const { rows: [lease] } = await db.query<any>(
+      `SELECT rent_amount::text FROM leases WHERE id = $1`, [f.leaseId])
+    // 615, not the 460 that was true on the day it was scheduled.
+    expect(Number(lease.rent_amount)).toBe(615)
+    // The resolved figure is written back, so the record says what actually happened.
+    const { rows: [chg] } = await db.query<any>(
+      `SELECT status, new_rent_amount::text FROM scheduled_lease_changes WHERE lease_id = $1`, [f.leaseId])
+    expect(chg.status).toBe('applied')
+    expect(Number(chg.new_rent_amount)).toBe(615)
+  })
+
+  it('refuses to guess when the reference unit can no longer answer', async () => {
+    const f = await seedLeaseCtx(460)
+    const ref = await seedLeaseCtx(460)
+    const refUnitId = ref.unitId
+    await db.query(`UPDATE units SET rent_amount = 0 WHERE id = $1`, [refUnitId])
+    await db.query(
+      `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, match_unit_id, status)
+       VALUES ($1, 'rent', CURRENT_DATE, $2, 'scheduled')`, [f.leaseId, refUnitId])
+
+    const before = await db.query<any>(`SELECT rent_amount::text FROM leases WHERE id = $1`, [f.leaseId])
+    const res = await applyDueScheduledChanges()
+    expect(res.applied).toBe(0)
+    const after = await db.query<any>(`SELECT rent_amount::text FROM leases WHERE id = $1`, [f.leaseId])
+    // The tenancy keeps its rent rather than being handed a guess…
+    expect(after.rows[0].rent_amount).toBe(before.rows[0].rent_amount)
+    // …and the change stays scheduled so it retries and stays visible.
+    const { rows: [chg] } = await db.query<any>(
+      `SELECT status FROM scheduled_lease_changes WHERE lease_id = $1`, [f.leaseId])
+    expect(chg.status).toBe('scheduled')
+  })
+})

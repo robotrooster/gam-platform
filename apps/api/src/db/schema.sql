@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict quxCdKIKcQex4QhaYuh18wvJgv8dbOpprnKFOorUbCE1vFKy1j7C2Js2M3tnIVs
+\restrict kRM6182c34m6cg7vfFSN2aZ2l3yfAhrfAt5Mfzd7uux76yHYlZyWW5Iczo7OM1Y
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7875,10 +7875,18 @@ CREATE TABLE public.scheduled_lease_changes (
     applied_lease_fee_id uuid,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
+    match_unit_id uuid,
     CONSTRAINT scheduled_lease_changes_change_type_check CHECK ((change_type = ANY (ARRAY['rent'::text, 'recurring_fee'::text]))),
-    CONSTRAINT scheduled_lease_changes_shape_check CHECK ((((change_type = 'rent'::text) AND (new_rent_amount IS NOT NULL)) OR ((change_type = 'recurring_fee'::text) AND (fee_amount IS NOT NULL) AND (fee_type IS NOT NULL)))),
+    CONSTRAINT scheduled_lease_changes_shape_check CHECK ((((change_type = 'rent'::text) AND ((new_rent_amount IS NOT NULL) OR (match_unit_id IS NOT NULL))) OR ((change_type = 'recurring_fee'::text) AND (fee_amount IS NOT NULL) AND (fee_type IS NOT NULL)))),
     CONSTRAINT scheduled_lease_changes_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'scheduled'::text, 'applied'::text, 'cancelled'::text])))
 );
+
+
+--
+-- Name: COLUMN scheduled_lease_changes.match_unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.scheduled_lease_changes.match_unit_id IS 'S639: resolve the new rent from this unit AT APPLY TIME rather than fixing an amount now. For a change years out, today''s number is the wrong answer.';
 
 
 --
@@ -24233,6 +24241,14 @@ ALTER TABLE ONLY public.scheduled_lease_changes
 
 
 --
+-- Name: scheduled_lease_changes scheduled_lease_changes_match_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_lease_changes
+    ADD CONSTRAINT scheduled_lease_changes_match_unit_id_fkey FOREIGN KEY (match_unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
 -- Name: scheduled_lease_changes scheduled_lease_changes_source_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25668,5 +25684,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict quxCdKIKcQex4QhaYuh18wvJgv8dbOpprnKFOorUbCE1vFKy1j7C2Js2M3tnIVs
+\unrestrict kRM6182c34m6cg7vfFSN2aZ2l3yfAhrfAt5Mfzd7uux76yHYlZyWW5Iczo7OM1Y
 

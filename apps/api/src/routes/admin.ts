@@ -110,10 +110,24 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
         -- platform carries an invoice_id, so this needs no fallback — but it is
         -- written to count an invoice-less row on its own rather than silently
         -- drop it if that ever changes.
+        -- S639 (Nic): "are you counting the work trade agreements? Because
+        -- there's five other invoices that would equate to your ten." He is
+        -- right — 5 real + 5 work-trade = 10, and 12 + 9 = 21 line items.
+        --
+        -- Work-trade rent is suspended, not owed: it settles in HOURS at month
+        -- close, not in cash. He has already had to say twice this session that
+        -- showing it as owed is "a false number", and the landlord surfaces were
+        -- fixed for it — the platform card was still doing it. Same rule here,
+        -- so this reads 5 and ties out to his outstanding-balances page.
         (SELECT COUNT(*)::int FROM (
             SELECT DISTINCT COALESCE(invoice_id::text, 'row:' || id::text) AS k
-              FROM payments WHERE status = 'pending') q) AS unpaid_charges,
-        (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS unpaid_line_items,
+              FROM payments
+             WHERE status = 'pending' AND work_trade_suspended_at IS NULL) q) AS unpaid_charges,
+        (SELECT COUNT(*)::int FROM payments
+          WHERE status='pending' AND work_trade_suspended_at IS NULL) AS unpaid_line_items,
+        (SELECT COUNT(*)::int FROM (
+            SELECT DISTINCT invoice_id FROM payments
+             WHERE status = 'pending' AND work_trade_suspended_at IS NOT NULL) q) AS work_trade_invoices,
         (SELECT COUNT(*)::int FROM payments WHERE status='processing') AS payments_in_flight,
         (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='processing') AS payments_in_flight_amount,
         (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS pending_payments,

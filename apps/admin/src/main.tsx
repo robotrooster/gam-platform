@@ -1096,7 +1096,7 @@ function Overview(){
             together as one item." Rent and its utilities are separate rows but
             one bill, paid in one act — counting rows counted the same debt
             twice. */}
-        <div className="kpi"><div className="kl">Unpaid Invoices</div><div className={`kv ${(stats?.unpaidCharges ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? 0}</div><div className="ks">{stats?.unpaidLineItems||0} line item{(stats?.unpaidLineItems||0)===1?'':'s'}, billed and not yet paid{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
+        <div className="kpi"><div className="kl">Unpaid Invoices</div><div className={`kv ${(stats?.unpaidCharges ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? 0}</div><div className="ks">{stats?.unpaidLineItems||0} line item{(stats?.unpaidLineItems||0)===1?'':'s'}, billed and not yet paid{(stats?.workTradeInvoices||0)>0?` · ${stats.workTradeInvoices} more settle in hours`:''}{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 

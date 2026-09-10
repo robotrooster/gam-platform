@@ -20,6 +20,7 @@
 import type { PoolClient } from 'pg'
 import { query, getClient } from '../db'
 import { logger } from '../lib/logger'
+import { createAdminNotification } from './adminNotifications'
 
 export type ScheduledChangeType = 'rent' | 'recurring_fee'
 
@@ -207,11 +208,47 @@ export async function applyDueScheduledChanges(nowUtc: Date = new Date()): Promi
       }
 
       if (row.change_type === 'rent') {
+        // ── S639 (Nic): AN AMOUNT YEARS OUT IS NOT KNOWN TODAY ──────────────
+        //
+        // "Rent will be whatever the current rate is for single wide mobile home
+        // spaces. Have it just automatically match whatever mobile home eighteen
+        // is at that point."
+        //
+        // MH 10's work trade runs to March 2028. Writing today's $460 into that
+        // row would hold the space at a two-year-stale rent; the reference unit
+        // carries the market answer because it is the same kind of space at the
+        // same park. Resolved here, at apply time.
+        let amount = row.new_rent_amount
+        if (row.match_unit_id) {
+          const ref = await client.query<{ rent_amount: string; unit_number: string }>(
+            `SELECT rent_amount, unit_number FROM units WHERE id = $1`, [row.match_unit_id],
+          ).then(r => r.rows[0])
+          if (ref && Number(ref.rent_amount) > 0) {
+            amount = ref.rent_amount
+          } else {
+            // The reference unit is gone or has no rate. Refusing to guess: the
+            // lease keeps its current rent, the row stays scheduled so it is
+            // retried and visible, and somebody is told rather than a wrong
+            // number being written into a live tenancy years from now.
+            await client.query('ROLLBACK')
+            await createAdminNotification({
+              severity: 'critical',
+              category: 'scheduled_rent_match_unresolved',
+              title: `Scheduled rent change could not resolve its reference unit`,
+              body: `Change ${id} was due today and takes its amount from another unit, `
+                  + `which no longer has a usable rent. The lease keeps its current rent `
+                  + `and this will retry daily until the reference is fixed or the change is cancelled.`,
+              context: { scheduled_change_id: id, lease_id: row.lease_id, match_unit_id: row.match_unit_id },
+            }).catch(() => {})
+            continue
+          }
+        }
         await client.query(
           `UPDATE leases SET rent_amount = $2, updated_at = NOW() WHERE id = $1`,
-          [row.lease_id, row.new_rent_amount])
+          [row.lease_id, amount])
         await client.query(
-          `UPDATE scheduled_lease_changes SET status = 'applied', applied_at = NOW(), updated_at = NOW() WHERE id = $1`, [id])
+          `UPDATE scheduled_lease_changes SET status = 'applied', applied_at = NOW(),
+                  new_rent_amount = $2, updated_at = NOW() WHERE id = $1`, [id, amount])
       } else {
         const fee = await client.query<{ id: string }>(
           `INSERT INTO lease_fees (lease_id, fee_type, amount, due_timing, is_refundable, description)
