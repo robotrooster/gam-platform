@@ -130,6 +130,45 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
         `SELECT user_id FROM landlords WHERE id = $1`, [booking.landlord_id])
       if (owner) {
         const ctx = await guestScreeningContext(booking.guest_email, booking.landlord_id)
+
+        // ── S639 (Nic): A LONG STAY IS SCREENED AUTOMATICALLY ───────────────
+        //
+        // "When the reservation is longer than thirty days, don't have me
+        // manually click on a thing to send a request for screening. Longer
+        // than thirty days, they automatically get the link for the background
+        // check."
+        //
+        // The notification below already warned that screening some guests and
+        // not others in the same situation can be considered discriminatory —
+        // and then handed the landlord a button that makes exactly that choice,
+        // guest by guest, at the moment they are looking at somebody's name.
+        // The consistent policy is the automatic one: every stay that crosses
+        // the threshold gets the same email, so there is no judgement call to
+        // apply unevenly.
+        //
+        // Skipped for a guest who already passed a GAM check and has had
+        // continuous tenancy since — that is the same rule the landlord was
+        // being told to apply by hand, and asking them to pay for a second
+        // check they do not need is its own unfairness.
+        const alreadyCleared = !!ctx.approvedCheckAt && !!ctx.continuousTenancySince
+        let screeningEmailed = false
+        if (booking.guest_email && !alreadyCleared) {
+          try {
+            const { emailBackgroundCheckScreeningRequest } = await import('./email')
+            const prop = await queryOne<{ name: string }>(
+              `SELECT p.name FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+              [booking.unit_id])
+            await emailBackgroundCheckScreeningRequest(
+              booking.guest_email, booking.guest_name, prop?.name || 'the property',
+              `${(process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com').replace(/\/$/, '')}/background-check`,
+              { landlordId: booking.landlord_id })
+            screeningEmailed = true
+            logger.info({ bookingId, leaseId, nights },
+              '[booking-lease-draft] screening request emailed automatically to long-stay guest')
+          } catch (e) {
+            logger.error({ err: e, bookingId }, '[booking-lease-draft] auto screening email failed')
+          }
+        }
         const history = ctx.approvedCheckAt && ctx.continuousTenancySince
           ? ` They passed a GAM background check on ${ctx.approvedCheckAt} and have had continuous tenancy in GAM since — no new check is needed.`
           : ctx.approvedCheckAt
@@ -141,8 +180,13 @@ export async function maybeDraftLeaseFromBooking(bookingId: string): Promise<{ d
           userId: owner.user_id,
           landlordId: booking.landlord_id,
           type: 'lease_drafted_from_booking',
-          title: 'Long stay — screen or send the lease',
-          body: `${booking.guest_name || 'A guest'} is requesting a ${nights}-night stay on unit ${booking.unit_number}. A draft lease is ready on your Leases page — request a background check first, or send the lease directly if you know them.${history} Consistency note: apply screening evenly — requiring checks from some guests but not others in the same situation can be considered discriminatory. Screen everyone in comparable situations, or apply the same no-screening policy to all.`,
+          title: screeningEmailed ? 'Long stay — screening sent' : 'Long stay — draft lease ready',
+          body: `${booking.guest_name || 'A guest'} is requesting a ${nights}-night stay on unit ${booking.unit_number}. A draft lease is ready on your Leases page.${history} `
+            + (screeningEmailed
+                ? 'A background-check link has been emailed to them automatically, as it is for every stay over the threshold — nothing to do until it comes back.'
+                : alreadyCleared
+                ? 'No screening was sent: they already passed a GAM check and have had continuous tenancy since.'
+                : 'No screening was sent because the reservation has no guest email on file.'),
           data: {
             leaseId, bookingId,
             priorStays: ctx.priorStays,
