@@ -775,15 +775,22 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
       -- ACCOUNT for every company it can read.
       WHERE bc.landlord_id = ANY($1::uuid[])
       ORDER BY bc.created_at DESC`, [landlordScopeIds(req.user!)])
-    // S561: surface the landlord's per-check screening charge (Checkr cost +
-    // $5 margin) so the review UI can show what they're billed. Only real
-    // checkr orders incur it; mock/speculative rows show 0.
-    const landlordCharge = Math.round((SCREENING_CHECKR_COST_USD + SCREENING_GAM_MARGIN_USD) * 100) / 100
-    const withCharge = checks.map((c) => ({
-      ...c,
-      landlord_charge: c.provider_name === 'checkr' ? landlordCharge : 0,
-    }))
-    res.json({ success: true, data: withCharge })
+    // ── S639 (Nic): THE LANDLORD IS NOT BILLED FOR SCREENING ───────────────
+    //
+    // "It says screening cost billed to you, forty two ninety four. That was
+    // not my charge to Checkr, and that wouldn't be billed to the landlord. So
+    // why is the landlord seeing any price on there at all?"
+    //
+    // They shouldn't, on two counts. S577 settled the billing: the APPLICANT
+    // pays up front and the landlord nets $0 — screening revenue is entirely
+    // the platform's. This line was left over from the S561 model where the
+    // landlord was charged, and it survived the change, quoting a bill that
+    // does not exist.
+    //
+    // It was also assembled as Checkr's cost PLUS GAM's $5 margin, which puts
+    // the platform's markup on a customer's screen. Nothing landlord-facing
+    // breaks GAM's costs out that way.
+    res.json({ success: true, data: checks })
   } catch (e) { next(e) }
 })
 

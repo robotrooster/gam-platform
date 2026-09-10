@@ -33,15 +33,33 @@ export function BackgroundChecksPage() {
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
           <table className="data-table" style={{minWidth:780}}>
-            <thead><tr><th>Applicant</th><th>Started</th><th>Risk</th><th>Status</th><th></th></tr></thead>
+            {/* S639 (Nic): "is that low risk vetted by Checkr?" No — and the
+                column said "Risk" as though it were. riskLevel is GAM's own
+                INTAKE score, computed from what the applicant typed on the form
+                (stated income, employment, how fast they filled it in) before
+                Checkr is contacted at all. Anastacio read "low" here while
+                Checkr's verdict on him was CONSIDER. Two different questions,
+                and the screening answer is the one a tenancy turns on, so it
+                gets the column and the intake score is named for what it is. */}
+            <thead><tr><th>Applicant</th><th>Started</th><th>Screening</th><th>Intake score</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {checks.length ? checks.map((c: any) => (
                 <tr key={c.id} onClick={() => setSelected(c)} style={{cursor:'pointer'}}>
                   <td style={{fontWeight:500}}>{[c.firstName, c.lastName].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{c.createdAt ? new Date(c.createdAt).toLocaleDateString() : '—'}</td>
                   <td>
+                    {(() => {
+                      // Checkr's verdict — the one that matters for a tenancy decision.
+                      const v = (c.reportSummary && typeof c.reportSummary === 'object')
+                        ? (c.reportSummary as any).result : null
+                      return <span className={`badge ${v === 'clear' ? 'badge-green' : v === 'consider' ? 'badge-amber' : 'badge-muted'}`}>
+                        {v === 'clear' ? 'Clear' : v === 'consider' ? 'Consider' : 'Not back yet'}
+                      </span>
+                    })()}
+                  </td>
+                  <td>
                     {c.riskLevel
-                      ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`}>{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
+                      ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`} title="GAM's intake plausibility score from the application form — NOT the background check result">{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
                       : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
                   <td><span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span></td>
@@ -136,18 +154,73 @@ function ReviewModal({ check, onClose, onDecided }: {
             {field('Email', check.email)}
             {field('Phone', check.phone)}
             {field('Applied', check.createdAt ? new Date(check.createdAt).toLocaleDateString() : null)}
-            {field('Screening cost (billed to you)', check.landlordCharge ? `$${Number(check.landlordCharge).toFixed(2)}` : '—')}
           </div>
 
+          {/* ── S639 (Nic): "how do I see the actual data in the report? Is the
+              landlord gonna have to go to the Checkr settings?" ─────────────
+
+              They could not see it. This block looped the summary's TOP level,
+              so it printed order_id, provider and report_id — identifiers of no
+              use to anybody — while the findings themselves sat one level down
+              inside `products` and rendered as nothing at all. Anastacio
+              Erreguin's report came back CONSIDER on the credit file and clear
+              on everything else, and none of that reached the screen.
+
+              Per-product, plainly, with the overall verdict first. */}
           {report && (
             <div style={{marginTop:8,padding:12,background:'var(--bg-3)',borderRadius:8}}>
-              <div style={{fontSize:'.72rem',textTransform:'uppercase',letterSpacing:'.05em',color:'var(--text-3)',marginBottom:8}}>Report</div>
-              {Object.entries(report).map(([k, v]) => v != null && (
-                <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.82rem',padding:'3px 0'}}>
-                  <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
-                  <span style={{color: String(v) === 'clear' ? 'var(--green,#22c55e)' : String(v) === 'consider' ? 'var(--amber,#f59e0b)' : 'var(--text-1)',fontWeight:600}}>{humanize(String(v))}</span>
-                </div>
-              ))}
+              <div style={{fontSize:'.72rem',textTransform:'uppercase',letterSpacing:'.05em',color:'var(--text-3)',marginBottom:8}}>
+                Background report · Checkr
+              </div>
+              {(() => {
+                // report_summary is on camelize's JSONB_PASSTHROUGH_KEYS list, so
+                // Checkr's own response shape survives verbatim — these inner keys
+                // are deliberately snake_case and camelCase reads return undefined.
+                const r: any = report
+                const verdict = typeof r.result === 'string' ? r.result : null   // wire-ok
+                const products: Record<string, any> = (r.products && typeof r.products === 'object') ? r.products : {}   // wire-ok
+                const reportId: string | null = r.report_id ? String(r.report_id) : null   // wire-ok
+                const fetchedAt: string | null = r.fetched_at ? String(r.fetched_at) : null   // wire-ok
+                const tone = (v: string) => v === 'clear' ? 'var(--green,#22c55e)'
+                  : v === 'consider' ? 'var(--amber,#f59e0b)' : 'var(--text-1)'
+                return (
+                  <>
+                    {verdict && (
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+                                   paddingBottom:8,marginBottom:8,borderBottom:'1px solid var(--border-0)'}}>
+                        <span style={{color:'var(--text-1)',fontWeight:700}}>Overall</span>
+                        <span style={{color:tone(verdict),fontWeight:800,fontSize:'.95rem'}}>
+                          {verdict === 'clear' ? 'Clear' : verdict === 'consider' ? 'Consider — review before deciding' : humanize(verdict)}
+                        </span>
+                      </div>
+                    )}
+                    {Object.keys(products).length === 0 ? (
+                      <div style={{fontSize:'.82rem',color:'var(--text-3)'}}>
+                        No per-check results returned yet.
+                      </div>
+                    ) : Object.entries(products).map(([k, v]) => (
+                      <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0'}}>
+                        <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
+                        <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
+                      </div>
+                    ))}
+                    {verdict === 'consider' && (
+                      <div style={{marginTop:10,fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5}}>
+                        A “consider” is not a decline — it means Checkr found something on that
+                        check worth your eyes. If you decline based on it, the applicant is
+                        entitled to an adverse action notice naming the agency and their right
+                        to dispute; use the Adverse Action button rather than declining silently.
+                      </div>
+                    )}
+                    {reportId && (
+                      <div style={{marginTop:10,fontSize:'.72rem',color:'var(--text-3)'}}>
+                        Checkr report {reportId}
+                        {fetchedAt ? ` · pulled ${new Date(fetchedAt).toLocaleString()}` : ''}
+                      </div>
+                    )}
+                  </>
+                )
+              })()}
             </div>
           )}
 
