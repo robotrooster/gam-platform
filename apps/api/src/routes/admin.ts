@@ -43,25 +43,38 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
         (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
         (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
         (SELECT COUNT(*)::int FROM units WHERE payment_block=TRUE) AS eviction_mode_units,
-        -- ── S639: OCCUPIED IS NOT THE SAME AS 'active' ─────────────────────
+        -- ── S639: THE ADMIN LENS IS MONEY THAT MOVED ───────────────────────
         --
-        -- Nic: "the monthly rent volume across twenty two units should be
-        -- eleven thousand five hundred and thirteen dollars, but the landlord
-        -- portal shows expected monthly rent at thirteen thousand four hundred
-        -- and seventy seven dollars."
+        -- Nic, correcting my first pass: "I'm not wanting to exclude the
+        -- delinquent. On the admin view, the KPI card that says monthly rent
+        -- volume, I want that to show the money that moved through the platform.
+        -- Delinquent people are only important to the landlord. That's not
+        -- important to the admin side of things. We're thinking about it through
+        -- two different lenses."
         --
-        -- Both were counting units.rent_amount; they disagreed on which units
-        -- are occupied. The landlord dashboard counts active + delinquent +
-        -- suspended, this counted 'active' alone — so four DELINQUENT units and
-        -- $1,964 of contracted rent were missing from the platform figure.
+        -- Right, and it makes the earlier disagreement a non-question. A
+        -- landlord's dashboard asks "what am I owed this month" — contracted
+        -- rent on every occupied unit, delinquent included, because a delinquent
+        -- tenant still owes. The platform asks "what came across the rails" —
+        -- and a charge nobody paid moved no money, whatever its unit's status.
+        -- They were never the same figure and should not be reconciled; they
+        -- should stop sharing a name.
         --
-        -- Delinquent is the state a unit enters when its tenant owes money. The
-        -- rent is still contracted and still owed; that is the entire meaning of
-        -- the status. Excluding it under-reports the platform by exactly the
-        -- units most worth looking at, and makes the number that should be
-        -- larger (whole platform) smaller than one landlord's own.
-        (SELECT COALESCE(SUM(rent_amount),0) FROM units
-          WHERE status IN ('active','delinquent','suspended')) AS monthly_rent_volume,
+        -- Rent only, so this stays distinguishable from the heartbeat beside it,
+        -- which counts rent + utilities + fees. Includes ACH still clearing, on
+        -- the same S616 reasoning the heartbeat uses: the tenant's bank has
+        -- already been debited, and excluding it makes the card read near zero
+        -- during the first week of every month, which is when rent arrives.
+        (SELECT COALESCE(SUM(amount),0) FROM payments
+          WHERE type = 'rent'
+            AND status IN ('settled','processing','paid_via_deposit')
+            AND date_trunc('month', COALESCE(settled_at, created_at))
+                = date_trunc('month', CURRENT_DATE)) AS monthly_rent_volume,
+        (SELECT COUNT(DISTINCT lease_id)::int FROM payments
+          WHERE type = 'rent'
+            AND status IN ('settled','processing','paid_via_deposit')
+            AND date_trunc('month', COALESCE(settled_at, created_at))
+                = date_trunc('month', CURRENT_DATE)) AS paying_leases,
         (SELECT COUNT(*)::int FROM units
           WHERE status IN ('active','delinquent','suspended')) AS occupied_units,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
@@ -87,7 +100,20 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
         -- simply not paid yet. Money genuinely in transit is 'processing',
         -- and there are 3 of those, not 20. The count was right for a question
         -- nobody asked and wrong for the one printed under it.
-        (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS unpaid_charges,
+        -- S639 (Nic): "if it's really just unpaid charges, then it needs to be
+        -- grouped together by lease. Remember, once line items go on an invoice,
+        -- they are bundled together as one item."
+        --
+        -- Rent and its utilities are separate payment ROWS but arrive as one
+        -- bill and get paid as one act, so counting rows counted the same debt
+        -- two or three times: 21 rows are 10 invoices. Every unpaid row on the
+        -- platform carries an invoice_id, so this needs no fallback — but it is
+        -- written to count an invoice-less row on its own rather than silently
+        -- drop it if that ever changes.
+        (SELECT COUNT(*)::int FROM (
+            SELECT DISTINCT COALESCE(invoice_id::text, 'row:' || id::text) AS k
+              FROM payments WHERE status = 'pending') q) AS unpaid_charges,
+        (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS unpaid_line_items,
         (SELECT COUNT(*)::int FROM payments WHERE status='processing') AS payments_in_flight,
         (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='processing') AS payments_in_flight_amount,
         (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS pending_payments,

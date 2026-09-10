@@ -495,20 +495,31 @@ describe('POST /api/admin/users/:userId/referral-upline — manual re-attach (su
 // The platform figure came out SMALLER than one landlord's own, which is the
 // tell: a whole-platform number can never be less than a subset of it.
 describe('S639 admin platform stats — occupied means occupied', () => {
-  it('monthly rent volume counts delinquent units, like the landlord dashboard does', async () => {
+  it('rent volume is money that MOVED, not rent that is owed', async () => {
     const f = await seedAFixture()
     const client = await db.connect()
-    let propertyId = ''
     try {
       await client.query('BEGIN')
-      propertyId = await seedProperty(client, {
+      const propertyId = await seedProperty(client, {
         landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
       })
+      const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      // A second unit and lease: two live rent charges on ONE lease and due date
+      // collide with the rent-idempotency rule, which is correct and is not what
+      // this test is about.
+      const unit2Id = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      await client.query(`UPDATE units SET status='active', rent_amount=1000 WHERE id IN ($1,$2)`, [unitId, unit2Id])
+      const tenantId = await seedTenant(client)
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      const lease2Id = await seedLease(client, { unitId: unit2Id, landlordId: f.landlordId })
+      // Paid, in flight, and unpaid — only the first two moved money.
       await client.query(
-        `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount)
-         VALUES ($1, $2, 'S639-A', 'active', 1000),
-                ($1, $2, 'S639-DQ', 'delinquent', 491)`,
-        [propertyId, f.landlordId])
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, settled_at)
+         VALUES ($1,$2,$3,$4,'rent',600,'settled','RENT',CURRENT_DATE,NOW()),
+                ($1,$2,$3,$4,'utility',75,'settled','UTILITY',CURRENT_DATE,NOW()),
+                ($5,$6,$3,$4,'rent',400,'processing','RENT',CURRENT_DATE,NOW())`,
+        [unitId, leaseId, tenantId, f.landlordId, unit2Id, lease2Id])
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
@@ -516,12 +527,12 @@ describe('S639 admin platform stats — occupied means occupied', () => {
     const res = await request(buildApp()).get('/api/admin/overview')
       .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
-    // Delinquent is the state a unit enters when its tenant OWES. The rent is
-    // still contracted, which is the whole meaning of the status — and before
-    // this, $1,964 across four of Nic's units was missing from the platform sum.
-    expect(Number(res.body.data.monthly_rent_volume)).toBe(1491)
-    // …and the caption's unit count describes the same set it summed.
-    expect(Number(res.body.data.occupied_units)).toBe(2)
+    // Nic: "monthly rent volume should only be money that actually moved."
+    // $600 settled + $400 still clearing. NOT the $1,000 contracted, and not
+    // the $75 of utilities — those belong to the heartbeat beside it.
+    expect(Number(res.body.data.monthly_rent_volume)).toBe(1000)
+    // Two leases sent rent this month.
+    expect(Number(res.body.data.paying_leases)).toBe(2)
   })
 
   it('separates unpaid charges from money actually in ACH flight', async () => {
@@ -537,5 +548,42 @@ describe('S639 admin platform stats — occupied means occupied', () => {
     expect(res.body.data).toHaveProperty('unpaid_charges')
     expect(res.body.data).toHaveProperty('payments_in_flight')
     expect(res.body.data).toHaveProperty('payments_in_flight_amount')
+  })
+
+  it('counts unpaid INVOICES, not the line items on them', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      const tenantId = await seedTenant(client)
+      const leaseId = await seedLease(client, { unitId, landlordId: f.landlordId })
+      const { rows: [inv] } = await client.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                               due_date, subtotal_rent, subtotal_fees, subtotal_utilities, total_amount)
+         VALUES ($1,$2,$3,$4,'S639-INV',CURRENT_DATE,900,0,120,1020) RETURNING id`,
+        [f.landlordId, tenantId, leaseId, unitId])
+      // Nic: "once line items go on an invoice, they are bundled together as one
+      // item." Rent and utilities are two rows and ONE bill, paid in one act.
+      await client.query(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type,
+                               amount, status, entry_description, due_date)
+         VALUES ($1,$2,$3,$4,$5,'rent',900,'pending','RENT',CURRENT_DATE),
+                ($1,$2,$3,$4,$5,'utility',120,'pending','UTILITY',CURRENT_DATE)`,
+        [inv.id, unitId, leaseId, tenantId, f.landlordId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // One bill, not two. Counting rows counted the same debt twice — 21 rows
+    // were 10 invoices on Nic's platform.
+    expect(Number(res.body.data.unpaid_charges)).toBe(1)
+    expect(Number(res.body.data.unpaid_line_items)).toBe(2)
   })
 })

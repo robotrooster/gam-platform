@@ -1075,11 +1075,11 @@ function Overview(){
             <span>💸 Pay: <strong style={{color:'var(--t0)'}}>{stats?.flexPay||0}</strong></span>
           </div>
         </div>
-        {/* S639 (Nic): the sum counts occupied units — active, delinquent and
-            suspended — but the caption counted only the ACTIVE ones, so the
-            figure and the unit count it was divided by described different
-            sets. Delinquent rent is still contracted rent. */}
-        {isSuperAdmin&&<div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">contracted across {stats?.occupiedUnits ?? stats?.activeUnits ?? 0} occupied units</div></div>}
+        {/* S639 (Nic): "monthly rent volume should only be money that actually
+            moved... delinquent people are only important to the landlord."
+            The landlord's card asks what they are OWED; this one asks what came
+            across the rails. Different lenses, so they stop sharing a name. */}
+        {isSuperAdmin&&<div className="kpi"><div className="kl">Rent Volume · This Month</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">rent that moved, from {stats?.payingLeases||0} lease{(stats?.payingLeases||0)===1?'':'s'}{(stats?.paymentsInFlight||0)>0?' · incl. ACH clearing':''}</div></div>}
         {!isSuperAdmin&&<div className="kpi"><div className="kl">Vacant Units</div><div className="kv b">{stats?.vacantUnits||0}</div><div className="ks">available to fill</div></div>}
       </div>
 
@@ -1092,7 +1092,11 @@ function Overview(){
             UNPAID CHARGE — nobody has sent anything and no ACH exists. Money
             actually in transit is status='processing'. The count was right for
             a question nobody asked and wrong for the one printed under it. */}
-        <div className="kpi"><div className="kl">Unpaid Charges</div><div className={`kv ${(stats?.unpaidCharges ?? stats?.pendingPayments ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? stats?.pendingPayments ?? 0}</div><div className="ks">billed, not yet paid{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
+        {/* S639 (Nic): "once line items go on an invoice, they are bundled
+            together as one item." Rent and its utilities are separate rows but
+            one bill, paid in one act — counting rows counted the same debt
+            twice. */}
+        <div className="kpi"><div className="kl">Unpaid Invoices</div><div className={`kv ${(stats?.unpaidCharges ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? 0}</div><div className="ks">{stats?.unpaidLineItems||0} line item{(stats?.unpaidLineItems||0)===1?'':'s'}, billed and not yet paid{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 

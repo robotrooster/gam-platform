@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict WqUL65gby66v634rhtWWzPyFcjYiKCW9SFSpWdzO3qcgSxweTwaChoDg8jANfTc
+\restrict quxCdKIKcQex4QhaYuh18wvJgv8dbOpprnKFOorUbCE1vFKy1j7C2Js2M3tnIVs
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10433,8 +10433,15 @@ CREATE TABLE public.work_trade_settlements (
     CONSTRAINT work_trade_settlements_hours_nonneg CHECK (((hours_worked >= (0)::numeric) AND (hours_applied >= (0)::numeric))),
     CONSTRAINT work_trade_settlements_period_is_month_start CHECK ((period_month = (date_trunc('month'::text, (period_month)::timestamp with time zone))::date)),
     CONSTRAINT work_trade_settlements_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'billed'::text]))),
-    CONSTRAINT work_trade_settlements_target_positive CHECK ((target_hours > (0)::numeric))
+    CONSTRAINT work_trade_settlements_target_nonnegative CHECK ((target_hours >= (0)::numeric))
 );
+
+
+--
+-- Name: CONSTRAINT work_trade_settlements_target_nonnegative ON work_trade_settlements; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON CONSTRAINT work_trade_settlements_target_nonnegative ON public.work_trade_settlements IS 'S639: zero is a real target — a tracks_hours=false agreement asks for no hours and still opens a settlement period, because the period is what carries the credit onto the invoice. Negative remains impossible.';
 
 
 --
@@ -25661,5 +25668,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict WqUL65gby66v634rhtWWzPyFcjYiKCW9SFSpWdzO3qcgSxweTwaChoDg8jANfTc
+\unrestrict quxCdKIKcQex4QhaYuh18wvJgv8dbOpprnKFOorUbCE1vFKy1j7C2Js2M3tnIVs
 
