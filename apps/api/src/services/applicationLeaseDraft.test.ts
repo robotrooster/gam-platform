@@ -35,7 +35,7 @@ interface Fx {
   unitId: string; applicantUserId: string; applicationId: string
 }
 
-async function seedFixture(opts: { bg?: string; moveIn?: string | null } = {}): Promise<Fx> {
+async function seedFixture(opts: { bg?: string; moveIn?: string | null; term?: number | null } = {}): Promise<Fx> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -49,10 +49,10 @@ async function seedFixture(opts: { bg?: string; moveIn?: string | null } = {}): 
     await client.query(`INSERT INTO tenants (user_id, background_check_status) VALUES ($1,$2)`,
       [applicantUserId, opts.bg ?? 'approved'])
     const a = await client.query<{ id: string }>(
-      `INSERT INTO unit_applications (unit_id, landlord_id, applicant_user_id, first_name, last_name, email, move_in_date)
-       VALUES ($1,$2,$3,'Rina','Renter',$4,$5) RETURNING id`,
+      `INSERT INTO unit_applications (unit_id, landlord_id, applicant_user_id, first_name, last_name, email, move_in_date, desired_term_months)
+       VALUES ($1,$2,$3,'Rina','Renter',$4,$5,$6) RETURNING id`,
       [unitId, landlordId, applicantUserId, `app-${randomUUID()}@t.dev`,
-       opts.moveIn === undefined ? '2026-09-01' : opts.moveIn])
+       opts.moveIn === undefined ? '2026-09-01' : opts.moveIn, opts.term ?? null])
     const applicationId = a.rows[0].id
     await client.query('COMMIT')
     return { landlordUserId, landlordId, unitId, applicantUserId, applicationId }
@@ -83,6 +83,24 @@ describe('draftLeaseFromApplication', () => {
     expect(r2.leaseId).toBe(r1.leaseId)
     const n = await db.query<any>('SELECT COUNT(*)::int AS c FROM leases WHERE source_application_id=$1', [fx.applicationId])
     expect(n.rows[0].c).toBe(1)
+  })
+
+  // ── S639: the applicant is now asked how long they want the space ──
+  it('drafts month-to-month with no end date when no term was named', async () => {
+    const fx = await seedFixture()
+    const r = await draftLeaseFromApplication(fx.applicationId)
+    const l = (await db.query<any>('SELECT lease_type, end_date FROM leases WHERE id=$1', [r.leaseId])).rows[0]
+    expect(l.lease_type).toBe('month_to_month')
+    expect(l.end_date).toBeNull()
+  })
+
+  it('drafts a fixed term ending the day before the anniversary when one was named', async () => {
+    const fx = await seedFixture({ term: 12 })
+    const r = await draftLeaseFromApplication(fx.applicationId)
+    const l = (await db.query<any>('SELECT lease_type, start_date, end_date FROM leases WHERE id=$1', [r.leaseId])).rows[0]
+    expect(l.lease_type).toBe('fixed_term')
+    expect(l.start_date.toISOString().slice(0, 10)).toBe('2026-09-01')
+    expect(l.end_date.toISOString().slice(0, 10)).toBe('2027-08-31')
   })
 
   it('falls back to CURRENT_DATE when the application has no move-in date', async () => {

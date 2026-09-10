@@ -109,6 +109,39 @@ function ReviewModal({ check, onClose, onDecided }: {
   const [busy, setBusy] = useState<'' | 'approved' | 'denied'>('')
   const decidable = DECIDABLE.has(check.status)
 
+  // S639: an approval used to end at "approved" with nothing to click. The
+  // application already carries the space, the move-in date and the term, so
+  // the next step is one button — it files the screening as an application and
+  // hands it to the same drafter the listings door uses.
+  const [drafting, setDrafting] = useState(false)
+  const [pickedUnit, setPickedUnit] = useState('')
+  // A walk-up who scanned the park's QR code named no space — that is the point
+  // of the code. The park IS known, so the choice is between ITS vacant units
+  // and nothing else: unit numbers repeat across parks, and a cross-property
+  // list here would let one wrong click file a lease at another property.
+  const needsUnit = check.status === 'approved' && !check.unitId
+  const { data: vacants = [] } = useQuery<any[]>(
+    ['vacant-units', check.propertyId],
+    () => apiGet(`/units?propertyId=${check.propertyId}`),
+    { enabled: !!(needsUnit && check.propertyId) },
+  )
+  const choosable = (vacants as any[]).filter(u => u.status === 'vacant')
+
+  const draftLease = async () => {
+    setDrafting(true)
+    try {
+      const res: any = await apiPost(`/background/${check.id}/draft-lease`,
+        pickedUnit ? { unitId: pickedUnit } : {})
+      const leaseId = res?.leaseId || res?.data?.leaseId
+      toast('Draft lease created — review the terms, then send it for signing.')
+      onClose()
+      if (leaseId) window.location.href = `/leases?open=${leaseId}`
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not draft a lease.')
+      setDrafting(false)
+    }
+  }
+
   const decide = async (decision: 'approved' | 'denied') => {
     setBusy(decision)
     try {
@@ -154,6 +187,13 @@ function ReviewModal({ check, onClose, onDecided }: {
             {field('Email', check.email)}
             {field('Phone', check.phone)}
             {field('Applied', check.createdAt ? new Date(check.createdAt).toLocaleDateString() : null)}
+            {/* S639 (Nic): "I don't know how much he's wanting to have the spot
+                for... I don't wanna do back and forth with, hey, they told me
+                something, and then I forgot because I was busy." Asked on the
+                application now, so the answer is sitting here when he decides. */}
+            {field('Wants to move in', check.desiredMoveIn ? new Date(check.desiredMoveIn + 'T00:00:00').toLocaleDateString() : null)}
+            {field('Term wanted', check.desiredMonthToMonth ? 'Month to month'
+              : check.desiredTermMonths ? `${check.desiredTermMonths} months` : null)}
           </div>
 
           {/* ── S639 (Nic): "how do I see the actual data in the report? Is the
@@ -259,6 +299,23 @@ function ReviewModal({ check, onClose, onDecided }: {
         </div>
         <div className="modal-footer">
           <button className="btn btn-ghost" onClick={onClose} disabled={!!busy}>Close</button>
+          {check.status === 'approved' && (
+            <>
+              {needsUnit && (
+                <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>
+                  <option value="">Which space?</option>
+                  {choosable.map(u => (
+                    <option key={u.id} value={u.id}>
+                      {u.unitNumber}{u.rentAmount ? ` · $${Number(u.rentAmount).toLocaleString()}/mo` : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <button className="btn btn-primary" onClick={draftLease} disabled={drafting || (needsUnit && !pickedUnit)}>
+                {drafting ? 'Drafting…' : 'Draft lease'}
+              </button>
+            </>
+          )}
           {decidable && (
             <>
               <button className="btn" style={{background:'var(--danger,#dc2626)',color:'#fff',borderColor:'var(--danger,#dc2626)'}} onClick={() => decide('denied')} disabled={!!busy}>

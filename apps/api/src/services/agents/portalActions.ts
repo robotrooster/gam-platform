@@ -247,6 +247,28 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
 
+  // ── LANDLORD · an approved screening becomes a lease ─────────────────
+  {
+    id: 'draft_lease_from_screening',
+    audience: 'landlord', method: 'POST', path: '/api/background/:checkId/draft-lease',
+    pathParams: ['checkId'],
+    description:
+      'Turn an approved screening into a DRAFT lease. Use for "draft a lease for the guy I just ' +
+      'approved" or "write up Anastacio\'s lease". The applicant already told us when they want to ' +
+      'move in and how long they want the space, so the draft carries those and the unit\'s rent.\n' +
+      'This drafts only — nothing is sent and nobody signs. It lands on the Leases page marked for ' +
+      'review so the landlord can change the terms first.\n' +
+      'The screening must be approved; if it is not, say so rather than drafting. If the applicant ' +
+      'never named a space, ask WHICH SPACE and take the unit id from that property\'s own unit list ' +
+      '— unit numbers repeat between parks, so read the space and the park back before calling.',
+    params: {
+      checkId: { type: 'string', description: 'The screening-check id, from get_background_check_status — never asked of the landlord.' },
+      unitId: { type: 'string', description: 'Only when the screening named no space: the unit id, from that property\'s unit list.' },
+    },
+    required: ['checkId'],
+    confirmFirst: true,
+  },
+
   // ── LANDLORD · documents out for signature ───────────────────────────
   {
     id: 'send_document_for_signature',

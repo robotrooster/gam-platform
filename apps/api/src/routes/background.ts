@@ -26,6 +26,7 @@ import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
 import { emailScreeningApplyLink } from '../services/email'
 import { archiveProviderPayload } from '../services/backgroundReportArchive'
+import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
@@ -388,6 +389,9 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       prevLandlordName, prevLandlordPhone, prevLandlordEmail,
       idDocumentUrl, incomeDocUrls, consentCredit, consentCriminal, consentPool,
       timeToComplete, applicantPaymentIntentId,
+      // S639 (Nic): the tenancy being applied FOR. Without these an approval
+      // lands on "now what" and the terms live in a conversation he had days ago.
+      desiredMoveIn, desiredTermMonths, desiredMonthToMonth,
     } = req.body
     // S636: propertyId rides in from the property's QR code — see the
     // resolution below, which verifies it belongs to this landlord before
@@ -492,6 +496,17 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
             [req.user!.userId, req.user!.email]))?.property_id
       || null
 
+    // S639: what tenancy is being applied for. Month-to-month and a term are
+    // exclusive answers to one question — a term wins if somehow both arrive.
+    const termMonths = Number.isFinite(Number(desiredTermMonths)) && Number(desiredTermMonths) > 0
+      ? Math.min(120, Math.trunc(Number(desiredTermMonths)))
+      : null
+    const stay = {
+      moveIn: typeof desiredMoveIn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(desiredMoveIn) ? desiredMoveIn : null,
+      termMonths,
+      monthToMonth: termMonths === null && !!desiredMonthToMonth,
+    }
+
     let check: any
     try {
       check = await queryOne<any>(`
@@ -504,7 +519,8 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           id_document_url, income_document_urls,
           consent_credit, consent_criminal, consent_pool, consent_signed_at, consent_ip,
           ip_address, user_agent, provider_name,
-          applicant_payment_intent_id, property_id
+          applicant_payment_intent_id, property_id,
+          desired_move_in, desired_term_months, desired_month_to_month
         ) VALUES (
           $1, $2, $3, $4, 'pending',
           $5, $6, $7, $8, $9,
@@ -514,7 +530,8 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           $23, $24,
           $25, $26, $27, NOW(), $28,
           $29, $30, $31,
-          $32, $33
+          $32, $33,
+          $34, $35, $36
         ) RETURNING id`,
         [
           tenant?.id || null, req.user!.userId, effectiveLandlordId, unitId || null,
@@ -527,6 +544,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           ipAddr, ua, providerName,
           isSpeculative ? applicantPaymentIntentId : null, // S564: pool applicants pay; landlord route billed to landlord
           effectivePropertyId,
+          stay.moveIn, stay.termMonths, stay.monthToMonth,
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —
@@ -747,8 +765,10 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         bc.decision_notes, bc.decided_at, bc.created_at, bc.expires_at,
         bc.risk_score, bc.risk_level, bc.risk_flags,
         bc.provider_name, bc.provider_ref, bc.report_summary,
+        bc.desired_move_in, bc.desired_term_months, bc.desired_month_to_month,
+        COALESCE(un.property_id, bc.property_id) AS property_id,
         u.email, u.phone,
-        un.unit_number,
+        un.unit_number, un.id AS unit_id, un.rent_amount AS unit_rent,
         -- S636: a walk-up who scanned a property's QR code has NO unit — that
         -- is the point of the code, they have not picked a space yet. This
         -- resolved the property only through the unit, so every scanned
@@ -805,6 +825,77 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
     if (!check) throw new AppError(404, 'Not found')
     delete check.ssn_encrypted
     res.json({ success: true, data: check })
+  } catch (e) { next(e) }
+})
+
+// ── LANDLORD: DRAFT A LEASE FROM AN APPROVED SCREENING ───────────────────
+//
+// S639 (Nic): "I've marked him as approved, but what is the next course of
+// action? I need to generate him a lease. I don't know how much he's wanting
+// to have the spot for... I wanted to just, like, draft up a lease, essentially,
+// from the information on the background check."
+//
+// The screening now asks for the move-in date and the term (see /submit), so
+// everything a draft needs is already on the check. This does NOT grow a second
+// lease drafter — it files the screening as an application and hands it to the
+// one that has existed since S593, so both public doors converge on the same
+// Master Schedule and the same review flow.
+backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const scope = landlordScopeIds(req.user!)
+    const check = await queryOne<any>(
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, scope],
+    )
+    if (!check) throw new AppError(404, 'Not found')
+    if (check.status !== 'approved') {
+      throw new AppError(400, 'Approve the screening before drafting a lease')
+    }
+
+    // The unit may come from the check (a QR scan or a landlord-sent link that
+    // named a space) or from the landlord picking one now for a walk-up. Either
+    // way it has to belong to a company this account can read — a body-supplied
+    // id is never trusted on its own.
+    const unitId = check.unit_id || req.body?.unitId || null
+    if (!unitId) throw new AppError(400, 'Pick a unit for this applicant first')
+    const unit = await queryOne<any>(
+      `SELECT u.id, u.unit_number, p.landlord_id
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`,
+      [unitId],
+    )
+    if (!unit || !scope.includes(unit.landlord_id)) throw new AppError(404, 'Unit not found')
+
+    const applicant = await queryOne<any>(
+      'SELECT email, phone FROM users WHERE id=$1', [check.user_id])
+
+    // One application per screening — the unique index is the real guard, this
+    // just means a second click returns the first draft instead of an error.
+    let app = await queryOne<any>(
+      'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
+    if (!app) {
+      app = await queryOne<any>(
+        `INSERT INTO unit_applications
+           (unit_id, landlord_id, property_id, applicant_user_id, background_check_id,
+            first_name, last_name, email, phone,
+            move_in_date, monthly_income, desired_term_months, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'approved')
+         ON CONFLICT (background_check_id) WHERE background_check_id IS NOT NULL DO NOTHING
+         RETURNING id`,
+        [
+          unit.id, unit.landlord_id, check.property_id || null, check.user_id, check.id,
+          check.first_name, check.last_name, applicant?.email || '', applicant?.phone || null,
+          check.desired_move_in || null, check.monthly_income || null,
+          check.desired_month_to_month ? null : (check.desired_term_months || null),
+        ],
+      ) || await queryOne<any>(
+        'SELECT id FROM unit_applications WHERE background_check_id=$1', [check.id])
+    }
+    if (!app) throw new AppError(500, 'Could not file the application')
+
+    const result = await draftLeaseFromApplication(app.id)
+    if (!result.leaseId) throw new AppError(400, `Could not draft a lease (${result.reason || 'unknown'})`)
+    res.json({ success: true, data: { leaseId: result.leaseId, applicationId: app.id, drafted: result.drafted } })
   } catch (e) { next(e) }
 })
 

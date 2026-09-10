@@ -21,7 +21,7 @@ export async function draftLeaseFromApplication(
 ): Promise<{ drafted: boolean; leaseId?: string; reason?: string }> {
   const app = await queryOne<any>(
     `SELECT a.id, a.unit_id, a.landlord_id, a.applicant_user_id,
-            a.first_name, a.last_name, a.move_in_date,
+            a.first_name, a.last_name, a.move_in_date, a.desired_term_months,
             u.rent_amount, u.unit_number, u.status AS unit_status,
             p.name AS property_name
        FROM unit_applications a
@@ -40,15 +40,26 @@ export async function draftLeaseFromApplication(
 
   const rent = Number(app.rent_amount) > 0 ? Number(app.rent_amount) : 0
 
+  // S639: a term the applicant actually named makes this a fixed-term draft
+  // with a real end date, instead of a month-to-month shell somebody has to
+  // retype. No term (a booking, or an applicant who said month-to-month) keeps
+  // the old shape exactly.
+  const term = Number(app.desired_term_months) > 0 ? Math.trunc(Number(app.desired_term_months)) : null
+
   const rows = await query<{ id: string }>(
     `INSERT INTO leases
        (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date,
         needs_review, lease_source, source_application_id)
-     VALUES ($1, $2, $3, 'month_to_month', 'pending', COALESCE($4::date, CURRENT_DATE), NULL,
+     VALUES ($1, $2, $3,
+             CASE WHEN $6::int IS NULL THEN 'month_to_month' ELSE 'fixed_term' END,
+             'pending', COALESCE($4::date, CURRENT_DATE),
+             CASE WHEN $6::int IS NULL THEN NULL
+                  ELSE (COALESCE($4::date, CURRENT_DATE) + ($6::int * INTERVAL '1 month'))::date - 1
+             END,
              TRUE, 'application_draft', $5)
      ON CONFLICT (source_application_id) WHERE source_application_id IS NOT NULL DO NOTHING
      RETURNING id`,
-    [app.unit_id, app.landlord_id, rent, app.move_in_date || null, applicationId],
+    [app.unit_id, app.landlord_id, rent, app.move_in_date || null, applicationId, term],
   )
   const leaseId = rows[0]?.id
   if (!leaseId) {

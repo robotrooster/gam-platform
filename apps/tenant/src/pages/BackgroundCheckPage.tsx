@@ -92,7 +92,7 @@ export function BackgroundCheckPage() {
   // doesn't allow. Address is now plain manual entry, verified only by GAM's own
   // /background/verify-address endpoint. (This whole legacy intake step is dropped
   // entirely under Checkr, which collects the address on its hosted flow.)
-  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
+  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', moveIn:'', stay:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
   const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'))
   const { data: me } = useQuery('tenant-me', () => get('/tenants/me'))
@@ -107,6 +107,9 @@ export function BackgroundCheckPage() {
   // the landlord, who owns the state-cap pass-through). Pool intake requires the
   // share authorization.
   const isSpeculative = !priceLandlordId
+  // Somebody who already lives here and is screening voluntarily is not moving
+  // in and has no term to name — the stay questions below are not theirs.
+  const invitedResident = !!(me as any)?.onboardingUnitNumber || !!(me as any)?.unitId
   const providerCollectsPii = !!(price as any)?.providerCollectsPii
   // The name the check needs comes from the account, never a form field.
   useEffect(() => {
@@ -163,6 +166,17 @@ export function BackgroundCheckPage() {
         // S636: carried in by the property's QR code, so a walk-up's check
         // binds to the park they scanned at.
         propertyId:new URLSearchParams(window.location.search).get('propertyId')||null,
+        // ── S639 (Nic): ASK FOR THE STAY WHILE THEY ARE STANDING HERE ──
+        //
+        // "I don't know how much he's wanting to have the spot for... I don't
+        //  wanna do back and forth with, hey, they told me something, and then
+        //  I forgot because I was busy."
+        //
+        // Two questions at the front of the funnel are what turn an approval
+        // into a lease the office can draft without another phone call.
+        desiredMoveIn: form.moveIn || null,
+        desiredTermMonths: form.stay && form.stay !== 'mtm' ? Number(form.stay) : null,
+        desiredMonthToMonth: form.stay === 'mtm',
         timeToComplete:Math.round((Date.now()-startTime)/1000),
         applicantPaymentIntentId:paymentIntentId,
       })
@@ -257,7 +271,7 @@ export function BackgroundCheckPage() {
   // near them find them.
   const canNext: Record<string, boolean> = {
     'Consent': !!((providerCollectsPii||(form.consentCredit&&form.consentCriminal))
-      && form.acceptedTerms
+      && form.acceptedTerms && (invitedResident || (form.moveIn && form.stay))
       && (!isSpeculative || (form.consentPool && validZip))),
     'Review & Pay': paid,
   }
@@ -351,7 +365,6 @@ export function BackgroundCheckPage() {
   // genuinely want), but it says so at the top, before the fee is anywhere on
   // screen. The subtitle lies to them too — nothing here gates their portal —
   // so it goes for this case.
-  const invitedResident = !!(me as any)?.onboardingUnitNumber || !!(me as any)?.unitId
   return(
     <div style={{maxWidth:540,margin:'0 auto'}}>
       {invitedResident && (
@@ -373,6 +386,28 @@ export function BackgroundCheckPage() {
       <div style={{fontSize:'.7rem',color:'#4a5568',textAlign:'center',marginBottom:20}}>Step {step+1} of {STEPS.length} — {STEPS[step]}</div>
       <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12,padding:24,marginBottom:16}}>
         {STEPS[step]==='Consent'&&<div>
+          {/* S639: the two questions the office would otherwise have to chase
+              by phone after an approval. Asked here, an approved applicant
+              arrives with a move-in date and a term, and the lease can be
+              drafted straight off the application. */}
+          {!invitedResident&&<div style={{marginBottom:18,padding:'14px 16px',background:'#141a22',border:'1px solid #1e2530',borderRadius:10}}>
+            <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:10}}>About your stay</div>
+            <label style={lbl}>When would you like to move in? *</label>
+            <input style={inp} type="date" min={new Date().toISOString().slice(0,10)}
+              value={form.moveIn} onChange={e=>set('moveIn',e.target.value)}/>
+            <label style={{...lbl,marginTop:12}}>How long do you plan to stay? *</label>
+            <select style={inp} value={form.stay} onChange={e=>set('stay',e.target.value)}>
+              <option value="">Select…</option>
+              <option value="mtm">Month to month</option>
+              <option value="3">3 months</option>
+              <option value="6">6 months</option>
+              <option value="12">12 months</option>
+              <option value="24">24 months</option>
+            </select>
+            <div style={{fontSize:'.7rem',color:'#4a5568',marginTop:6}}>
+              So the office can have your paperwork ready. Nothing is locked in until you sign a lease.
+            </div>
+          </div>}
           {/* S636: the ONLY personal detail this intake still asks for, and
               only on the pool route. A pool applicant has named no property,
               so without a ZIP there is nothing to match them to landlords
