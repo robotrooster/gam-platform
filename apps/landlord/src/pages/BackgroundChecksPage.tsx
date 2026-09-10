@@ -176,24 +176,31 @@ function ReviewModal({ check, onClose, onDecided }: {
                 // report_summary is on camelize's JSONB_PASSTHROUGH_KEYS list, so
                 // Checkr's own response shape survives verbatim — these inner keys
                 // are deliberately snake_case and camelCase reads return undefined.
+                // S639: the API camelizes with lib/caseConversion, which has NO
+                // passthrough list — it descends into jsonb, so Checkr's own
+                // snake_case keys arrive camelCased and are read that way.
+                // (packages/shared/camelize DOES have a passthrough list; it is a
+                // different, client-side camelizer. I read that one, marked the
+                // wire-contract guard a false positive, and shipped reads that
+                // returned undefined — the exact bug the guard exists to catch.)
                 const r: any = report
-                const verdict = typeof r.result === 'string' ? r.result : null   // wire-ok
-                const products: Record<string, any> = (r.products && typeof r.products === 'object') ? r.products : {}   // wire-ok
-                const details: Record<string, any> = (r.details && typeof r.details === 'object') ? r.details : {}   // wire-ok
+                const verdict = typeof r.result === 'string' ? r.result : null
+                const products: Record<string, any> = (r.products && typeof r.products === 'object') ? r.products : {}
+                const details: Record<string, any> = (r.details && typeof r.details === 'object') ? r.details : {}
                 // S639: the figures that explain a status — a credit score of 720
                 // reading "consider" makes no sense until you can see the 720.
                 const detailFor = (k: string): string | null => {
                   const d = details[k]
                   if (!d || typeof d !== 'object') return null
                   const bits: string[] = []
-                  if (d.credit_score != null) bits.push(`score ${d.credit_score}`)   // wire-ok
-                  if (d.records_count != null) bits.push(`${d.records_count} record${Number(d.records_count) === 1 ? '' : 's'}`)   // wire-ok
-                  const fileStatus = d.credit_file_status   // wire-ok
+                  if (d.creditScore != null) bits.push(`score ${d.creditScore}`)
+                  if (d.recordsCount != null) bits.push(`${d.recordsCount} record${Number(d.recordsCount) === 1 ? '' : 's'}`)
+                  const fileStatus = d.creditFileStatus
                   if (typeof fileStatus === 'string' && fileStatus !== 'available') bits.push(humanize(fileStatus))
                   return bits.length ? bits.join(' · ') : null
                 }
-                const reportId: string | null = r.report_id ? String(r.report_id) : null   // wire-ok
-                const fetchedAt: string | null = r.fetched_at ? String(r.fetched_at) : null   // wire-ok
+                const reportId: string | null = r.reportId ? String(r.reportId) : null
+                const fetchedAt: string | null = r.fetchedAt ? String(r.fetchedAt) : null
                 const tone = (v: string) => v === 'clear' ? 'var(--green,#22c55e)'
                   : v === 'consider' ? 'var(--amber,#f59e0b)' : 'var(--text-1)'
                 return (

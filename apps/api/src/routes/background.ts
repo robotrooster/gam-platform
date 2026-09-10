@@ -25,6 +25,7 @@ import Stripe from 'stripe'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
 import { emailScreeningApplyLink } from '../services/email'
+import { archiveProviderPayload } from '../services/backgroundReportArchive'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
 // unlock fee. When STRIPE_SECRET_KEY is unset (dev mode without Stripe
@@ -1144,6 +1145,26 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
           failure_reason=$3, webhook_received_at=NOW()${expiresClause}
       WHERE id=$4`,
       [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
+
+    // ── S639 (Nic): "start collecting it for future use" ────────────────────
+    //
+    // Two payloads worth keeping, and they answer different questions: the raw
+    // REPORT is what the provider found, the raw WEBHOOK is what they told us
+    // and when. Both are archived append-only; neither can fail the screening.
+    const rawReport = (provider as any).rawReport
+    if (rawReport) {
+      await archiveProviderPayload({
+        backgroundCheckId: check.id, landlordId: check.landlord_id,
+        provider: provider.name, reportRef: update.reportRef ?? null,
+        source: 'fetch', payload: rawReport,
+      })
+    }
+    await archiveProviderPayload({
+      backgroundCheckId: check.id, landlordId: check.landlord_id,
+      provider: provider.name, reportRef: update.reportRef ?? null,
+      source: 'webhook', eventType: (req.body && (req.body.type || req.body.event)) || null,
+      payload: req.body,
+    })
 
     // Speculative path: complete → pool (if eligible). No landlord decision step.
     if (update.status === 'complete' && (!check.landlord_id || await isPoolIntakeLandlord(check.landlord_id))) {

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Uo2DhURsT0HyALkHZwqr5WEkvwrMiqFNRJbgvxMrULzRFyVdUWGge7lWEl4ZJtF
+\restrict pQDIdjMj8kTPkt5J9ab4CvYsmSfLg2948GwU6bHv0VTlccmAH4ZJN6SnQgVQP74
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1274,6 +1274,32 @@ CREATE TABLE public.auto_field_jobs (
     pages_done integer DEFAULT 0 NOT NULL,
     CONSTRAINT auto_field_jobs_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'done'::text, 'error'::text])))
 );
+
+
+--
+-- Name: background_check_reports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.background_check_reports (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    background_check_id uuid NOT NULL,
+    landlord_id uuid,
+    provider text NOT NULL,
+    report_ref text,
+    source text NOT NULL,
+    event_type text,
+    payload jsonb NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    purge_after date,
+    CONSTRAINT background_check_reports_source_check CHECK ((source = ANY (ARRAY['fetch'::text, 'webhook'::text])))
+);
+
+
+--
+-- Name: TABLE background_check_reports; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.background_check_reports IS 'S639: append-only archive of every raw provider payload for a background check. Consumer report data — landlord/admin surfaces only, never tenant-facing. purge_after supports FCRA-reasonable disposal once a retention period is chosen.';
 
 
 --
@@ -10580,6 +10606,14 @@ ALTER TABLE ONLY public.auto_field_jobs
 
 
 --
+-- Name: background_check_reports background_check_reports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_check_reports
+    ADD CONSTRAINT background_check_reports_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: background_checks background_checks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14092,6 +14126,27 @@ CREATE INDEX idx_bcput_active_lookup ON public.business_customer_payment_update_
 --
 
 CREATE INDEX idx_bcput_customer ON public.business_customer_payment_update_tokens USING btree (customer_id, created_at DESC);
+
+
+--
+-- Name: idx_bg_reports_check; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bg_reports_check ON public.background_check_reports USING btree (background_check_id, received_at DESC);
+
+
+--
+-- Name: idx_bg_reports_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bg_reports_landlord ON public.background_check_reports USING btree (landlord_id, received_at DESC);
+
+
+--
+-- Name: idx_bg_reports_purge; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bg_reports_purge ON public.background_check_reports USING btree (purge_after) WHERE (purge_after IS NOT NULL);
 
 
 --
@@ -19862,6 +19917,22 @@ ALTER TABLE ONLY public.auto_field_jobs
 
 ALTER TABLE ONLY public.auto_field_jobs
     ADD CONSTRAINT auto_field_jobs_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
+
+
+--
+-- Name: background_check_reports background_check_reports_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_check_reports
+    ADD CONSTRAINT background_check_reports_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id) ON DELETE CASCADE;
+
+
+--
+-- Name: background_check_reports background_check_reports_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_check_reports
+    ADD CONSTRAINT background_check_reports_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
 
 
 --
@@ -25684,5 +25755,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Uo2DhURsT0HyALkHZwqr5WEkvwrMiqFNRJbgvxMrULzRFyVdUWGge7lWEl4ZJtF
+\unrestrict pQDIdjMj8kTPkt5J9ab4CvYsmSfLg2948GwU6bHv0VTlccmAH4ZJN6SnQgVQP74
 

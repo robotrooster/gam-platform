@@ -223,6 +223,8 @@ const CHECKR_TENANT_PRODUCTS = [
 
 class CheckrProvider implements BackgroundProvider {
   readonly name = 'checkr'
+  /** S639: the last raw report body fetched, for the archive. */
+  rawReport: Record<string, unknown> | null = null
 
   private get baseUrl(): string {
     return process.env.CHECKR_TENANT_BASE_URL || 'https://tenant.checkr.com/api'
@@ -390,6 +392,10 @@ class CheckrProvider implements BackgroundProvider {
     })
     if (!res.ok) return null
     const report = await res.json() as Record<string, any>
+    // S639: the payload verbatim, before it is narrowed to a summary. The
+    // normalisation below answers today's question; the archive answers the ones
+    // that come later — a dispute, a re-screen, "what did it actually say".
+    this.rawReport = report
     const products: Record<string, string> = {}
     const details: Record<string, Record<string, unknown>> = {}
     let overall: 'clear' | 'consider' = 'clear'
