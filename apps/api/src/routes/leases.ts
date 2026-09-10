@@ -1673,6 +1673,54 @@ leasesRouter.get('/:id/termination-quote', async (req, res, next) => {
 
 // POST /api/leases/:id/terminate-early — tenant initiates
 const reasonSchema = z.object({ reason: z.string().max(2000).optional() })
+// ── POST /api/leases/:id/discard — S640 (Nic) ───────────────────────────────
+//
+//   "The one lease in review, that's the one that was supposed to delete when I
+//    deleted it from the master schedule. So why is that still there? There's
+//    no way to delete it either. So it's just useless filler... just delete it
+//    for now. I've got other things to do."
+//
+// It survived because the reservation was cancelled about three hours before
+// the code that takes the draft with it went live. Fine — but the deeper
+// problem is that there was no way out. A draft nobody can execute, delete or
+// complete sits on the dashboard as a permanent action item, and the only
+// button on it opens a PDF that does not exist.
+//
+// So: a way to discard one. It is a SOFT close, not a delete (GAM keeps
+// everything) — the row stays, marked terminated, with who did it and when. And
+// it is strictly limited to paperwork nobody has signed: a lease that reached
+// 'active' is an agreement between two people, and no button on a list page
+// ends a tenancy.
+leasesRouter.post('/:id/discard', requirePerm('leases.terminate'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(
+      `SELECT id, landlord_id, status, lease_source FROM leases WHERE id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!['pending', 'draft'].includes(lease.status)) {
+      throw new AppError(400, 'Only an unsigned draft can be discarded')
+    }
+    // A draft with signatures on it is mid-signing, not abandoned — that is
+    // what Void is for on the e-sign document, which notifies the signers.
+    const signed = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM lease_document_signers s
+         JOIN lease_documents d ON d.id = s.document_id
+        WHERE d.lease_id = $1 AND s.signed_at IS NOT NULL`, [req.params.id])
+    if (Number(signed?.n ?? 0) > 0) {
+      throw new AppError(400, 'Someone has already signed this — void the document instead')
+    }
+
+    await query(
+      `UPDATE leases
+          SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
+        WHERE id = $1`, [req.params.id])
+    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source },
+      '[lease] unsigned draft discarded')
+    res.json({ success: true, data: { id: req.params.id, status: 'terminated' } })
+  } catch (e) { next(e) }
+})
+
 leasesRouter.post('/:id/terminate-early', async (req, res, next) => {
   try {
     const u = req.user!

@@ -892,6 +892,33 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
          AND ($2::uuid IS NULL OR i.unit_id IN (
                SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
 
+    // ── S640 (Nic): "SIX DELINQUENT UNITS, LATE FEES ACCRUING" WAS FALSE ────
+    //
+    //   "That's a false flag on the tenants currently, because onboarding
+    //    tenants are exempt from late fees."
+    //
+    // Not one of the six was accruing anything. Five are existing residents on
+    // their first bill here, waived by directive because the delay was our
+    // onboarding; the sixth has no fee terms that reach it either. The banner
+    // asserted a consequence instead of reading one, and "late fees accruing"
+    // against a resident's name is not a detail to be casually wrong about.
+    //
+    // Counted the same way the late-fee job now decides, so the number on the
+    // dashboard is the number of people who will actually be charged tonight.
+    const [delinq] = await query<any>(`
+      SELECT COUNT(DISTINCT u.id) FILTER (WHERE NOT (
+               i.late_fee_exempt
+               OR (l.is_existing_tenancy = true
+                   AND NOT EXISTS (SELECT 1 FROM invoices ip
+                                    WHERE ip.lease_id = l.id AND ip.due_date < i.due_date))
+               OR COALESCE(l.late_fee_enabled, false) = false
+               OR l.late_fee_initial_amount IS NULL))::int AS accruing_units
+        FROM units u
+        JOIN invoices i ON i.unit_id = u.id AND i.status IN ('pending', 'partial')
+        LEFT JOIN leases l ON l.id = i.lease_id
+       WHERE u.landlord_id = ANY($1) AND u.status = 'delinquent'
+         AND ($2::uuid IS NULL OR u.property_id = $2)`, [scopeIds, propertyFilter])
+
     // Leases expiring soon — active leases whose end_date falls inside the next
     // 30 / 60 days. Drives the renewal-action KPI. Scoped by leases.landlord_id.
     const [expiring] = await query<any>(`
@@ -929,7 +956,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
     res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0,
-      work_trade_suspended: outstandingRow?.work_trade_suspended||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
+      work_trade_suspended: outstandingRow?.work_trade_suspended||0,
+      delinquent_units_accruing_late_fees: delinq?.accruing_units||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead
       // of leaving the landlord to discover it in Financials → Banking.
       connect_payouts_enabled: connect?.payouts_enabled ?? false,

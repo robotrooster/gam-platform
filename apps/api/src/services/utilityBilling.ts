@@ -638,8 +638,18 @@ export async function generateBillsForMeter(
   // Everything downstream is unchanged: a stuck meter still bills the LOWEST
   // real usage among occupied neighbours, so the estimate can only ever be
   // conservative.
-  const OCCUPIED = new Set(['active', 'delinquent', 'suspended'])
-  const occupiedHere = units.some((u: any) => OCCUPIED.has(u.status))
+  //
+  // S640 (Nic, DIRECTIVE, second pass): "Any occupied spot of any status gets
+  // that treatment — delinquent or active or whatever. Anything that's not
+  // vacant is fine."
+  //
+  // So the test is stated as the EMPTY states rather than a list of occupied
+  // ones. Naming the occupied statuses is how this broke: the set was written
+  // when three of them existed, 'owner_use' was added later, and nothing went
+  // back to add it. An empty space is 'vacant' or 'available' and always will
+  // be; everything else has somebody in it.
+  const EMPTY = new Set(['vacant', 'available'])
+  const occupiedHere = units.some((u: any) => !EMPTY.has(u.status))
   let stuckOnOccupied = false
   if (meter.billing_method === 'submeter' && !meter.out_of_service && occupiedHere) {
     const move = await queryOne<{ usage: string | null }>(`
@@ -701,6 +711,30 @@ export async function generateBillsForMeter(
       const baseCharge = compUsage * Number(meter.rate_per_unit || 0) + Number(meter.base_fee || 0)
       const sewerCharge = compUsage * sewerRate
       const taxAmount = Math.round(baseCharge * taxRatePct + sewerCharge * sewerTaxRatePct) / 100
+      // ── S640 (Nic): AN OWNER-OCCUPIED SPOT'S USAGE IS THE LANDLORD'S MONEY ──
+      //
+      //   "If an owner-occupied spot has a submeter that's broken, we still want
+      //    to flag that usage so the owner's keeping track of the real money.
+      //    Giving somebody a free spot to live is just money that's not coming
+      //    in, they're not losing anything. But when they're paying the
+      //    utilities on behalf of somebody, that's actual real money going out."
+      //
+      // The distinction is exact. Free rent costs the landlord nothing they had;
+      // the power bill is a cheque they write. A broken meter on such a spot
+      // meant the usage was never even estimated, so the one number that IS a
+      // real loss was the one nobody had.
+      if (unit.status === 'owner_use') {
+        await recordOwnerUseAbsorption({
+          unitId: unit.unit_id, utilityType: meter.utility_type,
+          chargeAmount: round2(baseCharge + sewerCharge),
+          allocationMethod: 'comparable_low', allocationBasis: compUsage,
+          baseFeeShare: Number(meter.base_fee || 0),
+          notes: `Owner-occupied unit, meter not reading — estimated at ${compUsage} `
+            + `from the lowest real occupied usage on the property. Paid by the landlord, billed to nobody.`,
+        })
+        skipped++
+        continue
+      }
       const inserted = await tryInsertBill({
         meterId, unitId: unit.unit_id, landlordId,
         utilityType: meter.utility_type,
@@ -819,6 +853,24 @@ export async function generateBillsForMeter(
       const baseCharge = usage * effRate + Number(meter.base_fee || 0)
       const sewerCharge = usage * sewerRate
       const taxAmount = Math.round(baseCharge * taxRatePct + sewerCharge * sewerTaxRatePct) / 100
+      // S640 (Nic): the same money the broken-meter branch above now records —
+      // and this is the branch that runs when the meter WORKS. An owner-occupied
+      // unit has no tenant and no lease, so tryInsertBill had nothing to bill
+      // and quietly dropped the charge. The landlord was paying it either way;
+      // the absorption ledger is where that shows up, and it is what makes the
+      // property audit ("billed out plus kept back equals what we consumed")
+      // reconcile for a submetered owner household.
+      if (unit.status === 'owner_use') {
+        await recordOwnerUseAbsorption({
+          unitId: unit.unit_id, utilityType: meter.utility_type,
+          chargeAmount: round2(baseCharge + sewerCharge),
+          allocationMethod: 'submeter', allocationBasis: usage,
+          baseFeeShare: Number(meter.base_fee || 0),
+          notes: `Owner-occupied unit — ${usage} metered, paid by the landlord and billed to nobody.`,
+        })
+        unitsSkipped++
+        continue
+      }
       const inserted = await tryInsertBill({
         meterId, unitId: unit.unit_id, landlordId,
         utilityType: meter.utility_type,

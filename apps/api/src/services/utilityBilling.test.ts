@@ -2617,6 +2617,58 @@ describe('S637 stuck meter on an occupied spot', () => {
     expect(rows.some(r => r.status === 'billed')).toBe(true)
   })
 
+  // ── S640 (Nic, second pass): "Any occupied spot of any status gets that
+  // treatment — delinquent or active or whatever. Anything that's not vacant is
+  // fine. If an owner-occupied spot has a submeter that's broken, we still want
+  // to flag that usage so the owner's keeping track of the real money... when
+  // they're paying the utilities on behalf of somebody, that's actual real
+  // money going out." ──────────────────────────────────────────────────────
+  //
+  // Free rent costs the landlord nothing they had. The power bill is a cheque
+  // they write, and a broken meter meant that number was never even estimated.
+  it('records the absorption on an OWNER-OCCUPIED spot instead of billing nobody', async () => {
+    const base = await seedBaseProperty()
+    await spot(base, 'RV O electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV P electric', 700, 700, true)
+    await db.query(`UPDATE units SET status='owner_use', owner_household_size=2 WHERE id=$1`, [stuck.unitId])
+
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+
+    // Nobody is billed…
+    const bills = await db.query<any>(
+      `SELECT charge_amount FROM utility_bills WHERE meter_id=$1 AND billing_cycle_month=$2::date`,
+      [stuck.meterId, CYCLE])
+    expect(bills.rows).toHaveLength(0)
+    // …and the landlord's own cost is on the ledger, estimated off the lowest
+    // real occupied usage exactly as a tenant's would have been.
+    const abs = await db.query<any>(
+      `SELECT allocation_basis, charge_amount, allocation_method FROM utility_owner_use_absorptions
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(abs.rows).toHaveLength(1)
+    expect(Number(abs.rows[0].allocation_basis)).toBe(120)
+    expect(Number(abs.rows[0].charge_amount)).toBeCloseTo(18, 2)  // 120 × $0.15
+    expect(abs.rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  // The same money, in the branch that runs when the meter WORKS. An
+  // owner-occupied unit has no tenant and no lease, so the charge used to be
+  // dropped on the floor — the property audit could not reconcile.
+  it('records the absorption on an owner-occupied spot whose meter reads fine', async () => {
+    const base = await seedBaseProperty()
+    const owner = await spot(base, 'RV Q electric', 1000, 1300, true)
+    await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
+
+    await generateBillsForMeter(owner.meterId, new Date(CYCLE + 'T00:00:00Z'))
+
+    const abs = await db.query<any>(
+      `SELECT allocation_basis, charge_amount, allocation_method FROM utility_owner_use_absorptions
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [owner.meterId, CYCLE])
+    expect(abs.rows).toHaveLength(1)
+    expect(Number(abs.rows[0].allocation_basis)).toBe(300)
+    expect(Number(abs.rows[0].charge_amount)).toBeCloseTo(45, 2)  // 300 × $0.15
+    expect(abs.rows[0].allocation_method).toBe('submeter')
+  })
+
   // A vacant spot reading zero is simply a vacant spot. 33 read zero at Mountain
   // View this cycle and every one of those bills is correct.
   it('leaves a stuck meter on a VACANT spot alone', async () => {

@@ -284,6 +284,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'discard_draft_lease',
+    audience: 'landlord', method: 'POST', path: '/api/leases/:leaseId/discard',
+    pathParams: ['leaseId'],
+    description:
+      'Discard an unsigned DRAFT lease that should not exist — a reservation that fell through, a ' +
+      'duplicate, paperwork started for somebody who never came. Use for "get rid of that draft on ' +
+      'RV 1" or "kill the pending lease nobody signed".\n' +
+      'Only a draft nobody has signed: a lease that is active is an agreement between two people and ' +
+      'this will refuse it. Nothing is sent to anyone, and the record is kept, marked cancelled.\n' +
+      'Read back WHICH draft — the space and the park — before calling; drafts look alike in a list.',
+    params: {
+      leaseId: { type: 'string', description: 'The lease id, from a lookup — never asked of the landlord.' },
+    },
+    required: ['leaseId'],
+    confirmFirst: true,
+  },
+  {
     id: 'void_document',
     audience: 'landlord', method: 'POST', path: '/api/esign/documents/:documentId/void',
     pathParams: ['documentId'],

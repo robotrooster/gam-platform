@@ -24,6 +24,9 @@ interface DashStats {
   workTradeRent?: number
   workTradeUnits?: number
   workTradeSuspended?: number
+  // S640: of the delinquent units, how many a late fee will actually reach
+  // tonight. Onboarding residents are waived, so the two numbers differ.
+  delinquentUnitsAccruingLateFees?: number
   totalUnits: number
   occupancyRate: number
   leasesExpiring30d: number
@@ -172,7 +175,13 @@ export function DashboardPage() {
       {(stats?.delinquentUnits || 0) > 0 && (
         <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=delinquent')}>
           <Clock size={16} />
-          <strong>{stats!.delinquentUnits} delinquent unit(s)</strong> — In cure window. Late fees accruing.
+          <strong>{stats!.delinquentUnits} delinquent unit{stats!.delinquentUnits === 1 ? '' : 's'}</strong> — In cure window.{' '}
+          {/* S640 (Nic): "that's a false flag... onboarding tenants are exempt
+              from late fees." Not one of the six was accruing anything. Read
+              the state instead of asserting the consequence. */}
+          {(stats?.delinquentUnitsAccruingLateFees ?? 0) === 0
+            ? 'No late fees — first bill after onboarding is waived.'
+            : `Late fees accruing on ${stats!.delinquentUnitsAccruingLateFees} of them.`}
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}

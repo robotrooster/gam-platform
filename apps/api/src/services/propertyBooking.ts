@@ -442,10 +442,30 @@ export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | '
  * the next waitlister for any unit a cancellation/expiry frees. Cron-driven.
  */
 export async function sweepBookingHoldsAndClaims(): Promise<{ holdsExpired: number; claimsExpired: number; promoted: number }> {
-  const expiredHolds = await query<{ unit_id: string }>(
+  const expiredHolds = await query<{ id: string; unit_id: string }>(
     `UPDATE unit_bookings SET status='cancelled', updated_at=now()
       WHERE status='tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now()
-      RETURNING unit_id`)
+      RETURNING id, unit_id`)
+  // S640: a cancelled reservation takes its unsigned draft lease with it. That
+  // rule went in on the master-schedule cancel route (S639) and this second
+  // door — an abandoned hold expiring on its own — was left doing the old
+  // thing, so a lapsed hold would strand exactly the kind of orphan draft Nic
+  // had no way to delete. Unsigned paperwork only; an executed lease is never
+  // touched by an expiring hold.
+  if (expiredHolds.length) {
+    try {
+      const killed = await query<{ id: string }>(
+        `UPDATE leases SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
+          WHERE source_booking_id = ANY($1::uuid[]) AND status IN ('pending', 'draft')
+          RETURNING id`, [expiredHolds.map(h => h.id)])
+      if (killed.length) {
+        logger.info({ leaseIds: killed.map(k => k.id) },
+          '[booking-sweep] expired holds also cancelled their unsigned draft leases')
+      }
+    } catch (err) {
+      logger.error({ err }, '[booking-sweep] draft-lease cancel on hold expiry failed')
+    }
+  }
   const expiredClaims = await query<{ unit_id: string }>(
     `UPDATE unit_booking_waitlists SET status='expired', updated_at=now()
       WHERE status='notified' AND claim_expires_at IS NOT NULL AND claim_expires_at < now()

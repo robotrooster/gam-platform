@@ -123,6 +123,36 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         -- catch-up plan shouldn't be fined for arrears from the old system."
         -- Set per invoice, so a landlord CAN opt a specific debt back in.
         AND i.late_fee_exempt = false
+        -- ── S640 (Nic): THE ONBOARDING WAIVER CANNOT DEPEND ON A STAMP ───────
+        --
+        --   "That's a false flag on the tenants currently, because onboarding
+        --    tenants are exempt from late fees."
+        --
+        -- The S639 waiver — an existing resident's FIRST bill on the platform is
+        -- never late, because the delay was our onboarding and not theirs — is
+        -- stamped onto late_fee_exempt when the invoice is generated. That is
+        -- fine for invoices the generator makes, and useless for every other
+        -- way an invoice comes into being: two of the five delinquent leases
+        -- carry is_existing_tenancy with a first invoice and no stamp, because
+        -- their invoices were written before the rule existed or by another
+        -- path. Nothing would have re-checked before fining them.
+        --
+        -- So the condition is asserted here as well, against the facts rather
+        -- than against a flag. The stamp stays — it is the record, and a
+        -- landlord can still opt a specific debt back in by clearing it — but
+        -- it is no longer the only thing standing between an onboarding
+        -- resident and a fee they were promised they would not get.
+        --
+        -- COALESCE, not a bare comparison: a utility-service invoice has no
+        -- lease at all, so is_existing_tenancy is NULL there, and NULL inside a
+        -- NOT(...) filters the row out entirely — it would have silently
+        -- stopped late fees on every service agreement on the platform. Two
+        -- tests caught it; without them nobody would have noticed for months.
+        AND NOT (
+          COALESCE(l.is_existing_tenancy, FALSE)
+          AND NOT EXISTS (SELECT 1 FROM invoices ip
+                           WHERE ip.lease_id = l.id AND ip.due_date < i.due_date)
+        )
         AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled) = true
         AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount) IS NOT NULL
         AND (NOW() AT TIME ZONE p.timezone)::date

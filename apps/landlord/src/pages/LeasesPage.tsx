@@ -148,6 +148,24 @@ export function LeasesPage() {
     }
     openDetails(l)
   }
+  // S640: discard an unsigned draft. Soft — the row stays, marked cancelled.
+  const discardDraft = async (l: any) => {
+    const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
+    if (!await appConfirm(
+      `The unsigned draft lease${where ? ` for ${where}` : ''} will be cancelled. `
+      + 'It stays on record, and nothing is sent to anyone.',
+      { title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true },
+    )) return
+    try {
+      await apiPost(`/leases/${l.id}/discard`, {})
+      toast('Draft discarded.')
+      leasesQc.invalidateQueries('leases')
+      leasesQc.invalidateQueries('landlord-dashboard')
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not discard that draft.')
+    }
+  }
+
   const openDetails = (l: any) => {
     // S639: always read-only — see openLease above.
     setViewOnly(true)
@@ -244,7 +262,7 @@ export function LeasesPage() {
           <AlertTriangle size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
           <div>
             <strong style={{ color: 'var(--amber)' }}>{needsReviewCount} lease{needsReviewCount === 1 ? '' : 's'} need review.</strong>
-            {' '}These were imported with default values. Click a row to review and confirm.
+            {' '}These were imported with default values. Click a row to review and confirm, or Discard one that should never have existed.
           </div>
           <span style={{ marginLeft: 'auto', fontSize: '.78rem', fontWeight: 600, color: 'var(--amber)', flexShrink: 0 }}>
             {reviewOnly ? 'Show all leases' : 'View →'}
@@ -409,6 +427,23 @@ export function LeasesPage() {
                         >
                           <Eye size={12} /> Details
                         </button>
+                        {/* ── S640 (Nic): A DRAFT NEEDS A WAY OUT ───────────
+                            "There's no way to delete it either. So it's just
+                             useless filler."
+                            An unsigned draft nobody can execute or complete sat
+                            on the dashboard as a permanent action item with no
+                            button that did anything. This closes it. Unsigned
+                            only — a signed lease is never ended from a list. */}
+                        {can('leases.terminate') && (l.status === 'pending' || l.status === 'draft') && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="Discard this unsigned draft — it stays on record as cancelled"
+                            onClick={() => discardDraft(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <X size={12} /> Discard
+                          </button>
+                        )}
                         {can('leases.bill_fee') && l.status === 'active' && (
                           <button
                             className="btn btn-ghost btn-sm"
