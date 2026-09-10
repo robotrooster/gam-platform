@@ -15,6 +15,7 @@ import {
   BOOKKEEPER_ACCESS_LEVELS,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { resolveLandlordTarget, landlordIdForProperty } from '../lib/landlordScope'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
@@ -73,17 +74,35 @@ function isAssignableRole(s: string): s is LandlordAssignableRole {
 // - admin/super_admin: explicit ?landlordId= or body.landlordId
 // - property_manager (S81, with team.invite or team.manage_permissions perm):
 //   their scope's landlordId. They cannot act on any other landlord.
-function getLandlordIdFromReq(req: any): string {
-  if (req.user?.role === 'landlord') return req.user.profileId
-  if (req.user?.role === 'admin' || req.user?.role === 'super_admin') {
-    const lid = req.query?.landlordId || req.body?.landlordId
-    if (!lid) throw new AppError(400, 'landlordId required for admin calls')
-    return String(lid)
-  }
+/**
+ * Which company this team action belongs to.
+ *
+ * ── S640: NO LANDLORD COULD INVITE ANYBODY ─────────────────────────────────
+ *
+ * This returned `req.user.profileId` for a landlord, and since S633 a
+ * landlord's profileId is NULL — an account is not an entity. So every invite,
+ * every permission change and every scope listing on the Team page inserted a
+ * NULL landlord_id and died on the not-null constraint, surfacing as a raw
+ * Postgres string rather than anything a person could act on. Found trying to
+ * add Lisa Scheeler to the front desk: the whole Team page was dead.
+ *
+ * Same fix as the eleven sites in background.ts, plus the S633 preference for
+ * DERIVING over asking: a team member is scoped to a property, and the property
+ * already names its company, so an account with two companies has nothing to
+ * choose. Only a role with no property at all (bookkeeper) can be ambiguous,
+ * and that one asks.
+ */
+async function getLandlordIdFromReq(req: any): Promise<string> {
+  const explicit = req.body?.landlordId ?? req.query?.landlordId ?? null
+  if (explicit) return resolveLandlordTarget(req.user, String(explicit), 'team member')
+
+  const propertyId = req.body?.scope?.propertyIds?.[0]
+  if (propertyId) return landlordIdForProperty(req.user, String(propertyId), query)
+
   if (req.user?.role === 'property_manager' && req.user?.landlordId) {
     return req.user.landlordId
   }
-  throw new AppError(403, 'Only landlords may manage scoped users')
+  return resolveLandlordTarget(req.user, null, 'team member')
 }
 
 async function insertScopeRow(
@@ -158,7 +177,7 @@ scopesRouter.use(requireAuth)
 // Registered BEFORE /:roleType so Express doesn't match 'team' as a roleType.
 scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'), async (req, res, next) => {
   try {
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
 
     // S168: surface direct_deposit_enabled (per-manager opt-in toggle) and
     // the cached Connect-readiness flags from users so TeamPage can render
@@ -242,7 +261,7 @@ scopesRouter.patch(
   requirePerm('team.manage_permissions'),
   async (req, res, next) => {
     try {
-      const landlordId = getLandlordIdFromReq(req)
+      const landlordId = await getLandlordIdFromReq(req)
       const body = z.object({ enabled: z.boolean() }).parse(req.body)
 
       // S236: self-target guard. CLAUDE.md spec: manager Connect is
@@ -314,7 +333,7 @@ scopesRouter.get(
   requirePerm('team.manage_permissions'),
   async (req, res, next) => {
     try {
-      const landlordId = getLandlordIdFromReq(req)
+      const landlordId = await getLandlordIdFromReq(req)
 
       // Authorize: caller must employ this manager.
       const scope = await queryOne<{ id: string }>(
@@ -342,7 +361,7 @@ scopesRouter.get('/:roleType', requirePerm('team.invite', 'team.manage_permissio
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const table = SCOPE_TABLES[role]
 
     const users = await query<any>(
@@ -369,7 +388,7 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
 
     const body = z.object({
       email: z.string().email(),
@@ -455,7 +474,7 @@ scopesRouter.patch('/:roleType/:userId/permissions', requirePerm('team.manage_pe
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
     if (role === 'bookkeeper') throw new AppError(400, 'Bookkeeper uses accessLevel, not permissions toggles')
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const body = z.object({ permissions: z.record(z.boolean()) }).parse(req.body)
     const table = SCOPE_TABLES[role]
 
@@ -483,7 +502,7 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const scope = validateScopePayload(role, req.body)
 
     // S236: self-edit guard. Same reasoning as the /permissions
@@ -555,7 +574,7 @@ scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions')
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const table = SCOPE_TABLES[role]
 
     const deleted = await queryOne<any>(
@@ -569,7 +588,7 @@ scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions')
 // POST /api/scopes/invitations/:id/resend — new token, reset expiry
 scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (req, res, next) => {
   try {
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const inv = await queryOne<any>(
       `SELECT * FROM invitations WHERE id = $1 AND landlord_id = $2`,
       [req.params.id, landlordId])
@@ -608,7 +627,7 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
 // POST /api/scopes/invitations/:id/revoke
 scopesRouter.post('/invitations/:id/revoke', requirePerm('team.invite'), async (req, res, next) => {
   try {
-    const landlordId = getLandlordIdFromReq(req)
+    const landlordId = await getLandlordIdFromReq(req)
     const inv = await queryOne<any>(
       `SELECT * FROM invitations WHERE id = $1 AND landlord_id = $2`,
       [req.params.id, landlordId])
