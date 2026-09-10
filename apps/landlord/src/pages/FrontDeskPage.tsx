@@ -173,12 +173,28 @@ export function FrontDeskPage() {
       .sort((a, b) => (b.owed - a.owed) || a.name.localeCompare(b.name))
   })()
   const sectionOpen = (n: string) => (query ? true : openProps[n] !== false)
+  // ── S639 (Nic): NO CHOICE THEY COULD GET WRONG ─────────────────────────────
+  //
+  // "I want them scoped to the specific property. I don't want any filters that
+  // they have to choose... I'm basically having the system hand hold my people so
+  // that they can't screw anything up. The less things that it's possible for
+  // somebody to screw up, the bigger your talent pool is for helping run your
+  // business. So we're trying to expand the talent pool by shrinking the
+  // requirements."
+  //
+  // The API now returns only the parks this person works at, so somebody scoped
+  // to Mountain View gets one group — and a collapsible header over a single
+  // group is a control with exactly one setting, which is a thing to click
+  // wrongly and nothing else. It disappears; the page simply IS their park.
+  const singleProperty = groups.length === 1
 
   return (
     <div>
       <div className="page-header">
         <div>
-          <h1 className="page-title">Front Desk</h1>
+          <h1 className="page-title">
+            Front Desk{singleProperty ? ` · ${groups[0].name}` : ''}
+          </h1>
           <p className="page-subtitle">
             {isLoading ? 'Loading…' : `${toCall} ${toCall === 1 ? 'person needs' : 'people need'} contacting`}
           </p>
@@ -221,6 +237,10 @@ export function FrontDeskPage() {
         <div className="card" style={{ padding: 0 }}>
           {groups.map(g => (
             <div key={g.name} style={{ borderTop: '1px solid var(--border-0)' }}>
+              {/* S639: one park, no header. The title already says where they
+                  are, and a toggle with one option is only a way to hide the
+                  list from yourself. */}
+              {!singleProperty && (
               <button type="button"
                 onClick={() => setOpenProps(o => ({ ...o, [g.name]: o[g.name] === false }))}
                 style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10,
@@ -239,8 +259,9 @@ export function FrontDeskPage() {
                   </span>
                 )}
               </button>
+              )}
 
-              {sectionOpen(g.name) && (
+              {(singleProperty || sectionOpen(g.name)) && (
                 <div style={{ padding: '0 16px 12px' }}>
                   {g.list.map(({ r, phase: ph, say }) => {
                     const meta = PHASES.find(p => p.id === ph)!

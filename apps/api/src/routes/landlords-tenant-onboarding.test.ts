@@ -684,3 +684,83 @@ describe('onboarding somebody who is already on the platform (S616)', () => {
     expect(after.rows[0].status).toBe('active')
   })
 })
+
+// ─── S639: STAFF SEE THEIR OWN PARK AND NOTHING ELSE ────────────────────────
+//
+// Nic: "When I scope a front desk person to the front desk tab, I want them
+// scoped to the specific property. Because I own Mountain View and Oak Park, I
+// want my front desk person here to only see Mountain View. I don't want any
+// filters that they have to choose... the less things that it's possible for
+// somebody to screw up, the bigger your talent pool is."
+//
+// This list was filtered by LANDLORD only, so an onsite manager scoped to one
+// park was served the other park's residents — names, emails and phone numbers
+// for somewhere they do not work. The scope row already existed and every other
+// property-bound surface consulted it; this one never did.
+describe('S639 pending pool is scoped to the properties a worker actually works at', () => {
+  it('an onsite manager scoped to one property never sees the other', async () => {
+    const f = await seedTOFixture()
+    // Two properties under the same landlord, one invited person at each.
+    const client = await db.connect()
+    let propA = '', propB = ''
+    try {
+      await client.query('BEGIN')
+      propA = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      propB = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const mk = async (propertyId: string, tag: string) => {
+      const email = `s639-scope-${tag}-${randomUUID().slice(0, 6)}@test.dev`
+      const r = await request(buildApp())
+        .post('/api/landlords/me/onboard-tenant-pending')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ firstName: tag, lastName: 'X', email, phone: '555' })
+      const unitId = await (async () => {
+        const c = await db.connect()
+        try { return await seedUnit(c, { propertyId, landlordId: f.landlordId }) }
+        finally { c.release() }
+      })()
+      await db.query(
+        `UPDATE pending_tenant_intents SET unit_id = $2 WHERE id = $1`, [r.body.data.intentId, unitId])
+      return email
+    }
+    const emailA = await mk(propA, 'AAA')
+    const emailB = await mk(propB, 'BBB')
+
+    // A worker scoped to property A only.
+    const { rows: [w] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','onsite_manager','Desk','Person',TRUE) RETURNING id`,
+      [`s639-desk-${randomUUID().slice(0, 6)}@test.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, permissions)
+       VALUES ($1, $2, FALSE, ARRAY[$3::uuid], '{"tenants.create": true}'::jsonb)`,
+      [w.id, f.landlordId, propA])
+    const token = jwt.sign(
+      { userId: w.id, role: 'onsite_manager', email: 'desk@test.dev',
+        profileId: w.id, landlordId: f.landlordId, landlordIds: [f.landlordId],
+        permissions: { 'tenants.create': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    const res = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    // Addresses are stored lowercased, so compare that way.
+    const emails = (res.body.data as any[]).map(r => String(r.email).toLowerCase())
+    expect(emails).toContain(emailA.toLowerCase())
+    // The whole point: the other park's resident is not on this person's screen.
+    expect(emails).not.toContain(emailB.toLowerCase())
+  })
+
+  it('the owner still sees both', async () => {
+    const f = await seedTOFixture()
+    const res = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+  })
+})

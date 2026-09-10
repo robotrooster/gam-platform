@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requireAdmin, requireLandlord, requirePerm } from '../middleware/auth'
+import { requireAuth, requireAdmin, requireLandlord, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
@@ -2675,6 +2675,21 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
     // the ACCOUNT — every company it owns — instead of the one the session sat
     // on, which hid the other company's records behind a 404.
     const landlordIds = landlordScopeIds(req.user!)
+    // ── S639 (Nic): STAFF SEE THEIR OWN PARK, AND NOTHING ELSE ─────────────
+    //
+    // "When I scope a front desk person to the front desk tab, I want them
+    // scoped to the specific property. Because I own Mountain View and Oak Park,
+    // I want my front desk person here to only see Mountain View. I don't want
+    // any filters that they have to choose... the less things that it's possible
+    // for somebody to screw up, the bigger your talent pool is."
+    //
+    // This list was filtered by LANDLORD only, so an onsite manager scoped to
+    // Mountain View was served Oak Park's residents too — names, emails and
+    // phone numbers for a park they do not work at. The scope row already exists
+    // and every other property-bound surface consults it; this one never did.
+    //
+    // null means unrestricted (an owner, or a worker marked all_properties).
+    const scopedPropertyIds = await getScopedPropertyIds(req.user)
 
     const intents = await query<any>(
       `SELECT
@@ -2803,6 +2818,10 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
           ORDER BY s.order_index LIMIT 1
        ) nxt ON TRUE
        WHERE pti.landlord_id = ANY($1::uuid[])
+         -- S639: and inside the park(s) this person actually works at. The
+         -- waiver-audit fallback is included so a grandfathered resident is
+         -- scoped by the unit their waiver names, not dropped from every list.
+         AND ($2::uuid[] IS NULL OR COALESCE(pr.id, wpr.id) = ANY($2::uuid[]))
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
          -- S636 (Nic): "It's double sending things. The pending pool has two
@@ -2847,7 +2866,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          -- item. There is no case where the audit row is the thing to act on.
          AND NOT (pti.unit_id IS NULL AND pti.screening_waived)
        ORDER BY pti.created_at DESC`,
-      [landlordIds]
+      [landlordIds, scopedPropertyIds]
     )
 
     res.json({
