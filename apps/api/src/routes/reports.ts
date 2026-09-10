@@ -161,25 +161,30 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
 
     // Outstanding = invoice total minus settled payments matched to that invoice.
     // pending|partial invoices only — settled invoices net to zero.
+    // S640 (Nic): work-trade charges are suspended, not owed — they settle in
+    // hours at month close. Netted here for the same reason as on the dashboard
+    // and the balances page: this figure and those two are the same claim about
+    // the same money, and Reports is where a landlord goes to check the others.
+    const OUTSTANDING_PAID = `
+              SELECT invoice_id,
+                     SUM(amount) FILTER (WHERE status IN ('settled', 'processing')) AS paid,
+                     SUM(amount) FILTER (WHERE status NOT IN ('settled', 'processing')
+                                           AND work_trade_suspended_at IS NOT NULL) AS traded
+                FROM payments WHERE invoice_id IS NOT NULL
+               GROUP BY invoice_id`
+    const OUTSTANDING_SUM =
+      `COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0) - COALESCE(p.traded, 0), 0)), 0)::numeric AS amount`
     const outstandingRow = isAdmin
       ? await queryOne<any>(`
-          SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::numeric AS amount
+          SELECT ${OUTSTANDING_SUM}
             FROM invoices i
-            LEFT JOIN (
-              SELECT invoice_id, SUM(amount) AS paid
-                FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
-               GROUP BY invoice_id
-            ) p ON p.invoice_id = i.id
+            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
            WHERE i.status IN ('pending', 'partial')
         `)
       : await queryOne<any>(`
-          SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::numeric AS amount
+          SELECT ${OUTSTANDING_SUM}
             FROM invoices i
-            LEFT JOIN (
-              SELECT invoice_id, SUM(amount) AS paid
-                FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
-               GROUP BY invoice_id
-            ) p ON p.invoice_id = i.id
+            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
            WHERE i.landlord_id = ANY($1::uuid[]) AND i.status IN ('pending', 'partial')
         `, [landlordIds])
     const outstanding = parseFloat(outstandingRow?.amount ?? '0')

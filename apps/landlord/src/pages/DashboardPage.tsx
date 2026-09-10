@@ -19,6 +19,11 @@ interface DashStats {
   monthlyRentVolume: number
   collectedMtd: number
   outstanding: number
+  // S640: rent that trades for labour — contracted, real, and never arriving as
+  // money. Reported apart from monthlyRentVolume/outstanding, not inside them.
+  workTradeRent?: number
+  workTradeUnits?: number
+  workTradeSuspended?: number
   totalUnits: number
   occupancyRate: number
   leasesExpiring30d: number
@@ -97,6 +102,12 @@ export function DashboardPage() {
   // Backs the "Expected Monthly Rent" subtext so the count matches the units
   // actually summed into that figure. (direct_pay retired W-15/S531.)
   const rentRollUnits = (stats?.activeUnits || 0) + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
+  // S640 (Nic, DIRECTIVE): work trade is revenue that is never coming in as
+  // money. It is out of Expected and out of Outstanding, and stands on its own
+  // so the landlord can still see what the trades are worth.
+  const workTradeRent  = Number(stats?.workTradeRent ?? 0)
+  const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
+  const payableUnits   = Math.max(rentRollUnits - workTradeUnits, 0)
   const platformFee = stats?.platformFee ?? 0
   // S574: referral earnings offset the platform fee. Net > 0 = you still owe GAM
   // that much this month; Net <= 0 = your referrals earn back more than you pay.
@@ -200,7 +211,10 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
-          <div className="kpi-sub">contracted across {rentRollUnits} occupied units</div>
+          <div className="kpi-sub">
+            payable across {payableUnits} occupied unit{payableUnits === 1 ? '' : 's'}
+            {workTradeUnits > 0 && ` · ${fmtWhole(workTradeRent)} traded for work on ${workTradeUnits} more`}
+          </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
           <div className="kpi-label">Collected This Month</div>
@@ -211,7 +225,11 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
-          <div className="kpi-sub">unpaid invoice balances</div>
+          <div className="kpi-sub">
+            unpaid invoice balances
+            {Number(stats?.workTradeSuspended ?? 0) > 0
+              && ` · ${fmtWhole(Number(stats?.workTradeSuspended))} more suspended while it is worked off`}
+          </div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
         <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>

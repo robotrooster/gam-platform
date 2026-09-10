@@ -2518,6 +2518,20 @@ describe('S637 stuck meter on an occupied spot', () => {
     return { meterId, unitId }
   }
 
+  async function seedEmptyBill(base: BaseCtx, meterId: string, unitId: string, status: string) {
+    const { rows } = await db.query<{ tenant_id: string; lease_id: string }>(
+      `SELECT lt.tenant_id, l.id AS lease_id FROM leases l
+         JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role='primary'
+        WHERE l.unit_id = $1 ORDER BY l.start_date DESC LIMIT 1`, [unitId])
+    await db.query(
+      `INSERT INTO utility_bills
+         (meter_id, unit_id, tenant_id, lease_id, landlord_id, billing_cycle_month, usage_amount,
+          allocation_method, rate_per_unit, base_fee_share, charge_amount,
+          tax_rate_pct, tax_amount, utility_type, status)
+       VALUES ($1,$2,$3,$4,$5,$6::date,0,'submeter',0.15,0,0,0,0,'electric',$7)`,
+      [meterId, unitId, rows[0].tenant_id, rows[0].lease_id, base.landlordId, CYCLE, status])
+  }
+
   it('estimates from the lowest OCCUPIED comparable rather than billing zero', async () => {
     const base = await seedBaseProperty()
     await spot(base, 'RV A electric', 1000, 1120, true)   // lived-in, used 120
@@ -2533,6 +2547,74 @@ describe('S637 stuck meter on an occupied spot', () => {
         WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
     expect(Number(rows[0].usage_amount)).toBe(120)   // the lowest OCCUPIED, not the vacant zero
     expect(rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  // ── S640 (Nic): "Jared Coil in RV twenty three was not billed for
+  // electricity... if it is [a broken meter], it should be matching the lowest
+  // real use case." ────────────────────────────────────────────────────────
+  //
+  // His meter read 44999 twice running, so the rule above should have caught
+  // it. It did not: the occupancy test asked for status 'active' and Jared is
+  // DELINQUENT. A resident behind on rent is exactly who must not quietly get a
+  // free month of power and then a double bill when somebody notices.
+  it('estimates for a DELINQUENT spot — behind on rent is still lived in', async () => {
+    const base = await seedBaseProperty()
+    await spot(base, 'RV G electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV H electric', 44999, 44999, true)
+    await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
+
+    const res = await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    expect(res.billsCreated).toBe(1)
+    const { rows } = await db.query<{ usage_amount: string; allocation_method: string }>(
+      `SELECT usage_amount, allocation_method FROM utility_bills
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(Number(rows[0].usage_amount)).toBe(120)
+    expect(rows[0].allocation_method).toBe('comparable_low')
+  })
+
+  it('estimates for a SUSPENDED spot too', async () => {
+    const base = await seedBaseProperty()
+    await spot(base, 'RV I electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV J electric', 500, 500, true)
+    await db.query(`UPDATE units SET status='suspended' WHERE id=$1`, [stuck.unitId])
+    const res = await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    expect(res.billsCreated).toBe(1)
+  })
+
+  // The $0.00 row an earlier run already wrote would otherwise BLOCK the fix:
+  // bills are idempotent per (meter, unit, cycle), so re-running found RV 23's
+  // empty row and skipped. An empty, un-invoiced bill is the absence of a
+  // reading filed as a fact — it gets replaced, not kept.
+  it('replaces an empty $0 bill a prior run left behind', async () => {
+    const base = await seedBaseProperty()
+    await spot(base, 'RV K electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV L electric', 44999, 44999, true)
+    await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
+
+    // What the pre-fix run produced.
+    await seedEmptyBill(base, stuck.meterId, stuck.unitId, 'unbilled')
+
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    const { rows } = await db.query<{ usage_amount: string; charge_amount: string }>(
+      `SELECT usage_amount, charge_amount FROM utility_bills
+        WHERE meter_id=$1 AND billing_cycle_month=$2::date`, [stuck.meterId, CYCLE])
+    expect(rows.length).toBe(1)
+    expect(Number(rows[0].usage_amount)).toBe(120)
+    expect(Number(rows[0].charge_amount)).toBeGreaterThan(0)
+  })
+
+  // An invoiced bill is money the resident has already been told about. Even at
+  // zero it stays — reversing a sent charge is the landlord's call, not a job's.
+  it('leaves an already-billed row alone', async () => {
+    const base = await seedBaseProperty()
+    await spot(base, 'RV M electric', 1000, 1120, true)
+    const stuck = await spot(base, 'RV N electric', 44999, 44999, true)
+    await seedEmptyBill(base, stuck.meterId, stuck.unitId, 'billed')
+    await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM utility_bills WHERE meter_id=$1 AND billing_cycle_month=$2::date`,
+      [stuck.meterId, CYCLE])
+    expect(rows.some(r => r.status === 'billed')).toBe(true)
   })
 
   // A vacant spot reading zero is simply a vacant spot. 33 read zero at Mountain

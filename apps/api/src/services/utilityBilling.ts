@@ -620,7 +620,26 @@ export async function generateBillsForMeter(
   // Occupied plus no movement is the correlation. A vacant spot reading zero is
   // simply a vacant spot — 33 of them read zero this cycle and every one of
   // those is correct. An OCCUPIED one cannot use nothing.
-  const occupiedHere = units.some((u: any) => u.status === 'active')
+  // ── S640 (Nic): "Jared Coil in RV twenty three was not billed for
+  // electricity. So I wanna double check that that's not a broken meter. And if
+  // it is, it should be matching the lowest real use case." ─────────────────
+  //
+  // It is a broken meter — RV 23 read 44999 in August and 44999 in September —
+  // and the rule above was written for exactly that. It did not fire because
+  // this line asked whether the unit was 'active', and Jared is DELINQUENT.
+  //
+  // Delinquent and suspended spots are occupied. That is what those statuses
+  // MEAN: somebody lives there and owes for it. Reading occupancy as 'active'
+  // only is the same mistake that made Expected Monthly Rent read low, and here
+  // it is worse — a resident behind on rent is precisely who must not silently
+  // get a free month of electricity, and the person least able to absorb the
+  // catch-up bill when somebody notices. Nic found this one by eye.
+  //
+  // Everything downstream is unchanged: a stuck meter still bills the LOWEST
+  // real usage among occupied neighbours, so the estimate can only ever be
+  // conservative.
+  const OCCUPIED = new Set(['active', 'delinquent', 'suspended'])
+  const occupiedHere = units.some((u: any) => OCCUPIED.has(u.status))
   let stuckOnOccupied = false
   if (meter.billing_method === 'submeter' && !meter.out_of_service && occupiedHere) {
     const move = await queryOne<{ usage: string | null }>(`
@@ -663,6 +682,20 @@ export async function generateBillsForMeter(
            WHERE property_id = $1 AND utility_type = 'sewer'
         `, [meter.property_id]))?.tax_rate_pct || 0)
       : 0
+    // S640: a zero-dollar bill this same meter+cycle already wrote is not a
+    // record of anything — it is the absence of a reading, filed as though the
+    // resident used nothing. It also BLOCKS the estimate: tryInsertBill is
+    // idempotent per (meter, unit, cycle), so a re-run after the occupancy fix
+    // above would find RV 23's $0.00 row and skip. Clear the empty rows so the
+    // real number can land. Only $0 and only not-yet-billed — anything a
+    // resident has actually been invoiced for stays exactly where it is.
+    await query(`
+      DELETE FROM utility_bills
+       WHERE meter_id = $1 AND billing_cycle_month = $2
+         AND charge_amount = 0 AND tax_amount = 0
+         AND status = 'unbilled' AND payment_id IS NULL`,
+      [meterId, cycleIso])
+
     let created = 0, skipped = 0
     for (const unit of units) {
       const baseCharge = compUsage * Number(meter.rate_per_unit || 0) + Number(meter.base_fee || 0)

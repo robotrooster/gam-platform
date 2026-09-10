@@ -703,10 +703,40 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         -- payments appear in income — counting only 'active' made Expected read
         -- LOWER than the income reports. 'vacant'/'available' are empty → excluded.
         -- (direct_pay retired W-15/S531.)
-        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended') THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        -- ── S640 (Nic, DIRECTIVE): WORK TRADE IS NOT EXPECTED REVENUE ───────
+        --
+        --   "Outstanding and expected monthly rents are probably calculating
+        --    the work trade people. Those need to be subtracted from those KPI
+        --    cards. Those people are not gonna be paying. It's not outstanding.
+        --    ...Keep track of each work trade total in terms of a line item of
+        --    revenue that's not coming in, but don't keep track of it in the
+        --    outstanding balance or the expected monthly rent."
+        --
+        -- Six spaces trade rent for labour. Their rent is contracted and it is
+        -- real, but it is never going to arrive as money — it arrives as work.
+        -- Summing it into Expected made the card promise $2,869 a month that no
+        -- bank account will ever see, and then Outstanding billed the landlord's
+        -- own attention for chasing it.
+        --
+        -- So it comes out of both and gets its own figure. Not deleted, not
+        -- hidden: a landlord should be able to see what the trades are worth.
+        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
+                            AND NOT COALESCE(wt.trades_rent, FALSE) THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
+                            AND COALESCE(wt.trades_rent, FALSE) THEN u.rent_amount ELSE 0 END),0) AS work_trade_rent,
+        COUNT(*) FILTER (WHERE u.status IN ('active','delinquent','suspended')
+                           AND COALESCE(wt.trades_rent, FALSE))::int AS work_trade_units,
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
+      -- 'rent' has to be IN covered_charges: an agreement that trades only the
+      -- utilities still expects the rent in cash, and zeroing that unit would
+      -- understate the roll by a whole space.
+      LEFT JOIN LATERAL (
+        SELECT TRUE AS trades_rent FROM work_trade_agreements a
+         WHERE a.unit_id = u.id AND a.status = 'active'
+           AND 'rent' = ANY(a.covered_charges) LIMIT 1
+      ) wt ON TRUE
       WHERE u.landlord_id = ANY($1)
         AND ($2::uuid IS NULL OR p.id = $2)`, [scopeIds, propertyFilter])
     // S605 (Nic): the dashboard never said that payouts were unverified, so a
@@ -831,12 +861,31 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
          AND settled_at >= date_trunc('month', NOW())
          AND ($2::uuid IS NULL OR unit_id IN (
                SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
+    // ── S640 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT OUTSTANDING ───────
+    //
+    //   "It's not outstanding... not good to have that integrated everywhere
+    //    when it's not really real money at this point."
+    //
+    // A work-trade month issues its invoice GROSS and settles in HOURS at month
+    // close (S624), so every one of its charge rows sits `pending` with a
+    // work_trade_suspended_at stamp on it. The balances page has netted those
+    // out since S634 — this card did not, so the dashboard and the page it
+    // links to disagreed by the full value of the trades, and the disagreement
+    // always read in the direction of "your residents owe you more than they
+    // do". Same subquery the balances page uses, so they cannot drift again.
+    //
+    // `traded` is reported alongside rather than thrown away: what the trades
+    // are worth this month is a real number a landlord should be able to see.
     const [outstandingRow] = await query<any>(`
-      SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::float AS outstanding
+      SELECT COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0) - COALESCE(p.traded, 0), 0)), 0)::float AS outstanding,
+             COALESCE(SUM(LEAST(COALESCE(p.traded, 0), GREATEST(i.total_amount - COALESCE(p.paid, 0), 0))), 0)::float AS work_trade_suspended
         FROM invoices i
         LEFT JOIN (
-          SELECT invoice_id, SUM(amount) AS paid
-            FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
+          SELECT invoice_id,
+                 SUM(amount) FILTER (WHERE status IN ('settled', 'processing')) AS paid,
+                 SUM(amount) FILTER (WHERE status NOT IN ('settled', 'processing')
+                                       AND work_trade_suspended_at IS NOT NULL) AS traded
+            FROM payments WHERE invoice_id IS NOT NULL
            GROUP BY invoice_id
         ) p ON p.invoice_id = i.id
        WHERE i.landlord_id = ANY($1) AND i.status IN ('pending', 'partial')
@@ -879,7 +928,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0,
+      work_trade_suspended: outstandingRow?.work_trade_suspended||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead
       // of leaving the landlord to discover it in Financials → Banking.
       connect_payouts_enabled: connect?.payouts_enabled ?? false,
@@ -921,9 +971,31 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
         l.id AS lease_id, l.start_date, l.end_date, l.lease_type,
         vuo.primary_first_name AS tenant_first,
         vuo.primary_last_name AS tenant_last,
-        vuo.tenant_count
+        vuo.tenant_count,
+        -- ── S640 (Nic): "RV nine is showing active, but no name in there on the
+        -- expected monthly rent. Oh — that's because the lease is starting for
+        -- October first, not now." ────────────────────────────────────────────
+        --
+        -- He worked it out himself, which is the tell: the page made him. A
+        -- space held for somebody who has signed for next month is not the same
+        -- as a space with nobody on it, and the roll showed them identically —
+        -- a blank name beside a rent figure. Name the incoming resident and the
+        -- date, and there is nothing left to work out.
+        up.first_name AS upcoming_first, up.last_name AS upcoming_last,
+        up.start_date AS upcoming_start,
+        -- S640: this page explains the Expected Monthly Rent card, so it has to
+        -- split the roll the same way the card does. A traded space stays on
+        -- the list — it IS rented, and hiding it would make the roll disagree
+        -- with the unit count beside it — but its rent is labelled and totalled
+        -- separately, because it is never arriving as money.
+        COALESCE(wt.trades_rent, FALSE) AS work_trade
       FROM units u
       JOIN properties p ON p.id = u.property_id
+      LEFT JOIN LATERAL (
+        SELECT TRUE AS trades_rent FROM work_trade_agreements a
+         WHERE a.unit_id = u.id AND a.status = 'active'
+           AND 'rent' = ANY(a.covered_charges) LIMIT 1
+      ) wt ON TRUE
       -- LATERAL + LIMIT 1: nothing enforces one active lease per unit at the
       -- schema layer, and a stray duplicate would double-count the roll.
       LEFT JOIN LATERAL (
@@ -932,11 +1004,32 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
         ORDER BY start_date DESC LIMIT 1
       ) l ON TRUE
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      -- Only consulted when there is no active lease — an occupied space is
+      -- described by who lives there now, never by who is arriving.
+      LEFT JOIN LATERAL (
+        SELECT us.first_name, us.last_name, fl.start_date
+          FROM leases fl
+          JOIN lease_tenants flt ON flt.lease_id = fl.id AND flt.role = 'primary'
+          JOIN tenants ft ON ft.id = flt.tenant_id
+          JOIN users us ON us.id = ft.user_id
+         WHERE fl.unit_id = u.id AND l.id IS NULL
+           AND fl.status IN ('active', 'pending')
+           AND fl.start_date > CURRENT_DATE
+         ORDER BY fl.start_date ASC LIMIT 1
+      ) up ON TRUE
       WHERE u.landlord_id = ANY($1::uuid[])
         AND u.status IN ('active','delinquent','suspended')
       ORDER BY p.name, u.unit_number`, [rentRollIds])
-    const total = rows.reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
-    res.json({ success: true, data: { rows, total: Math.round(total * 100) / 100 } })
+    const cash = rows.filter((r: any) => !r.work_trade)
+        .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
+    const traded = rows.filter((r: any) => r.work_trade)
+        .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
+    res.json({ success: true, data: {
+      rows,
+      total: Math.round(cash * 100) / 100,
+      work_trade_total: Math.round(traded * 100) / 100,
+      work_trade_units: rows.filter((r: any) => r.work_trade).length,
+    } })
   } catch (e) { next(e) }
 })
 

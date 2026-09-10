@@ -78,6 +78,16 @@ unitsRouter.get('/', async (req, res, next) => {
         -- achVerified for the primary tenant's ACH badge; without this the
         -- field was always undefined and the badge stuck on "Pending".
         pt.ach_verified,
+        -- ── S640 (Nic): "they're all showing pending ACH... not good to have
+        -- that integrated everywhere when it's not really real money." ────────
+        --
+        -- A work-trade resident is never going to link a bank account, because
+        -- no money is ever going to move. The Tenants list read their ACH badge
+        -- as "Pending" and will read it that way for as long as they live there
+        -- — a permanent to-do item for something nobody should ever do.
+        EXISTS (SELECT 1 FROM work_trade_agreements a
+                 WHERE a.unit_id = u.id AND a.status = 'active'
+                   AND 'rent' = ANY(a.covered_charges)) AS work_trade_rent,
         -- S613 (Nic): how many people have ALREADY been invited to this unit and
         -- have not finished a lease yet. v_unit_occupancy only knows about an
         -- ACTIVE tenancy, so a unit with an invite out still looked free — and

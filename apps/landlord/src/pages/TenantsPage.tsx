@@ -60,8 +60,14 @@ export function TenantsPage() {
                   <td><div style={{fontWeight:600,color:'var(--text-0)'}}>{u.tenantFirst} {u.tenantLast}</div><div style={{fontSize:'.72rem',color:'var(--text-3)'}}>{u.tenantEmail}</div></td>
                   <td className="mono">{u.unitNumber}</td>
                   <td style={{fontSize:'.82rem'}}>{u.propertyName}</td>
-                  <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}</td>
-                  <td><span className={`badge ${u.achVerified?'badge-green':'badge-amber'}`}>{u.achVerified?'Verified':'Pending'}</span></td>
+                  <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}
+                    {u.workTradeRent && <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>traded for work</div>}</td>
+                  {/* S640 (Nic): a work-trade resident pays in hours and will
+                      never link a bank, so "ACH pending" is a chore that can
+                      never be finished. Say what is actually true of them. */}
+                  <td>{u.workTradeRent
+                    ? <span className="badge badge-gold">Work trade</span>
+                    : <span className={`badge ${u.achVerified?'badge-green':'badge-amber'}`}>{u.achVerified?'Verified':'Pending'}</span>}</td>
                   <td>{u.ssiSsdi ? <span className="badge badge-gold">SSI/SSDI</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>
                 </tr>
               )) : (

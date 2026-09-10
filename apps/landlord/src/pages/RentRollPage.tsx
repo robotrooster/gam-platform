@@ -34,7 +34,15 @@ export function RentRollPage() {
   const [propertyId, setPropertyId] = useState('')
   const propertyOptions = allRows.map(r => ({ id: r.propertyId, name: r.propertyName }))
   const rows = allRows.filter(r => propertyId === '' || r.propertyId === propertyId)
-  const total = rows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
+  // S640 (Nic): "Those people are not gonna be paying... keep track of each work
+  // trade total in terms of a line item of revenue that's not coming in, but
+  // don't keep track of it in the outstanding balance or the expected monthly
+  // rent." The traded spaces stay on the roll — they ARE rented — but their
+  // rent is its own figure, never folded into what the landlord is expecting.
+  const cashRows   = rows.filter((r: any) => !r.workTrade)
+  const tradedRows = rows.filter((r: any) => r.workTrade)
+  const total  = cashRows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
+  const traded = tradedRows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
 
   const byProperty = rows.reduce((acc: Record<string, any[]>, r) => {
     (acc[r.propertyName] = acc[r.propertyName] || []).push(r)
@@ -46,7 +54,7 @@ export function RentRollPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Rent Roll</h1>
-          <p className="page-subtitle">Contracted monthly rent across every occupied unit — including non-paying and evicting units, which still owe under their lease</p>
+          <p className="page-subtitle">Contracted monthly rent across every occupied unit — including non-paying and evicting units, which still owe under their lease. Work-trade spaces are listed but totalled apart: their rent is settled in hours.</p>
         </div>
       </div>
 
@@ -54,8 +62,17 @@ export function RentRollPage() {
         <div className="kpi-card">
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmt(total)}</div>
-          <div className="kpi-sub">contracted across {rows.length} occupied unit{rows.length === 1 ? '' : 's'}</div>
+          <div className="kpi-sub">payable across {cashRows.length} occupied unit{cashRows.length === 1 ? '' : 's'}</div>
         </div>
+        {tradedRows.length > 0 && (
+          <div className="kpi-card">
+            <div className="kpi-label">Traded For Work</div>
+            <div className="kpi-value">{fmt(traded)}</div>
+            <div className="kpi-sub">
+              {tradedRows.length} unit{tradedRows.length === 1 ? '' : 's'} on work trade — settled in hours, not cash
+            </div>
+          </div>
+        )}
       </div>
 
       {allRows.length > 0 && (
@@ -72,7 +89,9 @@ export function RentRollPage() {
         </div>
       ) : (
         Object.entries(byProperty).map(([propertyName, propRows]) => {
-          const subtotal = (propRows as any[]).reduce((s, r) => s + Number(r.rentAmount || 0), 0)
+          const subtotal = (propRows as any[])
+            .filter(r => !r.workTrade)
+            .reduce((s, r) => s + Number(r.rentAmount || 0), 0)
           return (
             <div key={propertyName} style={{ marginBottom: 20 }}>
               <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
@@ -87,13 +106,22 @@ export function RentRollPage() {
                       <tr key={r.unitId} style={{ cursor: 'pointer' }} onClick={() => navigate(`/units?search=${encodeURIComponent(r.unitNumber)}`)}>
                         <td className="mono" style={{ fontWeight: 600 }}>{r.unitNumber}</td>
                         <td>
-                          {r.tenantFirst ? `${r.tenantFirst} ${r.tenantLast}` : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                          {r.tenantFirst
+                            ? `${r.tenantFirst} ${r.tenantLast}`
+                            : r.upcomingFirst
+                              ? <span>{r.upcomingFirst} {r.upcomingLast}<span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}> — moves in {fmtDate(r.upcomingStart)}</span></span>
+                              : <span style={{ color: 'var(--text-3)' }}>—</span>}
                           {Number(r.tenantCount) > 1 && <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}> +{Number(r.tenantCount) - 1}</span>}
                         </td>
                         <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmtDate(r.startDate)}</td>
                         <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{r.leaseId ? (r.endDate ? fmtDate(r.endDate) : 'Month-to-month') : '—'}</td>
                         <td><span className={`badge ${STATUS_COLORS[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
-                        <td className="mono" style={{ textAlign: 'right', fontWeight: 600 }}>{fmt(r.rentAmount)}</td>
+                        <td className="mono" style={{ textAlign: 'right', fontWeight: 600 }}>
+                          {fmt(r.rentAmount)}
+                          {r.workTrade && (
+                            <div style={{ fontSize: '.68rem', fontWeight: 400, color: 'var(--text-3)' }}>traded for work</div>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
