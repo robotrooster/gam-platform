@@ -34,8 +34,12 @@ import { randomUUID } from 'crypto'
 // don't try to send real verification emails through Resend. Pattern
 // matches loginLockout.test.ts / emailVerification.test.ts.
 const { sendVerifyMock, sendResetMock } = vi.hoisted(() => ({
-  sendVerifyMock: vi.fn(async () => 'msg_mock_verify'),
-  sendResetMock:  vi.fn(async () => 'msg_mock_reset'),
+  // S639: typed with the real signature (to, firstName, url, ctx) so a test can
+  // assert on the URL it was called with. An arg-less vi.fn() infers calls as
+  // [][], which vitest runs happily and `tsc -b` then rejects — the build broke
+  // on it after the suite had gone green.
+  sendVerifyMock: vi.fn(async (..._args: any[]) => 'msg_mock_verify'),
+  sendResetMock:  vi.fn(async (..._args: any[]) => 'msg_mock_reset'),
 }))
 vi.mock('../services/email', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
