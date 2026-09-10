@@ -43,7 +43,27 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
         (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
         (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
         (SELECT COUNT(*)::int FROM units WHERE payment_block=TRUE) AS eviction_mode_units,
-        (SELECT COALESCE(SUM(rent_amount),0) FROM units WHERE status='active') AS monthly_rent_volume,
+        -- ── S639: OCCUPIED IS NOT THE SAME AS 'active' ─────────────────────
+        --
+        -- Nic: "the monthly rent volume across twenty two units should be
+        -- eleven thousand five hundred and thirteen dollars, but the landlord
+        -- portal shows expected monthly rent at thirteen thousand four hundred
+        -- and seventy seven dollars."
+        --
+        -- Both were counting units.rent_amount; they disagreed on which units
+        -- are occupied. The landlord dashboard counts active + delinquent +
+        -- suspended, this counted 'active' alone — so four DELINQUENT units and
+        -- $1,964 of contracted rent were missing from the platform figure.
+        --
+        -- Delinquent is the state a unit enters when its tenant owes money. The
+        -- rent is still contracted and still owed; that is the entire meaning of
+        -- the status. Excluding it under-reports the platform by exactly the
+        -- units most worth looking at, and makes the number that should be
+        -- larger (whole platform) smaller than one landlord's own.
+        (SELECT COALESCE(SUM(rent_amount),0) FROM units
+          WHERE status IN ('active','delinquent','suspended')) AS monthly_rent_volume,
+        (SELECT COUNT(*)::int FROM units
+          WHERE status IN ('active','delinquent','suspended')) AS occupied_units,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
         (SELECT COALESCE(balance,0) FROM float_account_state LIMIT 1) AS float_balance,
         -- FlexPay float BANKROLL NEEDED: total monthly rent of the distinct
@@ -59,6 +79,17 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
             JOIN v_unit_occupancy vuo ON vuo.primary_tenant_id = fi.tenant_id
             JOIN units u ON u.id = vuo.unit_id AND u.status = 'active'
         ) AS flexpay_bankroll,
+        -- S639 (Nic): "I'm showing also twenty pending payments awaiting ACH
+        -- settlement. Where is that card reading from?"
+        --
+        -- From every payment row with status='pending' — which is an UNPAID
+        -- CHARGE. Nobody has sent anything and no ACH exists; the tenant has
+        -- simply not paid yet. Money genuinely in transit is 'processing',
+        -- and there are 3 of those, not 20. The count was right for a question
+        -- nobody asked and wrong for the one printed under it.
+        (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS unpaid_charges,
+        (SELECT COUNT(*)::int FROM payments WHERE status='processing') AS payments_in_flight,
+        (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='processing') AS payments_in_flight_amount,
         (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS pending_payments,
         (SELECT COUNT(*)::int FROM disbursements WHERE status='pending') AS pending_disbursements,
         (SELECT COUNT(*)::int FROM maintenance_requests WHERE status='open') AS open_maintenance,

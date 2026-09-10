@@ -95,6 +95,8 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
   // against the way one property's rent roll does, so inventing a target would
   // be a made-up number on a dashboard that just had one removed.
   const current = vals[vals.length - 1] ?? 0
+  // S639: how much of the current month's figure has not cleared yet.
+  const inFlightNow = Number((data[data.length - 1] as any)?.inFlight ?? 0) || 0
   const prior = vals.slice(0, -1)
   const priorAvg = prior.length ? prior.reduce((s, v) => s + v, 0) / prior.length : 0
   const trend = priorAvg > 0 ? current / priorAvg : null
@@ -175,7 +177,15 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
       <div className="rvm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
         {hoverIdx == null ? (
           <div className="rvm-readout">
-            <span className="rvm-readout-label">collected · this month</span>
+            {/* S639 (Nic): "the heartbeat monitor is saying nine point nine k
+                collected versus the other heartbeat monitor saying eight point
+                nine k." Both right, neither labelled. This one counts money the
+                TENANT HAS SENT — including ACH still clearing — which was a
+                deliberate S616 decision so the chart does not flatline during
+                the first week of every month, exactly when rent arrives. The
+                landlord's card counts SETTLED only. The $980.20 between them
+                was three ACH payments in flight. */}
+            <span className="rvm-readout-label">received · this month{inFlightNow > 0 ? ' (incl. in flight)' : ''}</span>
             <span className="rvm-readout-value" style={{ color: status.color }}>{fmt(current)}</span>
           </div>
         ) : (
@@ -185,7 +195,10 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
             </div>
             <div className="rvm-tip-val" style={{ color: status.color }}>{fmt(vals[hoverIdx])}</div>
             <div className="rvm-tip-sub">
-              {vals[hoverIdx] === 0 ? 'nothing collected' : `${Math.round((vals[hoverIdx] / max) * 100)}% of peak`}
+              {vals[hoverIdx] === 0 ? 'nothing received'
+                : Number((data[hoverIdx] as any)?.inFlight ?? 0) > 0
+                  ? `incl. $${Number((data[hoverIdx] as any).inFlight).toFixed(2)} still clearing`
+                  : `${Math.round((vals[hoverIdx] / max) * 100)}% of peak`}
             </div>
           </div>
         )}
@@ -222,7 +235,9 @@ export function RentVolumeMonitor({ months, windowMonths, onWindowChange }: {
       </div>
 
       <div style={{ fontSize: '.66rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
-        Rent, utilities and fees that actually settled, by the month the money moved. Each beat is
+        Rent, utilities and fees the tenant has SENT — settled, plus ACH still clearing —
+        by the month the money moved. A landlord's own dashboard counts settled only, so
+        this figure runs ahead of theirs while payments are in flight. Each beat is
         one month; spike height is that month against the strongest in view, so a big month towers
         and a dead month flatlines. Contracted rent is the KPI above — this is what came in.
       </div>

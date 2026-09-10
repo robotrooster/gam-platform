@@ -1075,7 +1075,11 @@ function Overview(){
             <span>💸 Pay: <strong style={{color:'var(--t0)'}}>{stats?.flexPay||0}</strong></span>
           </div>
         </div>
-        {isSuperAdmin&&<div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">across {stats?.activeUnits||0} units</div></div>}
+        {/* S639 (Nic): the sum counts occupied units — active, delinquent and
+            suspended — but the caption counted only the ACTIVE ones, so the
+            figure and the unit count it was divided by described different
+            sets. Delinquent rent is still contracted rent. */}
+        {isSuperAdmin&&<div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthlyRentVolume||0)}</div><div className="ks">contracted across {stats?.occupiedUnits ?? stats?.activeUnits ?? 0} occupied units</div></div>}
         {!isSuperAdmin&&<div className="kpi"><div className="kl">Vacant Units</div><div className="kv b">{stats?.vacantUnits||0}</div><div className="ks">available to fill</div></div>}
       </div>
 
@@ -1083,7 +1087,12 @@ function Overview(){
       {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
         <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target (3% of FlexPay float)</div></div>
         <div className="kpi"><div className="kl">FlexPay Float Bankroll</div><div className="kv b">{formatCurrency(floatBankroll)}</div><div className="ks">rent of income-verified tenants who requested FlexPay</div></div>
-        <div className="kpi"><div className="kl">Pending Payments</div><div className={`kv ${(stats?.pendingPayments||0)>20?'r':'a'}`}>{stats?.pendingPayments||0}</div><div className="ks">awaiting ACH settlement</div></div>
+        {/* S639 (Nic): "twenty pending payments awaiting ACH settlement. Where
+            is that card reading from?" From status='pending', which is an
+            UNPAID CHARGE — nobody has sent anything and no ACH exists. Money
+            actually in transit is status='processing'. The count was right for
+            a question nobody asked and wrong for the one printed under it. */}
+        <div className="kpi"><div className="kl">Unpaid Charges</div><div className={`kv ${(stats?.unpaidCharges ?? stats?.pendingPayments ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? stats?.pendingPayments ?? 0}</div><div className="ks">billed, not yet paid{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 

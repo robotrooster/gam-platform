@@ -481,3 +481,61 @@ describe('POST /api/admin/users/:userId/referral-upline — manual re-attach (su
     expect(res.status).toBe(403)
   })
 })
+
+// ─── S639: THE ADMIN CARDS AND THE LANDLORD CARDS MEAN THE SAME WORDS ───────
+//
+// Nic, reading the platform overview against his own dashboard: "the monthly
+// rent volume across twenty two units should be eleven thousand five hundred and
+// thirteen dollars, but the landlord portal shows expected monthly rent at
+// thirteen thousand four hundred and seventy seven dollars... I'm showing also
+// twenty pending payments awaiting ACH settlement. Where is that card reading
+// from? We have a lot of issues with the cards on this page."
+//
+// Both were counting units.rent_amount and disagreeing about which units count.
+// The platform figure came out SMALLER than one landlord's own, which is the
+// tell: a whole-platform number can never be less than a subset of it.
+describe('S639 admin platform stats — occupied means occupied', () => {
+  it('monthly rent volume counts delinquent units, like the landlord dashboard does', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    let propertyId = ''
+    try {
+      await client.query('BEGIN')
+      propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      await client.query(
+        `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount)
+         VALUES ($1, $2, 'S639-A', 'active', 1000),
+                ($1, $2, 'S639-DQ', 'delinquent', 491)`,
+        [propertyId, f.landlordId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // Delinquent is the state a unit enters when its tenant OWES. The rent is
+    // still contracted, which is the whole meaning of the status — and before
+    // this, $1,964 across four of Nic's units was missing from the platform sum.
+    expect(Number(res.body.data.monthly_rent_volume)).toBe(1491)
+    // …and the caption's unit count describes the same set it summed.
+    expect(Number(res.body.data.occupied_units)).toBe(2)
+  })
+
+  it('separates unpaid charges from money actually in ACH flight', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    // 'pending' is a charge nobody has paid — no ACH exists for it. 'processing'
+    // is money the tenant has sent that has not cleared. The card said the first
+    // count was "awaiting ACH settlement", which was never true of it.
+    // The test harness mounts the router directly, so responses are still
+    // snake_case here; the real API camelizes on the way out.
+    expect(res.body.data).toHaveProperty('unpaid_charges')
+    expect(res.body.data).toHaveProperty('payments_in_flight')
+    expect(res.body.data).toHaveProperty('payments_in_flight_amount')
+  })
+})
