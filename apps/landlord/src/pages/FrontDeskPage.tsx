@@ -19,8 +19,8 @@
 // phases are ordered by who is genuinely blocked. Nobody at a counter should
 // have to work out which of three screens holds today's phone calls.
 import { useState } from 'react'
-import { useQuery } from 'react-query'
-import { apiGet } from '../lib/api'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { apiGet, apiPatch } from '../lib/api'
 import { SearchBox } from '../components/ListControls'
 import { Phone, Mail, Search } from 'lucide-react'
 
@@ -110,6 +110,31 @@ function classify(r: Row): { phase: PhaseId; say: string } {
 }
 
 export function FrontDeskPage() {
+  const qc = useQueryClient()
+  // ── S639 (Nic): "add a resend invite button so the front desk person can be
+  // useful in case the old one happens to have expired or accidentally been
+  // deleted or whatever. I don't want the front desk person held up on a
+  // technicality." ──
+  //
+  // The one action worth having here. Everything else on this page is read-only
+  // on purpose — a counter should not be able to cancel somebody's invite by
+  // misclicking — but re-sending is safe by construction: it issues a FRESH
+  // token to the address already on file, so the worst case is the resident
+  // getting a second email, and the best case is the desk fixing the call while
+  // the person is still on the phone.
+  const [sentTo, setSentTo] = useState<Record<string, 'sending' | 'sent' | 'error'>>({})
+  const resend = useMutation(
+    (intentId: string) => apiPatch(`/landlords/me/pending-intents/${intentId}/contact`, { resend: true }),
+    {
+      onMutate: (id: string) => { setSentTo(m => ({ ...m, [id]: 'sending' })) },
+      onSuccess: (_d, id) => {
+        setSentTo(m => ({ ...m, [id]: 'sent' }))
+        qc.invalidateQueries('pending-tenants')
+      },
+      onError: (_e, id) => { setSentTo(m => ({ ...m, [id]: 'error' })) },
+    },
+  )
+
   const { data: rows = [], isLoading } = useQuery<Row[]>(
     'pending-tenants', () => apiGet<Row[]>('/landlords/me/pending-tenants'),
     { refetchOnWindowFocus: true })
@@ -252,6 +277,30 @@ export function FrontDeskPage() {
                             {say}
                           </div>
                         </div>
+                        {/* Only where an invite is the thing that is stuck. A
+                            lease waiting on a signature is not fixed by another
+                            invite email. */}
+                        {(ph === 'awaiting_accept' || ph === 'not_invited') && (
+                          <div style={{ minWidth: 128, textAlign: 'right' }}>
+                            {sentTo[r.intentId] === 'sent' ? (
+                              <span style={{ fontSize: '.78rem', color: 'var(--green)', fontWeight: 600 }}>
+                                ✓ Invite re-sent
+                              </span>
+                            ) : (
+                              <button type="button" className="btn btn-primary btn-sm"
+                                disabled={sentTo[r.intentId] === 'sending'}
+                                onClick={() => resend.mutate(r.intentId)}
+                                title={`Send ${r.email} a brand-new invite link — the old one stops working`}>
+                                {sentTo[r.intentId] === 'sending' ? 'Sending…' : 'Re-send invite'}
+                              </button>
+                            )}
+                            {sentTo[r.intentId] === 'error' && (
+                              <div style={{ fontSize: '.74rem', color: 'var(--red)', marginTop: 4 }}>
+                                Could not send — try the pending pool.
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )
                   })}
