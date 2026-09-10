@@ -13,8 +13,7 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe
-} from 'lucide-react'
+  Sun, Moon, Globe, Headphones } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
 // it) and an optional `perm` list (sub-permission keys; worker roles
@@ -55,6 +54,11 @@ const NAV_ITEMS: Array<{
   { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
+  // S639 (Nic): "I need my front desk person to go to one page, see all the
+  // people that need to be contacted, and what phase they're in." Sits with
+  // onboarding because that is the process it reports on, and under the same
+  // permission — it shows the same people, without the destructive buttons.
+  { to: '/front-desk',    icon: Headphones,       label: 'Front Desk',       section: null,          category: 'tenant_onboarding' },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
   { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
   { to: '/esign',         icon: PenTool,          label: 'GoldSign',           section: null,          category: 'esign' },

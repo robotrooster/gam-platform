@@ -126,6 +126,7 @@ import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
+import { FrontDeskPage } from './pages/FrontDeskPage'
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: Error | null}> {
   constructor(props: any) { super(props); this.state = { error: null } }
@@ -272,6 +273,9 @@ function App() {
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
               <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
+              {/* S639: the front counter's call list — same people as the
+                  pending pool, shaped as "who do I ring and what do I say". */}
+              <Route path="front-desk" element={<FrontDeskPage />} />
               <Route path="tenant-onboarding/pending" element={<PendingTenantsPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
               <Route path="leases"         element={<LeasesPage />} />

@@ -2728,6 +2728,23 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          ld.id                       AS lease_doc_id,
          nxt.role                    AS lease_waiting_on_role,
          nxt.name                    AS lease_waiting_on_name,
+         -- S639 (Nic): "I need my front desk person to go to one page, see all
+         -- the people that need to be contacted, and what phase they're in...
+         -- 'hey, have your other household member accept their invite'."
+         --
+         -- The desk cannot deliver that sentence without the NAME. Everybody
+         -- else invited to this same space who has not accepted yet, excluding
+         -- the person being looked at.
+         (SELECT COALESCE(ARRAY_AGG(TRIM(CONCAT_WS(' ', hu.first_name, hu.last_name))
+                                    ORDER BY hu.first_name), '{}')
+            FROM pending_tenant_intents h
+            JOIN tenants ht ON ht.id = h.tenant_id
+            JOIN users hu ON hu.id = ht.user_id
+           WHERE h.unit_id = pti.unit_id
+             AND h.unit_id IS NOT NULL
+             AND h.cancelled_at IS NULL AND h.resolved_at IS NULL
+             AND h.accepted_at IS NULL
+             AND ht.id <> pti.tenant_id) AS household_pending_names,
          -- S639 (Nic): "you still have it listed as eight people not invited yet...
          -- We have literally sent invites to every single person."
          --
@@ -2869,6 +2886,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
         leaseDocId: r.lease_doc_id,
         leaseWaitingOnRole: r.lease_waiting_on_role,
         leaseWaitingOnName: r.lease_waiting_on_name,
+        householdPendingNames: r.household_pending_names,
       })),
     })
   } catch (e) { next(e) }
