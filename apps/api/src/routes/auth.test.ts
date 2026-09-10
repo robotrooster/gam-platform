@@ -722,3 +722,44 @@ describe('S639 verification link is routed by role', () => {
     }
   })
 })
+
+// ─── S639 OUTAGE: AN ADDRESS IS THE SAME ADDRESS ────────────────────────────
+//
+// Nic: "we are all getting invalid credentials during login now… it is both
+// Nicks locked out."
+//
+// Nobody was locked — locked_until was null on every admin account. Login
+// compared the typed email RAW against users.email, an exact case-sensitive
+// match, while every stored address is lowercase. A phone keyboard capitalising
+// the first letter was enough to make the lookup miss, and a miss returns the
+// deliberately vague "Invalid credentials" with no hint that the ADDRESS was
+// wrong. The API log proved it: those 401s returned in 5-12ms, far too fast for
+// bcrypt to have run.
+describe('S639 login is case- and whitespace-insensitive on the address', () => {
+  it('signs in when the keyboard capitalised the address', async () => {
+    const email = `s639-case-${randomUUID().slice(0, 8)}@test.dev`
+    const password = 'CorrectHorse!2026'
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, 'tenant', 'A', 'B', TRUE)`,
+      [email, await bcrypt.hash(password, 10)])
+
+    for (const typed of [email.toUpperCase(), email[0].toUpperCase() + email.slice(1), `  ${email} `]) {
+      const res = await request(buildApp()).post('/api/auth/login').send({ email: typed, password })
+      // 200 with a code challenge is a SUCCESSFUL credential check — email 2FA
+      // is universal now, so the win condition is "not 401", not "has a token".
+      expect(res.status, `typed as ${JSON.stringify(typed)}`).toBe(200)
+    }
+  })
+
+  it('still refuses a genuinely wrong password', async () => {
+    const email = `s639-wrong-${randomUUID().slice(0, 8)}@test.dev`
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, 'tenant', 'A', 'B', TRUE)`,
+      [email, await bcrypt.hash('CorrectHorse!2026', 10)])
+    const res = await request(buildApp()).post('/api/auth/login')
+      .send({ email: email.toUpperCase(), password: 'not-the-password' })
+    expect(res.status).toBe(401)
+  })
+})

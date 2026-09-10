@@ -134,8 +134,23 @@ const registerSchema = z.object({
   }),
 })
 
+// ── S639 OUTAGE: "we are all getting invalid credentials during login now" ──
+//
+// Every stored email is lowercase, and login compared the typed string RAW
+// against users.email — an exact, case-sensitive match. Type "Ben@golddoor.io"
+// and there is no such row, so the lookup misses and returns the deliberately
+// vague "Invalid credentials" with no hint that the address was the problem.
+//
+// Phone keyboards auto-capitalise the first letter of a text field, and both
+// Nicks and Ben were locked out simultaneously the first evening they all tried
+// to sign in to the admin portal. The API log shows it plainly: those 401s came
+// back in 5-12ms, far too fast for bcrypt to have run — the password was never
+// even checked, because no user was found. A genuine wrong password takes ~270ms
+// and there was exactly one of those all night.
+//
+// Normalised here, at the edge, so every path below sees the same string.
 const loginSchema = z.object({
-  email:    z.string().email(),
+  email:    z.string().trim().toLowerCase().pipe(z.string().email()),
   password: z.string(),
 })
 
@@ -151,7 +166,7 @@ authRouter.post('/register', async (req, res, next) => {
     if (isDisposableEmail(body.email)) {
       throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
     }
-    const exists = await queryOne('SELECT id FROM users WHERE email = $1', [body.email])
+    const exists = await queryOne('SELECT id FROM users WHERE lower(email) = lower($1)', [body.email])
     if (exists) throw new AppError(409, 'Email already registered')
 
     const hash = await bcrypt.hash(body.password, 12)
@@ -370,7 +385,9 @@ authRouter.post('/login', async (req, res, next) => {
        -- business_staff users go through getScopeForUser instead because
        -- their business_id lives in the scope row.
        LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
-       WHERE u.email = $1`, [email]
+       -- S639: case-insensitive. An address is the same address whatever a
+       -- phone keyboard capitalised on the way in.
+       WHERE lower(u.email) = lower($1)`, [email]
     )
     if (!user) throw new AppError(401, 'Invalid credentials')
 
@@ -791,7 +808,7 @@ authRouter.post('/register-prospect', async (req, res, next) => {
     }
 
     // Check email not already taken
-    const existing = await queryOne('SELECT id FROM users WHERE email=$1', [email])
+    const existing = await queryOne('SELECT id FROM users WHERE lower(email)=lower($1)', [email])
     if (existing) throw new AppError(409, 'An account with this email already exists. Please sign in.')
 
     const hash = await bcrypt.hash(password, 12)
@@ -873,7 +890,7 @@ authRouter.post('/forgot-password', async (req, res, next) => {
   try {
     const { email } = forgotPasswordSchema.parse(req.body)
     const user = await queryOne<{ id: string; first_name: string | null }>(
-      `SELECT id, first_name FROM users WHERE email = $1`,
+      `SELECT id, first_name FROM users WHERE lower(email) = lower($1)`,
       [email],
     )
     if (user) {
@@ -1079,7 +1096,7 @@ authRouter.post('/resend-verification', async (req, res, next) => {
     const user = await queryOne<{
       id: string; first_name: string | null; email_verified: boolean
     }>(
-      `SELECT id, first_name, email_verified FROM users WHERE email = $1`,
+      `SELECT id, first_name, email_verified FROM users WHERE lower(email) = lower($1)`,
       [email],
     )
     if (user && !user.email_verified) {
