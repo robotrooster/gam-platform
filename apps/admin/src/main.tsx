@@ -2816,6 +2816,118 @@ function CsvImportDetail({id,onClose,onNavigate,onMarkReviewed}:{id:string;onClo
 // (Ben has three of them from 2026-09-05). Even pointed at the right host there
 // was nothing here to land on: this portal had no /verify-email route, exactly
 // the gap the landlord portal had until S637.
+// ── S639: THE ADMIN PORTAL HAD NO PASSWORD RECOVERY EITHER ──────────────────
+//
+// Nic: "the link you sent me is a password reset request for the landlord page,
+// not for my admin login. Why is that the case?"
+//
+// Because I sent it with the landlord origin on purpose — an admin-origin link
+// would have 404'd, since this portal had no /reset-password route to land on.
+// The reset itself works either way (the token is consumed by the API, not by
+// the page), but being bounced into a different product to recover a login you
+// do not use there is a bad answer to give somebody who is locked out.
+//
+// Third time for this shape now: the landlord portal had no verify page (S637),
+// this portal had no verify page (earlier tonight), and this is recovery. A
+// portal that can log you in has to be able to let you back in.
+function AdminForgotPasswordPage(){
+  const [email,setEmail]=useState('')
+  const [sent,setSent]=useState(false)
+  const [busy,setBusy]=useState(false)
+  const [err,setErr]=useState('')
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();setBusy(true);setErr('')
+    try{ await post('/auth/forgot-password',{email:email.trim()}); setSent(true) }
+    catch(ex:any){ setErr(ex?.response?.data?.error||'Could not send the reset link.') }
+    finally{ setBusy(false) }
+  }
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · reset your password</div>
+        <div className="card" style={{padding:28,textAlign:'left'}}>
+          {sent?(
+            <>
+              <div style={{fontWeight:700,color:'var(--g)',marginBottom:8}}>Check your email</div>
+              <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:16}}>
+                If an account exists for that address, a reset link is on its way. It is good
+                for one hour — use it before it expires or request another.
+              </div>
+              <Link to="/login" className="btn btn-ghost">Back to sign in</Link>
+            </>
+          ):(
+            <form onSubmit={submit}>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>Email address</label>
+              <input className="input" type="email" value={email} autoFocus required
+                onChange={e=>setEmail(e.target.value)} style={{width:'100%',marginBottom:14}}/>
+              {err&&<div style={{color:'var(--r)',fontSize:'.82rem',marginBottom:12}}>{err}</div>}
+              <button className="btn btn-primary" type="submit" disabled={busy||!email.trim()} style={{width:'100%'}}>
+                {busy?'Sending…':'Send reset link'}
+              </button>
+              <div style={{marginTop:14,textAlign:'center'}}>
+                <Link to="/login" style={{color:'var(--t3)',fontSize:'.8rem'}}>Back to sign in</Link>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AdminResetPasswordPage(){
+  const [params]=useSearchParams()
+  const token=params.get('token')??''
+  const [pw,setPw]=useState('');const [pw2,setPw2]=useState('')
+  const [done,setDone]=useState(false);const [busy,setBusy]=useState(false);const [err,setErr]=useState('')
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();setErr('')
+    // Matches the backend: 12 characters, no composition rules (NIST 800-63B).
+    if(pw.length<12){setErr('Password must be at least 12 characters.');return}
+    if(pw!==pw2){setErr('Those two passwords do not match.');return}
+    setBusy(true)
+    try{ await post('/auth/reset-password',{token,newPassword:pw}); setDone(true) }
+    catch(ex:any){ setErr(ex?.response?.data?.error||'That link is invalid or has expired.') }
+    finally{ setBusy(false) }
+  }
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · choose a new password</div>
+        <div className="card" style={{padding:28,textAlign:'left'}}>
+          {!token?(
+            <div style={{color:'var(--r)',fontSize:'.88rem'}}>This link is missing its token.</div>
+          ):done?(
+            <>
+              <div style={{fontWeight:700,color:'var(--g)',marginBottom:8}}>Password updated</div>
+              <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:16}}>
+                Sign in with your new password. You&rsquo;ll get a six-digit code by email to finish.
+              </div>
+              <Link to="/login" className="btn btn-primary">Go to sign in</Link>
+            </>
+          ):(
+            <form onSubmit={submit}>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>New password</label>
+              <input className="input" type="password" value={pw} autoFocus required
+                onChange={e=>setPw(e.target.value)} style={{width:'100%',marginBottom:12}}/>
+              <label style={{fontSize:'.72rem',color:'var(--t3)',display:'block',marginBottom:6}}>Confirm new password</label>
+              <input className="input" type="password" value={pw2} required
+                onChange={e=>setPw2(e.target.value)} style={{width:'100%',marginBottom:8}}/>
+              <div style={{fontSize:'.76rem',color:'var(--t3)',marginBottom:14}}>At least 12 characters.</div>
+              {err&&<div style={{color:'var(--r)',fontSize:'.82rem',marginBottom:12}}>{err}</div>}
+              <button className="btn btn-primary" type="submit" disabled={busy} style={{width:'100%'}}>
+                {busy?'Saving…':'Set new password'}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function VerifyEmailPage(){
   const [params]=useSearchParams()
   const token=params.get('token')??''
@@ -3027,6 +3139,11 @@ function LoginPage(){
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center'}}>
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
+            {/* S639 (Nic, locked out of this very portal): there was no way
+                back in from here at all — no reset page and no link to one. */}
+            <div style={{marginTop:12,textAlign:'center'}}>
+              <Link to="/forgot-password" style={{color:'var(--t3)',fontSize:'.8rem'}}>Forgot your password?</Link>
+            </div>
           </form>
         </div>
       </div>
@@ -3645,6 +3762,10 @@ function App(){
         {/* S639: PUBLIC — somebody arriving here cannot sign in yet; that is
             the whole reason they were sent the link. */}
         <Route path="/verify-email" element={<VerifyEmailPage/>}/>
+        {/* S639: recovery is public by definition — somebody using it cannot
+            sign in, which is the whole reason they are here. */}
+        <Route path="/forgot-password" element={<AdminForgotPasswordPage/>}/>
+        <Route path="/reset-password" element={<AdminResetPasswordPage/>}/>
         {/* S631: public — no session exists until the invitation is accepted. */}
         <Route path="/accept-invite/:token" element={<AcceptInvite/>}/>
         {/* S289: TOTP enrollment lives outside the Layout — it's the only

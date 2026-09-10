@@ -763,3 +763,58 @@ describe('S639 login is case- and whitespace-insensitive on the address', () => 
     expect(res.status).toBe(401)
   })
 })
+
+// ─── S639: A RESET LINK GOES TO THE PORTAL YOU ACTUALLY SIGN IN TO ──────────
+//
+// Nic: "the link you sent me is a password reset request for the landlord page,
+// not for my admin login. Why is that the case?"
+//
+// With no recognised Origin the link fell to a fixed default with no regard for
+// WHO was resetting, so an admin was handed a link into a product they do not
+// log in to. Origin still wins when we recognise it — the portal that served the
+// form is the best answer, and echoing only allow-listed origins is what keeps a
+// forged Origin from redirecting a live reset token.
+describe('S639 password reset link is routed by role when there is no Origin', () => {
+  const orig = { ...process.env }
+  afterEach(() => { process.env = { ...orig } })
+
+  async function resetLinkFor(role: string, origin?: string): Promise<string> {
+    process.env.ADMIN_APP_URL = 'https://admin.example.test'
+    process.env.LANDLORD_APP_URL = 'https://landlord.example.test'
+    process.env.TENANT_APP_URL = 'https://tenant.example.test'
+    const email = `s639-reset-${role}-${randomUUID().slice(0, 6)}@test.dev`
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x',$2,'A','B',TRUE)`, [email, role])
+    sendResetMock.mockClear()
+    const r = request(buildApp()).post('/api/auth/forgot-password')
+    if (origin) r.set('Origin', origin)
+    await r.send({ email })
+    // sendPasswordResetEmail(to, firstName, resetUrl, ctx)
+    return String(sendResetMock.mock.calls.at(-1)?.[2] ?? '')
+  }
+
+  it('sends an admin to the admin portal, not the landlord one', async () => {
+    for (const role of ['admin', 'super_admin']) {
+      const url = await resetLinkFor(role)
+      expect(url).toContain('https://admin.example.test/reset-password')
+      expect(url).not.toContain('landlord.example.test')
+    }
+  })
+
+  it('sends a landlord to the landlord portal and a tenant to the tenant app', async () => {
+    expect(await resetLinkFor('landlord')).toContain('https://landlord.example.test/reset-password')
+    expect(await resetLinkFor('tenant')).toContain('https://tenant.example.test/reset-password')
+  })
+
+  it('a recognised Origin still wins — the portal that served the form knows best', async () => {
+    const url = await resetLinkFor('super_admin', 'https://landlord.example.test')
+    expect(url).toContain('https://landlord.example.test/reset-password')
+  })
+
+  it('an unrecognised Origin is ignored, so a forged one cannot capture the token', async () => {
+    const url = await resetLinkFor('super_admin', 'https://evil.example.com')
+    expect(url).toContain('https://admin.example.test/reset-password')
+    expect(url).not.toContain('evil.example.com')
+  })
+})

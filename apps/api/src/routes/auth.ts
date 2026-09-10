@@ -877,7 +877,7 @@ authRouter.post('/register-prospect', async (req, res, next) => {
 // `users.reset_token` (S277 surfaced this column existed but no route
 // touched it). Cleared on successful use.
 
-const forgotPasswordSchema = z.object({ email: z.string().email() })
+const forgotPasswordSchema = z.object({ email: z.string().trim().toLowerCase().pipe(z.string().email()) })
 const resetPasswordSchema  = z.object({
   token:       z.string().min(1),
   newPassword: z.string().min(PASSWORD_MIN_LEN),
@@ -889,8 +889,10 @@ const RESET_TOKEN_TTL_MINUTES = 60
 authRouter.post('/forgot-password', async (req, res, next) => {
   try {
     const { email } = forgotPasswordSchema.parse(req.body)
-    const user = await queryOne<{ id: string; first_name: string | null }>(
-      `SELECT id, first_name FROM users WHERE lower(email) = lower($1)`,
+    // S639: role comes back too — the reset link's fallback destination depends
+    // on which portal this person actually signs in to.
+    const user = await queryOne<{ id: string; first_name: string | null; role: string }>(
+      `SELECT id, first_name, role FROM users WHERE lower(email) = lower($1)`,
       [email],
     )
     if (user) {
@@ -932,11 +934,32 @@ authRouter.post('/forgot-password', async (req, res, next) => {
       const origin = String(req.get('origin') || '').replace(/\/$/, '')
       // Only ever echo back an origin we recognise — an attacker who could set
       // Origin freely would otherwise redirect a real reset token to their host.
+      // S639 (Nic): "the link you sent me is a password reset request for the
+      // landlord page, not for my admin login. Why is that the case?"
+      //
+      // Because with no recognised Origin this fell to a fixed default — the
+      // tenant app, or whatever RESET_PASSWORD_URL happened to say — with no
+      // regard for WHO is resetting. A reset fired from a script, a CLI or any
+      // client that does not send Origin therefore handed an admin a link into
+      // a product they do not log in to.
+      //
+      // The user is known here, so the fallback follows their ROLE, the same
+      // map the verification link uses. Origin still wins when it is one we
+      // recognise: the portal that served the form is the best answer, and
+      // echoing only allow-listed origins is what stops a forged Origin
+      // redirecting a live reset token somewhere else.
+      const roleFallback: Record<string, string | undefined> = {
+        admin:            process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
+        super_admin:      process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
+        landlord:         process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`,
+        property_manager: process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`,
+      }
       const portalBase = ALLOWED_RESET_ORIGINS.includes(origin)
         ? origin
-        : (process.env.RESET_PASSWORD_URL
-            ? String(process.env.RESET_PASSWORD_URL).replace(/\/reset-password\/?$/, '')
-            : (process.env.TENANT_APP_URL || 'http://localhost:3002'))
+        : (roleFallback[user.role]
+            || (process.env.RESET_PASSWORD_URL
+                  ? String(process.env.RESET_PASSWORD_URL).replace(/\/reset-password\/?$/, '')
+                  : (process.env.TENANT_APP_URL || 'http://localhost:3002')))
       const base = `${String(portalBase).replace(/\/$/, '')}/reset-password`
       const resetUrl = `${base}?token=${encodeURIComponent(token)}`
       // Fire-and-forget — don't let email-send latency bound the
