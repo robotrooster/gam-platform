@@ -23,7 +23,7 @@
  *                                weak password + landlordId stamped on JWT
  */
 
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -47,7 +47,7 @@ vi.mock('../services/email', async (importOriginal) => {
 })
 
 import { db } from '../db'
-import { authRouter } from './auth'
+import { authRouter, mintAndSendVerifyEmail } from './auth'
 import { errorHandler } from '../middleware/errorHandler'
 import { cleanupAllSchema, seedLandlord, seedTenant } from '../test/dbHelpers'
 
@@ -658,5 +658,63 @@ describe('S637 login codes stay out of the permanent log', () => {
         WHERE category = 'login_2fa_code' AND subject ~ '[0-9]{6}'
           AND created_at > NOW() - INTERVAL '1 minute'`)
     expect(Number(rows[0].n)).toBe(0)
+  })
+})
+
+// ─── S639: A VERIFICATION LINK MUST LAND IN THE RIGHT PRODUCT ───────────────
+//
+// Nic: "add the other admins on the admin portal. Point their login to not the
+// local host. Point it to the right thing. Every time they log in, it just shows
+// them nothing."
+//
+// Login refuses an unverified account and auto-resends the verification email —
+// so a link pointed at the wrong product is an account nobody can ever get into.
+// The role branch handled landlord and property_manager and let EVERYTHING else
+// fall through to the tenant app, admins included. Ben Ferrell and Nicholas
+// Fausett, both super_admins, were mailed tenant.goldassetmanagement.com three
+// times and never once reached a login code.
+describe('S639 verification link is routed by role', () => {
+  const origEnv = { ...process.env }
+  afterEach(() => { process.env = { ...origEnv } })
+
+  it('sends an admin to the ADMIN portal, not the tenant app', async () => {
+    process.env.ADMIN_APP_URL = 'https://admin.example.test'
+    process.env.TENANT_APP_URL = 'https://tenant.example.test'
+    process.env.LANDLORD_APP_URL = 'https://landlord.example.test'
+    delete process.env.VERIFY_EMAIL_URL
+
+    for (const role of ['admin', 'super_admin']) {
+      const email = `s639-${role}-${randomUUID().slice(0, 6)}@test.dev`
+      const { rows: [u] } = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1,'x',$2,'A','B',FALSE) RETURNING id`, [email, role])
+      sendVerifyMock.mockClear()
+      await mintAndSendVerifyEmail(u.id, email, 'A')
+      // sendEmailVerification(to, firstName, verifyUrl, ctx)
+      const url = String(sendVerifyMock.mock.calls.at(-1)?.[2] ?? '')
+      expect(url).toContain('https://admin.example.test/verify-email')
+      expect(url).not.toContain('tenant.example.test')
+    }
+  })
+
+  it('still sends a landlord to the landlord portal and a tenant to the tenant app', async () => {
+    process.env.ADMIN_APP_URL = 'https://admin.example.test'
+    process.env.TENANT_APP_URL = 'https://tenant.example.test'
+    process.env.LANDLORD_APP_URL = 'https://landlord.example.test'
+    delete process.env.VERIFY_EMAIL_URL
+
+    const cases: Array<[string, string]> = [
+      ['landlord', 'https://landlord.example.test/verify-email'],
+      ['tenant',   'https://tenant.example.test/verify-email'],
+    ]
+    for (const [role, expected] of cases) {
+      const email = `s639-${role}-${randomUUID().slice(0, 6)}@test.dev`
+      const { rows: [u] } = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1,'x',$2,'A','B',FALSE) RETURNING id`, [email, role])
+      sendVerifyMock.mockClear()
+      await mintAndSendVerifyEmail(u.id, email, 'A')
+      expect(String(sendVerifyMock.mock.calls.at(-1)?.[2] ?? '')).toContain(expected)
+    }
   })
 })

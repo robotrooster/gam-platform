@@ -18,7 +18,7 @@ import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useContext, useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
@@ -2804,6 +2804,64 @@ function CsvImportDetail({id,onClose,onNavigate,onMarkReviewed}:{id:string;onClo
 // component state — never persisted — so a refresh between steps
 // drops the user back to step 1, which is the desired safety
 // posture.
+// ── S639: THE ADMIN PORTAL HAD NO VERIFY-EMAIL PAGE ─────────────────────────
+//
+// Nic: "add the other admins on the admin portal. Point their login to not the
+// local host. Point it to the right thing. Every time they log in, it just shows
+// them nothing."
+//
+// Login refuses an unverified account and re-sends a verification link, and that
+// link was being built for the TENANT app for every role except landlord — so
+// two super_admins were sent to a product they have no account in, over and over
+// (Ben has three of them from 2026-09-05). Even pointed at the right host there
+// was nothing here to land on: this portal had no /verify-email route, exactly
+// the gap the landlord portal had until S637.
+function VerifyEmailPage(){
+  const [params]=useSearchParams()
+  const token=params.get('token')??''
+  const [status,setStatus]=useState<'verifying'|'success'|'error'>('verifying')
+  const [errMsg,setErrMsg]=useState('')
+  useEffect(()=>{
+    if(!token){setStatus('error');setErrMsg('This verification link is missing its token.');return}
+    let cancelled=false
+    post('/auth/verify-email',{token})
+      .then(()=>{if(!cancelled)setStatus('success')})
+      .catch((e:any)=>{
+        if(cancelled)return
+        setStatus('error')
+        const m=e?.response?.data?.error
+        setErrMsg(typeof m==='string'?m:'Verification failed. The link may have expired or already been used.')
+      })
+    return()=>{cancelled=true}
+  },[token])
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:420,textAlign:'center'}}>
+        <div style={{fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+        <div style={{color:'var(--t2)',fontSize:'.875rem',marginBottom:28}}>Admin · email verification</div>
+        <div className="card" style={{padding:28}}>
+          {status==='verifying'&&<div style={{color:'var(--t2)'}}>Verifying your email…</div>}
+          {status==='success'&&<>
+            <div style={{fontSize:'1.1rem',fontWeight:700,color:'var(--g)',marginBottom:8}}>Email verified</div>
+            <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:18}}>
+              Your admin account is ready. Sign in and you&rsquo;ll get a code by email to finish.
+            </div>
+            <Link to="/login" className="btn btn-primary">Go to sign in</Link>
+          </>}
+          {status==='error'&&<>
+            <div style={{fontSize:'1.1rem',fontWeight:700,color:'var(--r)',marginBottom:8}}>Could not verify</div>
+            <div style={{color:'var(--t2)',fontSize:'.88rem',marginBottom:18}}>{errMsg}</div>
+            <div style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:14}}>
+              Signing in with your password sends a fresh link automatically.
+            </div>
+            <Link to="/login" className="btn btn-ghost">Back to sign in</Link>
+          </>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function LoginPage(){
   const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth()
   React.useEffect(()=>{
@@ -3584,6 +3642,9 @@ function App(){
       <VersionWatch/>
       <Routes>
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
+        {/* S639: PUBLIC — somebody arriving here cannot sign in yet; that is
+            the whole reason they were sent the link. */}
+        <Route path="/verify-email" element={<VerifyEmailPage/>}/>
         {/* S631: public — no session exists until the invitation is accepted. */}
         <Route path="/accept-invite/:token" element={<AcceptInvite/>}/>
         {/* S289: TOTP enrollment lives outside the Layout — it's the only

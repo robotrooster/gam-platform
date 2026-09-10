@@ -1006,11 +1006,40 @@ export async function mintAndSendVerifyEmail(userId: string, email: string, firs
   // somewhere they do not have an account.
   const role = (await queryOne<{ role: string }>(
     `SELECT role FROM users WHERE id = $1`, [userId]))?.role ?? 'tenant'
-  const portal = role === 'landlord' || role === 'property_manager'
-    ? (process.env.LANDLORD_APP_URL || (process.env.NODE_ENV === 'production'
-        ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001'))
-    : (process.env.TENANT_APP_URL || (process.env.NODE_ENV === 'production'
-        ? 'https://tenant.goldassetmanagement.com' : 'http://localhost:3002'))
+  // S639 (Nic): "add the other admins on the admin portal. Point their login to
+  // not the localhost. Point it to the right thing. Every time they log in, it
+  // just shows them nothing."
+  //
+  // The role branch handled landlord and PM and let EVERYTHING ELSE fall to the
+  // tenant app — admins included. So Ben Ferrell and Nicholas Fausett, both
+  // super_admins, were mailed a verification link to tenant.goldassetmanagement
+  // .com, a product they have no account in. Login refuses an unverified account
+  // and helpfully re-sends the same wrong link, which is why Ben has three of
+  // them from 2026-09-05 and neither has ever reached a login code. Not "nothing
+  // shows" — they were never let in.
+  //
+  // Exactly the shape of the landlord bug fixed in S637, one role short. Written
+  // as a map now so the next role added cannot silently inherit the tenant app.
+  const portalFor: Record<string, string | undefined> = {
+    landlord:         process.env.LANDLORD_APP_URL,
+    property_manager: process.env.LANDLORD_APP_URL,
+    admin:            process.env.ADMIN_APP_URL,
+    super_admin:      process.env.ADMIN_APP_URL,
+  }
+  const devFallback: Record<string, string> = {
+    landlord: 'http://localhost:3001', property_manager: 'http://localhost:3001',
+    admin: 'http://localhost:3003', super_admin: 'http://localhost:3003',
+  }
+  const prodFallback: Record<string, string> = {
+    landlord: 'https://landlord.goldassetmanagement.com',
+    property_manager: 'https://landlord.goldassetmanagement.com',
+    admin: 'https://admin.goldassetmanagement.com',
+    super_admin: 'https://admin.goldassetmanagement.com',
+  }
+  const portal = portalFor[role]
+    || (process.env.NODE_ENV === 'production'
+          ? (prodFallback[role] || process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com')
+          : (devFallback[role] || process.env.TENANT_APP_URL || 'http://localhost:3002'))
   const base = process.env.VERIFY_EMAIL_URL || `${portal}/verify-email`
   const verifyUrl = `${base}?token=${encodeURIComponent(token)}`
   // Fire-and-forget; failures land in email_send_log.
