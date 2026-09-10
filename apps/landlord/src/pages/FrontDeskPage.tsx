@@ -24,6 +24,20 @@ import { apiGet, apiPatch } from '../lib/api'
 import { SearchBox } from '../components/ListControls'
 import { Phone, Mail, Search } from 'lucide-react'
 
+type Balance = {
+  tenantId: string
+  firstName: string | null
+  lastName: string | null
+  email: string
+  phone: string | null
+  unitNumber: string | null
+  propertyName: string | null
+  balance: string
+  creditOnAccount: string
+  oldestDueDate: string | null
+  openInvoices: number
+}
+
 type Row = {
   intentId: string
   firstName: string | null
@@ -43,10 +57,18 @@ type Row = {
 // The pipeline, in the order somebody is blocked. `owed` marks the phases where
 // the ball is on OUR side of the net — those sort first, because a resident
 // chasing us is worse than a resident we are chasing.
-type PhaseId = 'not_invited' | 'awaiting_accept' | 'awaiting_household'
+type PhaseId = 'overdue' | 'due' | 'not_invited' | 'awaiting_accept' | 'awaiting_household'
              | 'landlord_signs' | 'awaiting_signature' | 'awaiting_cosigner' | 'done'
 
+// ── S639 (Nic): "anything the front desk person needs to do should be there.
+// outstanding rent etc." ──
+//
+// Money sits at the top because it is the one thing a resident STANDING AT THE
+// COUNTER is usually there for, and because it is the only row on this page
+// where the desk takes an action rather than makes a request.
 const PHASES: { id: PhaseId; label: string; owed?: boolean; tone: string }[] = [
+  { id: 'overdue',            label: 'Owes — overdue',                      tone: 'var(--red)' },
+  { id: 'due',                label: 'Owes',                                tone: 'var(--gold)' },
   { id: 'not_invited',        label: 'Needs an invite',        owed: true,  tone: 'var(--red)' },
   { id: 'landlord_signs',     label: 'Waiting on you to sign', owed: true,  tone: 'var(--gold)' },
   { id: 'awaiting_accept',    label: 'Accept the invite',                   tone: 'var(--gold)' },
@@ -109,6 +131,33 @@ function classify(r: Row): { phase: PhaseId; say: string } {
       : `Ask ${first} to accept the portal invite in their email — the lease cannot be drafted until they do.` }
 }
 
+const money = (n: number) =>
+  new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+
+/** What the desk says to somebody who owes. The figure is the server's, already
+ *  net of any credit and already excluding work trade — a work-trade resident
+ *  settles in hours, not cash, and must never be asked for money at a counter. */
+function classifyBalance(b: Balance): { phase: PhaseId; say: string } {
+  const first = (b.firstName || 'They').trim()
+  const owed = Number(b.balance || 0)
+  const credit = Number(b.creditOnAccount || 0)
+  const due = b.oldestDueDate ? new Date(b.oldestDueDate) : null
+  const overdue = due ? due.getTime() < Date.now() : false
+  const when = due
+    ? due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    : null
+  const creditLine = credit > 0
+    ? ` Their ${money(credit)} credit is already taken off this figure.`
+    : ''
+  // Rent is pay-in-full platform-wide, so a part payment is not an option the
+  // desk can offer — saying so here stops them promising one at the counter.
+  return {
+    phase: overdue ? 'overdue' : 'due',
+    say: `${first} owes ${money(owed)}${when ? ` — oldest bill ${overdue ? 'was due' : 'due'} ${when}` : ''}.`
+       + `${creditLine} Take the full amount; rent cannot be part-paid.`,
+  }
+}
+
 export function FrontDeskPage() {
   const qc = useQueryClient()
   // ── S639 (Nic): "add a resend invite button so the front desk person can be
@@ -138,28 +187,56 @@ export function FrontDeskPage() {
   const { data: rows = [], isLoading } = useQuery<Row[]>(
     'pending-tenants', () => apiGet<Row[]>('/landlords/me/pending-tenants'),
     { refetchOnWindowFocus: true })
+  // S639: the money half. Same endpoint the outstanding-balances page uses, so
+  // the counter and the office can never quote different numbers — and it is
+  // already property-scoped and already excludes work trade.
+  const { data: balances = [] } = useQuery<Balance[]>(
+    'outstanding-balances', () => apiGet<Balance[]>('/balances'),
+    { refetchOnWindowFocus: true })
   const [q, setQ] = useState('')
   const [phase, setPhase] = useState<PhaseId | 'all'>('all')
   const [openProps, setOpenProps] = useState<Record<string, boolean>>({})
 
   const query = q.trim().toLowerCase()
-  const classified = (rows as Row[]).map(r => ({ r, ...classify(r) }))
+  // One list, two sources. A person can legitimately appear twice — owing money
+  // AND owing a signature are two separate things to say to them — so they are
+  // not merged into one row that would have to pick which matters more.
+  const classified: Array<{ key: string; r: Row | null; b: Balance | null
+                            phase: PhaseId; say: string
+                            name: string; email: string; phone: string | null
+                            unit: string | null; property: string | null }> = [
+    ...(balances as Balance[]).map(b => {
+      const c = classifyBalance(b)
+      return {
+        key: `bal:${b.tenantId}`, r: null, b, ...c,
+        name: `${b.firstName ?? ''} ${b.lastName ?? ''}`.trim() || b.email,
+        email: b.email, phone: b.phone, unit: b.unitNumber, property: b.propertyName,
+      }
+    }),
+    ...(rows as Row[]).map(r => {
+      const c = classify(r)
+      return {
+        key: `int:${r.intentId}`, r, b: null, ...c,
+        name: `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim() || r.email,
+        email: r.email, phone: r.phone, unit: r.heldUnitNumber, property: r.propertyName,
+      }
+    }),
+  ]
   // A search looks at everybody, whatever phase or property — the desk is
   // holding a name, not a filter.
-  const matches = classified.filter(({ r }) => !query || [
-    r.firstName, r.lastName, `${r.firstName ?? ''} ${r.lastName ?? ''}`,
-    r.email, r.phone, r.heldUnitNumber,
-  ].some(v => String(v ?? '').toLowerCase().includes(query)))
+  const matches = classified.filter(c => !query ||
+    [c.name, c.email, c.phone, c.unit].some(v => String(v ?? '').toLowerCase().includes(query)))
   const shown = query ? matches : matches.filter(c => phase === 'all' || c.phase === phase)
 
   const counts = (id: PhaseId) => classified.filter(c => c.phase === id).length
   const toCall = classified.filter(c => c.phase !== 'done').length
+  const owedTotal = (balances as Balance[]).reduce((t, b) => t + Number(b.balance || 0), 0)
 
   // One section per property, ordered by who has work owed by US first.
   const groups = (() => {
     const m = new Map<string, typeof shown>()
     for (const c of shown) {
-      const k = c.r.propertyName || 'No property'
+      const k = c.property || 'No property'
       if (!m.has(k)) m.set(k, [] as any)
       ;(m.get(k) as any).push(c)
     }
@@ -196,7 +273,14 @@ export function FrontDeskPage() {
             Front Desk{singleProperty ? ` · ${groups[0].name}` : ''}
           </h1>
           <p className="page-subtitle">
-            {isLoading ? 'Loading…' : `${toCall} ${toCall === 1 ? 'person needs' : 'people need'} contacting`}
+            {isLoading ? 'Loading…' : (
+              <>
+                {toCall} {toCall === 1 ? 'person needs' : 'people need'} contacting
+                {owedTotal > 0 && (
+                  <> · <strong style={{ color: 'var(--gold)' }}>{money(owedTotal)}</strong> to collect</>
+                )}
+              </>
+            )}
           </p>
         </div>
       </div>
@@ -263,30 +347,35 @@ export function FrontDeskPage() {
 
               {(singleProperty || sectionOpen(g.name)) && (
                 <div style={{ padding: '0 16px 12px' }}>
-                  {g.list.map(({ r, phase: ph, say }) => {
+                  {g.list.map(({ key, r, b, phase: ph, say, name, email, phone, unit }) => {
                     const meta = PHASES.find(p => p.id === ph)!
-                    const name = `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim() || r.email
                     return (
-                      <div key={r.intentId} style={{
+                      <div key={key} style={{
                         display: 'flex', gap: 14, alignItems: 'flex-start',
                         padding: '11px 0', borderTop: '1px solid var(--border-0)',
                       }}>
                         <div style={{ minWidth: 150 }}>
                           <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{name}</div>
                           <div style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>
-                            {r.heldUnitNumber || '—'}
+                            {unit || '—'}
                           </div>
+                          {/* The amount, big enough to read across a counter. */}
+                          {b && (
+                            <div style={{ fontSize: '1.05rem', fontWeight: 800, color: meta.tone, marginTop: 2 }}>
+                              {money(Number(b.balance || 0))}
+                            </div>
+                          )}
                         </div>
                         <div style={{ minWidth: 150, fontSize: '.78rem' }}>
                           {/* Both contact routes, one click each — this is a page
                               somebody works a phone from. */}
-                          {r.phone && (
-                            <div><a href={`tel:${r.phone}`} style={{ color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}>
-                              <Phone size={12} /> {r.phone}
+                          {phone && (
+                            <div><a href={`tel:${phone}`} style={{ color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}>
+                              <Phone size={12} /> {phone}
                             </a></div>
                           )}
-                          <div><a href={`mailto:${r.email}`} style={{ color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, wordBreak: 'break-all' }}>
-                            <Mail size={12} /> {r.email}
+                          <div><a href={`mailto:${email}`} style={{ color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, wordBreak: 'break-all' }}>
+                            <Mail size={12} /> {email}
                           </a></div>
                         </div>
                         <div style={{ flex: 1, minWidth: 220 }}>
@@ -301,7 +390,7 @@ export function FrontDeskPage() {
                         {/* Only where an invite is the thing that is stuck. A
                             lease waiting on a signature is not fixed by another
                             invite email. */}
-                        {(ph === 'awaiting_accept' || ph === 'not_invited') && (
+                        {r && (ph === 'awaiting_accept' || ph === 'not_invited') && (
                           <div style={{ minWidth: 128, textAlign: 'right' }}>
                             {sentTo[r.intentId] === 'sent' ? (
                               <span style={{ fontSize: '.78rem', color: 'var(--green)', fontWeight: 600 }}>
@@ -311,7 +400,7 @@ export function FrontDeskPage() {
                               <button type="button" className="btn btn-primary btn-sm"
                                 disabled={sentTo[r.intentId] === 'sending'}
                                 onClick={() => resend.mutate(r.intentId)}
-                                title={`Send ${r.email} a brand-new invite link — the old one stops working`}>
+                                title={`Send ${email} a brand-new invite link — the old one stops working`}>
                                 {sentTo[r.intentId] === 'sending' ? 'Sending…' : 'Re-send invite'}
                               </button>
                             )}
