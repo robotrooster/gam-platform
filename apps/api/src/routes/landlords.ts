@@ -2790,7 +2790,10 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
 // Returns this landlord's unresolved pending intents, joined to user info.
 // The pending list page reads from this. Resolved intents are excluded —
 // once a lease is built, the intent disappears from the active queue.
-landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async (req, res, next) => {
+// S640: also readable with front_desk.view — the Front Desk page is this list
+// without the destructive buttons, and asking for tenants.create to READ it
+// meant a desk person had to be given the power to create tenancies.
+landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_desk.view'), async (req, res, next) => {
   try {
     // S633: the landlord_id filter below is the ownership check. It now asks
     // the ACCOUNT — every company it owns — instead of the one the session sat
@@ -6061,7 +6064,11 @@ landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants
 // a fresh token. Refused once they have accepted or signed in: at that point the
 // account is theirs, the address is proven, and changing it from the landlord's
 // side would be taking over somebody's login.
-landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.create'),
+// S640: re-sending an invite is the one thing the Front Desk page can DO, and
+// Nic asked for it there by name — "I don't want the front desk person held up
+// on a technicality." It sends the same invite to the same address; it cannot
+// redirect one, because the desk role has no way to edit the contact details.
+landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.create', 'front_desk.view'),
   async (req, res, next) => {
     try {
       const body = z.object({
@@ -6072,6 +6079,18 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
       }).parse(req.body)
       if (!body.email && !body.firstName && !body.lastName && !body.resend) {
         throw new AppError(400, 'Nothing to change — send a new address, a name, or ask for a resend.')
+      }
+      // S640: the Front Desk role gets RESEND and nothing else. Retyping
+      // somebody's email from a spoken sentence is how an invite reaches a
+      // stranger, and that risk is why editing contact details was deliberately
+      // left off the agent too (see actionGap.ts). A desk person can push the
+      // same invite to the same address as many times as they need; changing
+      // where it goes stays with whoever can create a tenancy.
+      const deskOnly = !['admin', 'super_admin', 'landlord'].includes(req.user!.role)
+        && req.user!.permissions?.['tenants.create'] !== true
+      if (deskOnly && (body.email || body.firstName || body.lastName)) {
+        throw new AppError(403,
+          'You can re-send this invite, but changing the name or email on it is not part of the front-desk role.')
       }
 
       const intent = await queryOne<any>(

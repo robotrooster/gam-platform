@@ -58,7 +58,11 @@ const NAV_ITEMS: Array<{
   // people that need to be contacted, and what phase they're in." Sits with
   // onboarding because that is the process it reports on, and under the same
   // permission — it shows the same people, without the destructive buttons.
-  { to: '/front-desk',    icon: Headphones,       label: 'Front Desk',       section: null,          category: 'tenant_onboarding' },
+  // S640 (Nic): its own category, so a front-desk person can be given the call
+  // list without the import flows, the pending pool and the Tenants tab that
+  // came with it. Anyone who already holds tenant_onboarding.view keeps seeing
+  // it — the filter below accepts either category for this one item.
+  { to: '/front-desk',    icon: Headphones,       label: 'Front Desk',       section: null,          category: 'front_desk' },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
   { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
   { to: '/esign',         icon: PenTool,          label: 'GoldSign',           section: null,          category: 'esign' },
@@ -161,8 +165,10 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     // S168: /banking for property_manager — only when direct-deposit is on.
     if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
     if (!item.category) return false               // owner-only items (Team, Work Trade)
-    const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
-    return !!keys && keys.some(k => perms[k] === true)
+    // S640: Front Desk moved to its own category; onboarding staff who already
+    // had it keep it rather than silently losing a page they use daily.
+    const cats = item.to === '/front-desk' ? ['front_desk', 'tenant_onboarding'] : [item.category]
+    return cats.some(c => (CATALOG_KEYS_BY_CATEGORY[c] || []).some(k => perms[k] === true))
   })
 }
 

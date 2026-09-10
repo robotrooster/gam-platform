@@ -1755,6 +1755,21 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     ]}],
   },
   {
+    // ── S640 (Nic): THE FRONT DESK IS ITS OWN THING ────────────────────────
+    //
+    // The Front Desk to-do list shared a category with Tenant Onboarding, so
+    // there was no way to hand somebody the call list without also handing them
+    // the import flows and the pending pool — and its data endpoint asked for
+    // tenants.create, which lit up the Tenants tab as well. Three surfaces to
+    // grant one read-only page, which is the opposite of the rule Nic set for
+    // this role: "the less things that it's possible for somebody to screw up,
+    // the bigger your talent pool is."
+    category: 'front_desk', label: 'Front Desk',
+    sections: [{ label: 'Access', items: [
+      { key: 'front_desk.view', label: 'Front desk to-do list', hint: 'read-only: who to call, what phase, what they owe — plus re-send an invite' },
+    ]}],
+  },
+  {
     category: 'leases', label: 'Leases',
     sections: [{ label: 'Access & actions', items: [
       { key: 'leases.view',           label: 'View leases' },
@@ -1810,7 +1825,22 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'payments', label: 'Payments',
     sections: [{ label: 'Access & actions', items: [
       { key: 'payments.view',           label: 'View payments' },
-      { key: 'payments.import_history', label: 'Import payment history' },
+      // ── S640 (Nic): THE FRONT DESK TAKES CASH ────────────────────────────
+      //
+      //   "She needs to be able to record payments for people that come in to
+      //    pay with cash... I do not want to allow her to issue credit at this
+      //    time or import payment history. I don't know if there's that
+      //    granular of distinction on the permissions."
+      //
+      // There is, for two of the three, and there was NO way to grant the
+      // third: `take_payment` gates the record-a-cash-payment route but had
+      // never been listed here, so it could not be switched on for anybody. The
+      // one thing a front-desk person exists to do was ungrantable.
+      //
+      // Issuing credit needs no key of its own — that route admits owners and
+      // property managers only, and an onsite manager is neither.
+      { key: 'take_payment',            label: 'Record a cash / check payment', hint: 'marks a charge paid — GAM moves no money' },
+      { key: 'payments.import_history', label: 'Import payment history', sensitive: true },
     ]}],
   },
   {
