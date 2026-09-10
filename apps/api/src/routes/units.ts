@@ -1846,6 +1846,38 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (status === 'cancelled' && booking.status !== 'cancelled') {
       promoteNextWaitlister(booking.unit_id).catch(err =>
         logger.error({ err, unit_id: booking.unit_id }, '[booking] waitlist promote on cancel failed'))
+
+      // ── S639 (Nic): A CANCELLED RESERVATION TAKES ITS LEASE WITH IT ──────
+      //
+      // "When I click to delete it from the calendar, I clicked cancel. But it
+      // needs to delete itself everywhere when that happens. So in the leases
+      // page, it's still showing me pending for a thing that's not actually
+      // there."
+      //
+      // A stay of 30 nights or more drafts a lease alongside the booking.
+      // Cancelling the booking left that lease behind as a live 'pending' row —
+      // it appeared in lease counts and on the leases page as a tenancy nobody
+      // could explain, for a reservation that no longer exists.
+      //
+      // Only a lease that has not been executed: 'pending' and 'draft' are still
+      // paperwork and follow the booking. An ACTIVE lease is a signed agreement
+      // and is never touched here — if somebody has signed, cancelling the
+      // calendar entry is not the instrument that ends their tenancy.
+      try {
+        const killed = await query<{ id: string }>(
+          `UPDATE leases
+              SET status = 'terminated', updated_at = NOW()
+            WHERE source_booking_id = $1
+              AND status IN ('pending', 'draft')
+            RETURNING id`,
+          [booking.id])
+        if (killed.length) {
+          logger.info({ bookingId: booking.id, leaseIds: killed.map(k => k.id) },
+            '[booking] cancelled reservation also cancelled its unsigned draft lease(s)')
+        }
+      } catch (err) {
+        logger.error({ err, bookingId: booking.id }, '[booking] draft-lease cancel on booking cancel failed')
+      }
     }
     res.json({
       success: true,

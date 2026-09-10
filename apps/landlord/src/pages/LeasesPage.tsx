@@ -117,12 +117,31 @@ export function LeasesPage() {
   // flagged for action, not reading. Lease details moved to the Details
   // row button.
   const openLease = (l: any) => {
-    if (l.needsReview && can('leases.edit')) {
-      setViewOnly(false)
-      setEditingLeaseId(l.id)
-      setModalOpen(true)
-      return
-    }
+    // ── S639 (Nic): A LEASE IS READ-ONLY ───────────────────────────────────
+    //
+    // "This page should be read only. Right now that pending one, I can click
+    // on it and it wants me to select a tenant, which is not selectable, select
+    // a space, which is not selectable. It lets me change the dates, the rent
+    // and the security deposit. Lets me disable late fees, which is false. Late
+    // fees need to be set at the property level. Why am I able to toggle it on
+    // or off for this specific lease? That is a real possible discrimination
+    // gap. Basically that window should never pop up."
+    //
+    // He is right, and the late-fee toggle is the sharpest edge of it: a
+    // landlord able to switch late fees off for one tenant and on for another,
+    // after the fact, from a screen with no record of why, is a fair-housing
+    // problem waiting to happen. Late-fee terms belong to the PROPERTY and are
+    // stamped onto the lease when it is drafted — billing already reads them
+    // from the signed document, which stays true; what is going away is the
+    // ability to reach in afterwards and change one tenant's copy.
+    //
+    // Everything else in that form was equally wrong to offer: rent, deposit,
+    // dates and parties are what the signed document says. Editing them here
+    // would make the record disagree with the paper both sides signed.
+    //
+    // The needs-review branch that opened it is gone. Imports are confirmed in
+    // the pending pool now, and the one lease still carrying that flag is an
+    // orphan from a cancelled test booking.
     if (can('leases.view_pdf')) {
       navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)
       return
@@ -130,7 +149,8 @@ export function LeasesPage() {
     openDetails(l)
   }
   const openDetails = (l: any) => {
-    setViewOnly(!l.needsReview || !can('leases.edit'))
+    // S639: always read-only — see openLease above.
+    setViewOnly(true)
     setEditingLeaseId(l.id)
     setModalOpen(true)
   }

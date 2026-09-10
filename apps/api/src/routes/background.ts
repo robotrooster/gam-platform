@@ -761,8 +761,20 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
       LEFT JOIN units un ON un.id = bc.unit_id
       LEFT JOIN properties p ON p.id = un.property_id
       LEFT JOIN properties bcp ON bcp.id = bc.property_id
-      WHERE bc.landlord_id = $1
-      ORDER BY bc.created_at DESC`, [req.user!.profileId])
+      -- ── S639 (Nic): "I'm in the background checks flow, and there is nothing
+      -- showing here. Nothing rendered." ───────────────────────────────────
+      --
+      -- This filtered on req.user.profileId, and since S633 a landlord's
+      -- profileId is NULL — an account is not an entity, and the companies it
+      -- owns come from landlordIds. So the comparison matched nothing and the
+      -- page rendered empty for every landlord, however many screenings they
+      -- had. Anastacio Erreguin's check has been sitting under Mountain View
+      -- since 09-04, paid for and running, and Nic could not see it anywhere.
+      --
+      -- Same fix the dashboard, units and payments lists already carry: ask the
+      -- ACCOUNT for every company it can read.
+      WHERE bc.landlord_id = ANY($1::uuid[])
+      ORDER BY bc.created_at DESC`, [landlordScopeIds(req.user!)])
     // S561: surface the landlord's per-check screening charge (Checkr cost +
     // $5 margin) so the review UI can show what they're billed. Only real
     // checkr orders incur it; mock/speculative rows show 0.
@@ -778,8 +790,9 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
 backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+      // S639: same account-scope fix as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
     delete check.ssn_encrypted
@@ -795,8 +808,10 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
     const { decision, notes } = req.body
     if (!['approved', 'denied'].includes(decision)) throw new AppError(400, 'Invalid decision')
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+    // S639: account-scoped, not profileId — a landlord's profileId is NULL
+    // since S633 and this matched nothing. Same bug as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
     if (!['complete', 'submitted', 'processing'].includes(check.status)) {
@@ -878,8 +893,10 @@ backgroundRouter.post('/:id/adverse-action', requireAuth, requirePerm('tenants.r
     const { text, saveAsTemplate } = (req.body ?? {}) as { text?: string; saveAsTemplate?: boolean }
     if (!text || !text.trim()) throw new AppError(400, 'Notice text is required')
     const check = await queryOne<any>(
-      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId]
+    // S639: account-scoped, not profileId — a landlord's profileId is NULL
+    // since S633 and this matched nothing. Same bug as the list above.
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [req.params.id, landlordScopeIds(req.user!)]
     )
     if (!check) throw new AppError(404, 'Not found')
     if (check.status !== 'denied') throw new AppError(400, 'Adverse-action notices apply only to denied applicants')
@@ -943,7 +960,8 @@ backgroundRouter.get('/:id/adverse-action', requireAuth, async (req, res, next) 
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
     const isApplicant = check.user_id === req.user!.userId
-    const isLandlord = role === 'landlord' && check.landlord_id === req.user!.profileId
+    // S639: compare against every company the account owns, not the null profileId.
+    const isLandlord = role === 'landlord' && landlordScopeIds(req.user!).includes(check.landlord_id)
     const isWorker = ['property_manager','onsite_manager','maintenance'].includes(role)
       && req.user!.landlordId === check.landlord_id
       && req.user!.permissions?.['tenants.run_background_check'] === true
@@ -1009,7 +1027,8 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     )
     if (!owner) throw new AppError(404, 'Not found')
     const isApplicant = owner.user_id === req.user!.userId
-    const isLandlord = owner.landlord_id && owner.landlord_id === req.user!.profileId
+    // S639: same — an account can own several companies.
+    const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
     res.removeHeader('Content-Security-Policy')
     res.removeHeader('Cross-Origin-Resource-Policy')
@@ -1242,7 +1261,9 @@ backgroundRouter.post('/pool/withdraw', requireAuth, async (req, res, next) => {
 // the proximity_rank CASE can be swapped for a haversine ORDER BY.
 backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    // S639: a read spans the account's companies.
+    const landlordIds = landlordScopeIds(req.user!)
+    const landlordId = landlordIds[0] ?? null
     const pool = await query<any>(`
       WITH props AS (
         SELECT DISTINCT zip, lower(city) AS city, state
@@ -1346,15 +1367,24 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     // types it. S613: the unit carries its subtype's price (the subtype owns
     // it), so there is no longer a second number to fall back to.
     const monthlyRent = unit ? (unit.rent_amount ?? null) : null
+    // S639 (S633 rule): a write names ONE company. Prefer the company that owns
+    // the unit being offered — that is the entity making the offer — and fall
+    // back to the account's first company when no unit was named.
+    const poolMatchLandlordId = unit
+      ? await landlordIdForUnit(req.user!, unit.id, query)
+      : (landlordScopeIds(req.user!)[0] ?? null)
+    if (!poolMatchLandlordId) throw new AppError(403, 'No company on this account to send the match from')
 
     const match = await queryOne<any>(`
       INSERT INTO pool_match_requests (pool_entry_id, landlord_id, unit_id, status, landlord_message)
       VALUES ($1, $2, $3, 'pending', $4) RETURNING id`,
-      [entry.id, req.user!.profileId, unitId || null, message || null]
+      // S639: a WRITE names one company (S633: reads span, writes name). A null
+      // profileId would have written a null landlord_id onto the match.
+      [entry.id, poolMatchLandlordId, unitId || null, message || null]
     )
     const landlordUser = await queryOne<any>(
       'SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1',
-      [req.user!.profileId]
+      [poolMatchLandlordId]
     )
 
     await query(`
@@ -1431,8 +1461,9 @@ backgroundRouter.post('/pool/match/:matchId/payment-intent', requireAuth, requir
   try {
     const match = await queryOne<any>(
       `SELECT id, status, report_fee_paid, landlord_id FROM pool_match_requests
-       WHERE id=$1 AND landlord_id=$2`,
-      [req.params.matchId, req.user!.profileId])
+       -- S639: account-scoped; a landlord's profileId is NULL since S633.
+       WHERE id=$1 AND landlord_id = ANY($2::uuid[])`,
+      [req.params.matchId, landlordScopeIds(req.user!)])
     if (!match) throw new AppError(404, 'Match not found')
     if (match.status !== 'interested') throw new AppError(400, 'Tenant has not confirmed interest yet')
     if (match.report_fee_paid) throw new AppError(400, 'Report already purchased')
@@ -1480,8 +1511,9 @@ backgroundRouter.post('/pool/match/:matchId/purchase-report', requireAuth, requi
     const match = await queryOne<any>(`
       SELECT mr.*, ap.background_check_id, ap.user_id FROM pool_match_requests mr
       JOIN application_pool ap ON ap.id=mr.pool_entry_id
-      WHERE mr.id=$1 AND mr.landlord_id=$2`,
-      [req.params.matchId, req.user!.profileId])
+      -- S639: account-scoped; see above.
+      WHERE mr.id=$1 AND mr.landlord_id = ANY($2::uuid[])`,
+      [req.params.matchId, landlordScopeIds(req.user!)])
     if (!match) throw new AppError(404, 'Match not found')
     if (match.status !== 'interested') throw new AppError(400, 'Tenant has not confirmed interest yet')
     if (match.report_fee_paid) throw new AppError(400, 'Report already purchased')
