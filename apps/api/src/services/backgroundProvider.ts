@@ -391,12 +391,37 @@ class CheckrProvider implements BackgroundProvider {
     if (!res.ok) return null
     const report = await res.json() as Record<string, any>
     const products: Record<string, string> = {}
+    const details: Record<string, Record<string, unknown>> = {}
     let overall: 'clear' | 'consider' = 'clear'
     for (const p of CHECKR_TENANT_PRODUCTS) {
       const item = report[p]
       if (item && typeof item === 'object' && typeof item.status === 'string') {
         products[p] = item.status
         if (item.status === 'consider') overall = 'consider'
+        // ── S639 (Nic): "I'm just wondering why Checkr is considering a seven
+        // twenty credit score as consider instead of good." ─────────────────
+        //
+        // A fair question that nobody could answer, because this kept the
+        // one-word status and threw the rest away. Checkr had in fact returned
+        // credit_score 720 and credit_file_status "available" alongside that
+        // "consider", and neither ever reached the database, let alone the
+        // landlord — so "consider" arrived looking like a verdict on the number
+        // when it is a verdict against the criteria configured on the account.
+        //
+        // An explicit ALLOWLIST rather than the whole object: a consumer report
+        // carries far more about a person than a tenancy decision needs, and
+        // the reason to hold a field is that it explains the status.
+        const KEEP = [
+          'credit_score', 'credit_file_status',
+          'score', 'assessment', 'decision', 'reason', 'reasons',
+          'records_count', 'result',
+        ]
+        const kept: Record<string, unknown> = {}
+        for (const k of KEEP) {
+          const v = (item as Record<string, unknown>)[k]
+          if (v !== undefined && v !== null && (typeof v !== 'object' || Array.isArray(v))) kept[k] = v
+        }
+        if (Object.keys(kept).length) details[p] = kept
       }
     }
     return {
@@ -405,6 +430,7 @@ class CheckrProvider implements BackgroundProvider {
       order_id:   report.order_id ?? null,
       result:     overall,
       products,
+      details,
       fetched_at: new Date().toISOString(),
     }
   }

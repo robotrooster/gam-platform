@@ -179,6 +179,19 @@ function ReviewModal({ check, onClose, onDecided }: {
                 const r: any = report
                 const verdict = typeof r.result === 'string' ? r.result : null   // wire-ok
                 const products: Record<string, any> = (r.products && typeof r.products === 'object') ? r.products : {}   // wire-ok
+                const details: Record<string, any> = (r.details && typeof r.details === 'object') ? r.details : {}   // wire-ok
+                // S639: the figures that explain a status — a credit score of 720
+                // reading "consider" makes no sense until you can see the 720.
+                const detailFor = (k: string): string | null => {
+                  const d = details[k]
+                  if (!d || typeof d !== 'object') return null
+                  const bits: string[] = []
+                  if (d.credit_score != null) bits.push(`score ${d.credit_score}`)   // wire-ok
+                  if (d.records_count != null) bits.push(`${d.records_count} record${Number(d.records_count) === 1 ? '' : 's'}`)   // wire-ok
+                  const fileStatus = d.credit_file_status   // wire-ok
+                  if (typeof fileStatus === 'string' && fileStatus !== 'available') bits.push(humanize(fileStatus))
+                  return bits.length ? bits.join(' · ') : null
+                }
                 const reportId: string | null = r.report_id ? String(r.report_id) : null   // wire-ok
                 const fetchedAt: string | null = r.fetched_at ? String(r.fetched_at) : null   // wire-ok
                 const tone = (v: string) => v === 'clear' ? 'var(--green,#22c55e)'
@@ -198,18 +211,27 @@ function ReviewModal({ check, onClose, onDecided }: {
                       <div style={{fontSize:'.82rem',color:'var(--text-3)'}}>
                         No per-check results returned yet.
                       </div>
-                    ) : Object.entries(products).map(([k, v]) => (
-                      <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0'}}>
-                        <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
-                        <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
-                      </div>
-                    ))}
+                    ) : Object.entries(products).map(([k, v]) => {
+                      const extra = detailFor(k)
+                      return (
+                        <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0',gap:12}}>
+                          <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
+                          <span style={{textAlign:'right'}}>
+                            <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
+                            {extra && <span style={{color:'var(--text-3)',fontWeight:500}}> · {extra}</span>}
+                          </span>
+                        </div>
+                      )
+                    })}
                     {verdict === 'consider' && (
                       <div style={{marginTop:10,fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5}}>
-                        A “consider” is not a decline — it means Checkr found something on that
-                        check worth your eyes. If you decline based on it, the applicant is
-                        entitled to an adverse action notice naming the agency and their right
-                        to dispute; use the Adverse Action button rather than declining silently.
+                        A “consider” is not a decline, and not a judgement that a number is
+                        bad — it means the result did not automatically clear the criteria set
+                        on the Checkr account, so Checkr is handing you the decision. Read the
+                        figures beside each line before deciding. If you do decline on one, the
+                        applicant is entitled to an adverse action notice naming the agency and
+                        their right to dispute; use the Adverse Action button rather than
+                        declining silently.
                       </div>
                     )}
                     {reportId && (
