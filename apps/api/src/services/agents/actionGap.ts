@@ -38,6 +38,10 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S641: the filing cabinet ───────────────────────────────────────────────
+  'documents PUT /:id/properties':
+    'pins a document to the properties it applies to. The mistake this guards against is exactly a mis-pin — Nic: "assigned parking spots in one place and that gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud is where that mistake happens. Ticked on a screen that lists every park.',
+
   // ── S641: signing packages ─────────────────────────────────────────────────
   // A package decides what a resident is asked to put their name to. Nic:
   // "some things are pertinent to some tenants and some things are not." That
