@@ -2350,26 +2350,49 @@ export async function emailVerifyBankReminder(
   args: {
     tenantName: string
     bankLast4: string | null
-    /** When the deposit actually landed — Stripe tells us, so we do not guess. */
+    /** When the deposit lands (or landed) — Stripe tells us, so we do not guess. */
     arrivedOn: string
     /** 'descriptor_code' (a code in the statement description) or 'amounts'. */
     verificationKind: 'descriptor_code' | 'amounts'
     /** Stripe's hosted page. Falls back to the portal when absent. */
     verifyUrl: string
+    /**
+     * S641 (Nic): "do we have it set up where as soon as Stripe sends the
+     * microdeposits it will email the tenant as well?"
+     *
+     * 'sent'     — fired the moment the deposit is on its way, so nobody is
+     *              waiting on a message that never comes. This is the one that
+     *              would have saved Dominic Gonzalez nine days.
+     * 'reminder' — the chase, days later, if they still have not confirmed.
+     *
+     * Same facts, different tense. A first notice that scolds is wrong, and a
+     * reminder that reads like news is useless.
+     *
+     * REQUIRED, not defaulted: a default sends whichever tense the author of
+     * the next call site happens not to think about, and the chase went out
+     * worded as a first notice the moment this had one.
+     */
+    kind: 'sent' | 'reminder'
     landlordName?: string
     hasBalanceDue?: boolean
   },
   ctx?: { landlordId?: string; tenantId?: string },
 ): Promise<string | null> {
+  const first = args.kind === 'sent'
   const howTo = args.verificationKind === 'descriptor_code'
-    ? p('Look at your bank statement for a deposit of about a dollar from us. Next to it, in the description, is a <strong style="color:#eef1f8">six-character code</strong> that starts with <strong style="color:#eef1f8">SM</strong>. Enter that code and your account is ready.')
-    : p('Your bank received <strong style="color:#eef1f8">two small deposits</strong> from us, each under a dollar. Enter both amounts and your account is ready.')
+    ? p(`${first ? 'When it lands, look' : 'Look'} at your bank statement for a deposit of about a dollar from us. Next to it, in the description, is a <strong style="color:#eef1f8">six-character code</strong> that starts with <strong style="color:#eef1f8">SM</strong>. Enter that code and your account is ready.`)
+    : p(`Your bank ${first ? 'will receive' : 'received'} <strong style="color:#eef1f8">two small deposits</strong> from us, each under a dollar. Enter both amounts and your account is ready.`)
 
-  return await send(to, 'Finish setting up your bank account',
+  const bank = args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''
+
+  return await send(to,
+    first ? 'Your bank verification deposit is on its way' : 'Finish setting up your bank account',
     base(
-      h('One step left on your bank account') +
+      h(first ? 'We just sent your verification deposit' : 'One step left on your bank account') +
       p(`Hi ${escapeHtml(args.tenantName)},`) +
-      p(`You started adding your bank account${args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''}, and the verification deposit reached your bank on ${escapeHtml(args.arrivedOn)}. It has not been confirmed yet.`) +
+      (first
+        ? p(`Thanks for adding your bank account${bank}. We have sent a small verification deposit — it should reach your bank by <strong style="color:#eef1f8">${escapeHtml(args.arrivedOn)}</strong>. One more step and you can pay by bank.`)
+        : p(`You started adding your bank account${bank}, and the verification deposit reached your bank on ${escapeHtml(args.arrivedOn)}. It has not been confirmed yet.`)) +
       howTo +
       (args.hasBalanceDue
         // Say the quiet part: they may believe they already set up the payment
@@ -2380,7 +2403,7 @@ export async function emailVerifyBankReminder(
       p(`If you would rather use a different account, you can add one in your portal. Questions? Reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will help.`)
     ),
     {
-      category: 'bank_verification_reminder',
+      category: first ? 'bank_verification_sent' : 'bank_verification_reminder',
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.tenantId ? 'tenant' : null,
       relatedEntityId: ctx?.tenantId ?? null,

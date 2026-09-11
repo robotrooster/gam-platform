@@ -365,6 +365,49 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
       [verified, bank?.last4 || null, bank?.routing_number?.slice(-4) || null, req.user!.profileId]
     )
 
+    // ── S641: TELL THEM THE DEPOSIT IS COMING, NOW ──────────────────────────
+    //
+    // Nic: "do we have it set up where as soon as Stripe sends the microdeposits
+    // or the verification code, it will email the tenant as well?"
+    //
+    // We did not, and the cost was visible: Dominic Gonzalez started a setup on
+    // September 2 and sat in `requires_action` for nine days. Nothing told him
+    // anything was coming, so there was nothing to act on.
+    //
+    // Done HERE rather than from a webhook on purpose. This response is the
+    // first moment the fact exists, and it already carries everything the email
+    // needs — the arrival date Stripe computed and Stripe's own hosted
+    // verification page. A webhook would say the same thing later, or not at all.
+    //
+    // Fire-and-forget: a mail hiccup must never fail a bank setup that
+    // succeeded. The nudge job is the backstop if this never lands.
+    if (!verified) {
+      const na: any = (si as any).next_action
+      const md = na?.type === 'verify_with_microdeposits' ? na.verify_with_microdeposits : null
+      if (md) {
+        void (async () => {
+          try {
+            const who = await queryOne<any>(
+              `SELECT u.email, u.first_name FROM tenants t JOIN users u ON u.id = t.user_id
+                WHERE t.id = $1`, [req.user!.profileId])
+            if (!who?.email) return
+            const { emailVerifyBankReminder } = await import('../services/email')
+            await emailVerifyBankReminder(who.email, {
+              tenantName: who.first_name || 'there',
+              bankLast4: bank?.last4 || null,
+              arrivedOn: new Date((md.arrival_date ?? Math.floor(Date.now() / 1000)) * 1000)
+                .toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'America/Phoenix' }),
+              verificationKind: md.microdeposit_type === 'amounts' ? 'amounts' : 'descriptor_code',
+              verifyUrl: md.hosted_verification_url || '',
+              kind: 'sent',
+            }, { tenantId: req.user!.profileId ?? undefined })
+          } catch (e) {
+            logger.error({ err: e }, '[bank-verify] first notice failed')
+          }
+        })()
+      }
+    }
+
     // S571: email 2FA is mandatory for every tenant from signup (enforced at
     // login), so no payment-method-triggered flip is needed here.
 

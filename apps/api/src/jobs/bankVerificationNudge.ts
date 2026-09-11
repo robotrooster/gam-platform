@@ -111,6 +111,8 @@ export async function sendBankVerificationNudges(
         // than writing nothing.
         verificationKind: detail.microdeposit_type === 'amounts' ? 'amounts' : 'descriptor_code',
         verifyUrl: detail.hosted_verification_url || portalLink('tenant', 'payments'),
+        // The chase, not the announcement — that one already went out at setup.
+        kind: 'reminder',
         hasBalanceDue: t.has_balance_due === true,
       }, { landlordId: t.landlord_id ?? undefined, tenantId: t.id })
 
