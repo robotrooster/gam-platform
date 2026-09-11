@@ -27,7 +27,7 @@ import {
 } from '../lib/csvImportMappings'
 import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT, occupancyRateFrom, WORK_TRADE_COVERABLE } from '@gam/shared'
 import { emailPmPropertyInvitation, emailLandlordCoOwnerInvitation } from '../services/email'
-import { platformFeesByProperty, periodMonths } from '../services/platformFee'
+import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
 import {
   sendPropertyInvitation, acceptPropertyInvitation,
   rejectPropertyInvitation, revokePropertyInvitation,
@@ -877,7 +877,19 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // SAME calc the billing cron + Reports use, so the Dashboard agrees with the
     // bill. Replaces the old portfolio max(occupied×2, propertyCount×10) estimate.
     const feeMonth = periodMonths(new Date().getFullYear(), new Date().getMonth() + 1)
-    const feeMap = await platformFeesByProperty(id, feeMonth)
+    // S641 (Nic): "Oak Park is showing twenty two dollars and Mountain View is
+    // showing zero. They shouldn't be different in terms of one being no charge."
+    //
+    // They were not different. The fee was computed for ONE entity while the
+    // property list below spans every entity on the account, so any property
+    // belonging to a different company fell through `feeMap.get(...) ?? 0` and
+    // reported nothing. Mountain View's 25 billable units were quoting $0
+    // instead of $50 — the dashboard understating what the account actually
+    // owes, on the one card whose whole job is to say so.
+    //
+    // S633 in one line: reads span the account, writes name the company. This
+    // is a read, so it takes the same scope the property list takes.
+    const feeMap = await platformFeesByPropertyForEntities(scopeIds, feeMonth)
     const feeProps = await query<any>(
       `SELECT id, name FROM properties WHERE landlord_id = ANY($1) ORDER BY name`, [scopeIds])
     const platformFeeByProperty = feeProps.map((p: any) => ({

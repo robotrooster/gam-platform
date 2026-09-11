@@ -32,6 +32,11 @@ export function UnitsPage() {
     // Eviction mode is the paymentBlock flag, coupled 1:1 to the
     // 'suspended' unit status — land on the suspended filter, not "All".
     if (s === 'eviction') return 'suspended'
+    // S641: the Occupied Units card counts everything that is not vacant, so
+    // its click-through has to land on the same set. Without this it fell
+    // through to "All" and showed the vacant spaces too — a tile that does not
+    // land on what it counts is worse than one that does not link at all.
+    if (s === 'occupied') return 'occupied'
     return s && s in STATUS_COLORS ? s : 'all'
   })
   // S629 (Nic): "it needs to just revert back to the unit page on submission of
@@ -128,7 +133,13 @@ export function UnitsPage() {
     const matchSearch = search === '' ||
       u.unitNumber.toLowerCase().includes(search.toLowerCase()) ||
       `${u.tenantFirst} ${u.tenantLast}`.toLowerCase().includes(search.toLowerCase())
-    const matchFilter = filter === 'all' || u.status === filter
+    const matchFilter =
+      filter === 'all' ? true
+      // Occupied is "not vacant" — the same rule the utility billing and the
+      // dashboard card use. A delinquent or suspended space still has somebody
+      // in it.
+      : filter === 'occupied' ? !['vacant', 'available'].includes(String(u.status))
+      : u.status === filter
     return matchSearch && matchFilter
   })
 

@@ -116,7 +116,6 @@ export function DashboardPage() {
   // S640 (Nic, DIRECTIVE): work trade is revenue that is never coming in as
   // money. It is out of Expected and out of Outstanding, and stands on its own
   // so the landlord can still see what the trades are worth.
-  const workTradeRent  = Number(stats?.workTradeRent ?? 0)
   const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
   const payableUnits   = Math.max(rentRollUnits - workTradeUnits, 0)
   const platformFee = stats?.platformFee ?? 0
@@ -244,9 +243,14 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
+          {/* S641 (Nic): the "$2,869 traded for work on 6" clause is gone — he
+              knows what his trades are and does not need the figure quoted back
+              on the rent card every time he opens the dashboard. The count
+              stays, and now says what it is counting against, so the number
+              reconciles with the Occupied Units card instead of looking like a
+              third unexplained figure. */}
           <div className="kpi-sub">
-            payable across {payableUnits} occupied unit{payableUnits === 1 ? '' : 's'}
-            {workTradeUnits > 0 && ` · ${fmtWhole(workTradeRent)} traded for work on ${workTradeUnits} more`}
+            payable across {payableUnits} of {rentRollUnits} occupied unit{rentRollUnits === 1 ? '' : 's'}
           </div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
@@ -271,9 +275,18 @@ export function DashboardPage() {
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
         </div>
         {/* S527 W-4: land pre-filtered to active units. */}
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=active')}>
-          <div className="kpi-label">Active Units</div>
-          <div className="kpi-value green">{stats?.activeUnits || 0}</div>
+        {/* S641 (Nic): "my active units KPI card says thirty three, and the
+            expected monthly rent card only says thirty. So you have a three
+            unit distinction."
+            He is right and the gap was a definition, not a bug: this card
+            counted status='active' ONLY, while the rent card counted every
+            OCCUPIED space — active, delinquent, suspended. A delinquent space
+            has somebody living in it and owing rent; excluding it here and
+            including it there put two different denominators on one screen.
+            Occupied is occupied — the same rule the utility billing follows. */}
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=occupied')}>
+          <div className="kpi-label">Occupied Units</div>
+          <div className="kpi-value green">{rentRollUnits}</div>
           <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
         {/* S527 W-5: land pre-filtered to the expiring window. */}
