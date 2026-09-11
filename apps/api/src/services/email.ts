@@ -548,14 +548,38 @@ export async function emailDocumentAutoVoided(to: string, recipientName: string,
 
 // ── INVITATION EMAILS ─────────────────────────────────────────
 
-export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string }) {
+/**
+ * S641: `resend` is not cosmetic. A resent invitation used to carry the
+ * byte-identical subject, sender and body as the first one — only the token in
+ * the href differed. Outlook and Hotmail treat that as a duplicate: the message
+ * is accepted at the boundary (so Resend reports `delivered`) and then silently
+ * dropped or collapsed into the original conversation, where nobody looks.
+ *
+ * Lisa Scheeler's resent invitation did exactly this. Resend said delivered, the
+ * link was correct, and it never appeared in her mailbox — not even in spam.
+ *
+ * So a resend announces itself: different subject, different opening, and a line
+ * saying the earlier link is dead. That also happens to be the honest message,
+ * since resending always invalidates the previous token.
+ */
+export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string, ctx?: { landlordId?: string; invitationId?: string; resend?: boolean }) {
   const roleLabel = LANDLORD_ASSIGNABLE_ROLE_LABEL[role]
-  await send(to, `${inviterName} invited you to join GAM as ${roleLabel}`,
+  const isResend = ctx?.resend === true
+
+  const subject = isResend
+    ? `Your new ${roleLabel} sign-in link for ${inviterName}`
+    : `${inviterName} invited you to join GAM as ${roleLabel}`
+
+  const intro = isResend
+    ? p(`Here is a new link to set up your <strong style="color:#eef1f8">${roleLabel}</strong> account with <strong style="color:#eef1f8">${inviterName}</strong> on Gold Asset Management. If you had an earlier invitation email, that link no longer works — use this one.`)
+    : p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`)
+
+  await send(to, subject,
     base(
-      h("You've been invited") +
-      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
+      h(isResend ? 'Your new invitation link' : "You've been invited") +
+      intro +
       p('Click below to accept and set up your account. This invitation expires in 7 days.') +
-      btnWithLink('Accept Invitation', acceptUrl) +
+      btnWithLink(isResend ? 'Set Up My Account' : 'Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
     {
@@ -563,7 +587,7 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
       landlordId: ctx?.landlordId ?? null,
       relatedEntityType: ctx?.invitationId ? 'invitation' : null,
       relatedEntityId: ctx?.invitationId ?? null,
-      metadata: { role },
+      metadata: { role, resend: isResend },
     },
     'support',
   )

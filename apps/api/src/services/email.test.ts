@@ -128,7 +128,33 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   it('metadata field stored as jsonb (round-trips)', async () => {
     await email.emailInvitation('meta@mailer-test.co', 'X', 'bookkeeper', 'u')
     const log = await logRowFor('meta@mailer-test.co')
-    expect(log.metadata).toEqual({ role: 'bookkeeper' })
+    expect(log.metadata).toEqual({ role: 'bookkeeper', resend: false })
+  })
+
+  // S641: a resent invitation must NOT look like the first one. Outlook and
+  // Hotmail accept a duplicate at the boundary — so the provider reports it
+  // delivered — and then drop it or bury it in the original conversation. That
+  // is exactly what happened to Lisa Scheeler's resent invitation: correct link,
+  // reported delivered, never visible in her mailbox, not even in spam. The
+  // subject and the opening line have to differ for the message to survive.
+  it('a resend does not reuse the first invitation\'s subject or body', async () => {
+    // distinct ids: provider_message_id is UNIQUE, and the default mock
+    // returns one id for every call
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_first' }, error: null } as any)
+    await email.emailInvitation('first@mailer-test.co', 'Acme Ranch', 'onsite_manager', 'https://x/a')
+    const first = (resendSendMock.mock.calls.at(-1) as any[])![0]
+
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_again' }, error: null } as any)
+    await email.emailInvitation('again@mailer-test.co', 'Acme Ranch', 'onsite_manager', 'https://x/b', { resend: true })
+    const again = (resendSendMock.mock.calls.at(-1) as any[])![0]
+
+    expect(again.subject).not.toEqual(first.subject)
+    expect(again.html).not.toEqual(first.html)
+    // and it says plainly that the older link is dead
+    expect(again.html).toContain('no longer works')
+
+    const log = await logRowFor('again@mailer-test.co')
+    expect(log.metadata).toEqual({ role: 'onsite_manager', resend: true })
   })
 })
 

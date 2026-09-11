@@ -623,7 +623,7 @@ scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (
       await client.query('COMMIT')
 
       const inviterName = await getInviterName(landlordId)
-      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token), { landlordId, invitationId: inv.id })
+      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token), { landlordId, invitationId: inv.id, resend: true })
         .catch(e => logger.error({ err: e }, '[EMAIL] resend failed'))
 
       res.json({ success: true, data: upd.rows[0] })
