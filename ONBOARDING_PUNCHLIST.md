@@ -53,7 +53,26 @@ order they were hit.
 
 ---
 
-## 🟠 STRUCTURAL — decide before more landlords onboard
+## ✅ STRUCTURAL — all three SHIPPED (verified S641)
+
+These sat here as open decisions long after they were built, and cost a real
+conversation: they were read off this file and presented to Nic as outstanding
+three times in one day. Verified against the code and the live database, not
+against this list.
+
+- **Multi-entity — DONE.** `POST /landlords/me/entities` creates another
+  company, Settings → "Your entities" is the UI, and PropertiesPage carries an
+  entity picker when creating each property. Nic's own account owns Oak Park
+  Motel and RV LLC and Mountain View RV Park Ranch LLC, both as owner.
+- **Bank after units — DONE (S605).** The step order is profile → property →
+  units → payout account → bank feed → agreement. "It's weird to ask for bank
+  information when they haven't had a chance to immerse themselves."
+- **ACH fee-payer election — DONE, and never retroactive.** The payer is read
+  at payment time from the property, so switching it only affects payments made
+  after the switch. Nic (S641): "It's not retroactive. They don't get paid back.
+  It's just going forward."
+
+<details><summary>Original entries, kept for the reasoning</summary>
 
 - **SIGNUP accepts exactly one LLC, with no way to add a second.** A FLOW
   problem, not an architecture one — the DB and portfolio views already handle
@@ -69,6 +88,8 @@ order they were hit.
 - **ACH fee payer election** — make the toggle available, default BOTH to tenant.
   **Open question: how hard is retroactively charging the fee to the landlord's
   balance?** Easy → make it an option; not → skip.
+
+</details>
 
 ## 🔵 NEXT BUILD — RETIRE & REPLACE a unit (Nic's design, DECIDED)
 
