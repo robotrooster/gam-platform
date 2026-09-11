@@ -90,6 +90,61 @@ async function seedOwnerShareLedger(ctx: Ctx, amount: number): Promise<void> {
 // sorts first, so Oak Park's card and ACH rent could never leave the platform
 // balance — with nothing anywhere saying so. It has not bitten only because
 // Oak Park's residents have all paid cash so far.
+/**
+ * S640 — ONE TRANSFER, MANY PAYMENTS.
+ *
+ * Found firing Mountain View's first real disbursement by hand: both companies
+ * failed on a unique index over user_balance_ledger.stripe_transfer_id. That
+ * index is from S119, when a transfer was fired per ledger row for a PM cut.
+ * The platform-held passthrough sums every settled payment into ONE transfer and
+ * stamps its id on each reserved row — so three payments meant three rows
+ * carrying the same id, and the reservation rolled back.
+ *
+ * It had never fired with more than one payment in the batch. The Sep 8 sweep of
+ * $589 worked because it was a single payment; an ordinary month could not have
+ * paid out at all, for any landlord, and the failure showed only in the job's
+ * error array.
+ */
+describe('S640 a batch with several payments in it', () => {
+  it('moves every settled payment in one transfer', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 500)
+
+    // Two more settled, platform-held payments on the same landlord — the
+    // ordinary case of three residents paying by card in one month.
+    for (const amount of [300, 200]) {
+      const { rows: [p] } = await db.query<{ id: string }>(
+        `INSERT INTO payments
+           (unit_id, tenant_id, landlord_id, type, amount, status, entry_description,
+            due_date, platform_held, settled_at)
+         VALUES ($1,$2,$3,'rent',$4,'settled','RENT', CURRENT_DATE - $5::int, TRUE, NOW())
+         RETURNING id`,
+        [ctx.unitId, ctx.tenantId, ctx.landlordId, amount, amount])
+      await db.query(
+        `INSERT INTO user_balance_ledger
+           (user_id, type, amount, balance_after, reference_id, reference_type, notes)
+         VALUES ($1,'allocation_owner_share',$2,$2,$3,'payment','S640 batch')`,
+        [ctx.landlordUserId, amount, p.id])
+    }
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(true)
+    expect(res.amount).toBe(1000)          // 500 + 300 + 200, not just the first
+    expect(transferMock).toHaveBeenCalledTimes(1)
+
+    // Every row carries the same transfer id, which is the point.
+    const { rows } = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM user_balance_ledger
+        WHERE type = 'allocation_owner_share' AND stripe_transfer_id IS NOT NULL
+          AND stripe_transfer_id NOT LIKE 'intent:%'`)
+    expect(Number(rows[0].n)).toBe(3)
+
+    const held = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE platform_held = TRUE`)
+    expect(Number(held.rows[0].n)).toBe(0)
+  })
+})
+
 describe('S640 an account with several companies', () => {
   async function seedSecondCompany(ctx: Ctx, connectAccount: string) {
     const c = await db.connect()

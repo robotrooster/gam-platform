@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict fOsFf3MKZmCitpLfR6HtYjfoCZOzu38ophfXK8a5aNBs1Mkodd6qEHZOuh5iJHF
+\restrict acblKwQtG7PbgXJrU1P84uTGIpgynV2mVbgzelXQERIoWdToEN7SzrH4HxEANTj
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9730,6 +9730,13 @@ CREATE TABLE public.user_balance_ledger (
 
 
 --
+-- Name: COLUMN user_balance_ledger.stripe_transfer_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.user_balance_ledger.stripe_transfer_id IS 'S640: NOT unique. One platform-held passthrough transfer covers every owner-share row in the batch, so a transfer id legitimately repeats across rows.';
+
+
+--
 -- Name: user_bank_accounts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -17549,7 +17556,7 @@ CREATE INDEX idx_user_balance_ledger_reference ON public.user_balance_ledger USI
 -- Name: idx_user_balance_ledger_stripe_transfer_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_user_balance_ledger_stripe_transfer_id ON public.user_balance_ledger USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
+CREATE INDEX idx_user_balance_ledger_stripe_transfer_id ON public.user_balance_ledger USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
 
 
 --
@@ -25857,5 +25864,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict fOsFf3MKZmCitpLfR6HtYjfoCZOzu38ophfXK8a5aNBs1Mkodd6qEHZOuh5iJHF
+\unrestrict acblKwQtG7PbgXJrU1P84uTGIpgynV2mVbgzelXQERIoWdToEN7SzrH4HxEANTj
 
