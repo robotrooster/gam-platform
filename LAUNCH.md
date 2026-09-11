@@ -140,9 +140,11 @@ Nic is entering his three Oak Park lease templates and sending portal invites.
 Everything here is meant to land BEFORE real tenants are on the platform. Nic:
 *"I wanted to knock all those changes out before real people got on there."*
 
-1. **E-sign auto-draft workflow** — verify the path Nic is about to use for
-   real: upload template → auto-place fields → draft → send. Not yet checked
-   this session.
+1. **E-sign auto-draft workflow — ✅ PROVEN IN USE (S641).** This item was
+   written 2026-08-22, before Nic had used the flow. He has since put **35
+   completed leases and 12 in progress** through upload template → auto-place
+   fields → draft → send. Nothing to verify; it is the daily path.
+   Superseded by the SIGNING PACKAGE work (§2d).
 2. **AI agents — ✅ DONE (S617).** Knowledge re-ingested, scope enforced, manner
    fixed, and — the part nobody knew about — they had been **inventing account
    data**.
@@ -176,7 +178,14 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
      **Do not run it alongside the vitest suite** — together they starve the
      36B model server, which crashes and respawns mid-run.
 
-3. **Demo server — split the seed data off the live database.** Nic: *"when
+3. **Demo server — DEFERRED by Nic (S641): "skip demo data for now."** Still
+   wanted eventually, and it has to live on a server rather than this Mac,
+   since other salespeople will not be on this machine. The production
+   cleanup half already happened — Thornton Properties and Reyes Rentals and
+   their payment rows are gone from the live database.
+   Original note follows.
+
+   **Demo server — split the seed data off the live database.** Nic: *"when
    we're having sales calls and demos, I can walk through a process without
    showing real customer data."* Wants seeded data at EVERY STAGE of a flow —
    a template being built, one with its boxes already placed, one signed — so a
