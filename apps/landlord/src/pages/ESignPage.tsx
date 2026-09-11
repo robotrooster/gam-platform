@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
+import SigningPackagesPanel from './SigningPackagesPanel'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -1545,7 +1546,7 @@ export function ESignPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { can } = usePerms()
-  const [tab, setTab]           = useState<'documents'|'templates'>('documents')
+  const [tab, setTab]           = useState<'documents'|'templates'|'packages'>('documents')
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
   const [showStandalone, setShowStandalone] = useState(false)
@@ -1735,6 +1736,8 @@ export function ESignPage() {
   const TABS = [
     { id:'documents', label:'Documents', perm:'esign.tab.documents' },
     { id:'templates', label:'Templates', perm:'esign.tab.templates' },
+    // S641: a package is a list of templates, so it is gated with them.
+    { id:'packages',  label:'Packages',  perm:'esign.tab.templates' },
   ].filter(t => can(t.perm))
   const visibleTabIds = TABS.map(t => t.id).join(',')
   useEffect(() => {
@@ -1763,6 +1766,8 @@ export function ESignPage() {
           <button key={t.id} onClick={() => setTab(t.id as any)} className={`btn btn-sm ${tab===t.id?'btn-primary':'btn-ghost'}`}>{t.label}</button>
         ))}
       </div>
+
+      {tab === 'packages' && <SigningPackagesPanel />}
 
       {/* Documents */}
       {tab === 'documents' && (documents as any[]).length > 0 && (

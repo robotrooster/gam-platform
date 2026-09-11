@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
+import { packageSiblings } from '../services/signingPackages'
 import {
   LeaseDocumentType,
   UnitType,
@@ -208,6 +209,17 @@ export async function createDocumentRecord(client: any, opts: {
   // the home-sale purchase agreement — was a type error while the mechanism
   // underneath worked perfectly well.
   prefillValues?: Record<string, string>,
+  // S641: this document is one item of a signing package. The group id is the
+  // bundle's shared identity — deliberately a column rather than another table,
+  // since a bundle needs an identity and an order and nothing else a row on the
+  // document cannot carry. Note this is the PERPENDICULAR relation to
+  // document_batches, which sends one template out to many units.
+  packageGroupId?: string | null,
+  packageId?: string | null,
+  packageSortOrder?: number | null,
+  // What the signer actually agreed to, so "has this changed since?" has
+  // something to compare against at renewal.
+  templateVersion?: number | null,
 }): Promise<any> {
   // S629 (Nic): "it does not render the PDF to even see what you're signing."
   //
@@ -233,15 +245,18 @@ export async function createDocumentRecord(client: any, opts: {
       template_id, landlord_id, unit_id, lease_id,
       title, base_pdf_url,
       document_type, target_lease_tenant_id, promote_lease_tenant_id,
-      renews_lease_id, deposit_already_held
-    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11)
+      renews_lease_id, deposit_already_held,
+      package_group_id, package_id, package_sort_order, template_version
+    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11, $12,$13,$14,$15)
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
       opts.title, basePdfUrl,
       opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId,
       opts.renewsLeaseId || null,
-      opts.depositAlreadyHeld === true
+      opts.depositAlreadyHeld === true,
+      opts.packageGroupId ?? null, opts.packageId ?? null,
+      opts.packageSortOrder ?? null, opts.templateVersion ?? null
     ]).then((r: any) => r.rows[0])
 
   // S605 (Nic): "if a previous run drafted the lease, then it should know that
@@ -380,7 +395,12 @@ export async function createDocumentRecord(client: any, opts: {
       const ctx = await client.query(
         `SELECT u.unit_number, u.rent_amount, u.security_deposit, p.name AS property_name,
                 CONCAT_WS(', ', p.street1, NULLIF(p.street2,''), p.city, p.state, p.zip) AS property_address,
-                TRIM(CONCAT_WS(' ', lu.first_name, lu.last_name)) AS landlord_name
+                -- S641: the printed name under a landlord signature is whoever
+                -- signs, which is the property's named on-site signer when it
+                -- has one. This used to take the account owner unconditionally,
+                -- printing the owner's name over somebody else's signature.
+                TRIM(COALESCE(NULLIF(p.lease_signing_name, ''),
+                              CONCAT_WS(' ', lu.first_name, lu.last_name))) AS landlord_name
            FROM units u
            JOIN properties p ON p.id = u.property_id
            LEFT JOIN landlords l ON l.id = u.landlord_id
@@ -2432,8 +2452,77 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       await client.query('UPDATE lease_documents SET work_trade_agreement_id=$1 WHERE id=$2', [wtAgreementId, doc.id])
     }
 
+    // ── S641: the rest of the package ────────────────────────────────────────
+    //
+    // Nic: "when the lease is autodrafted, it combines them all together…
+    // otherwise a lot of people are gonna be like, well, I already signed the
+    // lease, what's this for?"
+    //
+    // packageTemplateIds is what the landlord left TICKED on the draft
+    // checklist, so an item that does not apply to this tenant is simply
+    // absent. Same signers, same group, inside the same transaction — a
+    // half-assembled package is worse than none, because somebody would sign
+    // part of an agreement.
+    const packageTemplateIds: string[] = Array.isArray(req.body?.packageTemplateIds)
+      ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && t !== templateId)
+      : []
+    const packageDocs: any[] = []
+    if (packageTemplateIds.length) {
+      const groupId = crypto.randomUUID()
+      // The lease itself is item zero of its own bundle.
+      await client.query(
+        `UPDATE lease_documents SET package_group_id=$1, package_id=$2, package_sort_order=0,
+                template_version=(SELECT version FROM lease_templates WHERE id=$3)
+          WHERE id=$4`,
+        [groupId, req.body?.packageId ?? null, templateId || null, doc.id])
+
+      // Ownership-checked in one query rather than trusting the body: a package
+      // must never reach for another landlord's form.
+      const extras = await client.query(
+        `SELECT id, name, base_pdf_url, purpose, version
+           FROM lease_templates
+          WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND is_active = TRUE`,
+        [packageTemplateIds, docLandlordId]).then((r: any) => r.rows)
+      if (extras.length !== new Set(packageTemplateIds).size) {
+        throw new AppError(403, 'One of those documents is not yours')
+      }
+
+      // Keep the landlord's own ordering from the package definition.
+      const orderById = new Map<string, number>()
+      const defined = await client.query(
+        `SELECT template_id, sort_order FROM document_package_items WHERE package_id = $1`,
+        [req.body?.packageId ?? null]).then((r: any) => r.rows).catch(() => [])
+      for (const d of defined) orderById.set(d.template_id, Number(d.sort_order))
+      extras.sort((a: any, b: any) => (orderById.get(a.id) ?? 999) - (orderById.get(b.id) ?? 999))
+
+      let order = 1
+      for (const t of extras) {
+        packageDocs.push(await createDocumentRecord(client, {
+          landlordId: docLandlordId,
+          templateId: t.id,
+          unitId: finalUnitId,
+          leaseId: docLeaseId,
+          title: t.name,
+          basePdfUrl: t.base_pdf_url || null,
+          // Everything that rides alongside a lease is an addendum to it unless
+          // it is a standalone instrument in its own right. An installment sale
+          // is the latter — that separability is the entire point at Country
+          // Acres, where lot rent and the trailer are currently one flat figure.
+          documentType: t.purpose === 'installment_sale' ? 'purchase_agreement' : 'addendum_terms',
+          targetLeaseTenantId: null,
+          promoteLeaseTenantId: null,
+          signers,
+          prefillValues: prefillValues || {},
+          packageGroupId: groupId,
+          packageId: req.body?.packageId ?? null,
+          packageSortOrder: order++,
+          templateVersion: Number(t.version) || 1,
+        } as any))
+      }
+    }
+
     await client.query('COMMIT')
-    res.status(201).json({ success: true, data: doc })
+    res.status(201).json({ success: true, data: doc, package: packageDocs })
   } catch (e) {
     await client.query('ROLLBACK')
     next(e)
@@ -4283,7 +4372,13 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     // S637: `waitingOn` names who the document is with, so the page can say
     // "waiting on the landlord" instead of showing a form that cannot be
     // submitted. readOnly already covers the mechanics; this covers the telling.
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly, waitingOn } })
+    // S641: the other documents in this bundle, so the signer sees "2 of 4" and
+    // one ceremony rather than a series of unrelated requests arriving days
+    // apart. Nic: "a lot of people are gonna be like, well, I already signed the
+    // lease, what's this for?"
+    const packageDocs = doc.package_group_id ? await packageSiblings(doc.id) : []
+
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly, waitingOn, packageDocs } })
   } catch (e) { next(e) }
 })
 

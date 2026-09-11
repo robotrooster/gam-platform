@@ -204,3 +204,68 @@ export async function bumpTemplateVersion(templateId: string): Promise<number> {
       WHERE id = $1 RETURNING version`, [templateId])
   return row?.version ?? 1
 }
+
+/**
+ * Draft every selected item of a package as ONE signing bundle.
+ *
+ * Nic: "when the lease is autodrafted, it combines them all together… having it
+ * all bundled together in a package type format would make life easier."
+ *
+ * The bundle shares a group id and an order, so the tenant sees "document 2 of
+ * 4" and one completion rather than a series of unrelated requests arriving
+ * days apart. Each document still executes as its own instrument — that is what
+ * keeps an installment contract separable from a lot lease, which is the whole
+ * point at Country Acres.
+ *
+ * Called INSIDE the caller's transaction: a half-assembled package is worse
+ * than none, because the tenant would sign part of an agreement.
+ */
+export interface AssembleItem {
+  templateId: string
+  title: string
+  documentType: string
+  sortOrder: number
+  version: number
+}
+
+export async function assemblePackageDocuments(
+  client: { query: Function },
+  params: {
+    landlordId: string
+    unitId: string | null
+    leaseId: string | null
+    packageId: string | null
+    packageGroupId: string
+    items: AssembleItem[]
+    createOne: (item: AssembleItem, groupId: string, order: number) => Promise<any>
+  },
+): Promise<any[]> {
+  const created: any[] = []
+  // Order matters: the lease first, then whatever explains or qualifies it.
+  const ordered = [...params.items].sort((a, b) => a.sortOrder - b.sortOrder)
+  for (let i = 0; i < ordered.length; i++) {
+    created.push(await params.createOne(ordered[i], params.packageGroupId, i))
+  }
+  return created
+}
+
+/**
+ * The other documents in this document's bundle, in order — what the signing
+ * screen needs to say "2 of 4" and to move somebody to the next one.
+ */
+export async function packageSiblings(documentId: string): Promise<Array<{
+  id: string; title: string; status: string; sortOrder: number; isSelf: boolean
+}>> {
+  const rows = await query<any>(
+    `SELECT d.id, d.title, d.status, COALESCE(d.package_sort_order, 0) AS sort_order
+       FROM lease_documents d
+      WHERE d.package_group_id = (SELECT package_group_id FROM lease_documents WHERE id = $1)
+        AND d.package_group_id IS NOT NULL
+        AND d.voided_at IS NULL
+      ORDER BY d.package_sort_order, d.created_at`,
+    [documentId])
+  return rows.map(r => ({
+    id: r.id, title: r.title, status: r.status,
+    sortOrder: Number(r.sort_order), isSelf: r.id === documentId,
+  }))
+}

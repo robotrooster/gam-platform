@@ -517,7 +517,7 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly, waitingOn } = data
+  const { signer, document:doc, fields, readOnly, waitingOn, packageDocs } = data
   const allFields = fields || []
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
@@ -665,11 +665,34 @@ export function SignPage() {
     </div>
   )
 
+  // S641: where this document sits in its bundle, and how much is left.
+  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
+  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
+  const packagePosition = bundle.length > 1 && selfAt >= 0
+    ? {
+        index: selfAt + 1,
+        total: bundle.length,
+        remaining: bundle.filter((d:any)=> !d.isSelf && d.status !== 'completed').length,
+      }
+    : null
+
   return (
     <div>
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
+          {/* S641: when this document is part of a package, say so up front.
+              Nic: "a lot of people are gonna be like, well, I already signed the
+              lease, what's this for?" Knowing there are four documents and this
+              is the second answers that before it is asked. */}
+          {packagePosition && (
+            <div style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600 }}>
+              Document {packagePosition.index} of {packagePosition.total}
+              {packagePosition.remaining > 0
+                ? ` · ${packagePosition.remaining} more after this`
+                : ' · last one'}
+            </div>
+          )}
           <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {requiredFields.length-unfilledRequired.length}/{requiredFields.length} required fields complete</div>
         </div>
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>

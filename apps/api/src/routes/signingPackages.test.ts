@@ -169,3 +169,119 @@ describe('the draft checklist for a unit', () => {
     expect(res.status).toBe(404)
   })
 })
+
+// ── the assembled bundle ────────────────────────────────────────────────────
+import { esignRouter } from './esign'
+import { packageSiblings } from '../services/signingPackages'
+import { randomUUID } from 'crypto'
+
+function buildEsignApp() {
+  const app = express()
+  app.use(express.json({ limit: '2mb' }))
+  app.use('/api/esign', esignRouter)
+  app.use(errorHandler)
+  return app
+}
+
+async function seedSignableUnit() {
+  const f = await seed()
+  const c = await db.connect()
+  try {
+    await c.query('BEGIN')
+    // a second template for the package
+    const rules = await c.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose) VALUES ($1,'Park Rules','park_rules') RETURNING id`,
+      [f.a.landlordId])
+    const inst = await c.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose) VALUES ($1,'Installment Sale','installment_sale') RETURNING id`,
+      [f.a.landlordId])
+    // a tenant who can sign
+    const tu = await c.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','tenant','Test','Tenant',TRUE) RETURNING id`, [`t-${randomUUID()}@test.dev`])
+    await c.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [tu.rows[0].id])
+    await c.query('COMMIT')
+    return { ...f, rules: rules.rows[0].id, inst: inst.rows[0].id, tenantUserId: tu.rows[0].id }
+  } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+}
+
+describe('drafting a package as one bundle', () => {
+  it('creates every ticked document in one group, the lease first', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Mobile Home Lease',
+        packageTemplateIds: [f.rules, f.inst],
+        signers: [
+          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+        ],
+      })
+    expect(res.status).toBe(201)
+    expect(res.body.package).toHaveLength(2)
+
+    const siblings = await packageSiblings(res.body.data.id)
+    expect(siblings).toHaveLength(3)
+    expect(siblings[0].title).toBe('Mobile Home Lease')
+    expect(siblings[0].isSelf).toBe(true)
+  })
+
+  // An installment contract must stay a separate instrument. Nic: the current
+  // Country Acres owner bundles lot rent and the trailer into one flat price,
+  // "so you don't know what's getting paid to lot rent and what's getting paid
+  // to the trailer."
+  it('an installment sale is its own instrument, not an addendum', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Lot Lease',
+        packageTemplateIds: [f.inst],
+        signers: [
+          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const { rows } = await db.query(
+      `SELECT document_type FROM lease_documents WHERE id=$1`, [res.body.package[0].id])
+    expect(rows[0].document_type).toBe('purchase_agreement')
+  })
+
+  it('refuses a package item belonging to another landlord', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Lease',
+        packageTemplateIds: [f.tplB],
+        signers: [
+          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+        ],
+      })
+    expect(res.status).toBe(403)
+    // and nothing was left half-built
+    const { rows } = await db.query(`SELECT COUNT(*)::int AS n FROM lease_documents`)
+    expect(rows[0].n).toBe(0)
+  })
+
+  it('no package ticked leaves an ordinary single-document draft', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Just A Lease',
+        signers: [
+          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+        ],
+      })
+    expect(res.status).toBe(201)
+    expect(res.body.package).toEqual([])
+    const { rows } = await db.query(
+      `SELECT package_group_id FROM lease_documents WHERE id=$1`, [res.body.data.id])
+    expect(rows[0].package_group_id).toBeNull()
+  })
+})
