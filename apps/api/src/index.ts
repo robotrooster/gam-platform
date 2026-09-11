@@ -97,6 +97,7 @@ import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
+import { emergencyContactsRouter } from './routes/emergencyContacts'
 import { announcementsRouter }  from './routes/announcements'
 import { surveysRouter }        from './routes/surveys'
 import { tenantCreditsRouter }  from './routes/tenantCredits'
@@ -434,6 +435,8 @@ app.use('/api/tenant-credits', tenantCreditsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
   app.use('/api/background',    backgroundRouter)
+  // S640: the front desk's emergency contact list.
+  app.use('/api/emergency-contacts', emergencyContactsRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/bank-accounts',  bankAccountsRouter)

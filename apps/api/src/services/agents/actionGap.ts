@@ -52,6 +52,13 @@ const DELIBERATE = new Map(Object.entries({
     'creates a unit CLASS, a structural piece of a property\'s setup that every later unit inherits its facts from. Named and shaped on the property setup screen where the existing classes are visible; spoken creation would quietly grow near-duplicate classes.',
   'utility POST /opening-reads':
     'records the starting number on physical meters, hundreds at a time, transcribed off the dials on site. It is a bulk data-entry screen with a date picker and one save — dictating three hundred five-digit readings is not a thing anybody would do, and a misheard digit becomes a wrong bill.',
+  // ── S640: emergency contacts ───────────────────────────────────────────
+  'emergencyContacts PUT /':
+    'records the number somebody dials on the worst day of a resident\'s life. Transcribing a phone number from a spoken sentence is the single highest-risk thing an agent can do with a contact detail — it is why editing an invite\'s email was kept away from the agent too — and here the failure mode is nobody answering in an emergency. Typed at the counter, read back off the screen.',
+  'emergencyContacts POST /confirm':
+    'asserts that a resident\'s emergency contact is still current. Only the RESIDENT can know that; a staff-side agent confirming it on their behalf would manufacture a fact. When the annual re-check reaches the tenant portal this becomes the tenant answering for themselves, not an agent answering for them.',
+  'emergencyContacts POST /import':
+    'a bulk write across every resident at once, reading the lease field for the whole portfolio. It is an owner-level one-off, idempotent, and there is nothing to say to it in a sentence.',
   'background PATCH /:id/decision':
     'record-intent-only by directive (FCRA / fair housing) — flag_applicant_decision captures the landlord\'s intent and routes them to record it themselves',
   'background POST /:id/adverse-action':

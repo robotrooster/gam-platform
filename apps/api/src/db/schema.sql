@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict PDMPgzcGCInn3YalHD6bRbjEGBRHCcgxcUggTdKb1n7SCTBUekwt8BJcgDSN9a0
+\restrict Es0XiYRsqtIwDfs1eh8qubvdn0duKMaNLQy2cFHfGYc1vNKuoUgYgzrtfZIrhkV
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3536,15 +3536,36 @@ CREATE TABLE public.email_send_log_archive (
 CREATE TABLE public.emergency_contacts (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     tenant_id uuid NOT NULL,
-    name text NOT NULL,
+    name text,
     phone text,
     email text,
     relationship text,
     notes text,
     sort_order integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    raw_text text,
+    source text DEFAULT 'staff'::text NOT NULL,
+    source_field_id uuid,
+    confirmed_at timestamp with time zone,
+    confirmed_by_user_id uuid,
+    CONSTRAINT emergency_contacts_not_empty CHECK (((name IS NOT NULL) OR (phone IS NOT NULL) OR (raw_text IS NOT NULL))),
+    CONSTRAINT emergency_contacts_source_check CHECK ((source = ANY (ARRAY['lease'::text, 'staff'::text, 'tenant'::text, 'parser'::text])))
 );
+
+
+--
+-- Name: COLUMN emergency_contacts.raw_text; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.emergency_contacts.raw_text IS 'S640: what the lease field said, verbatim. The parse is an interpretation; this is the evidence.';
+
+
+--
+-- Name: COLUMN emergency_contacts.confirmed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.emergency_contacts.confirmed_at IS 'S640: last time a person confirmed this is still current. Drives the annual re-check.';
 
 
 --
@@ -13898,6 +13919,20 @@ CREATE INDEX common_areas_property_idx ON public.common_areas USING btree (prope
 
 
 --
+-- Name: emergency_contacts_source_field_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX emergency_contacts_source_field_uniq ON public.emergency_contacts USING btree (source_field_id) WHERE (source_field_id IS NOT NULL);
+
+
+--
+-- Name: emergency_contacts_tenant_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX emergency_contacts_tenant_idx ON public.emergency_contacts USING btree (tenant_id);
+
+
+--
 -- Name: flex_charge_accounts_pos_customer_property_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -21379,6 +21414,22 @@ ALTER TABLE ONLY public.email_send_log
 
 
 --
+-- Name: emergency_contacts emergency_contacts_confirmed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emergency_contacts
+    ADD CONSTRAINT emergency_contacts_confirmed_by_user_id_fkey FOREIGN KEY (confirmed_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: emergency_contacts emergency_contacts_source_field_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emergency_contacts
+    ADD CONSTRAINT emergency_contacts_source_field_id_fkey FOREIGN KEY (source_field_id) REFERENCES public.lease_document_fields(id) ON DELETE SET NULL;
+
+
+--
 -- Name: emergency_contacts emergency_contacts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25798,5 +25849,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict PDMPgzcGCInn3YalHD6bRbjEGBRHCcgxcUggTdKb1n7SCTBUekwt8BJcgDSN9a0
+\unrestrict Es0XiYRsqtIwDfs1eh8qubvdn0duKMaNLQy2cFHfGYc1vNKuoUgYgzrtfZIrhkV
 

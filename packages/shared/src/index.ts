@@ -5063,6 +5063,8 @@ export * from './autopaySchedule';
 // S624: property timezone from state + ZIP. Fifteen states split, so state alone
 // is wrong for all of them — and an unresolvable ZIP is FLAGGED, not guessed.
 export * from './propertyTimezone';
+// S640: reading an emergency contact out of a free-text lease field.
+export * from './emergencyContact';
 
 // ============================================================================
 // Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)

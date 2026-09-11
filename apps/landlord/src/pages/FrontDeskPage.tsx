@@ -21,6 +21,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
+import { EmergencyContactsPanel } from './EmergencyContactsPanel'
 import { SearchBox } from '../components/ListControls'
 import { Phone, Mail, Search } from 'lucide-react'
 
@@ -265,6 +266,18 @@ export function FrontDeskPage() {
   // wrongly and nothing else. It disappears; the page simply IS their park.
   const singleProperty = groups.length === 1
 
+  // ── S640 (Nic): EMERGENCY CONTACTS LIVE HERE ───────────────────────────────
+  //
+  // "We wanna have a page that is accessible... somewhere near the front desk
+  // type page or maybe a sub tab in the front desk page. That way my front desk
+  // help Lisa Scheeler can see that."
+  //
+  // A sub-tab rather than its own nav entry, because it is the same job: things
+  // to say to the person standing in front of you. It also means one permission
+  // switch covers both, which is the rule for this role — the fewer things there
+  // are to get wrong, the wider the pool of people who can do it.
+  const [tab, setTab] = useState<'calls' | 'emergency'>('calls')
+
   return (
     <div>
       <div className="page-header">
@@ -285,6 +298,19 @@ export function FrontDeskPage() {
         </div>
       </div>
 
+      <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+        <button type="button" onClick={() => setTab('calls')}
+          className={`btn btn-sm ${tab === 'calls' ? 'btn-primary' : 'btn-ghost'}`}>
+          Call list{toCall > 0 ? ` (${toCall})` : ''}
+        </button>
+        <button type="button" onClick={() => setTab('emergency')}
+          className={`btn btn-sm ${tab === 'emergency' ? 'btn-primary' : 'btn-ghost'}`}>
+          Emergency contacts
+        </button>
+      </div>
+
+      {tab === 'emergency' ? <EmergencyContactsPanel /> : (
+      <>
       <div className="filter-bar">
         <SearchBox value={q} onChange={setQ} placeholder="Name, email, phone or unit…" />
         {query ? (
@@ -419,6 +445,8 @@ export function FrontDeskPage() {
             </div>
           ))}
         </div>
+      )}
+      </>
       )}
     </div>
   )
