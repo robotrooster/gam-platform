@@ -11,6 +11,8 @@ interface FieldStamp {
   value: string
   /** S637: the signature style the signer chose, as a CSS font shorthand. */
   font_css?: string | null
+  /** S641: how a ticked box is drawn — 'x' (default) or 'check'. */
+  checkbox_mark?: string | null
 }
 
 interface SignerInfo {
@@ -55,6 +57,12 @@ export async function stampPdf(
   // and the executed PDF agree. The cursive keywords stay in the matcher below
   // to keep any already-signed document rendering as it did.
   const timesItalic = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic)
+  // S641 (Nic): "it needs to be a check or an x, not just a solid square,
+  // because that could be ambiguous." A filled square reads as redaction to one
+  // person and "not applicable" to another. ZapfDingbats is one of the fourteen
+  // fonts every PDF reader carries, and its '3' is a check mark — Helvetica's
+  // WinAnsi encoding has no such glyph, so a literal ✓ would stamp as garbage.
+  const dingbats = await pdfDoc.embedFont(StandardFonts.ZapfDingbats)
   const signatureFontFor = (fontCss: string | null | undefined) => {
     if (!fontCss) return helvetica
     const css = String(fontCss).toLowerCase()
@@ -91,7 +99,14 @@ export async function stampPdf(
     } else if (field.field_type === 'date') {
       page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
     } else if (field.field_type === 'checkbox' && field.value === 'checked') {
-      page.drawText('X', { x:field.x+field.width*0.2, y:pdfY+field.height*0.15, size:field.height*0.65, font:helveticaBold, color:rgb(0,0.4,0) })
+      const useCheck = field.checkbox_mark === 'check'
+      page.drawText(useCheck ? '3' : 'X', {
+        x: field.x + field.width * 0.2,
+        y: pdfY + field.height * 0.15,
+        size: field.height * 0.65,
+        font: useCheck ? dingbats : helveticaBold,
+        color: rgb(0, 0.4, 0),
+      })
     } else if (field.value) {
       page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
     }

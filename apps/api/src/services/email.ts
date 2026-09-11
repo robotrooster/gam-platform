@@ -2329,6 +2329,92 @@ export async function emailBalanceDue(
   )
 }
 
+// ── S641: THE BILL ITSELF ────────────────────────────────────────────────────
+//
+// Nic: "a lot of people are saying, oh, I never got my bill. I don't know what
+// I owe."
+//
+// They were right. Invoice generation sent no email at all — not one line in
+// the whole job. In the thirty days before this was written the only
+// billing-related mail any tenant received was 197 LATE notices. We never told
+// anyone a bill existed, and then told them they were late for it.
+//
+// This goes out when the invoice is generated, at 7am in the property's own
+// timezone — deliberately NOT early. Nic: "when you send the invoices early,
+// people wanna pay early. And if people have paid ahead with credit, I want it
+// applied to their balance in the correct month. I don't want weird bookkeeping
+// where this person paid two thousand dollars one month, and then nothing the
+// next month, and then two thousand the next." The bill and the month it
+// belongs to stay aligned.
+export async function emailInvoiceReady(
+  to: string,
+  args: {
+    tenantName: string
+    unitLabel: string
+    invoiceNumber: string
+    dueDateLabel: string
+    total: number
+    lines: Array<{ label: string; amount: number }>
+    /** Work traded off this cycle — owed by nobody, but it belongs on the bill. */
+    workTradeCredit?: number
+    /** Credit on account, already netted out of `total`. */
+    creditApplied?: number
+    portalUrl?: string
+    landlordName?: string
+  },
+  ctx?: { landlordId?: string; tenantId?: string; invoiceId?: string },
+): Promise<string | null> {
+  const money = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
+
+  const rows = args.lines.map(l =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+       <span>${escapeHtml(l.label)}</span><span>${money(l.amount)}</span>
+     </div>`).join('')
+
+  const deduction = (label: string, amount: number) =>
+    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+       <span>${label}</span><span>-${money(amount)}</span>
+     </div>`
+
+  // A zero balance is still worth sending: it is the tenant's proof that the
+  // month was covered, and the commonest cause is work trade.
+  const settled = args.total <= 0
+
+  return await send(to,
+    settled
+      ? `Your ${args.dueDateLabel} statement — nothing due for ${args.unitLabel}`
+      : `${money(args.total)} due ${args.dueDateLabel} — ${args.unitLabel}`,
+    base(
+      h(settled ? 'Your statement' : 'Your bill is ready') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      p(settled
+        ? `Here is your statement for ${escapeHtml(args.unitLabel)}. Nothing is owed this cycle.`
+        : `<strong style="color:#eef1f8">${money(args.total)}</strong> is due on <strong style="color:#eef1f8">${escapeHtml(args.dueDateLabel)}</strong> for ${escapeHtml(args.unitLabel)}.`) +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(args.unitLabel)}</div>
+         <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
+         ${rows}` +
+      (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
+      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit on your account', args.creditApplied) : '') +
+      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>${settled ? 'Balance' : 'Total due'}</span><span>${money(Math.max(0, args.total))}</span>
+         </div>
+       </div>` +
+      (!settled && args.portalUrl ? btn('Pay now', args.portalUrl) : '') +
+      p(`If any of this looks wrong, reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will take a look.`)
+    ),
+    {
+      category: 'invoice_ready',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.invoiceId ? 'invoice' : (ctx?.tenantId ? 'tenant' : null),
+      relatedEntityId: ctx?.invoiceId ?? ctx?.tenantId ?? null,
+    },
+    'support',
+  )
+}
+
 // ── S639: THE APPLICANT NEEDS THEIR OWN SCREENING LINK ───────────────────────
 //
 // Checkr Tenant collects the SSN and the FCRA consent on its OWN hosted form,

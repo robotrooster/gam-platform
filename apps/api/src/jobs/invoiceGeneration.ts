@@ -1196,6 +1196,25 @@ export function registerInvoiceEngine(): void {
       } catch (e) {
         logger.error({ err: e, tz }, '[InvoiceGen] error')
       }
+
+      // S641 — tell the tenant. Generation used to send nothing at all, so the
+      // only billing mail anyone ever got was a late notice.
+      //
+      // Outside the try above on purpose: a generation failure for one property
+      // must not silence the bills that DID generate, and a mail failure must
+      // never look like a generation failure. Runs at the same 7am local hour
+      // as generation and not a day earlier — Nic: "when you send the invoices
+      // early, people wanna pay early", which drags a payment into the wrong
+      // month's books.
+      try {
+        const { sendPendingInvoiceNotices } = await import('../services/invoiceNotice')
+        const n = await sendPendingInvoiceNotices({ timezone: tz })
+        if (n.sent > 0 || n.failed > 0 || n.skippedNoEmail > 0) {
+          logger.info({ tz, ...n }, '[InvoiceGen] tenant invoice notices')
+        }
+      } catch (e) {
+        logger.error({ err: e, tz }, '[invoice-notice] pass failed')
+      }
     },
     label: 'Invoice generation',
   })

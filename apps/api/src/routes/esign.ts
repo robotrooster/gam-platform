@@ -510,17 +510,27 @@ export async function createDocumentRecord(client: any, opts: {
           ? (rosterNames.join(', ') || null)
           : f.lease_column && prefillValues[f.lease_column] != null
             ? leaseColumnDisplayValue(f.lease_column, prefillValues[f.lease_column])
-            : null
+            // S641 (Nic): the template's own starting answer, for the boxes that
+            // are ticked on every lease at a property — "tenant is responsible
+            // for box one electricity, box two water, box three sewer". Last in
+            // the chain on purpose: a known fact about this lease always beats a
+            // template's assumption. Signature, initial and date fields are
+            // filled by the signer and never reach here with a default.
+            : (f.default_value ?? null)
       await client.query(`
         INSERT INTO lease_document_fields
           (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column,
-           page, x, y, width, height, required, font_css, value, options, parent_field_id, parent_option)
-        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+           page, x, y, width, height, required, font_css, value, options, parent_field_id, parent_option,
+           checkbox_mark)
+        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
         [doc.id, f.id, signer?.id || null, f.field_type, f.signer_role, f.label, f.lease_column,
          f.page, f.x, f.y, f.width, f.height, f.required, f.font_css, prefill, f.options ?? null,
          // parent_field_id references the parent TEMPLATE field id; the sign UI
          // matches child.parent_field_id to the parent doc field's template_field_id.
-         f.parent_field_id ?? null, f.parent_option ?? null])
+         f.parent_field_id ?? null, f.parent_option ?? null,
+         // the document keeps its own copy, so editing a template never
+         // redraws a lease somebody already signed
+         f.checkbox_mark ?? 'x'])
     }
   }
 
@@ -2014,8 +2024,9 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     const inserted: Array<{ f: any; dbId: string }> = []
     for (const f of (fields || [])) {
       const row = await queryOne<{ id: string }>(`INSERT INTO lease_template_fields
-        (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css, options)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css, options,
+         default_value, checkbox_mark)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
         // S636 (Nic): an IDENTITY column belongs to nobody, enforced on the way
         // in. The editor clears the role when the label is picked, but a template
         // saved before that shipped — or by any other client — would otherwise
@@ -2028,7 +2039,15 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
          f.page||1, f.x, f.y, f.width||200, f.height||50,
          isAutoFilledLeaseColumn(f.leaseColumn) ? false : (f.required??true),
          f.sortOrder||0, f.fontCss||null,
-         f.options||null])
+         f.options||null,
+         // S641: the template's own starting answer. A box the landlord ticks
+         // on every lease at a property should arrive ticked. A signature or
+         // initial can never carry one — those are the signer's act, and a
+         // pre-filled signature is not a signature.
+         (f.fieldType === 'signature' || f.fieldType === 'initials' || f.fieldType === 'date')
+           ? null
+           : (f.defaultValue ?? null),
+         f.checkboxMark === 'check' ? 'check' : 'x'])
       if (f.clientId != null) clientToDbId.set(String(f.clientId), row!.id)
       inserted.push({ f, dbId: row!.id })
     }
@@ -2642,10 +2661,20 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     const prefillValues: Record<string, string> = {
       tenant_name:      `${primary.first_name} ${primary.last_name}`,
       tenant_email:     primary.email || '',
-      // The OWNER's legal name, deliberately not landlordUser.name: routing a
-      // signing request to an on-site manager does not change who the lease
-      // says the landlord is.
-      landlord_name:    `${landlordUser.firstName} ${landlordUser.lastName}`.trim(),
+      // S641 (Nic): "Nobody who's signing the landlord side of the legal
+      // document signs Oak Park Motel and RV. They sign their name as the agent
+      // of the landlord. So it needs to show the printed version of the name of
+      // the person signing."
+      //
+      // This used to reach past the signing contact and take the ACCOUNT
+      // OWNER's name, on the reasoning that delegating delivery does not change
+      // who the landlord is. True of the landlord as a PARTY — and irrelevant
+      // to this box, which sits under a signature line and must name whoever
+      // actually put ink on it. Once a property routes signing to an on-site
+      // manager, the old behaviour printed the owner's name over somebody
+      // else's signature. `name` already resolves to the property's signer when
+      // one is named, and to the owner otherwise.
+      landlord_name:    landlordUser.name,
       unit_number:      lease.unit_number,
       property_name:    lease.property_name || '',
       property_address: [lease.street1, lease.city, lease.state, lease.zip].filter(Boolean).join(', '),
@@ -4614,7 +4643,8 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
             await stampPdf(sourcePath, (allFields as any[]).map(f => ({
               page: parseInt(f.page)||1, x: parseFloat(f.x)||0, y: parseFloat(f.y)||0,
               width: parseFloat(f.width)||100, height: parseFloat(f.height)||30,
-              field_type: f.field_type, value: f.value, font_css: f.font_css
+              field_type: f.field_type, value: f.value, font_css: f.font_css,
+              checkbox_mark: f.checkbox_mark
             })), signerInfo, outputPath)
             executedUrl = '/api/esign/files/' + executedFilename
             await query('UPDATE lease_documents SET executed_pdf_url=$1 WHERE id=$2', [executedUrl, doc.id])
