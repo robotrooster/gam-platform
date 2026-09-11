@@ -8,10 +8,14 @@ Everything below is **committed and deployed** unless a line says otherwise.
 
 ## Where this left off
 `54fcf45` — the localhost-link fix — deployed green at 10:26 Phoenix (7,120 tests,
-all surfaces in sync, API healthy). **Lisa Scheeler's invitation was re-sent on
-the new code and Resend reports it `delivered`**: it now carries
-`https://landlord.goldassetmanagement.com/invite/<token>`, expires 9/18, and her
-old localhost token is dead. She is `onsite_manager` at Mountain View and has not
+all surfaces in sync, API healthy). **Lisa Scheeler's invitation was re-sent twice.** The
+10:26 send carried the correct link and Resend reported it `delivered` — and it
+never appeared in her mailbox, not even in spam. Hotmail is Outlook, and that
+message was identical to the previous day's in sender, subject and body apart
+from the token inside the href; Outlook accepts such a duplicate at the boundary
+(which is the only thing a sending provider can observe) and then drops it or
+buries it in the original conversation. `cadf3df` makes a resend announce itself
+with its own subject and opening, and the 10:34 send went out on that code. She is `onsite_manager` at Mountain View and has not
 accepted yet — when she does, spot-check that she sees POS, the schedule, the
 front-desk list, and only the outstanding-balances and payments tabs.
 
