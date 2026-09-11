@@ -20,10 +20,10 @@ describe('S640 per-unit economics', () => {
   it('counts the ACH fee GAM charges, not just the cost Stripe bills', () => {
     const e = calcNetPerUnit(500, 0, 'ach', 25)
     // $6 charged, 0.5% of $500 = $2.50 cost → $3.50 kept, plus the $2 unit fee,
-    // less 0.17% outbound ($0.85) and this unit's share of the park's $3.
+    // less 0.17% outbound ($0.85) and this unit's share of the park's $2.
     expect(e.processingFee).toBe(6)
     expect(e.processingCost).toBeCloseTo(2.5, 2)
-    expect(e.netBR).toBeCloseTo(4.53, 2)
+    expect(e.netBR).toBeCloseTo(4.57, 2)
   })
 
   it('shares the fixed cost across the park instead of billing every unit', () => {

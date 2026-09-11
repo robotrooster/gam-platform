@@ -4555,14 +4555,16 @@ export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; retryEl
  * old code added the whole $0.25 to EVERY UNIT, overstating it fiftyfold on a
  * fifty-unit park.
  *
- * NOTE ON THE $2: STRIPE_CONFIG.CONNECT_ACCT_MO says $1.00, carrying an S616
- * comment recording that Nic confirmed it against the Stripe contract. He has
- * now said $2. Modelled at $2 because being conservative about our own cost is
- * the safe direction to be wrong in, and left here in the open rather than
- * silently reconciled — if $1 is right, this understates margin by a dollar a
- * property a month and somebody should say so.
+ * THE CONNECT ACCOUNT IS $1, NOT $2. Flagged at $2 for one commit because Nic
+ * said $2 while STRIPE_CONFIG.CONNECT_ACCT_MO said $1 with an S616 note
+ * recording that he had confirmed $1 against the contract. Raising the flag was
+ * the right call and he settled it immediately: "Stripe did give us the one
+ * dollar per Connect account instead of the two dollar minimum. I was confusing
+ * that with the two dollar per unit on our thing."
+ *
+ * So: $1 of weekly payouts + $1 of Connect account = $2 per property per month.
  */
-export const FIXED_COST_PER_PROPERTY_MO = 3.00
+export const FIXED_COST_PER_PROPERTY_MO = 2.00
 
 export type PaymentMethodMix = 'ach' | 'card' | 'manual'
 
