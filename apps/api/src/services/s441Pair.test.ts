@@ -136,10 +136,13 @@ describe('backgroundProvider', () => {
         providerRef: 'r1', status: 'completed',
         reportSummary: { score: 80 },
       }))
-      expect(update.providerRef).toBe('r1')
-      expect(update.status).toBe('complete')  // 'completed' → 'complete'
-      expect(update.reportSummary).toEqual({ score: 80 })
-      expect(update.receivedAt).toBeInstanceOf(Date)
+      // S640: parseWebhook may return null for an event a real provider sends
+      // and we do not act on. The mock always produces one.
+      expect(update).not.toBeNull()
+      expect(update!.providerRef).toBe('r1')
+      expect(update!.status).toBe('complete')  // 'completed' → 'complete'
+      expect(update!.reportSummary).toEqual({ score: 80 })
+      expect(update!.receivedAt).toBeInstanceOf(Date)
     })
 
     it('parseWebhook: unknown status → failed (defensive)', () => {
@@ -147,7 +150,7 @@ describe('backgroundProvider', () => {
       const update = provider.parseWebhook(JSON.stringify({
         providerRef: 'r1', status: 'who_knows',
       }))
-      expect(update.status).toBe('failed')
+      expect(update!.status).toBe('failed')
     })
 
     it('craDisclosure flagged as development placeholder', () => {

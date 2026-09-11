@@ -85,7 +85,16 @@ export interface BackgroundProvider {
   readonly name: string
   initiate(req: BackgroundProviderInitiateRequest): Promise<BackgroundProviderInitiateResult>
   verifyWebhook(headers: Record<string, string | string[] | undefined>, rawBody: string): boolean
-  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate
+  /**
+   * S640: returns null for an event that is genuinely nothing to act on.
+   *
+   * Throwing made the route 500, which tells the provider to RETRY — so an
+   * event we simply did not need was redelivered forever. Checkr sent 79
+   * webhooks in 25 hours and 75 of them 500'd on one such event, burying the
+   * `report.completed` that actually mattered. An endpoint should acknowledge
+   * what it can safely ignore and reserve failure for things worth retrying.
+   */
+  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate | null
   craDisclosure(): CraDisclosure
   // S551: optional — pull the full report when the webhook only carries a
   // report id (see BackgroundProviderWebhookUpdate.reportRef). Returns the
@@ -362,7 +371,7 @@ class CheckrProvider implements BackgroundProvider {
     }
   }
 
-  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate {
+  parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate | null {
     // Event envelope: { id, object:'event', type, created_at, data }
     const evt = JSON.parse(rawBody) as {
       id: string
@@ -379,9 +388,19 @@ class CheckrProvider implements BackgroundProvider {
       case 'order.applicant.started':
       case 'order.applicant.completed':
         return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
-      // Individual product done — report not complete yet; stay processing.
+      // ── S640: A PER-PRODUCT PING IS NOT AN UPDATE ────────────────────────
+      //
+      // This asked requireOrderRef for an order id the event does not carry:
+      // the payload is the report ITEM (rpi_…), which references a report, not
+      // an order. So it threw, the route 500'd, and Checkr redelivered — 75
+      // failures against 4 successes, one per product per report, forever.
+      //
+      // And there was nothing to apply even if it had parsed. The check is
+      // already `processing`; a product finishing does not change that. Checkr
+      // sends `report.completed` when the whole thing is done, which is the
+      // event that matters. Acknowledge this one and move on.
       case 'report.product.completed':
-        return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
+        return null
       // Full report ready: data carries { id: report_id, order_id }. The route
       // fetches the actual results via fetchReport(reportRef).
       case 'report.completed':
@@ -391,8 +410,11 @@ class CheckrProvider implements BackgroundProvider {
           reportRef:   d.id || null,
           receivedAt:  new Date(),
         }
+      // S640: an event we do not recognise is acknowledged, not retried.
+      // Providers add event types without asking; the alternative is a retry
+      // storm on every one of them, which is exactly what happened here.
       default:
-        throw new Error(`Unhandled Checkr Tenant event type: ${evt.type}`)
+        return null
     }
   }
 

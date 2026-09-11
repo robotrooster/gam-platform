@@ -1172,6 +1172,19 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
       throw new AppError(401, 'Invalid webhook signature')
     }
     const update = provider.parseWebhook(rawBody)
+    // ── S640: ACKNOWLEDGE WHAT WE DO NOT ACT ON ────────────────────────────
+    //
+    // A null is a deliberate "nothing to do here" — a per-product progress
+    // ping, or an event type Checkr added without telling anyone. Answering 200
+    // ends the delivery. Answering 500, which is what throwing used to do, told
+    // Checkr to try again: 75 of 79 webhooks in a 25-hour window were the same
+    // event failing over and over, and the `report.completed` that would have
+    // finished Anastacio Erreguin's screening never got through.
+    if (!update) {
+      logger.info({ provider: provider.name, type: (req.body && (req.body.type || req.body.event)) || null },
+        '[BGC WEBHOOK] acknowledged, nothing to apply')
+      return res.json({ success: true, applied: false })
+    }
 
     const check = await queryOne<any>(
       'SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name=$2',
@@ -1204,6 +1217,9 @@ backgroundRouter.post('/dev-mock-webhook', requireAuth, requireAdmin, async (req
     const payload = JSON.stringify({ providerRef, status, reportSummary: reportSummary || null, failureReason: failureReason || null })
     const provider = getProvider('mock')
     const update = provider.parseWebhook(payload)
+    // The mock always produces an update; the null branch belongs to real
+    // providers that send progress events (see the live webhook above).
+    if (!update) throw new AppError(400, 'Mock webhook produced no update')
     const check = await queryOne<any>(
       "SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name='mock'",
       [update.providerRef]
