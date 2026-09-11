@@ -48,8 +48,7 @@ import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
 import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
 import {
-  rollProgressForLandlordUser, claimThresholdIfReached, claimMonthlySweep,
-  dueTriggers, markTriggerFired, deferTrigger, hasShortTermActivity,
+  dueTriggers, markTriggerFired,
 } from '../services/payoutTriggers'
 import { logger } from '../lib/logger'
 
@@ -189,6 +188,7 @@ export interface PayoutResult {
   skippedZeroBalance: number
   /** S640: held back under the $100 floor — money delayed, never kept. */
   skippedBelowMinimum: number
+  /** S640: retired — payouts are weekly and nothing defers. Always 0. */
   triggersDeferred: number
   skippedAlreadyPaidThisWeek: number
   payoutsFailed: number
@@ -227,16 +227,14 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   const today = localDateString(now, TZ)
   const cycleMonth = `${today.slice(0, 7)}-01`
 
-  // S616 (Nic): landlords no longer wait on a weekly calendar. Their payout is
-  // earned by how much of the rent roll has actually come in — 50% of occupied
-  // units paid, then 90%, then one guaranteed late-month sweep. Three firings
-  // per Connect account per cycle, capped by a unique index rather than by this
-  // code, so the per-initiation cost is $0.75 a month and cannot run away.
-  //
-  // This part runs EVERY weekday, because a threshold can be crossed on any of
-  // them. It only ever CLAIMS a trigger and schedules it four days out; the
-  // firing loop below is what moves money.
-  const sweepDay = isMonthlySweepDay(now, TZ)
+  // S640 (Nic): back to a weekly calendar, deliberately. S616 replaced it with
+  // rent-roll thresholds to pay landlords sooner; measured against real money
+  // they paid them LATER — a threshold schedules four business days out, which
+  // is behind the next Tuesday for most of a week — and they made one
+  // landlord's payday depend on whether their other residents had paid.
+  // The cadence is the only thing Stripe's fee structure lets us choose, and it
+  // is worth about 33 cents a month. Speed is worth more. See the candidate
+  // list below.
   const weeklyDay = shouldRunToday(now, TZ)
 
   // S580: retry any platform→Connect passthrough intent stuck in `pending` (its
@@ -309,60 +307,25 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   //
   // Landlords earn a payout by how much of their rent roll has come in, so
   // every weekday each one is measured and may CLAIM a trigger — scheduled four
-  // days out, because Stripe holds an ACH that long and scheduling ahead
-  // front-runs the wait rather than discovering it. The claim is capped at
-  // three per cycle by a unique index, not by this loop.
+  // ── S640: THE THRESHOLDS ARE RETIRED ──────────────────────────────────
   //
-  // PM companies and businesses have no rent roll to measure, so they keep the
-  // weekly Tuesday batch exactly as it was.
+  // Everybody is weekly now, so a rent-roll threshold has nothing left to
+  // decide. Claiming them anyway would grow a table of rows that schedule a
+  // payout nobody reads and are never retired — cruft that the next person to
+  // open payout_triggers would have to work out from scratch.
   //
-  // A user with NO RENT ROLL this cycle stays on the weekly batch. There is no
-  // roll to measure, so the thresholds can never trip, and putting them through
-  // this path would strand deposits, fees and POS money on a Connect balance
-  // until the late-month sweep. The percentage rule replaces the calendar only
-  // where there is something to take a percentage OF.
-  //
-  // S616 (Nic): "leases follow 3 batch plan we made. short term stays follow
-  // weekly plan." A landlord can be both — Oak Park is, with 29 of its 30 units
-  // allowing nightly stays alongside long-term leases — so the two run
-  // independently and coalesce on the shared balance.
-  // Kept for the roll measurement below, which still records how much of each
-  // landlord's rent has come in. Nothing here decides who gets paid any more.
-  const rollDrivenUserIds = new Set<string>()
-  for (const r of userRows) {
-    try {
-      const progress = await rollProgressForLandlordUser(r.entity_id, cycleMonth)
-
-      // S640: everybody is weekly now, so there is no longer a stream to sort
-      // people into — a landlord with no rent roll simply has nothing to
-      // measure, and the measurement is all that is left here.
-      if (progress.unitsTotal === 0) continue
-      rollDrivenUserIds.add(r.entity_id)
-
-      const claimed = await claimThresholdIfReached(
-        'user', r.entity_id, cycleMonth, today, progress)
-      if (claimed.claimed) {
-        logger.info({
-          user_id: r.entity_id, trigger: claimed.triggerKind,
-          units_paid: progress.unitsPaid, units_total: progress.unitsTotal,
-          scheduled_for: claimed.scheduledFor,
-        }, '[auto_payouts] rent-roll threshold reached — payout scheduled')
-      }
-      if (sweepDay) await claimMonthlySweep('user', r.entity_id, cycleMonth, today)
-    } catch (e) {
-      logger.error({ err: e, user_id: r.entity_id },
-        '[auto_payouts] trigger evaluation failed — landlord skipped this pass')
-    }
+  // The service and the table stay (GAM keeps everything, and the roll
+  // measurement is worth having again if the cadence is ever revisited); this
+  // is simply no longer the thing that pays anybody. Any trigger already
+  // scheduled is closed out below.
+  const stale = await dueTriggers(today, { includeFuture: true })
+  for (const t of stale) {
+    await markTriggerFired(t.id, 'superseded_by_weekly')
   }
-
-  // Everything with a trigger due on or before today. A landlord appears here
-  // once per due trigger; the same-day idempotency key at Stripe means two due
-  // on one day still move the balance once.
-  // S640: triggers no longer select candidates. They are still read so that any
-  // already-scheduled one is retired when the weekly run pays that landlord —
-  // otherwise Mountain View's Sep 16 threshold would sit in the table forever,
-  // claimed and never fired, and the next person to look would not know why.
-  const due = await dueTriggers(today)
+  if (stale.length) {
+    logger.info({ retired: stale.length },
+      '[auto_payouts] retired rent-roll triggers — payouts are weekly now')
+  }
 
   const candidates: Candidate[] = [
     // ── S640 (Nic, DIRECTIVE): WEEKLY, FOR EVERYBODY ───────────────────────
@@ -404,30 +367,6 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       else if (fired === 'already_paid_this_week')result.skippedAlreadyPaidThisWeek++
       else if (fired === 'failed')                result.payoutsFailed++
 
-      // S616/S617: settle up this candidate's due triggers.
-      //
-      // A firing that found nothing is not a failure — the tenants paid and
-      // Stripe has not released it yet, or our own webhook has not landed. S616
-      // retired the trigger anyway so it could not re-fire every day and burn
-      // the cycle's budget on empty payouts. That was right for a 16-hour-late
-      // firing and wrong for a 1-hour-early one: an empty firing never calls
-      // Stripe at all (processOneCandidate returns before creating the payout),
-      // so it costs NOTHING, and retiring it spent one of the landlord's three
-      // payouts on nothing.
-      //
-      // So an empty one is now PUSHED to the next business day, up to
-      // MAX_DEFERRALS. Everything else — a real payout, an already-paid, a
-      // failure — retires as before. The daily-refire worry S616 had is handled
-      // by the deferral cap, not by throwing the trigger away.
-      // S640: a trigger no longer schedules anything, so there is nothing to
-      // defer — it is simply retired once the weekly run has dealt with this
-      // landlord. Deferring would leave it sitting due forever now that nobody
-      // reads it to decide a payout.
-      if (cand.kind === 'user') {
-        for (const t of due.filter(x => x.entity_kind === 'user' && x.entity_id === cand.entity_id)) {
-          await markTriggerFired(t.id, fired === 'fired' ? undefined : fired)
-        }
-      }
     } catch (e: any) {
       result.payoutsFailed++
       result.errors.push({

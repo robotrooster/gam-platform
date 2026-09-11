@@ -125,6 +125,24 @@ describe('S640 weekly payout cadence', () => {
     expect(res.skippedAlreadyPaidThisWeek).toBe(1)
   })
 
+  // Mountain View had a threshold booked for Sep 16. With nothing claiming or
+  // reading thresholds any more it would have sat unfired forever, and the next
+  // person to open payout_triggers would have had to work out why.
+  it('retires a threshold trigger left behind by the old cadence', async () => {
+    const f = await seedPayable()
+    await db.query(
+      `INSERT INTO payout_triggers
+         (entity_kind, entity_id, cycle_month, trigger_kind, units_total, units_paid, scheduled_for)
+       VALUES ('user',$1, date_trunc('month', CURRENT_DATE)::date, 'threshold_50', 25, 17,
+               CURRENT_DATE + 6)`,
+      [f.userId])
+    balanceMock.mockResolvedValue(0 as any)
+    await processAutoPayouts(nextRunDate())
+    const left = await db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM payout_triggers WHERE fired_at IS NULL`)
+    expect(Number(left.rows[0].c)).toBe(0)
+  })
+
   it('pays again once the interval has passed', async () => {
     await seedPayable({ lastPayoutDaysAgo: 6 })
     balanceMock.mockResolvedValue(900 as any)
