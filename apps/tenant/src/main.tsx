@@ -1690,6 +1690,28 @@ function LeaseNoticeGate() {
       onError: () => setError('Could not save. Try again.'),
     },
   )
+  // S641 (Nic): "when somebody logs in to see their rent, I want that to be
+  // hidden behind whatever notices were released. So they have to see it,
+  // scroll down, and acknowledge it."
+  //
+  // It already blocked the portal. What it did not do was make anyone read:
+  // Acknowledge was live the instant the box appeared, so a long notice could be
+  // dismissed unseen — and an acknowledgement nobody read is worth nothing as
+  // proof. The button now waits until the notice has actually been scrolled
+  // through. A notice short enough to fit needs no scrolling, so it enables
+  // immediately rather than trapping somebody on a box with no scrollbar.
+  const [readToEnd, setReadToEnd] = useState(false)
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => { setReadToEnd(false) }, [current?.id])
+
+  // Measure AFTER the notice renders: a short one is already read.
+  useEffect(() => {
+    const el = bodyRef.current
+    if (!el || !current) return
+    if (el.scrollHeight <= el.clientHeight + 4) setReadToEnd(true)
+  }, [current?.id, current?.body])
+
   if (!current) return null
   return (
     // Blocking overlay: no onClick-to-dismiss — the tenant must Acknowledge.
@@ -1699,14 +1721,27 @@ function LeaseNoticeGate() {
         <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginBottom: 12 }}>
           {current.propertyName}{current.unitNumber ? ` · Unit ${current.unitNumber}` : ''}
         </div>
-        <p style={{ fontSize: '.92rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 16 }}>{current.body}</p>
+        <div
+          ref={bodyRef}
+          onScroll={e => {
+            const el = e.currentTarget
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 12) setReadToEnd(true)
+          }}
+          style={{ maxHeight: '45vh', overflowY: 'auto', marginBottom: 12, paddingRight: 6 }}
+        >
+          <p style={{ fontSize: '.92rem', color: 'var(--t1)', lineHeight: 1.6, margin: 0, whiteSpace: 'pre-wrap' }}>
+            {current.body}
+          </p>
+        </div>
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginBottom: 16 }}>
-          This is a formal notice from your landlord. Acknowledging confirms you have seen it.
+          {readToEnd
+            ? 'This is a formal notice from your landlord. Acknowledging confirms you have seen it.'
+            : 'Scroll to the end of the notice to continue.'}
         </div>
         {error && <div className="alert a-warn" style={{ marginBottom: 12 }}>{error}</div>}
-        <button className="btn btn-p" style={{ width: '100%' }} disabled={ack.isLoading}
+        <button className="btn btn-p" style={{ width: '100%' }} disabled={ack.isLoading || !readToEnd}
           onClick={() => ack.mutate(current.id)}>
-          {ack.isLoading ? 'Saving…' : 'Acknowledge'}
+          {ack.isLoading ? 'Saving…' : readToEnd ? 'Acknowledge' : 'Scroll to read'}
         </button>
       </div>
     </div>

@@ -1069,6 +1069,10 @@ function SendDocumentModal({ onClose }) {
   // 'manual' — the escape hatch for non-tenant signers (old flow).
   const [mode, setMode] = useState<'unit'|'property'|'manual'>('unit')
   const [selectedUnitId, setSelectedUnitId] = useState('')
+  // S641: the package checklist. Resolved at DRAFT time, not at invite — by now
+  // we know whether this tenant is work-trade or buying on installment, which
+  // is exactly what we did not know when the invite went out.
+  const [packageTicked, setPackageTicked] = useState<Record<string, boolean>>({})
   const [selectedPropertyId, setSelectedPropertyId] = useState('')
   const [tenantEmails, setTenantEmails] = useState([''])
   const [tenantNames, setTenantNames] = useState([{ firstName: '', lastName: '' }])
@@ -1152,6 +1156,20 @@ function SendDocumentModal({ onClose }) {
   }, [selectedUnitId, mode, templateId])
 
   // Resolved lease signers for the picked unit / property.
+  // S641: what would be drafted alongside the lease for this unit.
+  const { data: pkg } = useQuery(
+    ['signing-package-for-unit', selectedUnitId],
+    () => apiGet(`/signing-packages/for-unit/${selectedUnitId}`),
+    { enabled: mode === 'unit' && !!selectedUnitId },
+  )
+  useEffect(() => {
+    if (!pkg?.items) { setPackageTicked({}); return }
+    // Pre-ticked from the package's own judgement; the landlord adjusts.
+    const next: Record<string, boolean> = {}
+    for (const i of pkg.items) next[i.templateId] = !!i.suggested
+    setPackageTicked(next)
+  }, [pkg])
+
   const recipientsQ = mode === 'unit' && selectedUnitId
     ? `/esign/recipients?unitId=${selectedUnitId}`
     : mode === 'property' && selectedPropertyId
@@ -1205,7 +1223,15 @@ function SendDocumentModal({ onClose }) {
     const w = await witnessSigner(order)
     if (w) signers.push(w)
     const title = (selectedTemplate ? selectedTemplate.name : 'Document') + ' — Unit ' + group.unitNumber
-    const res = await apiPost('/esign/documents', { templateId, unitId: group.unitId, title, signers, prefillValues, depositAlreadyHeld })
+    // S641: everything still ticked rides along in the same bundle. The lease
+    // template itself is excluded server-side so it is never drafted twice.
+    const packageTemplateIds = Object.entries(packageTicked)
+      .filter(([id, on]) => on && id !== templateId).map(([id]) => id)
+    const res = await apiPost('/esign/documents', {
+      templateId, unitId: group.unitId, title, signers, prefillValues, depositAlreadyHeld,
+      packageId: pkg?.packageId ?? null,
+      packageTemplateIds,
+    })
     await apiPost('/esign/documents/' + res.data.id + '/send', {})
   }
 
@@ -1409,6 +1435,39 @@ function SendDocumentModal({ onClose }) {
               })}
               <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Blank values can be left for the signer to fill in.</div>
             </div>
+          </div>
+        )}
+        {/* S641 (Nic): the package checklist. "Some things are pertinent to some
+            tenants and some things are not, all at the same property." Ticked
+            items ride along in one signing session, so nobody receives a second
+            document days later wondering what it is for. Everything here is a
+            suggestion — untick what does not apply, tick what does. */}
+        {mode === 'unit' && pkg?.items?.length > 0 && (
+          <div style={{ marginBottom:12, padding:'10px 12px', background:'var(--bg-2)',
+                        borderRadius:8, border:'1px solid var(--border-0)' }}>
+            <div style={{ fontSize:'.8rem', fontWeight:600, color:'var(--text-0)', marginBottom:2 }}>
+              {pkg.name}
+            </div>
+            <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginBottom:8 }}>
+              Signed together in one sitting, in this order.
+            </div>
+            {pkg.items.map((i:any) => (
+              <label key={i.templateId}
+                style={{ display:'flex', alignItems:'flex-start', gap:9, padding:'4px 0',
+                         cursor: i.required ? 'default' : 'pointer', opacity: i.required ? .85 : 1 }}>
+                <input type="checkbox"
+                  checked={i.templateId === templateId ? true : !!packageTicked[i.templateId]}
+                  disabled={i.required || i.templateId === templateId}
+                  onChange={e => setPackageTicked(prev => ({ ...prev, [i.templateId]: e.target.checked }))}
+                  style={{ marginTop:3 }} />
+                <span>
+                  <span style={{ fontSize:'.78rem', color:'var(--text-1)' }}>{i.templateName}</span>
+                  <span style={{ display:'block', fontSize:'.68rem', color:'var(--text-3)', marginTop:1 }}>
+                    {i.templateId === templateId ? 'The lease you selected above' : i.reason}
+                  </span>
+                </span>
+              </label>
+            ))}
           </div>
         )}
         {/* S604 (Nic): migration onboarding. Existing tenants signing a NEW GAM
