@@ -26,46 +26,37 @@ function catalogKeys(): string[] {
 }
 
 describe('permission keys survive the wire', () => {
-  // This pinned the BUG when it was written — takePayment out, take_payment
-  // gone. Two fixes landed for it in the same hour from two sessions sharing
-  // this tree, and they compose rather than conflict:
-  //
-  //   · the landlord gate now accepts both spellings (defence at the call site,
-  //     and still the thing that saves a NEW dotless key)
-  //   · the camelizer no longer rewrites catalog keys at all (the wire stops
-  //     lying, which every other consumer benefits from — agents, other
-  //     portals, anything reading a permissions map)
-  //
-  // So the assertion is inverted to the truth: the key survives under its own
-  // name, and the camelize fallback in the gate simply never fires.
+  // FIXED at the source: the camelizer keeps any key in the permission catalog
+  // exactly as written, rather than only keys that happen to contain a dot.
   it('take_payment reaches the browser under its own name', () => {
     const out: any = camelCaseKeys({ permissions: { take_payment: true } })
     expect(out.permissions.take_payment).toBe(true)
     expect(out.permissions.takePayment).toBeUndefined()
   })
 
-  it('dotted keys are left alone, as they always were', () => {
-    const out: any = camelCaseKeys({
-      permissions: { 'balances.view': true, 'pos.tab.register': true, 'front_desk.view': true },
-    })
-    expect(out.permissions['balances.view']).toBe(true)
-    expect(out.permissions['pos.tab.register']).toBe(true)
-    expect(out.permissions['front_desk.view']).toBe(true)
+  it('every catalog key survives verbatim, dotted or not', () => {
+    const keys = catalogKeys()
+    const perms = Object.fromEntries(keys.map(k => [k, true]))
+    const out: any = camelCaseKeys({ permissions: perms })
+    const mangled = keys.filter(k => out.permissions[k] !== true)
+    expect(mangled, `these permission keys were rewritten on the wire:\n  ${mangled.join('\n  ')}`).toEqual([])
   })
 
-  // The frontend gate accepts BOTH spellings. If a new dotless key appears,
-  // this still passes — but the reminder below is the point of the test.
-  it('the landlord gate reads both the written key and its wire form', () => {
+  // Belt as well as braces. The server no longer mangles the key, and the
+  // landlord gate also accepts the camelized spelling — so a stale bundle, an
+  // older token, or the next converter change cannot take the button away
+  // again. Two independent fixes for one outage that cost a front desk an
+  // afternoon.
+  it('the landlord gate accepts the written key AND its camel form', () => {
     const gate = readFileSync(
       join(__dirname, '..', '..', '..', 'landlord', 'src', 'lib', 'permissions.ts'), 'utf8')
     expect(gate).toContain('camelize')
     expect(gate).toMatch(/perms\[key\][\s\S]*perms\[camelize\(key\)\]/)
   })
 
-  it('names every dotless catalog key, so a new one is a deliberate choice', () => {
-    const dotless = catalogKeys().filter(k => !k.includes('.'))
-    // Amenity keys share this regex shape; only real permission keys matter,
-    // and take_payment is the one that reaches a permissions map.
-    expect(dotless).toContain('take_payment')
+  it('ordinary response fields are still camelized — the carve-out is narrow', () => {
+    const out: any = camelCaseKeys({ unit_number: 'RV 12', due_date: '2026-09-01' })
+    expect(out.unitNumber).toBe('RV 12')
+    expect(out.dueDate).toBe('2026-09-01')
   })
 })
