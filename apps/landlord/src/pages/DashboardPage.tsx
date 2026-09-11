@@ -29,6 +29,8 @@ interface DashStats {
   // S640: of the delinquent units, how many a late fee will actually reach
   // tonight. Onboarding residents are waived, so the two numbers differ.
   delinquentUnitsAccruingLateFees?: number
+  /** S641: units owing ANYTHING, propane installments aside. What the card means. */
+  unitsOwing?: number
   totalUnits: number
   occupancyRate: number
   leasesExpiring30d: number
@@ -185,10 +187,19 @@ export function DashboardPage() {
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
-      {(stats?.delinquentUnits || 0) > 0 && (
-        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=delinquent')}>
+      {/* ── S641 (Nic): "it needs to read any outstanding charges" ──────────
+          The units table counts unpaid RENT only — correct for the eviction
+          clock, wrong for a card a landlord reads as "who owes me". Jeremy
+          Parker paid his rent and not his electricity, so his spot read clean
+          while the money was still owed. */}
+      {(stats?.unitsOwing ?? stats?.delinquentUnits ?? 0) > 0 && (
+        // S641: opens the BALANCES page, not the delinquent-unit filter. The
+        // banner now counts anyone owing anything, and /units?status=delinquent
+        // would show two of the three — a card that disagrees with the page it
+        // opens is the bug this whole pass has been about.
+        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <Clock size={16} />
-          <strong>{stats!.delinquentUnits} delinquent unit{stats!.delinquentUnits === 1 ? '' : 's'}</strong> — In cure window.{' '}
+          <strong>{stats!.unitsOwing ?? stats!.delinquentUnits} delinquent unit{(stats!.unitsOwing ?? stats!.delinquentUnits) === 1 ? '' : 's'}</strong> — In cure window.{' '}
           {/* S640 (Nic): "that's a false flag... onboarding tenants are exempt
               from late fees." Not one of the six was accruing anything. Read
               the state instead of asserting the consequence. */}

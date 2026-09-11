@@ -46,7 +46,7 @@ vi.mock('../services/adminNotifications', () => ({
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
-import { shouldRunToday, processAutoPayouts, nextPayoutDateUtc } from './autoPayouts'
+import { shouldRunToday, processAutoPayouts, nextPayoutDateUtc, isMonthEndSweepDay } from './autoPayouts'
 
 // Phoenix is UTC-7 year-round (no DST). Noon at -07:00 pins the calendar day.
 const phx = (isoDate: string) => new Date(`${isoDate}T12:00:00-07:00`)
@@ -55,7 +55,10 @@ const phx = (isoDate: string) => new Date(`${isoDate}T12:00:00-07:00`)
 const TUESDAY   = phx('2026-07-28')
 const THURSDAY  = phx('2026-07-30')
 const MONDAY    = phx('2026-07-27')
-const WEDNESDAY = phx('2026-07-29')
+// S641: was 2026-07-29, which is JULY'S MONTH-END SWEEP DAY — two business days
+// before Friday the 31st. It stopped being a non-payout day the moment the sweep
+// existed, and the test caught it. Mid-month Wednesday instead.
+const WEDNESDAY = phx('2026-07-22')
 const FRIDAY    = phx('2026-07-31')
 const SATURDAY  = phx('2026-08-01')
 const SUNDAY    = phx('2026-08-02')
@@ -174,19 +177,22 @@ describe('nextPayoutDateUtc', () => {
     expect(new Date(nextPayoutDateUtc(now) + 'T01:00:00Z').getTime()).toBeGreaterThan(now.getTime())
   })
 
-  it('lands on the payout day from any starting point in the week', () => {
+  it('lands on a payout day from any starting point in the week', () => {
     for (let i = 0; i < 9; i++) {
       const from = new Date(Date.UTC(2026, 6, 27 + i, 15, 0, 0))
-      const d = nextPayoutDateUtc(from)
-      expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
+      const inst = new Date(nextPayoutDateUtc(from) + 'T01:00:00Z')
+      // S641: the next payout is not always the WEEKLY one — the month-end
+      // sweep is a payout day too, and near the end of a month it is the next
+      // one a landlord will see.
+      expect(shouldRunToday(inst) || isMonthEndSweepDay(inst)).toBe(true)
     }
   })
 
   // The engine shifts off a federal holiday; a date derived beside it would not.
   it('agrees with the engine through a holiday week', () => {
     const from = new Date(Date.UTC(2026, 8, 5, 15, 0, 0))   // Labor Day week
-    const d = nextPayoutDateUtc(from)
-    expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
+    const inst = new Date(nextPayoutDateUtc(from) + 'T01:00:00Z')
+    expect(shouldRunToday(inst) || isMonthEndSweepDay(inst)).toBe(true)
   })
 })
 

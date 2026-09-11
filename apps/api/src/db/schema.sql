@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict acblKwQtG7PbgXJrU1P84uTGIpgynV2mVbgzelXQERIoWdToEN7SzrH4HxEANTj
+\restrict 9WvsXbD1vFIyITVdbGzY7JsKUjefNIaOPwn3JakeVv8RVHZUeLXVp8kZldG8wmg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10293,6 +10293,31 @@ COMMENT ON COLUMN public.utility_service_agreements.moveout_notice_at IS 'S616: 
 --
 
 COMMENT ON COLUMN public.utility_service_agreements.moveout_expected_on IS 'S616: the date the payer expects to be gone. Drives the final billing period and tells the landlord when to read the meter.';
+
+
+--
+-- Name: v_installment_payments; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_installment_payments AS
+ SELECT propane_fill_installments.payment_id
+   FROM public.propane_fill_installments
+  WHERE (propane_fill_installments.payment_id IS NOT NULL)
+UNION
+ SELECT home_sale_installments.payment_id
+   FROM public.home_sale_installments
+  WHERE (home_sale_installments.payment_id IS NOT NULL)
+UNION
+ SELECT flex_deposit_installments.payment_id
+   FROM public.flex_deposit_installments
+  WHERE (flex_deposit_installments.payment_id IS NOT NULL);
+
+
+--
+-- Name: VIEW v_installment_payments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_installment_payments IS 'S641: every payment row that is one instalment of an agreed plan. Such a charge is scheduled, not overdue — it must not make a unit read as delinquent. Add any new installment product here and every reader follows.';
 
 
 --
@@ -25864,5 +25889,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict acblKwQtG7PbgXJrU1P84uTGIpgynV2mVbgzelXQERIoWdToEN7SzrH4HxEANTj
+\unrestrict 9WvsXbD1vFIyITVdbGzY7JsKUjefNIaOPwn3JakeVv8RVHZUeLXVp8kZldG8wmg
 

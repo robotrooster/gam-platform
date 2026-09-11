@@ -939,6 +939,41 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     //
     // Counted the same way the late-fee job now decides, so the number on the
     // dashboard is the number of people who will actually be charged tonight.
+    // ── S641 (Nic): DELINQUENT MEANS OWING SOMETHING, NOT OWING RENT ───────
+    //
+    //   "It needs to say three delinquent units even though none are getting
+    //    late fees... it needs to read any outstanding charges. Any outstanding
+    //    charges aside from propane that has an installment plan, because
+    //    otherwise the notification will always be there. But because that's
+    //    just electricity on RV spot forty nine, it needs to be still labeled as
+    //    a third delinquent unit."
+    //
+    // The units table says two, because the delinquency trigger counts unpaid
+    // RENT only — which is right for the eviction clock and wrong for a card
+    // that a landlord reads as "who owes me". Jeremy Parker paid his rent and
+    // not his $96.81 of electricity, so his spot read clean.
+    //
+    // A charge on an INSTALLMENT PLAN is excluded because it is supposed to be
+    // outstanding: a scheduled balance would pin the banner on permanently and
+    // teach everyone to ignore it. Nic named propane; shown that home sales and
+    // FlexDeposit have the same shape, he widened it himself — "any installment
+    // structures should match what I said about the propane". One view lists
+    // them all, so the next such product is added in a single place.
+    //
+    // NOTE: it excludes the INSTALLMENT, not the person. A resident on a propane
+    // plan who is also behind on rent still counts — it is the scheduled charge
+    // that is not evidence of anything, not the tenancy.
+    const [owing] = await query<any>(`
+      SELECT COUNT(DISTINCT p.unit_id)::int AS units_owing
+        FROM payments p
+        JOIN units u ON u.id = p.unit_id
+       WHERE u.landlord_id = ANY($1)
+         AND p.status IN ('pending', 'failed')
+         AND p.work_trade_suspended_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
+         AND ($2::uuid IS NULL OR u.property_id = $2)`, [scopeIds, propertyFilter])
+
     const [delinq] = await query<any>(`
       SELECT COUNT(DISTINCT u.id) FILTER (WHERE NOT (
                i.late_fee_exempt
@@ -1001,7 +1036,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       // Thursday — and a landlord planning around a date we print deserves the
       // one the job will actually fire on.
       next_payout_date: nextPayoutDateUtc(),
-      delinquent_units_accruing_late_fees: delinq?.accruing_units||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
+      delinquent_units_accruing_late_fees: delinq?.accruing_units||0,
+      // S641: units owing ANYTHING, which is what the card means by delinquent.
+      units_owing: owing?.units_owing||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead
       // of leaving the landlord to discover it in Financials → Banking.
       connect_payouts_enabled: connect?.payouts_enabled ?? false,

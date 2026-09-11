@@ -171,6 +171,72 @@ export function isMonthlySweepDay(now: Date = new Date(), tz: string = TZ): bool
   return dom >= 20 && dom <= 26
 }
 
+// ── S641 (Nic): THE MONTH-END SWEEP ────────────────────────────────────────
+//
+//   "A lot of landlords like to sweep cash before the end of the month, so we
+//    should have one additional push timed so that the balance is swept and
+//    HITS THE BANK ACCOUNT by the last business day of the month. If the last
+//    business day is a Friday and we need to push it on a Tuesday or Wednesday
+//    for it to actually hit by that Friday, that's important to some landlords
+//    for bookkeeping. You don't want stuff rolling over — you want all the
+//    months separated accurately."
+//
+// The target is ARRIVAL, not firing. So this works backwards: find the last
+// business day of the month, then step back far enough that a standard payout
+// has landed by then.
+//
+// Two business days back. A Stripe standard payout arrives one to two business
+// days after it is created, so firing two ahead lands on the last business day
+// in the slow case and the day before in the fast one — early is fine for
+// bookkeeping, late is the whole thing this exists to prevent.
+
+/** Monday to Friday, and not a US federal holiday. */
+function isBusinessDayUtc(iso: string): boolean {
+  const dow = new Date(iso + 'T12:00:00Z').getUTCDay()
+  if (dow === 0 || dow === 6) return false
+  return !US_FEDERAL_HOLIDAYS.has(iso)
+}
+
+function isoUtc(y: number, m0: number, day: number): string {
+  return new Date(Date.UTC(y, m0, day, 12, 0, 0)).toISOString().slice(0, 10)
+}
+
+/** The last day of the month a bank is open. */
+export function lastBusinessDayOfMonthUtc(year: number, month0: number): string {
+  const lastDay = new Date(Date.UTC(year, month0 + 1, 0, 12, 0, 0)).getUTCDate()
+  for (let d = lastDay; d >= 1; d--) {
+    const iso = isoUtc(year, month0, d)
+    if (isBusinessDayUtc(iso)) return iso
+  }
+  return isoUtc(year, month0, lastDay)
+}
+
+/** How many business days ahead of arrival the sweep has to fire. */
+const SWEEP_LEAD_BUSINESS_DAYS = 2
+
+/** The day the month-end sweep fires, so the money has ARRIVED by month end. */
+export function monthEndSweepDateUtc(year: number, month0: number): string {
+  let cursor = new Date(lastBusinessDayOfMonthUtc(year, month0) + 'T12:00:00Z')
+  for (let stepped = 0; stepped < SWEEP_LEAD_BUSINESS_DAYS; ) {
+    cursor = new Date(cursor.getTime() - 86400000)
+    if (isBusinessDayUtc(cursor.toISOString().slice(0, 10))) stepped++
+  }
+  return cursor.toISOString().slice(0, 10)
+}
+
+/**
+ * Is this instant the month-end sweep?
+ *
+ * Measured in UTC, like the weekly gate: the cron fires at 01:00 UTC and Stripe
+ * books the payout on that UTC day, which is the day a landlord's statement
+ * shows and the day the arrival maths is done in.
+ */
+export function isMonthEndSweepDay(now: Date = new Date()): boolean {
+  const iso = now.toISOString().slice(0, 10)
+  const d = new Date(iso + 'T12:00:00Z')
+  return iso === monthEndSweepDateUtc(d.getUTCFullYear(), d.getUTCMonth())
+}
+
 /**
  * S640 — the next date a payout will actually be created, for the landlord's
  * dashboard.
@@ -191,7 +257,8 @@ export function nextPayoutDateUtc(from: Date = new Date()): string {
     const probe = new Date(Date.UTC(
       from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate() + i, 1, 0, 0))
     if (probe <= from) continue
-    if (shouldRunToday(probe)) return probe.toISOString().slice(0, 10)
+    // S641: the month-end sweep is a payout day too, and is often the next one.
+    if (shouldRunToday(probe) || isMonthEndSweepDay(probe)) return probe.toISOString().slice(0, 10)
   }
   return ''
 }
@@ -272,6 +339,15 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // is worth about 33 cents a month. Speed is worth more. See the candidate
   // list below.
   const weeklyDay = shouldRunToday(now, TZ)
+  // ── S641 (Nic): ONE EXTRA PUSH SO THE MONTH CLOSES CLEAN ────────────────
+  //
+  // "You don't want stuff rolling over — you want all the months separated
+  // accurately." This fires early enough that the money has ARRIVED by the last
+  // business day, and it ignores the floor and the interval below: the purpose
+  // of a sweep is to leave nothing behind, so a $40 residual and a landlord
+  // paid three days ago both still go.
+  const sweepDay = isMonthEndSweepDay(now)
+  const isPayoutDay = weeklyDay || sweepDay
 
   // S580: retry any platform→Connect passthrough intent stuck in `pending` (its
   // RESERVE committed but the Transfer never confirmed — e.g. Stripe was down).
@@ -388,7 +464,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     // Every Connect-ready landlord, every weekly run. The trigger machinery
     // below still measures the roll — that reporting is worth keeping — but it
     // no longer decides who gets paid.
-    ...(weeklyDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r })) : []),
+    ...(isPayoutDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r })) : []),
     ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
     ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
@@ -396,7 +472,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 
   for (const cand of candidates) {
     try {
-      const fired = await processOneCandidate(cand, today)
+      const fired = await processOneCandidate(cand, today, sweepDay)
       if (fired === 'fired')                      result.payoutsFired++
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
       else if (fired === 'below_minimum')         result.skippedBelowMinimum++
@@ -420,7 +496,9 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 type OneCandidateOutcome =
   'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed'
 
-async function processOneCandidate(cand: Candidate, today: string): Promise<OneCandidateOutcome> {
+async function processOneCandidate(
+  cand: Candidate, today: string, monthEndSweep = false,
+): Promise<OneCandidateOutcome> {
   // 1. Pre-skip: already paid TODAY? Stripe's idempotency_key is the
   //    authoritative guard; this avoids a wasted balance.retrieve round-trip.
   //
@@ -449,7 +527,12 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
       [cand.entity_id]
     )
     daysSinceLastPayout = last[0]?.days == null ? null : Number(last[0].days)
-    if (daysSinceLastPayout !== null && daysSinceLastPayout < MIN_DAYS_BETWEEN_PAYOUTS) {
+    // S641: the month-end sweep is exempt. Its whole job is that nothing rolls
+    // into next month, and a landlord paid on the weekly run two days earlier
+    // is exactly the case where a residual would be left behind.
+    if (!monthEndSweep
+        && daysSinceLastPayout !== null
+        && daysSinceLastPayout < MIN_DAYS_BETWEEN_PAYOUTS) {
       return 'already_paid_this_week'
     }
   }
@@ -496,7 +579,11 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
   // reaches $100 is paid anyway once it has waited a month, which is the same
   // billing cycle Nic measured it against. Money is delayed here; it is never
   // kept.
-  if (available < MIN_PAYOUT_AMOUNT
+  // S641: and the floor is waived at month end for the same reason — a $40
+  // residual sitting on the balance is precisely the thing that makes a month's
+  // books not tie out.
+  if (!monthEndSweep
+      && available < MIN_PAYOUT_AMOUNT
       && daysSinceLastPayout !== null
       && daysSinceLastPayout < MAX_DAYS_BELOW_MINIMUM) {
     return 'below_minimum'
@@ -513,7 +600,7 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
       method: 'standard',
       idempotencyKey,
       metadata: {
-        gam_trigger:    'auto_friday',
+        gam_trigger:    monthEndSweep ? 'month_end_sweep' : 'auto_friday',
         gam_entity:     cand.kind,
         gam_entity_id:  cand.entity_id,
         gam_run_date:   today,
