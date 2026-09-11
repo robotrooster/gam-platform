@@ -4192,7 +4192,12 @@ export interface PaginatedResponse<T> {
 export const STRIPE_CONFIG = {
   ACH_RATE:        0.005,   // negotiated — mirrors platform_processing_rates.ach stripe_cost_percent
   ACH_CAP:         3.00,    // negotiated — mirrors platform_processing_rates.ach stripe_cost_cap
-  PAYOUT_RATE:     0.0025,
+  // S640 (Nic, confirmed, said several times): the contracted OUTBOUND money
+  // movement rate is 0.17%, not the 0.25% that sat here. Third instance of the
+  // same failure — ACH_RATE was Stripe's public list price until S603, the
+  // Connect account fee until S616, and this was the last one left. There is no
+  // platform_processing_rates row for outbound, so nothing validated it.
+  PAYOUT_RATE:     0.0017,
   PAYOUT_FLAT:     0.25,
   // S616 (Nic, confirmed against the Stripe contract): $1.00 per active Connect
   // account per month, NOT the $2.00 that sat here. Same failure as ACH_RATE
@@ -4538,22 +4543,91 @@ export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; retryEl
 
 // ── UTILITY FUNCTIONS ──────────────────────────────────────
 
-export function calcStripePerUnit(rentAmount: number) {
-  const ach     = Math.min(rentAmount * STRIPE_CONFIG.ACH_RATE, STRIPE_CONFIG.ACH_CAP)
-  const payout  = rentAmount * STRIPE_CONFIG.PAYOUT_RATE + STRIPE_CONFIG.PAYOUT_FLAT
-  const connect = STRIPE_CONFIG.CONNECT_ACCT_MO / 50 // avg 50 units per landlord
-  return { ach, payout, connect, total: ach + payout + connect }
+/**
+ * S640 (Nic): FIXED COST PER PROPERTY PER MONTH, not per unit.
+ *
+ *   "One payout does not cover the whole park on a weekly cadence though. Let's
+ *    just charge that as a dollar a month, and then we have the Connect account
+ *    at two dollars a month. So there's three dollars a month per property
+ *    fixed cost."
+ *
+ * $0.25 × ~4.33 weekly payouts is $1.08, so a dollar is the right shape. The
+ * old code added the whole $0.25 to EVERY UNIT, overstating it fiftyfold on a
+ * fifty-unit park.
+ *
+ * NOTE ON THE $2: STRIPE_CONFIG.CONNECT_ACCT_MO says $1.00, carrying an S616
+ * comment recording that Nic confirmed it against the Stripe contract. He has
+ * now said $2. Modelled at $2 because being conservative about our own cost is
+ * the safe direction to be wrong in, and left here in the open rather than
+ * silently reconciled — if $1 is right, this understates margin by a dollar a
+ * property a month and somebody should say so.
+ */
+export const FIXED_COST_PER_PROPERTY_MO = 3.00
+
+export type PaymentMethodMix = 'ach' | 'card' | 'manual'
+
+/**
+ * What Stripe costs GAM for one unit in one month, and what GAM charges the
+ * payer to cover it. The two belong together: quoting the cost alone was the
+ * bug (see calcNetPerUnit).
+ */
+export function calcStripePerUnit(
+  rentAmount: number,
+  method: PaymentMethodMix = 'ach',
+  unitsPerLandlord = 50,
+) {
+  const fixedShare = FIXED_COST_PER_PROPERTY_MO / Math.max(1, unitsPerLandlord)
+  // Cash, check and money order never touch Stripe: nothing is processed and
+  // nothing is paid out, so a manual-paying unit costs GAM nothing to serve.
+  if (method === 'manual') {
+    return { processingCost: 0, processingFee: 0, outbound: 0, fixedShare, total: fixedShare }
+  }
+  const processingCost = method === 'ach'
+    ? Math.min(rentAmount * STRIPE_CONFIG.ACH_RATE, STRIPE_CONFIG.ACH_CAP)
+    : rentAmount * 0.029 + 0.26      // mirrors platform_processing_rates.card cost side
+  const processingFee = method === 'ach'
+    ? PROCESSING_FEES.ACH_FLAT
+    : rentAmount * PROCESSING_FEES.CARD_PCT + PROCESSING_FEES.CARD_FLAT
+  const outbound = rentAmount * STRIPE_CONFIG.PAYOUT_RATE
+  return { processingCost, processingFee, outbound, fixedShare,
+           total: processingCost + outbound + fixedShare }
 }
 
-export function calcNetPerUnit(rentAmount: number, reserveRate: number) {
-  const stripe = calcStripePerUnit(rentAmount)
+/**
+ * GAM's margin on one unit for one month.
+ *
+ * ── S640: THIS READ EVERY UNIT AS A LOSS ────────────────────────────────────
+ *
+ * It subtracted Stripe's ACH cost from the $2 platform fee and stopped there —
+ * so a $500 unit reported −$2.02 a month. But GAM CHARGES the payer $6 for that
+ * ACH. The cost is passed through, not absorbed; counting it against the
+ * platform fee booked it twice. With the fee counted, the same unit is +$4.59.
+ * A six-dollar error per unit, in the direction of believing the business does
+ * not work.
+ *
+ * The other half was the $0.25 payout flat, charged to every unit rather than
+ * shared across the park it actually covers.
+ */
+export function calcNetPerUnit(
+  rentAmount: number,
+  reserveRate: number,
+  method: PaymentMethodMix = 'ach',
+  unitsPerLandlord = 50,
+) {
+  const stripe = calcStripePerUnit(rentAmount, method, unitsPerLandlord)
   // S561: retired the stale pre-launch $15 tier (PLATFORM_FEES.ACTIVE_UNIT).
-  // The live landlord fee is the flat $2/occupied-unit launch model, so reserve
-  // + admin-income math must use it (walkthrough #34).
-  const gross  = LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT
+  // The live landlord fee is the flat $2/occupied-unit launch model.
+  const gross  = LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT + stripe.processingFee
   const netBR  = gross - stripe.total
   const reserve = netBR * reserveRate
-  return { gross, stripe: stripe.total, netBR, reserve, netKept: netBR - reserve }
+  return {
+    gross, stripe: stripe.total, netBR, reserve, netKept: netBR - reserve,
+    platformFee: LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT,
+    processingFee: stripe.processingFee,
+    processingCost: stripe.processingCost,
+    outbound: stripe.outbound,
+    fixedShare: stripe.fixedShare,
+  }
 }
 
 export function getReservePhase(occupiedUnits: number): { phase: 1|2|3; rate: number } {
