@@ -90,12 +90,6 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   onClose: () => void
   onRecorded: (msg: string) => void
 }) {
-  // S641: keeping an overpayment IS issuing credit, so it follows the same rule
-  // as the Issue Credit button — owners and property managers. Matches the
-  // server, which refuses it for anybody else.
-  const { isOwner: creditOwner } = usePerms()
-  const creditRole = useAuth().user?.role
-  const canIssueCredit = creditOwner || creditRole === 'property_manager'
   const [method, setMethod] = useState<ManualPaymentMethod>('cash')
   const [tendered, setTendered] = useState('')
   const [reference, setReference] = useState('')
@@ -238,14 +232,13 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
                     { v: 'change' as const,
                       t: cash ? 'Gave change' : 'Gave it back',
                       d: `Handed ${fmt(change)} back` },
-                    // S641 (Nic): "I do not want to allow her to issue credit at
-                    // this time." Keeping an overpayment IS issuing credit, so
-                    // the option belongs to whoever may issue one. The server
-                    // refuses it too — this only keeps the desk from reaching
-                    // for a button that would fail.
-                    ...(canIssueCredit
-                      ? [{ v: 'credit' as const, t: 'Keep as credit', d: 'Comes off next month' }]
-                      : []),
+                    // S641 (Nic): this is NOT the same thing as issuing a
+                    // credit. The money is already in the drawer — the desk is
+                    // recording where the surplus went, not granting anything.
+                    // "Lisa should have all access to take payments in whatever
+                    // form they come, including giving change out at the
+                    // register… or applying credit to the next bill."
+                    { v: 'credit' as const, t: 'Keep as credit', d: 'Comes off next month' },
                   ]).map(opt => {
                     const on = surplusHandling === opt.v
                     return (

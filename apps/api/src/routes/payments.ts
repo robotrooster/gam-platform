@@ -1068,23 +1068,25 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
-    // S641 (Nic, on his on-site manager): "I do not want to allow her to issue
-    // credit at this time."
+    // S641 — TWO DIFFERENT THINGS, and only one of them is a manager's call.
     //
-    // Issuing credit has always been owner/property-manager only, enforced on
-    // the tenant-credits route — but an overpayment recorded at the counter can
-    // be KEPT as credit (S637), and that path only ever checked take_payment.
-    // So the front desk could mint a credit through the back door: take $500
-    // against a $460 balance and click "keep as credit".
+    // Nic: "Lisa should have all access to take payments in whatever form they
+    // come, including giving change out at the register… or applying credit to
+    // the next bill if that's what she wants. She cannot just issue random
+    // credits that a landlord would issue for, you know, waiving a late fee."
     //
-    // Refused rather than quietly downgraded to "gave change" — what happened
-    // to real money in someone's hand is not ours to decide on their behalf.
-    if (body.surplusHandling === 'credit'
-        && !canManageLandlordResource(req.user, pmt.landlord_id, ['property_manager'])) {
-      throw new AppError(403,
-        'Keeping an overpayment as account credit needs a manager. Hand the difference back, '
-        + 'or ask a manager to record this one.')
-    }
+    // An overpayment surplus is money ALREADY IN THE DRAWER. The resident handed
+    // over $500 against $460 and the desk records where the $40 went — change
+    // back, or sitting on the account for next month. Recording that is part of
+    // taking the payment, not an act of discretion, and take_payment covers it.
+    //
+    // A DISCRETIONARY credit — waiving a late fee, a goodwill adjustment —
+    // creates money that was never received. That stays owner / property
+    // manager, enforced on the tenant-credits route.
+    //
+    // I gated the surplus here first and was wrong: it read as "issuing credit"
+    // because the word matched, and blocked a desk from recording the truth
+    // about cash they were holding.
     if (pmt.type !== 'rent') {
       throw new AppError(409, 'Only rent charges can be recorded as a manual payment')
     }

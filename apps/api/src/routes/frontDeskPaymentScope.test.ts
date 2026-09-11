@@ -152,14 +152,20 @@ describe('work trade stays private on the balances screen', () => {
   })
 })
 
-// ── the back door into issuing credit ───────────────────────────────────────
+// ── the two kinds of credit ─────────────────────────────────────────────────
 //
-// Nic: "I do not want to allow her to issue credit at this time." Issuing
-// credit was owner/property-manager only on the tenant-credits route — but an
-// overpayment taken at the counter could be KEPT as credit, and that path only
-// ever checked take_payment. Take $500 against a $460 balance, click "keep as
-// credit", and the front desk has minted one.
-describe('keeping an overpayment as credit', () => {
+// Nic: "Lisa should have all access to take payments in whatever form they come,
+// including giving change out at the register… or applying credit to the next
+// bill if that's what she wants. She cannot just issue random credits that a
+// landlord would issue for, you know, waiving a late fee. Two different things
+// there."
+//
+// An overpayment surplus is money ALREADY IN THE DRAWER — recording where it
+// went is part of taking the payment. A discretionary credit creates money that
+// was never received. I gated the first one as if it were the second, because
+// the word "credit" matched, and that blocked a desk from recording the truth
+// about cash they were holding.
+describe('an overpayment at the counter', () => {
   async function openRentCharge() {
     const f = await seed()
     const { rows } = await db.query<{ id: string }>(
@@ -167,31 +173,7 @@ describe('keeping an overpayment as credit', () => {
     return { f, paymentId: rows[0].id }
   }
 
-  it('is refused for the front desk', async () => {
-    const { f, paymentId } = await openRentCharge()
-    const res = await request(buildApp())
-      .post(`/api/payments/${paymentId}/record-manual`)
-      .set('Authorization', `Bearer ${f.deskToken}`)
-      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
-    expect(res.status).toBe(403)
-    expect(res.body.error).toMatch(/manager/i)
-  })
-
-  // Refused, not quietly downgraded: what happened to real money in somebody's
-  // hand is not ours to decide on their behalf.
-  it('and nothing is recorded when it is refused', async () => {
-    const { f, paymentId } = await openRentCharge()
-    await request(buildApp())
-      .post(`/api/payments/${paymentId}/record-manual`)
-      .set('Authorization', `Bearer ${f.deskToken}`)
-      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
-    const { rows } = await db.query(`SELECT status FROM payments WHERE id=$1`, [paymentId])
-    expect(rows[0].status).toBe('pending')
-    const credits = await db.query(`SELECT COUNT(*)::int AS n FROM tenant_credits`)
-    expect(credits.rows[0].n).toBe(0)
-  })
-
-  it('the front desk CAN still take the payment and hand the change back', async () => {
+  it('the front desk can hand the change back', async () => {
     const { f, paymentId } = await openRentCharge()
     const res = await request(buildApp())
       .post(`/api/payments/${paymentId}/record-manual`)
@@ -200,7 +182,16 @@ describe('keeping an overpayment as credit', () => {
     expect(res.status).toBe(200)
   })
 
-  it('the owner may keep it as credit', async () => {
+  it('and can leave the surplus on the account for next month', async () => {
+    const { f, paymentId } = await openRentCharge()
+    const res = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    expect(res.status).toBe(200)
+  })
+
+  it('the owner can too', async () => {
     const { f, paymentId } = await openRentCharge()
     const res = await request(buildApp())
       .post(`/api/payments/${paymentId}/record-manual`)
