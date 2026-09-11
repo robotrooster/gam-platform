@@ -24,6 +24,8 @@ interface DashStats {
   workTradeRent?: number
   workTradeUnits?: number
   workTradeSuspended?: number
+  /** S640: YYYY-MM-DD, from the payout engine. The card never derives it. */
+  nextPayoutDate?: string
   // S640: of the delinquent units, how many a late fee will actually reach
   // tonight. Onboarding residents are waived, so the two numbers differ.
   delinquentUnitsAccruingLateFees?: number
@@ -123,20 +125,21 @@ export function DashboardPage() {
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
 
-  // ── S640: THE DATE HAS TO BE THE REAL ONE ──────────────────────────────
+  // ── S640: THE DATE COMES FROM THE ENGINE NOW ───────────────────────────
   //
-  // This said "next payout {Friday}" while the engine has fired on TUESDAY the
-  // whole time. A landlord planning around a date we printed would have been
-  // three days out, every week. Payouts run Tuesday; a federal holiday pushes
-  // the run forward, which this does not model — it would rather be right 51
-  // weeks a year than confidently wrong about the 52nd, so a holiday week reads
-  // one day early and the money arrives a day later than the card said.
-  const nextPayoutDate = (() => {
-    const d = new Date()
-    const add = ((2 - d.getDay()) + 7) % 7 || 7
-    d.setDate(d.getDate() + add)
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-  })()
+  // This card computed its own payout date and was wrong three times running:
+  // it said Friday while the engine fired Tuesday, then Tuesday while Nic moved
+  // the run to Thursday — telling him "Sep 15" when the job would not fire until
+  // Sep 17. Two copies of a schedule is one copy too many.
+  //
+  // The API returns the date the payout job will actually fire, derived from
+  // the engine's own gate, holiday shifts and all. No fallback guess: if it is
+  // absent the card simply does not name a day, which is better than naming the
+  // wrong one.
+  const nextPayoutDate = stats?.nextPayoutDate
+    ? new Date(stats.nextPayoutDate + 'T12:00:00Z')
+        .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+    : null
 
   if (isLoading) return (
     <div>
@@ -301,8 +304,8 @@ export function DashboardPage() {
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
             {Number(stats?.nextPayoutReady ?? 0) > 0
-              ? `On its way to your bank — sent ${nextPayoutDate}`
-              : `Next payout ${nextPayoutDate}`}
+              ? (nextPayoutDate ? `On its way to your bank — sent ${nextPayoutDate}` : 'On its way to your bank')
+              : (nextPayoutDate ? `Next payout ${nextPayoutDate}` : 'Next payout scheduled')}
           </div>
           {Number(stats?.nextPayoutClearing ?? 0) > 0 && (
             <div className="kpi-sub" style={{color:'var(--text-3)'}}>

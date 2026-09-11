@@ -7,6 +7,8 @@ import { AppError } from '../middleware/errorHandler'
 // S633 — the account is not an entity. Reads span every company the account
 // owns; writes name their target and are authorised against it.
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
+// S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
+import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue } from '../services/email'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
@@ -993,6 +995,12 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       // still clearing behind it.
       next_payout_ready: pipeline?.ready||0,
       next_payout_clearing: pipeline?.clearing||0,
+      // S640: the date comes from the PAYOUT ENGINE, not from the card
+      // re-deriving the schedule. That duplication has been wrong three times —
+      // Friday while the engine ran Tuesday, then Tuesday while it moved to
+      // Thursday — and a landlord planning around a date we print deserves the
+      // one the job will actually fire on.
+      next_payout_date: nextPayoutDateUtc(),
       delinquent_units_accruing_late_fees: delinq?.accruing_units||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead
       // of leaving the landlord to discover it in Financials → Banking.

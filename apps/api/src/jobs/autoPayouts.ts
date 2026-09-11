@@ -171,6 +171,31 @@ export function isMonthlySweepDay(now: Date = new Date(), tz: string = TZ): bool
   return dom >= 20 && dom <= 26
 }
 
+/**
+ * S640 — the next date a payout will actually be created, for the landlord's
+ * dashboard.
+ *
+ * WHY THIS LIVES HERE: the card computed its own date and has now been wrong
+ * three times — it said Friday while the engine ran Tuesday, then Tuesday while
+ * the engine moved to Thursday. A landlord planning around a date we print is
+ * owed the date the engine will actually fire, so the card reads it from the
+ * engine instead of re-deriving the schedule beside it.
+ *
+ * Returns a UTC date string (YYYY-MM-DD), because that is the day STRIPE books
+ * the payout — the cron fires at 01:00 UTC, which is the evening before in
+ * Phoenix, and the landlord will see Stripe's day on their statement.
+ */
+export function nextPayoutDateUtc(from: Date = new Date()): string {
+  for (let i = 0; i < 14; i++) {
+    // The real firing instant for each candidate day: 01:00 UTC.
+    const probe = new Date(Date.UTC(
+      from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate() + i, 1, 0, 0))
+    if (probe <= from) continue
+    if (shouldRunToday(probe)) return probe.toISOString().slice(0, 10)
+  }
+  return ''
+}
+
 export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean {
   const dow = localDayOfWeek(now, tz)
   if (dow < 1 || dow > 5) return false

@@ -46,7 +46,7 @@ vi.mock('../services/adminNotifications', () => ({
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
-import { shouldRunToday, processAutoPayouts } from './autoPayouts'
+import { shouldRunToday, processAutoPayouts, nextPayoutDateUtc } from './autoPayouts'
 
 // Phoenix is UTC-7 year-round (no DST). Noon at -07:00 pins the calendar day.
 const phx = (isoDate: string) => new Date(`${isoDate}T12:00:00-07:00`)
@@ -154,6 +154,39 @@ describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
     // is a holiday.
     expect(shouldRunToday(atUtc('2026-09-08'))).toBe(false)  // Tuesday, no longer the day
     expect(shouldRunToday(atUtc('2026-09-10'))).toBe(true)   // 6pm Phoenix Wed Sep 9
+  })
+})
+
+// ── S640: THE DASHBOARD'S DATE COMES FROM HERE ─────────────────────────────
+//
+// The card derived its own and was wrong three times: Friday while the engine
+// fired Tuesday, then Tuesday while the run moved to Thursday — telling Nic
+// "Sep 15" when the job would not fire until Sep 17. One schedule, one owner.
+describe('nextPayoutDateUtc', () => {
+  it('is always a day the engine would actually fire on', () => {
+    const d = nextPayoutDateUtc()
+    expect(d).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
+  })
+
+  it('is in the future, never today already-past', () => {
+    const now = new Date()
+    expect(new Date(nextPayoutDateUtc(now) + 'T01:00:00Z').getTime()).toBeGreaterThan(now.getTime())
+  })
+
+  it('lands on the payout day from any starting point in the week', () => {
+    for (let i = 0; i < 9; i++) {
+      const from = new Date(Date.UTC(2026, 6, 27 + i, 15, 0, 0))
+      const d = nextPayoutDateUtc(from)
+      expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
+    }
+  })
+
+  // The engine shifts off a federal holiday; a date derived beside it would not.
+  it('agrees with the engine through a holiday week', () => {
+    const from = new Date(Date.UTC(2026, 8, 5, 15, 0, 0))   // Labor Day week
+    const d = nextPayoutDateUtc(from)
+    expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
   })
 })
 
