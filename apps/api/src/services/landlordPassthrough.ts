@@ -122,14 +122,35 @@ interface ReservedBatch {
  * intent inside one transaction, then commit. Returns null when there is
  * nothing to do (unknown user, no Connect account, nothing owed).
  */
-async function reservePlatformHeldBatch(landlordUserId: string): Promise<ReservedBatch | null> {
+async function reservePlatformHeldBatch(
+  landlordUserId: string,
+  onlyLandlordId?: string,
+): Promise<ReservedBatch | null> {
+  // ── S640: ONE ACCOUNT OWNS SEVERAL COMPANIES ───────────────────────────
+  //
+  // This was a queryOne over `users JOIN landlords` — and an account that owns
+  // two companies matches TWICE, so it silently took whichever row Postgres
+  // returned first and the other company's rent could never be swept off the
+  // platform balance at all. Nic's account owns Mountain View and Oak Park;
+  // Mountain View happens to sort first, so Oak Park's card and ACH money would
+  // have sat on GAM's balance forever, with nothing anywhere saying so.
+  //
+  // Not currently biting only because Oak Park's residents have all paid cash
+  // so far. The first one who pays online would have found out the hard way.
+  //
+  // The caller now names the company (see reconcilePlatformHeldPayments, which
+  // loops over all of them); the bare-user form still resolves when an account
+  // owns exactly one.
   const landlordRow = await queryOne<{ landlord_id: string; stripe_connect_account_id: string | null }>(
     `SELECT l.id AS landlord_id,
             COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
        FROM users u
        JOIN landlords l ON l.user_id = u.id
-      WHERE u.id = $1`,
-    [landlordUserId]
+      WHERE u.id = $1
+        AND ($2::uuid IS NULL OR l.id = $2::uuid)
+      ORDER BY l.created_at ASC
+      LIMIT 1`,
+    [landlordUserId, onlyLandlordId ?? null]
   )
   if (!landlordRow || !landlordRow.stripe_connect_account_id) return null
 
@@ -380,20 +401,32 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
 export async function reconcilePlatformHeldPayments(
   landlordUserId: string
 ): Promise<PassthroughResult> {
-  const reserved = await reservePlatformHeldBatch(landlordUserId)
-  if (!reserved) {
+  // S640: EVERY company the account owns, not the first one. Each has its own
+  // Connect account and its own owed balance, so each gets its own intent and
+  // its own transfer; the results are summed so the caller's shape is unchanged.
+  const companies = await query<{ id: string }>(
+    `SELECT id FROM landlords WHERE user_id = $1 ORDER BY created_at ASC`, [landlordUserId])
+  if (companies.length === 0) {
     return { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
   }
-  if (reserved.fullyNetted) {
-    return { attempted: true, payments_settled: reserved.payments_settled, transfer_id: `netted:${reserved.intentId}`, amount: 0 }
+
+  const out: PassthroughResult = { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
+  for (const c of companies) {
+    const reserved = await reservePlatformHeldBatch(landlordUserId, c.id)
+    if (!reserved) continue
+    out.attempted = true
+    out.payments_settled += reserved.payments_settled
+    if (reserved.fullyNetted) {
+      out.transfer_id = out.transfer_id ?? `netted:${reserved.intentId}`
+      continue
+    }
+    const transferId = await executePlatformTransferIntent(reserved.intentId)
+    // null → the intent stays pending and RECOVER retries it; the money is
+    // claimed either way, so a failure on one company never blocks the next.
+    out.transfer_id = out.transfer_id ?? transferId
+    out.amount += reserved.transferAmount
   }
-  const transferId = await executePlatformTransferIntent(reserved.intentId)
-  return {
-    attempted:        true,
-    payments_settled: reserved.payments_settled,
-    transfer_id:      transferId,   // null → pending, RECOVER will retry
-    amount:           reserved.transferAmount,
-  }
+  return out
 }
 
 /**

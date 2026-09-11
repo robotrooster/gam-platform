@@ -82,6 +82,89 @@ async function seedOwnerShareLedger(ctx: Ctx, amount: number): Promise<void> {
     [ctx.landlordUserId, amount, ctx.paymentId])
 }
 
+// ── S640: AN ACCOUNT THAT OWNS TWO COMPANIES ───────────────────────────────
+//
+// The reserve step was a queryOne over `users JOIN landlords`, so an account
+// owning two companies matched twice and it silently took whichever row came
+// back first. Nic's account owns Mountain View and Oak Park; Mountain View
+// sorts first, so Oak Park's card and ACH rent could never leave the platform
+// balance — with nothing anywhere saying so. It has not bitten only because
+// Oak Park's residents have all paid cash so far.
+describe('S640 an account with several companies', () => {
+  async function seedSecondCompany(ctx: Ctx, connectAccount: string) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const l = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name, stripe_connect_account_id)
+         VALUES ($1, 'Second Company', $2) RETURNING id`, [ctx.landlordUserId, connectAccount])
+      const landlordId = l.rows[0].id
+      const propertyId = await seedProperty(c, {
+        landlordId, ownerUserId: ctx.landlordUserId, managedByUserId: ctx.landlordUserId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const pay = await c.query<{ id: string }>(
+        `INSERT INTO payments
+           (unit_id, tenant_id, landlord_id, type, amount, status,
+            entry_description, due_date, platform_held, settled_at)
+         VALUES ($1,$2,$3,'rent',700,'settled','RENT',CURRENT_DATE,TRUE,NOW()) RETURNING id`,
+        [unitId, tenantId, landlordId])
+      await c.query('COMMIT')
+      return { landlordId, paymentId: pay.rows[0].id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('sweeps BOTH companies, each to its own Connect account', async () => {
+    // Distinct ids per call: real Stripe never returns the same transfer twice,
+    // and user_balance_ledger has a unique index on stripe_transfer_id that
+    // says so. The shared default id is a harness artifact, not the product.
+    let n = 0
+    transferMock.mockImplementation(async () => ({ id: `tr_mock_multi_${++n}` }) as any)
+    const ctx = await seedCtx({ connectAccount: null })
+    await db.query(`UPDATE landlords SET stripe_connect_account_id='acct_first' WHERE id=$1`, [ctx.landlordId])
+    await seedOwnerShareLedger(ctx, 950)
+
+    const second = await seedSecondCompany(ctx, 'acct_second')
+    await db.query(
+      `INSERT INTO user_balance_ledger
+         (user_id, type, amount, balance_after, reference_id, reference_type, notes)
+       VALUES ($1,'allocation_owner_share',$2,$2,$3,'payment','S640 second company')`,
+      [ctx.landlordUserId, 680, second.paymentId])
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(true)
+    expect(res.amount).toBe(1630)              // 950 + 680, not 950
+    expect(transferMock).toHaveBeenCalledTimes(2)
+
+    const destinations = transferMock.mock.calls
+      .map((c: any[]) => c[0]?.destinationConnectAccountId)
+    expect(destinations).toContain('acct_first')
+    expect(destinations).toContain('acct_second')
+
+    // Neither company's money is left claimable a second time.
+    const held = await db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM payments WHERE platform_held = TRUE`)
+    expect(Number(held.rows[0].c)).toBe(0)
+  })
+
+  it('one company owing nothing does not stop the other being swept', async () => {
+    const ctx = await seedCtx({ connectAccount: null })
+    await db.query(`UPDATE landlords SET stripe_connect_account_id='acct_first' WHERE id=$1`, [ctx.landlordId])
+    // No ledger row for the FIRST company — nothing owed there.
+    const second = await seedSecondCompany(ctx, 'acct_second')
+    await db.query(
+      `INSERT INTO user_balance_ledger
+         (user_id, type, amount, balance_after, reference_id, reference_type, notes)
+       VALUES ($1,'allocation_owner_share',$2,$2,$3,'payment','S640 second only')`,
+      [ctx.landlordUserId, 680, second.paymentId])
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(true)
+    expect(res.amount).toBe(680)
+    expect(transferMock).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('reconcilePlatformHeldPayments', () => {
   it('unknown user (no landlords row) → noop, no Stripe call', async () => {
     const res = await reconcilePlatformHeldPayments(
