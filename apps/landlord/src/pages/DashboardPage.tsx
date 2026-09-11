@@ -33,6 +33,10 @@ interface DashStats {
   leasesExpiring60d: number
   propertyCount: number
   upcomingDisbursement: { count: number; amount: number }
+  // S640: rent we are holding that goes out on the next weekly run, and the
+  // part still clearing at the tenant's bank behind it.
+  nextPayoutReady?: number
+  nextPayoutClearing?: number
   otpUnits?: number
   projectedOtpDisbursement?: number
   platformFee?: number
@@ -119,11 +123,17 @@ export function DashboardPage() {
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
 
-  // Auto-payout cadence is weekly (Fridays). Show the next Friday as the
-  // concrete next-payout date rather than a fixed "1st of month" SLA label.
+  // ── S640: THE DATE HAS TO BE THE REAL ONE ──────────────────────────────
+  //
+  // This said "next payout {Friday}" while the engine has fired on TUESDAY the
+  // whole time. A landlord planning around a date we printed would have been
+  // three days out, every week. Payouts run Tuesday; a federal holiday pushes
+  // the run forward, which this does not model — it would rather be right 51
+  // weeks a year than confidently wrong about the 52nd, so a holiday week reads
+  // one day early and the money arrives a day later than the card said.
   const nextPayoutDate = (() => {
     const d = new Date()
-    const add = ((5 - d.getDay()) + 7) % 7 || 7
+    const add = ((2 - d.getDay()) + 7) % 7 || 7
     d.setDate(d.getDate() + add)
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
   })()
@@ -274,12 +284,31 @@ export function DashboardPage() {
             one didn't, so the payout history was only reachable by knowing to
             look under Financials. */}
         <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/disbursements')}>
+          {/* S640 (Nic): "It's still showing a next disbursement of zero
+              dollars. The landlord's expecting money to be handled and moved.
+              They wanna know what's about to hit their bank."
+
+              It read the table of payouts ALREADY FIRED, so before the first
+              one it said $0 — while $2,049 of collected rent sat waiting to be
+              sent. Now it says what is going out, and names the part still
+              clearing separately rather than folding it in: quoting money that
+              has not cleared as "arriving Tuesday" is a promise we cannot
+              keep. */}
           <div className="kpi-label">Next Disbursement</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmtWhole(stats?.upcomingDisbursement?.amount || 0)}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>
+            {fmtWhole(Number(stats?.nextPayoutReady ?? 0) || (stats?.upcomingDisbursement?.amount || 0))}
+          </div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
-            Next payout {nextPayoutDate}
+            {Number(stats?.nextPayoutReady ?? 0) > 0
+              ? `On its way to your bank — sent ${nextPayoutDate}`
+              : `Next payout ${nextPayoutDate}`}
           </div>
+          {Number(stats?.nextPayoutClearing ?? 0) > 0 && (
+            <div className="kpi-sub" style={{color:'var(--text-3)'}}>
+              {fmtWhole(Number(stats?.nextPayoutClearing))} still clearing at the tenant's bank
+            </div>
+          )}
         </div>
         {/* Row 4 (span 4): your money with GAM — fee you pay, referral you earn, net.
             S574 (Nic): kept as three separate cards (a cost, an income, the net)

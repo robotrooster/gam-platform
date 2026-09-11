@@ -170,3 +170,79 @@ describe('S640 work trade is out of the money totals', () => {
     expect(Number(res.body.data.work_trade_rent)).toBe(0)
   })
 })
+
+/**
+ * S640 (Nic): "It's still showing a next disbursement of zero dollars. The
+ * landlord's expecting money to be handled and moved. They wanna know what's
+ * about to hit their bank."
+ *
+ * The card read the table of payouts ALREADY FIRED, so before the first one it
+ * said $0 — while $2,049.11 of collected rent sat on GAM's balance waiting to
+ * be sent. The most alarming possible way to say "everything is fine".
+ */
+describe('S640 next disbursement says what is coming', () => {
+  async function seedHeld(opts: { settled: number; processing: number }) {
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId, rentAmount: 800 })
+      // One rent row per unit per due date (ux_payments_unit_rent_due_date_active),
+      // so the two months sit a cycle apart the way real ones would.
+      let monthsBack = 0
+      const mk = async (amount: number, status: string, withLedger: boolean) => {
+        const p = await c.query<{ id: string }>(
+          `INSERT INTO payments (unit_id, landlord_id, type, amount, status, entry_description,
+                                 due_date, platform_held, settled_at)
+           VALUES ($1,$2,'rent',$3,$4,'RENT',
+                   (CURRENT_DATE - ($5 || ' months')::interval)::date, TRUE,
+                   CASE WHEN $4='settled' THEN NOW() ELSE NULL END) RETURNING id`,
+          [unitId, landlordId, amount, status, String(monthsBack++)])
+        if (withLedger) {
+          await c.query(
+            `INSERT INTO user_balance_ledger (user_id, type, amount, balance_after,
+                                              reference_id, reference_type, notes)
+             VALUES ($1,'allocation_owner_share',$2,$2,$3,'payment','S640 test')`,
+            [userId, amount, p.rows[0].id])
+        }
+      }
+      if (opts.settled > 0)    await mk(opts.settled, 'settled', true)
+      if (opts.processing > 0) await mk(opts.processing, 'processing', false)
+      await c.query('COMMIT')
+      const token = jwt.sign(
+        { userId, role: 'landlord', email: 'll@t.dev', landlordIds: [landlordId], permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { token }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('reports cleared rent as going out, and money still clearing apart from it', async () => {
+    const f = await seedHeld({ settled: 2049.11, processing: 980.20 })
+    const res = await request(buildApp())
+      .get('/api/landlords/me/dashboard').set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.next_payout_ready)).toBeCloseTo(2049.11, 2)
+    expect(Number(res.body.data.next_payout_clearing)).toBeCloseTo(980.20, 2)
+  })
+
+  // Quoting money that has not cleared as "arriving Tuesday" is a promise we
+  // cannot keep — it must never be folded into the headline figure.
+  it('never counts money still clearing as ready to send', async () => {
+    const f = await seedHeld({ settled: 0, processing: 460 })
+    const res = await request(buildApp())
+      .get('/api/landlords/me/dashboard').set('Authorization', `Bearer ${f.token}`)
+    expect(Number(res.body.data.next_payout_ready)).toBe(0)
+    expect(Number(res.body.data.next_payout_clearing)).toBeCloseTo(460, 2)
+  })
+
+  // Once swept, it is no longer "about to hit their bank" — it already left.
+  it('drops an owner share that has already been transferred out', async () => {
+    const f = await seedHeld({ settled: 700, processing: 0 })
+    await db.query(`UPDATE user_balance_ledger SET stripe_transfer_id = 'tr_done'
+                     WHERE type = 'allocation_owner_share'`)
+    const res = await request(buildApp())
+      .get('/api/landlords/me/dashboard').set('Authorization', `Bearer ${f.token}`)
+    expect(Number(res.body.data.next_payout_ready)).toBe(0)
+  })
+})

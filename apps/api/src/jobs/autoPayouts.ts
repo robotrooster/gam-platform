@@ -172,10 +172,23 @@ export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean
 // Engine
 // ============================================================================
 
+// ── S640 payout economics (Nic) ─────────────────────────────────────────────
+// Stripe bills 0.17% of the amount moved plus $0.25 per payout. The percentage
+// is unavoidable — it lands on the volume however it is batched — so these two
+// numbers are the whole of what cadence can control.
+/** Don't move less than this unless it has waited (see below). */
+const MIN_PAYOUT_AMOUNT = 100
+/** ...and after this many days, move it whatever it is. Nothing strands. */
+const MAX_DAYS_BELOW_MINIMUM = 30
+/** Never pay the same account twice inside this window. */
+const MIN_DAYS_BETWEEN_PAYOUTS = 5
+
 export interface PayoutResult {
   candidatesScanned: number
   payoutsFired: number
   skippedZeroBalance: number
+  /** S640: held back under the $100 floor — money delayed, never kept. */
+  skippedBelowMinimum: number
   triggersDeferred: number
   skippedAlreadyPaidThisWeek: number
   payoutsFailed: number
@@ -204,6 +217,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     candidatesScanned: 0,
     payoutsFired: 0,
     skippedZeroBalance: 0,
+    skippedBelowMinimum: 0,
     triggersDeferred: 0,
     skippedAlreadyPaidThisWeek: 0,
     payoutsFailed: 0,
@@ -312,20 +326,16 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // weekly plan." A landlord can be both — Oak Park is, with 29 of its 30 units
   // allowing nightly stays alongside long-term leases — so the two run
   // independently and coalesce on the shared balance.
+  // Kept for the roll measurement below, which still records how much of each
+  // landlord's rent has come in. Nothing here decides who gets paid any more.
   const rollDrivenUserIds = new Set<string>()
-  const weeklyUserIds = new Set<string>()
   for (const r of userRows) {
     try {
       const progress = await rollProgressForLandlordUser(r.entity_id, cycleMonth)
 
-      // Nightly and weekly stays have no denominator to take a percentage of —
-      // money arrives whenever someone books, all month — so that stream keeps
-      // the weekly Tuesday. A landlord with NO rent roll at all also stays
-      // weekly: there is nothing to measure, and putting them on thresholds
-      // would strand deposits and fees until the late-month sweep.
-      if (progress.unitsTotal === 0 || await hasShortTermActivity(r.entity_id, cycleMonth)) {
-        weeklyUserIds.add(r.entity_id)
-      }
+      // S640: everybody is weekly now, so there is no longer a stream to sort
+      // people into — a landlord with no rent roll simply has nothing to
+      // measure, and the measurement is all that is left here.
       if (progress.unitsTotal === 0) continue
       rollDrivenUserIds.add(r.entity_id)
 
@@ -348,18 +358,38 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   // Everything with a trigger due on or before today. A landlord appears here
   // once per due trigger; the same-day idempotency key at Stripe means two due
   // on one day still move the balance once.
+  // S640: triggers no longer select candidates. They are still read so that any
+  // already-scheduled one is retired when the weekly run pays that landlord —
+  // otherwise Mountain View's Sep 16 threshold would sit in the table forever,
+  // claimed and never fired, and the next person to look would not know why.
   const due = await dueTriggers(today)
-  const dueUserIds = new Set(due.filter(t => t.entity_kind === 'user').map(t => t.entity_id))
 
   const candidates: Candidate[] = [
-    // A landlord is included if EITHER stream says so: a rent threshold is due
-    // today, or it is the weekly Tuesday and they have short-term stays (or no
-    // rent roll at all). Both streams sweep the same balance, so an overlap
-    // costs nothing — the second finds it empty and skips.
-    ...userRows.filter(r =>
-        (dueUserIds.has(r.entity_id))
-        || (weeklyDay && weeklyUserIds.has(r.entity_id)))
-               .map((r): UserCandidate => ({ kind: 'user', ...r })),
+    // ── S640 (Nic, DIRECTIVE): WEEKLY, FOR EVERYBODY ───────────────────────
+    //
+    //   "The weekly transfer is a lot simpler than trying to have the three per
+    //    cycle... if for some reason everybody's fairly late one month, or we
+    //    don't hit the fifty percent threshold, and one person waits a whole
+    //    week just to make it cross that, that's a problem. The numbers line up
+    //    where let's just do it freaking weekly."
+    //
+    // The thresholds existed to pay a landlord FASTER than a weekly calendar.
+    // They do not: they schedule four business days out, which is slower than
+    // the next Tuesday for most of the week, and they made payment depend on
+    // the collective behaviour of a landlord's other residents — Mountain View
+    // reached 50% on Sep 9 and its money was booked for Sep 16 while sitting
+    // available the whole time.
+    //
+    // And the money says the complexity buys nothing. Stripe's outbound fee is
+    // 0.17% of VOLUME plus $0.25 per payout. The percentage is charged on the
+    // amount moved however it is batched, so cadence only moves the quarters:
+    // weekly against three-per-cycle is 33 cents a month at Mountain View.
+    // Paying a week sooner is worth more than that to a landlord.
+    //
+    // Every Connect-ready landlord, every weekly run. The trigger machinery
+    // below still measures the roll — that reporting is worth keeping — but it
+    // no longer decides who gets paid.
+    ...(weeklyDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r })) : []),
     ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
     ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
@@ -370,6 +400,7 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       const fired = await processOneCandidate(cand, today)
       if (fired === 'fired')                      result.payoutsFired++
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
+      else if (fired === 'below_minimum')         result.skippedBelowMinimum++
       else if (fired === 'already_paid_this_week')result.skippedAlreadyPaidThisWeek++
       else if (fired === 'failed')                result.payoutsFailed++
 
@@ -388,12 +419,12 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
       // MAX_DEFERRALS. Everything else — a real payout, an already-paid, a
       // failure — retires as before. The daily-refire worry S616 had is handled
       // by the deferral cap, not by throwing the trigger away.
+      // S640: a trigger no longer schedules anything, so there is nothing to
+      // defer — it is simply retired once the weekly run has dealt with this
+      // landlord. Deferring would leave it sitting due forever now that nobody
+      // reads it to decide a payout.
       if (cand.kind === 'user') {
         for (const t of due.filter(x => x.entity_kind === 'user' && x.entity_id === cand.entity_id)) {
-          if (fired === 'zero_balance' && await deferTrigger(t.id, today)) {
-            result.triggersDeferred++
-            continue
-          }
           await markTriggerFired(t.id, fired === 'fired' ? undefined : fired)
         }
       }
@@ -411,7 +442,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
   return result
 }
 
-type OneCandidateOutcome = 'fired' | 'zero_balance' | 'already_paid_this_week' | 'failed'
+type OneCandidateOutcome =
+  'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed'
 
 async function processOneCandidate(cand: Candidate, today: string): Promise<OneCandidateOutcome> {
   // 1. Pre-skip: already paid TODAY? Stripe's idempotency_key is the
@@ -424,20 +456,27 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
   //    second one, leaving the landlord waiting on the very money the change
   //    exists to release. Narrowed to the same day, which is what the Stripe
   //    idempotency key already dedupes on.
+  // ── S640 (Nic): A MINIMUM INTERVAL, NOT A CALENDAR RULE ────────────────
+  //
+  //   "I like your idea of the deduplication minimum interval instead of a
+  //    calendar rule."
+  //
+  // The old guard asked whether a payout had been created TODAY. That answers
+  // the wrong question: it permitted two payouts on consecutive days and it
+  // matched only the one trigger_type it knew about. Asking how long it has
+  // been since this account was last paid covers every ordering there is, and
+  // it is one rule instead of a list of pairings.
+  let daysSinceLastPayout: number | null = null
   if (cand.kind === 'user') {
-    const recent = await query(
-      `SELECT 1 FROM disbursements
-        WHERE user_id = $1
-          AND trigger_type = 'auto_friday'
-          -- S617: the frame matters now. This database runs in Phoenix, so a
-          -- bare $2::date would mean midnight PHOENIX (07:00 UTC) while the
-          -- engine fires at 01:00 UTC — the guard would stop matching its own
-          -- payouts. Anchored to UTC, the frame today is computed in.
-          AND created_at >= ($2::date AT TIME ZONE 'UTC')
-        LIMIT 1`,
-      [cand.entity_id, today]
+    const last = await query<{ days: string | null }>(
+      `SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 86400 AS days
+         FROM disbursements WHERE user_id = $1`,
+      [cand.entity_id]
     )
-    if (recent.length > 0) return 'already_paid_this_week'
+    daysSinceLastPayout = last[0]?.days == null ? null : Number(last[0].days)
+    if (daysSinceLastPayout !== null && daysSinceLastPayout < MIN_DAYS_BETWEEN_PAYOUTS) {
+      return 'already_paid_this_week'
+    }
   }
 
   // 1b. Platform-holds reconcile (S561). Landlord rent sits on the PLATFORM
@@ -465,6 +504,28 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
   // 2. Read live Stripe available USD balance.
   const available = await getAvailableUsdBalance(cand.stripe_connect_account_id)
   if (available <= 0) return 'zero_balance'
+
+  // ── S640 (Nic): A FLOOR, WITH AN AGE OVERRIDE SO NOTHING STRANDS ───────
+  //
+  //   "Let's just make it a hundred dollar minimum if money is ever just
+  //    sitting there... if somebody stays one night in an RV, that's gonna just
+  //    sit there until the next billing cycle. So it's not a big deal.
+  //    Landlords operating on that scale aren't crying for the forty bucks
+  //    right away."
+  //
+  // Stripe's outbound fee is 0.17% of volume plus $0.25 a payout. The quarter
+  // is 0.6% of a $40 payout and 0.03% of an $800 one, so a floor is the only
+  // part of the cost that cadence can actually change.
+  //
+  // The override is what keeps this from being a trap: a residual that never
+  // reaches $100 is paid anyway once it has waited a month, which is the same
+  // billing cycle Nic measured it against. Money is delayed here; it is never
+  // kept.
+  if (available < MIN_PAYOUT_AMOUNT
+      && daysSinceLastPayout !== null
+      && daysSinceLastPayout < MAX_DAYS_BELOW_MINIMUM) {
+    return 'below_minimum'
+  }
 
   // 3. Fire the payout. Idempotency key: deterministic per (account, day) so
   //    accidental same-day re-runs deduplicate at Stripe.

@@ -753,6 +753,38 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COALESCE(SUM(d.amount),0) AS amount
       FROM disbursements d
       WHERE d.landlord_id = ANY($1) AND d.status='pending'`, [scopeIds])
+
+    // ── S640 (Nic): "NEXT DISBURSEMENT" HAS TO MEAN SOMETHING ──────────────
+    //
+    //   "It's still showing a next disbursement of zero dollars. The landlord's
+    //    expecting money to be handled and moved. They wanna know what's about
+    //    to hit their bank."
+    //
+    // It read the `disbursements` table, which records payouts GAM has already
+    // fired. Before the first one there is nothing there, so a landlord with
+    // $2,049 of collected rent waiting to be sent read $0 — the most alarming
+    // possible way to say "everything is fine".
+    //
+    // What they actually want is the money we are holding for them: rent that
+    // has cleared and is going out on the next weekly run. Read from our own
+    // records rather than Stripe, so the card cannot hang on an API call, and
+    // split from the part still clearing at the tenant's bank — that is a real
+    // distinction to a landlord waiting on a number, and quoting it as ready
+    // would be a promise we cannot keep this week.
+    const [pipeline] = await query<any>(`
+      SELECT
+        COALESCE(SUM(ubl.amount) FILTER (WHERE p.status = 'settled'), 0)::float   AS ready,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.status = 'processing'), 0)::float AS clearing
+        FROM payments p
+        LEFT JOIN user_balance_ledger ubl
+               ON ubl.reference_id = p.id
+              AND ubl.reference_type = 'payment'
+              AND ubl.type = 'allocation_owner_share'
+              AND ubl.stripe_transfer_id IS NULL
+       WHERE p.landlord_id = ANY($1)
+         AND p.platform_held = TRUE
+         AND ($2::uuid IS NULL OR p.unit_id IN (
+               SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
     // disbursements carry no unit or property — a payout is an entity-level
     // movement of money, so it stays blended even when a property is chosen.
     // ── S639: THE TREND AND THE KPI CARD HAVE TO AGREE ─────────────────────
@@ -957,6 +989,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
 
     res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0,
       work_trade_suspended: outstandingRow?.work_trade_suspended||0,
+      // S640: what is actually going out on the next weekly run, and what is
+      // still clearing behind it.
+      next_payout_ready: pipeline?.ready||0,
+      next_payout_clearing: pipeline?.clearing||0,
       delinquent_units_accruing_late_fees: delinq?.accruing_units||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate,
       // S605: surfaced so the dashboard can say "no rent can move yet" instead
       // of leaving the landlord to discover it in Financials → Banking.
