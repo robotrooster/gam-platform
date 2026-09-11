@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict mmdlKC3bGjdr7tYfRyxFgZqNDDRsVCbawaJ7QDYKbxYeYpyrMbtUXRzysBmKruT
+\restrict 0ZQ4fzrMiBuSV3I5R4vIaDw0p2HwcxNCxXjKXqn5mjIpZJxrZhA1xQLUtz2qbLo
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3413,6 +3413,40 @@ CREATE TABLE public.document_batches (
 
 
 --
+-- Name: document_package_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_package_items (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    package_id uuid NOT NULL,
+    template_id uuid NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    renewal_behavior text DEFAULT 'with_lease'::text NOT NULL,
+    required boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT document_package_items_renewal_behavior_check CHECK ((renewal_behavior = ANY (ARRAY['with_lease'::text, 'once_per_tenancy'::text, 'on_version_change'::text])))
+);
+
+
+--
+-- Name: document_packages; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_packages (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    unit_type text,
+    is_default boolean DEFAULT false NOT NULL,
+    archived_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT document_packages_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))))
+);
+
+
+--
 -- Name: documents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4946,6 +4980,10 @@ CREATE TABLE public.lease_documents (
     delivery_mode text DEFAULT 'agreement'::text NOT NULL,
     deposit_already_held boolean DEFAULT false NOT NULL,
     signing_window_restarted_at timestamp with time zone,
+    template_version integer,
+    package_group_id uuid,
+    package_id uuid,
+    package_sort_order integer,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_delivery_mode_check CHECK ((delivery_mode = ANY (ARRAY['agreement'::text, 'notice'::text]))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text]))),
@@ -5179,6 +5217,17 @@ CREATE TABLE public.lease_template_fields (
 
 
 --
+-- Name: lease_template_properties; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_template_properties (
+    template_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: lease_templates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5199,9 +5248,10 @@ CREATE TABLE public.lease_templates (
     is_unit_type_default boolean DEFAULT false NOT NULL,
     purpose text DEFAULT 'lease'::text NOT NULL,
     late_fee_terms jsonb,
+    version integer DEFAULT 1 NOT NULL,
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
-    CONSTRAINT lease_templates_purpose_check CHECK ((purpose = ANY (ARRAY['lease'::text, 'work_trade_addendum'::text]))),
+    CONSTRAINT lease_templates_purpose_check CHECK ((purpose = ANY (ARRAY['lease'::text, 'work_trade_addendum'::text, 'installment_sale'::text, 'park_rules'::text, 'state_disclosure'::text, 'addendum'::text, 'other'::text]))),
     CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))))
 );
 
@@ -11436,6 +11486,30 @@ ALTER TABLE ONLY public.document_batches
 
 
 --
+-- Name: document_package_items document_package_items_package_id_template_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_package_items
+    ADD CONSTRAINT document_package_items_package_id_template_id_key UNIQUE (package_id, template_id);
+
+
+--
+-- Name: document_package_items document_package_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_package_items
+    ADD CONSTRAINT document_package_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: document_packages document_packages_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_packages
+    ADD CONSTRAINT document_packages_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: documents documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12049,6 +12123,14 @@ ALTER TABLE ONLY public.lease_template_conditional_fees
 
 ALTER TABLE ONLY public.lease_template_fields
     ADD CONSTRAINT lease_template_fields_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_template_properties lease_template_properties_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_properties
+    ADD CONSTRAINT lease_template_properties_pkey PRIMARY KEY (template_id, property_id);
 
 
 --
@@ -15056,6 +15138,27 @@ CREATE INDEX idx_document_batches_landlord ON public.document_batches USING btre
 
 
 --
+-- Name: idx_document_package_items_package; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_document_package_items_package ON public.document_package_items USING btree (package_id, sort_order);
+
+
+--
+-- Name: idx_document_package_items_template; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_document_package_items_template ON public.document_package_items USING btree (template_id);
+
+
+--
+-- Name: idx_document_packages_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_document_packages_landlord ON public.document_packages USING btree (landlord_id) WHERE (archived_at IS NULL);
+
+
+--
 -- Name: idx_documents_maintenance_request; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15700,6 +15803,13 @@ CREATE INDEX idx_lease_documents_batch ON public.lease_documents USING btree (ba
 
 
 --
+-- Name: idx_lease_documents_package_group; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_documents_package_group ON public.lease_documents USING btree (package_group_id, package_sort_order) WHERE (package_group_id IS NOT NULL);
+
+
+--
 -- Name: idx_lease_documents_work_trade_agreement; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15760,6 +15870,13 @@ CREATE INDEX idx_lease_renewal_requests_lease ON public.lease_renewal_requests U
 --
 
 CREATE INDEX idx_lease_rent_components_lease ON public.lease_rent_components USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_template_properties_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_template_properties_property ON public.lease_template_properties USING btree (property_id);
 
 
 --
@@ -18343,6 +18460,13 @@ CREATE UNIQUE INDEX ux_cpsl_live_agreement ON public.cross_property_service_link
 --
 
 CREATE UNIQUE INDEX ux_cpsl_live_unit ON public.cross_property_service_links USING btree (unit_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: ux_document_packages_default; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_document_packages_default ON public.document_packages USING btree (landlord_id, COALESCE(unit_type, ''::text)) WHERE (is_default AND (archived_at IS NULL));
 
 
 --
@@ -21403,6 +21527,30 @@ ALTER TABLE ONLY public.document_batches
 
 
 --
+-- Name: document_package_items document_package_items_package_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_package_items
+    ADD CONSTRAINT document_package_items_package_id_fkey FOREIGN KEY (package_id) REFERENCES public.document_packages(id) ON DELETE CASCADE;
+
+
+--
+-- Name: document_package_items document_package_items_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_package_items
+    ADD CONSTRAINT document_package_items_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: document_packages document_packages_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_packages
+    ADD CONSTRAINT document_packages_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
 -- Name: documents documents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22363,6 +22511,14 @@ ALTER TABLE ONLY public.lease_documents
 
 
 --
+-- Name: lease_documents lease_documents_package_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_package_id_fkey FOREIGN KEY (package_id) REFERENCES public.document_packages(id) ON DELETE SET NULL;
+
+
+--
 -- Name: lease_documents lease_documents_promote_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22560,6 +22716,22 @@ ALTER TABLE ONLY public.lease_template_fields
 
 ALTER TABLE ONLY public.lease_template_fields
     ADD CONSTRAINT lease_template_fields_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_template_properties lease_template_properties_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_properties
+    ADD CONSTRAINT lease_template_properties_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_template_properties lease_template_properties_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_properties
+    ADD CONSTRAINT lease_template_properties_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
 
 
 --
@@ -25894,5 +26066,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict mmdlKC3bGjdr7tYfRyxFgZqNDDRsVCbawaJ7QDYKbxYeYpyrMbtUXRzysBmKruT
+\unrestrict 0ZQ4fzrMiBuSV3I5R4vIaDw0p2HwcxNCxXjKXqn5mjIpZJxrZhA1xQLUtz2qbLo
 

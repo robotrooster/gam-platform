@@ -2678,11 +2678,34 @@ export type NoLeaseDocumentType = typeof NO_LEASE_DOCUMENT_TYPES[number]
 // for original leases + renewals. 'work_trade_addendum' = the landlord's own
 // work-trade addendum form, auto-attached to a renewal when a paused work-trade
 // agreement needs a fresh tenancy. Landlords bring their own forms (Nic).
-export const LEASE_TEMPLATE_PURPOSES = ['lease', 'work_trade_addendum'] as const
+//
+// S641: widened past 'lease' for the signing package. Country Acres is why —
+// its rent-to-own contract is currently typed as a LEASE, because there was
+// nothing else to call it, which is exactly the confusion Nic wants gone: "a
+// lot of people are gonna be like, well, I already signed the lease, what's
+// this for? And it's like, okay, that's your installment sale contract."
+export const LEASE_TEMPLATE_PURPOSES = [
+  'lease', 'work_trade_addendum', 'installment_sale',
+  'park_rules', 'state_disclosure', 'addendum', 'other',
+] as const
 export type LeaseTemplatePurpose = typeof LEASE_TEMPLATE_PURPOSES[number]
 export const LEASE_TEMPLATE_PURPOSE_LABEL: Record<LeaseTemplatePurpose, string> = {
   lease:               'Lease',
   work_trade_addendum: 'Work-Trade Addendum',
+  installment_sale:    'Installment Sale Contract',
+  park_rules:          'Park Rules',
+  state_disclosure:    'State Disclosure',
+  addendum:            'Addendum',
+  other:               'Other Document',
+}
+
+/** How a package item behaves when the lease renews. */
+export const RENEWAL_BEHAVIORS = ['with_lease', 'once_per_tenancy', 'on_version_change'] as const
+export type RenewalBehavior = typeof RENEWAL_BEHAVIORS[number]
+export const RENEWAL_BEHAVIOR_LABEL: Record<RenewalBehavior, string> = {
+  with_lease:        'Signed again at renewal',
+  once_per_tenancy:  'Signed once, at move-in',
+  on_version_change: 'Only when it changes',
 }
 
 export const LEASE_DOCUMENT_TYPES = ['original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms', 'sublease_agreement',

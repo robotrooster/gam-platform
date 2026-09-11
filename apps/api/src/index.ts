@@ -96,6 +96,7 @@ import { posRouter }          from './routes/pos'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
+import { signingPackagesRouter } from './routes/signingPackages'
 import { backgroundRouter }   from './routes/background'
 import { emergencyContactsRouter } from './routes/emergencyContacts'
 import { announcementsRouter }  from './routes/announcements'
@@ -429,6 +430,7 @@ app.use('/api/background/id-files', (req, res, next) => {
 })
 app.use('/api/maint-portal', maintenancePortalRouter)
 app.use('/api/esign',         esignRouter)
+app.use('/api/signing-packages', signingPackagesRouter)
 app.use('/api/announcements',  announcementsRouter)
 app.use('/api/surveys',        surveysRouter)
 app.use('/api/tenant-credits', tenantCreditsRouter)

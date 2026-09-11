@@ -2016,6 +2016,11 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
       }
     }
 
+    // S641: a version is what makes "has this changed since they agreed to it"
+    // answerable, which is how park rules decide whether to come back around at
+    // renewal — and the same question covers a mid-tenancy change, so there is
+    // no second mechanism for publishing new rules.
+    await query('UPDATE lease_templates SET version = version + 1 WHERE id = $1', [template.id])
     await query('DELETE FROM lease_template_fields WHERE template_id=$1', [template.id])
     // Two-pass so conditional (nested) fields can link to their parent: a full
     // replace regenerates DB ids, so children reference the parent by its
