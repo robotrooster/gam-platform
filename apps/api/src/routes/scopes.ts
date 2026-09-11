@@ -15,6 +15,8 @@ import {
   BOOKKEEPER_ACCESS_LEVELS,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
+// S641: one resolver for portal URLs — never a localhost link in production.
+import { portalUrl, portalLink } from '../lib/portalUrls'
 import { resolveLandlordTarget, landlordIdForProperty } from '../lib/landlordScope'
 
 // ── Shared helpers ────────────────────────────────────────────────
@@ -161,9 +163,19 @@ async function getInviterName(landlordId: string): Promise<string> {
     || 'Your landlord'
 }
 
+/**
+ * S641: the invitation link.
+ *
+ * This read LANDLORD_PORTAL_URL, which has never existed in any environment —
+ * the variable is LANDLORD_APP_URL — so every team invitation ever sent pointed
+ * at http://localhost:3001. Lisa Scheeler's did. Nic: "you keep sending links to
+ * localhost when that's not what we're doing."
+ *
+ * Resolved centrally now (lib/portalUrls), where a production boot with the
+ * variable missing logs loudly and still emits the real host.
+ */
 function buildAcceptUrl(token: string): string {
-  const base = process.env.LANDLORD_PORTAL_URL || 'http://localhost:3001'
-  return `${base}/invite/${token}`
+  return portalLink('landlord', `invite/${token}`)
 }
 
 // ── Authenticated router: landlord manages scoped users ───────────
@@ -295,7 +307,7 @@ scopesRouter.patch(
           [req.params.userId])
         if (manager) {
           const inviterName = await getInviterName(landlordId)
-          const portalBase = process.env.LANDLORD_PORTAL_URL || 'http://localhost:3001'
+          const portalBase = portalUrl('landlord')
           createNotification({
             userId:    req.params.userId,
             landlordId,

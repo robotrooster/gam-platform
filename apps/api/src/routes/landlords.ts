@@ -33,6 +33,7 @@ import {
   rejectPropertyInvitation, revokePropertyInvitation,
 } from '../services/pm'
 import { logger } from '../lib/logger'
+import { portalLink } from '../lib/portalUrls'
 import { randomUUID } from 'crypto'
 import { unitNumberNeedsPrefix } from '@gam/shared'
 import { checkAgainstStatute } from '../services/stateLaw'
@@ -184,7 +185,9 @@ landlordsRouter.get('/my-referral', requireAuth, requireLandlord, async (req: an
         catch { /* unique collision — try next */ }
       }
     }
-    const base = process.env.LANDLORD_SIGNUP_URL || 'https://app.goldassetmanagement.com/signup'
+    // S641: the old fallback was https://app.goldassetmanagement.com/signup —
+    // a host that does not resolve. Not localhost, but just as unopenable.
+    const base = process.env.LANDLORD_SIGNUP_URL || portalLink('landlord', 'signup')
     res.json({ success: true, data: {
       referralCode: row?.referral_code ?? null,
       referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,

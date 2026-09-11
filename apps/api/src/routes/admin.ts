@@ -1,4 +1,6 @@
 import os from 'os'
+// S641: portal links resolve in one place — never localhost in production.
+import { portalLink } from '../lib/portalUrls'
 import path from 'path'
 import fs from 'fs'
 import { Router, type Request } from 'express'
@@ -1049,7 +1051,8 @@ export const myReferralHandler = async (req: any, res: any, next: any) => {
         } catch { /* collision — try next */ }
       }
     }
-    const base = process.env.LANDLORD_SIGNUP_URL || 'https://app.goldassetmanagement.com/signup'
+    // S641: app.goldassetmanagement.com does not resolve — see routes/landlords.
+    const base = process.env.LANDLORD_SIGNUP_URL || portalLink('landlord', 'signup')
     res.json({ success: true, data: {
       referralCode: row?.referral_code ?? null,
       referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
