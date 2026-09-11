@@ -237,6 +237,18 @@ function mapProviderStatus(raw: string): BackgroundCheckStatus {
 
 // The report's per-product items. Each non-null product carries a status of
 // 'clear' | 'consider'; products not in the ordered package come back null.
+/**
+ * S640 — what Checkr's own docs call "fully resolved".
+ *
+ *   "inspect the `status` field on each non-null product for values `clear` or
+ *    `consider` to determine when the screening is fully resolved."
+ *
+ * Anything else — pending, suspended, a status they add later — is a product
+ * still running. See summariseProducts: a report with one of those in it is NOT
+ * a clear report, and must never be shown to a landlord as one.
+ */
+const TERMINAL_PRODUCT_STATUSES = new Set(['clear', 'consider'])
+
 const CHECKR_TENANT_PRODUCTS = [
   'criminal_history', 'credit_report', 'eviction_history',
   'identity_verification', 'income_verification',
@@ -401,13 +413,21 @@ class CheckrProvider implements BackgroundProvider {
       // event that matters. Acknowledge this one and move on.
       case 'report.product.completed':
         return null
-      // Full report ready: data carries { id: report_id, order_id }. The route
-      // fetches the actual results via fetchReport(reportRef).
+      // ── S640: THE COMPLETION EVENT CARRIES A REPORT ID, NOT AN ORDER ID ──
+      //
+      // Checkr's Tenant docs: "we POST a report.completed event ... including
+      // the report_id", and "fetch it via GET /reports/{id} using the report_id
+      // from the webhook payload". Nowhere do they promise an order_id.
+      //
+      // This demanded one and threw without it — the same failure that made 75
+      // of 79 deliveries 500, one level up and on the only event that finishes a
+      // screening. An empty providerRef tells the route to resolve the order
+      // FROM the report, which carries order_id in its body.
       case 'report.completed':
         return {
-          providerRef: requireOrderRef(d, evt.type),
+          providerRef: d.order_id || '',
           status:      'complete',
-          reportRef:   d.id || null,
+          reportRef:   d.id || d.report_id || null,
           receivedAt:  new Date(),
         }
       // S640: an event we do not recognise is acknowledged, not retried.
@@ -437,20 +457,28 @@ class CheckrProvider implements BackgroundProvider {
     const status = mapCheckrTenantStatus(String(order.status || ''))
     if (status !== 'complete') return { status, reportRef: null }
 
-    let reportRef: string | null = null
+    // S640: the order saying completed is not the same as the screening being
+    // resolved — Checkr's docs put terminal status on each PRODUCT. Pull the
+    // report and check. A report that is not there yet is a documented 404
+    // meaning "not ready", not a broken link, so it stays processing.
     try {
       const rep = await fetch(`${this.baseUrl}/orders/${encodeURIComponent(providerRef)}/report`, {
         headers: this.headers(),
       })
-      if (rep.ok) {
-        const body = await rep.json() as Record<string, any>
-        reportRef = typeof body.id === 'string' ? body.id : null
-      }
+      if (!rep.ok) return { status: 'processing', reportRef: null }
+      const body = await rep.json() as Record<string, any>
+      const unresolved = CHECKR_TENANT_PRODUCTS.some((p) => {
+        const item = body[p]
+        return item && typeof item === 'object' && typeof item.status === 'string'
+          && !TERMINAL_PRODUCT_STATUSES.has(item.status)
+      })
+      if (unresolved) return { status: 'processing', reportRef: null }
+      return { status, reportRef: typeof body.id === 'string' ? body.id : null }
     } catch {
-      // The order is complete either way. A missing report id only means the
-      // summary is backfilled on the next pass, never that the status is wrong.
+      // Reaching Checkr failed, which says nothing about the screening. Leave it
+      // where it is and try again on the next pass.
+      return { status: 'processing', reportRef: null }
     }
-    return { status, reportRef }
   }
 
   async fetchReport(reportRef: string): Promise<Record<string, unknown> | null> {
@@ -465,11 +493,20 @@ class CheckrProvider implements BackgroundProvider {
     this.rawReport = report
     const products: Record<string, string> = {}
     const details: Record<string, Record<string, unknown>> = {}
+    // ── S640: A HALF-FINISHED REPORT IS NOT A CLEAR REPORT ─────────────────
+    //
+    // This started at 'clear' and only moved on a 'consider', so a product
+    // still PENDING left the overall result reading clear. A landlord could
+    // have approved somebody on a screening that had not finished running, and
+    // nothing on the page would have said so. Checkr's docs are explicit that
+    // resolution is per product; unresolved is its own answer, not a pass.
     let overall: 'clear' | 'consider' = 'clear'
+    let allTerminal = true
     for (const p of CHECKR_TENANT_PRODUCTS) {
       const item = report[p]
       if (item && typeof item === 'object' && typeof item.status === 'string') {
         products[p] = item.status
+        if (!TERMINAL_PRODUCT_STATUSES.has(item.status)) allTerminal = false
         if (item.status === 'consider') overall = 'consider'
         // ── S639 (Nic): "I'm just wondering why Checkr is considering a seven
         // twenty credit score as consider instead of good." ─────────────────
@@ -501,7 +538,11 @@ class CheckrProvider implements BackgroundProvider {
       provider:   'checkr',
       report_id:  report.id ?? reportRef,
       order_id:   report.order_id ?? null,
-      result:     overall,
+      result:     allTerminal ? overall : 'pending',
+      // S640: stated outright so a reader never has to infer it from the
+      // per-product map, and so the landlord page can say "still running"
+      // instead of rendering a verdict that is not one yet.
+      all_products_resolved: allTerminal,
       products,
       details,
       fetched_at: new Date().toISOString(),

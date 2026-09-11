@@ -29,7 +29,10 @@ export async function applyProviderUpdate(args: {
   // real per-product results pulled here, before the row update, so status and
   // summary land together. A failed fetch still applies the status — the
   // summary is backfilled on the next event or the next poll.
-  if (update.reportRef && provider.fetchReport) {
+  // S640: skip when the caller already has it — the webhook route fetches the
+  // report to resolve the order id, and pulling it twice costs an API call and
+  // risks two different answers landing on one row.
+  if (update.reportRef && provider.fetchReport && !update.reportSummary) {
     try {
       update.reportSummary = (await provider.fetchReport(update.reportRef)) ?? update.reportSummary ?? null
     } catch (e) {

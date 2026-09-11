@@ -1216,6 +1216,40 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
       return res.json({ success: true, applied: false })
     }
 
+    // ── S640: RESOLVE THE ORDER FROM THE REPORT WHEN THAT IS ALL WE GET ────
+    //
+    // Checkr's `report.completed` carries a report_id and does not promise an
+    // order_id — which is what GAM keys a screening by. The report body does
+    // carry order_id, so fetch it here and use it. The summary comes back on
+    // the same call, so it is handed straight to applyProviderUpdate rather
+    // than fetched twice.
+    if (!update.providerRef && update.reportRef && provider.fetchReport) {
+      try {
+        const summary = await provider.fetchReport(update.reportRef)
+        const orderId = (summary as any)?.order_id || (provider as any).rawReport?.order_id
+        if (orderId) {
+          update.providerRef = String(orderId)
+          update.reportSummary = summary ?? null
+        }
+      } catch (e) {
+        logger.error({ err: e, report_ref: update.reportRef },
+          '[BGC WEBHOOK] could not resolve the order from the report')
+      }
+    }
+    if (!update.providerRef) {
+      // Nothing to attach it to. Keep the event — it is evidence about what
+      // Checkr sends — and acknowledge, so this does not become another retry
+      // storm. The ten-minute poller finishes the screening regardless.
+      await archiveProviderPayload({
+        backgroundCheckId: null, landlordId: null, provider: provider.name,
+        reportRef: update.reportRef ?? null, source: 'webhook', eventType,
+        payload: event ?? { unparseable: rawBody.slice(0, 4000) },
+      })
+      logger.warn({ type: eventType, reportRef: update.reportRef },
+        '[BGC WEBHOOK] event names no order we can resolve — archived, poller will finish it')
+      return res.json({ success: true, applied: false })
+    }
+
     const check = await queryOne<any>(
       'SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name=$2',
       [update.providerRef, provider.name]
