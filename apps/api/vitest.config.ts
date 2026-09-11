@@ -10,6 +10,10 @@ export default defineConfig({
     include: ['src/**/*.test.ts', '../../packages/shared/src/**/*.test.ts'],
     exclude: ['node_modules/**', 'dist/**'],
     globalSetup: ['./src/test/globalSetup.ts'],
+    // S641: runs in EVERY worker, for every file. Its afterEach clears the
+    // live-mail opt-in so one forgetful file cannot leak it into the next suite
+    // and put real email on the wire. See src/test/setupEnv.ts.
+    setupFiles: ['./src/test/setupEnv.ts'],
     pool: 'forks',
     poolOptions: { forks: { singleFork: true } },
     fileParallelism: false,

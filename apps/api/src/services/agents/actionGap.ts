@@ -38,6 +38,21 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S641: signing packages ─────────────────────────────────────────────────
+  // A package decides what a resident is asked to put their name to. Nic:
+  // "some things are pertinent to some tenants and some things are not." That
+  // judgement is the landlord's, made once on a screen showing the whole list
+  // in order — not assembled from a spoken sentence where a missing phrase
+  // silently drops a disclosure from somebody's lease. The agent can still say
+  // what a package contains; it just cannot author one.
+  'signingPackages POST /':
+    'defines which documents a resident is asked to sign. Composing that from speech is how a state disclosure quietly goes missing from a lease — the landlord builds it on a screen that shows the whole list in signing order.',
+  'signingPackages PUT /:id':
+    'same authorship as creating one, and it silently changes what every FUTURE resident signs. A package is edited where its current contents are visible.',
+  'signingPackages DELETE /:id':
+    'archives a package so it stops being offered. Reversible and low-stakes, but it is the same editing surface as the two above and belongs with them rather than in a sentence.',
+  'signingPackages PUT /templates/:templateId/properties':
+    'pins a document to the properties it applies to. Nic\'s worry is precisely the mis-pin — "assigned parking gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud are exactly where that mistake happens.',
   // ── S633 ──────────────────────────────────────────────────────────────────
   'properties PATCH /:id/first-billing-cycle':
     'declares which month GAM starts invoicing a property\'s EXISTING tenants — it moves money for every onboarded tenancy at once, and only the landlord knows which months they already collected off-platform. Not derivable, not delegable, and answered once during onboarding on a screen that explains the consequence.',

@@ -6,7 +6,7 @@
  * tenant had ever received was a late notice.
  */
 import { randomUUID } from 'crypto'
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 const { resendSendMock } = vi.hoisted(() => ({
   resendSendMock: vi.fn(async () => ({ data: { id: `m_${Math.random().toString(36).slice(2)}` }, error: null }) as any),
@@ -24,6 +24,10 @@ beforeEach(async () => {
   resendSendMock.mockClear()
   process.env.EMAIL_SEND_LIVE = '1'
 })
+
+// Vitest shares one process across files. A flag left set here leaks into the
+// next suite, and that is how six real emails escaped a test run.
+afterEach(() => { delete process.env.EMAIL_SEND_LIVE })
 
 async function seedInvoice(opts: {
   dueDaysAgo?: number

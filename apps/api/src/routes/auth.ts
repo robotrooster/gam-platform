@@ -948,11 +948,29 @@ authRouter.post('/forgot-password', async (req, res, next) => {
       // recognise: the portal that served the form is the best answer, and
       // echoing only allow-listed origins is what stops a forged Origin
       // redirecting a live reset token somewhere else.
+      //
+      // S641 (Nic): "Lisa just tried to sign in on the landlord account… you
+      // might need to send her a reset password link."
+      //
+      // The map listed four roles and every OTHER staff role fell through to
+      // RESET_PASSWORD_URL — a variable that has never existed in any
+      // environment — and from there to the TENANT portal. So an on-site
+      // manager, a bookkeeper or a maintenance user asking to reset the password
+      // for a LANDLORD-portal login was mailed a link into the residents' app.
+      // Lisa is an on-site manager, which is exactly the hole.
+      //
+      // Every landlord-side staff role now resolves to the landlord portal.
+      // Listing them explicitly rather than defaulting: a role that belongs
+      // somewhere else must be a deliberate entry, not an accident of omission.
+      const LANDLORD_PORTAL_ROLES = [
+        'landlord', 'property_manager', 'onsite_manager', 'bookkeeper',
+        'maintenance', 'portfolio_manager',
+      ]
+      const landlordPortal = process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`
       const roleFallback: Record<string, string | undefined> = {
         admin:            process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
         super_admin:      process.env.ADMIN_APP_URL    || `https://admin.${APEX}`,
-        landlord:         process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`,
-        property_manager: process.env.LANDLORD_APP_URL || `https://landlord.${APEX}`,
+        ...Object.fromEntries(LANDLORD_PORTAL_ROLES.map(r => [r, landlordPortal])),
       }
       const portalBase = ALLOWED_RESET_ORIGINS.includes(origin)
         ? origin
