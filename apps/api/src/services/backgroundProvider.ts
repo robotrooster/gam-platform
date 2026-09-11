@@ -91,6 +91,19 @@ export interface BackgroundProvider {
   // report id (see BackgroundProviderWebhookUpdate.reportRef). Returns the
   // normalized summary to store on the row, or null if unavailable.
   fetchReport?(reportRef: string): Promise<Record<string, unknown> | null>
+  /**
+   * S640: ask the provider where an order stands, without waiting to be told.
+   *
+   * A webhook is one HTTP request that either arrives or does not. Checkr
+   * finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9 and GAM
+   * never heard — his screening sat at `processing` for twenty-two hours until
+   * Nic went in and decided it by hand. A $44.99 report that gates somebody's
+   * tenancy cannot depend on a single delivery.
+   */
+  fetchStatus?(providerRef: string): Promise<{
+    status: BackgroundCheckStatus
+    reportRef: string | null
+  } | null>
 }
 
 // ── MOCK PROVIDER ─────────────────────────────────────────────
@@ -386,6 +399,38 @@ class CheckrProvider implements BackgroundProvider {
   // Pull the report and normalize into the row's report_summary jsonb:
   // { result: 'clear'|'consider', products: { <product>: 'clear'|'consider' } }
   // Overall result is 'consider' if ANY included product is consider.
+  /**
+   * S640: the order's own view of itself, plus its report when there is one.
+   *
+   * `GET /orders/{id}` carries the status but no pointer to the report;
+   * `GET /orders/{id}/report` returns the report directly. Two calls, and the
+   * second only once the first says completed.
+   */
+  async fetchStatus(providerRef: string): Promise<{ status: BackgroundCheckStatus; reportRef: string | null } | null> {
+    const res = await fetch(`${this.baseUrl}/orders/${encodeURIComponent(providerRef)}`, {
+      headers: this.headers(),
+    })
+    if (!res.ok) return null
+    const order = await res.json() as Record<string, any>
+    const status = mapCheckrTenantStatus(String(order.status || ''))
+    if (status !== 'complete') return { status, reportRef: null }
+
+    let reportRef: string | null = null
+    try {
+      const rep = await fetch(`${this.baseUrl}/orders/${encodeURIComponent(providerRef)}/report`, {
+        headers: this.headers(),
+      })
+      if (rep.ok) {
+        const body = await rep.json() as Record<string, any>
+        reportRef = typeof body.id === 'string' ? body.id : null
+      }
+    } catch {
+      // The order is complete either way. A missing report id only means the
+      // summary is backfilled on the next pass, never that the status is wrong.
+    }
+    return { status, reportRef }
+  }
+
   async fetchReport(reportRef: string): Promise<Record<string, unknown> | null> {
     const res = await fetch(`${this.baseUrl}/reports/${encodeURIComponent(reportRef)}`, {
       headers: this.headers(),

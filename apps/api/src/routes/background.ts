@@ -26,6 +26,9 @@ import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
 import { emailScreeningApplyLink } from '../services/email'
 import { archiveProviderPayload } from '../services/backgroundReportArchive'
+// S640: shared with the status poller — see services/applicationPool.ts.
+import { isPoolEligible, upsertPoolEntry } from '../services/applicationPool'
+import { applyProviderUpdate } from '../services/backgroundApplyUpdate'
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 
 // S83: real Stripe PaymentIntents for applicant intake fee + landlord pool
@@ -181,41 +184,6 @@ async function geocodeAddress(street1: string, city: string, state: string, zip:
     if (data?.[0]) return { lat: data[0].lat, lon: data[0].lon }
   } catch (_) { /* timeout or network — fall through */ }
   return { lat: null, lon: null }
-}
-
-// Pool eligibility: tenant consented + risk gate. Approved tenants are
-// housed and don't need leads; only denials and speculative completes
-// route here.
-function isPoolEligible(check: any): boolean {
-  if (!check.consent_pool) return false
-  if (check.risk_level === 'very_high') return false
-  return true
-}
-
-// Idempotent pool-entry create. Backfills pool_entry_id pointer on bgc.
-async function upsertPoolEntry(check: any) {
-  const existing = await queryOne<any>(
-    'SELECT id FROM application_pool WHERE background_check_id=$1',
-    [check.id]
-  )
-  if (existing) return existing
-  const geo = check.street1 && check.city
-    ? await geocodeAddress(check.street1, check.city, check.state, check.zip)
-    : { lat: null, lon: null }
-  const entry = await queryOne<any>(`
-    INSERT INTO application_pool
-      (background_check_id, user_id, status, consent_pool, employment_status, monthly_income, city, state, zip, lat, lon, risk_level, risk_score)
-    VALUES ($1, $2, 'available', TRUE, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    RETURNING id
-  `, [
-    check.id, check.user_id,
-    check.employment_status, check.monthly_income,
-    check.city, check.state, check.zip,
-    geo.lat, geo.lon,
-    check.risk_level, check.risk_score,
-  ])
-  await query('UPDATE background_checks SET pool_entry_id=$1 WHERE id=$2', [entry!.id, check.id])
-  return entry
 }
 
 // ── PRICING + PAYMENT INTENT (mock Stripe) ───────────────────
@@ -1205,65 +1173,22 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     }
     const update = provider.parseWebhook(rawBody)
 
-    // S551: providers whose webhooks carry only a report pointer (Checkr
-    // Tenant report.completed → { id, order_id }) get the real per-product
-    // results pulled here, before the row update, so status + summary land
-    // together. A failed fetch still applies the status — the summary can
-    // be backfilled by the next redelivery (their webhooks retry).
-    if (update.reportRef && provider.fetchReport) {
-      try {
-        update.reportSummary = (await provider.fetchReport(update.reportRef)) ?? update.reportSummary ?? null
-      } catch (e) {
-        logger.error({ err: e, report_ref: update.reportRef }, '[BGC WEBHOOK] report fetch failed')
-      }
-    }
-
     const check = await queryOne<any>(
       'SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name=$2',
       [update.providerRef, provider.name]
     )
     if (!check) throw new AppError(404, 'Unknown provider_ref')
 
-    const expiresClause = update.status === 'complete'
-      ? ", expires_at = NOW() + INTERVAL '6 months'"
-      : ''
-    // COALESCE keeps an existing summary when this event carries none —
-    // Checkr Tenant sends summary-less progress events (applicant.visited,
-    // product.completed) that must not null a previously stored report.
-    await query(`
-      UPDATE background_checks
-      SET status=$1, report_summary=COALESCE($2::jsonb, report_summary),
-          failure_reason=$3, webhook_received_at=NOW()${expiresClause}
-      WHERE id=$4`,
-      [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
-
-    // ── S639 (Nic): "start collecting it for future use" ────────────────────
-    //
-    // Two payloads worth keeping, and they answer different questions: the raw
-    // REPORT is what the provider found, the raw WEBHOOK is what they told us
-    // and when. Both are archived append-only; neither can fail the screening.
-    const rawReport = (provider as any).rawReport
-    if (rawReport) {
-      await archiveProviderPayload({
-        backgroundCheckId: check.id, landlordId: check.landlord_id,
-        provider: provider.name, reportRef: update.reportRef ?? null,
-        source: 'fetch', payload: rawReport,
-      })
-    }
-    await archiveProviderPayload({
-      backgroundCheckId: check.id, landlordId: check.landlord_id,
-      provider: provider.name, reportRef: update.reportRef ?? null,
-      source: 'webhook', eventType: (req.body && (req.body.type || req.body.event)) || null,
-      payload: req.body,
+    // S640: the body of this handler now lives in services/backgroundApplyUpdate
+    // so the status POLLER applies a verdict exactly the way a webhook does.
+    // Checkr completed Anastacio Erreguin's report and no webhook ever arrived;
+    // the poller is what makes the answer land at all, and two near-identical
+    // code paths advancing the same row is how they stop matching.
+    await applyProviderUpdate({
+      provider, check, update, source: 'webhook',
+      rawWebhookBody: req.body,
+      eventType: (req.body && (req.body.type || req.body.event)) || null,
     })
-
-    // Speculative path: complete → pool (if eligible). No landlord decision step.
-    if (update.status === 'complete' && (!check.landlord_id || await isPoolIntakeLandlord(check.landlord_id))) {
-      const fresh = await queryOne<any>('SELECT * FROM background_checks WHERE id=$1', [check.id])
-      if (fresh && isPoolEligible(fresh)) {
-        try { await upsertPoolEntry(fresh) } catch (e) { logger.error({ err: e }, '[POOL CREATE]') }
-      }
-    }
 
     res.json({ success: true })
   } catch (e) { next(e) }

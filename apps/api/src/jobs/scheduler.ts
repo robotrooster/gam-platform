@@ -1254,6 +1254,31 @@ export function schedulerInit() {
     }
   }, { timezone: 'UTC' })
 
+  // ── S640 (Nic): ASK CHECKR WHERE THE SCREENING IS ──────────────────────
+  //
+  //   "We do really need to fix whatever you were talking about with the
+  //    background check. I have sent the link to a couple more people through
+  //    text message today."
+  //
+  // Checkr finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9 and
+  // GAM never heard — not one request has reached /api/background/webhook in
+  // the entire log window. His screening sat at `processing` for twenty-two
+  // hours until Nic decided it by hand, on a report he could not see.
+  //
+  // Every ten minutes, because an applicant sitting on the "under review" page
+  // is the whole experience of this product, and because Checkr turned that
+  // report around in about two hours — ten minutes is noise against that and
+  // costs one API call per in-flight check.
+  cron.schedule('*/10 * * * *', async () => {
+    try {
+      const { syncPendingBackgroundChecks } = await import('../services/backgroundCheckSync')
+      const r = await syncPendingBackgroundChecks()
+      if (r.advanced > 0 || r.errors > 0) logger.info(r, '[bgc-sync]')
+    } catch (e) {
+      logger.error({ err: e }, '[bgc-sync] fatal')
+    }
+  })
+
   // S616 (Nic): link a neighbour's serviced space to the unit its own landlord
   // leases, automatically. "We are gonna be linking the units on the back end
   // automatically." Daily, because either side can onboard first.

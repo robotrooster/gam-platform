@@ -53,6 +53,7 @@ const phx = (isoDate: string) => new Date(`${isoDate}T12:00:00-07:00`)
 // July 2026 reference days (verified): 27th=Mon, 28th=Tue, 29th=Wed,
 // 31st=Fri, Aug 1=Sat, Aug 2=Sun.
 const TUESDAY   = phx('2026-07-28')
+const THURSDAY  = phx('2026-07-30')
 const MONDAY    = phx('2026-07-27')
 const WEDNESDAY = phx('2026-07-29')
 const FRIDAY    = phx('2026-07-31')
@@ -124,15 +125,20 @@ const atUtc = (isoDate: string, hour = 1) =>
   new Date(`${isoDate}T${String(hour).padStart(2, '0')}:00:00Z`)
 
 describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
-  it('is TRUE at 01:00 UTC on Tuesday — 6pm Phoenix Monday', () => {
-    const t = atUtc('2026-07-28')
-    // Sanity: this instant really is the previous day in Phoenix.
-    expect(t.toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })).toBe('2026-07-27')
+  // S640: the payout is booked at Stripe on THURSDAY now. The cron fires at
+  // 01:00 UTC Thursday, which is 6pm PHOENIX WEDNESDAY — the job pushes the
+  // button the evening before, exactly as it did for the old Tuesday payout
+  // (6pm Phoenix Monday). Pinning the real instant is the whole point of these:
+  // every other fixture is noon Phoenix and would stay green either way.
+  it('is TRUE at 01:00 UTC on Thursday — 6pm Phoenix Wednesday', () => {
+    const t = atUtc('2026-07-30')
+    expect(t.toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })).toBe('2026-07-29')
     expect(shouldRunToday(t)).toBe(true)
   })
 
   it('is FALSE at 01:00 UTC on the other weekdays', () => {
     expect(shouldRunToday(atUtc('2026-07-27'))).toBe(false)
+    expect(shouldRunToday(atUtc('2026-07-28'))).toBe(false)
     expect(shouldRunToday(atUtc('2026-07-29'))).toBe(false)
     expect(shouldRunToday(atUtc('2026-07-31'))).toBe(false)
   })
@@ -142,22 +148,22 @@ describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
     expect(shouldRunToday(atUtc('2026-08-02'))).toBe(false)
   })
 
-  it('skips the Tuesday that is a federal holiday', () => {
-    // 2026-12-25 is a Friday; use the New Year Tuesday-adjacent check instead:
-    // Christmas 2026 observed Fri Dec 25. Pick a Tuesday holiday: none in 2026,
-    // so assert the mechanism directly on Labor Day (Mon 2026-09-07) shifting
-    // that week's payout day forward off the holiday.
-    expect(shouldRunToday(atUtc('2026-09-07'))).toBe(false)  // Labor Day, a Monday
-    expect(shouldRunToday(atUtc('2026-09-08'))).toBe(true)   // that week's Tuesday
+  it('leaves a holiday week alone when the holiday is not the payout day', () => {
+    // Labor Day 2026 is Monday Sep 7. The payout day is Thursday, which the
+    // holiday does not touch — the shift only fires when the target day itself
+    // is a holiday.
+    expect(shouldRunToday(atUtc('2026-09-08'))).toBe(false)  // Tuesday, no longer the day
+    expect(shouldRunToday(atUtc('2026-09-10'))).toBe(true)   // 6pm Phoenix Wed Sep 9
   })
 })
 
-describe('shouldRunToday — Tuesday gate (D1)', () => {
-  it('is TRUE on Tuesday', () => {
-    expect(shouldRunToday(TUESDAY)).toBe(true)
+describe('shouldRunToday — Thursday gate (S640)', () => {
+  it('is TRUE on Thursday', () => {
+    expect(shouldRunToday(THURSDAY)).toBe(true)
   })
   it('is FALSE on every other weekday', () => {
     expect(shouldRunToday(MONDAY)).toBe(false)
+    expect(shouldRunToday(TUESDAY)).toBe(false)
     expect(shouldRunToday(WEDNESDAY)).toBe(false)
     expect(shouldRunToday(FRIDAY)).toBe(false)
   })
@@ -179,7 +185,7 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
 
   it('reconciles platform-held funds for a landlord user BEFORE firing the payout', async () => {
     const userId = await seedConnectReadyLandlord('acct_ll_1')
-    const res = await processAutoPayouts(TUESDAY)
+    const res = await processAutoPayouts(THURSDAY)
 
     expect(res.candidatesScanned).toBe(1)
     expect(res.payoutsFired).toBe(1)
@@ -203,7 +209,7 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
 
   it('sweeps an ENTITY-anchored landlord (Stage 2: account on landlords, users NULL)', async () => {
     const userId = await seedEntityAnchoredLandlord('acct_entity_1')
-    const res = await processAutoPayouts(TUESDAY)
+    const res = await processAutoPayouts(THURSDAY)
 
     // The pre-Stage-2 scan (users-only) would have missed this entirely.
     expect(res.candidatesScanned).toBe(1)
@@ -227,7 +233,7 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
         [landlordId])
       await c.query('COMMIT')
     } finally { c.release() }
-    const res = await processAutoPayouts(TUESDAY)
+    const res = await processAutoPayouts(THURSDAY)
     expect(res.candidatesScanned).toBe(0)
     expect(firePayoutMock).not.toHaveBeenCalled()
   })
@@ -239,7 +245,7 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
       attempted: false, payments_settled: 0, transfer_id: null, amount: 0,
     })
     const userId = await seedConnectReadyLandlord('acct_ll_2')
-    const res = await processAutoPayouts(TUESDAY)
+    const res = await processAutoPayouts(THURSDAY)
     expect(reconcileMock).toHaveBeenCalledWith(userId)
     expect(res.payoutsFired).toBe(1)
   })

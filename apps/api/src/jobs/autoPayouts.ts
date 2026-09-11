@@ -115,7 +115,18 @@ function addDays(date: Date, n: number): Date {
 // (Wed+2 = Fri, no margin) and only safe if the account reliably settles T+1.
 // PINNED PENDING C4 (live-account payout speed): if the live account is
 // confirmed reliably T+1, move to Wednesday to reclaim a float day.
-const PAYOUT_TARGET_DOW = 2  // Tuesday (0=Sun … 6=Sat)
+// ── S640 (Nic): THURSDAY ────────────────────────────────────────────────────
+//
+//   "Let's do the disbursement Thursdays... it'll either land Friday or Monday
+//    like you said."
+//
+// A standard Stripe payout lands one to two business days out, so Thursday
+// reaches the landlord's bank Friday at best and Monday at worst — money in
+// hand for the weekend when it moves fast, and waiting at the start of the week
+// when it does not. Tuesday was marginally quicker to usable funds; Nic weighed
+// that against landing on a Friday and chose Friday. Change this constant and
+// the holiday shift, the weekly gate and the run instant all follow.
+const PAYOUT_TARGET_DOW = 4  // Thursday (0=Sun … 6=Sat)
 
 // The target payout day for the work-week containing `now`, computed from any
 // day of that week. Sun is treated as day 7 (end of a Mon..Sun week) so the
