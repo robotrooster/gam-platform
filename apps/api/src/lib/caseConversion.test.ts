@@ -52,3 +52,49 @@ describe('camelCaseKeys', () => {
     expect(orig).toEqual(origCopy)
   })
 })
+
+// ── S641: a permission key must reach the frontend under its own name ───────
+//
+// Nic's on-site manager lost the Record payment button the moment it was
+// correctly gated on can('take_payment'). Her scope row said take_payment:true,
+// and the wire said takePayment:true — the camelizer preserved only DOTTED
+// keys, and two catalog keys have no dot.
+//
+// It hid for months because the button was ungated: it rendered for everyone,
+// so nothing ever revealed that the permission never answered.
+describe('permission keys survive the wire', () => {
+  it('keeps take_payment under its own name', () => {
+    const out: any = camelCaseKeys({ permissions: { take_payment: true } })
+    expect(out.permissions).toHaveProperty('take_payment', true)
+    expect(out.permissions).not.toHaveProperty('takePayment')
+  })
+
+  it('keeps guest_access too', () => {
+    const out: any = camelCaseKeys({ permissions: { guest_access: true } })
+    expect(out.permissions).toHaveProperty('guest_access', true)
+  })
+
+  it('keeps dotted keys verbatim, as before', () => {
+    const out: any = camelCaseKeys({ permissions: { 'pos.ring_sale': true, 'balances.view': true } })
+    expect(out.permissions).toHaveProperty('pos.ring_sale', true)
+    expect(out.permissions).toHaveProperty('balances.view', true)
+  })
+
+  // Config inside the same map is NOT a permission and still camelCases —
+  // bookkeeper access_level is read as accessLevel on the frontend.
+  it('still camelCases non-catalog config keys', () => {
+    const out: any = camelCaseKeys({ permissions: { access_level: 'read_only' } })
+    expect(out.permissions).toHaveProperty('accessLevel', 'read_only')
+  })
+
+  // The durable guard: a new catalog key without a dot cannot silently break.
+  it('EVERY catalog key survives, whatever its shape', () => {
+    const { PERMISSION_CATALOG } = require('@gam/shared')
+    const keys: string[] = []
+    for (const g of PERMISSION_CATALOG) for (const s of g.sections ?? []) for (const i of s.items ?? []) keys.push(i.key)
+    const perms = Object.fromEntries(keys.map(k => [k, true]))
+    const out: any = camelCaseKeys({ permissions: perms })
+    const mangled = keys.filter(k => out.permissions[k] !== true)
+    expect(mangled, `these keys do not survive camelization:\n  ${mangled.join('\n  ')}`).toEqual([])
+  })
+})
