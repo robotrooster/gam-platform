@@ -26,13 +26,25 @@ function catalogKeys(): string[] {
 }
 
 describe('permission keys survive the wire', () => {
-  it('take_payment is rewritten by the camelizer — the bug, pinned', () => {
+  // This pinned the BUG when it was written — takePayment out, take_payment
+  // gone. Two fixes landed for it in the same hour from two sessions sharing
+  // this tree, and they compose rather than conflict:
+  //
+  //   · the landlord gate now accepts both spellings (defence at the call site,
+  //     and still the thing that saves a NEW dotless key)
+  //   · the camelizer no longer rewrites catalog keys at all (the wire stops
+  //     lying, which every other consumer benefits from — agents, other
+  //     portals, anything reading a permissions map)
+  //
+  // So the assertion is inverted to the truth: the key survives under its own
+  // name, and the camelize fallback in the gate simply never fires.
+  it('take_payment reaches the browser under its own name', () => {
     const out: any = camelCaseKeys({ permissions: { take_payment: true } })
-    expect(out.permissions.takePayment).toBe(true)
-    expect(out.permissions.take_payment).toBeUndefined()
+    expect(out.permissions.take_payment).toBe(true)
+    expect(out.permissions.takePayment).toBeUndefined()
   })
 
-  it('dotted keys are left alone, which is why only this one broke', () => {
+  it('dotted keys are left alone, as they always were', () => {
     const out: any = camelCaseKeys({
       permissions: { 'balances.view': true, 'pos.tab.register': true, 'front_desk.view': true },
     })
