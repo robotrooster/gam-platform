@@ -151,3 +151,61 @@ describe('work trade stays private on the balances screen', () => {
     expect(res.body.data.some((i: any) => i.work_trade_credit_amount !== undefined)).toBe(true)
   })
 })
+
+// ── the back door into issuing credit ───────────────────────────────────────
+//
+// Nic: "I do not want to allow her to issue credit at this time." Issuing
+// credit was owner/property-manager only on the tenant-credits route — but an
+// overpayment taken at the counter could be KEPT as credit, and that path only
+// ever checked take_payment. Take $500 against a $460 balance, click "keep as
+// credit", and the front desk has minted one.
+describe('keeping an overpayment as credit', () => {
+  async function openRentCharge() {
+    const f = await seed()
+    const { rows } = await db.query<{ id: string }>(
+      `SELECT id FROM payments WHERE status='pending' AND work_trade_suspended_at IS NULL LIMIT 1`)
+    return { f, paymentId: rows[0].id }
+  }
+
+  it('is refused for the front desk', async () => {
+    const { f, paymentId } = await openRentCharge()
+    const res = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/manager/i)
+  })
+
+  // Refused, not quietly downgraded: what happened to real money in somebody's
+  // hand is not ours to decide on their behalf.
+  it('and nothing is recorded when it is refused', async () => {
+    const { f, paymentId } = await openRentCharge()
+    await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    const { rows } = await db.query(`SELECT status FROM payments WHERE id=$1`, [paymentId])
+    expect(rows[0].status).toBe('pending')
+    const credits = await db.query(`SELECT COUNT(*)::int AS n FROM tenant_credits`)
+    expect(credits.rows[0].n).toBe(0)
+  })
+
+  it('the front desk CAN still take the payment and hand the change back', async () => {
+    const { f, paymentId } = await openRentCharge()
+    const res = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'change' })
+    expect(res.status).toBe(200)
+  })
+
+  it('the owner may keep it as credit', async () => {
+    const { f, paymentId } = await openRentCharge()
+    const res = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ method: 'cash', amountTendered: 500, surplusHandling: 'credit' })
+    expect(res.status).toBe(200)
+  })
+})

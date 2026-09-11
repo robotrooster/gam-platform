@@ -1068,6 +1068,23 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // S641 (Nic, on his on-site manager): "I do not want to allow her to issue
+    // credit at this time."
+    //
+    // Issuing credit has always been owner/property-manager only, enforced on
+    // the tenant-credits route — but an overpayment recorded at the counter can
+    // be KEPT as credit (S637), and that path only ever checked take_payment.
+    // So the front desk could mint a credit through the back door: take $500
+    // against a $460 balance and click "keep as credit".
+    //
+    // Refused rather than quietly downgraded to "gave change" — what happened
+    // to real money in someone's hand is not ours to decide on their behalf.
+    if (body.surplusHandling === 'credit'
+        && !canManageLandlordResource(req.user, pmt.landlord_id, ['property_manager'])) {
+      throw new AppError(403,
+        'Keeping an overpayment as account credit needs a manager. Hand the difference back, '
+        + 'or ask a manager to record this one.')
+    }
     if (pmt.type !== 'rent') {
       throw new AppError(409, 'Only rent charges can be recorded as a manual payment')
     }
