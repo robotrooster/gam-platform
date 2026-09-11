@@ -160,6 +160,10 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flexsuite_enrollment_acceptances`)
   await db.query(`DELETE FROM flex_deposit_installments`)
   await db.query(`DELETE FROM screening_fee_accruals`)
+  // S640: the archive can now hold a webhook we could not attribute to a check
+  // (background_check_id NULL), so nothing cascades it away — it keeps a
+  // landlord_id, which keeps a user alive, which blocks the user delete below.
+  await db.query(`DELETE FROM background_check_reports`)
   await db.query(`DELETE FROM background_checks`)
   // S579: pending_tenant_intents FKs properties + units (property_id +
   // screening_waived_unit_id) with NO ACTION. Property-level intents have a

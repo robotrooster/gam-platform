@@ -1171,6 +1171,19 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     if (!provider.verifyWebhook(req.headers as any, rawBody)) {
       throw new AppError(401, 'Invalid webhook signature')
     }
+    // ── S640: THE ARCHIVE WAS STORING BUFFERS ──────────────────────────────
+    //
+    // This route takes the RAW bytes (express.raw, so the HMAC verifies against
+    // exactly what Checkr sent), which means req.body is a Buffer — not an
+    // object. Everything downstream read it as one anyway: the archived payload
+    // came out as {"type":"Buffer","data":[...]} and the event type as null, so
+    // the record of "what did the provider actually send us" was unreadable.
+    // Parse once, after verification, and use that everywhere.
+    const event: any = (() => {
+      try { return JSON.parse(rawBody) } catch { return null }
+    })()
+    const eventType: string | null = event?.type ?? event?.event ?? null
+
     const update = provider.parseWebhook(rawBody)
     // ── S640: ACKNOWLEDGE WHAT WE DO NOT ACT ON ────────────────────────────
     //
@@ -1181,8 +1194,25 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     // event failing over and over, and the `report.completed` that would have
     // finished Anastacio Erreguin's screening never got through.
     if (!update) {
-      logger.info({ provider: provider.name, type: (req.body && (req.body.type || req.body.event)) || null },
+      logger.info({ provider: provider.name, type: eventType },
         '[BGC WEBHOOK] acknowledged, nothing to apply')
+      // S640: ARCHIVE IT ANYWAY. Nobody can say for certain which events the
+      // Checkr TENANT API sends — it is a different product from the staffing
+      // API their public docs describe, its event names differ, and the
+      // dashboard offers no subscription list to read. We expect
+      // `report.completed` to finish a screening and have never seen one
+      // arrive. Recording the ones we ignore turns the next real applicant into
+      // the answer, instead of another round of guessing. Keyed by order id
+      // where the event carries one; unattached otherwise.
+      const ref = event?.data?.order_id || event?.data?.id || null
+      const owner = ref
+        ? await queryOne<any>('SELECT id, landlord_id FROM background_checks WHERE provider_ref=$1', [ref])
+        : null
+      await archiveProviderPayload({
+        backgroundCheckId: owner?.id ?? null, landlordId: owner?.landlord_id ?? null,
+        provider: provider.name, reportRef: null,
+        source: 'webhook', eventType, payload: event ?? { unparseable: rawBody.slice(0, 4000) },
+      })
       return res.json({ success: true, applied: false })
     }
 
@@ -1199,8 +1229,8 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     // code paths advancing the same row is how they stop matching.
     await applyProviderUpdate({
       provider, check, update, source: 'webhook',
-      rawWebhookBody: req.body,
-      eventType: (req.body && (req.body.type || req.body.event)) || null,
+      rawWebhookBody: event,
+      eventType,
     })
 
     res.json({ success: true })

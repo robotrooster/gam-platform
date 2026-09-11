@@ -282,6 +282,24 @@ describe('S640 events we do not act on are acknowledged, not retried', () => {
     expect(res.body.applied).toBe(false)
   })
 
+  // The point of acknowledging is not just to stop the retries — it is to find
+  // out what Checkr Tenant actually sends. Nobody can say: it is a different
+  // product from the staffing API the public docs describe, and the dashboard
+  // has no event list to read. The next real applicant is the answer, provided
+  // we keep what arrives.
+  it('keeps the ignored event, so the next applicant tells us what Checkr sends', async () => {
+    const raw = JSON.stringify(tenantEvent('report.product.completed',
+      { id: 'rpi_keep', report_id: 'rp_keep', status: 'clear' }))
+    await post(raw)
+    const { rows } = await db.query<any>(
+      `SELECT event_type, source, background_check_id FROM background_check_reports
+        WHERE event_type = 'report.product.completed'`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].source).toBe('webhook')
+    // Unattached: the event names a report item, not an order we know.
+    expect(rows[0].background_check_id).toBeNull()
+  })
+
   it('200s an event type Checkr adds without telling anyone', async () => {
     const raw = JSON.stringify(tenantEvent('order.something.brand_new', { id: 'ord_x' }))
     const res = await post(raw)

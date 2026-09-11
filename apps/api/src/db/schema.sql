@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict YLxz0abch2WMxbeQcmlTriW7xxmB57BRI6z2ba5Nrf2FBfWjStAday1PCgn7dJH
+\restrict PDMPgzcGCInn3YalHD6bRbjEGBRHCcgxcUggTdKb1n7SCTBUekwt8BJcgDSN9a0
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1282,7 +1282,7 @@ CREATE TABLE public.auto_field_jobs (
 
 CREATE TABLE public.background_check_reports (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    background_check_id uuid NOT NULL,
+    background_check_id uuid,
     landlord_id uuid,
     provider text NOT NULL,
     report_ref text,
@@ -1300,6 +1300,13 @@ CREATE TABLE public.background_check_reports (
 --
 
 COMMENT ON TABLE public.background_check_reports IS 'S639: append-only archive of every raw provider payload for a background check. Consumer report data — landlord/admin surfaces only, never tenant-facing. purge_after supports FCRA-reasonable disposal once a retention period is chosen.';
+
+
+--
+-- Name: COLUMN background_check_reports.background_check_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.background_check_reports.background_check_id IS 'S640: nullable. A fetched report always names its check; a raw webhook may carry an id we cannot resolve yet, and is kept unattached rather than dropped.';
 
 
 --
@@ -25791,5 +25798,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict YLxz0abch2WMxbeQcmlTriW7xxmB57BRI6z2ba5Nrf2FBfWjStAday1PCgn7dJH
+\unrestrict PDMPgzcGCInn3YalHD6bRbjEGBRHCcgxcUggTdKb1n7SCTBUekwt8BJcgDSN9a0
 

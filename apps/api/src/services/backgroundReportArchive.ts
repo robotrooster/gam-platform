@@ -11,7 +11,8 @@ import { query } from '../db'
 import { logger } from '../lib/logger'
 
 export interface ArchiveInput {
-  backgroundCheckId: string
+  /** S640: null for a raw webhook whose event names no check we know yet. */
+  backgroundCheckId: string | null
   landlordId?: string | null
   provider: string
   reportRef?: string | null
