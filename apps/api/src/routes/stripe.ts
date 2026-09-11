@@ -356,7 +356,12 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     // Stamp the bank metadata regardless (available on the PM once attached),
     // but only flip ach_verified when the SetupIntent actually succeeded.
     await query(
-      `UPDATE tenants SET ach_verified = $1, bank_last4 = $2, bank_routing_last4 = $3 WHERE id = $4`,
+      // S641: a fresh attempt resets the nudge counter, so somebody who
+      // abandons one setup and starts another is chased about the NEW one
+      // rather than being silently out of reminders.
+      `UPDATE tenants SET ach_verified = $1, bank_last4 = $2, bank_routing_last4 = $3,
+              bank_verify_nudge_count = 0, bank_verify_nudge_at = NULL
+        WHERE id = $4`,
       [verified, bank?.last4 || null, bank?.routing_number?.slice(-4) || null, req.user!.profileId]
     )
 

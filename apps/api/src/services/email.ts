@@ -2329,6 +2329,54 @@ export async function emailBalanceDue(
   )
 }
 
+// ── S641: FINISH VERIFYING YOUR BANK ────────────────────────────────────────
+//
+// Found while chasing a Stripe error in the log. Two residents had entered bank
+// details and were sitting in `requires_action` — Stripe had sent the two small
+// deposits and neither had come back to confirm the amounts. One of them had
+// been stalled for nine days. The other had tried twice, failed once, and was
+// simultaneously being mailed "Late payment alert — Day 10".
+//
+// Nothing chased either of them. The portal showed a bank on file, the late-fee
+// engine saw somebody not paying, and the one thing standing between the two
+// was a step nobody was reminded to finish. These are people actively trying to
+// pay us.
+export async function emailVerifyBankReminder(
+  to: string,
+  args: {
+    tenantName: string
+    bankLast4: string | null
+    startedOn: string
+    portalUrl: string
+    landlordName?: string
+    hasBalanceDue?: boolean
+  },
+  ctx?: { landlordId?: string; tenantId?: string },
+): Promise<string | null> {
+  return await send(to, 'Finish setting up your bank account',
+    base(
+      h('One step left on your bank account') +
+      p(`Hi ${escapeHtml(args.tenantName)},`) +
+      p(`You started adding your bank account${args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''} on ${escapeHtml(args.startedOn)}, but it is not finished yet.`) +
+      p('Your bank received two small deposits from us, each under a dollar. Enter those two amounts in your portal and your account is ready to use.') +
+      (args.hasBalanceDue
+        // Say the quiet part: they may be getting late notices for a payment
+        // they believe they already set up.
+        ? p('<strong style="color:#eef1f8">Until this is finished we cannot take a payment from that account</strong>, so any rent showing as owed is still owed.')
+        : '') +
+      btn('Finish verifying', args.portalUrl) +
+      p(`If you no longer want to use that account, you can add a different one on the same screen. Questions? Reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will help.`)
+    ),
+    {
+      category: 'bank_verification_reminder',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+    },
+    'support',
+  )
+}
+
 // ── S641: THE BILL ITSELF ────────────────────────────────────────────────────
 //
 // Nic: "a lot of people are saying, oh, I never got my bill. I don't know what

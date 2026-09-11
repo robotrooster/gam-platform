@@ -1074,7 +1074,9 @@ webhooksRouter.post('/stripe', async (req, res) => {
         const routingLast4 = bank?.routing_number?.slice(-4) ?? null
         // Flip only on the FALSE→TRUE transition (idempotent on re-delivery).
         const flipped = await queryOne<{ id: string }>(
-          `UPDATE tenants SET ach_verified = TRUE, bank_last4 = $2, bank_routing_last4 = $3
+          // S641: verified means we stop chasing them about finishing it.
+          `UPDATE tenants SET ach_verified = TRUE, bank_last4 = $2, bank_routing_last4 = $3,
+                  bank_verify_nudge_count = 0, bank_verify_nudge_at = NULL
             WHERE ${tenantId ? 'id = $1' : 'stripe_customer_id = $1'}
               AND ach_verified = FALSE
             RETURNING id`,

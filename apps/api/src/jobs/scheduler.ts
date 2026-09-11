@@ -1369,6 +1369,19 @@ export function schedulerInit() {
   // S582 (Nic): tenant invite nudge — remind tenants BEFORE their 7-day invite
   // lapses (reduces onboarding drop-off; the control tower alerts the landlord
   // only after it expires). 10am daily; the job self-spaces reminders per intent.
+  // S641: chase unfinished bank setups. 9:30am Phoenix — late enough that
+  // somebody can act on it during a working day, and once daily because the job
+  // paces itself (every 72 hours, four times, then stop).
+  cron.schedule('30 9 * * *', async () => {
+    try {
+      const { sendBankVerificationNudges } = await import('./bankVerificationNudge')
+      const r = await sendBankVerificationNudges()
+      if (r.sent > 0 || r.failed > 0) logger.info(r, '[bank-verify-nudge]')
+    } catch (e) {
+      logger.error({ err: e }, '[bank-verify-nudge] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   cron.schedule('0 10 * * *', async () => {
     try {
       const { nudgeExpiringInvites } = await import('./inviteNudge')

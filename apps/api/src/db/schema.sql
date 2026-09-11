@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 0ZQ4fzrMiBuSV3I5R4vIaDw0p2HwcxNCxXjKXqn5mjIpZJxrZhA1xQLUtz2qbLo
+\restrict y829F9hX0ff6W8N2VpYxzfX8oqBrR4NbPLgIHLX7O77aO8eGQMxWJKTbaYxt40K
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9304,6 +9304,8 @@ CREATE TABLE public.tenants (
     flexpay_clean_streak integer DEFAULT 0 NOT NULL,
     flexpay_returner_cleared boolean DEFAULT false NOT NULL,
     flexpay_permanently_banned boolean DEFAULT false NOT NULL,
+    bank_verify_nudge_at timestamp with time zone,
+    bank_verify_nudge_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT tenants_background_check_status_check CHECK ((background_check_status = ANY (ARRAY['not_started'::text, 'submitted'::text, 'approved'::text, 'denied'::text, 'cancelled'::text, 'expired'::text, 'waived'::text]))),
     CONSTRAINT tenants_flexpay_pull_day_check CHECK (((flexpay_pull_day IS NULL) OR ((flexpay_pull_day >= 1) AND (flexpay_pull_day <= 28)))),
     CONSTRAINT tenants_income_arrival_day_check CHECK (((income_arrival_day >= 1) AND (income_arrival_day <= 28))),
@@ -9331,6 +9333,13 @@ COMMENT ON COLUMN public.tenants.flexpay_returner_cleared IS 'S578: TRUE once a 
 --
 
 COMMENT ON COLUMN public.tenants.flexpay_permanently_banned IS 'S578: TRUE after the 2nd lifetime FlexPay default. Terminal — blocks all future enrollment.';
+
+
+--
+-- Name: COLUMN tenants.bank_verify_nudge_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.bank_verify_nudge_count IS 'S641: reminders sent for the CURRENT unfinished bank setup. Reset when a new setup starts or the bank verifies.';
 
 
 --
@@ -26066,5 +26075,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 0ZQ4fzrMiBuSV3I5R4vIaDw0p2HwcxNCxXjKXqn5mjIpZJxrZhA1xQLUtz2qbLo
+\unrestrict y829F9hX0ff6W8N2VpYxzfX8oqBrR4NbPLgIHLX7O77aO8eGQMxWJKTbaYxt40K
 
