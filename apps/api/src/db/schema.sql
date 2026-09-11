@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict y829F9hX0ff6W8N2VpYxzfX8oqBrR4NbPLgIHLX7O77aO8eGQMxWJKTbaYxt40K
+\restrict RLURdgfzEhmrSh1P2pYD4WOeEmVXUtefuSdTpjnnvBdNDFmDWR44LiLcSXBsg3x
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3447,6 +3447,17 @@ CREATE TABLE public.document_packages (
 
 
 --
+-- Name: document_properties; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_properties (
+    document_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: documents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3466,8 +3477,17 @@ CREATE TABLE public.documents (
     signed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
     maintenance_request_id uuid,
-    CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'receipt'::text, 'other'::text])))
+    property_id uuid,
+    is_reference boolean DEFAULT false NOT NULL,
+    CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'receipt'::text, 'park_rules'::text, 'disclosure'::text, 'reference'::text, 'other'::text])))
 );
+
+
+--
+-- Name: COLUMN documents.is_reference; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.documents.is_reference IS 'S641: kept to print and hand over — not produced by a signing flow and never shown as something the tenant executed.';
 
 
 --
@@ -11519,6 +11539,14 @@ ALTER TABLE ONLY public.document_packages
 
 
 --
+-- Name: document_properties document_properties_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_properties
+    ADD CONSTRAINT document_properties_pkey PRIMARY KEY (document_id, property_id);
+
+
+--
 -- Name: documents documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15168,10 +15196,24 @@ CREATE INDEX idx_document_packages_landlord ON public.document_packages USING bt
 
 
 --
+-- Name: idx_document_properties_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_document_properties_property ON public.document_properties USING btree (property_id);
+
+
+--
 -- Name: idx_documents_maintenance_request; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_documents_maintenance_request ON public.documents USING btree (maintenance_request_id) WHERE (maintenance_request_id IS NOT NULL);
+
+
+--
+-- Name: idx_documents_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_documents_property ON public.documents USING btree (property_id) WHERE (property_id IS NOT NULL);
 
 
 --
@@ -21560,6 +21602,22 @@ ALTER TABLE ONLY public.document_packages
 
 
 --
+-- Name: document_properties document_properties_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_properties
+    ADD CONSTRAINT document_properties_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.documents(id) ON DELETE CASCADE;
+
+
+--
+-- Name: document_properties document_properties_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_properties
+    ADD CONSTRAINT document_properties_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: documents documents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21581,6 +21639,14 @@ ALTER TABLE ONLY public.documents
 
 ALTER TABLE ONLY public.documents
     ADD CONSTRAINT documents_maintenance_request_id_fkey FOREIGN KEY (maintenance_request_id) REFERENCES public.maintenance_requests(id) ON DELETE SET NULL;
+
+
+--
+-- Name: documents documents_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
 
 
 --
@@ -26075,5 +26141,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict y829F9hX0ff6W8N2VpYxzfX8oqBrR4NbPLgIHLX7O77aO8eGQMxWJKTbaYxt40K
+\unrestrict RLURdgfzEhmrSh1P2pYD4WOeEmVXUtefuSdTpjnnvBdNDFmDWR44LiLcSXBsg3x
 

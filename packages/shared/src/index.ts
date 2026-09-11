@@ -2641,7 +2641,14 @@ export enum DepositStatus {
 // Single source of truth for documents.type CHECK constraint.
 // Pattern: as-const array + derived union + Record<T,...> label map.
 // Adding a value: edit the array, compiler forces the label map update.
-export const DOCUMENT_CATEGORIES = ['lease', 'addendum', 'move_in_checklist', 'move_out_checklist', 'notice', 'receipt', 'other'] as const
+// S641: the old list described things that come OUT of a signing flow. Nic's
+// filing cabinet is the other kind — "our park rules… most parks offer that as
+// a separate bulletin board posted in the office" — things you print and
+// physically hand somebody.
+export const DOCUMENT_CATEGORIES = [
+  'lease', 'addendum', 'move_in_checklist', 'move_out_checklist',
+  'notice', 'receipt', 'park_rules', 'disclosure', 'reference', 'other',
+] as const
 export type DocumentCategory = typeof DOCUMENT_CATEGORIES[number]
 export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
   lease:              'Lease',
@@ -2650,8 +2657,15 @@ export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
   move_out_checklist: 'Move-Out Checklist',
   notice:             'Notice',
   receipt:            'Receipt',
+  park_rules:         'Park Rules',
+  disclosure:         'Disclosure',
+  reference:          'Reference',
   other:              'Other',
 }
+
+/** Kept to print and hand over, rather than produced by a signing flow. */
+export const REFERENCE_DOCUMENT_CATEGORIES: readonly DocumentCategory[] =
+  ['park_rules', 'disclosure', 'reference', 'notice'] as const
 
 // Lease document types on the `lease_documents` table (e-sign dispatcher).
 // Single source of truth for lease_documents.document_type CHECK constraint.
