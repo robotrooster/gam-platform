@@ -1254,6 +1254,26 @@ export function schedulerInit() {
     }
   }, { timezone: 'UTC' })
 
+  // ── S640 (Nic): THE YEARLY EMERGENCY-CONTACT CHECK ─────────────────────
+  //
+  //   "Maybe make a thing where we can ping tenants to update an emergency
+  //    contact — maybe once a year, we make sure it's still relevant."
+  //
+  // Weekly, mid-morning, and deliberately quiet: it asks a household at most
+  // once every ninety days and only when their contact is missing or a year
+  // unconfirmed. Nothing here is urgent — a resident at the counter is a far
+  // better prompt than an email, which is what the Front Desk list is for. The
+  // signing reminders are the cautionary tale: 952 emails to 39 people.
+  cron.schedule('0 10 * * 2', async () => {
+    try {
+      const { pingTenantsForEmergencyContact } = await import('./emergencyContactRefresh')
+      const r = await pingTenantsForEmergencyContact()
+      if (r.asked > 0) logger.info(r, '[emergency-contact-refresh]')
+    } catch (e) {
+      logger.error({ err: e }, '[emergency-contact-refresh] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // ── S640 (Nic): ASK CHECKR WHERE THE SCREENING IS ──────────────────────
   //
   //   "We do really need to fix whatever you were talking about with the

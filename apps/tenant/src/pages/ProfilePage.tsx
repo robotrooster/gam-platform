@@ -9,6 +9,7 @@ const api = axios.create({ baseURL: `${API_URL}/api` })
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 function get<T>(path: string): Promise<T> { return api.get(path).then(r => r.data?.data ?? r.data) }
 function patchReq(path: string, body: any) { return api.patch(path, body).then(r => r.data) }
+function putReq(path: string, body: any) { return api.put(path, body).then(r => r.data?.data ?? r.data) }
 
 const NOTIF_TYPES = [
   { type:'payment_failed',              label:'Payment Failed',         desc:'When your rent payment fails' },
@@ -137,6 +138,7 @@ export function ProfilePage() {
 
       {tab === 'profile' && (
         <div style={{ maxWidth:440 }}>
+          <EmergencyContactCard />
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
             <div>
               <label style={s('First Name')}>First Name</label>
@@ -342,6 +344,93 @@ export function ProfilePage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * S640 — "who should we call?", answered by the person themselves.
+ *
+ * Nic: "if there's no emergency contact on the leases, then we send the sort of
+ * survey in the tenant portal... just a name and phone number and that basic
+ * stuff."
+ *
+ * The other end of the yearly check. Sits at the top of the profile tab when
+ * there is nothing on file, because that is the state worth interrupting for,
+ * and quietly further down once it is answered. Saving counts as confirming —
+ * a resident telling us it is right IS the confirmation, and asking them to
+ * click a second button to say so would be inventing a step.
+ */
+function EmergencyContactCard() {
+  const qc = useQueryClient()
+  const { data: ec, isLoading } = useQuery<any>('tenant-emergency-contact',
+    () => get<any>('/emergency-contacts/mine'))
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [rel, setRel] = useState('')
+  const [touched, setTouched] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (ec && !touched) {
+      setName(ec.name ?? ''); setPhone(ec.phone ?? ''); setRel(ec.relationship ?? '')
+    }
+  }, [ec, touched])
+
+  const save = useMutation(
+    () => putReq('/emergency-contacts/mine', { name, phone, relationship: rel }),
+    {
+      onSuccess: () => { setErr(null); setTouched(false); qc.invalidateQueries('tenant-emergency-contact') },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'Could not save that.'),
+    })
+
+  if (isLoading) return null
+  const missing = !ec?.phone
+  // The API camelizes on the way out — reading confirmed_at here would be
+  // undefined forever, which is the exact bug the wire-contract guard exists
+  // to catch (it caught this one).
+  const confirmed = ec?.confirmedAt
+
+  return (
+    <div style={{
+      marginBottom: 18, padding: '14px 16px', borderRadius: 10,
+      background: missing ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+      border: `1px solid ${missing ? 'rgba(201,162,39,.3)' : 'var(--border-0)'}`,
+    }}>
+      <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
+        Emergency contact
+      </div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        {missing
+          ? 'If there were ever an emergency here, who should we call for you?'
+          : confirmed
+            ? `Confirmed ${new Date(confirmed).toLocaleDateString()}. Update it any time it changes.`
+            : 'Please check this is still right.'}
+      </div>
+      <div style={{ display: 'grid', gap: 8 }}>
+        <input value={name} placeholder="Their name"
+          onChange={e => { setTouched(true); setName(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+        <input value={phone} placeholder="Their phone number" inputMode="tel"
+          onChange={e => { setTouched(true); setPhone(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+        <input value={rel} placeholder="How you know them (optional)"
+          onChange={e => { setTouched(true); setRel(e.target.value) }}
+          style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-1)' }} />
+      </div>
+      {err && (
+        <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #ef4444)', display:'flex', gap:5, alignItems:'center' }}>
+          <AlertCircle size={12} /> {err}
+        </div>
+      )}
+      <button type="button" disabled={save.isLoading || (!touched && !missing)}
+        onClick={() => save.mutate()}
+        style={{ marginTop: 10, padding:'8px 16px', borderRadius:8, border:'none', fontSize:'.8rem', fontWeight:700,
+                 cursor: save.isLoading ? 'default' : 'pointer',
+                 background: (touched || missing) ? 'var(--gold)' : 'var(--bg-3)',
+                 color: (touched || missing) ? 'var(--bg-0)' : 'var(--text-3)' }}>
+        {save.isLoading ? 'Saving…' : touched ? 'Save' : missing ? 'Save' : 'Saved'}
+      </button>
     </div>
   )
 }

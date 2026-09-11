@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Es0XiYRsqtIwDfs1eh8qubvdn0duKMaNLQy2cFHfGYc1vNKuoUgYgzrtfZIrhkV
+\restrict fOsFf3MKZmCitpLfR6HtYjfoCZOzu38ophfXK8a5aNBs1Mkodd6qEHZOuh5iJHF
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3549,7 +3549,8 @@ CREATE TABLE public.emergency_contacts (
     source_field_id uuid,
     confirmed_at timestamp with time zone,
     confirmed_by_user_id uuid,
-    CONSTRAINT emergency_contacts_not_empty CHECK (((name IS NOT NULL) OR (phone IS NOT NULL) OR (raw_text IS NOT NULL))),
+    asked_at timestamp with time zone,
+    CONSTRAINT emergency_contacts_not_empty CHECK (((name IS NOT NULL) OR (phone IS NOT NULL) OR (raw_text IS NOT NULL) OR (asked_at IS NOT NULL))),
     CONSTRAINT emergency_contacts_source_check CHECK ((source = ANY (ARRAY['lease'::text, 'staff'::text, 'tenant'::text, 'parser'::text])))
 );
 
@@ -3566,6 +3567,13 @@ COMMENT ON COLUMN public.emergency_contacts.raw_text IS 'S640: what the lease fi
 --
 
 COMMENT ON COLUMN public.emergency_contacts.confirmed_at IS 'S640: last time a person confirmed this is still current. Drives the annual re-check.';
+
+
+--
+-- Name: COLUMN emergency_contacts.asked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.emergency_contacts.asked_at IS 'S640: when we last asked this resident to confirm or supply a contact. Distinct from confirmed_at, which is when they last answered.';
 
 
 --
@@ -25849,5 +25857,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Es0XiYRsqtIwDfs1eh8qubvdn0duKMaNLQy2cFHfGYc1vNKuoUgYgzrtfZIrhkV
+\unrestrict fOsFf3MKZmCitpLfR6HtYjfoCZOzu38ophfXK8a5aNBs1Mkodd6qEHZOuh5iJHF
 

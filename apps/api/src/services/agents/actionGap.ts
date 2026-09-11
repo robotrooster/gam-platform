@@ -57,6 +57,10 @@ const DELIBERATE = new Map(Object.entries({
     'records the number somebody dials on the worst day of a resident\'s life. Transcribing a phone number from a spoken sentence is the single highest-risk thing an agent can do with a contact detail — it is why editing an invite\'s email was kept away from the agent too — and here the failure mode is nobody answering in an emergency. Typed at the counter, read back off the screen.',
   'emergencyContacts POST /confirm':
     'asserts that a resident\'s emergency contact is still current. Only the RESIDENT can know that; a staff-side agent confirming it on their behalf would manufacture a fact. When the annual re-check reaches the tenant portal this becomes the tenant answering for themselves, not an agent answering for them.',
+  'emergencyContacts GET /mine':
+    'a tenant reading their own emergency contact in their portal. Read-only and self-scoped; there is nothing for an agent to do with it that the page does not already do.',
+  'emergencyContacts PUT /mine':
+    'the resident answering "who should we call" for themselves. Same reason the staff-side write is not an agent action, and more so: transcribing a phone number from speech is the highest-risk thing an agent can do with a contact detail, and the failure mode is nobody answering in an emergency. They type it in their portal.',
   'emergencyContacts POST /import':
     'a bulk write across every resident at once, reading the lease field for the whole portfolio. It is an owner-level one-off, idempotent, and there is nothing to say to it in a sentence.',
   'background PATCH /:id/decision':

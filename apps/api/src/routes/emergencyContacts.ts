@@ -166,3 +166,67 @@ emergencyContactsRouter.post('/import', requirePerm('tenants.create'), async (re
     res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })
+
+// ── TENANT-FACING: MY OWN EMERGENCY CONTACT ────────────────────────────────
+//
+// Nic: "if there's no emergency contact on the leases, then we send the sort of
+// survey in the tenant portal."
+//
+// The other end of the yearly check. A resident answering for themselves is the
+// only version of this that is actually true — which is also why the agent is
+// not allowed to answer it for them (see actionGap.ts).
+emergencyContactsRouter.get('/mine', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const row = await queryOne<any>(
+      `SELECT id, name, phone, relationship, confirmed_at
+         FROM emergency_contacts
+        WHERE tenant_id = (SELECT id FROM tenants WHERE user_id = $1)
+        ORDER BY (phone IS NOT NULL) DESC, sort_order, created_at LIMIT 1`,
+      [req.user!.userId])
+    res.json({ success: true, data: row ?? null })
+  } catch (e) { next(e) }
+})
+
+emergencyContactsRouter.put('/mine', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const body = z.object({
+      name:         z.string().trim().max(120).nullish(),
+      phone:        z.string().trim().max(40).nullish(),
+      relationship: z.string().trim().max(60).nullish(),
+    }).parse(req.body)
+
+    const tenant = await queryOne<{ id: string }>(
+      'SELECT id FROM tenants WHERE user_id = $1', [req.user!.userId])
+    if (!tenant) throw new AppError(404, 'No tenant record')
+
+    const digits = (body.phone ?? '').replace(/\D/g, '')
+    const phone = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits
+    if (phone && phone.length !== 10) throw new AppError(400, 'That phone number needs to be 10 digits.')
+    const name = body.name?.trim() || null
+    if (!name && !phone) throw new AppError(400, 'Give a name and a phone number.')
+
+    const existing = await queryOne<{ id: string }>(
+      `SELECT id FROM emergency_contacts WHERE tenant_id = $1
+        ORDER BY (phone IS NOT NULL) DESC, sort_order, created_at LIMIT 1`, [tenant.id])
+
+    // Answered by the person themselves, so it is confirmed by definition.
+    const row = existing
+      ? await queryOne<any>(
+          `UPDATE emergency_contacts
+              SET name = $2, phone = NULLIF($3,''), relationship = $4,
+                  source = 'tenant', confirmed_at = NOW(), confirmed_by_user_id = $5,
+                  updated_at = NOW()
+            WHERE id = $1 RETURNING id, name, phone, relationship, confirmed_at`,
+          [existing.id, name, phone, body.relationship?.trim() || null, req.user!.userId])
+      : await queryOne<any>(
+          `INSERT INTO emergency_contacts
+             (tenant_id, name, phone, relationship, source, confirmed_at, confirmed_by_user_id, sort_order)
+           VALUES ($1,$2,NULLIF($3,''),$4,'tenant',NOW(),$5,0)
+           RETURNING id, name, phone, relationship, confirmed_at`,
+          [tenant.id, name, phone, body.relationship?.trim() || null, req.user!.userId])
+
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})

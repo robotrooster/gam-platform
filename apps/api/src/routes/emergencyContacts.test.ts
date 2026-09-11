@@ -160,6 +160,39 @@ describe('S640 emergency contact roster', () => {
   })
 })
 
+describe('S640 importing without trampling what staff typed', () => {
+  it('claims the row a person already entered instead of adding a second', async () => {
+    const f = await seed()
+    // What actually happened in production: David Shultz had "Henry Sauer" from
+    // his lease and again from the counter, and the roster then reported Henry
+    // as the emergency contact for two households.
+    await db.query(
+      `UPDATE emergency_contacts SET source = 'staff', source_field_id = NULL, phone = '5205551234'
+        WHERE tenant_id = $1`, [f.coreenTenantId])
+
+    const { importEmergencyContactsFromLeases } = await import('../services/emergencyContacts')
+    await importEmergencyContactsFromLeases({ landlordIds: [f.landlordId] })
+
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS c FROM emergency_contacts WHERE tenant_id=$1`, [f.coreenTenantId])
+    expect(rows[0].c).toBe(1)
+    const { rows: kept } = await db.query<any>(
+      `SELECT phone FROM emergency_contacts WHERE tenant_id=$1`, [f.coreenTenantId])
+    expect(kept[0].phone).toBe('5205551234')   // what the person typed survives
+  })
+
+  it('counts households, not rows, when one person is several people’s contact', async () => {
+    const f = await seed()
+    // A second row for the SAME resident must not read as a second household.
+    await db.query(
+      `INSERT INTO emergency_contacts (tenant_id, name, phone, source, sort_order)
+       VALUES ($1, 'Irma Fuentes', '5205559999', 'staff', 1)`, [f.coreenTenantId])
+    const res = await roster(f.ownerToken)
+    const coreen = res.body.data.find((r: any) => r.tenant_first === 'Coreen')
+    expect(coreen.shared_with_count).toBe(2)   // Coreen + Bret, not three rows
+  })
+})
+
 describe('S640 recording one at the counter', () => {
   const put = (token: string, body: any) => request(buildApp())
     .put('/api/emergency-contacts').set('Authorization', `Bearer ${token}`).send(body)
@@ -209,5 +242,70 @@ describe('S640 recording one at the counter', () => {
       `SELECT confirmed_at, name FROM emergency_contacts WHERE tenant_id=$1`, [f.coreenTenantId])
     expect(rows[0].confirmed_at).not.toBeNull()
     expect(rows[0].name).toBe('Irma Fuentes')   // untouched
+  })
+})
+
+/**
+ * S640 — the resident answering for themselves.
+ *
+ * Nic: "if there's no emergency contact on the leases, then we send the sort of
+ * survey in the tenant portal." This is the endpoint behind it — and the reason
+ * the agent is not allowed to answer it (actionGap.ts): only the person knows.
+ */
+describe('S640 a resident answering for themselves', () => {
+  const tenantToken = (userId: string) => jwt.sign(
+    { userId, role: 'tenant', email: 't@t.dev', permissions: {} },
+    process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+  async function seedTenantUser() {
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const u = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ('me-' || gen_random_uuid() || '@t.dev','x','tenant','Self','Serve',TRUE) RETURNING id`)
+      const t = await c.query<{ id: string }>(
+        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
+      await c.query('COMMIT')
+      return { userId: u.rows[0].id, tenantId: t.rows[0].id, token: tenantToken(u.rows[0].id) }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('returns null when they have nothing on file', async () => {
+    const me = await seedTenantUser()
+    const res = await request(buildApp())
+      .get('/api/emergency-contacts/mine').set('Authorization', `Bearer ${me.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toBeNull()
+  })
+
+  // Saving IS confirming. Asking somebody to click a second button to say the
+  // thing they just typed is right would be inventing a step.
+  it('saving their own counts as confirming it', async () => {
+    const me = await seedTenantUser()
+    const res = await request(buildApp())
+      .put('/api/emergency-contacts/mine').set('Authorization', `Bearer ${me.token}`)
+      .send({ name: 'Sam Kin', phone: '520-555-0142', relationship: 'Brother' })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT phone, source, confirmed_at FROM emergency_contacts WHERE tenant_id=$1`, [me.tenantId])
+    expect(rows[0].phone).toBe('5205550142')
+    expect(rows[0].source).toBe('tenant')
+    expect(rows[0].confirmed_at).not.toBeNull()
+  })
+
+  it('a landlord cannot use the tenant endpoint', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .get('/api/emergency-contacts/mine').set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('refuses a half-typed number rather than storing a stub', async () => {
+    const me = await seedTenantUser()
+    const res = await request(buildApp())
+      .put('/api/emergency-contacts/mine').set('Authorization', `Bearer ${me.token}`)
+      .send({ name: 'Sam', phone: '520555' })
+    expect(res.status).toBe(400)
   })
 })

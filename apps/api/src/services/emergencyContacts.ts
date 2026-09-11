@@ -61,6 +61,40 @@ export async function importEmergencyContactsFromLeases(
   for (const r of rows) {
     const parsed = parseEmergencyContact(r.value)
     try {
+      // ── S640: DO NOT ADD A SECOND ROW FOR THE SAME PERSON ────────────────
+      //
+      // A contact somebody typed at the counter has no source_field_id, so the
+      // conflict clause below cannot see it — and the import happily created a
+      // duplicate beside it. David Shultz ended up with "Henry Sauer" twice,
+      // once from his lease and once from staff, and the roster then reported
+      // Henry as the emergency contact for two households.
+      //
+      // When the lease names somebody this tenant already has, claim that row
+      // instead: it keeps the provenance, fills whatever is still blank, and
+      // leaves what a person typed alone.
+      if (parsed.name) {
+        const existing = await queryOne<{ id: string }>(
+          `SELECT id FROM emergency_contacts
+            WHERE tenant_id = $1 AND source_field_id IS NULL
+              AND name IS NOT NULL AND lower(trim(name)) = lower(trim($2))
+            ORDER BY created_at LIMIT 1`,
+          [r.tenant_id, parsed.name],
+        )
+        if (existing) {
+          await query(
+            `UPDATE emergency_contacts
+                SET source_field_id = $2,
+                    phone        = COALESCE(phone, $3),
+                    relationship = COALESCE(relationship, $4),
+                    raw_text     = COALESCE(raw_text, $5),
+                    updated_at   = NOW()
+              WHERE id = $1`,
+            [existing.id, r.field_id, parsed.phone, parsed.relationship, parsed.raw],
+          )
+          out.updated++
+          continue
+        }
+      }
       // Even an unusable line is kept — "Wife" or "NA" tells the desk the
       // question was asked and answered badly, which is different from never
       // having been asked. What is NOT kept is a name or number we invented.
@@ -167,9 +201,14 @@ export async function emergencyContactRoster(args: {
        -- S640 (Nic): "what if two or three other people have the same person as
        -- an emergency contact?" Then that person is worth knowing about — they
        -- are the one call that reaches several households.
-       (SELECT COUNT(*) FROM emergency_contacts o
+       -- S640: DISTINCT TENANTS, not rows. Counting rows read a duplicate on
+       -- ONE resident as two households — David Shultz had "Henry Sauer" from
+       -- his lease and again from the counter, and the page announced Henry as
+       -- the call for two homes. A number that reaches several households is
+       -- worth flagging; a double entry is worth fixing, not announcing.
+       (SELECT COUNT(DISTINCT o.tenant_id) FROM emergency_contacts o
          WHERE o.name IS NOT NULL AND ec.name IS NOT NULL
-           AND lower(o.name) = lower(ec.name))::int AS shared_with_count
+           AND lower(trim(o.name)) = lower(trim(ec.name)))::int AS shared_with_count
      FROM lease_tenants lt
      JOIN leases l    ON l.id = lt.lease_id AND l.status = 'active'
      JOIN tenants t   ON t.id = lt.tenant_id
