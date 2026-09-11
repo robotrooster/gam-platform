@@ -99,10 +99,28 @@ paymentsRouter.get('/', async (req, res, next) => {
       if (!req.user!.landlordId) {
         return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
       }
-      if (req.user!.permissions?.['payments.view_all'] !== true) {
+      // S641 (Nic): "the outstanding balances section of the payments tab is
+      // where you have to record a payment. My front desk needs to be able to
+      // record the damn payment."
+      //
+      // This used to return an EMPTY LIST to anyone without payments.view_all,
+      // which is why the front desk saw a blank tab: the page renders three
+      // sections off one query, and the one she needs came back with nothing.
+      //
+      // So `payments.view` is the narrow grant it always read like — the money
+      // still to collect, and nothing else. No settled history ("I don't want
+      // her seeing the histories at all") and no work-trade rows, which are a
+      // private arrangement between the landlord and that resident. Neither is
+      // needed to take cash across a counter.
+      const seesAll = req.user!.permissions?.['payments.view_all'] === true
+      if (!seesAll && req.user!.permissions?.['payments.view'] !== true) {
         return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
       }
       conditions.push(`p.landlord_id = $${pi++}`); params.push(req.user!.landlordId)
+      if (!seesAll) {
+        conditions.push(`p.status IN ('pending', 'failed')`)
+        conditions.push(`p.work_trade_suspended_at IS NULL`)
+      }
     } else if (!isAdmin) {
       // Unknown role with no scope — empty rather than leak.
       return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })

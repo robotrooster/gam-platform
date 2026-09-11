@@ -25,8 +25,18 @@ import { getStripe } from '../lib/stripe'
 
 const NUDGE_EVERY_HOURS = 72
 const MAX_NUDGES = 4
-/** Give the deposits time to land before asking anyone to look for them. */
-const SETTLE_HOURS = 24
+
+/**
+ * Grace after the deposit ACTUALLY LANDS, not after the setup started.
+ *
+ * Nic: "whatever the longest time the deposits would realistically take to
+ * finish is, have it remind them." We do not have to estimate that — Stripe
+ * reports an `arrival_date` on the SetupIntent, so the reminder is timed off
+ * the real event. A day after it lands is the earliest the message can be true
+ * and useful; before that we would be telling somebody to look for something
+ * their bank has not posted yet.
+ */
+const GRACE_AFTER_ARRIVAL_HOURS = 24
 
 export interface BankNudgeResult {
   considered: number
@@ -80,17 +90,27 @@ export async function sendBankVerificationNudges(
         si.next_action?.type === 'verify_with_microdeposits')
       if (!waiting) { result.skippedNotStalled++; continue }
 
-      const startedMs = waiting.created * 1000
+      const detail = (waiting as any).next_action?.verify_with_microdeposits ?? {}
+      // Stripe reports when the deposit reaches the bank. Fall back to the
+      // setup's creation only if it is somehow absent.
+      const arrivalMs = (detail.arrival_date ?? waiting.created) * 1000
       const now = (opts.now ?? new Date()).getTime()
-      if (now - startedMs < SETTLE_HOURS * 3600 * 1000) { result.skippedNotStalled++; continue }
+      if (now - arrivalMs < GRACE_AFTER_ARRIVAL_HOURS * 3600 * 1000) {
+        result.skippedNotStalled++
+        continue
+      }
 
       result.considered++
       await emailVerifyBankReminder(t.email, {
         tenantName: t.first_name || 'there',
         bankLast4: t.bank_last4,
-        startedOn: new Date(startedMs).toLocaleDateString('en-US',
+        arrivedOn: new Date(arrivalMs).toLocaleDateString('en-US',
           { month: 'long', day: 'numeric', timeZone: 'America/Phoenix' }),
-        portalUrl: portalLink('tenant', 'payments'),
+        // Driven by what Stripe reports, never assumed: sending somebody
+        // hunting for two amounts when their statement carries a code is worse
+        // than writing nothing.
+        verificationKind: detail.microdeposit_type === 'amounts' ? 'amounts' : 'descriptor_code',
+        verifyUrl: detail.hosted_verification_url || portalLink('tenant', 'payments'),
         hasBalanceDue: t.has_balance_due === true,
       }, { landlordId: t.landlord_id ?? undefined, tenantId: t.id })
 

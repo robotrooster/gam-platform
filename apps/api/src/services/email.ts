@@ -2331,41 +2331,53 @@ export async function emailBalanceDue(
 
 // ── S641: FINISH VERIFYING YOUR BANK ────────────────────────────────────────
 //
-// Found while chasing a Stripe error in the log. Two residents had entered bank
-// details and were sitting in `requires_action` — Stripe had sent the two small
-// deposits and neither had come back to confirm the amounts. One of them had
-// been stalled for nine days. The other had tried twice, failed once, and was
-// simultaneously being mailed "Late payment alert — Day 10".
+// Found while chasing a Stripe error in the log. Dominic Gonzalez started a bank
+// setup on September 2, Stripe's deposit landed on the 3rd, and he had been
+// parked in `requires_action` ever since. Nothing chased him: the portal showed
+// a bank on file and the engine saw somebody not paying.
 //
-// Nothing chased either of them. The portal showed a bank on file, the late-fee
-// engine saw somebody not paying, and the one thing standing between the two
-// was a step nobody was reminded to finish. These are people actively trying to
-// pay us.
+// The copy matters more than usual here. Stripe verifies one of two ways and
+// the live account uses `descriptor_code` — a SINGLE deposit of about a dollar
+// whose BANK STATEMENT DESCRIPTION carries a six-character code. An email
+// telling somebody to "enter the two amounts" would send them hunting for
+// something that is not on their statement, which is worse than not writing at
+// all. Both shapes are handled, driven by what Stripe actually reports.
+//
+// The link is Stripe's own hosted verification page, taken from the live
+// SetupIntent. It is the shortest path from this email to a finished setup.
 export async function emailVerifyBankReminder(
   to: string,
   args: {
     tenantName: string
     bankLast4: string | null
-    startedOn: string
-    portalUrl: string
+    /** When the deposit actually landed — Stripe tells us, so we do not guess. */
+    arrivedOn: string
+    /** 'descriptor_code' (a code in the statement description) or 'amounts'. */
+    verificationKind: 'descriptor_code' | 'amounts'
+    /** Stripe's hosted page. Falls back to the portal when absent. */
+    verifyUrl: string
     landlordName?: string
     hasBalanceDue?: boolean
   },
   ctx?: { landlordId?: string; tenantId?: string },
 ): Promise<string | null> {
+  const howTo = args.verificationKind === 'descriptor_code'
+    ? p('Look at your bank statement for a deposit of about a dollar from us. Next to it, in the description, is a <strong style="color:#eef1f8">six-character code</strong> that starts with <strong style="color:#eef1f8">SM</strong>. Enter that code and your account is ready.')
+    : p('Your bank received <strong style="color:#eef1f8">two small deposits</strong> from us, each under a dollar. Enter both amounts and your account is ready.')
+
   return await send(to, 'Finish setting up your bank account',
     base(
       h('One step left on your bank account') +
       p(`Hi ${escapeHtml(args.tenantName)},`) +
-      p(`You started adding your bank account${args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''} on ${escapeHtml(args.startedOn)}, but it is not finished yet.`) +
-      p('Your bank received two small deposits from us, each under a dollar. Enter those two amounts in your portal and your account is ready to use.') +
+      p(`You started adding your bank account${args.bankLast4 ? ` ending in <strong style="color:#eef1f8">${escapeHtml(args.bankLast4)}</strong>` : ''}, and the verification deposit reached your bank on ${escapeHtml(args.arrivedOn)}. It has not been confirmed yet.`) +
+      howTo +
       (args.hasBalanceDue
-        // Say the quiet part: they may be getting late notices for a payment
-        // they believe they already set up.
-        ? p('<strong style="color:#eef1f8">Until this is finished we cannot take a payment from that account</strong>, so any rent showing as owed is still owed.')
+        // Say the quiet part: they may believe they already set up the payment
+        // that would have covered what they owe.
+        ? p('<strong style="color:#eef1f8">Until this is confirmed we cannot take a payment from that account</strong>, so anything showing as owed is still owed.')
         : '') +
-      btn('Finish verifying', args.portalUrl) +
-      p(`If you no longer want to use that account, you can add a different one on the same screen. Questions? Reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will help.`)
+      btn('Confirm my bank', args.verifyUrl) +
+      p(`If you would rather use a different account, you can add one in your portal. Questions? Reply to this email and ${escapeHtml(args.landlordName || 'your landlord')} will help.`)
     ),
     {
       category: 'bank_verification_reminder',

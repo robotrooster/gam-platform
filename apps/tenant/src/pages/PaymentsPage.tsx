@@ -318,9 +318,15 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
       {showVerifyingNotice && (
         <div className="card" style={{ borderLeft: '3px solid var(--gold)', padding: '12px 16px', marginBottom: 12 }}>
-          <div style={{ fontWeight: 700, color: 'var(--t0)', marginBottom: 2 }}>Your bank is still verifying</div>
+          <div style={{ fontWeight: 700, color: 'var(--t0)', marginBottom: 2 }}>Your bank needs one more step from you</div>
           <div style={{ fontSize: '.82rem', color: 'var(--t2)', lineHeight: 1.5 }}>
-            This usually takes <strong>1–3 business days</strong> — we’ll email you the moment it’s ready, then you can pay by bank.
+            {/* S641 (Nic): this used to read "we'll email you the moment it's
+                ready", which says we are the ones working on it. We are not —
+                the bank is waiting on the tenant to confirm what we sent. One
+                resident sat for eight days past the deposit landing, waiting for
+                an email that was never coming while Stripe waited on him. */}
+            We sent a small deposit to your bank. Once it lands — usually <strong>1–3 business days</strong> —
+            confirm it in the box at the top of this page and you can pay by bank.
             {earliestDue ? <> Your rent is due <strong>{earliestDue}</strong>, so you have time.</> : null}
             {' '}Want to pay today? <button className="btn-link" style={{ padding: 0, font: 'inherit', color: 'var(--gold)', cursor: 'pointer', background: 'none', border: 'none' }} onClick={() => setAddMethodOpen('card')}>Add a card</button> — card payments are instant.
           </div>

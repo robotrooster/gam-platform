@@ -6,6 +6,7 @@ import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { useAuth } from '../context/AuthContext'
 import { SearchBox, PropertySelect } from '../components/ListControls'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle, Gift, ChevronRight, ChevronDown } from 'lucide-react'
 
@@ -665,7 +666,8 @@ export function PaymentsPage() {
   const [creditOpen, setCreditOpen] = useState(false)
   const [creditNotice, setCreditNotice] = useState<string | null>(null)
   const navigate = useNavigate()
-  const { can } = usePerms()
+  const { can, isOwner } = usePerms()
+  const role = useAuth().user?.role
   const queryClient = useQueryClient()
 
   // S576: the /payments payload carries propertyName (not propertyId), so the
@@ -811,9 +813,20 @@ export function PaymentsPage() {
           <p className="page-subtitle">Tenant ACH collections</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          {/* S641 (Nic): "I do not want to allow her to issue credit at this
+              time." The ROUTE already refuses anyone but an owner or property
+              manager, but the button was shown to everybody — so the front desk
+              saw an action that walls them at the last step. A control nobody
+              can use is worse than no control: it reads as something broken
+              rather than something withheld. */}
+          {/* Matches the server exactly: owners and property managers, nobody
+              else. Any wider and the button 403s; any narrower and a property
+              manager loses an action they legitimately have. */}
+          {(isOwner || role === 'property_manager') && (
           <button className="btn btn-primary" onClick={() => setCreditOpen(true)}>
             <Gift size={15} /> Issue Credit
           </button>
+          )}
           {can('payments.import_history') && (
             <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
               Import payment history
@@ -938,7 +951,12 @@ export function PaymentsPage() {
         {/* ── COVERED BY WORK TRADE ───────────────────────────────────────
             Not owed, not paid. Shown so the landlord can see the hours are
             doing their job instead of wondering why a charge vanished. */}
-        {workTradeCharges.length > 0 && (
+        {/* S641 (Nic): "I don't want her to see the covered by work trade or
+            the payment histories from people." A work-trade arrangement is
+            private between the landlord and that resident, and none of it is
+            needed to take cash at a counter. The server already withholds the
+            rows; this keeps the empty heading from appearing too. */}
+        {can('payments.view_all') && workTradeCharges.length > 0 && (
           <div className="card" style={{ padding: 0, marginBottom: 18, overflowX: 'auto' }}>
             <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
                           display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
@@ -1007,7 +1025,11 @@ export function PaymentsPage() {
         {/* ── WHAT HAPPENED ───────────────────────────────────────────────
             History only. Every charge summed into a household row above is
             excluded here (S637) — it is the same money, and listing it twice
-            is what made this page unreadable. */}
+            is what made this page unreadable.
+
+            S641 (Nic): the front desk does not get histories. Taking a payment
+            needs what is owed today, not what everybody has ever paid. */}
+        {can('payments.view_all') && (
         <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
           <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-0)',
                         fontSize: '.82rem', fontWeight: 700, color: 'var(--text-1)' }}>
@@ -1084,6 +1106,7 @@ export function PaymentsPage() {
             </tbody>
           </table>
         </div>
+        )}
         </>
       )}
 

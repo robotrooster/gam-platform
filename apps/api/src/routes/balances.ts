@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { query } from '../db'
 import { landlordScopeIds } from '../lib/landlordScope'
-import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
 // balance + their contact info, so a front-counter person knows who to call.
@@ -201,6 +201,22 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
       if (!byInvoice.has(l.invoice_id)) byInvoice.set(l.invoice_id, [])
       byInvoice.get(l.invoice_id)!.push(l)
     }
-    res.json({ success: true, data: invoices.map((i: any) => ({ ...i, lines: byInvoice.get(i.id) ?? [] })) })
+    // S641 (Nic): "I don't want her to see the covered by work trade." A
+    // work-trade arrangement is between the landlord and that resident; the
+    // front desk needs the amount owed, not the private terms behind it.
+    // Stripped from the RESPONSE rather than hidden on the screen — a figure
+    // that never leaves the server cannot be read out of a network tab.
+    //
+    // The netting itself is unaffected: what is owed is already net of the
+    // credit, so the desk still sees the right number to collect.
+    const seesWorkTrade = userHasPerm(req.user, 'payments.view_all', 'books.view')
+    res.json({ success: true, data: invoices.map((i: any) => {
+      const row: any = { ...i, lines: byInvoice.get(i.id) ?? [] }
+      if (!seesWorkTrade) {
+        delete row.work_trade_credit_amount
+        delete row.work_trade_credit_hours
+      }
+      return row
+    }) })
   } catch (e) { next(e) }
 })

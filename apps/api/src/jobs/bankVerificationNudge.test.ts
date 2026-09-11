@@ -24,10 +24,23 @@ import { sendBankVerificationNudges } from './bankVerificationNudge'
 const DAYS = 24 * 3600
 const nowS = () => Math.floor(Date.now() / 1000)
 
-/** Stripe is waiting on the tenant for the two deposit amounts. */
-const stalled = (ageDays: number) => ({
-  data: [{ status: 'requires_action', created: nowS() - ageDays * DAYS,
-           next_action: { type: 'verify_with_microdeposits' } }],
+/**
+ * Stripe is waiting on the tenant. `arrival_date` is when the deposit reached
+ * the bank — the real clock, not when the setup was started.
+ */
+const stalled = (daysSinceArrival: number, kind = 'descriptor_code') => ({
+  data: [{
+    status: 'requires_action',
+    created: nowS() - (daysSinceArrival + 1) * DAYS,
+    next_action: {
+      type: 'verify_with_microdeposits',
+      verify_with_microdeposits: {
+        arrival_date: nowS() - daysSinceArrival * DAYS,
+        microdeposit_type: kind,
+        hosted_verification_url: 'https://payments.stripe.com/microdeposit/test',
+      },
+    },
+  }],
 })
 
 beforeEach(async () => {
@@ -73,6 +86,8 @@ describe('unfinished bank setups get chased', () => {
     expect(r.sent).toBe(1)
     expect(lastSend().subject).toContain('bank account')
     expect(lastSend().html).toContain('1501')
+    // Stripe's own page is the shortest route to a finished setup
+    expect(lastSend().html).toContain('payments.stripe.com/microdeposit')
 
     const { rows } = await db.query(
       `SELECT bank_verify_nudge_count, bank_verify_nudge_at FROM tenants WHERE id=$1`, [tenantId])
@@ -80,9 +95,10 @@ describe('unfinished bank setups get chased', () => {
     expect(rows[0].bank_verify_nudge_at).not.toBeNull()
   })
 
-  // The deposits take a day or two to land. Asking somebody to read amounts
-  // that have not arrived is worse than saying nothing.
-  it('waits for the deposits to land before asking', async () => {
+  // Timed off Stripe's arrival_date, not off when the setup started. Asking
+  // somebody to read a statement line their bank has not posted is worse than
+  // saying nothing.
+  it('waits until the deposit has actually landed', async () => {
     await seedUnfinished()
     setupIntentsList.mockResolvedValue(stalled(0))
     const r = await sendBankVerificationNudges()
@@ -103,6 +119,25 @@ describe('unfinished bank setups get chased', () => {
     const r = await sendBankVerificationNudges()
     expect(r.sent).toBe(0)
     expect(r.skippedNotStalled).toBe(1)
+  })
+
+  // The live account uses descriptor_code: ONE deposit with a six-character
+  // code in the statement description. Telling somebody to enter two amounts
+  // sends them hunting for something that is not on their statement.
+  it('describes a descriptor code, not two amounts', async () => {
+    await seedUnfinished()
+    setupIntentsList.mockResolvedValue(stalled(8, 'descriptor_code'))
+    await sendBankVerificationNudges()
+    expect(lastSend().html).toContain('six-character code')
+    expect(lastSend().html).not.toContain('two small deposits')
+  })
+
+  it('describes two amounts when Stripe says that is the method', async () => {
+    await seedUnfinished()
+    setupIntentsList.mockResolvedValue(stalled(8, 'amounts'))
+    await sendBankVerificationNudges()
+    expect(lastSend().html).toContain('two small deposits')
+    expect(lastSend().html).not.toContain('six-character code')
   })
 
   // The lesson from this session's other reminder: 74 emails to one person in

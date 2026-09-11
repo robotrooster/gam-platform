@@ -259,6 +259,23 @@ export async function getScopedPropertyIds(
 //
 // Sub-permission keys come from packages/shared SUB_PERMISSIONS_BY_ROLE.
 // Absent / false / non-true value = denied.
+/**
+ * S641 — does this caller hold any of these permissions? Same rule requirePerm
+ * uses, exposed for shaping a RESPONSE rather than gating a route.
+ *
+ * Nic, on his on-site manager: "I don't want her to see the covered by work
+ * trade or the payment histories from people." The balances list is a screen she
+ * legitimately needs, carrying one figure she should not — which is a response
+ * to shape, not a door to lock. Doing it here rather than in the frontend is the
+ * point: data the viewer should not have never leaves the building.
+ */
+export function userHasPerm(user: Request['user'], ...keys: string[]): boolean {
+  if (!user) return false
+  if (OWNER_ROLES.includes(user.role)) return true
+  const perms = user.permissions || {}
+  return keys.some(k => perms[k] === true)
+}
+
 export function requirePerm(...keys: string[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
