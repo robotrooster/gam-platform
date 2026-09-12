@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play } from 'lucide-react'
+import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play, ArrowRight } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 import { LeaseFormModal } from './LeaseFormModal'
@@ -50,6 +50,7 @@ export function LeasesPage() {
   // lease." Separate state from Bill fee, which bills a fee the lease already
   // carries.
   const [chargeLease, setChargeLease] = useState<any | null>(null)
+  const [moveLease, setMoveLease] = useState<any | null>(null)
   // S581: money add-on / notice modal (recurring charge or rent change that
   // reaches billing on a landlord-set date).
   const [addonLease, setAddonLease] = useState<any | null>(null)
@@ -488,6 +489,23 @@ export function LeasesPage() {
                             <DollarSign size={12} /> Add-on / rent change
                           </button>
                         )}
+                        {/* S641 (Nic): "I don't wanna have to terminate their
+                            lease, send them a new lease for the new spot. I
+                            want to just be able to move them in the system and
+                            say, as of this date, they moved from this spot to
+                            this spot." Sits beside Move-out because that is
+                            where somebody looks for it, and reads as the
+                            opposite: the tenancy continues. */}
+                        {can('leases.edit') && l.status === 'active' && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="Move this resident to a different space — same lease, same rent, same terms"
+                            onClick={() => setMoveLease(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <ArrowRight size={12} /> Move spot
+                          </button>
+                        )}
                         {can('leases.deposit_return') && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -545,6 +563,12 @@ export function LeasesPage() {
         <BillFeeModal
           lease={billFeeLease}
           onClose={() => setBillFeeLease(null)}
+        />
+      )}
+      {moveLease && (
+        <MoveSpotModal
+          lease={moveLease}
+          onClose={() => setMoveLease(null)}
         />
       )}
       {chargeLease && (
@@ -1040,6 +1064,145 @@ function CarriedBalanceModal({ lease, onClose }: { lease: any; onClose: () => vo
           <button className="btn btn-primary" disabled={!Number(amount) || save.isLoading}
             onClick={() => { setError(''); save.mutate() }}>
             {save.isLoading ? 'Saving…' : 'Record balance'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * S641 (Nic) — move a resident to a different space.
+ *
+ *   "Moving sites at an RV park is very common, especially when somebody with a
+ *    nice shade tree leaves and somebody else wants to take that spot. I don't
+ *    wanna have to terminate their lease, send them a new lease for the new
+ *    spot, etcetera. I want to just be able to move them in the system and say,
+ *    as of this date, they moved from this spot to this spot."
+ *
+ * The screen says plainly what does NOT change, because the fear it is
+ * answering is that moving somebody means redoing their paperwork. And it ends
+ * on the meters, since a move only bills correctly if somebody reads both.
+ */
+function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [toUnitId, setToUnitId] = useState('')
+  const [movedOn, setMovedOn] = useState(() => new Date().toISOString().slice(0, 10))
+  const [reason, setReason] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+  const [done, setDone] = useState<any>(null)
+
+  // Only spaces at the SAME property — a resident moving parks is a new
+  // tenancy, not a move.
+  const { data: units = [] } = useQuery<any[]>(
+    ['units-for-move', lease.propertyId],
+    () => apiGet(`/units?propertyId=${lease.propertyId}`),
+    { enabled: !!lease.propertyId })
+
+  const open = (units as any[]).filter(u =>
+    u.id !== lease.unitId && ['vacant', 'available'].includes(String(u.status)))
+
+  const move = useMutation(
+    () => apiPost(`/leases/${lease.id}/move`, {
+      toUnitId, movedOn, reason: reason.trim() || null,
+    }),
+    {
+      onSuccess: (r: any) => {
+        setDone(r?.data ?? r)
+        qc.invalidateQueries('leases')
+        qc.invalidateQueries('units')
+      },
+      onError: (e: any) =>
+        setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not move them.'),
+    })
+
+  if (done) {
+    const reads = [...(done.closingReadsNeeded ?? []), ...(done.openingReadsNeeded ?? [])]
+    return (
+      <div className="modal-overlay" onClick={onClose}>
+        <div className="modal" style={{ maxWidth: 470 }} onClick={e => e.stopPropagation()}>
+          <div className="modal-header">
+            <span className="modal-title" style={{ marginBottom: 0 }}>Moved</span>
+            <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+          </div>
+          <p style={{ fontSize: '.86rem', color: 'var(--text-1)' }}>
+            Their tenancy continues unchanged — same lease, same rent, same terms.
+          </p>
+          {reads.length > 0 ? (
+            <div className="alert" style={{ borderColor: 'var(--gold)', fontSize: '.82rem' }}>
+              <strong>Read these meters on {done.movedOn}.</strong> Without a closing number on the
+              old space and an opening number on the new one, the month blends into one charge
+              instead of a line for each.
+              <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+                {done.closingReadsNeeded?.map((m: any) => (
+                  <li key={m.meterId} style={{ fontSize: '.8rem' }}>{m.label} — closing</li>
+                ))}
+                {done.openingReadsNeeded?.map((m: any) => (
+                  <li key={m.meterId} style={{ fontSize: '.8rem' }}>{m.label} — opening</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>
+              No submeters on either space, so there is nothing to read.
+            </div>
+          )}
+          <div className="modal-footer">
+            <button className="btn btn-primary" onClick={onClose}>Done</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 470 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title" style={{ marginBottom: 0 }}>Move to another space</span>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12 }}>
+          {lease.tenantName || 'This resident'} is in <strong>{lease.unitNumber}</strong>. Their lease,
+          rent and terms all stay exactly as they are — only the space changes.
+        </div>
+
+        <div style={{ display: 'grid', gap: 10 }}>
+          <label>
+            <div className="form-label">MOVE TO</div>
+            <select className="input" style={{ width: '100%' }} value={toUnitId}
+              onChange={e => setToUnitId(e.target.value)}>
+              <option value="">Choose a space…</option>
+              {open.map(u => <option key={u.id} value={u.id}>{u.unitNumber}</option>)}
+            </select>
+            {open.length === 0 && (
+              <div style={{ fontSize: '.72rem', color: 'var(--amber)', marginTop: 4 }}>
+                Nothing vacant at this property right now.
+              </div>
+            )}
+          </label>
+          <label>
+            <div className="form-label">AS OF</div>
+            <input type="date" className="input" style={{ width: '100%' }}
+              value={movedOn} onChange={e => setMovedOn(e.target.value)} />
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+              The day they actually change spaces. Utilities split on this date.
+            </div>
+          </label>
+          <label>
+            <div className="form-label">WHY (OPTIONAL)</div>
+            <input className="input" style={{ width: '100%' }} value={reason}
+              placeholder="Pedestal failed / wanted the shade" 
+              onChange={e => setReason(e.target.value)} />
+          </label>
+        </div>
+
+        {err && <div style={{ fontSize: '.78rem', color: 'var(--red)', marginTop: 10 }}>{err}</div>}
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!toUnitId || move.isLoading}
+            onClick={() => { setErr(null); move.mutate() }}>
+            {move.isLoading ? 'Moving…' : 'Move'}
           </button>
         </div>
       </div>
