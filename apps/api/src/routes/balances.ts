@@ -129,6 +129,11 @@ balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (r
     const scopedIds = await getScopedPropertyIds(req.user)
     const invoices = await query<any>(`
       SELECT i.id, i.invoice_number, i.due_date, i.status,
+             -- S641 (Nic): "when somebody goes on their history from last year
+             -- that it shows that they were in that spot at that time." An
+             -- invoice renders the number the space carried on its own due
+             -- date, not whatever it was renamed to since.
+             unit_number_on(i.unit_id, i.due_date) AS unit_number_then,
              i.subtotal_rent, i.subtotal_fees, i.subtotal_utilities,
              i.subtotal_deposits, i.subtotal_late_fees,
              i.work_trade_credit_amount, i.total_amount,

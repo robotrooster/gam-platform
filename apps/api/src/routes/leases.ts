@@ -251,7 +251,7 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name,
+          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name,
           -- S609 autopay VISIBILITY (Nic, DIRECTIVE). The landlord sees THAT a
           -- payment is scheduled and on which day, so a quiet lease does not
           -- read as a tenant who stopped paying. They can never CHANGE it — a
@@ -268,7 +268,7 @@ leasesRouter.get('/', async (req, res, next) => {
         ORDER BY l.start_date DESC`, [scope])
     } else if (role === 'tenant') {
       rows = await query<any>(`
-        SELECT DISTINCT l.*, u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
+        SELECT DISTINCT l.*, u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -284,7 +284,7 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
+          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -314,7 +314,7 @@ leasesRouter.get('/:id', async (req, res, next) => {
             AND lf.fee_type = 'security_deposit'
             AND lf.due_timing = 'move_in'
           LIMIT 1) AS security_deposit,
-        u.unit_number, p.name AS property_name
+        u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, p.name AS property_name
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -1070,7 +1070,7 @@ leasesRouter.post('/:id/request-background-check', requirePerm('tenants.run_back
 leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(`
-      SELECT l.*, u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
+      SELECT l.*, u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -1875,5 +1875,65 @@ leasesRouter.get('/:id/carried-balance', async (req, res, next) => {
     if (!row) return res.json({ success: true, data: null })
     if (!canAccessLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
     res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+
+/**
+ * POST /api/leases/:id/move — the resident changes spaces, the tenancy does not.
+ *
+ * Nic: "I don't wanna have to terminate their lease, send them a new lease for
+ * the new spot, etcetera. I want to just be able to move them in the system and
+ * say, as of this date, they moved from this spot to this spot."
+ *
+ * Returns the meters that need a reading on the move date — closing numbers on
+ * the space they left, opening numbers on the space they took. Without both
+ * there is no seam in the month's usage, and the bill blends two spaces into
+ * one figure nobody can check.
+ */
+leasesRouter.post('/:id/move', requirePerm('leases.edit'), async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      toUnitId: z.string().uuid(),
+      movedOn:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      reason:   z.string().max(500).nullable().optional(),
+    }).parse(req.body)
+
+    const lease = await queryOne<{ landlord_id: string }>(
+      'SELECT landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const { moveLeaseToUnit } = await import('../services/unitMove')
+    const result = await moveLeaseToUnit({
+      leaseId: req.params.id,
+      toUnitId: body.toUnitId,
+      movedOn: body.movedOn,
+      reason: body.reason ?? null,
+      actorUserId: req.user?.userId ?? null,
+    })
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+/** GET /api/leases/:id/units — every space this tenancy has occupied, newest first. */
+leasesRouter.get('/:id/units', requirePerm('leases.view'), async (req: any, res, next) => {
+  try {
+    const lease = await queryOne<{ landlord_id: string }>(
+      'SELECT landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(`
+      SELECT h.unit_id,
+             COALESCE(unit_number_on(h.unit_id, h.effective_from::timestamptz), u.unit_number) AS unit_number,
+             u.unit_number AS unit_number_now,
+             to_char(h.effective_from,'YYYY-MM-DD') AS effective_from,
+             to_char(h.effective_to,'YYYY-MM-DD')   AS effective_to,
+             h.reason
+        FROM lease_unit_history h
+        JOIN units u ON u.id = h.unit_id
+       WHERE h.lease_id = $1
+       ORDER BY h.effective_from DESC`, [req.params.id])
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })

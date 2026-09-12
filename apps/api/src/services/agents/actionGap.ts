@@ -38,6 +38,10 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S641: moving a resident between spaces ─────────────────────────────────
+  'leases POST /:id/move':
+    'moves a household to a different space mid-tenancy. Two reasons it stays typed. Unit numbers REPEAT across parks, and the error here — putting somebody on a space another household occupies — is the one thing the history cannot repair afterwards. And the move only bills correctly if somebody physically reads the meters on BOTH spaces on the move date; the response names those meters, which is a worklist for a person, not a sentence for an agent to acknowledge.',
+
   // ── S641: the filing cabinet ───────────────────────────────────────────────
   'documents PUT /:id/properties':
     'pins a document to the properties it applies to. The mistake this guards against is exactly a mis-pin — Nic: "assigned parking spots in one place and that gets sent to a property that doesn\'t have that, and then it\'s just generating confusion" — and property names spoken aloud is where that mistake happens. Ticked on a screen that lists every park.',

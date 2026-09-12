@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict V2PBsgBfUpwV7gZTuBncR1lXH7wWJHcsZypfZZlZrb6De3bGexgFSy6PDXgMPSI
+\restrict AjIbMFcfcDgHNoddq1mHlysUCq9f6ndICZVU0Cd65YGah9x3icOQgVp0tc5ldB5
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -404,6 +404,35 @@ $$;
 
 
 --
+-- Name: fn_lease_unit_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_lease_unit_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO lease_unit_history (lease_id, unit_id, effective_from)
+    VALUES (NEW.id, NEW.unit_id, NEW.start_date);
+    RETURN NEW;
+  END IF;
+
+  IF NEW.unit_id IS DISTINCT FROM OLD.unit_id THEN
+    -- The move date is carried on the lease row by the move endpoint; a bare
+    -- UPDATE with no date falls back to today, which is the honest default for
+    -- somebody correcting a mistake rather than recording a move.
+    UPDATE lease_unit_history
+       SET effective_to = COALESCE(NEW.unit_moved_on, CURRENT_DATE)
+     WHERE lease_id = NEW.id AND effective_to IS NULL;
+    INSERT INTO lease_unit_history (lease_id, unit_id, effective_from)
+    VALUES (NEW.id, NEW.unit_id, COALESCE(NEW.unit_moved_on, CURRENT_DATE));
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: fn_pos_items_log_price_change(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -502,6 +531,24 @@ BEGIN
     RETURN OLD;
   END IF;
 END;
+$$;
+
+
+--
+-- Name: lease_units_in_window(uuid, date, date); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lease_units_in_window(p_lease_id uuid, p_from date, p_to date) RETURNS TABLE(unit_id uuid, from_date date, to_date date)
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT h.unit_id,
+         GREATEST(h.effective_from, p_from) AS from_date,
+         LEAST(COALESCE(h.effective_to, p_to), p_to) AS to_date
+    FROM lease_unit_history h
+   WHERE h.lease_id = p_lease_id
+     AND h.effective_from <= p_to
+     AND (h.effective_to IS NULL OR h.effective_to > p_from)
+   ORDER BY h.effective_from
 $$;
 
 
@@ -5382,6 +5429,22 @@ CREATE TABLE public.lease_termination_requests (
 
 
 --
+-- Name: lease_unit_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_unit_history (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    effective_from date NOT NULL,
+    effective_to date,
+    reason text,
+    moved_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: lease_utility_assignments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5495,6 +5558,7 @@ CREATE TABLE public.leases (
     tenant_renewal_pinged_at timestamp with time zone,
     landlord_renewal_alerted_at timestamp with time zone,
     is_existing_tenancy boolean DEFAULT false NOT NULL,
+    unit_moved_on date,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -12266,6 +12330,14 @@ ALTER TABLE ONLY public.lease_termination_requests
 
 
 --
+-- Name: lease_unit_history lease_unit_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_unit_history
+    ADD CONSTRAINT lease_unit_history_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: lease_utility_assignments lease_utility_assignments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16051,6 +16123,20 @@ CREATE INDEX idx_lease_termination_requests_tenant ON public.lease_termination_r
 
 
 --
+-- Name: idx_lease_unit_history_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_unit_history_lease ON public.lease_unit_history USING btree (lease_id, effective_from DESC);
+
+
+--
+-- Name: idx_lease_unit_history_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_unit_history_unit ON public.lease_unit_history USING btree (unit_id, effective_from);
+
+
+--
 -- Name: idx_lease_utility_assignments_meter_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18655,6 +18741,13 @@ CREATE UNIQUE INDEX ux_invoices_service_agreement_due_date ON public.invoices US
 
 
 --
+-- Name: ux_lease_unit_history_current; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_lease_unit_history_current ON public.lease_unit_history USING btree (lease_id) WHERE (effective_to IS NULL);
+
+
+--
 -- Name: ux_monthly_fee_accruals_property_month; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19849,6 +19942,20 @@ CREATE TRIGGER trg_lease_pets_updated_at BEFORE UPDATE ON public.lease_pets FOR 
 --
 
 CREATE TRIGGER trg_lease_tenants_updated_at BEFORE UPDATE ON public.lease_tenants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: leases trg_lease_unit_history_ins; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_unit_history_ins AFTER INSERT ON public.leases FOR EACH ROW EXECUTE FUNCTION public.fn_lease_unit_history();
+
+
+--
+-- Name: leases trg_lease_unit_history_upd; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_unit_history_upd AFTER UPDATE OF unit_id ON public.leases FOR EACH ROW EXECUTE FUNCTION public.fn_lease_unit_history();
 
 
 --
@@ -23017,6 +23124,30 @@ ALTER TABLE ONLY public.lease_termination_requests
 
 ALTER TABLE ONLY public.lease_termination_requests
     ADD CONSTRAINT lease_termination_requests_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: lease_unit_history lease_unit_history_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_unit_history
+    ADD CONSTRAINT lease_unit_history_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_unit_history lease_unit_history_moved_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_unit_history
+    ADD CONSTRAINT lease_unit_history_moved_by_user_id_fkey FOREIGN KEY (moved_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_unit_history lease_unit_history_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_unit_history
+    ADD CONSTRAINT lease_unit_history_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
 
 
 --
@@ -26263,5 +26394,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict V2PBsgBfUpwV7gZTuBncR1lXH7wWJHcsZypfZZlZrb6De3bGexgFSy6PDXgMPSI
+\unrestrict AjIbMFcfcDgHNoddq1mHlysUCq9f6ndICZVU0Cd65YGah9x3icOQgVp0tc5ldB5
 
