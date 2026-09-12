@@ -142,7 +142,7 @@ async function send(
   const isTestAddress = TEST_DOMAINS.some((d) => toLower.endsWith(d))
     || RESERVED_TLDS.some((t) => toLower.endsWith(t))
   const willSend = (nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1') && !isTestAddress
-  let status: 'sent' | 'failed' = 'sent'
+  let status: 'sent' | 'failed' | 'suppressed' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
   if (willSend) {
@@ -182,6 +182,11 @@ async function send(
       logger.error({ err: e }, '[EMAIL FAILED]')
     }
   } else {
+    // S641: the log must not claim we sent something we did not. This row is
+    // the answer to "did the tenant get their notice?", and a record that
+    // cannot tell "delivered" from "never left the machine" is worse than no
+    // record, because it is believed.
+    status = 'suppressed'
     logger.info(`[EMAIL SUPPRESSED — ${nodeEnv}] ${subject} -> ${to}`)
     // S637: test logins used to recover the code from the SUBJECT in this log
     // line (S571). The code is no longer there — it is in the body now — so

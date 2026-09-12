@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict AjIbMFcfcDgHNoddq1mHlysUCq9f6ndICZVU0Cd65YGah9x3icOQgVp0tc5ldB5
+\restrict JAFN1zseM2tw8FasmcLeHqC2SmDSDF6fETJgDmS49U2jHIOJ0CzXFJaw8vqknbV
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3628,8 +3628,15 @@ CREATE TABLE public.email_send_log (
     last_event text,
     last_event_at timestamp with time zone,
     body_text text,
-    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text])))
+    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text])))
 );
+
+
+--
+-- Name: COLUMN email_send_log.status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.email_send_log.status IS 'sent = handed to the provider. failed = the provider refused it. suppressed = this environment has no mail configured and nothing left the machine (S641).';
 
 
 --
@@ -26394,5 +26401,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict AjIbMFcfcDgHNoddq1mHlysUCq9f6ndICZVU0Cd65YGah9x3icOQgVp0tc5ldB5
+\unrestrict JAFN1zseM2tw8FasmcLeHqC2SmDSDF6fETJgDmS49U2jHIOJ0CzXFJaw8vqknbV
 

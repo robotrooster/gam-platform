@@ -20,6 +20,7 @@
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { createNotification } from './notifications'
 
 export interface MoveResult {
   leaseId: string
@@ -130,6 +131,90 @@ export async function moveLeaseToUnit(params: {
   await query(
     `UPDATE units SET status = 'active' WHERE id = $1 AND status IN ('vacant','available')`,
     [params.toUnitId])
+
+  // S641 — CHASE THE READS, do not just list them.
+  //
+  // A list on a confirmation screen is gone the moment the screen closes, and
+  // the reads are the difference between a bill with two honest lines and one
+  // blended figure. So the move raises the same kind of prompt a pull-out does:
+  // it reaches the landlord and anyone who can actually take a reading, it says
+  // which meters and on what date, and it links to the meter screen.
+  //
+  // Fire-and-forget: a notification failing must never undo a move that already
+  // happened, and the reads are still listed in the response either way.
+  if (closing.length || opening.length) {
+    void (async () => {
+      try {
+        const prop = await queryOne<{ property_id: string; property_name: string; landlord_id: string }>(
+          `SELECT p.id AS property_id, p.name AS property_name, p.landlord_id
+             FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+          [params.toUnitId])
+        if (!prop) return
+
+        const from = await queryOne<{ unit_number: string }>(
+          `SELECT unit_number FROM units WHERE id = $1`, [fromUnitId])
+        const who = await queryOne<{ name: string }>(
+          `SELECT us.first_name || ' ' || us.last_name AS name
+             FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
+             JOIN users us ON us.id = t.user_id
+            WHERE lt.lease_id = $1 AND lt.role = 'primary' LIMIT 1`, [params.leaseId])
+
+        const body =
+          `${who?.name ?? 'A resident'} moved from ${from?.unit_number ?? 'their space'} to `
+          + `${dest.unit_number} on ${params.movedOn}. Read `
+          + [
+              closing.length ? `${closing.map(m => m.label).join(', ')} (closing)` : null,
+              opening.length ? `${opening.map(m => m.label).join(', ')} (opening)` : null,
+            ].filter(Boolean).join(' and ')
+          + `. Both reads are dated the move — without them the month bills as one blended charge `
+          + `instead of a line for each space.`
+
+        const landlord = await queryOne<{ user_id: string; email: string }>(
+          `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
+            WHERE l.id = $1`, [prop.landlord_id])
+        const staff = await query<{ user_id: string; email: string }>(
+          `SELECT DISTINCT u.id AS user_id, u.email FROM (
+              SELECT user_id FROM property_manager_scopes
+               WHERE landlord_id = $1
+                 AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+                 AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                      OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+              UNION
+              SELECT user_id FROM onsite_manager_scopes
+               WHERE landlord_id = $1
+                 AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+                 AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                      OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
+            ) s JOIN users u ON u.id = s.user_id`,
+          [prop.landlord_id, prop.property_id])
+
+        const recipients = [
+          ...(landlord ? [landlord] : []),
+          ...staff.filter(s => s.user_id !== landlord?.user_id),
+        ]
+        for (const r of recipients) {
+          await createNotification({
+            userId: r.user_id, landlordId: prop.landlord_id,
+            type: 'move_meter_reads_due',
+            title: `Meter reads due — ${from?.unit_number ?? '?'} → ${dest.unit_number}`,
+            body,
+            data: {
+              propertyId: prop.property_id,
+              leaseId: params.leaseId,
+              movedOn: params.movedOn,
+              meters: [...closing, ...opening].map(m => m.label),
+            },
+            actionUrl: `/utilities?propertyId=${prop.property_id}`,
+            sendEmail: true, emailTo: r.email,
+            emailSubject: `Meter reads due — ${from?.unit_number ?? '?'} → ${dest.unit_number}`,
+            emailHtml: body,
+          })
+        }
+      } catch (e) {
+        logger.error({ err: e, leaseId: params.leaseId }, '[unit-move] read prompt failed')
+      }
+    })()
+  }
 
   logger.info({
     leaseId: params.leaseId, fromUnitId, toUnitId: params.toUnitId,

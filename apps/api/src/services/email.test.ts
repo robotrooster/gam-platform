@@ -515,12 +515,25 @@ describe('reserved-domain suppression (S605)', () => {
     }
   })
 
-  it('still writes the audit row, so suppression is visible rather than silent', async () => {
+  // S641: it used to log 'sent'. That made the audit row a lie — this log is
+  // the answer to "did the tenant get their notice?", and a record that cannot
+  // tell "delivered" from "never left the machine" is worse than none, because
+  // it is believed.
+  it('writes the audit row as SUPPRESSED, not sent', async () => {
     await email.emailInvitation('someone@example.com', 'Nic', 'property_manager', 'https://x.test/accept')
     const rows = await db.query(
       `SELECT status FROM email_send_log WHERE to_email = 'someone@example.com'`)
     expect(rows.rows.length).toBe(1)
-    expect(rows.rows[0].status).toBe('sent')   // attempted-and-suppressed, not failed
+    expect(rows.rows[0].status).toBe('suppressed')
+  })
+
+  it('a real send is still recorded as sent', async () => {
+    process.env.EMAIL_SEND_LIVE = '1'
+    resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_real_one' }, error: null } as any)
+    await email.emailInvitation('live@mailer-test.co', 'Nic', 'property_manager', 'https://x.test/accept')
+    const rows = await db.query(
+      `SELECT status FROM email_send_log WHERE to_email = 'live@mailer-test.co'`)
+    expect(rows.rows[0].status).toBe('sent')
   })
 
   it('a real domain is unaffected', async () => {
