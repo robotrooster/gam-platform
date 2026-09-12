@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict RLURdgfzEhmrSh1P2pYD4WOeEmVXUtefuSdTpjnnvBdNDFmDWR44LiLcSXBsg3x
+\restrict V2PBsgBfUpwV7gZTuBncR1lXH7wWJHcsZypfZZlZrb6De3bGexgFSy6PDXgMPSI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -427,6 +427,34 @@ BEGIN
       (item_id, old_price, new_price, old_cost, new_cost, changed_by)
     VALUES
       (NEW.id, OLD.sell_price, NEW.sell_price, OLD.cost_price, NEW.cost_price, actor_id);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: fn_unit_number_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_unit_number_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO unit_number_history (unit_id, unit_number, building, effective_from)
+    VALUES (NEW.id, NEW.unit_number, NEW.building, COALESCE(NEW.created_at, now()));
+    RETURN NEW;
+  END IF;
+
+  -- Only a real change of identity opens a new period.
+  IF NEW.unit_number IS DISTINCT FROM OLD.unit_number
+     OR NEW.building IS DISTINCT FROM OLD.building THEN
+    UPDATE unit_number_history
+       SET effective_to = now()
+     WHERE unit_id = NEW.id AND effective_to IS NULL;
+    INSERT INTO unit_number_history (unit_id, unit_number, building, effective_from)
+    VALUES (NEW.id, NEW.unit_number, NEW.building, now());
   END IF;
   RETURN NEW;
 END;
@@ -855,6 +883,23 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
+$$;
+
+
+--
+-- Name: unit_number_on(uuid, timestamp with time zone); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.unit_number_on(p_unit_id uuid, p_when timestamp with time zone) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT h.unit_number
+    FROM unit_number_history h
+   WHERE h.unit_id = p_unit_id
+     AND h.effective_from <= p_when
+     AND (h.effective_to IS NULL OR h.effective_to > p_when)
+   ORDER BY h.effective_from DESC
+   LIMIT 1
 $$;
 
 
@@ -9634,6 +9679,23 @@ CREATE TABLE public.unit_inspections (
 
 
 --
+-- Name: unit_number_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_number_history (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    unit_id uuid NOT NULL,
+    unit_number text NOT NULL,
+    building text,
+    effective_from timestamp with time zone DEFAULT now() NOT NULL,
+    effective_to timestamp with time zone,
+    changed_by_user_id uuid,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: unit_photos; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9717,6 +9779,8 @@ CREATE TABLE public.units (
     water_fixture_count integer,
     owner_household_size integer DEFAULT 1 NOT NULL,
     has_propane_tank boolean DEFAULT false NOT NULL,
+    building text,
+    CONSTRAINT units_building_not_blank CHECK (((building IS NULL) OR (btrim(building) <> ''::text))),
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
     CONSTRAINT units_lot_rent_amount_check CHECK ((lot_rent_amount >= (0)::numeric)),
@@ -9790,6 +9854,13 @@ COMMENT ON COLUMN public.units.owner_household_size IS 'S609: how many people li
 --
 
 COMMENT ON COLUMN public.units.has_propane_tank IS 'S613: this space has a propane tank that gets filled. Drives which units the delivery form offers; propane still bills through propane_fills, not a meter.';
+
+
+--
+-- Name: COLUMN units.building; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.building IS 'S641: the building within the property. NULL for properties that have none — most parks. Part of the uniqueness key, so Apt 101 can exist in Building 1 and Building 2.';
 
 
 --
@@ -13723,6 +13794,14 @@ ALTER TABLE ONLY public.unit_inspections
 
 
 --
+-- Name: unit_number_history unit_number_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_number_history
+    ADD CONSTRAINT unit_number_history_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: unit_photos unit_photos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13744,14 +13823,6 @@ ALTER TABLE ONLY public.unit_subtype_links
 
 ALTER TABLE ONLY public.units
     ADD CONSTRAINT units_pkey PRIMARY KEY (id);
-
-
---
--- Name: units units_property_id_unit_number_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.units
-    ADD CONSTRAINT units_property_id_unit_number_key UNIQUE (property_id, unit_number);
 
 
 --
@@ -17667,6 +17738,13 @@ CREATE INDEX idx_unit_inspections_unit ON public.unit_inspections USING btree (u
 
 
 --
+-- Name: idx_unit_number_history_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_number_history_unit ON public.unit_number_history USING btree (unit_id, effective_from DESC);
+
+
+--
 -- Name: idx_unit_photos_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17678,6 +17756,13 @@ CREATE INDEX idx_unit_photos_unit ON public.unit_photos USING btree (unit_id);
 --
 
 CREATE INDEX idx_unit_subtype_links_subtype ON public.unit_subtype_links USING btree (subtype_id);
+
+
+--
+-- Name: idx_units_building; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_building ON public.units USING btree (property_id, building) WHERE (building IS NOT NULL);
 
 
 --
@@ -18444,10 +18529,10 @@ CREATE UNIQUE INDEX unit_applications_background_check_uniq ON public.unit_appli
 
 
 --
--- Name: units_property_unit_number_uniq; Type: INDEX; Schema: public; Owner: -
+-- Name: units_property_building_number_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX units_property_unit_number_uniq ON public.units USING btree (property_id, lower(btrim(unit_number)));
+CREATE UNIQUE INDEX units_property_building_number_uniq ON public.units USING btree (property_id, lower(btrim(COALESCE(building, ''::text))), lower(btrim(unit_number)));
 
 
 --
@@ -18679,6 +18764,13 @@ CREATE UNIQUE INDEX ux_unit_booking_waitlists_claim_token ON public.unit_booking
 --
 
 CREATE UNIQUE INDEX ux_unit_bookings_checkout_session ON public.unit_bookings USING btree (stripe_checkout_session_id) WHERE (stripe_checkout_session_id IS NOT NULL);
+
+
+--
+-- Name: ux_unit_number_history_current; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_unit_number_history_current ON public.unit_number_history USING btree (unit_id) WHERE (effective_to IS NULL);
 
 
 --
@@ -19988,6 +20080,20 @@ CREATE TRIGGER trg_unit_inspection_videos_no_delete BEFORE DELETE ON public.unit
 --
 
 CREATE TRIGGER trg_unit_inspection_videos_protect_url BEFORE UPDATE ON public.unit_inspection_videos FOR EACH ROW EXECUTE FUNCTION public.unit_inspection_videos_protect_url();
+
+
+--
+-- Name: units trg_unit_number_history_ins; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_number_history_ins AFTER INSERT ON public.units FOR EACH ROW EXECUTE FUNCTION public.fn_unit_number_history();
+
+
+--
+-- Name: units trg_unit_number_history_upd; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_number_history_upd AFTER UPDATE OF unit_number, building ON public.units FOR EACH ROW EXECUTE FUNCTION public.fn_unit_number_history();
 
 
 --
@@ -25690,6 +25796,22 @@ ALTER TABLE ONLY public.unit_inspections
 
 
 --
+-- Name: unit_number_history unit_number_history_changed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_number_history
+    ADD CONSTRAINT unit_number_history_changed_by_user_id_fkey FOREIGN KEY (changed_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_number_history unit_number_history_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_number_history
+    ADD CONSTRAINT unit_number_history_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: unit_photos unit_photos_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26141,5 +26263,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict RLURdgfzEhmrSh1P2pYD4WOeEmVXUtefuSdTpjnnvBdNDFmDWR44LiLcSXBsg3x
+\unrestrict V2PBsgBfUpwV7gZTuBncR1lXH7wWJHcsZypfZZlZrb6De3bGexgFSy6PDXgMPSI
 

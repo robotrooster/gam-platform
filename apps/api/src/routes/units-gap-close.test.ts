@@ -793,16 +793,29 @@ describe('PATCH /api/units/:id/number', () => {
     expect(res.status).toBe(403)
   })
 
-  // S604 (Nic): "I wouldn't allow a rename of a unit after data is on something."
-  // Nothing snapshots unit_number, so a rename rewrites how years of invoices
-  // display. Retire + replace is the intended path instead.
-  it('LOCKS the number once the unit has history (seed puts a booking on A)', async () => {
+  // S604 locked the number once a unit carried data, because nothing
+  // snapshotted unit_number and a rename rewrote years of invoices.
+  //
+  // S641 (Nic) fixed the cause instead: "would we just say that we're changing
+  // the unit number in the system — show a timeline of: this was classified as
+  // unit one up until this date." unit_number_history records each period,
+  // maintained by a database trigger, so the rename is now safe and allowed.
+  it('RENAMES a unit that has history, and records the old number', async () => {
     const f = await seed()
     const res = await request(buildApp()).patch(`/api/units/${f.aUnitId}/number`)
       .set('Authorization', `Bearer ${f.tokenA}`).send({ unitNumber: 'RV 99' })
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/number is locked/i)
-    expect(res.body.error).toMatch(/retire/i)
+    expect(res.status).toBe(200)
+
+    const { rows } = await db.query(
+      `SELECT unit_number, effective_to FROM unit_number_history
+        WHERE unit_id=$1 ORDER BY effective_from`, [f.aUnitId])
+    // the old name is preserved with a closed period, the new one is live
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    expect(rows.at(-1)!.effective_to).toBeNull()
+    // canonicalised against the unit's TYPE — the fixture unit is an apartment,
+    // so 'RV 99' is stored as 'APT 99'. Long-standing behaviour, not new here.
+    expect(rows.at(-1)!.unit_number).toBe('APT 99')
+    expect(rows.at(-2)!.effective_to).not.toBeNull()
   })
 
   it('still allows renaming a freshly-created unit with no history', async () => {

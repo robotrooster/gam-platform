@@ -485,9 +485,12 @@ describe('S605 renumbering during onboarding', () => {
     expect(rows[0].label).toBe('APT 14A electric')   // not the stale 'RV 03 electric'
   })
 
-  // The original protection must survive: once a meter has a reading, the number
-  // is genuinely load-bearing on records and stays locked.
-  it('a meter WITH a reading still blocks the renumber', async () => {
+  // S641: the number is no longer locked by history. A reading is exactly the
+  // case Nic had in mind — "would we just say that we're changing the unit
+  // number in the system, show a timeline" — and unit_number_history keeps what
+  // the space was called when that reading was taken, so the record still reads
+  // correctly after the rename.
+  it('renumbers even with a meter reading on record, and keeps the old name', async () => {
     const f = await seedUnitsFixture()
     const meter = await db.query<any>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
@@ -502,7 +505,14 @@ describe('S605 renumbering during onboarding', () => {
 
     const res = await request(buildApp()).patch(`/api/units/${f.unitId}/number`)
       .set('Authorization', `Bearer ${f.landlordToken}`).send({ unitNumber: 'RV 14' })
-    expect(res.status).toBe(409)
+    expect(res.status).toBe(200)
+
+    const hist = await db.query<any>(
+      `SELECT unit_number, effective_to FROM unit_number_history
+        WHERE unit_id=$1 ORDER BY effective_from`, [f.unitId])
+    expect(hist.rows.length).toBeGreaterThanOrEqual(2)
+    expect(hist.rows.at(-1).effective_to).toBeNull()
+    expect(hist.rows.at(-2).effective_to).not.toBeNull()
   })
 })
 

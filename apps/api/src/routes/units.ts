@@ -273,6 +273,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     const body = z.object({
       propertyId:      z.string().uuid(),
       unitNumber:      z.string(),
+      // S641 (Nic): "apartment 101 or 201, duplicated at the property when
+      // assigned a separate building. That's one tier that we didn't come up
+      // with yet." NULL for the properties that have no buildings — most parks.
+      building:        z.string().trim().min(1).max(40).nullable().optional(),
       subtypeId:       z.string().uuid().nullable().optional(),
       // S630: several, each toggled on its own. subtypeId stays for callers
       // that send one; both funnel into the same list below.
@@ -501,11 +505,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // software. So they have to manually select that."
       const leaseTypesAllowed = leaseTypesForUnitType(unitType, !!body.isBookable)
       const [unit] = await query<any>(`
-        INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
+        INSERT INTO units (property_id, landlord_id, unit_number, building, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
                            is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, owner_household_size, occupancy_mode)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+        VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
                 $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb, $27,
                 -- S558: new unit inherits the property's default occupancy mode
                 -- (a seed, not a governing setting — the unit owns it after).
@@ -518,7 +522,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
          // nature. A house or a mobile home starts closed and the operator opens
          // it; an RV spot or campsite is open the day it is created.
          body.isBookable ?? isShortStayByNature(unitType), leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features),
-         body.ownerHouseholdSize ?? 1]
+         body.ownerHouseholdSize ?? 1,
+         // $28 — the building. Trimmed to NULL so blank and absent are the
+         // same thing; the unique index treats them as one.
+         (body.building ?? null) ? String(body.building).trim() || null : null]
       )
       // S630: link EVERY selected subtype. units.subtype_id above holds the
       // first one for readers not yet moved over; unit_subtype_links is the
@@ -615,6 +622,30 @@ async function unitHistoryBlocker(unitId: string): Promise<string | null> {
   return null
 }
 
+/**
+ * GET /api/units/:id/number-history — what this space has been called.
+ *
+ * Nic: "show a timeline of: this was classified as unit one up until this date,
+ * and it's been since changed to unit number two."
+ *
+ * Newest first, with the live period's `effectiveTo` null.
+ */
+unitsRouter.get('/:id/number-history', requirePerm('units.view'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT id, landlord_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT h.unit_number, h.building, h.effective_from, h.effective_to, h.reason,
+              u.first_name || ' ' || u.last_name AS changed_by
+         FROM unit_number_history h
+         LEFT JOIN users u ON u.id = h.changed_by_user_id
+        WHERE h.unit_id = $1
+        ORDER BY h.effective_from DESC`, [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/units/:id/number — renumber a unit.
 unitsRouter.patch('/:id/number', requirePerm('units.edit'), async (req, res, next) => {
   try {
@@ -628,18 +659,25 @@ unitsRouter.patch('/:id/number', requirePerm('units.edit'), async (req, res, nex
       return res.json({ success: true, data: unit })   // no-op
     }
 
-    // S604 (Nic): NO rename once the unit carries data. Nothing snapshots
-    // unit_number — every invoice and payment renders the CURRENT value — so a
-    // rename would retroactively rewrite how years of records display, while
-    // executed lease PDFs keep the original and silently disagree. The intended
-    // path is to RETIRE the unit and create its replacement under the new
-    // number, keeping one physical space as two clean database records.
-    const blocker = await unitHistoryBlocker(req.params.id)
-    if (blocker) {
-      throw new AppError(409,
-        `This unit has ${blocker} on record, so its number is locked — renaming it would change how past invoices and records display. ` +
-        `Retire this unit and add its replacement under the new number instead.`)
-    }
+    // S641 (Nic): renaming is ALLOWED again, because the reason it was blocked
+    // has been fixed rather than worked around.
+    //
+    //   "I don't know why we're retiring units and replacing… would we just say
+    //    that we're changing the unit number in the system — show a timeline of:
+    //    this was classified as unit one up until this date, and it's been since
+    //    changed to unit number two."
+    //
+    // S604 blocked it because nothing snapshotted unit_number: every invoice
+    // rendered the CURRENT value, so a rename rewrote years of paperwork while
+    // the signed PDF kept the original. True then. `unit_number_history` now
+    // records each period a space carried a number, maintained by a database
+    // trigger so an importer or a script cannot skip it, and `unit_number_on()`
+    // answers what it was called on any given date. The history survives the
+    // rename, so the rename is safe.
+    //
+    // Retire-and-replace keeps its own job: a space that genuinely BECOMES a
+    // different space — a double lot split in two, two apartments combined.
+    // That is not renumbering, and the two were conflated.
     // Surface the collision as a friendly 409 rather than a 500 from the index.
     const clash = await queryOne<{ id: string }>(
       `SELECT id FROM units
@@ -718,6 +756,10 @@ export const UNIT_CLONE_COPIED = [
   'storage_size', 'subtype_id', 'dwelling_ownership', 'occupancy_mode',
   'lot_rent_amount', 'is_multi_level', 'is_ada_accessible', 'floor_level',
   'features', 'living_areas',
+  // S641: the building COPIES. Retire-and-replace is the same physical space
+  // under a new number, and a space does not move between buildings when it is
+  // renumbered. The drift guard caught this one too.
+  'building',
   // S609: added by the S608 utility work and never classified — the drift guard
   // caught it. It COPIES: how many water fixtures a space has is a fact about
   // the physical space, and retire-and-replace is the same space under a new
