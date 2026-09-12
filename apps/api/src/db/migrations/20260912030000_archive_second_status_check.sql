@@ -1,0 +1,12 @@
+-- S641 — the archive carried a SECOND status check, and it was still narrow.
+--
+-- email_send_log_archive has two: its own, and one named after the LIVE table,
+-- inherited when the archive was created from it. The previous migration
+-- widened the one whose name matched the table, which looked right and left the
+-- other still refusing 'suppressed'.
+--
+-- Same delayed break, one constraint deeper: nothing fails today, and the
+-- nightly archiver breaks the first time a suppressed row ages out — weeks
+-- later, in a cron job, on a table nobody watches. Found by listing EVERY check
+-- on the table rather than the one whose name matched.
+ALTER TABLE email_send_log_archive DROP CONSTRAINT IF EXISTS email_send_log_status_check;
