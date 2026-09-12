@@ -1442,15 +1442,28 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
   // lands after the lease-end processor expired the lease). Read the meter
   // AT turnover — a late final read folds the gap days into the departing
   // tenant's bill.
+  // S641: WHO WAS IN THIS SPACE — not who is in it now.
+  //
+  // This matched on `leases.unit_id`, the lease's CURRENT space. That is right
+  // until somebody moves. Nic: "moving sites at an RV park is very common… I
+  // want to just be able to move them in the system and say, as of this date,
+  // they moved from this spot to this spot, have it coordinate utilities for
+  // both."
+  //
+  // After a move the old space's meter would have found no lease at all — the
+  // tenancy had walked away from it — so the first half of the month's usage
+  // stranded, and the resident was billed only for where they ended up.
+  // `lease_unit_history` answers the question the bill is actually asking.
   let lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
-    SELECT l.id AS lease_id, lt2.tenant_id
-      FROM leases l
+    SELECT h.lease_id, lt2.tenant_id
+      FROM lease_unit_history h
+      JOIN leases l ON l.id = h.lease_id
       JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
-     WHERE l.unit_id = $1
+     WHERE h.unit_id = $1
        AND l.status IN ('active', 'expired', 'terminated')
-       AND l.start_date <= $2::date
-       AND COALESCE(l.end_date, '9999-12-31'::date) > $2::date
-     ORDER BY l.start_date DESC
+       AND h.effective_from <= $2::date
+       AND (h.effective_to IS NULL OR h.effective_to > $2::date)
+     ORDER BY h.effective_from DESC
      LIMIT 1
   `, [args.unitId, args.cycleMonth])
   if (!lt) {
@@ -1458,14 +1471,15 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     // the newest lease overlapping the month — same outcome as the old
     // active-lease rule for that case.
     lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
-      SELECT l.id AS lease_id, lt2.tenant_id
-        FROM leases l
+      SELECT h.lease_id, lt2.tenant_id
+        FROM lease_unit_history h
+        JOIN leases l ON l.id = h.lease_id
         JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
-       WHERE l.unit_id = $1
+       WHERE h.unit_id = $1
          AND l.status IN ('active', 'expired', 'terminated')
-         AND l.start_date < ($2::date + interval '1 month')::date
-         AND COALESCE(l.end_date, '9999-12-31'::date) >= $2::date
-       ORDER BY l.start_date DESC
+         AND h.effective_from < ($2::date + interval '1 month')::date
+         AND (h.effective_to IS NULL OR h.effective_to >= $2::date)
+       ORDER BY h.effective_from DESC
        LIMIT 1
     `, [args.unitId, args.cycleMonth])
   }

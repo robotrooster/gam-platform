@@ -140,3 +140,52 @@ describe('moving a resident to another space', () => {
     expect(slices.map(s => s.unit_number)).toEqual(['RV 12', 'RV 23', 'RV 12'])
   })
 })
+
+// ── the bill follows the occupancy, not the lease's current space ──────────
+//
+// Nic: "if they move mid month, it's gonna have a meter read start and end from
+// the first part of the month for that first site and for the later half of the
+// month start and end for the later site, and show them as line items."
+describe('billing a month with a move in it', () => {
+  it('attributes the OLD spot’s usage to the resident who was there', async () => {
+    const w = await world()
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })
+
+    // Who does a bill dated the 1st of that month belong to, for the space
+    // they LEFT? Before this, nothing — the lease had walked away from it.
+    const { rows } = await db.query(`
+      SELECT h.lease_id
+        FROM lease_unit_history h
+        JOIN leases l ON l.id = h.lease_id
+       WHERE h.unit_id = $1
+         AND h.effective_from <= '2026-06-01'::date
+         AND (h.effective_to IS NULL OR h.effective_to > '2026-06-01'::date)`, [w.shady])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].lease_id).toBe(w.leaseId)
+  })
+
+  it('attributes the NEW spot’s usage to the same resident', async () => {
+    const w = await world()
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })
+    const { rows } = await db.query(`
+      SELECT h.lease_id
+        FROM lease_unit_history h
+       WHERE h.unit_id = $1
+         AND h.effective_from <= '2026-06-20'::date
+         AND (h.effective_to IS NULL OR h.effective_to > '2026-06-20'::date)`, [w.sunny])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].lease_id).toBe(w.leaseId)
+  })
+
+  it('the spot they left stops being theirs after the move date', async () => {
+    const w = await world()
+    await moveLeaseToUnit({ leaseId: w.leaseId, toUnitId: w.sunny, movedOn: '2026-06-15' })
+    const { rows } = await db.query(`
+      SELECT h.lease_id
+        FROM lease_unit_history h
+       WHERE h.unit_id = $1
+         AND h.effective_from <= '2026-07-01'::date
+         AND (h.effective_to IS NULL OR h.effective_to > '2026-07-01'::date)`, [w.shady])
+    expect(rows).toHaveLength(0)
+  })
+})

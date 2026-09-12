@@ -477,6 +477,8 @@ async function runGeneration(
         // electric and exclude propane. Already SELECTed below; it just was not
         // in the type.
         utility_type: string
+        bill_unit_id: string | null
+        bill_unit_number: string | null
       }>(
         `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
                 ub.allocation_method, ub.allocation_basis, ub.rate_per_unit,
@@ -488,9 +490,18 @@ async function runGeneration(
                 -- invoice it is the landlord next door.
                 ub.landlord_id AS bill_landlord_id,
                 ub.service_agreement_id,
+                -- S641: WHICH SPACE this reading came from, named as it was
+                -- called at the time. Only matters when a resident moved
+                -- mid-cycle, and then it matters a lot: without it a bill with
+                -- two electric lines shows the same words twice and the reader
+                -- cannot tell which spot is which.
+                ub.unit_id AS bill_unit_id,
+                COALESCE(unit_number_on(ub.unit_id, ub.billing_cycle_month::timestamptz),
+                         bu.unit_number) AS bill_unit_number,
                 m.digits
            FROM utility_bills ub
            JOIN utility_meters m ON m.id = ub.meter_id
+           LEFT JOIN units bu ON bu.id = ub.unit_id
           WHERE (ub.lease_id = $1
                  -- S616: the linked serviced space's bills join this invoice.
                  -- They carry NO lease_id and never will; the link is what puts
@@ -889,6 +900,18 @@ async function runGeneration(
         // flipped to 'billed' so subsequent invoice runs don't double-
         // bill — this link is made even when the trade fully covers the
         // bill (the $0 settled row still owns the bill).
+        // S641 (Nic): "I want them to see the electric from where they started
+        // and the electric from where they went to."
+        //
+        // Name the space on a line ONLY when this cycle's bills come from more
+        // than one — i.e. the resident moved mid-month. Naming it always would
+        // put "RV 12" on every line of every bill forever, which is noise on
+        // the month nobody moved, and Nic was explicit that one line item is
+        // fine in the ordinary case.
+        const spotsThisCycle = new Set(
+          utilityBills.map(b => (b as any).bill_unit_id).filter(Boolean))
+        const movedMidCycle = spotsThisCycle.size > 1
+
         for (let i = 0; i < utilityBills.length; i++) {
           const ub = utilityBills[i]
           const net = dist.utilityNets[i]
@@ -919,7 +942,13 @@ async function runGeneration(
             : (ub as any).allocation_method === 'flat_rate' && Number((ub as any).allocation_basis || 1) > 1
               ? `${Number((ub as any).allocation_basis)} × $${Number((ub as any).rate_per_unit || 0).toFixed(2)}`
               : null
-          const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
+          // The space leads the line when there is more than one, so the two
+          // readings are told apart at a glance rather than by comparing meter
+          // numbers.
+          const spotNote = movedMidCycle && (ub as any).bill_unit_number
+            ? String((ub as any).bill_unit_number)
+            : null
+          const combinedNote = [spotNote, readNote, rowNote(net)].filter(Boolean).join(' — ') || null
           // S616 — THE DIVERSION. This row's landlord is the bill's own, not the
           // lease's. For every ordinary utility they are the same value and
           // nothing changes; on a converged invoice this is the line that sends
