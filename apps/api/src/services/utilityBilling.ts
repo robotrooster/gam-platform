@@ -649,7 +649,30 @@ export async function generateBillsForMeter(
   // back to add it. An empty space is 'vacant' or 'available' and always will
   // be; everything else has somebody in it.
   const EMPTY = new Set(['vacant', 'available'])
-  const occupiedHere = units.some((u: any) => !EMPTY.has(u.status))
+  // S642 (Nic, via Calvin Curtis on RV 40): "it's not showing any electricity —
+  // we're supposed to be matching broken reads that are active spots."
+  //
+  // The test was the unit's status AT THIS INSTANT, and the instant is wrong.
+  // A lease finalising bills its utilities BEFORE the unit is marked occupied,
+  // so a space somebody had lived in all cycle still read 'vacant' while its
+  // bill was being written — the stuck check was skipped and the charge came
+  // out $0. Four spaces at Mountain View were billed nothing that way: MH 04,
+  // RV 07, RV 40, RV 41, every one within days of its lease starting.
+  //
+  // Reordering the finalise path would fix that one caller and leave every
+  // other one exposed. The real question is not what the status says right now,
+  // it is whether anybody was in the space DURING THE CYCLE — which a lease
+  // overlapping the cycle answers, whatever order the writes happened in.
+  const occupiedNow = units.some((u: any) => !EMPTY.has(u.status))
+  const leasedDuringCycle = await queryOne<{ n: string }>(`
+    SELECT COUNT(*)::text AS n
+      FROM leases l
+     WHERE l.unit_id = ANY($1::uuid[])
+       AND l.status IN ('active','delinquent','suspended','expired','terminated','pending')
+       AND l.start_date < ($2::date + interval '1 month')::date
+       AND COALESCE(l.end_date, '9999-12-31'::date) >= $2::date`,
+    [units.map((u: any) => u.id), cycleIso])
+  const occupiedHere = occupiedNow || Number(leasedDuringCycle?.n ?? 0) > 0
   let stuckOnOccupied = false
   if (meter.billing_method === 'submeter' && !meter.out_of_service && occupiedHere) {
     const move = await queryOne<{ usage: string | null }>(`
