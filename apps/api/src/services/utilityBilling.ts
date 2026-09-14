@@ -669,8 +669,25 @@ export async function generateBillsForMeter(
       FROM leases l
      WHERE l.unit_id = ANY($1::uuid[])
        AND l.status IN ('active','delinquent','suspended','expired','terminated','pending')
-       AND l.start_date < ($2::date + interval '1 month')::date
-       AND COALESCE(l.end_date, '9999-12-31'::date) >= $2::date`,
+       AND COALESCE(l.end_date, '9999-12-31'::date) >= $2::date
+       AND (
+         l.start_date < ($2::date + interval '1 month')::date
+         -- S642 (Nic): "all the leases are onboarding existing tenants. During
+         -- the onboarding window, we are supposed to count it as existing
+         -- tenants here."
+         --
+         -- An onboarding lease's start_date is the day they signed onto GAM,
+         -- NOT the day they moved in — they were already living there, often
+         -- for years. Reading that date as a move-in makes every month before
+         -- it look like a vacancy, so a whole park's first cycle billed $0 on
+         -- spaces full of people using power. Calvin Curtis on RV 40 is the one
+         -- who noticed.
+         --
+         -- Bounded by the readings that exist: bills only run from the baseline
+         -- read taken when the property onboarded, so this reaches back over
+         -- the onboarding window and no further.
+         OR COALESCE(l.is_existing_tenancy, FALSE)
+       )`,
     [units.map((u: any) => u.id), cycleIso])
   const occupiedHere = occupiedNow || Number(leasedDuringCycle?.n ?? 0) > 0
   let stuckOnOccupied = false
@@ -1484,8 +1501,16 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
       JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
      WHERE h.unit_id = $1
        AND l.status IN ('active', 'expired', 'terminated')
-       AND h.effective_from <= $2::date
        AND (h.effective_to IS NULL OR h.effective_to > $2::date)
+       AND (
+         h.effective_from <= $2::date
+         -- S642 (Nic): an ONBOARDING lease's start date is the day they signed
+         -- onto GAM, not the day they moved in. They were already living there,
+         -- so they are the right person to bill for a cycle that precedes it.
+         -- Without this the occupancy check above says "somebody lived here"
+         -- and this one says "nobody to bill", and the charge is held forever.
+         OR COALESCE(l.is_existing_tenancy, FALSE)
+       )
      ORDER BY h.effective_from DESC
      LIMIT 1
   `, [args.unitId, args.cycleMonth])

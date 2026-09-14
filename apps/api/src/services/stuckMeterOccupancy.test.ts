@@ -21,7 +21,9 @@ beforeEach(async () => { await cleanupAllSchema() })
 const CYCLE = '2026-08-01'
 
 /** A space whose meter has not moved, plus a neighbour that used 120 kWh. */
-async function parkWithAStuckMeter(opts: { unitStatus: string; withLease: boolean }) {
+async function parkWithAStuckMeter(opts: {
+  unitStatus: string; withLease: boolean; existingTenancy?: boolean; leaseStart?: string
+}) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -60,8 +62,14 @@ async function parkWithAStuckMeter(opts: { unitStatus: string; withLease: boolea
 
     if (opts.withLease) {
       // A bill needs somebody to bill — the lookup joins the primary tenant.
-      const sLease = await seedLease(c, { unitId: stuckUnit, landlordId: ll.landlordId, startDate: '2026-08-01' })
+      const sLease = await seedLease(c, {
+        unitId: stuckUnit, landlordId: ll.landlordId,
+        startDate: opts.leaseStart ?? '2026-08-01',
+      })
       await seedLeaseTenant(c, { leaseId: sLease, tenantId: await seedTenant(c) })
+      if (opts.existingTenancy) {
+        await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [sLease])
+      }
     }
     await c.query('COMMIT')
     return { stuckUnit, stuckMeter, propertyId }
@@ -102,6 +110,44 @@ describe('a stuck meter on a space somebody lives in', () => {
   // The other direction must still hold: an empty space owes nothing.
   it('a genuinely empty space is still billed nothing', async () => {
     const w = await parkWithAStuckMeter({ unitStatus: 'vacant', withLease: false })
+    await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    const b = await billFor(w.stuckUnit)
+    if (b) {
+      expect(b.allocation_method).not.toBe('comparable_low')
+      expect(Number(b.charge_amount)).toBe(0)
+    }
+  })
+})
+
+// ── the onboarding window ──────────────────────────────────────────────────
+//
+// Nic: "all the leases are onboarding existing tenants. During the onboarding
+// window, we are supposed to count it as existing tenants here."
+//
+// An onboarding lease's start_date is the day they signed onto GAM, not the day
+// they moved in. Reading it as a move-in makes every month before it look like
+// a vacancy — so a park's first cycle billed $0 on spaces full of people using
+// power.
+describe('a resident who was already living there', () => {
+  it('is billed for the cycle BEFORE their GAM lease starts', async () => {
+    const w = await parkWithAStuckMeter({
+      unitStatus: 'active', withLease: true,
+      existingTenancy: true, leaseStart: '2026-09-02',   // after the Aug cycle
+    })
+    await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    const b = await billFor(w.stuckUnit)
+    expect(b.allocation_method, 'they lived there in August — the meter is dead, not the space')
+      .toBe('comparable_low')
+    expect(Number(b.charge_amount)).toBeGreaterThan(0)
+  })
+
+  // The boundary that keeps it honest: a genuinely NEW tenant is not billed for
+  // the month before they arrived.
+  it('a new tenant is NOT billed for the month before they moved in', async () => {
+    const w = await parkWithAStuckMeter({
+      unitStatus: 'active', withLease: true,
+      existingTenancy: false, leaseStart: '2026-09-02',
+    })
     await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
     const b = await billFor(w.stuckUnit)
     if (b) {
