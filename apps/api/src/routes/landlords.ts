@@ -9,6 +9,8 @@ import { AppError } from '../middleware/errorHandler'
 import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, isEntityMember } from '../lib/landlordScope'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
+// S642: one definition of rent collected this month, shared with Reports and admin.
+import { collectedRentMtd } from '../lib/rentCollected'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue } from '../services/email'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
@@ -901,15 +903,13 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // SQL definitions, so the Dashboard's Collected/Outstanding cards agree with
     // Reports. Distinct from monthly_rent_volume above, which is CONTRACTED rent
     // on active units (the "Expected" capacity number), not collected cash.
-    //   collected_mtd — settled rent payments this calendar month
+    //   collected_mtd — rent the tenant has SENT this month (settled + ACH
+    //                   clearing), matching the admin overview. S642.
     //   outstanding   — unpaid (pending+partial) invoice balances
-    const [collectedRow] = await query<any>(`
-      SELECT COALESCE(SUM(amount), 0)::float AS collected_mtd
-        FROM payments
-       WHERE landlord_id = ANY($1) AND status='settled' AND type='rent'
-         AND settled_at >= date_trunc('month', NOW())
-         AND ($2::uuid IS NULL OR unit_id IN (
-               SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
+    // S642 (Nic): one shared definition with the admin overview and Reports —
+    // settled PLUS ACH still clearing. See lib/rentCollected.
+    const collected = await collectedRentMtd(scopeIds, propertyFilter)
+    const collectedRow = { collected_mtd: collected.collected }
     // ── S640 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT OUTSTANDING ───────
     //
     //   "It's not outstanding... not good to have that integrated everywhere
@@ -1039,7 +1039,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: collected.inFlight, outstanding: outstandingRow?.outstanding||0,
       work_trade_suspended: outstandingRow?.work_trade_suspended||0,
       // S640: what is actually going out on the next weekly run, and what is
       // still clearing behind it.

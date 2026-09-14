@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { collectedRentMtd } from '../lib/rentCollected'
 import { occupancyRateFrom } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
@@ -65,7 +66,8 @@ function reportEntity(user: any, explicit: unknown): string {
 // see the whole platform).
 //
 // Returns:
-//   collectedMtd     — sum of settled rent payments this calendar month
+//   collectedMtd     — rent the tenant has SENT this month (settled + ACH
+//                      still clearing) — one definition, lib/rentCollected
 //   outstanding      — sum of unsettled invoice amounts (pending + partial)
 //   occupancyRate    — round(100 × active / total) across landlord's units
 //   monthly[]        — last 6 months: collected, disbursed, fees, net
@@ -144,20 +146,12 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
         net: round2(v.collected - v.fees),
       }))
 
-    const collectedMtdRow = isAdmin
-      ? await queryOne<any>(`
-          SELECT COALESCE(SUM(amount), 0)::numeric AS amount
-            FROM payments
-           WHERE status='settled' AND type='rent'
-             AND settled_at >= date_trunc('month', NOW())
-        `)
-      : await queryOne<any>(`
-          SELECT COALESCE(SUM(amount), 0)::numeric AS amount
-            FROM payments
-           WHERE landlord_id = ANY($1::uuid[]) AND status='settled' AND type='rent'
-             AND settled_at >= date_trunc('month', NOW())
-        `, [landlordIds])
-    const collectedMtd = parseFloat(collectedMtdRow?.amount ?? '0')
+    // S642: the same definition the dashboard and the admin overview use —
+    // settled PLUS ACH still clearing. These were three copies of one query and
+    // the landlord's two screens disagreed with the platform's by a live $460
+    // payment. See lib/rentCollected.
+    const collectedRent = await collectedRentMtd(isAdmin ? null : landlordIds)
+    const collectedMtd = collectedRent.collected
 
     // Outstanding = invoice total minus settled payments matched to that invoice.
     // pending|partial invoices only — settled invoices net to zero.

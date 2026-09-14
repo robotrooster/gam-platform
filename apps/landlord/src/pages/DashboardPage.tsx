@@ -18,6 +18,8 @@ interface DashStats {
   evictionModeUnits: number
   monthlyRentVolume: number
   collectedMtd: number
+  /** S642: of collectedMtd, how much is ACH still clearing. */
+  collectedInFlight?: number
   outstanding: number
   // S640: rent that trades for labour — contracted, real, and never arriving as
   // money. Reported apart from monthlyRentVolume/outstanding, not inside them.
@@ -256,7 +258,18 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
           <div className="kpi-label">Collected This Month</div>
           <div className="kpi-value green">{fmtWhole(stats?.collectedMtd || 0)}</div>
-          <div className="kpi-sub">settled rent payments MTD</div>
+          {/* S642 (Nic): "Collected this month needs to show any in-flight
+              stuff… those two cards need to match up." This counted SETTLED
+              only while the admin overview counted settled plus ACH clearing,
+              so the two read $460 apart — one mobile home's payment, already
+              debited from the tenant's bank and invisible here. Same definition
+              now (lib/rentCollected), and when money is still on its way the
+              card says so rather than quietly including it. */}
+          <div className="kpi-sub">
+            {(stats?.collectedInFlight || 0) > 0
+              ? <>rent received MTD · incl. {fmtWhole(stats!.collectedInFlight)} ACH clearing</>
+              : <>rent received MTD</>}
+          </div>
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
