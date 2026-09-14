@@ -205,13 +205,16 @@ describe('POST /api/bank-accounts', () => {
   // the Wells Fargo account that Mountain View's rent pays into — clicked "Add
   // account" and the form silently did nothing. Nic: "He's old school, and he
   // may not have named the account."
-  it('blank nickname is accepted and derived from the account', async () => {
+  it('S637: nickname optional — a blank one gets a generated label', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
       .send({ ...happyPayload(), nickname: '' })
     expect(res.status).toBe(201)
-    expect(res.body.data.nickname).toMatch(/^(Checking|Savings) ••\d{4}$/)
+    // Ben's exact form kept over my regex: the fixture is a checking account
+    // ending 7890, so the precise string is assertable and catches a wrong
+    // derivation that a pattern would wave through.
+    expect(res.body.data.nickname).toBe('Checking ••7890')
   })
 
   it('an omitted nickname is accepted too', async () => {

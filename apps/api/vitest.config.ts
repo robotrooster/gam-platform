@@ -9,6 +9,24 @@ export default defineConfig({
     // worth testing: it is the part two apps depend on at once.
     include: ['src/**/*.test.ts', '../../packages/shared/src/**/*.test.ts'],
     exclude: ['node_modules/**', 'dist/**'],
+    // Hermetic test env. These suites passed on the dev Mac and failed in CI
+    // because db/index.ts loads apps/api/.env at import time — the Mac's real
+    // RESEND_API_KEY and BANK_ENCRYPTION_KEY leaked into the test process and
+    // four files silently depended on them (email.test.ts asserts on a mocked
+    // Resend client that is never constructed without a key; bank-account
+    // routes 500 without an encryption key). Pin deterministic test values so
+    // the suite passes identically on any machine. The dummy Resend key can
+    // never send: email.ts only fires real sends in production/EMAIL_SEND_LIVE
+    // and the email tests mock the resend module anyway.
+    env: {
+      RESEND_API_KEY: 're_test_never_sends',
+      BANK_ENCRYPTION_KEY: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+      // S637's deliverability tests assert which SENDER a message uses; without
+      // these the support sender silently falls back to onboarding@resend.dev
+      // and the assertions only passed where a real .env supplied them.
+      EMAIL_FROM_NOREPLY: 'GAM <noreply@gam.test>',
+      EMAIL_FROM_SUPPORT: 'GAM Support <support@gam.test>',
+    },
     globalSetup: ['./src/test/globalSetup.ts'],
     // S641: runs in EVERY worker, for every file. Its afterEach clears the
     // live-mail opt-in so one forgetful file cannot leak it into the next suite

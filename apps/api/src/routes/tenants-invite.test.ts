@@ -246,9 +246,10 @@ describe('POST /accept-invite — tenant activates account', () => {
 
     // The activation itself is whole: password, phone, terms AND the 2FA flag,
     // which used to be a separate late UPDATE that Laurel never reached.
-    const u = await db.query<{ pw: string; phone: string; tos: string | null; twofa: boolean; tok: string | null }>(
+    const u = await db.query<{ pw: string; phone: string; tos: string | null; twofa: boolean; tok: string | null; accepted: string | null }>(
       `SELECT password_hash AS pw, phone, accepted_tos_at AS tos,
-              email_2fa_enabled AS twofa, tenant_invite_token AS tok
+              email_2fa_enabled AS twofa, tenant_invite_token AS tok,
+              tenant_invite_accepted_at AS accepted
          FROM users WHERE id = $1`, [f.userId])
     expect(u.rows[0].pw.startsWith('$2')).toBe(true)
     expect(u.rows[0].phone).toBe('5205551234')
@@ -257,8 +258,10 @@ describe('POST /accept-invite — tenant activates account', () => {
     // S637: the token is RETAINED and the acceptance is stamped instead. A
     // spent link used to be indistinguishable from a bad one, so tenants who had
     // already set up their account were told the invite "expired" and asked Nic
-    // for a new one. The row now knows the difference.
-    expect(u.rows[0].tok).not.toBeNull()
+    // for a new one. The row now knows the difference — and the kept token
+    // authorises nothing once accepted.
+    expect(u.rows[0].tok).toBe(f.token)
+    expect(u.rows[0].accepted).not.toBeNull()
   })
 
   it('S637: the token is only spent if the activation commits', async () => {
@@ -300,10 +303,11 @@ describe('POST /accept-invite — tenant activates account', () => {
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
     expect(ok.status).toBe(200)
 
-    // Still single-use — it never activates twice or drafts a second lease —
-    // but a replay is now told WHICH thing happened. Nic (S637): "several more
-    // people tell me that their invite expired when they already accepted it...
-    // tell them to look for a separate email for their lease."
+    // Still single-use — a replay of a SPENT link is refused with 409 rather
+    // than activating twice or drafting a second lease — but it is now told
+    // WHICH thing happened. Nic (S637): "several more people tell me that their
+    // invite expired when they already accepted it... tell them to look for a
+    // separate email for their lease." 
     const replay = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token: f.token, password: 'longenoughpassword', acceptedTerms: true })
@@ -385,6 +389,9 @@ describe('POST /accept-invite — tenant activates account', () => {
          FROM users WHERE id=$1`, [userId])
     expect(u.rows[0].password_hash).not.toBe('$2b$10$placeholder_invite_pending')
     expect(u.rows[0].password_hash).toMatch(/^\$2[aby]\$/)  // bcrypt envelope
+    // S637 (b51aa57): the token is retained (marked accepted) so a reopened
+    // invite reads "already set up"; only the EXPIRY is cleared, so an
+    // accepted invite can never also report as timed out.
     expect(u.rows[0].tenant_invite_token).not.toBeNull()
     expect(u.rows[0].tenant_invite_expires_at).toBeNull()
     expect(u.rows[0].tenant_invite_accepted_at).not.toBeNull()

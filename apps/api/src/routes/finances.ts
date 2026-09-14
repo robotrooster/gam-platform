@@ -33,6 +33,7 @@ import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { getConnectBalance } from '../services/connectPayouts'
+import { heldOwnerShareForUser } from '../services/landlordPassthrough'
 import { logger } from '../lib/logger'
 
 export const financesRouter = Router()
@@ -103,6 +104,23 @@ financesRouter.get('/me/finances', async (req, res, next) => {
       }
     }
 
+    // S639: the number that actually answers "where is my rent money".
+    // Under platform-holds the Connect balance above is structurally ~$0
+    // (money sits on GAM's platform until the batch, then transfers and pays
+    // out back-to-back) — so without this figure the portal reads as empty
+    // in exactly the week rent arrives. held_balance is the unfired
+    // owner-share pool the next batch will reserve; next_payout is when that
+    // batch is already scheduled to run (null = waiting on a 50%/90%
+    // threshold, the late-month sweep, or the weekly Tuesday batch).
+    const heldBalance = await heldOwnerShareForUser(userId)
+    const nextPayout = await queryOne<{ scheduled_for: string; trigger_kind: string }>(
+      `SELECT scheduled_for::text, trigger_kind
+         FROM payout_triggers
+        WHERE entity_kind = 'user' AND entity_id = $1 AND fired_at IS NULL
+        ORDER BY scheduled_for ASC
+        LIMIT 1`,
+      [userId])
+
     const params: any[] = [userId]
     let whereSql = 'WHERE user_id = $1'
     if (q.propertyId) {
@@ -127,6 +145,8 @@ financesRouter.get('/me/finances', async (req, res, next) => {
         current_balance:   currentBalance,
         pending_balance:   pendingBalance,
         connect_ready:     connectReady,
+        held_balance:      heldBalance,
+        next_payout:       nextPayout ?? null,
         // Deprecated-but-preserved fields for frontend back-compat. UI
         // cleanup will drop these in a separate session.
         unrouted_balance:  0,
