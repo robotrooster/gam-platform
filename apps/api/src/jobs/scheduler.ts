@@ -1769,6 +1769,30 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S642 (Nic): "Calculate interest, have it be paid out as credit where
+  // applicable." Deposit interest accrued monthly since S604 and was only ever
+  // paid at MOVE-OUT. Eight states require it paid annually while the tenancy
+  // continues — AZ, IL, MA, NJ, NM, OH, PA, RI — so a tenant three years into a
+  // lease was owed money the platform had calculated and never handed over.
+  //
+  // Daily rather than yearly, because it pays on each tenancy's OWN
+  // anniversary: a deposit becomes due the day its oldest unpaid month turns
+  // twelve. A once-a-year run would make most tenants wait up to eleven extra
+  // months, and would put every payout on one day. Almost every run does
+  // nothing, which is the point.
+  //
+  // 6am Phoenix — before the invoice generator at 7, so a credit issued today
+  // lands on today's bill rather than next month's.
+  cron.schedule('0 6 * * *', async () => {
+    try {
+      const { payAnnualDepositInterest } = await import('../services/depositInterestPayout')
+      const r = await payAnnualDepositInterest()
+      if (r.paid > 0 || r.errors > 0) logger.info(r, '[deposit-interest]')
+    } catch (e) {
+      logger.error({ err: e }, '[deposit-interest] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // ── S642: THE BALANCE REFRESH IS ITS OWN JOB, ON BANKING DAYS ─────────────
   //
   // Nic: "Change it to once a day and only Monday through Friday excluding

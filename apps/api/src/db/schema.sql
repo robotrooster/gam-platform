@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 7q8IdAwe2OzhXm8OfuDRwxFNhheiV5tosrCn5GaGXA3GtZWp4lOZuN8CouT2pTf
+\restrict Fu3iMgTtNRQkeeLGYq0QbHKLjoPNhEycBGCF34g6DQ6cHoYDakzgfzFWrsOIQPt
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8269,6 +8269,8 @@ CREATE TABLE public.security_deposit_interest_accruals (
     spread_amount numeric(10,4),
     market_rate_pct numeric(6,4),
     rate_basis text,
+    paid_at timestamp with time zone,
+    paid_credit_id uuid,
     CONSTRAINT sdi_accruals_rate_basis_check CHECK (((rate_basis IS NULL) OR (rate_basis = ANY (ARRAY['fixed'::text, 'lesser_of_actual'::text, 'share_of_actual'::text, 'actual_earned'::text, 'actual_minus_admin'::text, 'index_linked'::text, 'none'::text])))),
     CONSTRAINT sdi_accruals_rate_source_check CHECK (((rate_source IS NULL) OR (rate_source = ANY (ARRAY['statutory'::text, 'landlord_override'::text])))),
     CONSTRAINT security_deposit_interest_accruals_days_held_check CHECK (((days_held >= 0) AND (days_held <= days_in_month))),
@@ -8351,6 +8353,13 @@ COMMENT ON COLUMN public.security_deposit_interest_accruals.market_rate_pct IS '
 --
 
 COMMENT ON COLUMN public.security_deposit_interest_accruals.rate_basis IS 'S604: how annual_rate_pct was applied to produce interest_amount. fixed = flat; lesser_of_actual = MIN(rate, earned); share_of_actual = share of earned. NULL when nothing was owed.';
+
+
+--
+-- Name: COLUMN security_deposit_interest_accruals.paid_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposit_interest_accruals.paid_at IS 'When this month''s owed interest was handed to the tenant. NULL = still owed. Set by the annual sweep or by the move-out deposit return, never by hand.';
 
 
 --
@@ -9244,7 +9253,7 @@ CREATE TABLE public.tenant_credits (
     voided_at timestamp with time zone,
     CONSTRAINT tenant_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
     CONSTRAINT tenant_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric)),
-    CONSTRAINT tenant_credits_category_check CHECK ((category = ANY (ARRAY['screening_cap'::text, 'late_fee_refund'::text, 'overcharge'::text, 'goodwill'::text, 'other'::text]))),
+    CONSTRAINT tenant_credits_category_check CHECK ((category = ANY (ARRAY['screening_cap'::text, 'late_fee_refund'::text, 'overcharge'::text, 'goodwill'::text, 'deposit_interest'::text, 'other'::text]))),
     CONSTRAINT tenant_credits_status_check CHECK ((status = ANY (ARRAY['active'::text, 'void'::text])))
 );
 
@@ -17308,6 +17317,13 @@ CREATE INDEX idx_sdi_accruals_month_spread ON public.security_deposit_interest_a
 
 
 --
+-- Name: idx_sdia_unpaid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sdia_unpaid ON public.security_deposit_interest_accruals USING btree (security_deposit_id, accrual_month) WHERE (paid_at IS NULL);
+
+
+--
 -- Name: idx_sdir_state_year_units; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -25110,6 +25126,14 @@ ALTER TABLE ONLY public.security_deposit_interest_accruals
 
 
 --
+-- Name: security_deposit_interest_accruals security_deposit_interest_accruals_paid_credit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposit_interest_accruals
+    ADD CONSTRAINT security_deposit_interest_accruals_paid_credit_id_fkey FOREIGN KEY (paid_credit_id) REFERENCES public.tenant_credits(id) ON DELETE SET NULL;
+
+
+--
 -- Name: security_deposit_interest_accruals security_deposit_interest_accruals_security_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26473,5 +26497,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 7q8IdAwe2OzhXm8OfuDRwxFNhheiV5tosrCn5GaGXA3GtZWp4lOZuN8CouT2pTf
+\unrestrict Fu3iMgTtNRQkeeLGYq0QbHKLjoPNhEycBGCF34g6DQ6cHoYDakzgfzFWrsOIQPt
 
