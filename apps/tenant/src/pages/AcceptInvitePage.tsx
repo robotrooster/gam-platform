@@ -27,7 +27,9 @@ export function AcceptInvitePage() {
     if (!token) { setError('Invalid invite link'); setLoading(false); return }
     apiGet(`/tenants/invite-info?token=${token}`)
       .then((data: any) => { setInviteInfo(data); setLoading(false) })
-      .catch(() => { setError('This invite link is invalid or has already been used.'); setLoading(false) })
+      // S642: the message no longer matters for wording — the screen below
+      // says what happened — but keep a value so the error branch renders.
+      .catch(() => { setError('used-or-invalid'); setLoading(false) })
   }, [token])
 
   const handleSubmit = async () => {
@@ -122,18 +124,35 @@ export function AcceptInvitePage() {
   if (error && !inviteInfo) return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#060809', padding: 24, fontFamily: 'system-ui' }}>
       <div style={{ maxWidth: 400, textAlign: 'center', color: '#b8c4d8' }}>
-        <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
-        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>Invalid Invite</div>
-        <div style={{ fontSize: '.85rem', lineHeight: 1.6 }}>{error}</div>
-        {/* S637: the commonest reason this screen appears is a link that was
-            already used successfully — so lead with that, and only then offer
-            the landlord. */}
-        <div style={{ fontSize: '.8rem', color: '#8a96b0', marginTop: 14, lineHeight: 1.6 }}>
-          If you already set a password with this link, you&rsquo;re done —{' '}
-          <a href="/login" style={{ color: '#c9a227', fontWeight: 700 }}>sign in</a> instead.
-          Your lease comes as a <strong style={{ color: '#c9a227' }}>separate email</strong>.
+        {/* S642 (Nic, via Calvin Curtis): "the lease link said to contact the
+            landlord." He had activated on September 7 and has a working
+            account — he had reopened the invite email, whose link is spent.
+            S637 kept the token from then on so we could say "you're already set
+            up", but 34 residents activated BEFORE that and their tokens were
+            deleted. The server cannot identify them, ever.
+            So this screen stops leading with a warning and an accusation. The
+            overwhelmingly commonest reason somebody is here is a link they
+            already used successfully, and that person needs a Sign in button,
+            not a suggestion that something is wrong and they should call their
+            landlord. */}
+        <div style={{ fontSize: 48, marginBottom: 16 }}>👋</div>
+        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>
+          This link has already been used
         </div>
-        <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 10 }}>Still stuck? Ask your landlord to resend it.</div>
+        <div style={{ fontSize: '.88rem', lineHeight: 1.65 }}>
+          Setup links work once. If you set a password with it, your account is fine —
+          nothing is wrong and you don&rsquo;t need a new invite.
+        </div>
+        <a href="/login" style={{ display: 'inline-block', marginTop: 18, padding: '11px 26px',
+          background: '#c9a227', color: '#060809', borderRadius: 10, fontWeight: 800,
+          textDecoration: 'none', fontSize: '.9rem' }}>Sign in</a>
+        <div style={{ fontSize: '.8rem', color: '#8a96b0', marginTop: 18, lineHeight: 1.6 }}>
+          Signing your lease? That comes as a <strong style={{ color: '#c9a227' }}>separate email</strong> —
+          look for &ldquo;please sign&rdquo; rather than reopening this one.
+        </div>
+        <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 14 }}>
+          Never set a password? Ask your landlord to resend the invite.
+        </div>
       </div>
     </div>
   )
