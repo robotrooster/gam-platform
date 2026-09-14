@@ -386,10 +386,9 @@ describe('POST /api/stripe/tenant/setup', () => {
     } finally { c.release() }
   })
 
-  // S642 (Nic, reverses S603): a card may be stored at ANY time, including
-  // during onboarding before a single invoice exists. S603 refused it because
-  // storing a card burns a ~$0.28 Stripe authorization that collects nothing;
-  // Nic's call is that a resident stuck unable to get set up costs more.
+  // S603: a tenant may only add a CARD when something is actually due — storing
+  // a card early burns a $0.26 Stripe authorization (+ $0.02 Radar) that collects
+  // nothing. Card entry belongs at the moment of payment. ACH is exempt.
   async function seedOutstanding(c: any, tenantId: string): Promise<void> {
     const { landlordId } = await seedLandlord(c)
     await c.query(
@@ -399,7 +398,7 @@ describe('POST /api/stripe/tenant/setup', () => {
       [tenantId, landlordId])
   }
 
-  it('card setup is ALLOWED when the tenant owes nothing (S642: save a method any time)', async () => {
+  it('card setup is REFUSED when the tenant owes nothing (S603 auth-cost gate)', async () => {
     const c = await db.connect()
     try {
       await c.query('BEGIN')
@@ -411,12 +410,10 @@ describe('POST /api/stripe/tenant/setup', () => {
       const res = await request(buildApp()).post('/api/stripe/tenant/setup')
         .set('Authorization', `Bearer ${token}`)
         .send({ method: 'card' })
-      expect(res.status).toBe(200)
-      expect(res.body.data.method).toBe('card')
-      // A brand-new tenant with no invoice still gets a customer + SetupIntent.
-      expect(stripeMocks.customersCreate).toHaveBeenCalledTimes(1)
-      const siCall = stripeMocks.setupIntentsCreate.mock.calls[0][0] as any
-      expect(siCall.payment_method_types).toEqual(['card'])
+      expect(res.status).toBe(409)
+      // No Stripe object may be created — that's the whole point of the gate.
+      expect(stripeMocks.setupIntentsCreate).not.toHaveBeenCalled()
+      expect(stripeMocks.customersCreate).not.toHaveBeenCalled()
     } finally { c.release() }
   })
 

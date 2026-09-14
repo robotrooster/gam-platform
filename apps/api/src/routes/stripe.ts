@@ -180,21 +180,35 @@ stripeRouter.post('/tenant/setup', async (req: any, res, next) => {
     )
     if (!tenant) throw new AppError(404, 'Tenant not found')
 
-    // S642 (Nic, DIRECTIVE — reverses S603): "People should be able to add a
-    // payment method at any time. Something is blocking it, even if the invoice
-    // hadn't been generated yet. People should be able to get on there and start
-    // saving payment methods on file during the onboarding process."
+    // S603 (Nic): a tenant may NOT store a card when nothing is due.
     //
-    // S603 refused a card SetupIntent unless something was outstanding, because
-    // Stripe bills per AUTHORIZATION rather than per successful payment: saving
-    // a card is its own bank ask (~$0.28) that collects nothing, so "add + pay"
-    // as a single action was the cheaper shape. That reasoning is still true and
-    // it is still the shape we steer toward at the moment of payment — but it is
-    // not worth a resident sitting in the portal unable to get set up. A new
-    // tenant should be able to put a method on file the day they sign, before a
-    // single invoice exists. The ~$0.28 is the cost of that, knowingly paid.
+    // Stripe bills per AUTHORIZATION, not per successful payment. Saving a card
+    // is its own bank ask ($0.26 auth + $0.02 Radar) that collects nothing, so a
+    // tenant who stores a card today and pays rent next week costs GAM $0.28 for
+    // no reason — the exact waste this rule exists to kill. Card entry belongs at
+    // the moment of payment, where ONE authorization can both charge and store.
     //
-    // ACH remains free to store and remains the rail we push rent toward.
+    // Tenants are also the least mobile users on the platform; card-on-file is a
+    // GUEST feature (someone touring between RV parks), not a tenant one.
+    // See memory gam-card-on-file-guests-not-tenants + gam-card-auth-cost-model.
+    //
+    // ACH is unaffected — a bank mandate is not a card authorization, costs
+    // nothing to store, and is the rail GAM actively steers rent toward.
+    if (method === 'card') {
+      const outstanding = await queryOne<{ n: string }>(
+        `SELECT COUNT(*)::text AS n
+           FROM payments
+          WHERE tenant_id = $1
+            AND ((status = 'pending' AND stripe_payment_intent_id IS NULL)
+                 OR status = 'failed')`,
+        [req.user!.profileId]
+      )
+      if (!outstanding || parseInt(outstanding.n, 10) === 0) {
+        throw new AppError(409,
+          'You can add a card when a payment is due. Nothing is outstanding right now — ' +
+          'to set up automatic payments before then, add a bank account instead.')
+      }
+    }
 
     const stripe = getStripe()
 
