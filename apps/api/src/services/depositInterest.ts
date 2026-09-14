@@ -81,6 +81,9 @@ interface DepositForAccrual {
   state:            string
   unit_type:        string | null   // S604: selects the unit-type-specific rate row
   property_units:   number | null   // S604: for size gates (IL 25+, NY 6+)
+  /** S642: units of THIS deposit's own type that are occupied — "regularly
+   *  containing 25 or more mobile homes". See min_units_basis. */
+  occupied_of_type: number | null
   funded_at:        string | null    // earliest installment payment date
   disbursed_at:     string | null
 }
@@ -114,6 +117,7 @@ export interface ResolvedRate {
   /** Gates: the obligation only attaches past these thresholds. */
   min_tenure_months?:   number | null
   min_property_units?:  number | null
+  min_units_basis?:     string | null
   /** S604 deposit-SIZE thresholds. 'trigger' = the whole deposit earns once it
    *  exceeds the threshold (NM); 'excess_only' = only the amount ABOVE the
    *  threshold earns (OH). When both legs are set the statute takes WHICHEVER
@@ -223,13 +227,19 @@ export function applyRateBasis(
  * Below the gate the state owes nothing, and GAM keeps the whole yield.
  */
 export function gateApplies(
-  rate:          Pick<ResolvedRate, 'min_tenure_months' | 'min_property_units'>,
+  rate:          Pick<ResolvedRate, 'min_tenure_months' | 'min_property_units' | 'min_units_basis'>,
   monthsHeld:    number,
   propertyUnits: number | null,
+  occupiedOfType: number | null = null,
 ): boolean {
   if (rate.min_tenure_months != null && monthsHeld < rate.min_tenure_months) return false
-  if (rate.min_property_units != null &&
-      (propertyUnits == null || propertyUnits < rate.min_property_units)) return false
+  if (rate.min_property_units != null) {
+    // S642: count what the statute counts. Counting every unit row for a
+    // mobile-home-park gate reads a 30-space park with 21 homes as 30 and
+    // starts paying interest the state never asked for.
+    const counted = rate.min_units_basis === 'occupied_of_type' ? occupiedOfType : propertyUnits
+    if (counted == null || counted < rate.min_property_units) return false
+  }
   return true
 }
 
@@ -270,13 +280,14 @@ export async function resolveRateForLandlord(
     admin_retention_pct: string | null
     min_tenure_months:      number | null
     min_property_units:     number | null
+    min_units_basis:        string | null
     threshold_rule:         'trigger' | 'excess_only' | null
     threshold_amount:       string | null
     threshold_months_rent:  string | null
   }>(
     `SELECT annual_rate_pct, effective_year, unit_types, act_key,
             statute_citation, notes, rate_basis, actual_share_pct,
-            admin_retention_pct, min_tenure_months, min_property_units,
+            admin_retention_pct, min_tenure_months, min_property_units, min_units_basis,
             threshold_rule, threshold_amount, threshold_months_rent
        FROM state_deposit_interest_rates
       WHERE state_code = $1 AND effective_year = $2
@@ -304,6 +315,7 @@ export async function resolveRateForLandlord(
         ? null : parseFloat(statutory.admin_retention_pct),
       min_tenure_months:  statutory.min_tenure_months,
       min_property_units: statutory.min_property_units,
+      min_units_basis:    statutory.min_units_basis,
       threshold_rule:     statutory.threshold_rule,
       threshold_amount:   statutory.threshold_amount == null
         ? null : parseFloat(statutory.threshold_amount),
@@ -471,7 +483,9 @@ export async function computeMonthlyAccrual(
   // Below the gate the state owes nothing and GAM keeps the whole yield.
   const monthsHeld = Math.floor(
     (monthStart.getTime() - fundedDate.getTime()) / (1000 * 60 * 60 * 24 * 30.44))
-  const gated = rate ? gateApplies(rate, monthsHeld, deposit.property_units) : false
+  const gated = rate
+    ? gateApplies(rate, monthsHeld, deposit.property_units, deposit.occupied_of_type)
+    : false
 
   const interest = rate && gated
     ? applyRateBasis(rate.rate_basis, flatInterest, earned, rate.actual_share_pct, {
@@ -545,7 +559,17 @@ export async function runMonthlyAccrual(monthStartIso: string): Promise<MonthlyA
         u.rent_amount::text AS monthly_rent,
         p.state,
         u.unit_type,
+        -- S642 (Nic): two counts, because two statutes count different things.
+        -- 765 ILCS 715/1 covers property "containing 25 or more UNITS" — units
+        -- that exist. 765 ILCS 745/18 covers a park "regularly containing 25 or
+        -- more MOBILE HOMES" — homes actually there. Mattoon is ~30 slabbed
+        -- spaces with ~21 homes on them: over one gate, under the other. Which
+        -- one a rule means is min_units_basis.
         (SELECT COUNT(*)::int FROM units u2 WHERE u2.property_id = p.id) AS property_units,
+        (SELECT COUNT(*)::int FROM units u3
+          WHERE u3.property_id = p.id
+            AND u3.unit_type = u.unit_type
+            AND u3.status NOT IN ('vacant','available')) AS occupied_of_type,
         COALESCE(
           (SELECT MIN(pmt.due_date::timestamp)
              FROM payments pmt

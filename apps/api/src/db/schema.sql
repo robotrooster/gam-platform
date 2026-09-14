@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 7EbQ3fFLZ9zYq2tJnLrhnIcm7qEZeGY8Qx2FPd7h9WdmdtqbMNILgvOf0ZHcVrF
+\restrict r2efBAh5vcSs4NPfSyAYbK3XSsHC4a6d5Xaesg7VxLaAXVxLjMiKGIMiXPmQCAb
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8566,8 +8566,10 @@ CREATE TABLE public.state_deposit_interest_rates (
     threshold_rule text,
     threshold_amount numeric(10,2),
     threshold_months_rent numeric(5,2),
+    min_units_basis text DEFAULT 'all_units'::text NOT NULL,
     CONSTRAINT sdir_rate_basis_check CHECK (((rate_basis = ANY (ARRAY['fixed'::text, 'lesser_of_actual'::text, 'share_of_actual'::text, 'actual_earned'::text, 'actual_minus_admin'::text, 'index_linked'::text, 'none'::text])) AND ((rate_basis <> 'share_of_actual'::text) OR (actual_share_pct IS NOT NULL)) AND ((rate_basis <> 'actual_minus_admin'::text) OR (admin_retention_pct IS NOT NULL)))),
     CONSTRAINT sdir_threshold_check CHECK (((threshold_rule IS NULL) OR (threshold_rule = ANY (ARRAY['trigger'::text, 'excess_only'::text])))),
+    CONSTRAINT state_deposit_interest_rates_min_units_basis_check CHECK ((min_units_basis = ANY (ARRAY['all_units'::text, 'occupied_of_type'::text]))),
     CONSTRAINT state_deposit_interest_rates_rate_check CHECK (((annual_rate_pct >= (0)::numeric) AND (annual_rate_pct <= (100)::numeric))),
     CONSTRAINT state_deposit_interest_rates_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
     CONSTRAINT state_deposit_interest_rates_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
@@ -8642,6 +8644,13 @@ COMMENT ON COLUMN public.state_deposit_interest_rates.threshold_rule IS 'S604: N
 --
 
 COMMENT ON COLUMN public.state_deposit_interest_rates.threshold_amount IS 'S604: dollar leg of the threshold. When both this and threshold_months_rent are set, the statute takes WHICHEVER IS GREATER (OH: $50 or one month rent).';
+
+
+--
+-- Name: COLUMN state_deposit_interest_rates.min_units_basis; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_deposit_interest_rates.min_units_basis IS 'What min_property_units counts. all_units = units that exist (765 ILCS 715/1 "25 or more units"). occupied_of_type = units of the deposit''s own type that are occupied (765 ILCS 745/18 "regularly containing 25 or more mobile homes").';
 
 
 --
@@ -26464,5 +26473,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 7EbQ3fFLZ9zYq2tJnLrhnIcm7qEZeGY8Qx2FPd7h9WdmdtqbMNILgvOf0ZHcVrF
+\unrestrict r2efBAh5vcSs4NPfSyAYbK3XSsHC4a6d5Xaesg7VxLaAXVxLjMiKGIMiXPmQCAb
 
