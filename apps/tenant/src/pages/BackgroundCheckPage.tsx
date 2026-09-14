@@ -36,6 +36,17 @@ function ScreeningCardForm({ amountLabel, onPaid }: { amountLabel: string; onPai
   return (
     <div style={{ textAlign: 'left' }}>
       <PaymentElement />
+      {/* S642 (Nic): the screening charge now stores the card, because THIS
+          authorization is already being made and storing on it is free. That
+          has to be said plainly on the form where the card is typed — a card
+          kept for later off-session use is not something to do quietly, and a
+          resident who finds it saved without being told reads it as a mistake.
+          Stated, not asked: "no choices to be made by tenants." It is removable
+          from the portal any time. */}
+      <div style={{ fontSize: '.72rem', color: '#7a8aaa', lineHeight: 1.55, marginTop: 10 }}>
+        We'll keep this card on file so it's ready if you move in — you can remove it from
+        your portal at any time. Nothing else is charged to it today.
+      </div>
       {err && <div style={{ color: '#ef4444', fontSize: '.78rem', marginTop: 8 }}>{err}</div>}
       <button onClick={pay} disabled={busy || !stripe}
         style={{ width: '100%', marginTop: 14, padding: '12px', borderRadius: 8, border: 'none', background: busy ? '#141a22' : '#c9a227', color: busy ? '#4a5568' : '#060809', fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', fontSize: '.88rem' }}>
@@ -368,8 +379,36 @@ export function BackgroundCheckPage() {
   if((status as any)?.status==='approved')return(
     <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'60vh',gap:16,textAlign:'center',padding:32}}>
       <div style={{width:72,height:72,borderRadius:'50%',background:'rgba(34,197,94,.1)',border:'2px solid #22c55e',display:'flex',alignItems:'center',justifyContent:'center'}}><Check size={32} style={{color:'#22c55e'}}/></div>
-      <h2 style={{color:'#eef1f8',margin:0}}>Application Approved</h2>
-      <p style={{color:'#4a5568',maxWidth:380}}>Your background check has been approved. You now have full access to your tenant portal.</p>
+      <h2 style={{color:'#eef1f8',margin:0}}>{isSpeculative?"You're in the renter pool":'Application Approved'}</h2>
+      {/* S642 (Nic): a POOL applicant has no landlord, no unit and no lease, so
+          "full access to your tenant portal" described a tenancy they do not
+          have — it reads as though something should be there and isn't. They
+          get told what actually happens next instead.
+
+          "Maybe if anybody goes through that flow of self-sign-up, they see a
+          coming soon thing." Browsing listings yourself is built but not
+          deployed, so it is named as coming rather than linked or hidden —
+          somebody who just paid to be screened is owed a straight answer about
+          what they can do now. */}
+      {isSpeculative ? (
+        <>
+          <p style={{color:'#4a5568',maxWidth:400,lineHeight:1.6}}>
+            Your screening came back clear and you're in the renter pool. Landlords with
+            open units in your area can find you from here — you don't need to do anything
+            else, and we'll email you the moment one is interested.
+          </p>
+          <div style={{maxWidth:400,padding:'14px 18px',borderRadius:10,background:'#141a22',border:'1px solid #1e2530'}}>
+            <div style={{fontSize:'.72rem',fontWeight:700,color:'#c9a227',letterSpacing:'.08em',textTransform:'uppercase',marginBottom:6}}>Coming soon</div>
+            <div style={{fontSize:'.82rem',color:'#b8c4d8',lineHeight:1.6}}>
+              Browsing open places yourself. For now the matching runs the other way —
+              landlords come to you, and your screening is already good across every one
+              of them.
+            </div>
+          </div>
+        </>
+      ) : (
+        <p style={{color:'#4a5568',maxWidth:380}}>Your background check has been approved. You now have full access to your tenant portal.</p>
+      )}
     </div>
   )
   if((status as any)?.status==='denied'){

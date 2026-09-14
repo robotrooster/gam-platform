@@ -286,10 +286,55 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
         data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.total, breakdown: fee, feeWaived: false, testMode: true },
       })
     }
+    // ── S642 (Nic): KEEP THE CARD, ON THE AUTHORIZATION WE ARE ALREADY MAKING ──
+    //
+    // "Let's store the card on the screening charge."
+    //
+    // Stripe bills per AUTHORIZATION, not per successful payment, which is the
+    // whole reason a tenant cannot store a card out of the blue — that would be
+    // a ~$0.28 bank ask collecting nothing ([[gam-card-auth-cost-model]], and the
+    // gate on /stripe/tenant/setup that Nic re-affirmed this same session).
+    // THIS authorization is already happening: the applicant is paying the
+    // screening fee. Adding setup_future_usage stores the card on it for free.
+    //
+    // Same platform Stripe account the rent rails use, so if this applicant
+    // becomes a tenant anywhere on GAM the card is already on file and their
+    // first rent payment is one action instead of two.
+    //
+    // Best-effort: a customer that cannot be created must never stop somebody
+    // paying for a screening. The charge proceeds without storage.
+    let bgcCustomerId: string | null = null
+    try {
+      const t = await queryOne<{ id: string; stripe_customer_id: string | null; email: string }>(
+        `SELECT t.id, t.stripe_customer_id, u.email
+           FROM tenants t JOIN users u ON u.id = t.user_id
+          WHERE t.id = $1`,
+        [req.user!.profileId])
+      if (t) {
+        bgcCustomerId = t.stripe_customer_id
+        if (!bgcCustomerId) {
+          const customer = await stripeForBgc!.customers.create({
+            email:    t.email,
+            metadata: { tenantId: t.id, createdBy: 'background_check_intake' },
+          })
+          bgcCustomerId = customer.id
+          await query(`UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2`,
+            [bgcCustomerId, t.id])
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, user_id: req.user!.userId },
+        '[bgc] could not prepare a customer to keep the card on — charging without storing')
+      bgcCustomerId = null
+    }
+
     const intent = await stripeForBgc!.paymentIntents.create({
       amount: Math.round(fee.total * 100),
       currency: 'usd',
       payment_method_types: ['card'],
+      ...(bgcCustomerId
+        ? { customer: bgcCustomerId, setup_future_usage: 'off_session' as const }
+        : {}),
       description: landlordId ? 'GAM tenant background screening' : 'GAM renter-pool background screening',
       // The landlord id still rides in metadata so the check can be attributed,
       // but it steers nothing about the charge.
