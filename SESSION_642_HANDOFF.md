@@ -187,65 +187,106 @@ so the next session starts from the real state rather than a blank page.
 ### 1. Pay links — somebody else pays your bill
 
 **Nic:** *"Say somebody's on hard times, can they get some assistance? Can they
-share a link to have somebody help them pay the bill? Like a one-time thing
-that doesn't save their information, or asks them if they wanna save their
-information. There's a widow whose son is gonna help pay the rent."*
+share a link to have somebody help them pay the bill?… There's a widow whose son
+is gonna help pay the rent."*
 
-The resident generates the link herself and sends it — **she** texts or emails
-it to her son. GAM sends nothing on her behalf, which sidesteps the fact that
-there is no SMS capability yet.
+The resident generates the link and sends it herself, so GAM needs no SMS.
 
-**Prior art that already works this way** — do not build a parallel system:
-`publicCustomerPortal.ts` (S502) is a no-auth, token-scoped page on the
-BUSINESS side: the token scopes everything to one customer of one business, they
-see only their own invoices, and `POST .../invoices/:id/pay` returns a hosted
+**DECIDED S642 — the link covers the WHOLE BALANCE, not one invoice.** Nic:
+*"If somebody's more than a month behind and they have two invoices generated,
+paying one isn't gonna help them get current. And then you also have the
+confusion of making sure it sends the oldest invoice first. It needs to send the
+entire amount due."* Right on both counts — per-invoice links would also make
+the helper guess which one matters.
+
+**Prior art — do not build a parallel system:** `publicCustomerPortal.ts` (S502)
+is already a no-auth, token-scoped page on the BUSINESS side; the token scopes
+to one customer of one business and `POST .../invoices/:id/pay` returns a hosted
 pay link. `publicCardUpdate.ts` is the same shape for a card. The tenant version
-is that pattern pointed at a rent invoice instead of a business invoice.
+is that pattern pointed at a rent balance.
 
-**Real questions before building:**
-- The link exposes an amount owed and a unit to whoever holds it. Scope it to
-  ONE invoice, not the account, and give it a short life — a forwarded link
-  should not become a standing window into somebody's balance.
-- Saving the payer's card: the helper is not the tenant, so a saved card must
-  attach to the HELPER, never to the tenant's account, or the next month's
-  autopay silently charges the son. Ask, default to not saving.
-- Who the receipt names, and whether the tenant is told who paid. She probably
-  wants to know it landed; he may not want his name on her ledger.
-- [[gam-no-partial-rent-payments]] still applies — the helper pays the balance
-  in full or not at all.
-- Fees follow the method used, same as any other payment
-  ([[gam-card-auth-cost-model]], [[gam-ach-fee-schedule-untouchable]]).
+#### The open question: can a helper pay PART of it?
 
-### 2. VoIP numbers, voicemail transcription, and auto-reply
+Nic's case: *"Her son can only help her out with two hundred dollars out of the
+four sixty."* His proposal — hold the $200 suspended, and when she pays the
+remaining $260 the whole $460 applies as ONE payment to the landlord, so
+[[gam-no-partial-rent-payments]] and the eviction clock are both preserved. If
+the landlord files eviction while money is held, it returns to wherever it came
+from.
 
-**Nic:** *"Having the ability for voice over internet protocol phone numbers. Is
-there a way we could set something up to transcribe a voicemail, or if somebody's
-calling about a reservation, have it automatically kind of text them back — hey,
-we booked your reservation, here's a link to pay your deposit. Just to make
-answering the phone easier, because a lot of people have a bunch of redundant
-questions. Like, do you have any spots that are facing to the northwest and blah
-blah blah. I don't wanna waste my time on the phone with all those people. It's
-not worth it."*
+He then talked himself part-way out of it and asked for options. **Nic:** *"I
+don't know how that works, because the front counter person can't type in, oh,
+you're paying two hundred and sixty dollars. So maybe it's better if we scrap
+the whole person being able to help out with partial… but adult children often
+live far away from their parents. If they can only help them out with part of
+the money, it seems like we should be able to handle that."*
 
-The goal is **fewer pointless calls**, not a phone system for its own sake. The
-two things he actually named:
-- a voicemail arrives as TEXT he can read in seconds rather than a recording he
-  has to listen to;
-- a reservation caller gets an automatic text back carrying the booking and a
-  deposit pay link — which is the SAME artifact as idea 1 above, so the two
-  should share one mechanism.
+**Option A — full balance only.** The helper pays everything or nothing. No
+custody of third-party money, no refund path, no expiry policy, nothing new to
+display. The son who can only give $200 sends it to his mother directly and she
+pays — money still reaches the landlord, GAM just is not in the middle. Cheapest
+by a wide margin.
 
-**What this would need that does not exist:** a phone number provider and an
-SMS sender. GAM has neither today, and
-[[gam-email-dns-posture]] records how carefully the email sender was set up —
-an SMS identity deserves the same care (A2P registration is not optional and is
-not fast).
+**Option B — pledged contributions (Nic's design).** A contribution is held and
+is NOT a payment. When the held amount plus what the tenant pays covers the
+balance, ONE full payment settles. Solves the real case. Costs: GAM holds other
+people's money with a refund obligation, which needs an expiry, a return path,
+and a decision about what happens when she simply never pays the rest.
 
-**Worth deciding early:** the redundant questions he wants to stop answering are
-mostly facts a booking site already publishes. Some of that traffic is better
-removed by the site answering the question than by a phone system handling the
-call more efficiently. The agents ([[gam-agent-roster]] — Skye is the guest-facing
-one) are the obvious place for it, and are already built.
+**Option C — the tenant names the amount.** She generates a link FOR $200
+because that is what she asked him for. Same mechanism as B, but she controls
+the split instead of the helper choosing at the till. Better UX, identical
+custody question.
+
+**The thing that decides whether B/C are safe:** the protection only holds if
+the held money is never treated as a payment anywhere. The balance owed stays
+$460, late fees keep accruing, delinquency still counts the unit, and the
+landlord is shown nothing until it settles in full. The moment one screen says
+"partially paid", the eviction-clock protection this whole design exists to keep
+is gone. That discipline is the build, more than the plumbing is.
+
+**Nic's own front-desk objection is answerable and should not kill the idea.**
+The desk does not type a reduced figure — it shows *"Owes $460 · $200 pledged,
+expires Sept 20 · collect $260"*. Pledged funds displayed, not a partial payment
+recorded.
+
+**Who the receipt names — proposed:** everyone gets a true document. The helper
+gets a receipt for HIS contribution (amount, unit, date), the tenant's ledger
+shows one $460 payment noting $200 came from a contribution, the landlord sees
+one payment. Nobody is told a half-truth, and the helper's name is on his own
+receipt rather than on her ledger.
+
+**Also still true:** a saved card must attach to the HELPER, never the tenant,
+or next month's autopay silently charges the son. Ask, default to not saving.
+
+### 2. Voicemail → email, via Google Voice
+
+**Nic corrected the framing:** *"I wouldn't be buying a phone number. We already
+use a phone number for the front counter — most RV parks are already gonna have
+one. We use Google Voice. It's linked to our Google business page. Google Voice
+is free, and I'm just wondering if there's a way we can kinda harvest that: when
+people leave a voicemail, can we harvest it and have it automatically send them
+an email coming from a subdomain from that property's account."*
+
+So this is NOT a telephony build. No numbers to buy, no A2P registration, no SMS
+identity.
+
+**The practical path:** Google Voice has no public API, so nothing can "harvest"
+it directly. But it already **emails a transcript** of every voicemail to the
+linked Google account. Forward those to a GAM inbound address, parse the
+transcript and the caller's number, and act on it. That turns a telephony
+integration into an email-parsing one, which is a far smaller build.
+
+**What does not exist yet:** GAM has no inbound email handling at all — nothing
+receives or parses mail today. Resend supports inbound; that is the piece to
+stand up first, and it is reusable well beyond this.
+
+**Worth deciding before building any of it:** the redundant questions Nic wants
+to stop answering — *"do you have any spots that are facing to the northwest"* —
+are mostly facts a booking site already publishes. Some of that call volume
+disappears if the site answers better, not if voicemails are processed faster.
+Skye, the guest-facing agent ([[gam-agent-roster]]), is already built and is the
+obvious place for it.
 
 ## Rules I broke today — do not repeat
 
