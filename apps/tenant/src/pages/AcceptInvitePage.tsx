@@ -27,9 +27,11 @@ export function AcceptInvitePage() {
     if (!token) { setError('Invalid invite link'); setLoading(false); return }
     apiGet(`/tenants/invite-info?token=${token}`)
       .then((data: any) => { setInviteInfo(data); setLoading(false) })
-      // S642: the message no longer matters for wording — the screen below
-      // says what happened — but keep a value so the error branch renders.
-      .catch(() => { setError('used-or-invalid'); setLoading(false) })
+      // S642: the dead-end screen below writes its own copy, so this value is
+      // only a flag that the lookup failed. Kept as a real sentence rather than
+      // a sentinel: if it ever reaches a screen that prints it, a resident
+      // should read English, not a code word.
+      .catch(() => { setError('This setup link has already been used.'); setLoading(false) })
   }, [token])
 
   const handleSubmit = async () => {
