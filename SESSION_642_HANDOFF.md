@@ -178,6 +178,75 @@ FlexPay/FlexDeposit, tenant-side agents must never mention FlexVault.
 
 ---
 
+## Raised S642, captured not built — two new ideas
+
+Both came up at the end of the session as things Nic did not want to lose. They
+are NOT designed yet; what follows is his framing plus the prior art that exists,
+so the next session starts from the real state rather than a blank page.
+
+### 1. Pay links — somebody else pays your bill
+
+**Nic:** *"Say somebody's on hard times, can they get some assistance? Can they
+share a link to have somebody help them pay the bill? Like a one-time thing
+that doesn't save their information, or asks them if they wanna save their
+information. There's a widow whose son is gonna help pay the rent."*
+
+The resident generates the link herself and sends it — **she** texts or emails
+it to her son. GAM sends nothing on her behalf, which sidesteps the fact that
+there is no SMS capability yet.
+
+**Prior art that already works this way** — do not build a parallel system:
+`publicCustomerPortal.ts` (S502) is a no-auth, token-scoped page on the
+BUSINESS side: the token scopes everything to one customer of one business, they
+see only their own invoices, and `POST .../invoices/:id/pay` returns a hosted
+pay link. `publicCardUpdate.ts` is the same shape for a card. The tenant version
+is that pattern pointed at a rent invoice instead of a business invoice.
+
+**Real questions before building:**
+- The link exposes an amount owed and a unit to whoever holds it. Scope it to
+  ONE invoice, not the account, and give it a short life — a forwarded link
+  should not become a standing window into somebody's balance.
+- Saving the payer's card: the helper is not the tenant, so a saved card must
+  attach to the HELPER, never to the tenant's account, or the next month's
+  autopay silently charges the son. Ask, default to not saving.
+- Who the receipt names, and whether the tenant is told who paid. She probably
+  wants to know it landed; he may not want his name on her ledger.
+- [[gam-no-partial-rent-payments]] still applies — the helper pays the balance
+  in full or not at all.
+- Fees follow the method used, same as any other payment
+  ([[gam-card-auth-cost-model]], [[gam-ach-fee-schedule-untouchable]]).
+
+### 2. VoIP numbers, voicemail transcription, and auto-reply
+
+**Nic:** *"Having the ability for voice over internet protocol phone numbers. Is
+there a way we could set something up to transcribe a voicemail, or if somebody's
+calling about a reservation, have it automatically kind of text them back — hey,
+we booked your reservation, here's a link to pay your deposit. Just to make
+answering the phone easier, because a lot of people have a bunch of redundant
+questions. Like, do you have any spots that are facing to the northwest and blah
+blah blah. I don't wanna waste my time on the phone with all those people. It's
+not worth it."*
+
+The goal is **fewer pointless calls**, not a phone system for its own sake. The
+two things he actually named:
+- a voicemail arrives as TEXT he can read in seconds rather than a recording he
+  has to listen to;
+- a reservation caller gets an automatic text back carrying the booking and a
+  deposit pay link — which is the SAME artifact as idea 1 above, so the two
+  should share one mechanism.
+
+**What this would need that does not exist:** a phone number provider and an
+SMS sender. GAM has neither today, and
+[[gam-email-dns-posture]] records how carefully the email sender was set up —
+an SMS identity deserves the same care (A2P registration is not optional and is
+not fast).
+
+**Worth deciding early:** the redundant questions he wants to stop answering are
+mostly facts a booking site already publishes. Some of that traffic is better
+removed by the site answering the question than by a phone system handling the
+call more efficiently. The agents ([[gam-agent-roster]] — Skye is the guest-facing
+one) are the obvious place for it, and are already built.
+
 ## Rules I broke today — do not repeat
 
 - **Never stack background deploys.** Two ran at once with four vitest workers
