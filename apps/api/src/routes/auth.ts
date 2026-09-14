@@ -792,8 +792,20 @@ authRouter.patch('/me', requireAuth, async (req, res, next) => {
 // POST /api/auth/register-prospect — public, creates tenant account from listings page
 authRouter.post('/register-prospect', async (req, res, next) => {
   try {
-    const { firstName, lastName, email, password, phone, unitId, landlordId, acceptedTerms } = req.body
-    if (!firstName || !lastName || !email || !password)
+    const { firstName, lastName, email, password, phone, unitId, landlordId, acceptedTerms, inline } = req.body
+    // S642 (Nic, DIRECTIVE): "Can people pay for the background check, start the
+    // workflow, and have their tenant portal be created off of the information
+    // in the background check?… They never have a spot to type in their name.
+    // We're gonna generate accounts off a legal name."
+    //
+    // In the inline applicant flow the account is created from EMAIL + PASSWORD
+    // alone, partway through the screening form. No name is asked for here: a
+    // name is seeded later only because Checkr's Tenant order requires one to
+    // open the order, and the account's stored legal name is then overwritten
+    // by the matched name on the completed report.
+    if (!email || !password)
+      throw new AppError(400, 'email, password required')
+    if (!inline && (!firstName || !lastName))
       throw new AppError(400, 'firstName, lastName, email, password required')
     if (password.length < PASSWORD_MIN_LEN)
       throw new AppError(400, `Password must be at least ${PASSWORD_MIN_LEN} characters`)
@@ -818,11 +830,14 @@ authRouter.post('/register-prospect', async (req, res, next) => {
       await client.query('BEGIN')
 
       // Create user
+      // first_name/last_name are NOT NULL. In the inline flow they are not known
+      // yet, so they start empty and are filled from the Checkr match. Empty is
+      // the marker for "not established yet" — never a name we invented.
       const { rows: [user] } = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
                             accepted_tos_at, accepted_privacy_at)
          VALUES ($1,$2,'tenant',$3,$4,$5, NOW(), NOW()) RETURNING *`,
-        [email, hash, firstName, lastName, phone || null]
+        [email, hash, firstName || '', lastName || '', phone || null]
       )
 
       // Create tenant profile
@@ -848,11 +863,36 @@ authRouter.post('/register-prospect', async (req, res, next) => {
       // inline in the background-check flow — the prospect signs up + verifies,
       // lands in the gated portal, THEN completes the check.
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
-      const emailOtpSession = signEmailOtpSessionToken({
+      const claims = {
         userId: user.id, role: 'tenant', email: user.email, profileId: tenant.id,
         landlordId: landlordId || null,
         landlordIds: null, businessId: null, staffRole: null, permissions: null,
-      })
+      }
+
+      // S642: the inline applicant flow issues a REAL session immediately.
+      //
+      // S578 withheld it behind an emailed 6-digit code. That code never gated
+      // account CREATION — the rows above are written either way — it gated only
+      // the session, and in a single-page flow it stops the applicant halfway
+      // through to go hunting in their inbox, which is the confusion this whole
+      // change exists to remove. The account at this instant is empty: a session
+      // on it grants access to nothing but itself.
+      //
+      // What the code was really protecting — somebody's screening report
+      // landing in an inbox they do not control — is still protected, at the
+      // point where it matters: email_2fa_enabled stays TRUE, so every LATER
+      // sign-in needs the code, and the report is not viewable until the address
+      // is verified.
+      if (inline) {
+        const token = signToken(claims)
+        return res.status(201).json({
+          success: true,
+          data: { requiresEmailOtp: false, token,
+            user: { id: user.id, email: user.email, firstName: '', lastName: '', role: 'tenant', profileId: tenant.id } }
+        })
+      }
+
+      const emailOtpSession = signEmailOtpSessionToken(claims)
       await issueEmailOtp(user.id, user.email)
 
       res.status(201).json({

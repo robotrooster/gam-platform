@@ -28,7 +28,7 @@ vi.mock('./backgroundProvider', async (orig) => {
 })
 
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
 import { syncPendingBackgroundChecks } from './backgroundCheckSync'
 
 beforeEach(async () => {
@@ -126,5 +126,85 @@ describe('S640 background-check status sync', () => {
     const r = await syncPendingBackgroundChecks()
     expect(r.advanced).toBe(1)
     expect((await statusOf(checkId)).status).toBe('complete')
+  })
+})
+
+// ── S642: THE SCREENER NAMES THE ACCOUNT ─────────────────────────────────────
+//
+// Nic: "They never have a spot to type in their name. We're gonna generate
+// accounts off a legal name."
+//
+// An applicant account is created from email + password alone. The only name it
+// carries is the provisional one typed to open the Checkr order, because Checkr
+// will not create an order without one. When the report lands, the matched legal
+// name replaces it.
+describe('S642 the matched legal name becomes the account name', () => {
+  async function seedApplicant(first: string, last: string) {
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const { landlordId } = await seedLandlord(c)
+      const u = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ('applicant-' || gen_random_uuid() || '@t.dev','x','tenant',$1,$2,FALSE) RETURNING id`,
+        [first, last])
+      const bc = await c.query<{ id: string }>(
+        `INSERT INTO background_checks (landlord_id, user_id, status, provider_name, provider_ref,
+                                        first_name, last_name, created_at)
+         VALUES ($1,$2,'processing','checkr','ord_name',$3,$4, NOW()) RETURNING id`,
+        [landlordId, u.rows[0].id, first, last])
+      await c.query('COMMIT')
+      return { userId: u.rows[0].id, checkId: bc.rows[0].id }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  const nameOf = async (userId: string) =>
+    (await db.query<any>('SELECT first_name, last_name FROM users WHERE id=$1', [userId])).rows[0]
+
+  it('replaces the provisional name with the one the screener matched', async () => {
+    const { userId } = await seedApplicant('cal', 'curtis')
+    fetchStatusMock.mockResolvedValue({ status: 'complete', reportRef: 'rp_name' })
+    fetchReportMock.mockResolvedValue({
+      result: 'clear', products: { credit_report: 'clear' },
+      matched_first_name: 'Calvin', matched_last_name: 'Curtis',
+    })
+    await syncPendingBackgroundChecks()
+    expect(await nameOf(userId)).toMatchObject({ first_name: 'Calvin', last_name: 'Curtis' })
+  })
+
+  it('leaves the name alone when the report carries none', async () => {
+    // trg_normalize_user_name title-cases on write, so the seed is asserted in
+    // the form the trigger stores, not the form it was typed in.
+    const { userId } = await seedApplicant('Cal', 'Curtis')
+    fetchStatusMock.mockResolvedValue({ status: 'complete', reportRef: 'rp_noname' })
+    fetchReportMock.mockResolvedValue({ result: 'clear', products: { credit_report: 'clear' } })
+    await syncPendingBackgroundChecks()
+    expect(await nameOf(userId)).toMatchObject({ first_name: 'Cal', last_name: 'Curtis' })
+  })
+
+  it('never renames somebody who already holds a lease', async () => {
+    // A tenancy is held in a legal name that appears on signed documents.
+    // Quietly rewriting it under a sitting resident is worse than a misspelling.
+    const { userId } = await seedApplicant('Bob', 'Tenant')
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const t = await c.query<{ id: string }>(
+        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [userId])
+      const { landlordId, userId: ownerUserId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId, status: 'active' })
+      await c.query(`INSERT INTO lease_tenants (lease_id, tenant_id, role) VALUES ($1,$2,'primary')`,
+        [leaseId, t.rows[0].id])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    fetchStatusMock.mockResolvedValue({ status: 'complete', reportRef: 'rp_lease' })
+    fetchReportMock.mockResolvedValue({
+      result: 'clear', products: { credit_report: 'clear' },
+      matched_first_name: 'Robert', matched_last_name: 'Tenant',
+    })
+    await syncPendingBackgroundChecks()
+    expect(await nameOf(userId)).toMatchObject({ first_name: 'Bob', last_name: 'Tenant' })
   })
 })

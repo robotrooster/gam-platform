@@ -566,6 +566,80 @@ describe('POST /api/auth/register-prospect', () => {
     expect(t).toHaveLength(1)
   })
 
+  // ── S642: THE INLINE APPLICANT FLOW ──────────────────────────────────────
+  //
+  // Nic: "Can people pay for the background check, start the workflow, and have
+  // their tenant portal be created off of the information in the background
+  // check?… They never have a spot to type in their name. We're gonna generate
+  // accounts off a legal name."
+  //
+  // The account step is now the front of the screening form, so it creates the
+  // account from EMAIL + PASSWORD only and must hand back a usable session — a
+  // 6-digit code would stop the applicant mid-form to go hunting in their inbox,
+  // and the next step mints a Stripe PaymentIntent that needs the token.
+  describe('inline: true (account step inside the screening form)', () => {
+    it('creates the account from email + password alone — no name required', async () => {
+      const email = `inline-${Date.now()}@gam.dev`
+      const res = await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email, password: 'correct horse battery', acceptedTerms: true, inline: true })
+      expect(res.status).toBe(201)
+      const { rows: [u] } = await db.query<any>(
+        `SELECT first_name, last_name, role FROM users WHERE email = $1`, [email])
+      expect(u.role).toBe('tenant')
+      // Empty, NOT a name we invented. The screener supplies the real one.
+      expect(u.first_name).toBe('')
+      expect(u.last_name).toBe('')
+    })
+
+    it('returns a REAL session, not a pending 2FA one', async () => {
+      const email = `inline-sess-${Date.now()}@gam.dev`
+      const res = await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email, password: 'correct horse battery', acceptedTerms: true, inline: true })
+      expect(res.body.data.requiresEmailOtp).toBe(false)
+      expect(res.body.data.token).toEqual(expect.any(String))
+      const claims = jwt.decode(res.body.data.token) as any
+      expect(claims.role).toBe('tenant')
+      expect(claims.profileId).toEqual(expect.any(String))
+    })
+
+    it('still arms 2FA for every LATER sign-in', async () => {
+      // The code was never protecting account creation — the rows are written
+      // either way. It protects returning logins to an account that by then
+      // holds a screening report. That has to survive the inline path.
+      const email = `inline-2fa-${Date.now()}@gam.dev`
+      await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email, password: 'correct horse battery', acceptedTerms: true, inline: true })
+      const { rows: [u] } = await db.query<any>(
+        `SELECT email_2fa_enabled, email_verified FROM users WHERE email = $1`, [email])
+      expect(u.email_2fa_enabled).toBe(true)
+      expect(u.email_verified).toBe(false)
+    })
+
+    it('a password is still required, and still has to be strong', async () => {
+      const res = await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email: `inline-weak-${Date.now()}@gam.dev`, password: 'short', acceptedTerms: true, inline: true })
+      expect(res.status).toBe(400)
+    })
+
+    it('terms are still required', async () => {
+      const res = await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email: `inline-tos-${Date.now()}@gam.dev`, password: 'correct horse battery', inline: true })
+      expect(res.status).toBe(400)
+    })
+
+    it('WITHOUT inline, a name is still required (the old contract is intact)', async () => {
+      const res = await request(buildApp())
+        .post('/api/auth/register-prospect')
+        .send({ email: `noinline-${Date.now()}@gam.dev`, password: 'correct horse battery', acceptedTerms: true })
+      expect(res.status).toBe(400)
+    })
+  })
+
   it('landlordId in body stamps the pending 2FA session (for downstream lease attribution)', async () => {
     const c = await db.connect()
     let landlordId = ''

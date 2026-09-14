@@ -346,7 +346,7 @@ http.createServer((req, res) => {
   // The renter pool kept its own route but lost its only discoverable entry
   // when that card came off the login page, so it gets one here instead.
   if (url === '/renters' || url === '/renter-pool' || url === '/find-a-place') {
-    return redirect(TENANT + '/signup')
+    return redirect(TENANT + '/background-check')
   }
 
   // S603: support page — the URL Stripe prints on receipts + dispute evidence.

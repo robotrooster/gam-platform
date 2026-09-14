@@ -40,6 +40,21 @@
       "permanent": false
     },
     {
+      "source": "/renters",
+      "destination": "https://tenant.goldassetmanagement.com/background-check",
+      "permanent": false
+    },
+    {
+      "source": "/renter-pool",
+      "destination": "https://tenant.goldassetmanagement.com/background-check",
+      "permanent": false
+    },
+    {
+      "source": "/find-a-place",
+      "destination": "https://tenant.goldassetmanagement.com/background-check",
+      "permanent": false
+    },
+    {
       "source": "/tenant",
       "destination": "https://tenant.goldassetmanagement.com/login",
       "permanent": false

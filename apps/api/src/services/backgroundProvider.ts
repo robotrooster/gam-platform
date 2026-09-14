@@ -534,11 +534,23 @@ class CheckrProvider implements BackgroundProvider {
         if (Object.keys(kept).length) details[p] = kept
       }
     }
+    // S642 (Nic): "We're gonna generate accounts off a legal name." An applicant
+    // account is created from email + password and carries only the provisional
+    // name typed to open the order. The screener is the authority on who this
+    // person legally is, so the matched name comes back with the report and
+    // replaces it. Narrow on purpose — a name, nothing else from the candidate
+    // record, in keeping with the allowlist above.
+    const cand = (report.candidate ?? report.applicant ?? {}) as Record<string, any>
+    const matchedFirst = typeof cand.first_name === 'string' ? cand.first_name.trim() : ''
+    const matchedLast  = typeof cand.last_name  === 'string' ? cand.last_name.trim()  : ''
+
     return {
       provider:   'checkr',
       report_id:  report.id ?? reportRef,
       order_id:   report.order_id ?? null,
       result:     allTerminal ? overall : 'pending',
+      matched_first_name: matchedFirst || null,
+      matched_last_name:  matchedLast  || null,
       // S640: stated outright so a reader never has to infer it from the
       // per-product map, and so the landlord page can say "still running"
       // instead of rendering a verdict that is not one yet.

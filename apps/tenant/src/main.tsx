@@ -53,7 +53,6 @@ import {
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
 } from 'lucide-react'
-import { CONSUMER_TERMS_URL, CONSUMER_PRIVACY_URL } from './lib/marketing'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -4677,146 +4676,23 @@ function LoginPage() {
   )
 }
 
-// S578: prospect self-signup — account created FIRST, with mandatory email-2FA,
-// as its own step (NOT inline in the background check). name/email/password →
-// emailed 6-digit code → verify → land in the gated portal, which shows only
-// "complete your background check" until it's done. A landlordId/unitId in the
-// URL (from a landlord invite / listing) rides along for property attribution.
-function SignupPage() {
-  const { signup, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
-  const params = new URLSearchParams(window.location.search)
-  const landlordId = params.get('landlordId'); const unitId = params.get('unitId')
-  const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
-  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.tenant.signup')
-  const [resent, setResent] = useState(false); const [code, setCode] = useState('')
-  const { register, handleSubmit, watch } = useForm<{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean}>()
-  const pw = watch('password')
-  const onSubmit = async(d:{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean})=>{
-    setErr('')
-    if(d.password!==d.confirmPassword){setErr('Passwords do not match');return}
-    if(d.password.length<12){setErr('Password must be at least 12 characters');return}
-    if(!d.acceptedTerms){setErr('You must accept the Terms of Service and Privacy Policy');return}
-    setLoading(true)
-    try{
-      const r = await signup({ firstName:d.firstName, lastName:d.lastName, email:d.email, password:d.password, acceptedTerms:true, landlordId, unitId })
-      setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false)
-    }
-    catch(e:any){setErr(e.response?.data?.error||'Could not create your account')}
-    finally{setLoading(false)}
-  }
-  const onEmailOtpSubmit = async(e:React.FormEvent)=>{
-    e.preventDefault();setLoading(true);setErr('')
-    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); setEmailOtpSession(null); navigate('/') }
-    catch(ex:any){
-      const msg=ex.response?.data?.error||'Invalid code.'
-      setErr(msg)
-      if(/session/i.test(msg)){setEmailOtpSession(null);setCode('')}
-    }
-    finally{setLoading(false)}
-  }
-  const onResend = async()=>{
-    setErr('')
-    try{ await resendEmailOtp(emailOtpSession!); setResent(true) }
-    catch{ setErr('Could not resend the code. Please try again.') }
-  }
-
-  // ── Step 2: emailed 2FA code ──────────────────────────────────
-  if(emailOtpSession){
-    return (
-      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
-        <div style={{width:'100%',maxWidth:400}}>
-          <div style={{textAlign:'center',marginBottom:40}}>
-            <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-            <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Verify your email</div>
-          </div>
-          <div className="card" style={{padding:28}}>
-            <h2 style={{marginBottom:14}}>Check your email</h2>
-            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
-              We sent a 6-digit code to your email. Enter it to finish creating your account.
-            </div>
-            {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
-            {resent && !err && <div className="alert a-green" style={{marginBottom:16}}>A new code is on its way.</div>}
-            <form onSubmit={onEmailOtpSubmit}>
-              <div className="fg">
-                <label className="fl">Code</label>
-                <input className="fi" type="text" value={code} onChange={e=>setCode(e.target.value)} autoFocus required autoComplete="one-time-code" inputMode="numeric" placeholder="123 456" style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}} />
-              </div>
-              <button className="btn btn-p" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:8}}>
-                {loading?<span className="spinner"/>:'Verify'}
-              </button>
-            </form>
-            <div style={{marginTop:16,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <button onClick={()=>{setEmailOtpSession(null);setCode('');setErr('');setResent(false)}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>← Back</button>
-              <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Step 1: account details ───────────────────────────────────
-  return (
-    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
-      <div style={{width:'100%',maxWidth:400}}>
-        <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-          <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Looking for a place to live</div>
-        </div>
-        <div className="card" style={{padding:28}}>
-          {/* S642 (Nic): one flow per route. This route is the renter pool —
-              get background-checked once, and landlords with open units find
-              you. It is NOT how somebody who already rents gets a login; those
-              arrive by invite. The heading has to say which of the two this is,
-              because the page used to be reachable from the residents' login
-              screen under the word "Create account". */}
-          <h2 style={{marginBottom:6}}>Join the renter pool</h2>
-          <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,marginBottom:20}}>
-            Create your account, get background-checked once, and landlords with open units find
-            you. No chosen property needed to start.
-          </div>
-          {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
-          <form onSubmit={handleSubmit(onSubmit)}>
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-              <div className="fg"><label className="fl">First name</label><input className="fi" {...register('firstName',{required:true})} autoFocus /></div>
-              <div className="fg"><label className="fl">Last name</label><input className="fi" {...register('lastName',{required:true})} /></div>
-            </div>
-            <div className="fg"><label className="fl">Email</label><input className="fi" type="email" {...register('email',{required:true})} /></div>
-            <div className="fg"><label className="fl">Password</label><input className="fi" type="password" {...register('password',{required:true})} placeholder="At least 12 characters" /></div>
-            <div className="fg"><label className="fl">Confirm password</label><input className="fi" type="password" {...register('confirmPassword',{required:true})} /></div>
-            {pw && pw.length>0 && pw.length<12 && <div style={{fontSize:'.72rem',color:'var(--warn,#f59e0b)',marginTop:-6,marginBottom:10}}>{12-pw.length} more character{12-pw.length===1?'':'s'} required</div>}
-            <label style={{display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer',fontSize:'.8rem',color:'var(--t1)',lineHeight:1.5,margin:'4px 0 12px'}}>
-              <input type="checkbox" {...register('acceptedTerms',{required:true})} style={{marginTop:2,flexShrink:0}} />
-              {/* S636: same two defects as the invite acceptance page — a click
-                  inside the <label> was going to the checkbox, and the URL was
-                  built from a fallback that shipped as localhost. */}
-              <span>I agree to the{' '}
-                <a href={CONSUMER_TERMS_URL} target="_blank" rel="noopener noreferrer"
-                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Terms of Service</a>
-                {' '}and{' '}
-                <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer"
-                   onClick={e => e.stopPropagation()} style={{color:'var(--gold)'}}>Privacy Policy</a>.
-              </span>
-            </label>
-            <div style={{fontSize:'.63rem',color:'var(--t3,#5a6a86)',lineHeight:1.6,
-                         wordBreak:'break-all',margin:'0 0 12px'}}>
-              Prefer to read them directly?<br />{CONSUMER_TERMS_URL}<br />{CONSUMER_PRIVACY_URL}
-            </div>
-            <button className="btn btn-p" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:8}}>
-              {loading?<span className="spinner"/>:'Create account'}
-            </button>
-          </form>
-          <div style={{marginTop:16,textAlign:'center'}}>
-            <Link to="/login" style={{color:'var(--gold)',fontSize:'.85rem',textDecoration:'none'}}>Already have an account? Sign in</Link>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
+// S642: /signup is no longer its own flow — it forwards into the screening
+// form, carrying any landlord/unit attribution from the URL so a QR code or a
+// listing link still credits the right property.
+function SignupRedirect() {
+  useEffect(() => {
+    window.location.replace('/background-check' + window.location.search)
+  }, [])
+  return null
 }
 
-
-// ── APP ───────────────────────────────────────────────────────
+// S642: the standalone SignupPage that used to live here is GONE, not disabled.
+// It was the second way to make a tenant account — name/email/password, then a
+// 6-digit code, then a gated portal, then find the background check again. Nic:
+// "One flow per route so nothing is confusing. No choices to be made by tenants."
+// Account creation is now the first step of the screening form itself; /signup
+// forwards there via SignupRedirect above. Left as a comment rather than dead
+// code so it cannot drift back into a second flow.
 
 // S605 (Nic): "we should be doing that automatically... that way we're not
 // working on old visuals." A bfcache-restored tab on an outdated build reloads
@@ -4876,7 +4752,11 @@ function App() {
       <ScrollUnlock />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/signup" element={<SignupPage />} />
+        {/* S642 (Nic): "One flow per route so nothing is confusing." Account
+            creation for a housing-seeker is now the first step of the screening
+            form itself, not a page in front of it. /signup stays only so older
+            links and bookmarks land somewhere sensible. */}
+        <Route path="/signup" element={<SignupRedirect />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/verify-email" element={<VerifyEmailPage />} />

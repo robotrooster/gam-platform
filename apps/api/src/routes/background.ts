@@ -370,6 +370,21 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     if (!firstName || !lastName) throw new AppError(400, 'Required fields missing')
     if (isSpeculative && !consentPool) throw new AppError(400, 'Pool consent required for speculative applications')
 
+    // S642 (Nic): an account made in the inline applicant flow was created from
+    // email + password alone and carries no name yet. The name typed here is the
+    // seed Checkr needs to open the order, so it is also the first name the
+    // account has ever had — write it through. It is provisional: applyMatchedLegalName()
+    // replaces it with the matched legal name when the report lands.
+    //
+    // Only fills a BLANK name. An established account is never renamed by a form.
+    await query(
+      `UPDATE users
+          SET first_name = CASE WHEN COALESCE(TRIM(first_name),'') = '' THEN $2 ELSE first_name END,
+              last_name  = CASE WHEN COALESCE(TRIM(last_name), '') = '' THEN $3 ELSE last_name  END,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [req.user!.userId, String(firstName).trim(), String(lastName).trim()])
+
     // S423: resolve the provider per-landlord (moved above SSN handling in
     // S551 — whether GAM collects an SSN at all depends on the provider).
     // Default to 'mock' for speculative (no landlord) since the row will be

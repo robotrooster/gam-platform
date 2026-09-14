@@ -75,7 +75,17 @@ const lbl = { fontSize:'.72rem', fontWeight:600 as const, color:'#4a5568', textT
 // pool route — see the Consent step — because a pool applicant with no
 // location cannot be shown to landlords near them, which is the entire
 // point of the pool.
-const STEPS = ['Consent', 'Review & Pay'] as const
+// S642 (Nic, DIRECTIVE): "Can people pay for the background check, start the
+// workflow, and have their tenant portal be created off of the information in
+// the background check?… That way people know what's going on."
+//
+// The account step is part of THIS form, not a separate page in front of it. A
+// walk-up used to be bounced to /signup, made an account, verified a 6-digit
+// code, landed in a portal and then had to find the check again — four screens
+// to start one thing. Someone already signed in (an invited resident screening
+// voluntarily, or an applicant coming back) never sees it.
+const ACCOUNT_STEP = 'Your account'
+const BASE_STEPS = ['Consent', 'Review & Pay'] as const
 
 export function BackgroundCheckPage() {
   const [step, setStep] = useState(0)
@@ -94,8 +104,16 @@ export function BackgroundCheckPage() {
   // entirely under Checkr, which collects the address on its hosted flow.)
   const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', moveIn:'', stay:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
-  const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'))
-  const { data: me } = useQuery('tenant-me', () => get('/tenants/me'))
+  // S642: an anonymous walk-up now lands HERE rather than being bounced to
+  // /signup, so these two must not fire without a session. Both are
+  // authenticated routes, and the 401 interceptor in lib/api treats any 401
+  // outside /auth/ as an expired session and redirects to /login — which would
+  // throw a first-time applicant off this page before they ever saw the form.
+  // (/background/price is public and stays enabled: the fee is on screen from
+  // the first paint.)
+  const [hasSession, setHasSession] = useState(!!tok())
+  const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'), { enabled: hasSession })
+  const { data: me } = useQuery('tenant-me', () => get('/tenants/me'), { enabled: hasSession })
   // S551: fee breakdown + provider from the API. When the landlord screens
   // via Checkr Tenant, Checkr collects SSN/identity on ITS hosted apply flow
   // — GAM's form drops those fields entirely.
@@ -183,17 +201,58 @@ export function BackgroundCheckPage() {
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const validZip = /^\d{5}(-\d{4})?$/.test(form.zip)
-  // S578: this page is authenticated-only now. The account is created FIRST via
-  // the dedicated signup page (with mandatory email-2FA); a prospect reaches the
-  // check from INSIDE the gated portal. If we render without a session (e.g. a
-  // direct hit on the public /background-check link), send them to sign up,
-  // preserving any landlord/unit attribution in the URL.
-  useEffect(()=>{
-    if(!tok()){
-      const qs = window.location.search
-      window.location.replace('/signup' + qs)
+  // S642: no bounce to /signup. Someone arriving without a session gets the
+  // account step at the front of this same form; the account is created from
+  // email + password when they continue past it.
+  const [creatingAccount, setCreatingAccount] = useState(false)
+  const [accountErr, setAccountErr] = useState('')
+  // Frozen at mount, NOT derived from hasSession. Creating the account flips
+  // hasSession true, and a reactive STEPS would drop the account step from the
+  // array at that instant — the index the flow had just advanced to would then
+  // point at 'Review & Pay' and the applicant would sail past Consent without
+  // ever giving one.
+  const [needsAccountStep] = useState(!tok())
+  const STEPS = (needsAccountStep ? [ACCOUNT_STEP, ...BASE_STEPS] : BASE_STEPS) as readonly string[]
+
+  const createAccountInline = async () => {
+    setAccountErr('')
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email)) { setAccountErr('Enter a valid email address'); return false }
+    if (form.password.length < 12) { setAccountErr('Password must be at least 12 characters'); return false }
+    if (form.password !== form.confirmPassword) { setAccountErr('Passwords do not match'); return false }
+    if (!form.acceptedTerms) { setAccountErr('You must accept the Terms of Service and Privacy Policy'); return false }
+    setCreatingAccount(true)
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const res = await fetch(`${API}/api/auth/register-prospect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          // No name: Checkr's order needs one and it is asked for at the consent
+          // step, but the ACCOUNT is not named by a form — the matched legal
+          // name from the completed report becomes the name on it.
+          inline: true,
+          email: form.email.trim(),
+          password: form.password,
+          acceptedTerms: true,
+          landlordId: params.get('landlordId') || null,
+          unitId: params.get('unitId') || null,
+        }),
+      })
+      const body = await res.json()
+      if (!res.ok || !body?.data?.token) {
+        setAccountErr(body?.error || 'Could not create your account. Please try again.')
+        return false
+      }
+      localStorage.setItem('gam_tenant_token', body.data.token)
+      setHasSession(true)
+      return true
+    } catch {
+      setAccountErr('Could not reach the server. Please try again.')
+      return false
+    } finally {
+      setCreatingAccount(false)
     }
-  },[])
+  }
   // S583: re-verify (GAM's own endpoint) whenever any address field changes —
   // S84: on entering step 5, ensure tenant account exists (so we have a
   // token), then mint a Stripe PaymentIntent. Both flows write into
@@ -207,10 +266,12 @@ export function BackgroundCheckPage() {
       try {
         // S578: account is guaranteed to exist by now (created via signup/invite
         // before the portal renders this page). No inline account creation.
+        // S642: the account step guarantees a session before this step is
+        // reachable, so there is nowhere to bounce to. If it is somehow missing,
+        // surface it rather than throwing the applicant out of a paid flow.
         const token = tok()
         if (!token) {
-          const qs = window.location.search
-          window.location.replace('/signup' + qs)
+          setPaymentInitError('Your session expired. Please reload the page and sign in.')
           return
         }
         const params = new URLSearchParams(window.location.search)
@@ -270,9 +331,18 @@ export function BackgroundCheckPage() {
   // applicant also gives a ZIP, which is the only thing that lets a landlord
   // near them find them.
   const canNext: Record<string, boolean> = {
+    // S642: terms are accepted HERE when the account is made here — an account
+    // is the thing the terms govern. The consent step drops its own copy in
+    // that case rather than asking twice for the same acceptance.
+    [ACCOUNT_STEP]: !!(form.email && form.password && form.confirmPassword
+      && form.acceptedTerms && !creatingAccount),
     'Consent': !!((providerCollectsPii||(form.consentCredit&&form.consentCriminal))
       && form.acceptedTerms && (invitedResident || (form.moveIn && form.stay))
-      && (!isSpeculative || (form.consentPool && validZip))),
+      && (!isSpeculative || (form.consentPool && validZip))
+      // Checkr's order cannot be opened without a name, so it is asked for once
+      // here. It names the ORDER, not the account: the matched legal name off
+      // the finished report is what the account ends up carrying.
+      && form.firstName.trim() && form.lastName.trim()),
     'Review & Pay': paid,
   }
   if((status as any)?.status==='submitted'){
@@ -381,11 +451,66 @@ export function BackgroundCheckPage() {
           </div>
         </div>
       )}
-      <div style={{textAlign:'center',marginBottom:24}}><div style={{width:52,height:52,borderRadius:'50%',background:'rgba(201,162,39,.1)',border:'2px solid #c9a227',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 10px'}}><Shield size={22} style={{color:'#c9a227'}}/></div><h1 style={{color:'#eef1f8',fontSize:'1.2rem',fontWeight:800,margin:'0 0 4px'}}>Background Check Application</h1><p style={{color:'#4a5568',fontSize:'.82rem',margin:0}}>{invitedResident ? 'Optional — your tenancy does not depend on this' : 'Required before accessing your tenant portal'}</p></div>
+      <div style={{textAlign:'center',marginBottom:24}}><div style={{width:52,height:52,borderRadius:'50%',background:'rgba(201,162,39,.1)',border:'2px solid #c9a227',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 10px'}}><Shield size={22} style={{color:'#c9a227'}}/></div><h1 style={{color:'#eef1f8',fontSize:'1.2rem',fontWeight:800,margin:'0 0 4px'}}>Background Check Application</h1><p style={{color:'#4a5568',fontSize:'.82rem',margin:0}}>{
+        // S642: a walk-up joining the renter pool is not "accessing their tenant
+        // portal" — they have no tenancy and no landlord. Saying so made the
+        // page read as though they were in the wrong place.
+        invitedResident ? 'Optional — your tenancy does not depend on this'
+        : needsAccountStep ? 'Get screened once — landlords with open units find you'
+        : 'Required before accessing your tenant portal'}</p></div>
       <div style={{display:'flex',gap:4,marginBottom:8}}>{STEPS.map((_,i)=><div key={i} style={{flex:1,height:3,borderRadius:2,background:i<=step?'#c9a227':'#141a22',transition:'background .2s'}}/>)}</div>
       <div style={{fontSize:'.7rem',color:'#4a5568',textAlign:'center',marginBottom:20}}>Step {step+1} of {STEPS.length} — {STEPS[step]}</div>
       <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12,padding:24,marginBottom:16}}>
+        {/* S642: the account step. Email and a password — nothing else. No name
+            field: "They never have a spot to type in their name. We're gonna
+            generate accounts off a legal name." (Nic) */}
+        {STEPS[step]===ACCOUNT_STEP&&<div>
+          <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Set up your account</div>
+          <div style={{fontSize:'.78rem',color:'#7a8aaa',lineHeight:1.6,marginBottom:16}}>
+            This is how you'll sign back in to see your result. Your name comes off your
+            screening report — there's nothing to type.
+          </div>
+          <label style={lbl}>Email address *</label>
+          <input style={inp} type="email" autoComplete="email" value={form.email}
+            onChange={e=>set('email',e.target.value)} placeholder="you@example.com"/>
+          <label style={{...lbl,marginTop:12}}>Password *</label>
+          <input style={inp} type="password" autoComplete="new-password" value={form.password}
+            onChange={e=>set('password',e.target.value)} placeholder="At least 12 characters"/>
+          <label style={{...lbl,marginTop:12}}>Confirm password *</label>
+          <input style={inp} type="password" autoComplete="new-password" value={form.confirmPassword}
+            onChange={e=>set('confirmPassword',e.target.value)}/>
+          {form.confirmPassword.length>0&&form.password!==form.confirmPassword&&
+            <div style={{fontSize:'.74rem',color:'#f59e0b',marginTop:6}}>Passwords don't match yet.</div>}
+          <label style={{display:'flex',gap:10,alignItems:'flex-start',marginTop:16,cursor:'pointer'}}>
+            <input type="checkbox" checked={form.acceptedTerms}
+              onChange={e=>set('acceptedTerms',e.target.checked)} style={{marginTop:3}}/>
+            <span style={{fontSize:'.78rem',color:'#b8c4d8',lineHeight:1.55}}>
+              I agree to the <a href={CONSUMER_TERMS_URL} target="_blank" rel="noreferrer" style={{color:'#c9a227'}}>Terms of Service</a>
+              {' '}and <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noreferrer" style={{color:'#c9a227'}}>Privacy Policy</a>.
+            </span>
+          </label>
+          {accountErr&&<div style={{marginTop:14,padding:'10px 14px',borderRadius:8,background:'rgba(239,68,68,.08)',border:'1px solid rgba(239,68,68,.25)',color:'#ef4444',fontSize:'.8rem'}}>{accountErr}</div>}
+        </div>}
         {STEPS[step]==='Consent'&&<div>
+          {/* S642: Checkr's Tenant order will not open without a name, so it is
+              asked for once, here, as the order's seed. The account is NOT named
+              by it — the matched legal name off the finished report replaces it. */}
+          {needsAccountStep&&<div style={{marginBottom:18,padding:'14px 16px',background:'#141a22',border:'1px solid #1e2530',borderRadius:10}}>
+            <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Your legal name</div>
+            <div style={{fontSize:'.75rem',color:'#7a8aaa',lineHeight:1.55,marginBottom:10}}>
+              As it appears on your government ID — the screener matches against it.
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+              <div>
+                <label style={lbl}>First name *</label>
+                <input style={inp} autoComplete="given-name" value={form.firstName} onChange={e=>set('firstName',e.target.value)}/>
+              </div>
+              <div>
+                <label style={lbl}>Last name *</label>
+                <input style={inp} autoComplete="family-name" value={form.lastName} onChange={e=>set('lastName',e.target.value)}/>
+              </div>
+            </div>
+          </div>}
           {/* S639: the two questions the office would otherwise have to chase
               by phone after an approval. Asked here, an approved applicant
               arrives with a move-in date and a term, and the lease can be
@@ -445,7 +570,9 @@ export function BackgroundCheckPage() {
                 <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>{isSpeculative?'I authorize GAM to share my completed screening with landlords in the renter pool so they can offer me a place to live. I confirm this to process my check.':'The landlord you are applying to receives this screening either way. Tick this only if you also want GAM to tell you about matching vacancies from OTHER landlords — and even then, your report is shared only after you confirm interest.'}</div>
               </div>
             </label>
-            <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.acceptedTerms?'rgba(34,197,94,.06)':'#141a22',border:'1px solid '+(form.acceptedTerms?'rgba(34,197,94,.25)':'#1e2530'),borderRadius:10}}>
+            {/* S642: asking the same acceptance twice reads as a bug. When the
+                account step took it a moment ago, it is not asked again here. */}
+            {!needsAccountStep&&<label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.acceptedTerms?'rgba(34,197,94,.06)':'#141a22',border:'1px solid '+(form.acceptedTerms?'rgba(34,197,94,.25)':'#1e2530'),borderRadius:10}}>
               <input type="checkbox" checked={form.acceptedTerms} onChange={e=>set('acceptedTerms',e.target.checked)} style={{width:18,height:18,marginTop:2,flexShrink:0}}/>
               <div>
                 <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Platform Terms &amp; Privacy</div>
@@ -456,7 +583,7 @@ export function BackgroundCheckPage() {
                   <a href={CONSUMER_PRIVACY_URL} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Privacy Policy</a>.
                 </div>
               </div>
-            </label>
+            </label>}
             <div style={{padding:'10px 14px',background:'#141a22',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568',lineHeight:1.5}}>By continuing I certify all information provided is accurate. Providing false information is grounds for immediate denial.</div>
         </div>}
         {STEPS[step]==='Review & Pay'&&<div style={{textAlign:'center'}}>
@@ -514,7 +641,13 @@ export function BackgroundCheckPage() {
       </div>
       <div style={{display:'flex',gap:10}}>
         <button onClick={()=>step>0&&setStep(s=>s-1)} disabled={step===0} style={{padding:'10px 20px',borderRadius:8,border:'1px solid #1e2530',background:'transparent',color:step===0?'#4a5568':'#b8c4d8',cursor:step===0?'not-allowed':'pointer',fontSize:'.85rem'}}>← Back</button>
-        {step<STEPS.length-1?<button onClick={()=>setStep(s=>s+1)} disabled={!canNext[STEPS[step]]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[STEPS[step]]?'#c9a227':'#141a22',color:canNext[STEPS[step]]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[STEPS[step]]?'pointer':'not-allowed',fontSize:'.88rem'}}>Continue →</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
+        {step<STEPS.length-1?<button onClick={async()=>{
+          // S642: leaving the account step is what creates the account. It has
+          // to succeed before the flow moves on — the next step mints a Stripe
+          // PaymentIntent against the session this call establishes.
+          if(STEPS[step]===ACCOUNT_STEP){ if(!(await createAccountInline())) return }
+          setStep(s=>s+1)
+        }} disabled={!canNext[STEPS[step]]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[STEPS[step]]?'#c9a227':'#141a22',color:canNext[STEPS[step]]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[STEPS[step]]?'pointer':'not-allowed',fontSize:'.88rem'}}>{creatingAccount?'Creating your account…':'Continue →'}</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
       </div>
     </div>
   )

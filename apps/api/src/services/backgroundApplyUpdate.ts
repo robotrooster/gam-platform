@@ -54,6 +54,46 @@ export async function applyProviderUpdate(args: {
     [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null,
      update.failureReason || null, check.id])
 
+  // ── S642: THE SCREENER NAMES THE ACCOUNT ──────────────────────────────────
+  //
+  // Nic: "They never have a spot to type in their name. We're gonna generate
+  // accounts off a legal name."
+  //
+  // An applicant account is created from email + password alone; the name on it
+  // is only the provisional seed typed to open the Checkr order. The screener
+  // matched this person against their actual records, so it is the authority on
+  // who they legally are — take the matched name and make it the account's.
+  //
+  // Guards: only a COMPLETE report speaks, only a name the provider actually
+  // returned, and never a rename of somebody already living under a lease —
+  // a tenancy is held in a legal name that appears on signed documents, and
+  // quietly rewriting it under them would be worse than a stale spelling.
+  const summary = update.reportSummary as Record<string, any> | null | undefined
+  const legalFirst = typeof summary?.matched_first_name === 'string' ? summary.matched_first_name.trim() : ''
+  const legalLast  = typeof summary?.matched_last_name  === 'string' ? summary.matched_last_name.trim()  : ''
+  if (update.status === 'complete' && legalFirst && legalLast && check.user_id) {
+    try {
+      const renamed = await query<{ id: string }>(
+        `UPDATE users u
+            SET first_name = $2, last_name = $3, updated_at = NOW()
+          WHERE u.id = $1
+            AND (u.first_name IS DISTINCT FROM $2 OR u.last_name IS DISTINCT FROM $3)
+            AND NOT EXISTS (
+              SELECT 1 FROM tenants t
+                JOIN lease_tenants lt ON lt.tenant_id = t.id
+               WHERE t.user_id = u.id)
+          RETURNING u.id`,
+        [check.user_id, legalFirst, legalLast])
+      if (renamed.length) {
+        logger.info({ user_id: check.user_id, check_id: check.id },
+          '[bgc] account now carries the legal name the screener matched')
+      }
+    } catch (e) {
+      // A name is not worth failing a screening over.
+      logger.error({ err: e, check_id: check.id }, '[bgc] could not apply matched legal name')
+    }
+  }
+
   // Two payloads worth keeping, answering different questions: the raw REPORT
   // is what the provider found, the raw WEBHOOK is what they told us and when.
   // Append-only; neither can fail the screening.
