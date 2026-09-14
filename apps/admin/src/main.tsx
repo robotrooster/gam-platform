@@ -1039,6 +1039,13 @@ function Overview(){
     () => get(`/admin/rent-volume-trend?months=${trendMonths}`),
     { enabled: isSuperAdmin },
   )
+  // S642 (Nic): "Instead of showing $199 fees from Stripe I want to see our
+  // margin on that too."
+  const { data: marginData = [] } = useQuery<any[]>(
+    ['processing-margin', trendMonths],
+    () => get(`/admin/processing-margin?months=${trendMonths}`),
+    { enabled: isSuperAdmin },
+  )
 
   if(isLoading&&!stats)return<div style={{padding:32,color:'var(--t3)'}}>Loading platform data…</div>
 
@@ -1111,6 +1118,58 @@ function Overview(){
 
 
 
+      {/* ── S642: WHAT WE KEEP ON PROCESSING ────────────────────────────────
+          Nic: "I want to see our margin on that too… if they got charged a $26
+          fee, how much of that comes to us."
+          Month level, not per payment, and deliberately: the account is on
+          unbundled pricing so Stripe attributes NO cost to an individual charge
+          (fee = 0, fee_details = []) and bills the day's volume in aggregate.
+          Interchange varies by card type too. Per-payment would be invented. */}
+      {isSuperAdmin&&marginData.length>0&&(()=>{
+        const m:any=marginData[0]
+        return(
+        <div className="card" style={{marginBottom:12}}>
+          <div className="ct" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+            <span>Processing Margin · {m.month}</span>
+            <span style={{fontSize:'.7rem',color:'var(--t3)'}}>what tenants paid in fees, minus what Stripe charged us</span>
+          </div>
+          <div style={{display:'flex',gap:28,flexWrap:'wrap',alignItems:'flex-end',margin:'10px 0 16px'}}>
+            <div>
+              <div className="kl">Fee revenue</div>
+              <div className="kv" style={{fontSize:'1.5rem'}}>{formatCurrency(m.feeRevenue)}</div>
+            </div>
+            <div>
+              <div className="kl">Stripe took</div>
+              <div className="kv r" style={{fontSize:'1.5rem'}}>−{formatCurrency(m.stripeCost)}</div>
+            </div>
+            <div>
+              <div className="kl">We keep</div>
+              <div className="kv gold" style={{fontSize:'1.9rem'}}>{formatCurrency(m.margin)}</div>
+              {m.marginPct!==null&&<div className="ks">{m.marginPct}% of fees charged</div>}
+            </div>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}>
+            <div>
+              <div className="kl" style={{marginBottom:6}}>Charged to tenants</div>
+              {m.byRail.map((r:any)=>(
+                <div key={r.rail} className="dr">
+                  <span className="dk">{r.rail==='ach'?'Bank transfer':r.rail==='card'?'Card':r.rail} · {r.count}</span>
+                  <span className="dv mono">{formatCurrency(r.charged)}</span>
+                </div>
+              ))}
+            </div>
+            <div>
+              <div className="kl" style={{marginBottom:6}}>What Stripe charged us</div>
+              {m.byCategory.map((c:any)=>(
+                <div key={c.category} className="dr">
+                  <span className="dk">{c.label}</span>
+                  <span className="dv mono">{formatCurrency(c.amount)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>)
+      })()}
       {isSuperAdmin&&<div className="grid2">
         <RentVolumeMonitor months={trendData} windowMonths={trendMonths} onWindowChange={setTrendMonths} />
         <div className="card">

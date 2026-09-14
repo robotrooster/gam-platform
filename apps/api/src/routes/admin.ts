@@ -201,6 +201,28 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
  * collections is a ZERO, never a missing row: the heartbeat has to flatline
  * rather than silently close the gap and imply continuous activity.
  */
+/**
+ * GET /api/admin/processing-margin?months=6 — S642 (Nic).
+ *
+ * "Instead of showing $199 fees from Stripe I want to see our margin on that
+ * too… I want to know when somebody pays a card, if they got charged a $26 fee,
+ * how much of that comes to us."
+ *
+ * Exact at the MONTH level, which is the level at which it is knowable: the
+ * account is on unbundled pricing, so Stripe attributes no cost to individual
+ * charges (every charge balance-transaction returns fee = 0 with an empty
+ * fee_details) and bills the real cost as daily aggregates across the whole
+ * day's volume. Interchange also varies by card type. A per-payment cost column
+ * would be a number we made up; this is the real one.
+ */
+adminRouter.get('/processing-margin', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const months = Math.min(24, Math.max(1, parseInt(String(req.query.months ?? '6'), 10) || 6))
+    const { marginByMonth } = await import('../services/stripeCosts')
+    res.json({ success: true, data: await marginByMonth(months) })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) => {
   try {
     // 1..36 — a year is the usual read; 36 supports the long "whole history"

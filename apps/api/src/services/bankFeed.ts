@@ -274,7 +274,17 @@ export async function syncConnection(connectionId: string): Promise<{ inserted: 
     throw new AppError(502, 'Could not sync transactions from the bank')
   }
   const inserted = await upsertTransactions(connectionId, conn.landlord_id, rows)
-  await refreshBalance(conn).catch(() => { /* see refreshBalance: never fails a sync */ })
+  // S642 (Nic): the balance is NO LONGER refreshed on every transaction sync.
+  //
+  // Every refresh is a billable Stripe Financial Connections call. Riding along
+  // with a sync that runs four times a day cost $9.30 in August for a SINGLE
+  // linked account — against $0.30 for the transaction subscription that is the
+  // feature's actual point. The expensive half was the nicety.
+  //
+  // It now runs once a day on banking days only (see the scheduler), because a
+  // real bank does not post on a weekend or a federal holiday either. Callers
+  // who genuinely need it fresh — someone opening the page — call
+  // refreshBalance() directly.
   return { inserted }
 }
 
@@ -682,6 +692,36 @@ export async function syncAllActiveConnections(): Promise<{ synced: number; inse
     }
   }
   return { synced, inserted, failed }
+}
+
+/**
+ * S642 (Nic): refresh every linked account's cached balance — once a day, on
+ * banking days only.
+ *
+ *   "Change it to once a day and only Monday through Friday excluding banking
+ *    holidays. There's no reason their real bank would even update on banking
+ *    holidays or weekends, so let's match that."
+ *
+ * Each call is billable. This used to ride along with the transaction sync four
+ * times a day, which cost $9.30 in August on ONE account while the transaction
+ * feed itself — the thing the feature exists for — cost $0.30. Four times a day,
+ * every day, to re-read a number that a bank only moves on business days.
+ *
+ * 4×/day × 365 = 1,460 calls a year per account. Once a day on ~251 banking
+ * days = 251. A 83% cut, and nothing a landlord can perceive: the balance was
+ * never fresher than the bank's own posting schedule.
+ *
+ * The caller decides it is a banking day (see scheduler) so this stays a plain
+ * "do it now" the admin can also trigger by hand.
+ */
+export async function refreshAllBalances(): Promise<{ refreshed: number; failed: number }> {
+  const conns = await query<any>(
+    `SELECT * FROM bank_connections WHERE status = 'active'`)
+  let refreshed = 0, failed = 0
+  for (const c of conns) {
+    try { await refreshBalance(c); refreshed++ } catch { failed++ }
+  }
+  return { refreshed, failed }
 }
 
 /**

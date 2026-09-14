@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict xrC8YTwGnBm0yiKn5PJ8KIYk4p0cvGSFOkLPTpX4WwFDc4PN1cD4CbfcNlKUkp4
+\restrict HWvvNbWUjOfQ0b4bgVCN8jmUVSF47yavr0lTnnSVn9pDaU3ayNQcjFzXqbzApXI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8895,6 +8895,32 @@ COMMENT ON TABLE public.state_tax_registrations IS 'Per-state sales-tax registra
 
 
 --
+-- Name: stripe_processing_costs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stripe_processing_costs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    stripe_txn_id text NOT NULL,
+    txn_type text NOT NULL,
+    category text NOT NULL,
+    description text,
+    amount numeric(12,2) NOT NULL,
+    posted_at timestamp with time zone NOT NULL,
+    period_start date,
+    period_end date,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT stripe_processing_costs_amount_check CHECK ((amount >= (0)::numeric))
+);
+
+
+--
+-- Name: TABLE stripe_processing_costs; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.stripe_processing_costs IS 'What Stripe charged GAM, as Stripe states it. Unbundled pricing attributes no cost to individual charges, so these are daily aggregates; margin is exact by day/month, never per payment.';
+
+
+--
 -- Name: stripe_webhook_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -13552,6 +13578,22 @@ ALTER TABLE ONLY public.state_tax_registrations
 
 
 --
+-- Name: stripe_processing_costs stripe_processing_costs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stripe_processing_costs
+    ADD CONSTRAINT stripe_processing_costs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: stripe_processing_costs stripe_processing_costs_stripe_txn_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stripe_processing_costs
+    ADD CONSTRAINT stripe_processing_costs_stripe_txn_id_key UNIQUE (stripe_txn_id);
+
+
+--
 -- Name: stripe_webhook_events stripe_webhook_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17338,6 +17380,20 @@ CREATE INDEX idx_sptp_lookup ON public.state_property_tax_provisions USING btree
 --
 
 CREATE INDEX idx_state_tax_forms_state_year ON public.state_tax_forms USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_stripe_costs_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stripe_costs_category ON public.stripe_processing_costs USING btree (category, posted_at DESC);
+
+
+--
+-- Name: idx_stripe_costs_posted; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stripe_costs_posted ON public.stripe_processing_costs USING btree (posted_at DESC);
 
 
 --
@@ -26408,5 +26464,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict xrC8YTwGnBm0yiKn5PJ8KIYk4p0cvGSFOkLPTpX4WwFDc4PN1cD4CbfcNlKUkp4
+\unrestrict HWvvNbWUjOfQ0b4bgVCN8jmUVSF47yavr0lTnnSVn9pDaU3ayNQcjFzXqbzApXI
 

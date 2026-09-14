@@ -1754,6 +1754,56 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S642 (Nic): "I want to see our margin on that too." Pulls what Stripe
+  // actually charged GAM so margin is a figure the platform holds rather than
+  // one somebody has to go ask Stripe for. Idempotent on Stripe's own
+  // transaction id, and the lookback overlaps deliberately — a cost that posts
+  // late is picked up on the next run rather than lost.
+  cron.schedule('20 5 * * *', async () => {
+    try {
+      const { syncStripeCosts } = await import('../services/stripeCosts')
+      const r = await syncStripeCosts({ lookbackDays: 10 })
+      if (r.stored > 0) logger.info(r, '[stripe-costs]')
+    } catch (e) {
+      logger.error({ err: e }, '[stripe-costs] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // ── S642: THE BALANCE REFRESH IS ITS OWN JOB, ON BANKING DAYS ─────────────
+  //
+  // Nic: "Change it to once a day and only Monday through Friday excluding
+  // banking holidays. There's no reason their real bank would even update on
+  // banking holidays or weekends, so let's match that."
+  //
+  // Every Financial Connections balance refresh is billable, and this used to
+  // ride along with the transaction sync above — four times a day, every day.
+  // August's bill for ONE linked account was $9.30 of balance refreshes against
+  // $0.30 for the transaction subscription the feature actually exists for.
+  //
+  // 4x daily = 1,460 calls per account per year. Once per banking day = ~251.
+  // An 83% cut that costs nothing observable: the number was never fresher than
+  // the bank's own posting schedule, and a landlord who wants it now still has
+  // the per-connection refresh on the page.
+  //
+  // 7am Phoenix — after overnight ACH posting, before anyone opens the books.
+  // The holiday test reuses the payout engine's calendar rather than inventing
+  // a second one, so "is the bank open" has ONE answer platform-wide.
+  cron.schedule('0 7 * * 1-5', async () => {
+    try {
+      const { isUsFederalHoliday } = await import('@gam/shared')
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })
+      if (isUsFederalHoliday(today)) {
+        logger.info({ today }, '[bank-balance-refresh] banks are shut, skipping')
+        return
+      }
+      const { refreshAllBalances } = await import('../services/bankFeed')
+      const r = await refreshAllBalances()
+      logger.info({ ...r, today }, '[bank-balance-refresh]')
+    } catch (e) {
+      logger.error({ err: e }, '[bank-balance-refresh] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S605 (Nic): retry lease drafts still waiting. Saving a template as the
   // unit-type default fires drafting immediately — this is the backstop for
   // everything else. Nic: "on the off chance that something does fail, what
