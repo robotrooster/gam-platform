@@ -505,3 +505,86 @@ describe('S636 — property binding from a scanned QR', () => {
     expect(row.property_id).toBe(f.propertyId)
   })
 })
+
+// ── S642: THE MONEY HAS TO REFLECT WHAT ACTUALLY HAPPENED ────────────────────
+//
+// Nic: "I don't know what the $40 is, but let's get it fixed because that's not
+// the real price. As long as she's getting charged right, that's priority number
+// one. But just as important is all the money needs to reflect what actually
+// happened."
+//
+// Two defects, both found on the ONE real screening on file. Her row said
+// $40.00 (a column DEFAULT nothing ever overwrote) against a $44.99 Stripe
+// charge, and the applicant's payment id was recorded only on the pool route —
+// so a landlord-route or QR-scanned applicant left a charge in Stripe and a
+// screening in the database with nothing joining them.
+describe('S642 the screening record matches the charge', () => {
+  it('records the applicant payment id on the LANDLORD route, not just the pool route', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    const payload = happyPayload({ landlordId: f.landlordId, unitId: f.unitId })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(payload)
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT applicant_payment_intent_id FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    // The old line was `isSpeculative ? applicantPaymentIntentId : null`, which
+    // stored NULL here — no refund path and no dispute evidence.
+    expect(row.applicant_payment_intent_id).toBe(payload.applicantPaymentIntentId)
+  })
+
+  it('records it on the pool route too', async () => {
+    const f = await seedFixture({ provider: 'mock' })
+    // The pool route anchors at a system shell landlord; without it the route
+    // 503s ("Renter pool intake is not set up") long before it reaches the line
+    // under test.
+    const shellUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ('pool-intake@gam.internal','x','landlord','Pool','Intake',TRUE)
+       ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name
+       RETURNING id`)
+    const shellLl = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id, is_system, background_provider)
+       VALUES ($1, TRUE, 'mock') RETURNING id`, [shellUser.rows[0].id])
+    // getPoolIntakeShell returns null unless the shell landlord also has a
+    // PROPERTY — Checkr Tenant orders need an address to run against.
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      await seedProperty(c, {
+        landlordId: shellLl.rows[0].id,
+        ownerUserId: shellUser.rows[0].id,
+        managedByUserId: shellUser.rows[0].id,
+      })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+    const payload = happyPayload()
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(payload)
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT applicant_payment_intent_id FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    expect(row.applicant_payment_intent_id).toBe(payload.applicantPaymentIntentId)
+  })
+
+  it('never invents an amount — an unrecorded charge reads as NULL, not $40', async () => {
+    // Mock intents carry no Stripe amount to read, so nothing is recorded. The
+    // point is that nothing is FABRICATED either: the 40.00 default is gone, so
+    // "unknown" stays visibly unknown instead of masquerading as a price.
+    const f = await seedFixture({ provider: 'mock' })
+    const res = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send(happyPayload({ landlordId: f.landlordId, unitId: f.unitId }))
+    expect(res.status).toBe(201)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT amount_charged FROM background_checks WHERE id = $1`,
+      [res.body.data.id ?? res.body.data.checkId])
+    expect(row.amount_charged).toBeNull()
+  })
+})

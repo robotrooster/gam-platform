@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict hn7OVCuTfl7Aos6lPcX1qQGmeXTF7gMkgoH4Cvs2g9j8ukDbPpFci9EZ2kyOEHk
+\restrict xrC8YTwGnBm0yiKn5PJ8KIYk4p0cvGSFOkLPTpX4WwFDc4PN1cD4CbfcNlKUkp4
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1409,7 +1409,7 @@ CREATE TABLE public.background_checks (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     unit_id uuid,
     landlord_id uuid NOT NULL,
-    amount_charged numeric(10,2) DEFAULT 40.00,
+    amount_charged numeric(10,2),
     platform_net numeric(10,2) DEFAULT 15.00,
     provider_ref text,
     status text DEFAULT 'pending'::text,
@@ -1469,6 +1469,13 @@ CREATE TABLE public.background_checks (
     CONSTRAINT background_checks_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'awaiting_applicant'::text, 'submitted'::text, 'processing'::text, 'complete'::text, 'failed'::text, 'cancelled'::text, 'approved'::text, 'denied'::text, 'expired'::text]))),
     CONSTRAINT background_checks_term_sane CHECK (((desired_term_months IS NULL) OR ((desired_term_months > 0) AND (desired_term_months <= 120))))
 );
+
+
+--
+-- Name: COLUMN background_checks.amount_charged; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.background_checks.amount_charged IS 'USD actually captured by Stripe for this screening, written at submit from the verified PaymentIntent. NULL means no amount was recorded — never assume a price.';
 
 
 --
@@ -26401,5 +26408,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict hn7OVCuTfl7Aos6lPcX1qQGmeXTF7gMkgoH4Cvs2g9j8ukDbPpFci9EZ2kyOEHk
+\unrestrict xrC8YTwGnBm0yiKn5PJ8KIYk4p0cvGSFOkLPTpX4WwFDc4PN1cD4CbfcNlKUkp4
 

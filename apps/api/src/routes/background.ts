@@ -351,15 +351,22 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
 // Used by /submit (intake fee) and /pool/match/:matchId/purchase-report
 // (pool unlock fee). Mock IDs from the dev fallback are accepted in
 // non-production only.
+/**
+ * S642 (Nic): "All the money needs to reflect what actually happened."
+ *
+ * Returns the cents Stripe ACTUALLY captured, so the caller records the real
+ * figure instead of re-deriving a fee and hoping the two agree. Null for a mock
+ * intent, which only exists outside production.
+ */
 async function verifyPaymentIntent(
   intentId: string,
   expected: { kind: 'background_check_intake' | 'pool_report_unlock'; amountUsd: number; userId?: string; matchId?: string },
-): Promise<void> {
+): Promise<number | null> {
   if (isMockIntentId(intentId)) {
     if (process.env.NODE_ENV === 'production') {
       throw new AppError(400, 'Mock payment intents are not accepted in production')
     }
-    return
+    return null
   }
   if (!STRIPE_LIVE) {
     throw new AppError(500, 'Stripe not configured but a non-mock intent id was supplied')
@@ -387,6 +394,8 @@ async function verifyPaymentIntent(
   if (Math.abs(pi.amount - expectedCents) > 1) {
     throw new AppError(400, `Payment amount mismatch (got ${pi.amount}¢, expected ${expectedCents}¢)`)
   }
+  // What was really taken — not what we expected to take.
+  return pi.amount
 }
 
 // ── INTAKE: APPLICANT PAYS + SUBMITS ATOMICALLY ──────────────
@@ -468,17 +477,23 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     }
 
     // S577 (Nic): the applicant pays for the screen up front on BOTH routes,
-    // verified BEFORE the check is created — no free checks, and the landlord is
-    // never billed (they're the property lock / merchant-of-record via
-    // on_behalf_of at payment time). Landlord handles any state fee-cap by
-    // issuing the tenant a credit (POST /:id/screening-credit); GAM never
-    // computes caps.
+    // verified BEFORE the check is created — no free checks.
+    //
+    // S642: the rest of this comment used to say the landlord was "the property
+    // lock / merchant-of-record via on_behalf_of at payment time". S636 removed
+    // on_behalf_of entirely — "the landlord is not part of the screening process
+    // at all" — and the one real screening on file proves it: that charge has
+    // on_behalf_of null, transfer_data null and no application fee, settling
+    // 100% to the platform. The stale sentence cost real time today, read as
+    // current behaviour. Landlord handles any state fee-cap by issuing the
+    // tenant a credit (POST /:id/screening-credit); GAM never computes caps.
     if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required before screening can start')
-    await verifyPaymentIntent(applicantPaymentIntentId, {
+    const chargedCents = await verifyPaymentIntent(applicantPaymentIntentId, {
       kind: 'background_check_intake',
       amountUsd: (await screeningIntakeFee(state)).total,
       userId: req.user!.userId,
     })
+    const amountChargedUsd = chargedCents === null ? null : chargedCents / 100
 
     let ssnClean: string | null = null
     let ssnLast4: string | null = null
@@ -548,7 +563,8 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           consent_credit, consent_criminal, consent_pool, consent_signed_at, consent_ip,
           ip_address, user_agent, provider_name,
           applicant_payment_intent_id, property_id,
-          desired_move_in, desired_term_months, desired_month_to_month
+          desired_move_in, desired_term_months, desired_month_to_month,
+          amount_charged
         ) VALUES (
           $1, $2, $3, $4, 'pending',
           $5, $6, $7, $8, $9,
@@ -559,7 +575,8 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           $25, $26, $27, NOW(), $28,
           $29, $30, $31,
           $32, $33,
-          $34, $35, $36
+          $34, $35, $36,
+          $37
         ) RETURNING id`,
         [
           tenant?.id || null, req.user!.userId, effectiveLandlordId, unitId || null,
@@ -570,9 +587,23 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           idDocumentUrl || null, JSON.stringify(incomeDocUrls || []),
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
-          isSpeculative ? applicantPaymentIntentId : null, // S564: pool applicants pay; landlord route billed to landlord
+          // S642 (Nic): "All the money needs to reflect what actually happened."
+          //
+          // This was `isSpeculative ? applicantPaymentIntentId : null`, on the
+          // S564 reasoning that only pool applicants paid and the landlord route
+          // was billed to the landlord. S636 ended that — the applicant pays on
+          // BOTH routes now, screening revenue is 100% platform — but this line
+          // was never updated. So every landlord-route or QR-scanned applicant
+          // left a charge in Stripe and a screening in the database with nothing
+          // joining them: no refund path, no dispute evidence, no way to
+          // reconcile screening income against what was collected.
+          applicantPaymentIntentId,
           effectivePropertyId,
           stay.moveIn, stay.termMonths, stay.monthToMonth,
+          // The figure Stripe actually captured. The column's old 40.00 DEFAULT
+          // showed through on every row ever written, because nothing set it —
+          // a number that looked like a price and was not one.
+          amountChargedUsd,
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —
