@@ -97,56 +97,85 @@ describe('S642 a rate is matched by UNIT TYPE, not by state alone', () => {
 describe('S642 a size gate counts what its statute counts', () => {
   const MATTOON = { spaces: 30, homesPresent: 21 }
 
-  /** Mirrors gateApplies() in depositInterest.ts. */
-  const passes = (basis: string, min: number, allUnits: number, occupiedOfType: number) => {
-    const counted = basis === 'occupied_of_type' ? occupiedOfType : allUnits
-    return counted >= min
+  /** Mirrors gateApplies()'s homes_present branch in depositInterest.ts. */
+  const passes = (o: {
+    min: number; spaces: number | null
+    present?: number | null; inventoryKnown?: boolean
+  }) => {
+    if (o.spaces != null && o.spaces < o.min) return false      // 1. too few spaces
+    if (o.inventoryKnown) return (o.present ?? 0) >= o.min       // 2. count the homes
+    return true                                                  // 3. unknown → lean safe
   }
 
-  it('Mattoon is UNDER the mobile-home gate: 21 homes, not 30 spaces', () => {
-    expect(passes('occupied_of_type', 25, MATTOON.spaces, MATTOON.homesPresent)).toBe(false)
+  it('Mattoon is UNDER the gate: 21 homes on 30 slabs', () => {
+    expect(passes({ min: 25, spaces: MATTOON.spaces,
+                    present: MATTOON.homesPresent, inventoryKnown: true })).toBe(false)
   })
 
-  it('counting every unit row would have wrongly tripped it', () => {
-    // The pre-S642 behaviour, kept as a test so the bug cannot return quietly.
-    expect(passes('all_units', 25, MATTOON.spaces, MATTOON.homesPresent)).toBe(true)
+  it('a park-owned home standing EMPTY still counts — occupancy is not the question', () => {
+    // The case the occupancy proxy got wrong: 25 homes present, only 20 leased.
+    // 765 ILCS 745/18 counts what the park "regularly contains", not who is in it.
+    expect(passes({ min: 25, spaces: 30, present: 25, inventoryKnown: true })).toBe(true)
   })
 
-  it('an apartment building still counts units that EXIST, occupancy aside', () => {
-    // 765 ILCS 715/1 says "units", so a half-empty 30-unit building is covered.
-    expect(passes('all_units', 25, 30, 12)).toBe(true)
+  it('a bare slab is not a home', () => {
+    expect(passes({ min: 25, spaces: 40, present: 24, inventoryKnown: true })).toBe(false)
   })
 
-  it('the park crosses the gate when the 25th home actually arrives', () => {
-    expect(passes('occupied_of_type', 25, 30, 24)).toBe(false)
-    expect(passes('occupied_of_type', 25, 30, 25)).toBe(true)
+  it('too few SPACES settles it with no inventory at all', () => {
+    // Mattoon today: 11 spaces. It cannot regularly contain 25 homes, so nobody
+    // has to record anything for the gate to resolve.
+    expect(passes({ min: 25, spaces: 11 })).toBe(false)
   })
 
-  it('the column exists and defaults to counting units that exist', async () => {
-    // The live IL rows are seeded by migration and this harness builds from a
-    // schema-only dump, so the SHAPE is what is assertable here; the seeded
-    // values are checked by scripts/depositRuleCoverage.ts against the real
-    // database. What must never regress is the default: a rule that says
-    // nothing about basis counts units, which is the pre-S642 meaning.
-    await db.query(`DELETE FROM state_deposit_interest_rates WHERE state_code='ZW'`)
+  it('enough spaces but NO inventory leans safe, not to zero', () => {
+    // Reading "no records" as "no homes" would silently under-pay tenants,
+    // which is a statutory violation. Over-accruing is money GAM can reconcile.
+    expect(passes({ min: 25, spaces: 30 })).toBe(true)
+    // And the opposite reading — the bug this guards against.
+    expect(passes({ min: 25, spaces: 30, present: 0, inventoryKnown: true })).toBe(false)
+  })
+
+  it('the gate flips when the 25th home actually arrives', () => {
+    expect(passes({ min: 25, spaces: 30, present: 24, inventoryKnown: true })).toBe(false)
+    expect(passes({ min: 25, spaces: 30, present: 25, inventoryKnown: true })).toBe(true)
+  })
+
+  it('an uninhabitable apartment still counts toward an all_units gate', () => {
+    // 765 ILCS 715/1 counts "units", not habitable ones — which is why this is
+    // a different basis and not a shared unit status.
+    const allUnits = (min: number, unitsThatExist: number) => unitsThatExist >= min
+    expect(allUnits(25, 30)).toBe(true)
+  })
+
+  it('the basis column accepts homes_present and refuses an invented one', async () => {
+    await db.query(`DELETE FROM state_deposit_interest_rates WHERE state_code IN ('ZW','ZV')`)
     await db.query(
       `INSERT INTO state_deposit_interest_rates
          (state_code, effective_year, annual_rate_pct, statute_citation, notes,
-          unit_types, act_key, rate_basis, min_property_units)
-       VALUES ('ZW', 2026, 1, 'test', 'test', ARRAY['mobile_home'], 'mobile_home_park', 'fixed', 25)`)
+          unit_types, act_key, rate_basis, min_property_units, min_units_basis)
+       VALUES ('ZW',2026,1,'t','t',ARRAY['mobile_home'],'mobile_home_park','fixed',25,'homes_present')`)
     const { rows } = await db.query<any>(
       `SELECT min_units_basis FROM state_deposit_interest_rates WHERE state_code='ZW'`)
-    expect(rows[0].min_units_basis).toBe('all_units')
-  })
+    expect(rows[0].min_units_basis).toBe('homes_present')
 
-  it('refuses a basis nobody has defined', async () => {
-    // A typo here silently changes which number a gate reads, so the column is
-    // constrained rather than trusted.
     await expect(db.query(
       `INSERT INTO state_deposit_interest_rates
          (state_code, effective_year, annual_rate_pct, statute_citation, notes,
           unit_types, act_key, rate_basis, min_units_basis)
-       VALUES ('ZV', 2026, 1, 'test', 'test', ARRAY['mobile_home'], 'x', 'fixed', 'licensed_capacity')`))
+       VALUES ('ZV',2026,1,'t','t',ARRAY['mobile_home'],'x','fixed','licensed_capacity')`))
       .rejects.toThrow()
+  })
+
+  it('defaults to counting units that exist', async () => {
+    await db.query(`DELETE FROM state_deposit_interest_rates WHERE state_code='ZU'`)
+    await db.query(
+      `INSERT INTO state_deposit_interest_rates
+         (state_code, effective_year, annual_rate_pct, statute_citation, notes,
+          unit_types, act_key, rate_basis, min_property_units)
+       VALUES ('ZU',2026,1,'t','t',ARRAY['apartment'],'residential','fixed',25)`)
+    const { rows } = await db.query<any>(
+      `SELECT min_units_basis FROM state_deposit_interest_rates WHERE state_code='ZU'`)
+    expect(rows[0].min_units_basis).toBe('all_units')
   })
 })

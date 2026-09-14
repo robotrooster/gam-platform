@@ -1929,6 +1929,49 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       })
     }
 
+    // ── S642: A PARK BIG ENOUGH TO OWE INTEREST, WITH NO HOME INVENTORY ────
+    //
+    // Nic: "How do we distinguish… that they are indeed below the 25 unit
+    // threshold." Some states switch a deposit-interest obligation on by the
+    // number of HOMES a park regularly contains (765 ILCS 745/18: 25 or more).
+    // A park-owned home standing empty counts; a bare slab does not — so the
+    // count comes from the mobile_homes inventory, not from occupancy.
+    //
+    // When a park has ENOUGH SPACES to cross the gate but nobody has recorded a
+    // single home, the count is UNKNOWN. The engine leans safe and accrues the
+    // interest, because under-paying a tenant is a statutory violation while
+    // over-accruing is money GAM can reconcile. That safety is only honest if
+    // the landlord is told, so it surfaces here instead of quietly costing
+    // them. Parks below the gate never appear: their spaces already settle it.
+    const homeInventoryRows = await query<any>(`
+      SELECT p.id, p.name, p.state,
+             COUNT(*) FILTER (WHERE u.unit_type = 'mobile_home')::int AS spaces
+        FROM properties p
+        JOIN units u ON u.property_id = p.id
+       WHERE p.landlord_id = ANY($1)
+       GROUP BY p.id, p.name, p.state
+      HAVING COUNT(*) FILTER (WHERE u.unit_type = 'mobile_home') >= (
+               SELECT COALESCE(MIN(r.min_property_units), 25)
+                 FROM state_deposit_interest_rates r
+                WHERE r.state_code = p.state
+                  AND r.min_units_basis = 'homes_present'
+                  AND r.min_property_units IS NOT NULL)
+         AND NOT EXISTS (
+               SELECT 1 FROM mobile_homes mh
+                 JOIN units u2 ON u2.id = mh.unit_id
+                WHERE u2.property_id = p.id)
+    `, [scopeIds]).catch(() => [])
+
+    const homeInventory = homeInventoryRows.map((r: any) => ({
+      id: r.id,
+      type: 'home_inventory',
+      title: `Record the homes at ${r.name}`,
+      subtitle: `${r.spaces} mobile home spaces · ${r.state} owes deposit interest once a park `
+        + `regularly contains enough homes, and we have none recorded. Until it is filled in we `
+        + `assume the obligation applies.`,
+      href: `/properties/${r.id}?tab=units`,
+    }))
+
     res.json({
       success: true,
       data: {
@@ -1937,13 +1980,16 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         maintenance,
         workTrade,
         onboarding,
+        homeInventory,
         counts: {
           leases: leases.length,
           ach: ach.length,
           maintenance: maintenance.length,
           workTrade: workTrade.length,
           onboarding: onboarding.length,
-          total: leases.length + ach.length + maintenance.length + workTrade.length + onboarding.length,
+          homeInventory: homeInventory.length,
+          total: leases.length + ach.length + maintenance.length + workTrade.length
+                 + onboarding.length + homeInventory.length,
         },
       },
     })

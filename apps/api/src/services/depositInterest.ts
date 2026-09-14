@@ -81,9 +81,13 @@ interface DepositForAccrual {
   state:            string
   unit_type:        string | null   // S604: selects the unit-type-specific rate row
   property_units:   number | null   // S604: for size gates (IL 25+, NY 6+)
-  /** S642: units of THIS deposit's own type that are occupied — "regularly
-   *  containing 25 or more mobile homes". See min_units_basis. */
-  occupied_of_type: number | null
+  /** S642: physical homes on this property's spaces, not yet removed. */
+  homes_present:        number | null
+  /** S642: false = nobody has recorded ANY home here, so homes_present is
+   *  UNKNOWN rather than zero. */
+  home_inventory_known: boolean | null
+  /** S642: spaces of this unit type. Below the gate, no inventory is needed. */
+  spaces_of_type:       number | null
   funded_at:        string | null    // earliest installment payment date
   disbursed_at:     string | null
 }
@@ -230,15 +234,29 @@ export function gateApplies(
   rate:          Pick<ResolvedRate, 'min_tenure_months' | 'min_property_units' | 'min_units_basis'>,
   monthsHeld:    number,
   propertyUnits: number | null,
-  occupiedOfType: number | null = null,
+  homes?: { present: number | null; inventoryKnown: boolean | null; spaces: number | null },
 ): boolean {
   if (rate.min_tenure_months != null && monthsHeld < rate.min_tenure_months) return false
   if (rate.min_property_units != null) {
-    // S642: count what the statute counts. Counting every unit row for a
-    // mobile-home-park gate reads a 30-space park with 21 homes as 30 and
-    // starts paying interest the state never asked for.
-    const counted = rate.min_units_basis === 'occupied_of_type' ? occupiedOfType : propertyUnits
-    if (counted == null || counted < rate.min_property_units) return false
+    if (rate.min_units_basis === 'homes_present') {
+      // S642: count the HOMES, per "regularly containing 25 or more mobile
+      // homes". Three cases, in the order that avoids needing an inventory:
+      //
+      //  1. Fewer SPACES than the gate → it cannot be met, whatever is on them.
+      //     Settles Mattoon (11 spaces) with no data entry at all.
+      //  2. An inventory exists → count the homes standing there.
+      //  3. Enough spaces but NO inventory → UNKNOWN. Apply the obligation.
+      //     Under-paying a tenant is a statutory violation; over-accruing costs
+      //     GAM money it can reconcile before payout. Unknown leans the safe
+      //     way and raises a to-do (see /me/todos) rather than guessing zero.
+      const spaces = homes?.spaces ?? propertyUnits
+      if (spaces != null && spaces < rate.min_property_units) return false
+      if (homes?.inventoryKnown) {
+        if ((homes.present ?? 0) < rate.min_property_units) return false
+      }
+      return true
+    }
+    if (propertyUnits == null || propertyUnits < rate.min_property_units) return false
   }
   return true
 }
@@ -484,7 +502,11 @@ export async function computeMonthlyAccrual(
   const monthsHeld = Math.floor(
     (monthStart.getTime() - fundedDate.getTime()) / (1000 * 60 * 60 * 24 * 30.44))
   const gated = rate
-    ? gateApplies(rate, monthsHeld, deposit.property_units, deposit.occupied_of_type)
+    ? gateApplies(rate, monthsHeld, deposit.property_units, {
+        present:        deposit.homes_present,
+        inventoryKnown: deposit.home_inventory_known,
+        spaces:         deposit.spaces_of_type,
+      })
     : false
 
   const interest = rate && gated
@@ -566,10 +588,25 @@ export async function runMonthlyAccrual(monthStartIso: string): Promise<MonthlyA
         -- spaces with ~21 homes on them: over one gate, under the other. Which
         -- one a rule means is min_units_basis.
         (SELECT COUNT(*)::int FROM units u2 WHERE u2.property_id = p.id) AS property_units,
-        (SELECT COUNT(*)::int FROM units u3
+        -- S642: homes PRESENT, from the mobile_homes inventory. A park-owned
+        -- home standing empty counts; a bare slab does not. Occupancy is not
+        -- the question.
+        (SELECT COUNT(*)::int FROM mobile_homes mh
+           JOIN units u3 ON u3.id = mh.unit_id
           WHERE u3.property_id = p.id
-            AND u3.unit_type = u.unit_type
-            AND u3.status NOT IN ('vacant','available')) AS occupied_of_type,
+            AND mh.removed_at IS NULL) AS homes_present,
+        -- Whether an inventory EXISTS at all. Zero homes recorded on a park
+        -- that has mobile-home spaces means "nobody has told us", not "there
+        -- are none" — and reading it as none under-pays tenants, which is the
+        -- one direction that must never happen silently.
+        EXISTS (SELECT 1 FROM mobile_homes mh2
+                  JOIN units u4 ON u4.id = mh2.unit_id
+                 WHERE u4.property_id = p.id) AS home_inventory_known,
+        -- Spaces that could ever hold a home. Below the gate this settles the
+        -- question without any inventory: a park with 11 mobile-home spaces
+        -- cannot regularly contain 25 homes.
+        (SELECT COUNT(*)::int FROM units u5
+          WHERE u5.property_id = p.id AND u5.unit_type = u.unit_type) AS spaces_of_type,
         COALESCE(
           (SELECT MIN(pmt.due_date::timestamp)
              FROM payments pmt
