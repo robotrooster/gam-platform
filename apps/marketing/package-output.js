@@ -39,6 +39,14 @@ fs.writeFileSync(path.join(OUT, 'config.json'), JSON.stringify({
     redirect('/tenant',   `${TENANT}/login`),
     redirect('/tenants',  `${TENANT}/login`),
 
+    // S642: the renter doors. THIS file is the one that ships — the header
+    // above says project settings beat vercel.json, so a redirect added only
+    // there silently never fires (I added these to vercel.json first and
+    // /renters kept returning the homepage). Both files list them now.
+    redirect('/renters',     `${TENANT}/background-check`),
+    redirect('/renter-pool', `${TENANT}/background-check`),
+    redirect('/find-a-place',`${TENANT}/background-check`),
+
     { handle: 'filesystem' },
 
     // Legal + support, reachable with or without .html
