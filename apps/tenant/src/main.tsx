@@ -4650,25 +4650,27 @@ function LoginPage() {
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
           </form>
-          <div style={{ marginTop: 16, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+          {/* S642 (Nic, DIRECTIVE): "Tenants shouldn't be able to sign up for
+              just a random account. We designed it to be invite only… One flow
+              per route so nothing is confusing. No choices to be made by
+              tenants."
+
+              This route is for people who already live somewhere: sign in, or
+              recover the password. Nothing else. A "Create account" link used
+              to sit right here beside Sign in, and a resident who could not get
+              in read it as the thing he was supposed to do — he made a second,
+              lease-less account, then could not pay rent from it because it had
+              no lease and no bill. That is the only way self-signup has ever
+              been used by a resident.
+
+              Housing-seekers still create accounts; that door lives on the
+              screening route (/signup, which /background-check redirects into),
+              reached from marketing, not from the residents' login page. */}
+          <div style={{ marginTop: 16 }}>
             <Link to="/forgot-password" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
               Forgot password?
             </Link>
-            <Link to="/signup" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
-              Create account
-            </Link>
           </div>
-        </div>
-        {/* S578: renter-pool entry is now account-first — create an account
-            (with 2FA), then get screened from inside the gated portal. */}
-        <div className="card" style={{ padding: 20, marginTop: 16, textAlign: 'center' }}>
-          <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>Looking for a place to live?</div>
-          <div style={{ fontSize: '.8rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 14 }}>
-            Create your account, get background-checked once, and join the renter pool — landlords with open units find you. No chosen property needed to start.
-          </div>
-          <Link to="/signup" className="btn btn-p" style={{ width: '100%', justifyContent: 'center', textDecoration: 'none' }}>
-            Get started
-          </Link>
         </div>
       </div>
     </div>
@@ -4759,10 +4761,20 @@ function SignupPage() {
       <div style={{width:'100%',maxWidth:400}}>
         <div style={{textAlign:'center',marginBottom:40}}>
           <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
-          <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Create your account</div>
+          <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Looking for a place to live</div>
         </div>
         <div className="card" style={{padding:28}}>
-          <h2 style={{marginBottom:20}}>Sign up</h2>
+          {/* S642 (Nic): one flow per route. This route is the renter pool —
+              get background-checked once, and landlords with open units find
+              you. It is NOT how somebody who already rents gets a login; those
+              arrive by invite. The heading has to say which of the two this is,
+              because the page used to be reachable from the residents' login
+              screen under the word "Create account". */}
+          <h2 style={{marginBottom:6}}>Join the renter pool</h2>
+          <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,marginBottom:20}}>
+            Create your account, get background-checked once, and landlords with open units find
+            you. No chosen property needed to start.
+          </div>
           {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
           <form onSubmit={handleSubmit(onSubmit)}>
             <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>

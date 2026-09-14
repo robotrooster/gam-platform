@@ -334,6 +334,15 @@ http.createServer((req, res) => {
   }
   if (url === '/tenant' || url === '/tenants') return redirect(TENANT + '/login')
 
+  // S642 (Nic): the tenant login page is sign-in only now — a "Create account"
+  // link beside it read as an instruction to residents who could not get in,
+  // and one of them made a second, lease-less account he could not pay from.
+  // The renter pool kept its own route but lost its only discoverable entry
+  // when that card came off the login page, so it gets one here instead.
+  if (url === '/renters' || url === '/renter-pool' || url === '/find-a-place') {
+    return redirect(TENANT + '/signup')
+  }
+
   // S603: support page — the URL Stripe prints on receipts + dispute evidence.
   if (url === '/support' || url === '/help') return send(SUPPORT_HTML)
 
