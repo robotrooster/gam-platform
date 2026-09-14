@@ -34,7 +34,7 @@ vi.mock('./email', async (importOriginal) => {
   return { ...actual, sendNotificationEmail: sendNotificationEmailMock }
 })
 
-import { createNotification } from './notifications'
+import { createNotification, notifyRentCollected } from './notifications'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -241,5 +241,91 @@ describe('createNotification — best-effort error swallow', () => {
       userId: randomUUID(),  // not in users table
       type: 'orphan', title: 'X', body: 'Y',
     })).resolves.toBeUndefined()
+  })
+})
+
+// ─── S642: the rent-collected card states the money, not the lease ──────────
+//
+// Nic: "It's only showing the base rent in the email card. It's not showing
+// what they actually paid. So it's misleading… Calvin Curtis paid four ninety
+// five for unit RV 40. That is not the total he paid."
+//
+// He settled $495.00 rent and $25.20 electricity on ONE intent. The webhook
+// looped the settled rows, fired once per RENT row, and read that row's own
+// amount — so the landlord was told $495.00, the lease's base rent, as though
+// that were the payment.
+describe('notifyRentCollected — S642: the figure is the money that arrived', () => {
+  // createNotification writes an in-app row whose landlord_id is a REAL FK to
+  // landlords. A made-up uuid makes the insert throw, the best-effort catch
+  // swallows it, and NO email is sent — so an assertion-on-the-email test fails
+  // for a reason that has nothing to do with the thing under test. Seed one.
+  async function seedLandlord(): Promise<string> {
+    const { userId } = await seedUser()
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [userId])
+    return r.rows[0].id
+  }
+
+  async function fire(over: Partial<Parameters<typeof notifyRentCollected>[0]> = {}) {
+    const { userId, email } = await seedUser()
+    const landlordId = await seedLandlord()
+    await notifyRentCollected({
+      landlordUserId: userId,
+      landlordId,
+      landlordEmail:  email,
+      tenantName:     'Calvin Curtis',
+      unitNumber:     'RV 40',
+      propertyName:   'Mountain View RV Ranch',
+      amount:         520.20,
+      ...over,
+    } as any)
+    const call = (sendNotificationEmailMock.mock.calls as any[][])[0]![0] as any
+    return { call, userId }
+  }
+
+  it('states the event total, not the rent row', async () => {
+    const { call } = await fire({
+      breakdown: [
+        { label: 'Rent',        amount: 495.00 },
+        { label: 'Electricity', amount: 25.20 },
+      ],
+    })
+    expect(call.html).toContain('$520.20')
+    // The exact shape of the old bug: announcing base rent as the amount paid.
+    expect(call.html).not.toContain('paid <b>$495.00</b>')
+  })
+
+  it('names where the money went when the total covers more than one charge', async () => {
+    const { call } = await fire({
+      breakdown: [
+        { label: 'Rent',        amount: 495.00 },
+        { label: 'Electricity', amount: 25.20 },
+      ],
+    })
+    // A landlord reading $520.20 against a $495 lease needs the $25.20 named,
+    // or the total itself looks like the error.
+    expect(call.html).toContain('Electricity')
+    expect(call.html).toContain('$25.20')
+    expect(call.html).toContain('$495.00')
+    expect(call.html).toContain('Total paid')
+  })
+
+  it('a rent-only payment grows no one-line breakdown', async () => {
+    const { call } = await fire({ amount: 495.00, breakdown: undefined })
+    expect(call.html).toContain('$495.00')
+    expect(call.html).not.toContain('Total paid')
+  })
+
+  it('the in-app row carries the same total as the email', async () => {
+    const { userId } = await fire({
+      breakdown: [
+        { label: 'Rent',        amount: 495.00 },
+        { label: 'Electricity', amount: 25.20 },
+      ],
+    })
+    const row = await db.query<{ body: string }>(
+      `SELECT body FROM notifications WHERE user_id = $1 AND type = 'rent_collected'`, [userId])
+    expect(row.rows[0].body).toContain('$520.20')
+    expect(row.rows[0].body).toContain('Electricity: $25.20')
   })
 })

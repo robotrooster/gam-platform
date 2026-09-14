@@ -82,8 +82,32 @@ export async function createNotification(p: {
   } catch (e) { logger.error({ err: e }, '[NOTIFY]') }
 }
 
-export async function notifyRentCollected(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amount:number }) {
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:`${o.tenantName} paid $${o.amount.toFixed(2)} for Unit ${o.unitNumber} at ${o.propertyName}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, `<b>${o.tenantName}</b> paid <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`)})
+// S642 (Nic): `amount` is the TOTAL that arrived in the payment event, not the
+// lease's base rent. `breakdown` is set whenever that total covers more than
+// one charge, so the card can say where the money went — a landlord reading
+// "$520.20" against a $495 lease needs the $25.20 named or the figure looks
+// wrong. Rent-only payments pass no breakdown and read exactly as before.
+export async function notifyRentCollected(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amount:number; breakdown?: Array<{ label:string; amount:number }> }) {
+  const money = (n:number) => `$${n.toFixed(2)}`
+  const lead = `${o.tenantName} paid ${money(o.amount)} for Unit ${o.unitNumber} at ${o.propertyName}.`
+  const leadHtml = `<b>${o.tenantName}</b> paid <b>${money(o.amount)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`
+  const items = o.breakdown ?? []
+  const plain = items.length
+    ? `${lead}\n\n${items.map(i => `  ${i.label}: ${money(i.amount)}`).join('\n')}`
+    : lead
+  const html = items.length
+    ? leadHtml +
+      `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">` +
+      items.map(i =>
+        `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+           <span>${i.label}</span><span>${money(i.amount)}</span>
+         </div>`).join('') +
+      `<div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                   border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+         <span>Total paid</span><span>${money(o.amount)}</span>
+       </div></div>`
+    : leadHtml
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:plain, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, html)})
 }
 
 // S561: bold landlord alert when a tenant's already-paid rent REVERSES (late

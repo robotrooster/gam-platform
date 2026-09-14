@@ -23,9 +23,15 @@ const API_BASE = process.env.API_URL || 'http://localhost:4000'
 // from the API host when LANDLORD_URL isn't set explicitly; dev falls back to :3001.
 const LANDLORD_URL = process.env.LANDLORD_URL ||
   (API_BASE.includes('goldassetmanagement.com') ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001')
+// S642 (Nic): "The marketing page should have a thing — hey, looking for a spot
+// to live, view properties in your area, do a background check." Every CTA on
+// this site pointed at the LANDLORD portal; a renter had nowhere to go. The
+// tenant host has to be injected the same way for the renter section's links.
+const TENANT_URL = process.env.TENANT_URL ||
+  (API_BASE.includes('goldassetmanagement.com') ? 'https://tenant.goldassetmanagement.com' : 'http://localhost:3002')
 const HTML_WITH_API = HTML.replace(
   '</head>',
-  `<script>window.GAM_API_BASE=${JSON.stringify(API_BASE)};window.GAM_LANDLORD_URL=${JSON.stringify(LANDLORD_URL)}</script>\n</head>`
+  `<script>window.GAM_API_BASE=${JSON.stringify(API_BASE)};window.GAM_LANDLORD_URL=${JSON.stringify(LANDLORD_URL)};window.GAM_TENANT_URL=${JSON.stringify(TENANT_URL)}</script>\n</head>`
 )
 
 // Legal docs live in /legal at repo root. Resolve from this server.js

@@ -23,6 +23,15 @@
   // that rejects them with "Email already registered", and
   // goldassetmanagement.com/landlord silently serves THIS page (the static
   // server falls back to index.html for unknown paths), so it looks broken.
+  // S642 (Nic): "If you're a tenant that wants to look for a place to live,
+  // sign up here." Every CTA on this page went to the LANDLORD portal. Renters
+  // are a second audience with a second destination.
+  window.gamRenters = function () {
+    var base = window.GAM_TENANT_URL
+      || ((location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+            ? 'http://localhost:3002' : 'https://tenant.goldassetmanagement.com');
+    window.location.href = base + '/signup';
+  };
   window.gamSignIn = function () {
     var base = window.GAM_LANDLORD_URL
       || ((location.hostname === 'localhost' || location.hostname === '127.0.0.1')
@@ -198,6 +207,32 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
 .footer-nav{display:flex;gap:26px;flex-wrap:wrap;align-items:center}
 .footer-nav a{font-size:.85rem;color:var(--muted);transition:color .15s}
 .footer-nav a:hover{color:var(--gold)}
+
+/* S642: the renter band. Deliberately a different ground from the landlord
+   sections above so a renter can tell at a glance that this part is for them. */
+.renters-section{background:var(--bg2);border-top:1px solid var(--border);padding:86px 0;text-align:center}
+.renters-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:26px;margin-top:40px;text-align:left}
+.renters-step{background:var(--bg3);border:1px solid var(--border);border-radius:14px;padding:26px 24px}
+.renters-num{width:32px;height:32px;border-radius:50%;background:var(--gold);color:#080a0c;
+  font-weight:800;font-size:.9rem;display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+.renters-h{font-weight:700;color:var(--text);margin-bottom:7px;font-size:1.02rem}
+.renters-p{color:var(--muted);font-size:.9rem;line-height:1.65;margin:0}
+@media (max-width:860px){
+  .renters-section{padding:60px 0}
+  .renters-grid{grid-template-columns:1fr;gap:16px;margin-top:30px}
+}
+
+/* S642: the nav had no mobile rule at all — the section links crowded the logo
+   into three wrapped lines on a phone. Below 760px the in-page anchors drop
+   (the sections are all reachable by scrolling) and the actions stay. */
+@media(max-width:760px){
+  .nav-anchor{display:none}
+  .nav-links{gap:14px}
+  /* The logo was wrapping onto three lines beside the buttons. */
+  nav .logo{font-size:.92rem;white-space:nowrap}
+  .nav-links .btn-outline{padding:8px 12px;font-size:.78rem}
+  .nav-links .btn-nav{padding:8px 14px;font-size:.78rem;white-space:nowrap}
+}
 </style>
 </head>
 <body>
@@ -208,8 +243,9 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     <div class="nav-inner">
       <div class="logo">⚡ Gold Asset Management</div>
       <div class="nav-links">
-        <a href="#why">Platform</a>
-        <a href="#pricing">Pricing</a>
+        <a class="nav-anchor" href="#why">Platform</a>
+        <a class="nav-anchor" href="#pricing">Pricing</a>
+        <a class="nav-anchor" href="#renters">For renters</a>
         <button class="btn-outline" style="padding:8px 18px;font-size:.82rem" onclick="window.gamOpenDemo&&window.gamOpenDemo()">Book a demo</button>
         <a href="#" onclick="gamSignIn();return false;" style="font-weight:600">Sign in</a>
         <button class="btn-nav" onclick="gamRegister()">Get started →</button>
@@ -347,6 +383,48 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   </div>
 </section>
 
+<!-- S642 (Nic): THE RENTER SECTION.
+     "The marketing page should have a thing. Hey, looking for a spot to live,
+     view properties in your area, do a background check, that kind of thing.
+     If you're a tenant that wants to look for a place to live, sign up here."
+
+     This whole site spoke only to landlords — every CTA on it goes to the
+     landlord portal. The renter pool had no pitch anywhere, and its only
+     discoverable door was a card on the tenant LOGIN page, which is exactly
+     where it confused a resident into making a second account. That card came
+     off; this is where renters get told about it instead. Visually its own
+     band, so it never competes with the landlord funnel above. -->
+<section class="renters-section" id="renters">
+  <div class="container">
+    <div class="section-label">Looking for a place to live?</div>
+    <h2 class="section-title">Get screened once. Let the places come to you.</h2>
+    <p class="section-sub">You don't need to chase a listing, pay for another background check, or fill the same form out for every park you call. Get checked one time and join the renter pool — landlords with open spots find you.</p>
+
+    <div class="renters-grid">
+      <div class="renters-step">
+        <div class="renters-num">1</div>
+        <div class="renters-h">Create your account</div>
+        <p class="renters-p">Name, email, a password. That's the whole thing.</p>
+      </div>
+      <div class="renters-step">
+        <div class="renters-num">2</div>
+        <div class="renters-h">Get background-checked once</div>
+        <p class="renters-p">One check, one fee, and it's good across every landlord on GAM — not once per application.</p>
+      </div>
+      <div class="renters-step">
+        <div class="renters-num">3</div>
+        <div class="renters-h">Landlords with openings find you</div>
+        <p class="renters-p">You don't have to have a place picked out to start. Nothing is shared until you're in the pool.</p>
+      </div>
+    </div>
+
+    <div class="hero-cta" style="justify-content:center;margin-top:34px">
+      <button class="btn-primary" onclick="gamRenters()">Get started →</button>
+    </div>
+    <p class="cta-note">Already rent from a GAM landlord? Your landlord sends you an invite — you don't sign up here.</p>
+  </div>
+</section>
+
 <!-- FOOTER -->
 <footer>
   <div class="container">
@@ -358,6 +436,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
       <div class="footer-nav">
         <a href="#why">Platform</a>
         <a href="#pricing">Pricing</a>
+        <a href="#renters">For renters</a>
         <a href="#" onclick="window.gamOpenSalesChat&&window.gamOpenSalesChat();return false;">Contact sales</a>
         <a href="#" onclick="gamRegister();return false;">Get started</a>
       </div>

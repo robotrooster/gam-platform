@@ -529,12 +529,49 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // owner regardless of whether the property was delegated, which spammed
       // owners about properties they'd handed off to a PM. Failures don't
       // propagate; credit ledger event inside the tx is the durable record.
-      // Skip utility rows — utilities are smaller / more frequent.
+      //
+      // S642 (Nic): "It's only showing the base rent in the email card. It's
+      // not showing what they actually paid. So it's misleading… Calvin Curtis
+      // paid four ninety five for unit RV 40. That is not the total he paid. He
+      // paid the full amount. Why is that card only generating the standard
+      // lease amount instead of the total invoice?"
+      //
+      // Because this used to loop the settled rows and fire one notification
+      // per RENT row, reading that row's own amount. A resident paying one
+      // invoice settles several rows on a single intent — Calvin's was $495.00
+      // rent plus $25.20 electricity — and the card announced $495.00 as though
+      // that were the payment. It named the lease's base rent, never the money.
+      //
+      // Now the event is summed per tenant+unit and reported once, with the
+      // breakdown, so the figure on the card is the figure that arrived.
+      //
+      // The trigger is unchanged: an event containing no rent at all still
+      // sends nothing, because utility-only payments are small and frequent.
+      const eventGroups = new Map<string, { rowIds: string[]; hasRent: boolean }>()
       for (const row of settledRows) {
-        if (row.type !== 'rent') continue
+        try {
+          const keyRow = await query<{ tenant_id: string; unit_id: string }>(
+            `SELECT tenant_id::text, unit_id::text FROM payments WHERE id = $1`, [row.id])
+          const k = keyRow[0]
+          if (!k || !k.tenant_id || !k.unit_id) continue
+          const key = `${k.tenant_id}:${k.unit_id}`
+          const g = eventGroups.get(key) ?? { rowIds: [], hasRent: false }
+          g.rowIds.push(row.id)
+          if (row.type === 'rent') g.hasRent = true
+          eventGroups.set(key, g)
+        } catch (e) {
+          logger.error({ err: e, payment_id: row.id }, 'rent-collected grouping failed')
+        }
+      }
+
+      for (const [, group] of eventGroups) {
+        // No rent in this event — unchanged behaviour, stay quiet.
+        if (!group.hasRent) continue
         try {
           const ctx = await query<{
             amount:         string
+            type:           string
+            notes:          string | null
             landlord_id_pk: string
             property_id:    string
             tenant_name:    string
@@ -542,6 +579,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
             property_name:  string
           }>(
             `SELECT p.amount,
+                    p.type,
+                    p.notes,
                     l.id  AS landlord_id_pk,
                     pr.id AS property_id,
                     tu.first_name || ' ' || tu.last_name AS tenant_name,
@@ -553,11 +592,24 @@ webhooksRouter.post('/stripe', async (req, res) => {
                JOIN landlords  l  ON l.id = p.landlord_id
                JOIN units      un ON un.id = p.unit_id
                JOIN properties pr ON pr.id = un.property_id
-              WHERE p.id = $1`,
-            [row.id],
+              WHERE p.id = ANY($1::uuid[])
+              ORDER BY CASE p.type WHEN 'rent' THEN 0 WHEN 'utility' THEN 1
+                                   WHEN 'fee' THEN 2 ELSE 3 END`,
+            [group.rowIds],
           )
+          if (!ctx.length) continue
           const c = ctx[0]
-          if (!c) continue
+          const total = Math.round(
+            ctx.reduce((sum, r) => sum + parseFloat(r.amount), 0) * 100) / 100
+          // Only itemise when there is actually more than one charge — a plain
+          // rent payment should not grow a one-line "breakdown".
+          const breakdown = ctx.length > 1
+            ? ctx.map((r) => {
+                const note = (r.notes ?? '').split(' — ')[0].trim()
+                const label = r.type === 'rent' ? 'Rent' : (note || r.type)
+                return { label, amount: parseFloat(r.amount) }
+              })
+            : undefined
           const { getPropertyResponsibleParty } = await import('../services/responsibleParty')
           const targets = await getPropertyResponsibleParty(c.property_id)
           if (!targets) continue
@@ -571,13 +623,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
               tenantName:     c.tenant_name,
               unitNumber:     c.unit_number,
               propertyName:   c.property_name,
-              amount:         parseFloat(c.amount),
+              amount:         total,
+              breakdown,
             })
           }
         } catch (e) {
           // Notification failure shouldn't fail the webhook (Stripe would
           // retry the whole thing and re-allocate). Log and continue.
-          logger.error({ err: e, payment_id: row.id }, 'rent-collected-notify failed')
+          logger.error({ err: e, payment_ids: group.rowIds }, 'rent-collected-notify failed')
         }
       }
 
