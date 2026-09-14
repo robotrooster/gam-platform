@@ -1784,6 +1784,22 @@ export function ESignPage() {
     { onSuccess: () => qc.invalidateQueries('esign-documents') }
   )
 
+  // S642: push a reminder by hand. Says WHO it reached — a landlord clicking
+  // this wants to know the lease went to the right person, not that a request
+  // succeeded.
+  const remindMut = useMutation(
+    (id: string) => apiPost(`/esign/documents/${id}/remind`, {}),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toast(d?.name ? `Reminder sent to ${d.name}` : 'Reminder sent')
+        qc.invalidateQueries('esign-documents')
+      },
+      onError: (e: any) =>
+        toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not send that reminder.'),
+    }
+  )
+
   const STATUS_COLORS: Record<string,string> = {
     draft:'badge-muted', sent:'badge-blue', in_progress:'badge-amber',
     completed:'badge-green', voided:'badge-red'
@@ -1978,6 +1994,20 @@ export function ESignPage() {
                               try { await printAuthedFile(d.executedPdfUrl) }
                               catch (err: any) { toast.error(`Could not print that lease (${err?.message || 'unknown error'}).`) }
                             }}><Printer size={12} /></button>
+                        )}
+                        {/* S642 (Nic): "we need to send the lease out to people
+                            in progress. They all timed out over the weekend."
+                            The automatic reminder stops after five — correctly,
+                            since a reminder that never stops is harassment — but
+                            with no way to push, the platform's answer to "they
+                            still haven't signed" was permanent silence. Nine
+                            residents sat unreachable for five days. */}
+                        {can('esign.send') && d.status !== 'completed' && d.status !== 'voided' && (
+                          <button className="btn btn-ghost btn-sm" title="Email a reminder to whoever is holding this up"
+                            disabled={remindMut.isLoading}
+                            onClick={e => { e.stopPropagation(); remindMut.mutate(d.id) }}>
+                            <Send size={12} />
+                          </button>
                         )}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>

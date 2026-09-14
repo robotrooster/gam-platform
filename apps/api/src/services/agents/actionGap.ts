@@ -38,6 +38,10 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S642: pushing a signing reminder ───────────────────────────────────────
+  'esign POST /documents/:id/remind':
+    'emails a reminder to whoever is holding up a lease. Reachable by an agent would defeat the point: the automatic reminder already has a ceiling precisely so nobody is chased forever, and an agent that can push on request is a ceiling with a loophole. This is the landlord deciding one person is worth another nudge, on a screen showing how many have already gone.',
+
   // ── S641: moving a resident between spaces ─────────────────────────────────
   'leases POST /:id/move':
     'moves a household to a different space mid-tenancy. Two reasons it stays typed. Unit numbers REPEAT across parks, and the error here — putting somebody on a space another household occupies — is the one thing the history cannot repair afterwards. And the move only bills correctly if somebody physically reads the meters on BOTH spaces on the move date; the response names those meters, which is a worklist for a person, not a sentence for an agent to acknowledge.',

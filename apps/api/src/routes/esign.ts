@@ -35,7 +35,8 @@ import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../service
 import { suggestUnitPrefill } from '../services/leasePrefill'
 import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
 import { createAdminNotification } from '../services/adminNotifications'
-import { emailSigningRequest, emailSigningCompleted } from '../services/email'
+import { emailSigningRequest, emailSigningCompleted, emailSigningReminder } from '../services/email'
+import { portalUrl } from '../lib/portalUrls'
 import { createNotification } from '../services/notifications'
 import crypto from 'crypto'
 import multer from 'multer'
@@ -3745,6 +3746,77 @@ esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────
 // SEND DOCUMENT
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/esign/documents/:id/remind — push a reminder by hand.
+ *
+ * S642 (Nic): "we need to send the lease out to people in progress. They all
+ * timed out over the weekend. Is it worth adding a button on landlord side to
+ * manually push?"
+ *
+ * Yes, and for a stronger reason than convenience. The automatic reminder has a
+ * CEILING — five, then it stops — and that ceiling is right: a reminder that
+ * arrives forever is not a reminder, and S639 fixed a loop that sent 74 emails
+ * to one person in eight days. But a ceiling with no human override means the
+ * platform's answer to "they still have not signed" is permanent silence. Nine
+ * residents sat unreachable for five days because of exactly that.
+ *
+ * So the ceiling governs the CRON, and a person can always push. Pushing also
+ * resets the counter, because somebody re-engaged by hand deserves the normal
+ * follow-up again rather than staying muted forever.
+ *
+ * It emails the signer whose turn it actually is. A co-tenant waiting on the
+ * primary is not chased ahead of turn — that is how a household gets two
+ * contradictory asks in one day.
+ */
+esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
+  try {
+    const doc = await queryOne<any>(`
+      SELECT d.id, d.title, d.status, d.landlord_id, d.voided_at,
+             u.unit_number, p.name AS property_name,
+             COALESCE(NULLIF(la.business_name,''), lu.first_name||' '||lu.last_name) AS landlord_name
+        FROM lease_documents d
+        LEFT JOIN units u ON u.id = d.unit_id
+        LEFT JOIN properties p ON p.id = u.property_id
+        JOIN landlords la ON la.id = d.landlord_id
+        JOIN users lu ON lu.id = la.user_id
+       WHERE d.id = $1 AND d.landlord_id = ANY($2::uuid[])`,
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'completed') throw new AppError(409, 'Everyone has already signed this.')
+    if (doc.voided_at || doc.status === 'voided') throw new AppError(409, 'This document was voided.')
+
+    // Whose turn it is: invited and not yet acted, lowest order first. A
+    // 'pending' signer has not been reached yet and is waiting on somebody
+    // ahead of them.
+    const signer = await queryOne<any>(`
+      SELECT id, name, email, token, role, reminder_sent_at
+        FROM lease_document_signers
+       WHERE document_id = $1 AND status IN ('sent','viewed')
+       ORDER BY order_index LIMIT 1`, [req.params.id])
+    if (!signer) throw new AppError(409, 'Nobody is waiting to sign right now.')
+
+    // A person clicking twice must not mail twice. Not a ceiling — a debounce.
+    if (signer.reminder_sent_at &&
+        Date.now() - new Date(signer.reminder_sent_at).getTime() < 60 * 60 * 1000) {
+      throw new AppError(429,
+        `${signer.name} was reminded within the last hour. Give them a little time.`)
+    }
+
+    const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
+    const appUrl = signer.role === 'landlord' ? portalUrl('landlord') : portalUrl('tenant')
+    const signingUrl = `${appUrl}/sign/${signer.token || doc.id}`
+
+    await emailSigningReminder(signer.email, signer.name, doc.title, unitLabel,
+      doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
+
+    await query(
+      `UPDATE lease_document_signers
+          SET reminder_count = 0, reminder_sent_at = NOW() WHERE id = $1`, [signer.id])
+
+    res.json({ success: true, data: { sentTo: signer.email, name: signer.name } })
+  } catch (e) { next(e) }
+})
 
 esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
   try {
