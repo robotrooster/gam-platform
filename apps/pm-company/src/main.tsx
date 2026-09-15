@@ -29,6 +29,7 @@ import { RegisterPage } from './pages/RegisterPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { InvitationsPage } from './pages/InvitationsPage'
 import { PropertiesPage } from './pages/PropertiesPage'
+import { OwnersPage } from './pages/OwnersPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
 import { FeePlansPage } from './pages/FeePlansPage'
 import { StaffPage } from './pages/StaffPage'
@@ -79,6 +80,7 @@ appRoot.render(
               <Route path="dashboard"      element={<DashboardPage />} />
               <Route path="properties"      element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
+              <Route path="owners"          element={<OwnersPage />} />
               <Route path="invitations" element={<InvitationsPage />} />
               <Route path="fee-plans"  element={<FeePlansPage />} />
               <Route path="staff"      element={<StaffPage />} />

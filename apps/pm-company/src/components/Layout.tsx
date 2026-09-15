@@ -4,12 +4,13 @@ import { useAuth } from '../context/AuthContext'
 import { TotpNudge } from './TotpNudge'
 import {
   LayoutDashboard, Building2, Users, Banknote,
-  HeartHandshake, Receipt, LogOut, Settings, Sun, Moon,
+  HeartHandshake, Receipt, LogOut, Settings, Sun, Moon, UserSquare,
 } from 'lucide-react'
 
 const NAV: Array<{ to: string; icon: any; label: string; section: string | null }> = [
   { to: '/dashboard',      icon: LayoutDashboard, label: 'Dashboard',         section: 'Overview' },
   { to: '/properties',     icon: Building2,        label: 'Properties',         section: 'Portfolio' },
+  { to: '/owners',         icon: UserSquare,       label: 'Owners',             section: null },
   { to: '/invitations',    icon: HeartHandshake,   label: 'Property Invites',   section: null },
   { to: '/fee-plans',      icon: Receipt,          label: 'Fee Plans',          section: 'Company' },
   { to: '/staff',          icon: Users,            label: 'Staff',              section: null },
