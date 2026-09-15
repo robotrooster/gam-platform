@@ -1317,6 +1317,42 @@ function DepositTrust(){
           <div style={{fontFamily:'var(--font-d)',fontSize:'2.4rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(d.totalPrincipal)}</div>
           <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>{d.heldCount} deposit{d.heldCount===1?'':'s'} · should be in the trust account now</div>
           {d.totalInterestAccrued>0&&<div style={{fontSize:'.74rem',color:'var(--t2)',marginTop:8}}>+ {formatCurrency(d.totalInterestAccrued)} interest owed → {formatCurrency(d.totalLiability)} total liability</div>}
+          {/* ── S642: IS THE MONEY ACTUALLY THERE? ──────────────────────────
+              The figure above is what the LEDGER says GAM owes tenants. Until
+              now nothing compared it to a real bank balance, because no bank
+              was connected. A SHORTFALL is the failure the segregated-trust
+              model exists to prevent, so it is stated in words and in red
+              rather than left as a negative number somebody has to notice.
+              Dormant until COLUMN_API_KEY is set. */}
+          {(()=>{
+            const rec=d.reconciliation
+            if(!rec)return null
+            if(rec.status==='not_configured')return(
+              <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:10}}>
+                Bank not connected — nothing is checking this figure against a real balance yet.
+              </div>)
+            if(rec.status==='unreachable')return(
+              <div style={{fontSize:'.72rem',color:'var(--a)',marginTop:10}}>
+                ⚠ Could not reach Column — {rec.error}
+              </div>)
+            const short=rec.status==='SHORT'
+            return(
+              <div style={{marginTop:10,padding:'10px 14px',borderRadius:8,
+                background:short?'rgba(239,68,68,.10)':'rgba(34,197,94,.08)',
+                border:`1px solid ${short?'rgba(239,68,68,.35)':'rgba(34,197,94,.25)'}`}}>
+                <div style={{fontSize:'.78rem',fontWeight:800,color:short?'var(--r)':'var(--g)'}}>
+                  {short?'SHORTFALL':rec.status==='surplus'?'Surplus in trust':'Trust balanced'}
+                  {rec.environment==='sandbox'&&<span style={{color:'var(--t3)',fontWeight:600}}> · sandbox</span>}
+                </div>
+                <div style={{fontSize:'.74rem',color:'var(--t2)',marginTop:4}}>
+                  Bank holds {formatCurrency(rec.bankBalance)} against {formatCurrency(rec.onBookLiability)} owed
+                  {Math.abs(rec.difference)>=0.01&&<> · {short?'short by':'over by'} {formatCurrency(Math.abs(rec.difference))}</>}
+                </div>
+                {short&&<div style={{fontSize:'.72rem',color:'var(--r)',marginTop:4}}>
+                  GAM owes tenants more than it is holding. This is the condition the trust exists to make impossible.
+                </div>}
+              </div>)
+          })()}
         </div>
         {g>0&&(
           <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>

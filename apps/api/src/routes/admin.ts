@@ -339,11 +339,24 @@ adminRouter.get('/deposit-trust/summary', requireSuperAdmin, async (_req, res, n
        GROUP BY COALESCE(NULLIF(p.state,''),'—')
        ORDER BY principal DESC
     `)
+    // S642 (Nic): "On confirmed Column FBO account… let's take a look at that."
+    //
+    // The liability below has never been checked against a real bank balance —
+    // there was no bank connected. A SHORTFALL (owing tenants more than is
+    // actually held) is the failure the segregated-trust model exists to
+    // prevent, and until now nothing anywhere would have noticed one.
+    //
+    // Read-only and dormant without COLUMN_API_KEY, so this is inert until the
+    // sandbox key is in place and cannot move a cent either way.
+    const { reconcileTrust } = await import('../services/columnBank')
+    const reconciliation = await reconcileTrust(Number(totals.total_liability))
+
     res.json({ success: true, data: {
       heldCount:            totals.held_count,
       totalPrincipal:       Number(totals.total_principal),
       totalInterestAccrued: Number(totals.total_interest),
       totalLiability:       Number(totals.total_liability),
+      reconciliation,
       byState: byState.map((r: any) => ({
         state: r.state, count: r.count,
         principal: Number(r.principal), interest: Number(r.interest),
