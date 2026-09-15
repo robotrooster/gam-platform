@@ -431,11 +431,21 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
 // seeing another is how a work-trade argument starts.
 workTradeRouter.get('/:id/standing', async (req, res, next) => {
   try {
-    await getAgreementForEitherParty(req.params.id, req.user!)
+    const agreement = await getAgreementForEitherParty(req.params.id, req.user!)
+    // S643 (Nic, DIRECTIVE): the tenant's copy of this never carries a dollar
+    // figure next to an hour count — "don't show the tenant any sort of hourly
+    // rate... that's when they decide it's not worth it." The two audiences
+    // still read the SAME HOURS from the same place, which is the point of one
+    // endpoint; what differs is only whether the shortfall is priced. Decided
+    // here rather than on the screen so the tenant portal cannot render it by
+    // accident (see the audience-isolation rule).
+    const audience = canManageLandlordResource(
+      req.user, agreement.landlord_id, ['property_manager']) ? 'landlord' : 'tenant'
     const { loadWorkTradeStanding } = await import('../services/workTradeStanding')
     const standing = await loadWorkTradeStanding(
       req.params.id,
-      typeof req.query.month === 'string' ? req.query.month : undefined)
+      typeof req.query.month === 'string' ? req.query.month : undefined,
+      audience)
     if (!standing) throw new AppError(404, 'Work-trade agreement not found')
     res.json({ success: true, data: standing })
   } catch (e) { next(e) }

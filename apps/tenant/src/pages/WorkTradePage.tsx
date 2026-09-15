@@ -123,13 +123,20 @@ export function WorkTradePage() {
               and come off future months — they never expire.
             </div>
           )}
-          {/* Say what happens if the hours are not worked, before it happens. */}
+          {/* Say what happens if the hours are not worked, before it happens.
+
+              S643 (Nic, DIRECTIVE): this used to name the dollar amount right
+              beside the hour count, which is an hourly rate whether or not it
+              is labelled one — "don't show the tenant any sort of hourly rate,
+              that's when they decide it's not worth it... they forget all the
+              conveniences they get along the way." The warning stays, priced in
+              nothing. The API no longer sends the figure to a tenant either, so
+              this cannot come back by someone re-adding the field. */}
           {standing.carriedHours > 0 && (
             <div style={{ fontSize: '.74rem', color: '#7a8aaa', marginTop: 10, lineHeight: 1.5 }}>
-              If the carried hours aren't worked, that part of the bill
-              ({new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
-                 .format(standing.carriedValue)}) is charged as an ordinary balance —
-              never a late fee, and you can pay it down in any amount.
+              If the carried hours aren't worked, the share of that month's bill
+              they would have covered is charged as an ordinary balance — never a
+              late fee, and you can pay it down in any amount.
             </div>
           )}
         </div>
@@ -189,7 +196,13 @@ export function WorkTradePage() {
           <div style={{ height: '100%', width: `${progress}%`, background: progress >= 100 ? '#1edb7a' : '#c9a227', borderRadius: 4, transition: 'width .3s' }} />
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.72rem', color: '#7a8aaa' }}>
-          <span>≈ {creditPct}% of next month's bill covered</span>
+          {/* S643: said "next month's bill" — the pre-S624 model, where a month's
+              hours credited the FOLLOWING month. Rent is paid forward, so the
+              work that pays for a month happens during it and settles at that
+              month's close. The card above this line already says "This Month's
+              Progress" and counts this month's approved hours, so the caption
+              was contradicting its own heading. */}
+          <span>≈ {creditPct}% of this month's bill covered</span>
           <span>{pending.length > 0 ? `${pending.length} pending approval` : (hoursLeft > 0 ? `${hoursLeft.toFixed(1)} hrs to full` : '✓ Fully covered')}</span>
         </div>
       </div>

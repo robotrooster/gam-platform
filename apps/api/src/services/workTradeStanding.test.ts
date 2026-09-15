@@ -92,3 +92,57 @@ describe('telling the landlord when it cannot be caught up', () => {
     expect(s.carriedValue).toBe(125 + 225)
   })
 })
+
+// S643 (Nic, DIRECTIVE): "Leave the hours for tracking. Don't show the tenant
+// any sort of hourly rate — that's when they decide it's not worth it. They're
+// bad at calculation, some people think they're getting three dollars an hour in
+// rent but they forget all the conveniences they get along the way."
+//
+// A dollar figure printed beside an hour count IS an hourly rate: $125 next to
+// 20 hours is one division away from $6.25/hr. So the tenant's copy carries the
+// hours and no money at all.
+describe('what the tenant is allowed to see', () => {
+  const twenty = () => ({
+    currentMonth: '2026-11-01', currentMonthTarget: 80, currentMonthApplied: 0,
+    carried: [carried({ periodMonth: '2026-10-01', hoursOutstanding: 20, hourRate: 6.25 })],
+    bankedHours: 0,
+  })
+
+  it('never prices a tenant\'s carried hours', () => {
+    const t = workTradeStanding({ ...twenty(), audience: 'tenant' })
+    expect(t.carriedValue).toBeNull()
+    expect(t.summary).not.toMatch(/\$/)
+    // The hours themselves are the whole point of the agreement — they stay.
+    expect(t.summary).toContain('20 hours')
+    expect(t.currentMonthHours).toBe(80)
+    expect(t.carriedHours).toBe(20)
+    expect(t.catchUpHours).toBe(100)
+  })
+
+  it('still prices them for the landlord', () => {
+    const l = workTradeStanding({ ...twenty(), audience: 'landlord' })
+    expect(l.carriedValue).toBe(125)
+    expect(l.summary).toContain('$125.00')
+  })
+
+  it('defaults to the landlord view when nobody says', () => {
+    expect(workTradeStanding(twenty()).carriedValue).toBe(125)
+  })
+
+  it('gives both audiences the same hours', () => {
+    const t = workTradeStanding({ ...twenty(), audience: 'tenant' })
+    const l = workTradeStanding({ ...twenty(), audience: 'landlord' })
+    expect(t.catchUpHours).toBe(l.catchUpHours)
+    expect(t.carriedHours).toBe(l.carriedHours)
+    expect(t.nextBillingMonth).toBe(l.nextBillingMonth)
+  })
+
+  it('says nothing about money to a tenant who is straight', () => {
+    const t = workTradeStanding({
+      currentMonth: '2026-11-01', currentMonthTarget: 80, currentMonthApplied: 80,
+      carried: [], bankedHours: 10, audience: 'tenant',
+    })
+    expect(t.summary).not.toMatch(/\$/)
+    expect(t.carriedValue).toBeNull()
+  })
+})
