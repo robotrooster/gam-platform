@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Fu3iMgTtNRQkeeLGYq0QbHKLjoPNhEycBGCF34g6DQ6cHoYDakzgfzFWrsOIQPt
+\restrict ICvbxi7uSmJWcD8WEGxEEaLokojVdeHufs4gZoMpRHKpOfVOk7t5K3eLtHy2Bpf
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -8519,9 +8519,11 @@ CREATE TABLE public.state_deposit_custody_rules (
     qualifies_with_segregated_account boolean,
     bond_alternative boolean DEFAULT false NOT NULL,
     bond_notes text,
+    blocked_reason text,
     CONSTRAINT sdcr_geography_check CHECK (((geography_test IS NULL) OR (geography_test = ANY (ARRAY['none'::text, 'doing_business'::text, 'physical_office'::text, 'state_chartered'::text, 'n/a'::text])))),
     CONSTRAINT sdcr_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
-    CONSTRAINT sdcr_status_check CHECK ((custody_status = ANY (ARRAY['supported'::text, 'needs_research'::text, 'blocked'::text])))
+    CONSTRAINT sdcr_status_check CHECK ((custody_status = ANY (ARRAY['supported'::text, 'needs_research'::text, 'blocked'::text]))),
+    CONSTRAINT state_deposit_custody_rules_blocked_reason_check CHECK (((blocked_reason IS NULL) OR (blocked_reason = ANY (ARRAY['vehicle_unconfirmed'::text, 'in_state_depository'::text, 'pooling_restricted'::text, 'other'::text]))))
 );
 
 
@@ -8551,6 +8553,13 @@ COMMENT ON COLUMN public.state_deposit_custody_rules.geography_test IS 'S604: ho
 --
 
 COMMENT ON COLUMN public.state_deposit_custody_rules.qualifies_with_segregated_account IS 'S604: would a per-tenant account at an FDIC-insured national bank (Jiko pocket accounts, GAM-controlled disbursement) satisfy this state? NULL = supported already / not applicable.';
+
+
+--
+-- Name: COLUMN state_deposit_custody_rules.blocked_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_deposit_custody_rules.blocked_reason IS 'Why custody_status is blocked. vehicle_unconfirmed = a federally insured FBO would likely satisfy it; in_state_depository = needs a bank in that state; pooling_restricted = a single pooled trust may not be permitted at all. NULL when not blocked.';
 
 
 --
@@ -26497,5 +26506,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Fu3iMgTtNRQkeeLGYq0QbHKLjoPNhEycBGCF34g6DQ6cHoYDakzgfzFWrsOIQPt
+\unrestrict ICvbxi7uSmJWcD8WEGxEEaLokojVdeHufs4gZoMpRHKpOfVOk7t5K3eLtHy2Bpf
 

@@ -23,6 +23,19 @@ const KNOWN_OPEN: Record<string,string[]> = { rv_spot: ['CA','RI'] }
     `SELECT COUNT(*)::text n FROM state_deposit_interest_rates
       WHERE effective_year=2026 AND COALESCE(TRIM(statute_citation),'')=''`)
   if (Number(nocite[0].n) > 0) { console.log(`   ✗ ${nocite[0].n} rule(s) with no citation`); bad++ }
+  // S642: custody reach, so the FBO account's value is a number rather than a
+  // feeling. 'blocked' hid three different obstacles behind one word.
+  const { rows: cust } = await db.query<{ reason: string; n: string; states: string }>(
+    `SELECT COALESCE(blocked_reason, custody_status) AS reason,
+            COUNT(*)::text AS n,
+            string_agg(state_code, ',' ORDER BY state_code) AS states
+       FROM state_deposit_custody_rules GROUP BY 1 ORDER BY 2 DESC`)
+  console.log('\ncustody reach')
+  for (const c of cust) console.log(`  ${c.reason.padEnd(22)} ${String(c.n).padStart(2)}  ${c.states}`)
+  const supported = Number(cust.find(c => c.reason === 'supported')?.n ?? 0)
+  const fbo = Number(cust.find(c => c.reason === 'vehicle_unconfirmed')?.n ?? 0)
+  console.log(`  → ${supported} today; ${supported + fbo} once a federally-insured FBO is confirmed`)
+
   console.log(bad ? `\nFAIL — ${bad} problem(s)` : '\nOK — coverage matches the S642 sweep')
   process.exit(bad ? 1 : 0)
 })().catch(e => { console.error(e); process.exit(1) })

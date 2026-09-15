@@ -179,3 +179,77 @@ describe('S642 a size gate counts what its statute counts', () => {
     expect(rows[0].min_units_basis).toBe('all_units')
   })
 })
+
+// ── S642: 'BLOCKED' WAS HIDING THREE DIFFERENT OBSTACLES ────────────────────
+//
+// Nic: "You say 21 states are custody blocked, but I thought… 45 to 47 states
+// was okay for us to hold security deposits, whether it's in a for-benefit-of
+// account, FBO account through Column."
+//
+// He remembered right. All 21 were researched before the custody vehicle was
+// settled, so 'blocked' has meant "we have not confirmed our vehicle satisfies
+// this" — not "impossible" — and the code fail-closes on anything that is not
+// 'supported'. Three obstacles, one word, very different prospects.
+describe('S642 a blocked state says WHY', () => {
+  // Seeded, not read from the live table: this data is migration-seeded and the
+  // harness builds from a schema-only dump, so an assertion about the real 50
+  // states would pass VACUOUSLY on an empty table — which is worse than failing,
+  // because it reads as coverage. scripts/depositRuleCoverage.ts checks the
+  // actual classification against the production database; these check that the
+  // shape cannot be violated.
+  const seed = (code: string, status: string, reason: string | null, inState = false) =>
+    db.query(
+      `INSERT INTO state_deposit_custody_rules
+         (state_code, custody_status, blocked_reason, requires_in_state_depository)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (state_code) DO UPDATE
+         SET custody_status = EXCLUDED.custody_status,
+             blocked_reason = EXCLUDED.blocked_reason,
+             requires_in_state_depository = EXCLUDED.requires_in_state_depository`,
+      [code, status, reason, inState])
+
+  beforeEach(async () => {
+    await db.query(`DELETE FROM state_deposit_custody_rules WHERE state_code LIKE 'Z%'`)
+  })
+
+  it('the three obstacles are distinguishable — they have very different prospects', async () => {
+    // One FBO account solves ZA. ZB needs a banking relationship in that state.
+    // ZC may not permit a pooled trust at all. Collapsing them into "blocked"
+    // is what made 21 states look impossible when 8 were merely unconfirmed.
+    await seed('ZA', 'blocked', 'vehicle_unconfirmed')
+    await seed('ZB', 'blocked', 'in_state_depository', true)
+    await seed('ZC', 'blocked', 'pooling_restricted')
+    const { rows } = await db.query<any>(
+      `SELECT blocked_reason, COUNT(*)::int AS n FROM state_deposit_custody_rules
+        WHERE state_code LIKE 'Z%' GROUP BY 1`)
+    const by = Object.fromEntries(rows.map((r: any) => [r.blocked_reason, r.n]))
+    expect(by.vehicle_unconfirmed).toBe(1)
+    expect(by.in_state_depository).toBe(1)
+    expect(by.pooling_restricted).toBe(1)
+  })
+
+  it('refuses a reason nobody has defined', async () => {
+    // A typo here would quietly drop a state out of every reach calculation.
+    await expect(seed('ZD', 'blocked', 'probably_fine')).rejects.toThrow()
+  })
+
+  it('a reason never promotes a state to supported', async () => {
+    // Labelling must never be mistaken for clearance: flipping a state to
+    // 'supported' sends real tenant money into GAM custody on a legal reading.
+    await seed('ZA', 'blocked', 'vehicle_unconfirmed')
+    const { rows } = await db.query<any>(
+      `SELECT custody_status FROM state_deposit_custody_rules WHERE state_code='ZA'`)
+    expect(rows[0].custody_status).toBe('blocked')
+  })
+
+  it('the escrow decision still fail-closes on anything not supported', async () => {
+    // leaseFeesSync resolves held_by from this table and treats ONLY 'supported'
+    // as go. A reason column must not become a second, softer yes.
+    await seed('ZA', 'blocked', 'vehicle_unconfirmed')
+    const { rows } = await db.query<any>(
+      `SELECT CASE WHEN COALESCE(custody_status,'needs_research') <> 'supported'
+                   THEN 'landlord' ELSE 'gam_escrow' END AS held_by
+         FROM state_deposit_custody_rules WHERE state_code='ZA'`)
+    expect(rows[0].held_by).toBe('landlord')
+  })
+})
