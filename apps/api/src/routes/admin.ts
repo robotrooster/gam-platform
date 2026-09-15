@@ -99,6 +99,35 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
             AND ubl.stripe_transfer_id IS NULL
           WHERE p.platform_held = true
             AND p.status = 'settled') AS held_for_landlords,
+        -- ── S642 (Nic): THE FLEXPAY FLOAT TARGET, FROM REAL LEASES ──────────
+        --
+        -- "Our goal is 30% adoption, so our target should be 30% of total
+        -- active leases… plus 20% on utilities. Then we'll know if demand
+        -- actually gets to 30% that we can fund it."
+        --
+        -- Computed, never stored: a stored target goes stale the day a unit is
+        -- leased, which is how the old target_balance ($12,600) ended up
+        -- disagreeing with the 3%-of-bankroll figure the card actually showed.
+        --
+        -- ONE MONTH's rent, not a cumulative pile. S642 correction (Nic):
+        -- flexpay_pull_day is when GAM pulls BACK from the tenant, not when it
+        -- funds. GAM funds by the grace deadline — the 5th in Arizona, initiated
+        -- by the 3rd — because "the tenant was going to be late anyway, so as
+        -- long as we aren't late for the tenant they have no issue". Repayment
+        -- lands the 15th-20th, so the money is out 10-15 days, not 30.
+        --
+        -- That shortens EXPOSURE, not the target. Every tenancy shares the
+        -- cycle, so the float is fully deployed the 5th to the 20th and idle
+        -- the rest — it recycles month to month, not within a month. Peak
+        -- capital is still one month of enrolled rent.
+        --
+        -- The 20% utility uplift is PEAK protection, not an average: measured
+        -- September was 12.5% of rent, but that is a mild Arizona month and the
+        -- float has to survive a July of air conditioning. Revisit after a
+        -- summer of real data.
+        (SELECT COALESCE(SUM(rent_amount), 0) * 0.30 * 1.20
+           FROM units WHERE status IN ('active','delinquent','suspended'))
+          AS flexpay_float_target,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
         (SELECT COALESCE(balance,0) FROM float_account_state LIMIT 1) AS float_balance,
         -- FlexPay float BANKROLL NEEDED: total monthly rent of the distinct

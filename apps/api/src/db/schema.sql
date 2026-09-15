@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ICvbxi7uSmJWcD8WEGxEEaLokojVdeHufs4gZoMpRHKpOfVOk7t5K3eLtHy2Bpf
+\restrict 0CaOc9rx3ItxrviyROQ3EddCFGxghFhjp3Hs94kpeUvupJ5e63nDysWoqZ4aoJy
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4238,6 +4238,13 @@ CREATE TABLE public.float_account_state (
 
 
 --
+-- Name: TABLE float_account_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.float_account_state IS 'GAM''s FlexPay float. balance is REAL money available to advance (0 until funded from reinvested revenue + tips). Superseded model figures, seeded 2026-05-15 and zeroed S642: balance 26750, seed_capital 25000, apy 0.045, monthly_interest 100.';
+
+
+--
 -- Name: generated_routes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7993,6 +8000,13 @@ CREATE TABLE public.reserve_fund_state (
     updated_at timestamp with time zone DEFAULT now(),
     CONSTRAINT reserve_fund_state_phase_check CHECK ((phase = ANY (ARRAY[1, 2, 3])))
 );
+
+
+--
+-- Name: TABLE reserve_fund_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.reserve_fund_state IS 'GAM''s FlexPay default reserve. balance is REAL money accumulated (0 until the float is funded from reinvested revenue — never outside capital). The target is COMPUTED, not stored: 30% of occupied-unit rent + 20% for utilities. Superseded model figures, seeded 2026-05-15 and zeroed S642: balance 4200, target 12600, monthly_contribution 796, reserve_rate 1.0.';
 
 
 --
@@ -26506,5 +26520,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ICvbxi7uSmJWcD8WEGxEEaLokojVdeHufs4gZoMpRHKpOfVOk7t5K3eLtHy2Bpf
+\unrestrict 0CaOc9rx3ItxrviyROQ3EddCFGxghFhjp3Hs94kpeUvupJ5e63nDysWoqZ4aoJy
 

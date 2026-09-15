@@ -1024,11 +1024,35 @@ function Overview(){
   // inquiries) — the money GAM would actually front. No phases; scales with
   // enrollment.
   const floatBankroll=stats?.flexpayBankroll||0
-  // Default reserve target = flat 3% default rate applied to the FlexPay FLOAT
-  // (the money at risk), NOT total platform rent. Covers FlexPay defaults.
-  const DEFAULT_RESERVE_RATE=0.03
-  const reserveTarget=floatBankroll*DEFAULT_RESERVE_RATE
-  const reservePct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(reserveTarget,1))*100,100):0
+  // ── S642 (Nic): TWO DIFFERENT RISKS, TWO DIFFERENT TARGETS ──────────────
+  //
+  // The FLOAT is working capital GAM advances and gets back — Nic's formula:
+  // "30% of all base lease totals plus 20% on utilities", from live leases.
+  // ONE month's worth, because the float revolves: advanced on the 1st,
+  // recovered through the month, advanced again from what came back.
+  //
+  // The DEFAULT RESERVE is money GAM does NOT get back — tenants who never
+  // repay. Conflating the two would size a default reserve as if every advance
+  // defaulted.
+  //
+  // 10% of enrolled dollars (Nic: "5%, 10% of enrolled dollars for an extra
+  // reserve buffer"). The number is NOT an expected-loss estimate — nobody has
+  // FlexPay history yet. It buys DECISION TIME, which is what Nic actually
+  // described wanting: "we should know about the last week of the month how
+  // many more people we can approve for the next month." At 3% a single bad
+  // month empties it and enrolment stops that day; at 10%, against a ~3% real
+  // loss rate, there is roughly a quarter's cushion — enough to see a trend,
+  // tighten underwriting and taper deliberately rather than telling people who
+  // were just approved no. Revisit once real loss data exists.
+  //
+  // Both previously keyed off `flexpayBankroll`, which is $0 and always has
+  // been: there has never been a single flexpay_inquiry. So the card divided a
+  // seeded $4,200 balance by nothing and reported full coverage of a target
+  // that did not exist.
+  const DEFAULT_RESERVE_RATE=0.10
+  const floatTarget=stats?.flexpayFloatTarget||0
+  const reserveTarget=floatTarget*DEFAULT_RESERVE_RATE
+  const reservePct=reserveTarget>0?Math.min(((stats?.reserveBalance||0)/reserveTarget)*100,100):0
 
   // S609: this WAS a hardcoded array — five invented months plus one real value
   // labelled with a month it wasn't, drawing a tidy rising line whatever the
@@ -1101,8 +1125,8 @@ function Overview(){
 
       {/* ── Row 3: Super admin financial ── */}
       {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target (3% of FlexPay float)</div></div>
-        <div className="kpi"><div className="kl">FlexPay Float Bankroll</div><div className="kv b">{formatCurrency(floatBankroll)}</div><div className="ks">rent of income-verified tenants who requested FlexPay</div></div>
+        <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target · 10% buffer on enrolled dollars</div></div>
+        <div className="kpi"><div className="kl">FlexPay Float Target</div><div className="kv b">{formatCurrency(floatTarget)}</div><div className="ks">30% adoption + 20% utilities, from live leases</div></div>
         {/* S642 (Nic): "We have a KPI card on the admin portal for unpaid
             invoices. That seems like a landlord specific thing. We should
             replace that with a KPI card for something beneficial to this view."
@@ -2155,10 +2179,12 @@ function Reserve(){
   // Matches the Overview reserve/float model (S566): reserve target = 3% of the
   // FlexPay FLOAT (money at risk), NOT total platform rent; bankroll = rent of
   // income-verified FlexPay tenants; no phases; float yield waits for ODFI.
-  const floatBankroll=stats?.flexpayBankroll||0
-  const DEFAULT_RESERVE_RATE=0.03
+  // S642: same two-target model as the Overview, read from the same server
+  // figure, so the two pages cannot drift.
+  const floatBankroll=stats?.flexpayFloatTarget||0
+  const DEFAULT_RESERVE_RATE=0.10
   const target=floatBankroll*DEFAULT_RESERVE_RATE
-  const pct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(target,1))*100,100):0
+  const pct=target>0?Math.min(((stats?.reserveBalance||0)/target)*100,100):0
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">Scales with FlexPay enrollment — $0 until the first income-verified enrollment</p></div></div>
