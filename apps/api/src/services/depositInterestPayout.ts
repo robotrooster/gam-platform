@@ -169,3 +169,112 @@ export async function outstandingDepositInterest(landlordIds?: string[] | null) 
       ORDER BY owed DESC`,
     [landlordIds ?? null])
 }
+
+// ── S642: DEPOSITS THE LANDLORD HOLDS ───────────────────────────────────────
+//
+// Nic: "We're only paying interest on the deposit when we hold it, right?
+// Otherwise, it's just a flag for the landlord. Hey, your tenant is owed this
+// much interest. Recommend adding a credit to their bill."
+//
+// Right on both counts. Accrual is scoped to held_by = 'gam_escrow' — GAM does
+// not pay out of its own pocket on money it never touched. But until now the
+// landlord got NOTHING either: no accrual, no flag, no warning that their
+// state owes their tenant money. Twenty-one states are custody-BLOCKED, so the
+// landlord necessarily holds the deposit there — including Illinois, whose
+// penalty for willful non-payment is the deposit amount again plus costs and
+// attorney fees.
+//
+// ADVISORY, AND COMPUTED ON READ — never written as an accrual row. An accrual
+// row is a payable: the nightly sweep would find it and GAM would credit the
+// tenant out of its own funds for a deposit sitting in the landlord's bank.
+// That is the one mistake this whole area cannot afford, so the estimate has no
+// path to becoming a payment.
+//
+// It is an ESTIMATE and says so. GAM cannot know what the landlord has already
+// paid the tenant directly, so this is interest accrued since the deposit was
+// funded, not a balance due. The landlord judges it against their own records.
+export interface LandlordHeldAdvisory {
+  landlordId:    string
+  propertyName:  string
+  unitNumber:    string
+  tenantName:    string
+  tenantId:      string
+  leaseId:       string
+  stateCode:     string
+  principal:     number
+  ratePct:       number
+  rateBasis:     string | null
+  citation:      string | null
+  daysHeld:      number
+  estimated:     number
+}
+
+export async function landlordHeldInterestAdvisory(
+  landlordIds?: string[] | null,
+): Promise<LandlordHeldAdvisory[]> {
+  const rows = await query<any>(
+    `SELECT sd.id, sd.collected_amount::float AS principal, sd.tenant_id, sd.lease_id,
+            l.landlord_id, p.state AS state_code, p.name AS property_name,
+            u.unit_number, u.unit_type, u.rent_amount::float AS monthly_rent,
+            TRIM(CONCAT_WS(' ', tu.first_name, tu.last_name)) AS tenant_name,
+            -- Same definition of "funded" the accrual engine uses, so the
+            -- advisory and the real thing cannot disagree about when the clock
+            -- started: the first settled DEPOSIT payment on the lease, falling
+            -- back to when the row was created.
+            GREATEST(0, EXTRACT(DAY FROM (NOW() - COALESCE(
+              (SELECT MIN(pmt.due_date::timestamp)
+                 FROM payments pmt
+                WHERE pmt.entry_description = 'DEPOSIT'
+                  AND pmt.lease_id = sd.lease_id
+                  AND pmt.status = 'settled'),
+              sd.created_at)))::int) AS days_held
+       FROM security_deposits sd
+       JOIN leases l     ON l.id = sd.lease_id
+       JOIN units u      ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
+       JOIN tenants t    ON t.id = sd.tenant_id
+       JOIN users tu     ON tu.id = t.user_id
+      WHERE sd.held_by <> 'gam_escrow'
+        AND sd.status IN ('funded','partial','claimed')
+        AND sd.collected_amount > 0
+        AND sd.disbursed_at IS NULL
+        AND ($1::uuid[] IS NULL OR l.landlord_id = ANY($1::uuid[]))`,
+    // NOT swallowed. An error here would render as "no interest owed", which
+    // is precisely the wrong thing to tell a landlord who is accruing an
+    // obligation. Let it surface.
+    [landlordIds ?? null])
+
+  const out: LandlordHeldAdvisory[] = []
+  const year = new Date().getUTCFullYear()
+  for (const r of rows) {
+    try {
+      const { resolveRateForLandlord, principalSubjectToInterest } = await import('./depositInterest')
+      const rate = await resolveRateForLandlord(r.landlord_id, r.state_code, year, r.unit_type)
+      // No rule, or a rule that owes nothing — nothing to tell them about.
+      if (!rate || Number(rate.annual_rate_pct) <= 0) continue
+      const base = principalSubjectToInterest(rate, r.principal, r.monthly_rent ?? null)
+      if (base <= 0) continue
+      const estimated = Math.round(
+        base * (Number(rate.annual_rate_pct) / 100) * (r.days_held / 365) * 100) / 100
+      if (estimated < 0.01) continue
+      out.push({
+        landlordId:   r.landlord_id,
+        propertyName: r.property_name,
+        unitNumber:   r.unit_number,
+        tenantName:   r.tenant_name,
+        tenantId:     r.tenant_id,
+        leaseId:      r.lease_id,
+        stateCode:    r.state_code,
+        principal:    r.principal,
+        ratePct:      Number(rate.annual_rate_pct),
+        rateBasis:    rate.rate_basis ?? null,
+        citation:     (rate as any).statute_citation ?? null,
+        daysHeld:     r.days_held,
+        estimated,
+      })
+    } catch (e) {
+      logger.error({ err: e, deposit: r.id }, '[deposit-interest] advisory failed for one deposit')
+    }
+  }
+  return out.sort((a, b) => b.estimated - a.estimated)
+}

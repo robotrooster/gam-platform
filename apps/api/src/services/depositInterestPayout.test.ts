@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
-import { payAnnualDepositInterest, outstandingDepositInterest } from './depositInterestPayout'
+import { payAnnualDepositInterest, outstandingDepositInterest, landlordHeldInterestAdvisory } from './depositInterestPayout'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -172,5 +172,107 @@ describe('S642 a paid credit is explicable from both sides', () => {
     expect(rows).toHaveLength(1)
     expect(Number(rows[0].owed)).toBeCloseTo(12, 2)
     expect(rows.every((r: any) => r.landlord_id !== theirs.landlordId)).toBe(true)
+  })
+})
+
+// ── S642: A DEPOSIT THE LANDLORD HOLDS ──────────────────────────────────────
+//
+// Nic: "We're only paying interest on the deposit when we hold it, right?
+// Otherwise, it's just a flag for the landlord. Hey, your tenant is owed this
+// much interest. Recommend adding a credit to their bill."
+//
+// Two things must both hold, and the second is the dangerous one: GAM must TELL
+// the landlord, and GAM must never PAY on money it does not custody. An advisory
+// that could reach the nightly sweep would have GAM crediting a tenant out of
+// its own funds for a deposit sitting in someone else's bank account.
+describe('S642 landlord-held deposits are flagged, never paid', () => {
+  /**
+   * The rates are seeded by MIGRATION and this harness builds the database from
+   * a schema-only dump, so no reference data exists here — the advisory would
+   * find no rule and return nothing for a reason that has nothing to do with
+   * the code under test. Seed the two Arizona rules the cases below rely on.
+   */
+  async function seedAzRules() {
+    const year = new Date().getUTCFullYear()
+    await db.query(`DELETE FROM state_deposit_interest_rates WHERE state_code='AZ'`)
+    await db.query(
+      `INSERT INTO state_deposit_interest_rates
+         (state_code, effective_year, annual_rate_pct, statute_citation, notes,
+          unit_types, act_key, rate_basis)
+       VALUES ('AZ',$1,5,'A.R.S. § 33-1431(B)','mobile home park',
+               ARRAY['mobile_home'],'mobile_home_park','fixed'),
+              ('AZ',$1,0,'A.R.S. § 33-2121','RV long-term spaces owe nothing',
+               ARRAY['rv_spot'],'rv_long_term','none')`,
+      [year])
+  }
+
+  async function seedLandlordHeld(stateCode: string, unitType: string, principal: number) {
+    await seedAzRules()
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      const { landlordId, userId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, {
+        landlordId, ownerUserId: userId, managedByUserId: userId, state: stateCode })
+      const unitId = await seedUnit(c, { propertyId, landlordId, unitType })
+      const leaseId = await seedLease(c, { unitId, landlordId, status: 'active' })
+      const u = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name)
+         VALUES ('lh-' || gen_random_uuid() || '@t.dev','x','tenant','Lan','Held') RETURNING id`)
+      const t = await c.query<{ id: string }>(
+        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
+      await c.query(
+        `INSERT INTO security_deposits
+           (tenant_id, lease_id, unit_id, total_amount, collected_amount,
+            status, held_by, portability_status, custody_fee_active, created_at)
+         VALUES ($1,$2,$3,$4,$4,'funded','landlord','none',FALSE, NOW() - INTERVAL '365 days')`,
+        [t.rows[0].id, leaseId, unitId, principal])
+      await c.query('COMMIT')
+      return { landlordId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('flags an Arizona mobile-home deposit the landlord holds, at the statutory 5%', async () => {
+    const { landlordId } = await seedLandlordHeld('AZ', 'mobile_home', 1000)
+    const rows = await landlordHeldInterestAdvisory([landlordId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].ratePct).toBe(5)
+    // A year at 5% on $1,000.
+    expect(rows[0].estimated).toBeCloseTo(50, 0)
+  })
+
+  it('NEVER pays it — the sweep does not touch money GAM does not hold', async () => {
+    const { landlordId } = await seedLandlordHeld('AZ', 'mobile_home', 1000)
+    const r = await payAnnualDepositInterest()
+    expect(r.paid).toBe(0)
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM tenant_credits WHERE landlord_id=$1`, [landlordId])
+    expect(rows[0].n).toBe(0)
+  })
+
+  it('writes no accrual row, so it has no path into the payout sweep', async () => {
+    // The whole reason the advisory is computed on READ. An accrual row IS a
+    // payable; creating one here would make GAM liable for someone else's money.
+    const { landlordId } = await seedLandlordHeld('AZ', 'mobile_home', 1000)
+    await landlordHeldInterestAdvisory([landlordId])
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM security_deposit_interest_accruals a
+         JOIN leases l ON l.id = a.lease_id WHERE l.landlord_id = $1`, [landlordId])
+    expect(rows[0].n).toBe(0)
+  })
+
+  it('stays quiet where the state owes nothing — an RV space in Arizona', async () => {
+    // A.R.S. § 33-2121: RV long-term spaces owe no interest. Flagging one would
+    // be telling a landlord to hand over money their state never asked for.
+    const { landlordId } = await seedLandlordHeld('AZ', 'rv_spot', 1000)
+    expect(await landlordHeldInterestAdvisory([landlordId])).toHaveLength(0)
+  })
+
+  it('one landlord cannot see another’s advisory', async () => {
+    const mine   = await seedLandlordHeld('AZ', 'mobile_home', 1000)
+    await seedLandlordHeld('AZ', 'mobile_home', 9000)
+    const rows = await landlordHeldInterestAdvisory([mine.landlordId])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].landlordId).toBe(mine.landlordId)
   })
 })

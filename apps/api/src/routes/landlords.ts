@@ -1452,8 +1452,25 @@ landlordsRouter.post('/me/entities', requireLandlord, async (req, res, next) => 
 landlordsRouter.get('/me/deposit-interest', requireLandlord, async (req, res, next) => {
   try {
     const scopeIds = landlordScopeIds(req.user!)
-    const { outstandingDepositInterest } = await import('../services/depositInterestPayout')
+    const { outstandingDepositInterest, landlordHeldInterestAdvisory } =
+      await import('../services/depositInterestPayout')
     const outstanding = await outstandingDepositInterest(scopeIds)
+
+    // S642 (Nic): "We're only paying interest on the deposit when we hold it,
+    // right? Otherwise, it's just a flag for the landlord. Hey, your tenant is
+    // owed this much interest. Recommend adding a credit to their bill."
+    //
+    // Exactly so. Accrual is scoped to held_by='gam_escrow' — GAM does not pay
+    // out of its own funds on money it never touched. Twenty-one states are
+    // custody-BLOCKED, so the landlord necessarily holds the deposit there, and
+    // until now they were told nothing at all. Illinois is one of them, and its
+    // penalty for willful non-payment is the deposit amount AGAIN plus costs
+    // and attorney fees.
+    //
+    // An ESTIMATE, never a payable: GAM cannot know what the landlord has
+    // already paid the tenant directly, and the figure is deliberately computed
+    // on read so it has no path into the nightly payout sweep.
+    const landlordHeld = await landlordHeldInterestAdvisory(scopeIds)
 
     // What has already gone out, so the credits on tenant balances are
     // traceable to their cause.
@@ -1480,9 +1497,12 @@ landlordsRouter.get('/me/deposit-interest', requireLandlord, async (req, res, ne
       data: {
         outstanding,
         paid,
+        landlordHeld,
         totals: {
           owed: Math.round(outstanding.reduce((s: number, r: any) => s + Number(r.owed), 0) * 100) / 100,
           paid: Math.round(paid.reduce((s: number, r: any) => s + Number(r.amount), 0) * 100) / 100,
+          landlordHeldEstimate:
+            Math.round(landlordHeld.reduce((s, r) => s + r.estimated, 0) * 100) / 100,
         },
       },
     })
