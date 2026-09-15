@@ -952,9 +952,36 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
     const prepaidRemaining = Math.round(
       credits.reduce((sum: number, c: any) => sum + c.amount_remaining, 0) * 100) / 100
 
+    // ── S642: CREDITS THAT ARE NOT PAY-AHEAD ──────────────────────────────
+    //
+    // This card read lease_prepaid_credits ONLY — money the tenant paid ahead.
+    // Statutory deposit interest is now credited to tenant_credits instead, and
+    // that table already reduces what they owe (see the balance query above).
+    // So the balance would drop and the card would explain nothing: money
+    // appearing from nowhere, which reads as a bug to the one person who can
+    // least afford to guess.
+    //
+    // Returned SEPARATELY rather than folded into prepaidRemaining, because
+    // "you paid ahead" and "your state owes you interest on your deposit" are
+    // different sentences and the second one is worth reading.
+    const otherCredits = await query<any>(
+      `SELECT category,
+              SUM(amount_remaining)::float AS remaining
+         FROM tenant_credits
+        WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
+        GROUP BY category`,
+      [tenantId])
+    const depositInterestCredit = Math.round(
+      (otherCredits.find((c: any) => c.category === 'deposit_interest')?.remaining ?? 0) * 100) / 100
+    const otherCreditTotal = Math.round(
+      otherCredits.filter((c: any) => c.category !== 'deposit_interest')
+        .reduce((s: number, c: any) => s + Number(c.remaining), 0) * 100) / 100
+
     res.json({ success: true, data: {
       remittances: remits.map((r: any) => ({ ...r, lines: linesByRemit.get(r.id) ?? [] })),
       prepaidRemaining,
+      depositInterestCredit,
+      otherCreditTotal,
     } })
   } catch (e) { next(e) }
 })

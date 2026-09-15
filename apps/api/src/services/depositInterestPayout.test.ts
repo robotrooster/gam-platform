@@ -130,3 +130,47 @@ describe('S642 statutory deposit interest is actually handed over', () => {
     expect(await outstandingDepositInterest([f.landlordId])).toHaveLength(0)
   })
 })
+
+// ── S642: THE MONEY HAS TO BE VISIBLE TO BOTH SIDES ─────────────────────────
+//
+// Paying statutory interest as a credit creates a new way to be confusing: a
+// tenant's balance drops and a landlord sees a credit appear, with nothing
+// anywhere saying where it came from. Money moving on someone's ledger without
+// explanation reads as a bug — to the tenant especially, who can least afford
+// to guess.
+describe('S642 a paid credit is explicable from both sides', () => {
+  it('the tenant credit is categorised so it can be named, not lumped in "other"', async () => {
+    const f = await seedAccruals({ months: 12, perMonth: 1.5, ageMonths: 12 })
+    await payAnnualDepositInterest()
+    const { rows } = await db.query<any>(
+      `SELECT category, reason, amount_remaining::float AS remaining
+         FROM tenant_credits WHERE tenant_id=$1`, [f.tenantId])
+    expect(rows[0].category).toBe('deposit_interest')
+    // The reason is what a resident reads when they ask what this is.
+    expect(rows[0].reason).toMatch(/interest on your security deposit/i)
+    // And it is spendable — it reduces what they owe, it is not a note.
+    expect(rows[0].remaining).toBeCloseTo(18, 2)
+  })
+
+  it('the landlord can see what is still owed AND what has gone out', async () => {
+    const f = await seedAccruals({ months: 12, perMonth: 2, ageMonths: 12 })
+    expect(await outstandingDepositInterest([f.landlordId])).toHaveLength(1)
+    await payAnnualDepositInterest()
+    // Owed is now nil...
+    expect(await outstandingDepositInterest([f.landlordId])).toHaveLength(0)
+    // ...and the credit is on the books, attributable to this landlord.
+    const { rows } = await db.query<any>(
+      `SELECT COUNT(*)::int AS n FROM tenant_credits
+        WHERE landlord_id=$1 AND category='deposit_interest'`, [f.landlordId])
+    expect(rows[0].n).toBe(1)
+  })
+
+  it('one landlord cannot see another landlord’s obligation', async () => {
+    const mine   = await seedAccruals({ months: 12, perMonth: 1, ageMonths: 12 })
+    const theirs = await seedAccruals({ months: 12, perMonth: 9, ageMonths: 12 })
+    const rows = await outstandingDepositInterest([mine.landlordId])
+    expect(rows).toHaveLength(1)
+    expect(Number(rows[0].owed)).toBeCloseTo(12, 2)
+    expect(rows.every((r: any) => r.landlord_id !== theirs.landlordId)).toBe(true)
+  })
+})

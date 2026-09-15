@@ -1433,6 +1433,62 @@ landlordsRouter.post('/me/entities', requireLandlord, async (req, res, next) => 
   } finally { client.release() }
 })
 
+// ── GET /api/landlords/me/deposit-interest ────────────────────────────────
+//
+// S642 (Nic): "Calculate interest, have it be paid out as credit where
+// applicable."
+//
+// Now that statutory deposit interest is actually PAID — as a credit on the
+// tenant's balance — a landlord would otherwise watch credits appear on their
+// residents' accounts with nothing anywhere saying where they came from. Money
+// moving on someone's ledger with no explanation is how a landlord decides the
+// platform is broken.
+//
+// Shows both sides: what is still owed and accruing, and what has already been
+// handed over. The obligation is statutory, so this is informational — there is
+// nothing for the landlord to approve, and deliberately no control to withhold
+// it (see gam-never-gate-on-legality: GAM accommodates, it does not adjudicate,
+// but it also does not let a landlord switch off a state's own rule).
+landlordsRouter.get('/me/deposit-interest', requireLandlord, async (req, res, next) => {
+  try {
+    const scopeIds = landlordScopeIds(req.user!)
+    const { outstandingDepositInterest } = await import('../services/depositInterestPayout')
+    const outstanding = await outstandingDepositInterest(scopeIds)
+
+    // What has already gone out, so the credits on tenant balances are
+    // traceable to their cause.
+    const paid = await query<any>(`
+      SELECT tc.id,
+             tc.amount_original::float AS amount,
+             tc.created_at,
+             p.name  AS property_name,
+             u.unit_number,
+             TRIM(CONCAT_WS(' ', tu.first_name, tu.last_name)) AS tenant_name
+        FROM tenant_credits tc
+        JOIN tenants t  ON t.id = tc.tenant_id
+        JOIN users   tu ON tu.id = t.user_id
+        LEFT JOIN leases l ON l.id = tc.lease_id
+        LEFT JOIN units u  ON u.id = l.unit_id
+        LEFT JOIN properties p ON p.id = u.property_id
+       WHERE tc.landlord_id = ANY($1)
+         AND tc.category = 'deposit_interest'
+       ORDER BY tc.created_at DESC
+       LIMIT 50`, [scopeIds])
+
+    res.json({
+      success: true,
+      data: {
+        outstanding,
+        paid,
+        totals: {
+          owed: Math.round(outstanding.reduce((s: number, r: any) => s + Number(r.owed), 0) * 100) / 100,
+          paid: Math.round(paid.reduce((s: number, r: any) => s + Number(r.amount), 0) * 100) / 100,
+        },
+      },
+    })
+  } catch (e) { next(e) }
+})
+
 landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
   try {
     // S620 (Nic): "nobody's seeing a notification for setting up a bank account

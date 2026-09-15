@@ -175,7 +175,13 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
   const { data: methods = [], isLoading: methodsLoading } = useTenantPaymentMethods()
-  const { data: remitData } = useQuery<{ remittances: Remittance[]; prepaidRemaining: number }>(
+  const { data: remitData } = useQuery<{
+    remittances: Remittance[]
+    prepaidRemaining: number
+    /** S642: statutory deposit interest credited to the account. */
+    depositInterestCredit?: number
+    otherCreditTotal?: number
+  }>(
     'remittances',
     () => apiGet('/payments/remittances'),
   )
@@ -337,20 +343,51 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           outstanding credit they have. If it's ten thousand dollars in
           prepayments, it should show that they have ten thousand dollars in
           credit." Top of the page, not tucked into a history card. */}
-      {(remitData?.prepaidRemaining ?? 0) > 0 && (
+      {(() => {
+        const prepaid  = remitData?.prepaidRemaining ?? 0
+        const interest = remitData?.depositInterestCredit ?? 0
+        const other    = remitData?.otherCreditTotal ?? 0
+        const total    = Math.round((prepaid + interest + other) * 100) / 100
+        if (total <= 0) return null
+        return (
         <div className="card" style={{ padding: 16, marginTop: 16, borderColor: 'var(--green)' }}>
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
             Account credit
           </div>
           <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--green)' }}>
-            {formatCurrency(remitData!.prepaidRemaining)}
+            {formatCurrency(total)}
           </div>
-          <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4, lineHeight: 1.5 }}>
-            Money you&apos;ve paid ahead. It comes off each bill automatically as it arrives — you don&apos;t
-            need to do anything. Anything still unused comes back to you when you move out.
+          {/* S642: this card counted PAY-AHEAD money only, while the balance
+              above it already netted off every credit. So statutory deposit
+              interest would have quietly reduced what they owe with nothing
+              here saying why — money appearing from nowhere, which reads as a
+              mistake to the person least able to check it. Each kind is named,
+              because "you paid ahead" and "your state owes you interest on your
+              deposit" are different sentences. */}
+          {prepaid > 0 && (
+            <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+              <strong style={{ color: 'var(--t1)' }}>{formatCurrency(prepaid)}</strong> you&apos;ve paid ahead.
+              Anything still unused comes back to you when you move out.
+            </div>
+          )}
+          {interest > 0 && (
+            <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+              <strong style={{ color: 'var(--t1)' }}>{formatCurrency(interest)}</strong> interest your state
+              requires on your security deposit. It&apos;s yours — we credit it to your account each year
+              rather than making you ask.
+            </div>
+          )}
+          {other > 0 && (
+            <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.5 }}>
+              <strong style={{ color: 'var(--t1)' }}>{formatCurrency(other)}</strong> in other credits on
+              your account.
+            </div>
+          )}
+          <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>
+            It all comes off each bill automatically as it arrives — you don&apos;t need to do anything.
           </div>
-        </div>
-      )}
+        </div>)
+      })()}
 
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
 
