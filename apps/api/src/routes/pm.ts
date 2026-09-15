@@ -47,6 +47,7 @@ import {
   ensureConnectAccount, createOnboardingSession, fetchAccountStatus,
 } from '../services/stripeConnect'
 import { logger } from '../lib/logger'
+import { landlordScopeIds, ownsLandlord } from '../lib/landlordScope'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
 export const pmRouter = Router()
@@ -1121,5 +1122,242 @@ pmRouter.get('/companies/:id/connect/account-status', async (req: any, res, next
 
     const status = await fetchAccountStatus(company.stripe_connect_account_id)
     res.json({ success: true, data: { has_account: true, ...status } })
+  } catch (e) { next(e) }
+})
+
+// ── OWNERS ────────────────────────────────────────────────────────────────
+//
+// S644 — the people the manager works FOR.
+//
+// Nic (S644): a manager is onboarding with roughly 11,000 units across Texas,
+// Oklahoma and Georgia. "He has other owners that get their reports and things
+// like that, and their payments." Until now GAM could describe a manager and a
+// property but had no name for the relationship between a manager and an owner,
+// so there was nowhere to put the two things that belong to it: how that owner
+// is paid, and whether they can see any of this for themselves.
+//
+// AUTHORISATION. Every route below resolves the (company, owner) relationship
+// row FIRST and 404s when there isn't one. A manager passing a landlordId they
+// do not manage must not be able to tell the difference between "no such owner"
+// and "not yours" — and more importantly must never read that owner's money.
+
+/**
+ * Resolve the relationship, or refuse. Returns the row so callers never have to
+ * re-read it. `landlordId` arrives from the URL, so it is a foreign reference
+ * and is ownership-checked here before anything uses it.
+ */
+async function requireOwnerRelationship(pmCompanyId: string, landlordId: string) {
+  const rel = await queryOne<any>(
+    `SELECT r.*, l.business_name
+       FROM pm_owner_relationships r
+       JOIN landlords l ON l.id = r.landlord_id
+      WHERE r.pm_company_id = $1 AND r.landlord_id = $2 AND r.status = 'active'`,
+    [pmCompanyId, landlordId])
+  if (!rel) throw new AppError(404, 'No active owner relationship with this company')
+  return rel
+}
+
+// GET /api/pm/companies/:id/owners — who this manager works for, with the terms
+// that differ between them and enough of a rollup to be a working screen.
+pmRouter.get('/companies/:id/owners', async (req: any, res, next) => {
+  try {
+    await assertPmStaffRole(req.user!.userId, req.params.id, ['owner', 'manager', 'staff'])
+    // One query with the counts attached. A manager with 11,000 units cannot
+    // have a screen that asks the database once per owner.
+    const rows = await query<any>(
+      `SELECT r.landlord_id                AS "landlordId",
+              l.business_name              AS "businessName",
+              u.email                      AS "ownerEmail",
+              r.payout_mode                AS "payoutMode",
+              r.disbursement_day           AS "disbursementDay",
+              r.portal_access              AS "portalAccess",
+              r.portal_opened_at           AS "portalOpenedAt",
+              r.notes,
+              COALESCE(p.property_count, 0)::int AS "propertyCount",
+              COALESCE(p.unit_count, 0)::int     AS "unitCount"
+         FROM pm_owner_relationships r
+         JOIN landlords l ON l.id = r.landlord_id
+         LEFT JOIN users u ON u.id = l.user_id
+         LEFT JOIN (
+           SELECT pr.landlord_id,
+                  COUNT(DISTINCT pr.id) AS property_count,
+                  COUNT(un.id)          AS unit_count
+             FROM properties pr
+             LEFT JOIN units un ON un.property_id = pr.id
+            WHERE pr.pm_company_id = $1
+            GROUP BY pr.landlord_id
+         ) p ON p.landlord_id = r.landlord_id
+        WHERE r.pm_company_id = $1 AND r.status = 'active'
+        ORDER BY l.business_name`,
+      [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/pm/companies/:id/owners/:landlordId — the terms of the relationship.
+//
+// Nic (S644, DIRECTIVE) on the money: per-owner choice. 'direct' pays the owner
+// their share the moment a resident's rent settles, which is what allocation.ts
+// already does. 'pm_trust' holds it to the manager and pays out on a run.
+pmRouter.patch('/companies/:id/owners/:landlordId', async (req: any, res, next) => {
+  try {
+    await assertPmStaffRole(req.user!.userId, req.params.id, ['owner', 'manager'])
+    await requireOwnerRelationship(req.params.id, req.params.landlordId)
+    const body = z.object({
+      payoutMode: z.enum(['direct', 'pm_trust']).optional(),
+      disbursementDay: z.number().int().min(1).max(28).optional(),
+      notes: z.string().max(2000).nullish(),
+    }).strict().parse(req.body)
+
+    const sets: string[] = []
+    const vals: any[] = [req.params.id, req.params.landlordId]
+    for (const [k, v] of Object.entries(body)) {
+      if (v === undefined) continue
+      vals.push(v)
+      sets.push(`${toSnake(k)} = $${vals.length}`)
+    }
+    if (sets.length === 0) throw new AppError(400, 'Nothing to change')
+
+    const updated = await queryOne<any>(
+      `UPDATE pm_owner_relationships SET ${sets.join(', ')}, updated_at = now()
+        WHERE pm_company_id = $1 AND landlord_id = $2
+        RETURNING payout_mode AS "payoutMode", disbursement_day AS "disbursementDay",
+                  portal_access AS "portalAccess", notes`,
+      vals)
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// POST /api/pm/companies/:id/owners/:landlordId/portal — let the owner in.
+//
+// Nic (S644, DIRECTIVE): "Owner can access if they want. Request portal access
+// through PM, but PM can't deny an owner."
+//
+// So this is the only verb there is. There is no matching reject route, and
+// there is no 'pending' state for a manager to sit on — a request that can only
+// ever be granted is not a decision, and leaving it pending would be refusal
+// with better manners. The manager is the CHANNEL (the owner rings them, they
+// click this); they are not a gate. The database agrees: portal_access has no
+// 'denied' value.
+//
+// Closing it is the owner's own act and lives on the owner-facing route below.
+pmRouter.post('/companies/:id/owners/:landlordId/portal', async (req: any, res, next) => {
+  try {
+    await assertPmStaffRole(req.user!.userId, req.params.id, ['owner', 'manager', 'staff'])
+    await requireOwnerRelationship(req.params.id, req.params.landlordId)
+    const updated = await queryOne<any>(
+      `UPDATE pm_owner_relationships
+          SET portal_access = 'active',
+              portal_opened_at = COALESCE(portal_opened_at, now()),
+              portal_opened_by = COALESCE(portal_opened_by, 'pm_company'),
+              portal_closed_at = NULL,
+              updated_at = now()
+        WHERE pm_company_id = $1 AND landlord_id = $2
+        RETURNING portal_access AS "portalAccess", portal_opened_at AS "portalOpenedAt"`,
+      [req.params.id, req.params.landlordId])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pm/companies/:id/owners/:landlordId/statement?month=YYYY-MM
+//
+// What the manager sends the owner. Same computation the owner reads for
+// themselves — one statement, so the two can never be shown different numbers
+// about the same month.
+pmRouter.get('/companies/:id/owners/:landlordId/statement', async (req: any, res, next) => {
+  try {
+    await assertPmStaffRole(req.user!.userId, req.params.id, ['owner', 'manager', 'staff'])
+    await requireOwnerRelationship(req.params.id, req.params.landlordId)
+    const { ownerStatement } = await import('../services/ownerStatement')
+    const month = typeof req.query.month === 'string'
+      ? req.query.month
+      : new Date().toISOString().slice(0, 7)
+    const statement = await ownerStatement({
+      landlordId: req.params.landlordId,
+      periodMonth: month,
+      pmCompanyId: req.params.id,
+    })
+    res.json({ success: true, data: statement })
+  } catch (e) { next(e) }
+})
+
+// ── THE OWNER'S OWN VIEW ──────────────────────────────────────────────────
+//
+// An owner is a landlord record whose properties happen to be run by somebody
+// else, so they arrive here with an ordinary landlord session. These routes let
+// them read their own statements and step away from the portal — and nothing
+// else. Scoped through landlordScopeIds, so the entities an account owns are
+// exactly the entities it can read, and a manager's own staff session gets
+// nothing from these routes at all.
+
+// GET /api/pm/my-statements?month=YYYY-MM[&landlordId=]
+//
+// Every managed entity this account owns, each with its own statement. An owner
+// with parks under two managers gets two — separate fees, separate people to
+// ring about them.
+pmRouter.get('/my-statements', async (req: any, res, next) => {
+  try {
+    const mine = landlordScopeIds(req.user!)
+    if (mine.length === 0) throw new AppError(403, 'No owned entity on this account')
+
+    // A specific entity may be named, but only one this account actually owns.
+    const wanted = typeof req.query.landlordId === 'string' ? req.query.landlordId : null
+    if (wanted && !ownsLandlord(req.user!, wanted)) {
+      throw new AppError(403, 'Not your entity')
+    }
+    const scope = wanted ? [wanted] : mine
+
+    const month = typeof req.query.month === 'string'
+      ? req.query.month
+      : new Date().toISOString().slice(0, 7)
+
+    // Only relationships the owner has actually been let into. An owner whose
+    // portal was never opened still HAS statements — their manager sends them —
+    // but they do not read them here, because nobody switched that on.
+    const rels = await query<any>(
+      `SELECT r.landlord_id, r.pm_company_id, c.name AS pm_name, l.business_name
+         FROM pm_owner_relationships r
+         JOIN pm_companies c ON c.id = r.pm_company_id
+         JOIN landlords l    ON l.id = r.landlord_id
+        WHERE r.landlord_id = ANY($1::uuid[])
+          AND r.status = 'active' AND r.portal_access = 'active'
+        ORDER BY c.name`,
+      [scope])
+
+    const { ownerStatement } = await import('../services/ownerStatement')
+    const data = []
+    for (const r of rels) {
+      data.push({
+        pmCompanyId: r.pm_company_id,
+        pmCompanyName: r.pm_name,
+        entityName: r.business_name,
+        statement: await ownerStatement({
+          landlordId: r.landlord_id, periodMonth: month, pmCompanyId: r.pm_company_id,
+        }),
+      })
+    }
+    res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/pm/my-portal/:pmCompanyId — the owner steps away.
+//
+// Only the owner closes this, which is why it lives here and not beside the
+// manager's routes. The manager cannot deny access (S644 directive) and equally
+// cannot revoke it; the person whose money it is decides whether they want to
+// look at it. Re-opening later is the same one-click grant, so nothing is lost.
+pmRouter.delete('/my-portal/:pmCompanyId', async (req: any, res, next) => {
+  try {
+    const mine = landlordScopeIds(req.user!)
+    if (mine.length === 0) throw new AppError(403, 'No owned entity on this account')
+    const closed = await query<any>(
+      `UPDATE pm_owner_relationships
+          SET portal_access = 'closed', portal_closed_at = now(), updated_at = now()
+        WHERE pm_company_id = $1 AND landlord_id = ANY($2::uuid[])
+          AND status = 'active' AND portal_access = 'active'
+        RETURNING landlord_id`,
+      [req.params.pmCompanyId, mine])
+    if (closed.length === 0) throw new AppError(404, 'No open portal with that company')
+    res.json({ success: true, data: { closed: closed.length } })
   } catch (e) { next(e) }
 })

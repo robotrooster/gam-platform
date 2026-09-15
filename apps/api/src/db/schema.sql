@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 0CaOc9rx3ItxrviyROQ3EddCFGxghFhjp3Hs94kpeUvupJ5e63nDysWoqZ4aoJy
+\restrict sfQcmla66IQ3M7gS3OiPqsKrJL9i8pPPLnVYObji3i8rROhbdrZ0YtdFR2ymO8p
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -255,6 +255,24 @@ BEGIN
       'This unit is already on the % meter "%". A unit can only be on one % meter — remove it from that one first.',
       v_utility, v_conflict, v_utility
       USING ERRCODE = 'unique_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: ensure_pm_owner_relationship(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ensure_pm_owner_relationship() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.pm_company_id IS NOT NULL AND NEW.landlord_id IS NOT NULL THEN
+    INSERT INTO pm_owner_relationships (pm_company_id, landlord_id)
+    VALUES (NEW.pm_company_id, NEW.landlord_id)
+    ON CONFLICT (pm_company_id, landlord_id) DO NOTHING;
   END IF;
   RETURN NEW;
 END;
@@ -6631,6 +6649,33 @@ CREATE TABLE public.pm_monthly_fee_accruals (
 
 
 --
+-- Name: pm_owner_relationships; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_owner_relationships (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    pm_company_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    payout_mode text DEFAULT 'direct'::text NOT NULL,
+    disbursement_day smallint DEFAULT 10 NOT NULL,
+    portal_access text DEFAULT 'none'::text NOT NULL,
+    portal_opened_at timestamp with time zone,
+    portal_opened_by text,
+    portal_closed_at timestamp with time zone,
+    status text DEFAULT 'active'::text NOT NULL,
+    ended_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_owner_relationships_disbursement_day_check CHECK (((disbursement_day >= 1) AND (disbursement_day <= 28))),
+    CONSTRAINT pm_owner_relationships_payout_mode_check CHECK ((payout_mode = ANY (ARRAY['direct'::text, 'pm_trust'::text]))),
+    CONSTRAINT pm_owner_relationships_portal_access_check CHECK ((portal_access = ANY (ARRAY['none'::text, 'active'::text, 'closed'::text]))),
+    CONSTRAINT pm_owner_relationships_portal_opened_by_check CHECK ((portal_opened_by = ANY (ARRAY['owner'::text, 'pm_company'::text, 'gam'::text]))),
+    CONSTRAINT pm_owner_relationships_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
+);
+
+
+--
 -- Name: pm_property_invitations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12819,6 +12864,22 @@ ALTER TABLE ONLY public.pm_monthly_fee_accruals
 
 
 --
+-- Name: pm_owner_relationships pm_owner_relationships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_owner_relationships
+    ADD CONSTRAINT pm_owner_relationships_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_owner_relationships pm_owner_relationships_pm_company_id_landlord_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_owner_relationships
+    ADD CONSTRAINT pm_owner_relationships_pm_company_id_landlord_id_key UNIQUE (pm_company_id, landlord_id);
+
+
+--
 -- Name: pm_property_invitations pm_property_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16808,6 +16869,27 @@ CREATE INDEX idx_pm_monthly_fee_accruals_property_month ON public.pm_monthly_fee
 
 
 --
+-- Name: idx_pm_owner_rel_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_owner_rel_company ON public.pm_owner_relationships USING btree (pm_company_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_pm_owner_rel_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_owner_rel_landlord ON public.pm_owner_relationships USING btree (landlord_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_pm_owner_rel_trust_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_owner_rel_trust_day ON public.pm_owner_relationships USING btree (disbursement_day) WHERE ((payout_mode = 'pm_trust'::text) AND (status = 'active'::text));
+
+
+--
 -- Name: idx_pm_property_invitations_email_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -20004,6 +20086,13 @@ CREATE TRIGGER trg_email_log_freeze_content BEFORE UPDATE ON public.email_send_l
 --
 
 CREATE TRIGGER trg_emergency_contacts_updated_at BEFORE UPDATE ON public.emergency_contacts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: properties trg_ensure_pm_owner_relationship; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_ensure_pm_owner_relationship AFTER INSERT OR UPDATE OF pm_company_id, landlord_id ON public.properties FOR EACH ROW EXECUTE FUNCTION public.ensure_pm_owner_relationship();
 
 
 --
@@ -24037,6 +24126,22 @@ ALTER TABLE ONLY public.pm_monthly_fee_accruals
 
 
 --
+-- Name: pm_owner_relationships pm_owner_relationships_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_owner_relationships
+    ADD CONSTRAINT pm_owner_relationships_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_owner_relationships pm_owner_relationships_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_owner_relationships
+    ADD CONSTRAINT pm_owner_relationships_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
 -- Name: pm_property_invitations pm_property_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26520,5 +26625,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 0CaOc9rx3ItxrviyROQ3EddCFGxghFhjp3Hs94kpeUvupJ5e63nDysWoqZ4aoJy
+\unrestrict sfQcmla66IQ3M7gS3OiPqsKrJL9i8pPPLnVYObji3i8rROhbdrZ0YtdFR2ymO8p
 
