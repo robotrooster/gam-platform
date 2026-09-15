@@ -82,9 +82,6 @@ export function DashboardPage() {
     { select: (d: any) => d?.slice(0, 5) }
   )
 
-  // S574 (Nic): referral earnings for the platform-fee / referral / net trio.
-  // The platform-fee card is a gross COST; this is the income that offsets it.
-  const { data: referral } = useQuery<any>('referral-earnings', () => apiGet('/landlords/referral-earnings'))
 
   // Pad trend to always show 6 months
   const trendData = (() => {
@@ -121,10 +118,6 @@ export function DashboardPage() {
   const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
   const payableUnits   = Math.max(rentRollUnits - workTradeUnits, 0)
   const platformFee = stats?.platformFee ?? 0
-  // S574: referral earnings offset the platform fee. Net > 0 = you still owe GAM
-  // that much this month; Net <= 0 = your referrals earn back more than you pay.
-  const referralThisMonth = Number(referral?.thisMonth ?? 0)
-  const netToGam = platformFee - referralThisMonth
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
 
@@ -350,25 +343,17 @@ export function DashboardPage() {
             </div>
           )}
         </div>
-        {/* Row 4 (span 4): your money with GAM — fee you pay, referral you earn, net.
-            S574 (Nic): kept as three separate cards (a cost, an income, the net)
-            rather than netting into one, so each reads clearly at a glance. */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
+        {/* Row 4: what you pay GAM.
+            S642 (Nic): the landlord referral programme is withdrawn — "not
+            having something there is better than offering it to landlords and
+            then taking it away", and it cannot survive landlords onboarding
+            free. The Referral Earnings and Net Platform Cost cards went with
+            it; this one widens to fill the row rather than leaving a gap where
+            an offer used to be. */}
+        <div className="kpi-card" style={{gridColumn:'span 12',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmtWhole(platformFee)}</div>
           <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
-        </div>
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/refer')}>
-          <div className="kpi-label">Referral Earnings</div>
-          <div className="kpi-value green">{fmtWhole(referralThisMonth)}</div>
-          <div className="kpi-sub">this month{referral?.referredCount ? ` · ${referral.referredCount} referred landlord${referral.referredCount === 1 ? '' : 's'}` : ''}</div>
-        </div>
-        <div className="kpi-card" style={{gridColumn:'span 4'}}>
-          <div className="kpi-label">Net Platform Cost</div>
-          <div className="kpi-value" style={{color: netToGam <= 0 ? 'var(--green)' : 'var(--text-0)'}}>
-            {netToGam < 0 ? `+${fmtWhole(-netToGam)}` : fmtWhole(netToGam)}
-          </div>
-          <div className="kpi-sub">{netToGam <= 0 ? 'referrals cover your fee' : 'fee − referral earnings'}</div>
         </div>
       </div>
 

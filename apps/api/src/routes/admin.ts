@@ -79,6 +79,26 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
                 = date_trunc('month', CURRENT_DATE)) AS paying_leases,
         (SELECT COUNT(*)::int FROM units
           WHERE status IN ('active','delinquent','suspended')) AS occupied_units,
+        -- S642 (Nic): "Unpaid invoices seems like a landlord specific thing. We
+        -- should replace that with a KPI card for something beneficial to this
+        -- view." Money GAM is HOLDING for landlords — collected, allocated as
+        -- owner share, and not yet transferred out. That is the platform's own
+        -- position, not a landlord's collections problem, and it pairs with the
+        -- Pending Disbursements COUNT beside it, which gives no amount.
+        --
+        -- Identical ledger conditions to heldOwnerShareForUser() in
+        -- landlordPassthrough (Ben's S639 landlord-facing twin), minus the user
+        -- filter. Deposits need no exclusion: they never get an
+        -- allocation_owner_share entry, because they are never the landlord's.
+        (SELECT COALESCE(SUM(ubl.amount), 0)
+           FROM payments p
+           JOIN user_balance_ledger ubl
+             ON ubl.reference_id = p.id
+            AND ubl.reference_type = 'payment'
+            AND ubl.type = 'allocation_owner_share'
+            AND ubl.stripe_transfer_id IS NULL
+          WHERE p.platform_held = true
+            AND p.status = 'settled') AS held_for_landlords,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
         (SELECT COALESCE(balance,0) FROM float_account_state LIMIT 1) AS float_balance,
         -- FlexPay float BANKROLL NEEDED: total monthly rent of the distinct

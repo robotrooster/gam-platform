@@ -40,7 +40,6 @@ const NAV_ITEMS: Array<{
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
-  { to: '/refer',         icon: HeartHandshake,   label: 'Refer & Earn',     section: null },
   { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          category: 'pos' },
   // Portfolio
   // S605 (Nic, DIRECTIVE): Utilities and Amenities were removed from top-level

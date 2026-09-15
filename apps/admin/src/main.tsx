@@ -1103,16 +1103,15 @@ function Overview(){
       {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
         <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target (3% of FlexPay float)</div></div>
         <div className="kpi"><div className="kl">FlexPay Float Bankroll</div><div className="kv b">{formatCurrency(floatBankroll)}</div><div className="ks">rent of income-verified tenants who requested FlexPay</div></div>
-        {/* S639 (Nic): "twenty pending payments awaiting ACH settlement. Where
-            is that card reading from?" From status='pending', which is an
-            UNPAID CHARGE — nobody has sent anything and no ACH exists. Money
-            actually in transit is status='processing'. The count was right for
-            a question nobody asked and wrong for the one printed under it. */}
-        {/* S639 (Nic): "once line items go on an invoice, they are bundled
-            together as one item." Rent and its utilities are separate rows but
-            one bill, paid in one act — counting rows counted the same debt
-            twice. */}
-        <div className="kpi"><div className="kl">Unpaid Invoices</div><div className={`kv ${(stats?.unpaidCharges ?? 0)>20?'r':'a'}`}>{stats?.unpaidCharges ?? 0}</div><div className="ks">{stats?.unpaidLineItems||0} line item{(stats?.unpaidLineItems||0)===1?'':'s'}, billed and not yet paid{(stats?.workTradeInvoices||0)>0?` · ${stats.workTradeInvoices} more settle in hours`:''}{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
+        {/* S642 (Nic): "We have a KPI card on the admin portal for unpaid
+            invoices. That seems like a landlord specific thing. We should
+            replace that with a KPI card for something beneficial to this view."
+            Right — who owes their landlord rent is the landlord's problem. What
+            belongs here is GAM's own position: money COLLECTED and allocated to
+            landlords that has not left the platform balance yet. It also gives
+            the Pending Disbursements count beside it an amount, which it never
+            had. */}
+        <div className="kpi"><div className="kl">Held for Landlords</div><div className="kv gold">{formatCurrency(stats?.heldForLandlords||0)}</div><div className="ks">collected, not yet paid out{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} more in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 

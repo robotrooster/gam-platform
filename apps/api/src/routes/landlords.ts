@@ -171,56 +171,28 @@ landlordsRouter.get('/', requireAdmin, adminLandlordsListHandler)
 // (customer, property) account semantics. Engine + statement math
 // live in services/flexCharge.ts.
 
-// ── landlord referral (S567) ──────────────────────────────────────
-// A landlord's own referral code + shareable signup link. Referring another
-// landlord makes the referrer the CLOSER on that landlord — a 25¢/occupied
-// unit/month residual, identical to a PM closer (customer service still routes
-// to a PM). Lazily generates the code on first request.
-landlordsRouter.get('/my-referral', requireAuth, requireLandlord, async (req: any, res, next) => {
-  try {
-    const uid = req.user.userId
-    let row = await queryOne<any>(`SELECT referral_code FROM users WHERE id=$1`, [uid])
-    if (!row?.referral_code) {
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const code = ('L' + uid.replace(/-/g, '') + attempt).slice(0, 8).toUpperCase()
-        try { await query(`UPDATE users SET referral_code=$1 WHERE id=$2`, [code, uid]); row = { referral_code: code }; break }
-        catch { /* unique collision — try next */ }
-      }
-    }
-    // S641: the old fallback was https://app.goldassetmanagement.com/signup —
-    // a host that does not resolve. Not localhost, but just as unopenable.
-    const base = process.env.LANDLORD_SIGNUP_URL || portalLink('landlord', 'signup')
-    res.json({ success: true, data: {
-      referralCode: row?.referral_code ?? null,
-      referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
-    }})
-  } catch (e) { next(e) }
-})
+// ── S642: THE LANDLORD REFERRAL PROGRAMME IS WITHDRAWN ───────────────────
+//
+// Nic: "Not having something there is better than offering it to landlords
+// and then taking it away… the referral program can't happen when landlords
+// onboard for free. Let's rip that right now."
+//
+// GET /my-referral and GET /referral-earnings are gone with the page, the nav
+// item and the two dashboard cards. Leaving live endpoints behind a withdrawn
+// offer is how it creeps back: a landlord who bookmarked the link would still
+// have been quoted 25¢/occupied unit/month by an API that meant it.
+//
+// NOT removed, deliberately:
+//   • users.referral_code and referred_by_user_id — one real referral exists
+//     (hawshomes.llc, referred by Nic's own landlord account) and GAM does not
+//     erase history. See gam-data-retention-keep-everything.
+//   • the ?ref= parameter on landlord signup, and the whole commission engine.
+//     Those serve the SALES REP model (closing/service/pot), which is a
+//     different programme that stands. Only the landlord-facing offer is gone.
+//
+// Nothing was ever earned on it: commission_accruals is empty, so withdrawing
+// it deprives nobody of money they had been promised.
 
-// The landlord's referral earnings — closing commission on landlords they
-// referred (they are the closing manager on those accruals).
-landlordsRouter.get('/referral-earnings', requireAuth, requireLandlord, async (req: any, res, next) => {
-  try {
-    const uid = req.user.userId
-    const [tot] = await query<any>(
-      `SELECT COALESCE(SUM(amount),0) AS all_time,
-              COALESCE(SUM(amount) FILTER (WHERE accrual_month = date_trunc('month', now())::date),0) AS this_month
-         FROM commission_accruals WHERE manager_id=$1 AND role='closing' AND NOT to_pot`, [uid])
-    const byLandlord = await query<any>(
-      `SELECT ca.landlord_id, lu.first_name, lu.last_name, l.business_name,
-              MAX(ca.occupied_units) AS occupied_units,
-              COALESCE(SUM(ca.amount),0) AS all_time,
-              COALESCE(SUM(ca.amount) FILTER (WHERE ca.accrual_month = date_trunc('month', now())::date),0) AS this_month
-         FROM commission_accruals ca
-         JOIN landlords l ON l.id = ca.landlord_id
-         JOIN users lu ON lu.id = l.user_id
-        WHERE ca.manager_id=$1 AND ca.role='closing' AND NOT ca.to_pot
-        GROUP BY ca.landlord_id, lu.first_name, lu.last_name, l.business_name
-        ORDER BY all_time DESC`, [uid])
-    const [ref] = await query<any>(`SELECT COUNT(*)::int AS n FROM landlords WHERE referred_by_user_id=$1`, [uid])
-    res.json({ success: true, data: { thisMonth: +tot.this_month, allTime: +tot.all_time, referredCount: ref.n, byLandlord } })
-  } catch (e) { next(e) }
-})
 
 // ── pos_customers — merchant-owned non-tenant roster ──────────────
 landlordsRouter.get('/pos-customers', requireAuth, requireLandlord, async (req, res, next) => {

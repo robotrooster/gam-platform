@@ -68,7 +68,6 @@ import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { AcceptOwnerInvitePage } from './pages/AcceptOwnerInvitePage'
 import { VerifyEmailPage } from './pages/VerifyEmailPage'
 import { DashboardPage }   from './pages/DashboardPage'
-import { ReferLandlordPage } from './pages/ReferLandlordPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
 import { PmInvitationsPage } from './pages/PmInvitationsPage'
@@ -261,7 +260,6 @@ function App() {
               <Route index element={<RoleRedirect />} />
               <Route path="welcome"        element={<NoAccessPage />} />
               <Route path="dashboard"      element={<DashboardPage />} />
-              <Route path="refer"          element={<ReferLandlordPage />} />
               <Route path="onboarding"     element={<OnboardingPage />} />
               <Route path="properties"     element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
