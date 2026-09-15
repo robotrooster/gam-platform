@@ -199,9 +199,27 @@ async function persist(
     const row = byMonth.get(out.periodMonth)
     if (!row) continue
 
-    if (out.hoursAppliedNow > 0 && row.invoiceId) {
-      await creditInvoice(client, row.invoiceId,
-        round2(out.hoursAppliedNow * row.hourRate), out.hoursAppliedNow)
+    // S643 — AN UNTRACKED TRADE STILL HAS TO ZERO THE BILL.
+    //
+    // Two of the live agreements (MH 02, MH 10) have tracks_hours = false: the
+    // landlord does not log hours, the trade simply covers the rent. Those open
+    // with target_hours = 0, so `hoursAppliedNow` is 0 forever — and this gate
+    // was on HOURS, which meant creditInvoice never ran for them. The period
+    // would have closed as `settled` with the full $460 recorded as credited
+    // while the rent row stayed `pending`, suspended, at $460, with the invoice
+    // total at $0. The books and the bill would have disagreed permanently, and
+    // that row is exactly the kind of never-clearing "pending" Nic does not want
+    // a landlord looking at.
+    //
+    // periodCredit already answers this correctly — no target means the whole
+    // basis is covered — so gate on the MONEY it produced, not on hours. A
+    // re-run cannot double-credit: the period leaves `open` and loadOpenPeriods
+    // never picks it up again.
+    const creditNow = row.targetHours > 0
+      ? round2(out.hoursAppliedNow * row.hourRate)
+      : out.creditTotal
+    if (creditNow > 0 && row.invoiceId) {
+      await creditInvoice(client, row.invoiceId, creditNow, out.hoursAppliedNow)
     }
 
     await client.query(

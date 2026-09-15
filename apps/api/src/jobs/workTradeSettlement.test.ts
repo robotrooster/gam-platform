@@ -28,9 +28,14 @@ interface Stack {
 /** One work-trade tenancy: 80-hour target, a $500 September invoice, gross. */
 async function buildStack(opts: {
   target?: number; basis?: number; carryForwardMonths?: number
-  periodMonth?: string
+  periodMonth?: string; suspended?: boolean; tracksHours?: boolean
 } = {}): Promise<Stack> {
+  // S643: `target` is what the PERIOD asks for. The agreement's own
+  // monthly_hours_target must stay positive (DB check) even when the landlord
+  // does not clock the trade — tracks_hours is the switch that zeroes the
+  // period, exactly as moveInBundle/loadWorkTradeCreditContext do it.
   const target = opts.target ?? 80
+  const agreementTarget = opts.target && opts.target > 0 ? opts.target : 80
   const basis = opts.basis ?? 500
   const periodMonth = opts.periodMonth ?? '2026-09-01'
   const client = await getClient()
@@ -46,9 +51,10 @@ async function buildStack(opts: {
     const ag = await client.query(
       `INSERT INTO work_trade_agreements
          (unit_id, tenant_id, landlord_id, start_date, status,
-          monthly_hours_target, carry_forward_months)
-       VALUES ($1,$2,$3,'2026-08-01','active',$4,$5) RETURNING id`,
-      [unitId, tenantId, landlordId, target, opts.carryForwardMonths ?? 1])
+          monthly_hours_target, carry_forward_months, tracks_hours)
+       VALUES ($1,$2,$3,'2026-08-01','active',$4,$5,$6) RETURNING id`,
+      [unitId, tenantId, landlordId, agreementTarget, opts.carryForwardMonths ?? 1,
+       opts.tracksHours !== false])
     const agreementId = ag.rows[0].id
 
     const inv = await client.query(
@@ -59,13 +65,20 @@ async function buildStack(opts: {
       [landlordId, tenantId, leaseId, unitId, `WT-${randomUUID().slice(0, 8)}`, periodMonth,
        basis.toFixed(2), agreementId])
     const invoiceId = inv.rows[0].id
+    // A `suspended` stack is the S634 shape: the line is excluded from
+    // total_amount until the month closes, so the total starts at zero.
+    if (opts.suspended) {
+      await client.query(`UPDATE invoices SET total_amount = 0 WHERE id = $1`, [invoiceId])
+    }
 
     await client.query(
       `INSERT INTO payments
          (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount,
-          status, due_date, entry_description)
-       VALUES ($1,$2,$3,$4,$5,'rent',$6,'pending',$7::date,'RENT')`,
-      [invoiceId, unitId, leaseId, tenantId, landlordId, basis.toFixed(2), periodMonth])
+          status, due_date, entry_description, work_trade_suspended_at)
+       VALUES ($1,$2,$3,$4,$5,'rent',$6,'pending',$7::date,'RENT',
+               CASE WHEN $8::boolean THEN NOW() ELSE NULL END)`,
+      [invoiceId, unitId, leaseId, tenantId, landlordId, basis.toFixed(2), periodMonth,
+       opts.suspended === true])
 
     await client.query(
       `INSERT INTO work_trade_settlements
@@ -149,6 +162,50 @@ describe('month close, against the database', () => {
     const inv = await invoiceOf(s.invoiceId)
     expect(inv.credit).toBe(0)
     expect(inv.total).toBe(500)
+  })
+})
+
+// S643 — Nic runs two agreements (MH 02, MH 10) with tracks_hours = false: the
+// landlord does not log hours, the trade just covers the rent. Those open with
+// target_hours = 0, and the job used to gate crediting on HOURS WORKED, which
+// those can never have. The period closed as `settled` with the whole basis
+// recorded as credited while the rent row sat `pending` at full price with the
+// suspension still on it — a charge that would never clear and never be paid.
+describe('a trade the landlord does not clock', () => {
+  it('zeroes the bill even though nobody logged an hour', async () => {
+    const s = await buildStack({ target: 0, basis: 460, suspended: true, tracksHours: false })
+
+    const r = await runWorkTradeSettlement('2026-09-01')
+    expect(r.errors).toEqual([])
+    expect(r.periodsSettled).toBe(1)
+
+    const rent = (await db.query(
+      `SELECT status, amount::float AS amount, work_trade_suspended_at
+         FROM payments WHERE invoice_id=$1 AND type='rent'`, [s.invoiceId])).rows[0]
+    expect(rent.status).toBe('settled')
+    expect(rent.amount).toBe(0)
+    expect(rent.work_trade_suspended_at).toBeNull()
+
+    const inv = await invoiceOf(s.invoiceId)
+    expect(inv.total).toBe(0)
+    expect(inv.credit).toBe(460)
+
+    // What the books say and what the tenant owes have to be the same number.
+    const st = (await db.query(
+      `SELECT status, credit_applied::float AS credit
+         FROM work_trade_settlements WHERE agreement_id=$1`, [s.agreementId])).rows[0]
+    expect(st.status).toBe('settled')
+    expect(st.credit).toBe(460)
+  })
+
+  it('does not pay for the month twice when the job re-runs', async () => {
+    const s = await buildStack({ target: 0, basis: 460, suspended: true, tracksHours: false })
+    await runWorkTradeSettlement('2026-09-01')
+    await runWorkTradeSettlement('2026-09-01')
+
+    const inv = await invoiceOf(s.invoiceId)
+    expect(inv.total).toBe(0)
+    expect(inv.credit).toBe(460)
   })
 })
 

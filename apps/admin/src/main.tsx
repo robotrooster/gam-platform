@@ -24,7 +24,7 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, BookOpen, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, DollarSign, Sun, Moon,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -306,7 +306,6 @@ function Layout(){
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
-          <NavLink to="/commissions" className={({isActive})=>`ni${isActive?' active':''}`}><DollarSign size={15}/> Commissions</NavLink>
           {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
           {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
@@ -1820,8 +1819,28 @@ function Payments(){
   const{data:payments=[],isLoading}=useQuery<any[]>('payments',()=>get('/payments'),{enabled:!!user})
   const[selected,setSelected]=React.useState<any>(null)
   const[pSearch,setPSearch]=React.useState('')
+  const[showWorkTrade,setShowWorkTrade]=React.useState(false)
   const filteredPayments=React.useMemo(()=>pSearch?((payments as any[]).filter((p:any)=>`${p.propertyName||''} ${p.unitNumber||''} ${p.tenantFirst||''} ${p.tenantLast||''} ${p.type} ${p.status}`.toLowerCase().includes(pSearch.toLowerCase()))):(payments as any[]),[payments,pSearch])
   const ST:Record<string,string>={settled:'bg2',pending:'ba',failed:'br',returned:'br',processing:'bb'}
+  // ── S642 (Nic): A SUSPENDED WORK-TRADE CHARGE IS NOT PENDING ─────────────
+  //
+  // "I don't want a landlord to think it's outstanding… it shouldn't show
+  // pending anywhere. It comes into existence after the hours shortfall, if one
+  // exists."
+  //
+  // The row IS still `pending` in the database, and correctly so: if the tenant
+  // falls short on hours they get billed the difference at month close, so the
+  // charge has to survive until reconciliation decides. What is wrong is
+  // showing that intermediate state to a human as an unpaid bill — it is labour
+  // already being done, not money owed.
+  //
+  // workTradeSettlement (1st of the month, 02:15) zeroes what the hours covered
+  // and raises a fresh charge for any shortfall. Until it runs, these are
+  // shown as what they are and kept out of the outstanding count.
+  const isWorkTrade=(p:any)=>!!p.workTradeSuspendedAt
+  const workTradeRows=filteredPayments.filter(isWorkTrade)
+  const moneyRows=filteredPayments.filter((p:any)=>!isWorkTrade(p))
+  const workTradeTotal=workTradeRows.reduce((s:number,p:any)=>s+Number(p.amount||0),0)
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Payments</h1><p className="ps">All ACH collections platform-wide</p></div></div>
@@ -1831,7 +1850,7 @@ function Payments(){
           <table className="tbl">
             <thead><tr><th>Due</th><th>Property · Unit</th><th>Tenant</th><th>Type</th><th>Amount</th><th>Status</th><th>Return</th></tr></thead>
             <tbody>
-              {filteredPayments.length?filteredPayments.map((p:any)=>(
+              {moneyRows.length?moneyRows.map((p:any)=>(
                 <tr key={p.id} style={{cursor:'pointer',background:p.zeroToleranceFlag?'rgba(239,68,68,.03)':selected?.id===p.id?'rgba(201,162,39,.04)':''}} onClick={()=>setSelected(p)}>
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
                   <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
@@ -1844,6 +1863,40 @@ function Payments(){
               )):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--t3)',padding:32}}>{pSearch?'No payments match your search.':'No payments yet.'}</td></tr>}
             </tbody>
           </table>
+        )}
+        {/* S642: work trade in its own band, below the money. Said out loud
+            rather than filed under a heading that misdescribes it — the same
+            treatment the landlord payments page has had since S637. Collapsed
+            by default because these rows grow every month and none of them is
+            a bill; one click opens them, so nothing is hidden from an admin. */}
+        {workTradeRows.length>0&&(
+          <div style={{borderTop:'1px solid var(--b0)',padding:'12px 14px'}}>
+            <button onClick={()=>setShowWorkTrade(v=>!v)}
+              style={{background:'none',border:'none',padding:0,cursor:'pointer',color:'var(--t2)',fontSize:'.78rem',textAlign:'left'}}>
+              <strong style={{color:'var(--t0)'}}>{workTradeRows.length} work-trade charge{workTradeRows.length===1?'':'s'}</strong>
+              {' · '}{formatCurrency(workTradeTotal)} covered by hours, not owed
+              <span style={{color:'var(--gold)'}}> · {showWorkTrade?'hide':'show'}</span>
+            </button>
+            <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:4}}>
+              Settles on the 1st — hours worked zero these out, and any shortfall becomes a real charge then.
+            </div>
+            {showWorkTrade&&(
+              <table className="tbl" style={{marginTop:10}}>
+                <thead><tr><th>Due</th><th>Property · Unit</th><th>Tenant</th><th>Type</th><th>Amount</th></tr></thead>
+                <tbody>
+                  {workTradeRows.map((p:any)=>(
+                    <tr key={p.id}>
+                      <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
+                      <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
+                      <td style={{fontSize:'.75rem'}}>{p.tenantFirst?`${p.tenantFirst} ${p.tenantLast}`:'—'}</td>
+                      <td><span className="badge bmu">{humanize(p.type)}</span></td>
+                      <td className="mono" style={{color:'var(--t2)'}}>{formatCurrency(p.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         )}
       </div>
       {selected&&(
@@ -2117,61 +2170,31 @@ function Bool({ v }: { v: boolean }) {
   )
 }
 
-function Commissions(){
-  const{user}=useAuth()
-  const qc=useQueryClient()
-  const isSuper=user?.role==='super_admin'
-  const{data,isLoading}=useQuery<any>('commissions-summary',()=>get('/admin/commissions/summary'),{enabled:!!user})
-  const[running,setRunning]=React.useState(false)
-  const[msg,setMsg]=React.useState('')
-  const runAccrual=async()=>{ setRunning(true)
-    try{ const r=await post<any>('/admin/commissions/accrue'); setMsg(`Accrued ${r?.data?.landlordsAccrued??0} landlords for ${r?.data?.monthScanned}`); qc.invalidateQueries('commissions-summary') }
-    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
-    finally{ setRunning(false); setTimeout(()=>setMsg(''),5000) }
-  }
-  return(
-    <div>
-      <div className="ph"><div><h1 className="pt">Commissions</h1><p className="ps">{isSuper?'Portfolio-manager earnings + platform pot':'Your portfolio-manager earnings'}</p></div></div>
-      {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
-      {isLoading?<div className="card" style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
-      <>
-        <div className="grid4" style={{marginBottom:14}}>
-          <div className="kpi"><div className="kl">Your earnings — this month</div><div className="kv gold">{formatCurrency(data?.myEarnings?.thisMonth||0)}</div><div className="ks">closing + customer service</div></div>
-          <div className="kpi"><div className="kl">Your earnings — all time</div><div className="kv">{formatCurrency(data?.myEarnings?.allTime||0)}</div><div className="ks">residual while landlords stay</div></div>
-          {isSuper&&<div className="kpi"><div className="kl">Pot — this month</div><div className="kv b">{formatCurrency(data?.pot?.thisMonth||0)}</div><div className="ks">10¢/occ always + orphaned closing</div></div>}
-          {isSuper&&<div className="kpi"><div className="kl">Pot — all time</div><div className="kv b">{formatCurrency(data?.pot?.allTime||0)}</div><div className="ks">held for later use</div></div>}
-        </div>
-        <div className="card" style={{padding:0,marginBottom:14}}>
-          <div className="ct" style={{padding:'10px 14px',margin:0,borderBottom:'1px solid var(--b0)'}}>Your commissions by landlord</div>
-          <table className="tbl">
-            <thead><tr><th>Landlord</th><th>Occupied units</th><th>This month</th><th>All time</th></tr></thead>
-            <tbody>
-              {(data?.myByLandlord||[]).length?(data.myByLandlord as any[]).map((m:any)=>(
-                <tr key={m.landlordId}><td style={{color:'var(--t0)'}}>{m.businessName||`${m.firstName} ${m.lastName}`}</td><td className="mono">{m.occupiedUnits||0}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
-              )):<tr><td colSpan={4} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions yet — you earn once you close or service a landlord with occupied units.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-        {isSuper&&(
-        <div className="card" style={{padding:0,marginBottom:14}}>
-          <div style={{display:'flex',alignItems:'center',padding:'10px 14px',borderBottom:'1px solid var(--b0)'}}>
-            <div className="ct" style={{margin:0}}>Earnings by portfolio strategist</div>
-            <button className="btn bg-btn" style={{marginLeft:'auto',padding:'5px 12px'}} disabled={running} onClick={runAccrual}>{running?'Running…':'Run accrual now'}</button>
-          </div>
-          <table className="tbl">
-            <thead><tr><th>Portfolio strategist</th><th>This month</th><th>All time</th></tr></thead>
-            <tbody>
-              {(data?.byManager||[]).length?(data.byManager as any[]).map((m:any)=>(
-                <tr key={m.managerId}><td style={{color:'var(--t0)'}}>{m.firstName} {m.lastName}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
-              )):<tr><td colSpan={3} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions accrued yet.</td></tr>}
-            </tbody>
-          </table>
-        </div>)}
-      </>
-      )}
-    </div>
-  )
-}
+// ── S642 (Nic): THE COMMISSION PROGRAMME IS SCRAPPED ─────────────────────
+//
+// "Scrap commissions completely. The $10 a month does not even begin to cover
+// the book that somebody would have had under their belt with us doing a
+// quarter of the commission on residual for salesmen or customer service. That
+// 50 cents per unit was going to go a long way to helping people build up their
+// recurring revenue. $10 a month is never going to get somebody there."
+//
+// The model paid closing and service managers a per-occupied-unit residual out
+// of the platform subscription. With the fee moving to a flat $10/month per
+// Connect account — which barely covers Connect fees, bank linking and the
+// other per-account costs — there is nothing left to split, and a residual
+// nobody can live on is worse than no offer at all. Same reasoning that
+// retired the landlord referral programme earlier this session.
+//
+// The page, its nav item and its route are gone. NOT removed: commission_accruals
+// and the engine behind it (the table is EMPTY — nothing was ever earned or
+// owed), users.referral_code, referred_by_user_id, and the ?ref= signup path.
+// Those are history and plumbing, and GAM does not erase history.
+//
+// Nic on what might replace it, when there are people to pay: commission for
+// ENROLLING tenants in FlexPay, FlexCredit and whatever follows — paying for an
+// action that creates revenue rather than for an account continuing to exist.
+// Worth designing at hiring time, not before.
+
 
 function Reserve(){
   const{user}=useAuth()
@@ -3914,7 +3937,6 @@ function App(){
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
-          <Route path="commissions"   element={<Commissions/>}/>
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
