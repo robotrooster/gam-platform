@@ -130,7 +130,11 @@ export function OwnersPage() {
                       style={selectStyle}
                     >
                       <option value="direct">{PAYOUT_LABEL.direct}</option>
-                      <option value="pm_trust">{PAYOUT_LABEL.pm_trust}</option>
+                      {/* A local label map keyed by the enum VALUE the API serves,
+                          not a field read off a response — the value stays snake
+                          because that is what the column stores, the label is what
+                          a human sees. Annotation must sit on the read's own line. */}
+                      <option value="pm_trust">{PAYOUT_LABEL.pm_trust /* wire-ok */}</option>
                     </select>
                     {o.payoutMode === 'pm_trust' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>

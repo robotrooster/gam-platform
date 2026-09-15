@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict sfQcmla66IQ3M7gS3OiPqsKrJL9i8pPPLnVYObji3i8rROhbdrZ0YtdFR2ymO8p
+\restrict L7BK4l3cekPCMOFWZ29FlVfOgbLOt9UddRMSg1RVoAexWx3ICEz7ameYCn4hUqs
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -18122,6 +18122,13 @@ CREATE INDEX idx_user_balance_ledger_reference ON public.user_balance_ledger USI
 
 
 --
+-- Name: idx_user_balance_ledger_statement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_statement ON public.user_balance_ledger USING btree (property_id, created_at) WHERE (type = ANY (ARRAY['allocation_owner_share'::text, 'allocation_pm_company_fee'::text]));
+
+
+--
 -- Name: idx_user_balance_ledger_stripe_transfer_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26625,5 +26632,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict sfQcmla66IQ3M7gS3OiPqsKrJL9i8pPPLnVYObji3i8rROhbdrZ0YtdFR2ymO8p
+\unrestrict L7BK4l3cekPCMOFWZ29FlVfOgbLOt9UddRMSg1RVoAexWx3ICEz7ameYCn4hUqs
 
