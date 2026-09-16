@@ -26,6 +26,7 @@ import {
   isAutoFilledLeaseColumn,
   FEE_TYPES,
   FEE_TYPE_META,
+  moveInDefaults,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -520,6 +521,23 @@ export async function createDocumentRecord(client: any, opts: {
               if (prefillValues[tag] == null) prefillValues[tag] = '0.00'
             }
           }
+
+          // S648: page 8's rent lines start from the lease's own terms. The
+          // deposit copy and the total are stamped after the fields exist
+          // (restampMoveInBoxes, below).
+          const collects = await client.query(
+            `SELECT p.move_in_collects_next_period AS on FROM units u
+               JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
+            .then((r: any) => r.rows[0]?.on === true)
+          const d = moveInDefaults({
+            rent: Number(prefillValues.rent_amount ?? ctx.rent_amount ?? 0),
+            startIso: prefillValues.start_date ?? null,
+            existingTenancy, collectsNextPeriod: collects,
+          })
+          if (prefillValues.move_in_first_month_rent == null)
+            prefillValues.move_in_first_month_rent = d.firstMonthRent.toFixed(2)
+          if (prefillValues.move_in_proration == null)
+            prefillValues.move_in_proration = d.proration.toFixed(2)
         }
       }
     }
@@ -590,6 +608,11 @@ export async function createDocumentRecord(client: any, opts: {
          // the document keeps its own copy, so editing a template never
          // redraws a lease somebody already signed
          f.checkbox_mark ?? 'x'])
+    }
+    // S648: the computed page 8 boxes, from the values just placed.
+    if (opts.documentType === 'original_lease') {
+      const { restampMoveInBoxes } = await import('../services/moveInBoxes')
+      await restampMoveInBoxes(client, doc.id)
     }
   }
 
@@ -4550,7 +4573,12 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     // lease, what's this for?"
     const packageDocs = doc.package_group_id ? await packageSiblings(doc.id) : []
 
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly, waitingOn, packageDocs } })
+    // S648: page 8 locks differently for an onboarding resident.
+    const { isExistingTenancyDocument } = await import('../services/moveInBoxes')
+    const existing_tenancy = doc.document_type === 'original_lease'
+      ? await isExistingTenancyDocument({ query: async (t: string, v: any[]) => ({ rows: await query<any>(t, v) }) }, doc.id)
+      : false
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, existing_tenancy, readOnly, waitingOn, packageDocs } })
   } catch (e) { next(e) }
 })
 
@@ -4724,6 +4752,14 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       if (f.parent_field_id && !isActive(f) && effVal(f) != null) {
         await client.query('UPDATE lease_document_fields SET value=NULL WHERE id=$1 AND document_id=$2', [f.id, doc.id])
       }
+    }
+
+    // S648 (Nic): page 8's computed boxes follow what was just signed — the
+    // deposit copies page 2, the total adds up, an onboarding resident's
+    // move-in lines stay at the month's rent and $0.
+    if (signer.role === 'landlord') {
+      const { restampMoveInBoxes } = await import('../services/moveInBoxes')
+      await restampMoveInBoxes(client, doc.id)
     }
 
     // S535: the LANDLORD-first signing pass is where lease terms are

@@ -757,6 +757,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_move_in_collection',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/move-in-collection',
+    pathParams: ['propertyId'],
+    description:
+      'Choose, for one property, what a new tenant moving in partway through the month pays at move-in: ' +
+      'the prorated rent only, with the next month billed on the regular date (collectsNextPeriod false), ' +
+      'or the prorated rent AND the next full month up front (true). It applies to everyone at that ' +
+      'property. Read the choice back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      collectsNextPeriod: { type: 'boolean', description: 'true = prorated rent plus the next full month at move-in.' },
+    },
+    required: ['propertyId', 'collectsNextPeriod'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_broken_meter_billing',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/broken-meter-estimate',

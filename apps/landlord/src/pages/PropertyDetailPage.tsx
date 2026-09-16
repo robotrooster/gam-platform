@@ -212,6 +212,7 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -714,6 +715,31 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
           <button className="btn btn-primary" onClick={() => onGoTab(a.tab)}>{a.cta}</button>
         </div>
       ))}
+    </div>
+  )
+}
+
+// S648 (Nic): "billing a new move-in collects the mid-month and the next month
+// all at the same time, or they just want the prorated amount and bill the
+// rest on the first with the regular billing cycle." One answer per property,
+// so everyone moving in there is asked for the same up front.
+function MoveInCollectionCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const set = useMutation(
+    (collectsNextPeriod: boolean) => apiPatch(`/properties/${property.id}/move-in-collection`, { collectsNextPeriod }),
+    { onSuccess: onSaved })
+  const on = !!property.moveInCollectsNextPeriod
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>New tenants moving in mid-month</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        What page 8 of the lease asks for at move-in. Applies to everyone moving in at this property.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => on && set.mutate(false)}>Prorated rent only</button>
+        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => !on && set.mutate(true)}>Prorated rent plus the next month</button>
+      </div>
     </div>
   )
 }

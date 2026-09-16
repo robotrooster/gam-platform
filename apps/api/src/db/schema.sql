@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DOgDa2cF1mzEb41MpovELq43sauWE8ppawyg3lETNhIEYOzsDKppxb80gZS5Zq0
+\restrict Zqejw6nNGIdyeW5FsljQVLSeU0aQFiFQ6CtHXNbBNYFcVvqFDjkfEEpauD3AfBb
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5057,7 +5057,7 @@ CREATE TABLE public.lease_document_fields (
     parent_option text,
     checkbox_mark text DEFAULT 'x'::text NOT NULL,
     CONSTRAINT lease_document_fields_checkbox_mark_check CHECK ((checkbox_mark = ANY (ARRAY['x'::text, 'check'::text]))),
-    CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
+    CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'move_in_first_month_rent'::text, 'move_in_proration'::text, 'move_in_security_deposit'::text, 'move_in_total_due'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
 );
 
 
@@ -5371,7 +5371,7 @@ CREATE TABLE public.lease_template_fields (
     default_value text,
     checkbox_mark text DEFAULT 'x'::text NOT NULL,
     CONSTRAINT lease_template_fields_checkbox_mark_check CHECK ((checkbox_mark = ANY (ARRAY['x'::text, 'check'::text]))),
-    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
+    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'date_signed_day'::text, 'date_signed_month'::text, 'tenant_2_name'::text, 'tenant_3_name'::text, 'tenant_4_name'::text, 'occupant_names'::text, 'sale_price'::text, 'sale_down_payment'::text, 'sale_financed_amount'::text, 'sale_monthly_payment'::text, 'sale_term_months'::text, 'sale_interest_rate'::text, 'sale_first_payment_month'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'move_in_first_month_rent'::text, 'move_in_proration'::text, 'move_in_security_deposit'::text, 'move_in_total_due'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'utility_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
 );
 
 
@@ -5606,6 +5606,8 @@ CREATE TABLE public.leases (
     landlord_renewal_alerted_at timestamp with time zone,
     is_existing_tenancy boolean DEFAULT false NOT NULL,
     unit_moved_on date,
+    move_in_first_month_rent numeric(10,2),
+    move_in_proration numeric(10,2),
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -5615,6 +5617,7 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text, 'booking_draft'::text, 'application_draft'::text]))),
     CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
+    CONSTRAINT leases_move_in_amounts_nonneg CHECK (((COALESCE(move_in_first_month_rent, (0)::numeric) >= (0)::numeric) AND (COALESCE(move_in_proration, (0)::numeric) >= (0)::numeric))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
     CONSTRAINT leases_tenant_renewal_intent_check CHECK (((tenant_renewal_intent IS NULL) OR (tenant_renewal_intent = ANY (ARRAY['yes'::text, 'no'::text, 'unsure'::text]))))
@@ -7461,6 +7464,7 @@ CREATE TABLE public.properties (
     first_billing_cycle date,
     onboarding_late_fee_waiver boolean,
     estimates_stuck_meters boolean DEFAULT false NOT NULL,
+    move_in_collects_next_period boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -7574,6 +7578,13 @@ COMMENT ON COLUMN public.properties.onboarding_late_fee_waiver IS 'S648: landlor
 --
 
 COMMENT ON COLUMN public.properties.estimates_stuck_meters IS 'S648: landlord setting. TRUE = a stuck or out-of-service submeter on an occupied space bills the low-end usage of occupied neighbours until repaired. FALSE (default) = the meter is flagged broken and bills nothing until it is marked repaired with a fresh starting reading.';
+
+
+--
+-- Name: COLUMN properties.move_in_collects_next_period; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.move_in_collects_next_period IS 'S648: TRUE = a new tenant moving in mid-cycle pays the proration AND the next full month at move-in (that regular bill is then skipped). FALSE = proration only; the next month bills on the regular cycle.';
 
 
 --
@@ -26726,5 +26737,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DOgDa2cF1mzEb41MpovELq43sauWE8ppawyg3lETNhIEYOzsDKppxb80gZS5Zq0
+\unrestrict Zqejw6nNGIdyeW5FsljQVLSeU0aQFiFQ6CtHXNbBNYFcVvqFDjkfEEpauD3AfBb
 

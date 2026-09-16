@@ -16,6 +16,9 @@ beforeEach(async () => { await cleanupAllSchema() })
 afterAll(async () => { await db.end() })
 
 const TAGS = ['pet_deposit', 'utility_deposit', 'move_in_fee', 'pet_rent', 'other_fee']
+// S648: the rest of page 8, plus the page 2 terms it reads from.
+const PAGE8 = ['move_in_first_month_rent', 'move_in_proration', 'move_in_security_deposit', 'move_in_total_due']
+const PAGE2 = ['rent_amount', 'start_date', 'security_deposit']
 
 async function seed(unitType: string) {
   const c = await db.connect()
@@ -29,6 +32,19 @@ async function seed(unitType: string) {
     const tpl = await c.query<{ id: string }>(
       `INSERT INTO lease_templates (landlord_id, name, unit_type, is_unit_type_default, base_pdf_url, is_active)
        VALUES ($1,'Lease',$2,TRUE,'/uploads/lease.pdf',TRUE) RETURNING id`, [landlordId, unitType])
+    await c.query(`UPDATE units SET rent_amount=500, security_deposit=350, available_date='2026-09-16' WHERE id=$1`, [unitId])
+    for (const [i, tag] of [...PAGE2].entries()) {
+      await c.query(
+        `INSERT INTO lease_template_fields
+           (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+         VALUES ($1,'text','landlord',$2,$2,2,10,$3,80,14,FALSE)`, [tpl.rows[0].id, tag, 20 * i + 20])
+    }
+    for (const [i, tag] of [...PAGE8].entries()) {
+      await c.query(
+        `INSERT INTO lease_template_fields
+           (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+         VALUES ($1,'text','landlord',$2,$2,8,200,$3,80,14,FALSE)`, [tpl.rows[0].id, tag, 20 * i + 20])
+    }
     for (const [i, tag] of TAGS.entries()) {
       await c.query(
         `INSERT INTO lease_template_fields
@@ -53,6 +69,7 @@ async function seed(unitType: string) {
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
 
+let lastDoc = ''
 async function draft(f: Awaited<ReturnType<typeof seed>>) {
   const client = await db.connect()
   try {
@@ -69,7 +86,10 @@ async function draft(f: Awaited<ReturnType<typeof seed>>) {
     await client.query('COMMIT')
     const rows = await db.query<{ lease_column: string; value: string | null }>(
       `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1 AND page=8`, [doc.id])
-    return Object.fromEntries(rows.rows.map(r => [r.lease_column, r.value]))
+    lastDoc = doc.id
+    const all = Object.fromEntries(rows.rows.map(r => [r.lease_column, r.value]))
+    for (const k of PAGE8) delete all[k]
+    return all
   } finally { client.release() }
 }
 
@@ -106,5 +126,58 @@ describe('page 8 fee boxes', () => {
       pet_rent: null,
       other_fee: null,
     })
+  })
+})
+
+const page8 = async () => Object.fromEntries((await db.query(
+  `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1 AND lease_column = ANY($2)`,
+  [lastDoc, PAGE8])).rows.map((r: any) => [r.lease_column, r.value]))
+
+describe('S648 page 8 rent lines, deposit copy and total', () => {
+  it('a new mid-month tenant: proration, deposit copied, total adds up', async () => {
+    const f = await seed('apartment')
+    await draft(f)
+    // 500/month from Sept 16 = 250; deposit 350; fees 350 + 100 + 50
+    expect(await page8()).toEqual({
+      move_in_first_month_rent: '0.00', move_in_proration: '250.00',
+      move_in_security_deposit: '350.00', move_in_total_due: '1100.00',
+    })
+  })
+
+  it('a property that collects the next month up front starts with it filled in', async () => {
+    const f = await seed('apartment')
+    await db.query(`UPDATE properties SET move_in_collects_next_period=TRUE WHERE id=$1`, [f.propertyId])
+    await draft(f)
+    expect((await page8()).move_in_first_month_rent).toBe('500.00')
+    expect((await page8()).move_in_total_due).toBe('1600.00')
+  })
+
+  it('an onboarding resident: the month\'s rent, nothing else due', async () => {
+    const f = await seed('apartment')
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
+       VALUES ($1,$2,$3,$4,TRUE)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId])
+    await draft(f)
+    expect(await page8()).toEqual({
+      move_in_first_month_rent: '500.00', move_in_proration: '0.00',
+      move_in_security_deposit: '0.00', move_in_total_due: '500.00',
+    })
+  })
+
+  // Clay Simpson and Martin Alvarado: page 2 said one rent, page 8 another,
+  // and billing followed page 2. For an existing resident the two now cannot
+  // differ — whatever page 2 says, page 8 follows when the landlord signs.
+  it('restamping follows a changed page 2 rent for an onboarding resident', async () => {
+    const f = await seed('apartment')
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
+       VALUES ($1,$2,$3,$4,TRUE)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId])
+    await draft(f)
+    await db.query(`UPDATE lease_document_fields SET value='495.00' WHERE document_id=$1 AND lease_column='rent_amount'`, [lastDoc])
+    await db.query(`UPDATE lease_document_fields SET value='589.00' WHERE document_id=$1 AND lease_column='move_in_first_month_rent'`, [lastDoc])
+    const { restampMoveInBoxes } = await import('./moveInBoxes')
+    await restampMoveInBoxes(db as any, lastDoc)
+    expect((await page8()).move_in_first_month_rent).toBe('495.00')
+    expect((await page8()).move_in_total_due).toBe('495.00')
   })
 })

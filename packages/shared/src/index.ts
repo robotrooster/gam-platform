@@ -2858,6 +2858,11 @@ export const LEASE_COLUMNS = [
   'date_signed',
   // writable (leases table) — core terms
   'rent_amount', 'start_date', 'end_date', 'security_deposit',
+  // S648: page 8 — the move-in invoice. Editable for a new tenant (specials);
+  // copied from the rent and locked for an onboarding resident.
+  'move_in_first_month_rent', 'move_in_proration',
+  // S648: page 8, computed and locked — never typed.
+  'move_in_security_deposit', 'move_in_total_due',
   'rent_due_day', 'lease_type', 'auto_renew', 'auto_renew_mode',
   'notice_days_required', 'expiration_notice_days',
   // writable (leases table) — late fee snapshot columns (see S24)
@@ -2923,6 +2928,10 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   start_date:             'writable',
   end_date:               'writable',
   security_deposit:       'fee_row',  // S196: deprecated as a leases column; now a lease_fees row
+  move_in_first_month_rent: 'writable',
+  move_in_proration:        'writable',
+  move_in_security_deposit: 'identity',   // S648: display only, mirrors page 2
+  move_in_total_due:        'identity',   // S648: display only, computed
   rent_due_day:           'writable',
   lease_type:             'writable',
   auto_renew:             'writable',
@@ -3060,6 +3069,10 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   start_date:             'Lease start date',
   end_date:               'Lease end date',
   security_deposit:       'Security deposit',
+  move_in_first_month_rent: "Move-in — first month's rent",
+  move_in_proration:        'Move-in — proration',
+  move_in_security_deposit: 'Move-in — security deposit (copies the deposit)',
+  move_in_total_due:        'Move-in — total due (calculated)',
   rent_due_day:           'Rent due day',
   lease_type:             'Lease type',
   auto_renew:             'Auto-renew (Yes/No)',
@@ -3142,6 +3155,10 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   start_date:             'date',
   end_date:               'date',
   security_deposit:       'text',
+  move_in_first_month_rent: 'text',
+  move_in_proration:        'text',
+  move_in_security_deposit: 'text',
+  move_in_total_due:        'text',
   rent_due_day:           'text',
   lease_type:             'text',
   auto_renew:             'text',
@@ -3205,6 +3222,8 @@ export type WritableLeaseColumn =
   | 'start_date'
   | 'end_date'
   // S196: 'security_deposit' removed — now a fee_row, not a leases column.
+  | 'move_in_first_month_rent'
+  | 'move_in_proration'
   | 'rent_due_day'
   | 'lease_type'
   | 'auto_renew'
@@ -3266,6 +3285,18 @@ export function normaliseAutoRenewMode(raw: string | null | undefined): string {
 }
 
 export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLeaseColumnSpec> = {
+  // S648: what page 8 says the move-in invoice charges for rent. Absent (an
+  // older template with no tagged box) leaves billing on its original rule.
+  move_in_first_month_rent: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> =>
+      v.move_in_first_month_rent == null || String(v.move_in_first_month_rent).trim() === ''
+        ? {} : { move_in_first_month_rent: parseMoney(v.move_in_first_month_rent) ?? 0 },
+  },
+  move_in_proration: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> =>
+      v.move_in_proration == null || String(v.move_in_proration).trim() === ''
+        ? {} : { move_in_proration: parseMoney(v.move_in_proration) ?? 0 },
+  },
   rent_amount: {
     parse: (v) => {
       if (!v.rent_amount) throw new Error('Template missing rent_amount field — cannot build lease')
@@ -4725,6 +4756,7 @@ export * from './standaloneScroll'
 export * from './chatCadence'
 export * from './paymentAllocation'
 export * from './creditAllocation'
+export * from './moveInCharges'
 export * from './camelize'
 export * from './versionWatch'
 export * from './autoPlaceEstimate'

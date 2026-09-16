@@ -199,11 +199,14 @@ export async function generateMoveInInvoice(
     lease_source: string | null; end_date: string | null
     is_existing_tenancy: boolean; first_billing_cycle: string | null
     onboarding_late_fee_waiver: boolean
+    move_in_first_month_rent: string | null; move_in_proration: string | null
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
             to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
-            COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver
+            COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver,
+            l.move_in_first_month_rent::text AS move_in_first_month_rent,
+            l.move_in_proration::text AS move_in_proration
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -215,7 +218,15 @@ export async function generateMoveInInvoice(
     : null
   const rentForMoveIn = bookingArrival != null
     ? roundHalfEvenCents(bookingArrival)
-    : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy)
+    // S648 (Nic): page 8 IS the move-in invoice. A new tenant is billed the
+    // first month's rent and proration the landlord signed (specials
+    // included). An onboarding resident keeps the full-month rule — their
+    // page 8 is locked to exactly that. A lease with no page 8 values (older
+    // template) keeps the original rule.
+    : (!leaseMeta?.is_existing_tenancy && leaseMeta?.move_in_first_month_rent != null
+        && leaseMeta?.move_in_proration != null)
+      ? roundHalfEvenCents(Number(leaseMeta.move_in_first_month_rent) + Number(leaseMeta.move_in_proration))
+      : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy)
 
   // S631: an existing tenancy's first invoice is dated the 1st of its billing
   // cycle, not the signing date. That is what makes it a September invoice for

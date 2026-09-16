@@ -41,6 +41,8 @@ interface ActiveLease {
   tenant_id: string | null
   property_tz: string
   lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
+  // S648: page 8's first month, when the move-in invoice collected it.
+  move_in_first_month_rent?: string | null
 }
 
 interface MonthlyFee {
@@ -215,13 +217,13 @@ export async function generateFinalUtilityInvoice(
 }
 
 /**
- * Generate (or catch up) invoices for all active leases.
- * Called daily by cron.
+ * S648: ONE lease query for every generator. There were three copies, and the
+ * one production actually runs (generateInvoicesForTimezone) had drifted: it
+ * never loaded is_existing_tenancy (so the S639 first-bill waiver stamp never
+ * fired from the daily run) and never excluded hibernating leases (so a
+ * snowbird's paused lease would still have been billed).
  */
-export async function generateInvoices(
-  nowUtc: Date = new Date()
-): Promise<InvoiceGenResult> {
-  const leases = await query<ActiveLease>(`
+const ACTIVE_LEASE_SELECT = `
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
            l.lease_source,
            -- S639: somebody who was already living there when the park came onto
@@ -229,6 +231,7 @@ export async function generateInvoices(
            -- took to sign — see lateStartExempt below.
            l.is_existing_tenancy,
            COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
+           l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
@@ -245,8 +248,16 @@ export async function generateInvoices(
       -- rent/utility invoices. No invoice → nothing pulled off the ACH mandate,
       -- so the snowbird is never charged in the off-season. Resume clears the
       -- flag and billing restarts.
-      AND l.is_hibernating = false
-  `)
+      AND l.is_hibernating = false`
+
+/**
+ * Generate (or catch up) invoices for all active leases.
+ * Called daily by cron.
+ */
+export async function generateInvoices(
+  nowUtc: Date = new Date()
+): Promise<InvoiceGenResult> {
+  const leases = await query<ActiveLease>(ACTIVE_LEASE_SELECT)
 
   return runGeneration(leases, nowUtc)
 }
@@ -304,7 +315,18 @@ async function runGeneration(
     // lease start — so a start-month match is necessarily on/after move-in;
     // it can never drop a legitimately earlier same-month cycle.)
     const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
-    const dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+    let dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+    // S648 (Nic): a new tenant who moved in mid-month and paid page 8's
+    // "first month's rent" on top of the proration has ALREADY paid the next
+    // due date. Billing it again would charge that month twice.
+    const paidNextAtMoveIn = !lease.is_existing_tenancy
+      && Number(lease.move_in_first_month_rent ?? 0) > 0
+      && Number(lease.start_date.slice(8, 10)) !== Number(lease.rent_due_day)
+    if (paidNextAtMoveIn) {
+      const firstAfter = dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), lease.rent_due_day)
+        .find(d => d.slice(0, 7) !== startMonth)
+      if (firstAfter) dueDates = dueDates.filter(d => d !== firstAfter)
+    }
     if (dueDates.length === 0) continue
 
     // Load monthly fees once per lease
@@ -1138,23 +1160,9 @@ export async function generateInvoicesForTimezone(
   tz: string,
   nowUtc: Date = new Date()
 ): Promise<InvoiceGenResult> {
-  const leases = await query<ActiveLease>(`
-    SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
-           l.lease_source,
-           to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
-           to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
-           (SELECT vlat.tenant_id
-              FROM v_lease_active_tenants vlat
-              WHERE vlat.lease_id = l.id AND vlat.role = 'primary'
-              LIMIT 1) AS tenant_id,
-           p.timezone AS property_tz
-    FROM leases l
-    JOIN units u ON u.id = l.unit_id
-    JOIN properties p ON p.id = u.property_id
-    WHERE l.status = 'active'
-      AND (l.needs_review IS NULL OR l.needs_review = false)
-      AND p.timezone = $1
-  `, [tz])
+  const leases = await query<ActiveLease>(
+    ACTIVE_LEASE_SELECT + `
+      AND p.timezone = $1`, [tz])
 
   return runGeneration(leases, nowUtc)
 }
@@ -1200,6 +1208,11 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
   const leases = await query<ActiveLease>(`
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
            l.lease_source,
+           -- S648: the same fields as ACTIVE_LEASE_SELECT; a catch-up must bill
+           -- exactly as the daily run does.
+           l.is_existing_tenancy,
+           COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
+           l.move_in_first_month_rent::text AS move_in_first_month_rent,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id

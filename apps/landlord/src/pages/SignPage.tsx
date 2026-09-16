@@ -2,7 +2,8 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
-import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone } from '@gam/shared'
+import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone,
+  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
 
@@ -389,6 +390,62 @@ export function SignPage() {
 
   useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
+
+  // ── S648 (Nic): PAGE 8 ADDS ITSELF UP AS YOU TYPE ─────────────────────
+  //   "The total should still calculate everything from those and not be
+  //    typable." "Page eight security deposit copies page two."
+  // The server recomputes the same numbers when you sign (moveInBoxes.ts);
+  // this is so the page you are signing already shows them.
+  const autoProration = useRef<string | null>(null)
+  useEffect(() => {
+    if (!data?.fields) return
+    const fs: any[] = data.fields
+    const existing = !!data.existingTenancy
+    const val = (col: string) => {
+      const f = fs.find(x => x.leaseColumn === col && (fieldValues[x.id] ?? '').trim() !== '')
+      return f ? fieldValues[f.id] : null
+    }
+    const toIso = (v: string | null) => {
+      if (!v) return null
+      if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v.slice(0, 10)
+      const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(v.trim())
+      return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : null
+    }
+    const moveInFeeTags = FEE_TYPES.filter(t => t !== 'security_deposit' && t !== 'other_fee'
+      && FEE_TYPE_META[t].dueTiming === 'move_in')
+    const want: Record<string, string> = {}
+    const rent = moneyBoxValue(val('rent_amount'))
+    if (existing) {
+      want.move_in_first_month_rent = rent.toFixed(2)
+      want.move_in_proration = '0.00'
+      for (const t of moveInFeeTags) want[t] = '0.00'
+    } else {
+      // Proration follows the start date and rent until the landlord types
+      // their own figure over it (a special) — then it is theirs.
+      const start = toIso(val('start_date'))
+      const current = val('move_in_proration')
+      const auto = start ? prorateMoveInRent(rent, start).toFixed(2) : null
+      if (auto != null && (current == null || current === autoProration.current)) {
+        want.move_in_proration = auto
+        autoProration.current = auto
+      }
+    }
+    const first = want.move_in_first_month_rent ?? val('move_in_first_month_rent')
+    const prorate = want.move_in_proration ?? val('move_in_proration')
+    const deposit = moveInDepositMirror(val('security_deposit'), existing)
+    want.move_in_security_deposit = deposit.toFixed(2)
+    want.move_in_total_due = moveInTotalDue({
+      firstMonthRent: first, proration: prorate, depositMirror: deposit,
+      moveInFees: moveInFeeTags.map(t => want[t] ?? val(t)),
+    }).toFixed(2)
+    const updates: Record<string, string> = {}
+    for (const f of fs) {
+      if (!f.leaseColumn || !(f.leaseColumn in want)) continue
+      if (f.signerRole !== 'landlord' || f.mine === false || data.readOnly) continue
+      if ((fieldValues[f.id] ?? '') !== want[f.leaseColumn]) updates[f.id] = want[f.leaseColumn]
+    }
+    if (Object.keys(updates).length) setFieldValues(prev => ({ ...prev, ...updates }))
+  }, [data, fieldValues])
   useEffect(() => {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
@@ -670,9 +727,17 @@ export function SignPage() {
             // change the term you change the template, and the document
             // follows.
             const DERIVED_LOCKED = new Set(['lease_type', 'end_date'])
+            // S648 (Nic): an onboarding resident's page 8 is not a move-in —
+            // their first month is the rent and every move-in fee is $0.
+            const ONBOARDING_LOCKED = data.existingTenancy && !!f.leaseColumn && (
+              f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration'
+              || (LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'fee_row'
+                  && f.leaseColumn !== 'security_deposit' && f.leaseColumn !== 'other_fee'
+                  && FEE_TYPE_META[f.leaseColumn as keyof typeof FEE_TYPE_META]?.dueTiming === 'move_in'))
             const locked = !!val && !!f.leaseColumn && (
               LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
               || DERIVED_LOCKED.has(f.leaseColumn)
+              || ONBOARDING_LOCKED
             )
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'

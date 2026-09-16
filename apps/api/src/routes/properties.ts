@@ -1055,6 +1055,21 @@ propertiesRouter.post('/:id/onboarding-complete', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/move-in-collection — S648 (Nic). Whether a new
+// tenant moving in mid-month pays the proration only, or the proration AND the
+// next full month. Property-wide on purpose: the same up-front ask for everyone.
+propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { collectsNextPeriod } = z.object({ collectsNextPeriod: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET move_in_collects_next_period = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, collectsNextPeriod])
+    res.json({ success: true, data: { propertyId: req.params.id, moveInCollectsNextPeriod: collectsNextPeriod } })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/properties/:id/broken-meter-estimate — S648 (Nic). Whether a
 // broken or stuck submeter on an occupied space bills the low end of what
 // occupied neighbours used, or nothing until it is repaired. The landlord's
