@@ -1392,6 +1392,22 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // S196: security_deposit no longer passed as a separate input — it
   // flows in via the lease_fees move_in iteration inside
   // generateMoveInInvoice.
+  // S647: pass the date POSTGRES STORED, not the raw field string.
+  //
+  // `startDate` is whatever was typed into the document. RV 09 held
+  // "10/01/2026" — a US-format date the lease column parsed correctly to
+  // 2026-10-01, while the invoice used the raw string. existingTenancyCycle
+  // compares cycles as STRINGS, so "2026-09-01" > "10/01/2001" came out true
+  // and a tenancy starting 1 October was invoiced for September. A month of
+  // rent, billed to somebody who does not live there yet.
+  //
+  // The lease row is the only thing that has already been through date
+  // parsing, so it is the only safe source. Reading it back also costs nothing
+  // next to being wrong about which month a resident owes.
+  const storedStart: string = await client.query(
+    `SELECT to_char(start_date, 'YYYY-MM-DD') AS d FROM leases WHERE id = $1`,
+    [lease.id]).then((r: any) => r.rows[0].d)
+
   await generateMoveInInvoice(
     {
       lease_id: lease.id,
@@ -1399,7 +1415,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       tenant_id: primarySigner.tenant_id,
       landlord_id: doc.landlord_id,
       rent_amount: rentAmountNum,
-      start_date: startDate,
+      start_date: storedStart,
     },
     client
   )

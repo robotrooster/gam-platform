@@ -92,6 +92,7 @@ export function moveInRentAmount(
   startDate: string,
   isExistingTenancy = false,
 ): number {
+  assertIsoDate(startDate, 'moveInRentAmount')
   // An existing tenancy always owes a whole month — the cycle it lands on is
   // decided by existingTenancyCycle(), not by how much of it had elapsed.
   if (isExistingTenancy) return roundHalfEvenCents(rentAmount)
@@ -121,10 +122,29 @@ export function moveInRentAmount(
  * residents up in September is normally billing them for September, and that is
  * also the reading that never silently skips a month.
  */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}/
+
+/**
+ * S647: refuse a date this function cannot reason about.
+ *
+ * Both helpers below slice and string-compare dates, which silently produces a
+ * wrong ANSWER rather than an error when handed "10/01/2026" — and the answer
+ * is which month a resident is billed for. It cost RV 09 a September invoice on
+ * an October tenancy. Callers pass the stored column now; this makes sure a
+ * future one that doesn't finds out immediately.
+ */
+function assertIsoDate(d: string, fn: string): void {
+  if (!ISO_DATE.test(d)) {
+    throw new Error(`${fn}: expected an ISO date (YYYY-MM-DD), got "${d}". ` +
+      'Pass the stored lease column, not a raw document field.')
+  }
+}
+
 export function existingTenancyCycle(
   startDate: string,
   firstBillingCycle: string | null,
 ): string {
+  assertIsoDate(startDate, 'existingTenancyCycle')
   const leaseMonth = startDate.slice(0, 8) + '01'
   if (!firstBillingCycle) return leaseMonth
   const declared = String(firstBillingCycle).slice(0, 8) + '01'
