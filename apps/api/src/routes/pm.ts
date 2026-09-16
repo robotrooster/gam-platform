@@ -1320,16 +1320,21 @@ pmRouter.get('/my-statements', async (req: any, res, next) => {
       ? req.query.month
       : new Date().toISOString().slice(0, 7)
 
-    // Only relationships the owner has actually been let into. An owner whose
-    // portal was never opened still HAS statements — their manager sends them —
-    // but they do not read them here, because nobody switched that on.
+    // S645 — EVERY manager, not only the ones who opened a portal.
+    //
+    // This used to require portal_access = 'active', which meant an owner whose
+    // book was split between two managers saw only the half that had switched
+    // them on. Nic: "the owner portal can still see all of their properties...
+    // I don't want to have to log in to see half my properties and log into a
+    // different thing to see the other half." These are their own entities;
+    // access is not a manager's to grant for an owner's own money.
     const rels = await query<any>(
       `SELECT r.landlord_id, r.pm_company_id, c.name AS pm_name, l.business_name
          FROM pm_owner_relationships r
          JOIN pm_companies c ON c.id = r.pm_company_id
          JOIN landlords l    ON l.id = r.landlord_id
         WHERE r.landlord_id = ANY($1::uuid[])
-          AND r.status = 'active' AND r.portal_access = 'active'
+          AND r.status = 'active'
         ORDER BY c.name`,
       [scope])
 
@@ -1346,6 +1351,30 @@ pmRouter.get('/my-statements', async (req: any, res, next) => {
       })
     }
     res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pm/my-portfolio?months=12
+//
+// Nic (S645, DIRECTIVE): "I don't want to have to log in to see half my
+// properties and log into a different thing to see the other half... I want to
+// be able to do side-by-side comparison on who's filling vacancies faster,
+// who's handling evictions promptly, who's collecting on time."
+//
+// EVERY property the account owns, grouped by who runs it, self-managed
+// included. Deliberately NOT gated on portal_access: these are the owner's own
+// properties and an owner does not need a manager's permission to look at their
+// own portfolio. The flag records that a manager onboarded them to the
+// statement flow; it was never meant to hide half an owner's book from them.
+pmRouter.get('/my-portfolio', async (req: any, res, next) => {
+  try {
+    const mine = landlordScopeIds(req.user!)
+    if (mine.length === 0) throw new AppError(403, 'No owned entity on this account')
+    const months = typeof req.query.months === 'string'
+      ? Math.min(60, Math.max(1, Number(req.query.months) || 12))
+      : 12
+    const { ownerPortfolio } = await import('../services/ownerPortfolio')
+    res.json({ success: true, data: await ownerPortfolio({ landlordIds: mine, months }) })
   } catch (e) { next(e) }
 })
 

@@ -83,6 +83,7 @@ import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { LotRentPage } from './pages/LotRentPage'
 import { ExpensesPage } from './pages/ExpensesPage'
+import { MyManagersPage } from './pages/MyManagersPage'
 import { BankPage } from './pages/BankPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
@@ -295,6 +296,7 @@ function App() {
                 <Route path="disbursements"  element={<DisbursementsPage />} />
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
+                <Route path="my-managers"    element={<MyManagersPage />} />
                 {/* S605: one Bank tab. The old paths redirect so existing
                     links and bookmarks don't 404. */}
                 <Route path="bank"           element={<BankPage />} />

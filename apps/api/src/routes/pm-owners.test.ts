@@ -262,13 +262,74 @@ describe('portal access', () => {
 })
 
 describe('what an owner reads for themselves', () => {
-  it('nothing at all until somebody opened the portal', async () => {
+  // S645 — CHANGED DELIBERATELY. This used to assert an owner saw nothing until
+  // a manager opened their portal. Nic: "the owner portal can still see all of
+  // their properties... I don't want to have to log in to see half my properties
+  // and log into a different thing to see the other half." An owner whose book
+  // is split between two managers was seeing only the half that had switched
+  // them on. These are their own entities; access to their own money was never
+  // a manager's to grant.
+  it('their own statement even before any manager opened a portal', async () => {
     const o = await managedOwner()
     const res = await request(buildApp())
       .get('/api/pm/my-statements')
       .set('Authorization', `Bearer ${o.ownerToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data).toHaveLength(0)
+    expect(res.body.data).toHaveLength(1)
+    expect(res.body.data[0].statement.landlordId).toBe(o.landlordId)
+  })
+
+  it('both halves of a split portfolio in one call', async () => {
+    // The case Nic described: half with one manager, half with another.
+    const client = await getClient()
+    let landlordId: string, ownerToken: string
+    try {
+      const seeded = await seedLandlord(client)
+      landlordId = seeded.landlordId
+      ownerToken = tokenFor(seeded.userId, 'landlord', { landlordIds: [landlordId] })
+      const bankId = await seedUserBankAccount(client, { userId: seeded.userId })
+      for (const name of ['Able Management', 'Baker Property Co']) {
+        const c = await client.query<{ id: string }>(
+          `INSERT INTO pm_companies (name, bank_account_id) VALUES ($1,$2) RETURNING id`,
+          [name, bankId])
+        const propertyId = await seedProperty(client, {
+          landlordId, ownerUserId: seeded.userId, managedByUserId: seeded.userId })
+        await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`,
+          [propertyId, c.rows[0].id])
+        await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      }
+    } finally { client.release() }
+
+    const res = await request(buildApp())
+      .get('/api/pm/my-statements')
+      .set('Authorization', `Bearer ${ownerToken!}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(2)
+    expect(res.body.data.map((d: any) => d.pmCompanyName).sort())
+      .toEqual(['Able Management', 'Baker Property Co'])
+  })
+
+  it('scores the two managers side by side on one screen', async () => {
+    const o = await managedOwner()
+    const res = await request(buildApp())
+      .get('/api/pm/my-portfolio')
+      .set('Authorization', `Bearer ${o.ownerToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.managers.length).toBeGreaterThan(0)
+    expect(res.body.data.managers[0]).toHaveProperty('onTimeRatePct')
+    expect(res.body.data.managers[0]).toHaveProperty('avgDaysToFill')
+    // Eviction promptness is named as unmeasured rather than shown as a zero.
+    expect(res.body.data.notMeasured.join(' ')).toMatch(/eviction/i)
+  })
+
+  it('refuses the portfolio to a manager\'s staff session', async () => {
+    const o = await managedOwner()
+    const staff = await pmStaffUser()
+    await makeStaff(o.pmCompanyId, staff.userId)
+    const res = await request(buildApp())
+      .get('/api/pm/my-portfolio')
+      .set('Authorization', `Bearer ${staff.token}`)
+    expect(res.status).toBe(403)
   })
 
   it('their own statement once it is open', async () => {

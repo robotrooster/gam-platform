@@ -76,6 +76,10 @@ const NAV_ITEMS: Array<{
   { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports' },
   // S568: landlord expense entry (feeds the P&L). Owner-level.
   { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
+  // S645 (Nic): an owner whose book is split between managers reads it here,
+  // in one place, with the managers side by side. Owner-level like the rest of
+  // the financials hub — it is a judgement about the people they hired.
+  { to: '/my-managers',   icon: BarChart2,        label: 'My Managers',      section: null, hub: 'financials' },
   // S605 (Nic): ONE Bank tab. Feed (S570) + reconciliation (S568) were two nav
   // items answering one question — "is my bank money right?" — because
   // reconciliation was built as the manual stand-in before the feed existed and
