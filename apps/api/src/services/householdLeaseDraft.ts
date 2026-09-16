@@ -224,7 +224,7 @@ export async function draftPendingForUnitType(args: {
          FROM pending_tenant_intents pti
          JOIN units u2 ON u2.id = pti.unit_id
         WHERE pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
-          AND pti.accepted_at IS NOT NULL
+          -- S647: no longer waits for acceptance; see autoDraftLeasesForUnit.
           AND pti.draft_document_id IS NULL
      ) AS u
      WHERE u.landlord_id = $1
@@ -249,7 +249,7 @@ export async function draftPendingForUnitType(args: {
     const intentWaiting = await queryOne<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
         WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
-          AND accepted_at IS NOT NULL AND draft_document_id IS NULL`, [unit_id])
+          AND draft_document_id IS NULL`, [unit_id])
     if (Number(intentWaiting?.n || 0) > 0) {
       const client = await getClient()
       try {
@@ -276,11 +276,6 @@ export async function draftPendingForUnitType(args: {
           // unbuilt RV template, and a household genuinely waiting on a
           // co-tenant looks identical to one blocked on setup.
           const tmpl = await resolveDefaultTemplateForUnit(unit_id)
-          const waiting = await queryOne<{ n: string }>(
-            `SELECT COUNT(*)::text AS n FROM pending_tenant_intents
-              WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL
-                AND accepted_at IS NULL`, [unit_id])
-          const stillToAccept = Number(waiting?.n || 0)
           const tmplFields = tmpl ? await queryOne<{ n: string }>(
             `SELECT COUNT(*)::text AS n FROM lease_template_fields WHERE template_id = $1`,
             [tmpl.id]) : null
@@ -297,13 +292,12 @@ export async function draftPendingForUnitType(args: {
               // on the household", which sent Nic looking at his residents.
               ? 'That unit type’s default template has no fields saved yet — open it in the '
                 + 'template editor and save the auto-placed fields.'
-            : stillToAccept > 0
-              ? `Waiting on ${stillToAccept} more of the household to accept`
-              // Everyone accepted, the template looks complete, and drafting
-              // still refused — the reason is specific (e.g. the late-fee policy
-              // must appear in the document) and was sent as its own
-              // notification. Never guess at it here.
-              : 'The draft was refused — see the "Lease could not be drafted automatically" '
+              // S647: "waiting on the household to accept" is gone as a reason —
+              // drafting no longer waits for acceptance at all. With the template
+              // complete and drafting still refused, the reason is specific (e.g.
+              // the late-fee policy must appear in the document) and was sent as
+              // its own notification. Never guess at it here.
+            : 'The draft was refused — see the "Lease could not be drafted automatically" '
                 + 'notification for the reason.')
         }
       } catch (e: any) {
@@ -377,8 +371,7 @@ export async function draftAllPendingLeases(): Promise<{ drafted: number; skippe
      SELECT DISTINCT pti.landlord_id, u.unit_type
        FROM pending_tenant_intents pti
        JOIN units u ON u.id = pti.unit_id
-      WHERE pti.accepted_at IS NOT NULL
-        AND pti.draft_document_id IS NULL
+      WHERE pti.draft_document_id IS NULL
         AND pti.resolved_at IS NULL
         AND pti.cancelled_at IS NULL
         AND u.unit_type IS NOT NULL`)

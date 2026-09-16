@@ -149,19 +149,25 @@ describe('onboard-new-lease-tenant (Flow B)', () => {
 })
 
 describe('accept → auto-draft', () => {
-  it('whole_unit: drafts ONE shared lease once both co-tenants accept, deposit + term pre-filled', async () => {
+  // S647 (Nic, DIRECTIVE): "I want to sign my side of the lease for everybody
+  // even before they accept the portal invite." This test used to prove the
+  // opposite — that nothing drafted until the whole household had accepted.
+  it('whole_unit: drafts ONE shared lease for the household BEFORE anyone accepts, deposit + term pre-filled', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1.5, 12)
     const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, eA, 'Aaa'); await onboard(f, eB, 'Bbb')
 
-    // First accept: roster incomplete → no draft yet.
-    await accept(await inviteToken(eA))
-    expect((await draftsForUnit(f.unitId)).length).toBe(0)
+    // Nobody has accepted. The second invite voided the one-person draft and
+    // re-drafted it with both, so exactly one live lease is waiting on the
+    // landlord's signature.
+    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    expect(live.length).toBe(1)
 
-    // Second accept: roster complete → one draft.
+    // Accepting afterwards does not draft a second copy.
+    await accept(await inviteToken(eA))
     await accept(await inviteToken(eB))
-    const drafts = await draftsForUnit(f.unitId)
+    const drafts = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
     expect(drafts.length).toBe(1)
     const roles = await signerRoles(drafts[0].id)
     expect(roles).toContain('landlord')
@@ -203,22 +209,36 @@ describe('accept → auto-draft', () => {
     await seedDefaultTemplate(f.landlordId, 1, 12)
     const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`, eC = `c-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, eA, 'Aaa'); await onboard(f, eB, 'Bbb')
-    await accept(await inviteToken(eA)); await accept(await inviteToken(eB))
     const first = await draftsForUnit(f.unitId)
     expect(first.filter(d => d.status !== 'voided').length).toBe(1)
+    const firstLiveId = first.find(d => d.status !== 'voided')!.id
 
-    // Add a 3rd co-tenant → the unsigned draft voids.
+    // Add a 3rd co-tenant → the unsigned draft voids and re-drafts with all
+    // three straight away (S647: drafting no longer waits for acceptance).
     const add = await onboard(f, eC, 'Ccc')
     expect(add.status).toBe(200)
     const afterAdd = await draftsForUnit(f.unitId)
-    expect(afterAdd.every(d => d.status === 'voided')).toBe(true)
-
-    // 3rd accepts → re-draft now includes all three.
-    await accept(await inviteToken(eC))
-    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    expect(afterAdd.find(d => d.id === firstLiveId)!.status).toBe('voided')
+    const live = afterAdd.filter(d => d.status !== 'voided')
     expect(live.length).toBe(1)
     const roles = await signerRoles(live[0].id)
     expect(roles).toContain('co_tenant_2')
+  })
+
+  // S647: once the landlord has signed, the lease is issued and billing. Voiding
+  // it to re-draft with an extra person would orphan a live lease and invoice.
+  it('whole_unit: refuses to add a co-tenant once the landlord has signed', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    const live = (await draftsForUnit(f.unitId)).filter(d => d.status !== 'voided')
+    await db.query(`UPDATE lease_documents SET issued_at = NOW() WHERE id = $1`, [live[0].id])
+
+    const add = await onboard(f, `b-${randomUUID().slice(0, 6)}@x.dev`, 'Bbb')
+    expect(add.status).toBe(409)
+    expect(add.body.error).toMatch(/addendum/i)
+    const still = await db.query(`SELECT status FROM lease_documents WHERE id=$1`, [live[0].id])
+    expect(still.rows[0].status).not.toBe('voided')
   })
 })
 
@@ -231,6 +251,12 @@ describe('accept → auto-draft: draft failure is contained', () => {
     await seedDefaultTemplate(f.landlordId, 1.5, 12) // resolveDefaultTemplate returns a template
     const email = `fail-${randomUUID().slice(0, 6)}@x.dev`
     await onboard(f, email) // creates the unit-bound pending intent (+ user + tenant)
+    // S647: the invite now drafts on its own. Clear that so this test still
+    // exercises what it is about — a draft that FAILS inside the accept txn.
+    await db.query(
+      `UPDATE lease_documents SET status='voided' WHERE unit_id=$1`, [f.unitId])
+    await db.query(
+      `UPDATE pending_tenant_intents SET draft_document_id=NULL WHERE unit_id=$1`, [f.unitId])
 
     const client = await db.connect()
     try {
@@ -276,7 +302,7 @@ describe('accept → auto-draft: draft failure is contained', () => {
 //
 // Every test here asserted the document EXISTS. None asserted anyone was told
 // about it, which is why a year of drafts could go out unsent without a failure.
-describe('S636 an accepted household gets a lease that is actually sent', () => {
+describe('S636 an invited household gets a lease that is actually sent', () => {
   it('the drafted document reaches status sent, and the landlord is the one invited', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1.5, 12)
@@ -285,8 +311,10 @@ describe('S636 an accepted household gets a lease that is actually sent', () => 
     await accept(await inviteToken(eA))
     await accept(await inviteToken(eB))
 
+    // S647: the household was drafted at invite time — the second invite voided
+    // the one-person copy — so only the live document counts.
     const { rows } = await db.query<any>(
-      `SELECT id, status FROM lease_documents WHERE unit_id = $1`, [f.unitId])
+      `SELECT id, status FROM lease_documents WHERE unit_id = $1 AND status <> 'voided'`, [f.unitId])
     expect(rows).toHaveLength(1)
     // THE POINT: not 'pending'. A draft nobody was told about helps no one.
     expect(rows[0].status).toBe('sent')
@@ -299,5 +327,63 @@ describe('S636 an accepted household gets a lease that is actually sent', () => 
     expect(signers.rows[0].role).toBe('landlord')
     expect(signers.rows[0].invite_sent).toBe(true)
     expect(signers.rows.slice(1).every((s: any) => s.invite_sent === false)).toBe(true)
+  })
+})
+
+// ─── S647: what the front desk sees ──────────────────────────────────────────
+//
+// Nic: "it's still saying waiting on them to accept the invite is 16 people. I
+// want to sign my end of the lease for… [them]." Two things had to become true
+// on the pending list for that to work, and neither had a test before.
+describe('S647 the front desk after drafting moved to invite time', () => {
+  async function pending(f: Base) {
+    const r = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(r.status).toBe(200)
+    return r.body.data as any[]
+  }
+
+  it('an invited, unaccepted person reads as invited — not accepted — and waits on the landlord', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+
+    const [row] = await pending(f)
+    // Being named on a draft used to count as proof of acceptance. It isn't now.
+    expect(row.inviteState).toBe('invited')
+    expect(row.leaseDocStatus).toBeTruthy()
+    expect(row.leaseWaitingOnRole).toBe('landlord')
+  })
+
+  it('stays on the list after the landlord signs, while the tenant still owes theirs', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    // Simulate issuance: the landlord has signed, the lease is built, and S638
+    // has closed the invite.
+    const [before] = await pending(f)
+    await db.query(
+      `UPDATE lease_document_signers SET status='signed', signed_at=NOW()
+        WHERE document_id=$1 AND role='landlord'`, [before.leaseDocId])
+    await db.query(
+      `UPDATE lease_documents SET status='in_progress', issued_at=NOW() WHERE id=$1`,
+      [before.leaseDocId])
+    await db.query(
+      `UPDATE pending_tenant_intents SET resolved_at=NOW() WHERE unit_id=$1`, [f.unitId])
+
+    const rows = await pending(f)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].leaseWaitingOnRole).toBe('primary')
+  })
+
+  it('drops off once the lease is fully signed', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    const [before] = await pending(f)
+    await db.query(`UPDATE lease_documents SET status='completed' WHERE id=$1`, [before.leaseDocId])
+    await db.query(`UPDATE pending_tenant_intents SET resolved_at=NOW() WHERE unit_id=$1`, [f.unitId])
+    expect(await pending(f)).toHaveLength(0)
   })
 })

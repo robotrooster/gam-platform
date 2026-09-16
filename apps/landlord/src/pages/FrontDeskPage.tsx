@@ -119,7 +119,10 @@ function classify(r: Row): { phase: PhaseId; say: string } {
   if (r.inviteState === 'accepted') {
     if (household.length > 0) {
       return { phase: 'awaiting_household',
-        say: `${first} is in. Their lease drafts as soon as ${joinNames(household)} accept${household.length === 1 ? 's' : ''} their portal invite — ask ${first} to nudge them.` }
+        // S647: leases draft at invite time now, so an accepted person with no
+        // lease document means drafting did not happen (usually the template) —
+        // not that the household is holding it up.
+        say: `${first} is in. ${joinNames(household)} still ${household.length === 1 ? 'has' : 'have'} to accept their portal invite — ask ${first} to nudge them. Their lease hasn't been drafted yet; check E-Sign.` }
     }
     return { phase: 'done', say: `${first} has accepted. Their lease is being prepared — nothing needed.` }
   }
@@ -129,7 +132,9 @@ function classify(r: Row): { phase: PhaseId; say: string } {
   return { phase: 'awaiting_accept',
     say: expired
       ? `${first}'s invite has expired. Re-send it from the pending pool, then ask them to accept.`
-      : `Ask ${first} to accept the portal invite in their email — the lease cannot be drafted until they do.` }
+      // S647: the lease no longer waits for acceptance — the landlord signs
+      // first — so the old "cannot be drafted until they do" was false.
+      : `Ask ${first} to accept the portal invite in their email.` }
 }
 
 const money = (n: number) =>

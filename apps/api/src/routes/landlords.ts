@@ -2395,6 +2395,15 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
           `SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1`,
           [draft.draft_document_id]).then((r: any) => r.rows[0])
         if (tenantSigned) throw new AppError(409, 'A tenant has already signed the lease for this unit — void or supersede it before adding another person.')
+        // S647: YOUR signature counts too now. Since issuance, the landlord
+        // signing is what creates the lease and bills it — so voiding that
+        // document to re-draft with an extra person would orphan a live lease
+        // and its invoice. Same answer as a tenant signature: add them by
+        // addendum instead.
+        const issued = await client.query(
+          `SELECT 1 FROM lease_documents WHERE id=$1 AND issued_at IS NOT NULL`,
+          [draft.draft_document_id]).then((r: any) => r.rows[0])
+        if (issued) throw new AppError(409, 'You have already signed the lease for this unit, so it is live and billing. Add this person with an addendum instead.')
         await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [draft.draft_document_id])
         await client.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL, updated_at=NOW() WHERE unit_id=$1 AND draft_document_id=$2`, [unitId, draft.draft_document_id])
       }
@@ -2529,11 +2538,43 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       }
     }
 
+    // S647 (Nic, DIRECTIVE): "I want to sign my side of the lease for everybody
+    // even before they accept the portal invite."
+    //
+    // Draft the lease NOW rather than on acceptance, so the household lands in
+    // "Waiting on you to sign" the moment it is invited. After the screening
+    // waive on purpose: the send path's screening gate needs to see it.
+    //
+    // Best-effort and post-commit, like everything around it. The invite is
+    // done and must not be undone by a template problem — and a draft that
+    // fails here still gets retried by the sweep and on acceptance, and the
+    // failure is surfaced to the landlord by autoDraftLeasesForUnit itself.
+    let draftedDocumentIds: string[] = []
+    const draftClient = await getClient()
+    try {
+      await draftClient.query('BEGIN')
+      const { autoDraftLeasesForUnit } = await import('../services/leaseOnboarding')
+      const { createDocumentRecord, autoSendDraftedDocument } = await import('./esign')
+      const out = await autoDraftLeasesForUnit(draftClient as any, unitId, createDocumentRecord)
+      await draftClient.query('COMMIT')
+      draftedDocumentIds = out.draftedDocumentIds
+      // After commit — the sender reads through the pool (S636).
+      for (const docId of draftedDocumentIds) {
+        await autoSendDraftedDocument(docId, { emailFirstSigner: false }).catch(err =>
+          logger.error({ err, docId }, '[ONBOARD-NEW-LEASE] send after invite-time draft failed'))
+      }
+    } catch (draftErr) {
+      await draftClient.query('ROLLBACK').catch(() => {})
+      logger.error({ err: draftErr, ctx: unitId }, '[ONBOARD-NEW-LEASE] invite-time draft failed')
+    } finally {
+      draftClient.release()
+    }
+
     // S616: the landlord is told which of the two actually happened, so the
     // screen never claims an invite was sent when a lease was drafted instead.
     res.json({ success: true, data: {
       userId, tenantId, email: emailNorm, unitId, activationUrl, screeningWaived,
-      alreadyOnPlatform,
+      alreadyOnPlatform, draftedDocumentIds,
     } })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -3108,8 +3149,13 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
            WHEN EXISTS (SELECT 1 FROM pending_tenant_intents a
                          WHERE a.tenant_id = pti.tenant_id
                            AND a.accepted_at IS NOT NULL) THEN 'accepted'
-           WHEN EXISTS (SELECT 1 FROM lease_document_signers lds
-                         WHERE lds.user_id = u.id)      THEN 'accepted'
+           -- S647: "is named on a lease document" is NO LONGER proof of
+           -- acceptance, and this line is removed rather than kept as a last
+           -- resort. It leaned on leaseOnboarding refusing to draft until
+           -- everyone accepted; since S647 it drafts at invite time so the
+           -- landlord can sign first. Left in, every freshly invited person
+           -- would read as 'accepted' the moment their lease was drafted — the
+           -- exact people Nic is trying to count as still waiting.
            WHEN u.tenant_invite_token IS NOT NULL       THEN 'invited'
            WHEN u.tenant_invite_sent_at IS NOT NULL     THEN 'invited'
            ELSE 'not_invited'
@@ -3136,7 +3182,16 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
          -- waiver-audit fallback is included so a grandfathered resident is
          -- scoped by the unit their waiver names, not dropped from every list.
          AND ($2::uuid[] IS NULL OR COALESCE(pr.id, wpr.id) = ANY($2::uuid[]))
-         AND pti.resolved_at IS NULL
+         -- S647: a CLOSED invite still belongs here while its lease is unsigned.
+         --
+         -- S638 closes the invite when the lease is built ("a signed lease
+         -- closes the invite"), which used to mean every signer was done. Since
+         -- S647 the lease is built on the LANDLORD's signature, so the invite
+         -- closes while the tenant still owes theirs — and the household fell
+         -- off this page at exactly the moment the desk needed to ask them to
+         -- sign. Six did, the day issuance shipped.
+         AND (pti.resolved_at IS NULL
+              OR (ld.id IS NOT NULL AND ld.status NOT IN ('completed','voided')))
          AND pti.cancelled_at IS NULL
          -- S636 (Nic): "It's double sending things. The pending pool has two
          -- Blanca Avalos, two Little Joe Martinez. It's doubling people that

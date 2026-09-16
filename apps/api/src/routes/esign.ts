@@ -4158,7 +4158,18 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
  * to send must still exist and still be sendable by hand; losing the draft
  * because an email bounced would be worse than the button it replaces.
  */
-export async function autoSendDraftedDocument(documentId: string): Promise<boolean> {
+export async function autoSendDraftedDocument(
+  documentId: string,
+  // S647: a draft made the moment the landlord clicks Invite does not need an
+  // email telling that same landlord to sign it — they are looking at the
+  // "Waiting on you to sign" list it just joined. Worse, a household invited one
+  // person at a time redrafts as each member is added, so emailing on every
+  // draft sends a signing link for copies that get voided seconds later. The
+  // S620 reason for the email — the tenant accepted while the landlord was out —
+  // still holds on the ACCEPT path, which keeps the default.
+  opts: { emailFirstSigner?: boolean } = {},
+): Promise<boolean> {
+  const emailFirstSigner = opts.emailFirstSigner !== false
   try {
     const doc = await queryOne<any>(`
       SELECT d.*, u.unit_number, p.name AS property_name,
@@ -4189,8 +4200,10 @@ export async function autoSendDraftedDocument(documentId: string): Promise<boole
       'SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [firstSigner.user_id])
     const url = signingUrlFor(firstSigner, doc.id, signerUser)
 
-    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel,
-      doc.landlord_name, url, { landlordId: doc.landlord_id, documentId: doc.id })
+    if (emailFirstSigner) {
+      await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel,
+        doc.landlord_name, url, { landlordId: doc.landlord_id, documentId: doc.id })
+    }
     await createNotification({
       userId: firstSigner.user_id,
       type: 'esign_request',

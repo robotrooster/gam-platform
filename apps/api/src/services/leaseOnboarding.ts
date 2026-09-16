@@ -5,12 +5,12 @@
  *  - assertUnitCanAcceptNewLease: the occupancy-mode safeguard. whole_unit caps
  *    at ONE lease (co-tenants share it); by_room caps at 2×bedrooms independent
  *    leases. Called when inviting someone to a unit.
- *  - autoDraftLeasesForUnit: fired after an invited person accepts. When the
- *    unit's roster is ready it auto-drafts the lease(s) off the unit's default
+ *  - autoDraftLeasesForUnit: fired when someone is invited (S647) and again on
+ *    acceptance (a no-op once drafted). It auto-drafts the lease(s) off the unit's default
  *    template (rent/deposit/unit/property fill via createDocumentRecord's own
  *    unit prefill; this adds the term dates), landlord signs first, tenants sign.
- *      whole_unit → ONE shared lease once every roster member has accepted.
- *      by_room    → one INDEPENDENT single-tenant lease per accepted person.
+ *      whole_unit → ONE shared lease for the household.
+ *      by_room    → one INDEPENDENT single-tenant lease per person.
  */
 import { AppError } from '../middleware/errorHandler'
 import { landlordSigningContact } from './landlordSigningContact'
@@ -239,20 +239,33 @@ export async function autoDraftLeasesForUnit(
     }
   }
 
+  // S647 (Nic, DIRECTIVE): "I want to sign my side of the lease for everybody
+  // even before they accept the portal invite."
+  //
+  // Drafting used to wait for acceptance — per person for by-room, and for the
+  // WHOLE household for whole-unit. That made the landlord's signature wait on
+  // the slowest member of every household, and it is why sixteen people were
+  // parked behind "waiting on them to accept" with no lease anyone could sign.
+  // Since S647 the landlord's signature is what issues and bills a lease, so
+  // making it wait on the tenant's first step inverted the whole order.
+  //
+  // Acceptance still matters — it activates their login — it just no longer
+  // gates the paperwork. A tenant who has not accepted can sign straight from
+  // the emailed token link (S629), and accepting later still works: the portal
+  // invite authenticates by the token on their account, not by this row.
   if (unit.occupancy_mode === 'by_room') {
-    // Each accepted, not-yet-drafted person → their own single-tenant lease.
+    // Each not-yet-drafted person → their own single-tenant lease.
     for (const m of roster) {
-      if (!m.accepted_at || m.draft_document_id) continue
+      if (m.draft_document_id) continue
       await draftFor([m], `Lease — Unit ${unit.unit_number}, ${m.first_name} ${m.last_name}`.trim())
     }
   } else {
-    // whole_unit: one shared lease once the WHOLE roster has accepted and none
-    // is drafted yet. (Adding a co-tenant voids the stale draft upstream, so
-    // draft_document_id being null here is the re-draft signal.)
+    // whole_unit: one shared lease for the household as it stands, if none is
+    // drafted yet. Adding a co-tenant voids an UNSIGNED draft upstream, so
+    // draft_document_id being null here is still the re-draft signal.
     if (roster.length === 0) return { draftedDocumentIds: [] }
-    const allAccepted = roster.every(m => m.accepted_at)
     const alreadyDrafted = roster.some(m => m.draft_document_id)
-    if (allAccepted && !alreadyDrafted) {
+    if (!alreadyDrafted) {
       if (roster.length > 4) {
         await createNotification({
           userId: landlord.userId, type: 'lease_draft_blocked',
