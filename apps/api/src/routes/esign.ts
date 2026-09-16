@@ -4108,6 +4108,12 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     // Cascade lease_tenants state by document_type
     await cascadeLeaseTenantsOnVoid(client.query.bind(client), doc)
 
+    // S647: a document the landlord signed has already issued a lease, an
+    // invoice and possibly a work-trade agreement. Voiding the paper alone left
+    // all three live. See lib/unwindIssuedLease.
+    const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
+    await unwindIssuedLease(client.query.bind(client), doc)
+
     await client.query(
       "UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
       [reason || null, doc.id])

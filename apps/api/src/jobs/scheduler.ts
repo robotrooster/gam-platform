@@ -6,7 +6,7 @@ import {
   sendLatePaymentNotice,
 } from '../services/email'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
@@ -678,6 +678,7 @@ export async function processEsignTimeouts() {
     // whose send hiccuped with no deadline at all.
     const renewalExpired = await query<any>(`
       SELECT d.id, d.title, d.document_type, d.landlord_id,
+             d.lease_id, d.issued_at, d.unit_id,
              u.unit_number, p.name as property_name
       FROM lease_documents d
       JOIN leases ol ON ol.id = d.renews_lease_id
@@ -691,9 +692,25 @@ export async function processEsignTimeouts() {
     `)
     for (const d of renewalExpired as any[]) {
       try {
-        await cascadeLeaseTenantsOnVoid(query, d)
-        await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: renewal not fully signed 1 day before the current lease ends', d.id])
+        // S647: a renewal the landlord signed has already issued its successor
+        // lease and first invoice. Voiding only the paper left both live, and
+        // the expiry handoff would then read that successor as a renewal that
+        // happened. One transaction, so the paper and the lease go together.
+        const vc = await getClient()
+        try {
+          await vc.query('BEGIN')
+          await cascadeLeaseTenantsOnVoid(vc.query.bind(vc) as any, d)
+          const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
+          await unwindIssuedLease(vc.query.bind(vc), d)
+          await vc.query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+            ['auto-voided: renewal not fully signed 1 day before the current lease ends', d.id])
+          await vc.query('COMMIT')
+        } catch (e) {
+          await vc.query('ROLLBACK').catch(() => {})
+          throw e
+        } finally {
+          vc.release()
+        }
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
         const recipients = await query<any>(`
           SELECT email, name FROM lease_document_signers WHERE document_id=$1

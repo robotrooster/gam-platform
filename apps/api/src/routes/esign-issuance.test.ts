@@ -331,3 +331,141 @@ describe('the email the tenant gets when the landlord signs', () => {
     expect(ctx.needsSetup).toBe(false)
   })
 })
+
+// S647: voiding a lease the landlord signed takes back what the signature made.
+// Before this, the document voided and the lease, its invoice and its charges
+// stayed live — a bill for a tenancy nobody agreed to.
+describe('voiding a lease the landlord already signed', () => {
+  const voidDoc = (documentId: string, token: string) =>
+    request(buildApp())
+      .post(`/api/esign/documents/${documentId}/void`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ reason: 'wrong rent' })
+
+  async function openInvite(f: Fixture, extra: Record<string, any> = {}) {
+    const cols = ['landlord_id', 'tenant_id', 'unit_id', 'property_id', ...Object.keys(extra)]
+    const vals = [f.landlordId, f.tenantId, f.unitId, f.propertyId, ...Object.values(extra)]
+    await db.query(
+      `INSERT INTO pending_tenant_intents (${cols.join(',')})
+       VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')})`, vals)
+  }
+
+  it('terminates the lease, voids the invoice and removes the charges', async () => {
+    const f = await fixture()
+    await openInvite(f)
+    const documentId = await unsignedDoc(f)
+    await signAs(documentId, f.landlordToken)
+    const lease = (await leasesFor(f.unitId))[0]
+    expect(lease.status).toBe('active')
+
+    const res = await voidDoc(documentId, f.landlordToken)
+    expect(res.status).toBe(200)
+
+    const after = (await db.query(`SELECT status, termination_reason FROM leases WHERE id=$1`,
+      [lease.id])).rows[0]
+    expect(after.status).toBe('terminated')
+    expect(after.termination_reason).toMatch(/voided before the tenant signed/)
+
+    const inv = await invoicesFor(f.unitId)
+    expect(inv.length).toBeGreaterThan(0)                  // kept, as a record
+    expect(inv.every((i: any) => i.status === 'void')).toBe(true)
+
+    const charges = await db.query(
+      `SELECT COUNT(*)::int AS n FROM payments WHERE lease_id=$1`, [lease.id])
+    expect(charges.rows[0].n).toBe(0)
+
+    const lt = await db.query(`SELECT status FROM lease_tenants WHERE lease_id=$1`, [lease.id])
+    expect(lt.rows.every((r: any) => r.status === 'void')).toBe(true)
+  })
+
+  it('puts the household back on the desk as a voided lease, without re-drafting it', async () => {
+    const f = await fixture()
+    await openInvite(f)
+    const documentId = await unsignedDoc(f)
+    await db.query(`UPDATE pending_tenant_intents SET draft_document_id=$1 WHERE unit_id=$2`,
+      [documentId, f.unitId])
+    await signAs(documentId, f.landlordToken)
+    await voidDoc(documentId, f.landlordToken)
+
+    const intent = (await db.query(
+      `SELECT resolved_at, resolved_lease_id, draft_document_id FROM pending_tenant_intents
+        WHERE unit_id=$1`, [f.unitId])).rows[0]
+    expect(intent.resolved_at).toBeNull()
+    expect(intent.resolved_lease_id).toBeNull()
+    // Still pointing at the voided document: re-sending is the landlord's call.
+    expect(intent.draft_document_id).toBe(documentId)
+  })
+
+  it('refuses when money has already been paid on the lease', async () => {
+    const f = await fixture()
+    await openInvite(f)
+    const documentId = await unsignedDoc(f)
+    await signAs(documentId, f.landlordToken)
+    const lease = (await leasesFor(f.unitId))[0]
+    await db.query(
+      `UPDATE payments SET status='settled', settled_at=NOW()
+        WHERE id = (SELECT id FROM payments WHERE lease_id=$1 LIMIT 1)`, [lease.id])
+
+    const res = await voidDoc(documentId, f.landlordToken)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/superseding/i)
+    const still = (await db.query(`SELECT status FROM leases WHERE id=$1`, [lease.id])).rows[0]
+    expect(still.status).toBe('active')
+    const doc = (await db.query(`SELECT status FROM lease_documents WHERE id=$1`, [documentId])).rows[0]
+    expect(doc.status).not.toBe('voided')
+  })
+
+  it('ends the work-trade agreement the signature created, so re-signing makes only one', async () => {
+    const f = await fixture()
+    await openInvite(f, { is_work_trade: true, work_trade_hours_target: 40 })
+    const documentId = await unsignedDoc(f)
+    await signAs(documentId, f.landlordToken)
+    const active = await db.query(
+      `SELECT COUNT(*)::int AS n FROM work_trade_agreements WHERE unit_id=$1 AND status='active'`,
+      [f.unitId])
+    expect(active.rows[0].n).toBe(1)
+
+    await voidDoc(documentId, f.landlordToken)
+    const after = await db.query(
+      `SELECT COUNT(*)::int AS n FROM work_trade_agreements WHERE unit_id=$1 AND status='active'`,
+      [f.unitId])
+    expect(after.rows[0].n).toBe(0)
+  })
+
+  it('puts released utility back on hold, and a re-signed lease picks it up again', async () => {
+    const f = await fixture()
+    await openInvite(f)
+    const m = await db.query<{ id: string }>(
+      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method)
+       VALUES ($1,'electric','E','submeter') RETURNING id`, [f.propertyId])
+    await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+      [m.rows[0].id, f.unitId])
+    await db.query(
+      `INSERT INTO suspended_utility_charges
+         (meter_id, unit_id, landlord_id, billing_cycle_month, utility_type, usage_amount, charge_amount)
+       VALUES ($1,$2,$3,'2026-08-01','electric',100,21.00)`,
+      [m.rows[0].id, f.unitId, f.landlordId])
+
+    const first = await unsignedDoc(f)
+    await signAs(first, f.landlordToken)
+    const billed = await db.query(
+      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+    expect(billed.rows[0].n).toBe(1)
+
+    await voidDoc(first, f.landlordToken)
+    const held = (await db.query(
+      `SELECT released_at FROM suspended_utility_charges WHERE unit_id=$1`, [f.unitId])).rows[0]
+    expect(held.released_at).toBeNull()
+    const gone = await db.query(
+      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+    expect(gone.rows[0].n).toBe(0)
+
+    // Re-draft at the right terms and sign again: the $21 comes back, once.
+    const second = await unsignedDoc(f)
+    await signAs(second, f.landlordToken)
+    const again = await db.query(
+      `SELECT charge_amount::float AS amt FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+    expect(again.rows).toHaveLength(1)
+    expect(again.rows[0].amt).toBe(21)
+  })
+})
