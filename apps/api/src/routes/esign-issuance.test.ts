@@ -236,6 +236,33 @@ describe('then the tenant signs', () => {
   })
 })
 
+// S647: the first invoice of an existing tenancy is dated the 1st of its
+// billing cycle, which can already be weeks in the past — that is deliberate
+// (an existing resident knows when rent is due). What must NOT follow is a late
+// fee for missing a bill nobody had sent them. invoiceGeneration has exempted
+// this since S637; the move-in invoice had not.
+describe('an existing tenancy onboarded late', () => {
+  it('is not fined for a bill it had not been sent', async () => {
+    const f = await fixture()
+    const documentId = await unsignedDoc(f)
+    // Papering a resident who has lived there for years. esign reads this off
+    // the INVITE, which is where the landlord said which kind of tenancy it was.
+    await db.query(
+      `INSERT INTO pending_tenant_intents
+         (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
+       VALUES ($1,$2,$3,$4,TRUE)`,
+      [f.landlordId, f.tenantId, f.unitId, f.propertyId])
+
+    await signAs(documentId, f.landlordToken)
+    const lease = (await leasesFor(f.unitId))[0]
+    expect(lease.is_existing_tenancy).toBe(true)
+    const inv = (await db.query(
+      `SELECT late_fee_exempt, due_date FROM invoices WHERE lease_id=$1
+        ORDER BY created_at LIMIT 1`, [lease.id])).rows[0]
+    expect(inv.late_fee_exempt).toBe(true)
+  })
+})
+
 describe('a lease that never gets a tenant signature', () => {
   it('still bills, which is the thirteen households this was built for', async () => {
     const f = await fixture()

@@ -332,7 +332,21 @@ export async function generateMoveInInvoice(
         depositAmountForInvoice.toFixed(2),
         totalAmount.toFixed(2),
         wtAgreement?.id ?? null,
-        !!wtAgreement,
+        // S647: work trade, OR an existing tenancy's first invoice.
+        //
+        // invoiceGeneration has exempted the latter since S637 on reasoning
+        // that applies here word for word — "their first bill here was late
+        // because onboarding took time, which is our doing and not theirs,
+        // however long they take to get signed." The MOVE-IN invoice never got
+        // the same carve-out, and issuance is what makes that bite: an existing
+        // tenancy's first invoice is deliberately dated the 1st of its cycle,
+        // which can already be weeks past. Billing someone a late fee for
+        // missing a bill nobody had sent them yet is indefensible, and it is
+        // the first thing they would ever see from this platform.
+        //
+        // Only the FIRST one. After a full cycle they are an ordinary resident
+        // and their lease's own late-fee terms apply, exactly as configured.
+        !!wtAgreement || !!leaseMeta?.is_existing_tenancy,
       ]
     )
 
