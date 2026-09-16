@@ -202,7 +202,8 @@ describe('GET /balances — property scope + landlordId resolution', () => {
       .get('/api/balances')
       .set('Authorization', `Bearer ${f.ownerToken}`)
     expect(res.status).toBe(200)
-    const propIds = (res.body.data as any[]).map(r => r.property_id)
+    // S648: one line per person — spaces at two properties are one row.
+    const propIds = (res.body.data as any[]).flatMap(r => r.property_ids)
     expect(propIds).toContain(f.propAId)
     expect(propIds).toContain(f.propBId)
   })

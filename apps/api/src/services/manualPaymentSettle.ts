@@ -198,8 +198,9 @@ export async function settleManualRentPayment(
     `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
        FROM tenant_credits
       WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-        AND (lease_id IS NULL OR lease_id = $2)`,
-    [payment.tenant_id, payment.lease_id])
+        -- S648: a general credit is only the issuing landlord's to give
+        AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3))`,
+    [payment.tenant_id, payment.lease_id, payment.landlord_id])
   const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
   const creditUsed = Math.min(creditAvailable, chargesOpen)
   const amountSettled = Math.round((chargesOpen - creditUsed) * 100) / 100
@@ -366,8 +367,8 @@ export async function settleManualRentPayment(
     const open = await client.query<{ id: string; amount_remaining: string }>(
       `SELECT id, amount_remaining::text FROM tenant_credits
         WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-          AND (lease_id IS NULL OR lease_id = $2)
-        ORDER BY created_at`, [payment.tenant_id, payment.lease_id])
+          AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3))
+        ORDER BY (lease_id IS NULL), created_at`, [payment.tenant_id, payment.lease_id, payment.landlord_id])
     for (const c of open.rows) {
       if (left <= 0) break
       const take = Math.min(left, Number(c.amount_remaining))

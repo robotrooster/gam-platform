@@ -4724,6 +4724,7 @@ export * from './standaloneScroll'
 // === S617: one definition of how fast an agent reads and types ===
 export * from './chatCadence'
 export * from './paymentAllocation'
+export * from './creditAllocation'
 export * from './camelize'
 export * from './versionWatch'
 export * from './autoPlaceEstimate'

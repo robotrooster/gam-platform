@@ -315,7 +315,9 @@ export async function chargeLeaseBalance(
       `SELECT (
          COALESCE((SELECT SUM(amount_remaining) FROM tenant_credits
                     WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-                      AND (lease_id = $2 OR lease_id IS NULL)), 0)
+                      -- S648: a general credit is only the issuing landlord's to give
+                      AND (lease_id = $2 OR (lease_id IS NULL
+                           AND landlord_id = (SELECT landlord_id FROM leases WHERE id = $2)))), 0)
        + COALESCE((SELECT SUM(amount_remaining) FROM lease_prepaid_credits
                     WHERE tenant_id = $1 AND amount_remaining > 0
                       AND ($2::uuid IS NULL OR lease_id = $2)), 0)

@@ -68,9 +68,17 @@ export async function applyCreditsToOpenCharges(
   opts: { leaseId: string; scope: 'invoice' | 'lease'; invoiceId?: string },
 ): Promise<CreditApplicationResult> {
   const credits = await client.query<{ id: string; amount_remaining: string }>(
+    // S648 (Nic): "every dollar should only be counted once." The pay flows
+    // NET a general (lease-less) credit off what is owed, so this has to be
+    // able to SPEND it too — otherwise the same general credit reduces every
+    // bill forever. Only the issuing landlord's, only for a tenant on this
+    // lease; the lease's own credits go first.
     `SELECT id, amount_remaining::text FROM tenant_credits
-      WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0
-      ORDER BY created_at ASC
+      WHERE status = 'active' AND amount_remaining > 0
+        AND (lease_id = $1 OR (lease_id IS NULL
+               AND landlord_id = (SELECT landlord_id FROM leases WHERE id = $1)
+               AND tenant_id IN (SELECT tenant_id FROM v_lease_active_tenants WHERE lease_id = $1)))
+      ORDER BY (lease_id IS NULL), created_at ASC
       FOR UPDATE`,
     [opts.leaseId])
 

@@ -131,3 +131,48 @@ describe('S638 posting a credit changes no charge', () => {
       .toBeCloseTo(100, 2)
   })
 })
+
+// ── S648 (Nic): "every dollar should only be counted once. Everywhere." ────
+//
+// The pay flows take a GENERAL (lease-less) credit off what is owed, so the
+// step that spends credits has to be able to spend it too — otherwise the same
+// general credit comes off every bill forever. And it is only ever the issuing
+// landlord's to spend.
+describe('S648 general credits', () => {
+  it('are spent by the lease they cover, once', async () => {
+    const f = await seedLeaseWithCharges([40])
+    const { applyCreditsToOpenCharges } = await import('./creditApplication')
+    const ll = (await db.query(`SELECT landlord_id FROM leases WHERE id=$1`, [f.leaseId])).rows[0].landlord_id
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,NULL,50,50,'goodwill')`, [ll, f.tenantId])
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const r = await applyCreditsToOpenCharges(c, { leaseId: f.leaseId, scope: 'lease' })
+      await c.query('COMMIT')
+      expect(r.applied).toBe(40)
+    } finally { c.release() }
+    const left = (await db.query(`SELECT amount_remaining::float AS a FROM tenant_credits WHERE tenant_id=$1`, [f.tenantId])).rows[0].a
+    expect(left).toBe(10)
+  })
+
+  it('never cross to another landlord', async () => {
+    const f = await seedLeaseWithCharges([40])
+    const other = await (async () => {
+      const c = await db.connect()
+      try { return (await seedLandlord(c)).landlordId } finally { c.release() }
+    })()
+    await db.query(
+      `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
+       VALUES ($1,$2,NULL,50,50,'goodwill')`, [other, f.tenantId])
+    const { applyCreditsToOpenCharges } = await import('./creditApplication')
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const r = await applyCreditsToOpenCharges(c, { leaseId: f.leaseId, scope: 'lease' })
+      await c.query('COMMIT')
+      expect(r.applied).toBe(0)
+    } finally { c.release() }
+  })
+})

@@ -17,6 +17,7 @@
  * `invoices.sent_at` already existed and had never been set on a single row —
  * it is exactly the "the tenant has been told" stamp, so no migration.
  */
+import { allocateCredits } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { emailInvoiceReady } from './email'
@@ -119,15 +120,33 @@ export async function sendPendingInvoiceNotices(
           ORDER BY CASE type WHEN 'rent' THEN 0 WHEN 'deposit' THEN 1 ELSE 2 END, created_at`,
         [inv.id])
 
-      const creditRow = await queryOne<{ credit: string }>(
-        `SELECT COALESCE(SUM(amount_remaining), 0)::text AS credit
+      // S648 (Nic): "every dollar should only be counted once." Every invoice
+      // email used to claim the person's WHOLE credit, so two bills in one run
+      // each showed it coming off. Spent once across their open bills with this
+      // landlord, oldest first, lease-tied credits only on their own lease.
+      const pool = await query<{ lease_id: string | null; amount: string }>(
+        `SELECT lease_id, amount_remaining::text AS amount
            FROM tenant_credits
-          WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0`,
-        [inv.tenant_id])
+          WHERE tenant_id = $1 AND landlord_id = $2
+            AND status = 'active' AND amount_remaining > 0`,
+        [inv.tenant_id, inv.landlord_id])
+      const openBills = pool.length ? await query<{ id: string; lease_id: string | null; open: string; due: string }>(
+        `SELECT i.id, i.lease_id, to_char(i.due_date, 'YYYY-MM-DD') AS due,
+                (i.total_amount - COALESCE((SELECT SUM(p.amount) FROM payments p
+                   WHERE p.invoice_id = i.id
+                     AND (p.status IN ('settled','processing') OR p.work_trade_suspended_at IS NOT NULL)), 0))::text AS open
+           FROM invoices i
+          WHERE i.tenant_id = $1 AND i.landlord_id = $2
+            AND (i.status IN ('pending','partial') OR i.id = $3)`,
+        [inv.tenant_id, inv.landlord_id, inv.id]) : []
 
       const invoiceTotal = Number(inv.total_amount)
-      const creditAvailable = Number(creditRow?.credit ?? 0)
-      const creditApplied = Math.min(creditAvailable, Math.max(0, invoiceTotal))
+      const creditApplied = pool.length
+        ? Math.min(Math.max(0, invoiceTotal), allocateCredits(
+            pool.map(c => ({ leaseId: c.lease_id, amount: Number(c.amount) })),
+            openBills.map(b => ({ key: b.id, leaseId: b.lease_id, total: Number(b.open), earliestDue: b.due })),
+          ).applied[inv.id] ?? 0)
+        : 0
       const total = Math.round((invoiceTotal - creditApplied) * 100) / 100
 
       await emailInvoiceReady(inv.tenant_email, {

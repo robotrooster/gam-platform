@@ -15,7 +15,7 @@ import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
          suggestedPayAheadFor } from '../services/rentCharge'
-import { allocateOldestFirst } from '@gam/shared'
+import { allocateOldestFirst, allocateCredits } from '@gam/shared'
 import { getClient } from '../db'
 import { logger } from '../lib/logger'
 
@@ -162,8 +162,18 @@ paymentsRouter.get('/', async (req, res, next) => {
         COALESCE((SELECT SUM(tc.amount_remaining) FROM tenant_credits tc
                    WHERE tc.tenant_id = p.tenant_id AND tc.status = 'active'
                      AND tc.amount_remaining > 0
-                     AND (tc.lease_id IS NULL OR tc.lease_id = p.lease_id)), 0)
-          AS credit_on_account
+                     AND (tc.lease_id = p.lease_id
+                          OR (tc.lease_id IS NULL AND tc.landlord_id = p.landlord_id))), 0)
+          AS credit_on_account,
+        -- S648 (Nic): "every dollar should only be counted once." The figure
+        -- above repeats a general credit on every lease; the desk spends THIS
+        -- list once across the person's leases (allocateCredits).
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('leaseId', tc.lease_id,
+                                                      'amount', tc.amount_remaining))
+                    FROM tenant_credits tc
+                   WHERE tc.tenant_id = p.tenant_id AND tc.status = 'active'
+                     AND tc.amount_remaining > 0 AND tc.landlord_id = p.landlord_id), '[]'::jsonb)
+          AS credit_pool
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
@@ -700,7 +710,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     const rows = await query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.entry_description, p.notes, p.lease_id, u.payment_block,
-              u.unit_number, pr.name AS property_name,
+              u.unit_number, pr.name AS property_name, p.landlord_id,
               -- S615: the ONLY reliable mark of a utility-service charge. A
               -- NULL lease_id is not it: ordinary tenants have lease-less
               -- payment rows too, and treating those as service charges pulled
@@ -746,7 +756,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // charge (see /pay-balance), so the portal renders one Pay button per
     // lease. A tenant with a single lease (launch norm) gets exactly one group.
     const byLease = new Map<string, {
-      leaseId: string; propertyName: string; unitNumber: string
+      leaseId: string; propertyName: string; unitNumber: string; landlordId: string
       paymentBlocked: boolean; outstanding: number; carriedBalance: number; rows: any[]
       manualFeePayer: 'tenant' | 'landlord'; manualFirstFree: boolean
     }>()
@@ -764,6 +774,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       let g = byLease.get(r.lease_id)
       if (!g) {
         g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
+              landlordId: r.landlord_id,
               paymentBlocked: !!r.payment_block, outstanding: 0, carriedBalance: 0, rows: [],
               manualFeePayer: r.manual_fee_payer, manualFirstFree: !!r.manual_first_free }
         byLease.set(r.lease_id, g)
@@ -795,23 +806,37 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     // netted. Credits are read here and subtracted from the lease's total —
     // never by settling a line item, which is what chopped her credit into a
     // water row, a trash row and five late fees.
-    const creditRows = await query<{ lease_id: string | null; credit: string }>(
-      `SELECT lease_id, SUM(amount_remaining)::text AS credit
+    const creditRows = await query<{ lease_id: string | null; landlord_id: string; credit: string }>(
+      `SELECT lease_id, landlord_id, SUM(amount_remaining)::text AS credit
          FROM tenant_credits
         WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-        GROUP BY lease_id`,
+        GROUP BY lease_id, landlord_id`,
       [req.user!.profileId])
-    const creditFor = (leaseId: string) => {
-      const scoped = creditRows.find(c => c.lease_id === leaseId)
-      const unscoped = creditRows.find(c => c.lease_id === null)
-      return Math.round(((Number(scoped?.credit ?? 0)) + Number(unscoped?.credit ?? 0)) * 100) / 100
+    // ── S648 (Nic): "every dollar should only be counted once." ─────────────
+    // A general credit was added to EVERY lease here, so a resident with two
+    // spaces saw it come off both bills. Spent once now, oldest bill first,
+    // and only against the landlord who gave it.
+    const creditApplied = new Map<string, number>()
+    const creditLeft = new Map<string, number>()
+    for (const landlordId of new Set([...byLease.values()].map(g => g.landlordId))) {
+      const groups = [...byLease.values()].filter(g => g.landlordId === landlordId)
+      const alloc = allocateCredits(
+        creditRows.filter(c => c.landlord_id === landlordId)
+          .map(c => ({ leaseId: c.lease_id, amount: Number(c.credit) })),
+        groups.map(g => ({ key: g.leaseId, leaseId: g.leaseId, total: g.outstanding,
+                           earliestDue: g.rows[0]?.due_date ?? null })))
+      for (const g of groups) creditApplied.set(g.leaseId, alloc.applied[g.leaseId] ?? 0)
+      // What is still on the account after these bills, shown once (on the
+      // first of this landlord's leases), never repeated per lease.
+      if (groups[0]) creditLeft.set(groups[0].leaseId, alloc.remaining)
     }
 
+    const creditApplied_ = (leaseId: string) => creditApplied.get(leaseId) ?? 0
     const leases = await Promise.all([...byLease.values()].map(async l => {
       const landlordCovers = l.manualFeePayer === 'landlord'
       // Never below zero: a credit larger than the bill leaves the rest on the
       // account for next month, it does not hand out change.
-      const creditApplied = Math.min(creditFor(l.leaseId), l.outstanding)
+      const creditApplied = creditApplied_(l.leaseId)
       const grossOutstanding = l.outstanding
       l.outstanding = Math.round((l.outstanding - creditApplied) * 100) / 100
       const manualFee = (landlordCovers || l.manualFirstFree) ? 0 : MANUAL_PAYMENT_FEE
@@ -822,7 +847,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         // number they have to take on faith.
         grossOutstanding,
         creditApplied,
-        creditRemaining: Math.round((creditFor(l.leaseId) - creditApplied) * 100) / 100,
+        creditRemaining: creditLeft.get(l.leaseId) ?? 0,
         manualFeeCoveredByLandlord: landlordCovers,
         manualFeeFirstFree: l.manualFirstFree,
         // What the landlord is absorbing on their behalf, so the tenant can see

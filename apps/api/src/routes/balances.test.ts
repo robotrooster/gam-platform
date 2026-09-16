@@ -96,6 +96,41 @@ describe('GET /api/balances — the list', () => {
   })
 })
 
+// S648 (Nic): "every dollar should only be counted once. Everywhere." Billy
+// Jose Miranda rents two spaces and showed as two people; a $100 credit came
+// off both of them.
+describe('S648 GET /api/balances — one line per person', () => {
+  it('merges a second space and takes a general credit off only once', async () => {
+    const f = await seedOwedTenant()                      // 616.40 on space one
+    const c = await db.connect()
+    try {
+      const propertyId = (await c.query(`SELECT property_id FROM units WHERE id=$1`, [f.unitId])).rows[0].property_id
+      const unit2 = await seedUnit(c, { propertyId, landlordId: f.landlordId })
+      const lease2 = await seedLease(c, { unitId: unit2, landlordId: f.landlordId, rentAmount: 220 })
+      await c.query(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
+                               due_date, subtotal_rent, total_amount, status)
+         VALUES ($1,$2,$3,$4,'INV-TEST-0002','2026-09-01',220,220,'pending')`,
+        [f.landlordId, f.tenantId, lease2, unit2])
+      await c.query(
+        `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining,
+                                     category, reason, status, created_by)
+         VALUES ($1,$2,NULL,100,100,'goodwill','test','active',$3)`,
+        [f.landlordId, f.tenantId, f.userId])
+    } finally { c.release() }
+
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.status).toBe(200)
+    const rows = res.body.data.filter((r: any) => (r.tenant_id ?? r.tenantId) === f.tenantId)
+    expect(rows).toHaveLength(1)
+    expect(Number(rows[0].balance)).toBe(736.40)          // 616.40 + 220 − 100, once
+    expect(rows[0].spaces).toHaveLength(2)
+    const credited = rows[0].spaces.reduce((s: number, x: any) => s + Number(x.credit_applied ?? x.creditApplied), 0)
+    expect(credited).toBe(100)
+  })
+})
+
 describe('S634 GET /api/balances/:tenantId/invoices — the breakdown', () => {
   it('returns every line, with the note that explains it', async () => {
     const f = await seedOwedTenant()

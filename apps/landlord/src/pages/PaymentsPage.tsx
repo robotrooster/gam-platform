@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          type ManualPaymentMethod,
-         TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
+         TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, allocateCredits } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
@@ -728,14 +728,19 @@ export function PaymentsPage() {
   const OUTSTANDING = new Set(['pending', 'failed'])
   const outstandingGroups = (() => {
     const groups = new Map<string, any>()
-    const creditByTenant = new Map<string, number>()
+    // S648: each person's credits (per landlord), spent ONCE across their leases.
+    const poolByTenant = new Map<string, Array<{ leaseId: string | null; amount: number }>>()
     for (const p of filteredPayments) {
       if (!OUTSTANDING.has(p.status)) continue
       if (p.workTradeSuspendedAt) continue   // worked off, not owed
-      if (p.creditOnAccount != null) creditByTenant.set(p.tenantId, Number(p.creditOnAccount))
+      const poolKey = `${p.tenantId}:${p.landlordId}`
+      if (Array.isArray(p.creditPool) && !poolByTenant.has(poolKey)) {
+        poolByTenant.set(poolKey, p.creditPool.map((c: any) => ({ leaseId: c.leaseId ?? null, amount: Number(c.amount) })))
+      }
       const key = p.leaseId || `tenant:${p.tenantId}`
       const g = groups.get(key) ?? {
         key, unitNumber: p.unitNumber, propertyName: p.propertyName,
+        poolKey, leaseId: p.leaseId ?? null,
         tenantFirst: p.tenantFirst, tenantLast: p.tenantLast,
         charges: [] as any[], total: 0, earliestDue: p.dueDate,
       }
@@ -755,9 +760,18 @@ export function PaymentsPage() {
     // the whole bill — and since rent is pay-in-full, anything less was refused.
     // The credit reduces the ONE total here exactly as it does on the balances
     // page; the gross stays visible so the desk can see where it came from.
+    //
+    // S648 (Nic): "every dollar should only be counted once." This took the
+    // person's whole credit off EACH of their leases. Now it is spent once,
+    // oldest bill first, lease-tied credits only on their own lease.
+    for (const [poolKey, pool] of poolByTenant) {
+      const mine = [...groups.values()].filter(g => g.poolKey === poolKey)
+      const alloc = allocateCredits(pool, mine.map(g => ({
+        key: g.key, leaseId: g.leaseId, total: g.total, earliestDue: g.earliestDue })))
+      for (const g of mine) g.creditApplied = alloc.applied[g.key] ?? 0
+    }
     for (const g of groups.values()) {
-      const credit = creditByTenant.get(g.charges[0]?.tenantId) ?? 0
-      g.creditApplied = Math.min(credit, g.total)
+      g.creditApplied = g.creditApplied ?? 0
       g.gross = g.total
       g.total = Math.round((g.total - g.creditApplied) * 100) / 100
     }

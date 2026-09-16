@@ -14,10 +14,15 @@ interface Owed {
   email: string | null
   unitNumber: string | null
   propertyId: string | null
+  propertyIds?: string[]
   propertyName: string | null
   balance: string
   openInvoices: number
   oldestDueDate: string | null
+  // S648: one line per person; each space they rent, with what it owes after
+  // their credit (spent once, oldest bill first).
+  spaces?: Array<{ leaseId: string | null; unitNumber: string | null; propertyId: string | null
+    propertyName: string | null; balance: number; creditApplied: number; openInvoices: number }>
 }
 
 const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -129,9 +134,23 @@ export function BalancesPage() {
   // control. Total follows the filter — a heading that keeps counting rows the
   // table is no longer showing is worse than no total.
   const [propertyId, setPropertyId] = useState('')
-  const propertyOptions = (rows as Owed[])
-    .map(r => ({ id: r.propertyId || '', name: r.propertyName || '' }))
-  const shown = (rows as Owed[]).filter(r => propertyId === '' || r.propertyId === propertyId)
+  const propertyOptions = (rows as Owed[]).flatMap(r => (r.spaces?.length
+    ? r.spaces.map(x => ({ id: x.propertyId || '', name: x.propertyName || '' }))
+    : [{ id: r.propertyId || '', name: r.propertyName || '' }]))
+  // S648: filtered to one property, a person renting at two shows only what
+  // they owe HERE.
+  const shown = (rows as Owed[]).map(r => {
+    if (propertyId === '' || !r.spaces?.length) return r
+    const here = r.spaces.filter(x => x.propertyId === propertyId)
+    if (here.length === r.spaces.length) return r
+    return { ...r, spaces: here,
+      balance: here.reduce((t, x) => t + Number(x.balance), 0).toFixed(2),
+      openInvoices: here.reduce((t, x) => t + x.openInvoices, 0),
+      unitNumber: here.map(x => x.unitNumber).filter(Boolean).join(', '),
+      propertyName: here[0]?.propertyName ?? r.propertyName }
+  }).filter(r => propertyId === '' || (r.spaces?.length
+    ? r.spaces.length > 0 && Number(r.balance) > 0
+    : r.propertyId === propertyId))
 
   const total = shown.reduce((s, r) => s + Number(r.balance), 0)
 
@@ -182,7 +201,7 @@ export function BalancesPage() {
               {shown.map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
-                const rowKey = r.tenantId + (r.unitNumber || '')
+                const rowKey = r.tenantId
                 const isOpen = openRow === rowKey
                 return (
                   <Fragment key={rowKey}>
@@ -194,7 +213,19 @@ export function BalancesPage() {
                       {name}
                     </td>
                     <td style={{ fontSize: '.85rem', color: 'var(--text-2)' }}>
-                      {r.unitNumber ? `Unit ${r.unitNumber}` : '—'}
+                      {(r.spaces?.length ?? 0) > 1 ? (
+                        r.spaces!.map(x => (
+                          <div key={(x.leaseId || '') + x.unitNumber}>
+                            {x.unitNumber || '—'}
+                            <span style={{ color: 'var(--text-3)' }}> · {fmt(Number(x.balance))}</span>
+                            {x.creditApplied > 0 && (
+                              <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}> (after {fmt(x.creditApplied)} credit)</span>
+                            )}
+                          </div>
+                        ))
+                      ) : (
+                        <>{r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
+                      )}
                       {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: 'var(--gold)' }}>

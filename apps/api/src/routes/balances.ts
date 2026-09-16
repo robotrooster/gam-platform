@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { allocateCredits } from '@gam/shared'
 import { query } from '../db'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
@@ -10,7 +11,7 @@ import { requireAuth, requirePerm, getScopedPropertyIds, userHasPerm } from '../
 export const balancesRouter = Router()
 balancesRouter.use(requireAuth)
 
-// GET /api/balances — grouped per tenant + unit. Owners bypass requirePerm;
+// GET /api/balances — one line per tenant (S648), each space broken out. Owners bypass requirePerm;
 // staff need the balances.view grant (part of the Front Desk preset).
 // Property-scoped: a worker with a property-locked scope row only sees
 // balances at their assigned properties (invoices with no unit have no
@@ -21,25 +22,26 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
     // entity showed half the money owed and looked like the rest was paid.
     const landlordIds = landlordScopeIds(req.user!)
     const scopedIds = await getScopedPropertyIds(req.user)
-    const rows = await query<any>(`
+    // ── S648 (Nic): ONE LINE PER PERSON, AND EVERY DOLLAR COUNTED ONCE ──────
+    //
+    // Billy Jose Miranda rents RV 34 and RV 35 and showed as two people owing
+    // $457.07 and $470.22. Grouping by tenant AND unit also subtracted his
+    // account credit once per space — a $100 credit took $200 off. "Every
+    // dollar should only be counted once. Everywhere."
+    //
+    // So: what is open is summed per space here, the credit is read once per
+    // tenant below, and allocateCredits spends it once, oldest bill first.
+    const spaces = await query<any>(`
       SELECT
         t.id                                        AS tenant_id,
         tu.first_name, tu.last_name, tu.phone, tu.email,
+        i.lease_id,
         u.unit_number,
         pr.id                                       AS property_id,
         pr.name                                     AS property_name,
-        -- S637 (Nic, DIRECTIVE): "It's a credit against the overall ledger."
-        -- Owed is charges MINUS what the landlord owes back. Credits used to
-        -- reach this number by faking a settled payment (the split), so the paid
-        -- column picked them up; now they are netted honestly and nothing pretends a
-        -- payment happened. GREATEST(...,0) because a credit larger than the
-        -- open balance leaves the tenant owing nothing, never a negative.
-        GREATEST(
-          SUM(i.total_amount - COALESCE(pd.paid, 0)) - COALESCE(MAX(cr.credit), 0),
-          0)::numeric                               AS balance,
-        COALESCE(MAX(cr.credit), 0)::numeric        AS credit_on_account,
+        SUM(i.total_amount - COALESCE(pd.paid, 0))::float AS open_amount,
         COUNT(*)::int                               AS open_invoices,
-        MIN(i.due_date)                             AS oldest_due_date
+        to_char(MIN(i.due_date), 'YYYY-MM-DD')      AS oldest_due_date
       FROM invoices i
       JOIN tenants t          ON t.id  = i.tenant_id
       LEFT JOIN users tu      ON tu.id = t.user_id
@@ -48,61 +50,77 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
       LEFT JOIN (
         SELECT invoice_id, SUM(amount) AS paid
           FROM payments
-         -- S637 (Nic): MONEY IN FLIGHT IS NOT OUTSTANDING.
-         --
-         --   "I thought we decided it was gonna be marked settled or paid in
-         --    the system, or at least not outstanding, at the time the attempt
-         --    is made to pay. And if it ever fails, it shows as outstanding and
-         --    reupdated with any late fees to that point in time."
-         --
-         -- An ACH debit sits 'processing' for about four business days. Counting
-         -- it as owed for those four days put Randall Cox's $520.20 on the
-         -- outstanding list the whole time he was waiting, so the list could not
-         -- be worked down to zero and a paid resident looked delinquent.
-         --
-         -- Safe to net out here because a failure is not silent: the row flips
-         -- to 'failed', the balance reappears, and jobs/lateFees.ts already
-         -- suppresses late fees only while a payment is genuinely in flight —
-         -- so fees resume from the real due date if the debit bounces.
-         -- ── S638 (Nic, DIRECTIVE): WORK TRADE IS NOT AN OUTSTANDING BALANCE ──
-         --
-         --   "The ones that are on work trade need to not show in the
-         --    outstanding balances list. That's a false number... while it's in
-         --    a suspended state, don't have it show on this table. Don't have it
-         --    be part of these calculations."
-         --
-         -- The invoice total DOES include suspended rows — RV 45 reads $776.11,
-         -- all of it suspended and none of it owed — so they have to be netted
-         -- here or the landlord is shown money nobody owes. (An earlier note
-         -- here claimed the totals already excluded them; that was read off an
-         -- older invoice and was wrong.)
-         --
-         -- A work-trade DEFICIT is different and still belongs on this list: at
-         -- month close, hours that were not worked bill in cash as an ordinary
-         -- charge with no suspension on it, so it lands here the moment it
-         -- becomes real money.
+         -- S637 (Nic): money in flight is not outstanding — an ACH debit sits
+         -- 'processing' ~4 business days; a failure flips it back to owed.
+         -- S638 (Nic): work trade is not an outstanding balance — suspended
+         -- rows are netted; a month-close deficit bills unsuspended.
          WHERE (status IN ('settled', 'processing') OR work_trade_suspended_at IS NOT NULL)
            AND invoice_id IS NOT NULL
          GROUP BY invoice_id
       ) pd ON pd.invoice_id = i.id
-      -- Credit balance is per TENANT, while this groups many invoices per
-      -- tenant — so it joins on tenant and is read with MAX (one value repeated
-      -- across the group), never SUM, which would subtract it once per invoice.
-      LEFT JOIN (
-        SELECT tenant_id, SUM(amount_remaining) AS credit
-          FROM tenant_credits
-         WHERE status = 'active' AND amount_remaining > 0
-         GROUP BY tenant_id
-      ) cr ON cr.tenant_id = t.id
       WHERE i.landlord_id = ANY($1::uuid[])
         AND i.status IN ('pending', 'partial')
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
       GROUP BY t.id, tu.first_name, tu.last_name, tu.phone, tu.email,
-               u.unit_number, pr.id, pr.name
-      HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) - COALESCE(MAX(cr.credit), 0) > 0
-      ORDER BY balance DESC
+               i.lease_id, u.unit_number, pr.id, pr.name
+      HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) > 0
     `, [landlordIds, scopedIds])
-    res.json({ success: true, data: rows })
+
+    const tenantIds = [...new Set(spaces.map(r => r.tenant_id))]
+    // S637 (Nic): "It's a credit against the overall ledger." Read at its own
+    // grain — per tenant, per lease tie — and never joined into the rows above.
+    const credits = tenantIds.length ? await query<any>(`
+      SELECT tenant_id, lease_id, SUM(amount_remaining)::float AS amount
+        FROM tenant_credits
+       WHERE tenant_id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])
+         AND status = 'active' AND amount_remaining > 0
+       GROUP BY tenant_id, lease_id`, [tenantIds, landlordIds]) : []
+
+    const out: any[] = []
+    for (const tenantId of tenantIds) {
+      const mine = spaces.filter(r => r.tenant_id === tenantId)
+        .sort((a, b) => String(a.oldest_due_date).localeCompare(String(b.oldest_due_date)))
+      const keyOf = (r: any, i: number) => r.lease_id || `space:${i}`
+      const alloc = allocateCredits(
+        credits.filter(c => c.tenant_id === tenantId).map(c => ({ leaseId: c.lease_id, amount: c.amount })),
+        mine.map((r, i) => ({ key: keyOf(r, i), leaseId: r.lease_id, total: r.open_amount, earliestDue: r.oldest_due_date })))
+      const breakdown = mine.map((r, i) => {
+        const credit = alloc.applied[keyOf(r, i)] ?? 0
+        return {
+          lease_id: r.lease_id,
+          unit_number: r.unit_number,
+          property_id: r.property_id,
+          property_name: r.property_name,
+          open_amount: Math.round(r.open_amount * 100) / 100,
+          credit_applied: credit,
+          balance: Math.round((r.open_amount - credit) * 100) / 100,
+          open_invoices: r.open_invoices,
+          oldest_due_date: r.oldest_due_date,
+        }
+      })
+      const balance = Math.round(breakdown.reduce((s, x) => s + x.balance, 0) * 100) / 100
+      if (balance <= 0) continue
+      const first = mine[0]
+      const uniq = (xs: any[]) => [...new Set(xs.filter(Boolean))]
+      out.push({
+        tenant_id: tenantId,
+        first_name: first.first_name, last_name: first.last_name,
+        phone: first.phone, email: first.email,
+        // Joined for the screens that print one line ("RV 34, RV 35").
+        unit_number: uniq(mine.map(r => r.unit_number)).join(', ') || null,
+        property_id: first.property_id,
+        property_ids: uniq(mine.map(r => r.property_id)),
+        property_name: uniq(mine.map(r => r.property_name)).join(', ') || null,
+        balance: balance.toFixed(2),
+        credit_on_account: Math.round(
+          breakdown.reduce((s, x) => s + x.credit_applied, 0) * 100 + alloc.remaining * 100) / 100,
+        open_invoices: mine.reduce((s, r) => s + r.open_invoices, 0),
+        oldest_due_date: first.oldest_due_date,
+        spaces: breakdown,
+      })
+    }
+    out.sort((a, b) => Number(b.balance) - Number(a.balance))
+    res.json({ success: true, data: out })
   } catch (e) { next(e) }
 })
 
