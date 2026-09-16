@@ -232,7 +232,7 @@ describe('what the owner is shown', () => {
 // because they're operating the portfolio."
 describe('software the manager passes through', () => {
   async function managed(client: any, opts: {
-    payer: 'pm_company' | 'owner'; rateToOwner?: number | null
+    billedTo: 'pm_company' | 'owner'; rateToOwner?: number | null
   }) {
     const { userId, landlordId } = await seedLandlord(client)
     const bankId = await seedUserBankAccount(client, { userId })
@@ -243,9 +243,9 @@ describe('software the manager passes through', () => {
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
     await client.query(
       `UPDATE pm_owner_relationships
-          SET platform_fee_payer=$3, platform_fee_rate_to_owner=$4
+          SET platform_fee_billed_to=$3, platform_fee_rate_to_owner=$4
         WHERE pm_company_id=$1 AND landlord_id=$2`,
-      [pmId, landlordId, opts.payer, opts.rateToOwner ?? null])
+      [pmId, landlordId, opts.billedTo, opts.rateToOwner ?? null])
     const o = { landlordId, userId, propertyId, unitId }
     await allocate(client, o, 'allocation_owner_share', 880)
     return { ...o, pmCompanyId: pmId }
@@ -263,7 +263,7 @@ describe('software the manager passes through', () => {
   it('shows nothing when the manager absorbs it', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { payer: 'pm_company' })
+      const o = await managed(client, { billedTo: 'pm_company' })
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
       expect(s.totals.platformPassthrough).toBe(0)
       expect(s.totals.net).toBe(880)
@@ -273,7 +273,7 @@ describe('software the manager passes through', () => {
   it('shows it as its own line and takes it off the net', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
       await passthrough(client, o, 40, 1.00, 0.50)
 
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
@@ -290,7 +290,7 @@ describe('software the manager passes through', () => {
     // price would price their business for them in front of their customer.
     const client = await getClient()
     try {
-      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
       await passthrough(client, o, 40, 1.00, 0.50)
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
       expect(JSON.stringify(s)).not.toContain('0.5')
@@ -301,7 +301,7 @@ describe('software the manager passes through', () => {
   it('stacks with expenses rather than replacing them', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
       await passthrough(client, o, 40, 1.00, 0.50)
       await expense(client, o as any, 150)
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })

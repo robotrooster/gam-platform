@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict KuUekfYJU1DGsd8yvE1EnLQOmeNOPD2MfLogZDnMKjTnnY6QRieRBTaebvFqngY
+\restrict 8rITZSXdFzps8YD1ehTbujcNrI0blaUuRt1Ef5NhxAxqHTpuayVPVmfiCX2lBA6
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6686,11 +6686,11 @@ CREATE TABLE public.pm_owner_relationships (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    platform_fee_payer text DEFAULT 'pm_company'::text NOT NULL,
+    platform_fee_billed_to text DEFAULT 'pm_company'::text NOT NULL,
     platform_fee_rate_to_owner numeric(10,2),
     CONSTRAINT pm_owner_relationships_disbursement_day_check CHECK (((disbursement_day >= 1) AND (disbursement_day <= 28))),
     CONSTRAINT pm_owner_relationships_payout_mode_check CHECK ((payout_mode = ANY (ARRAY['direct'::text, 'pm_trust'::text]))),
-    CONSTRAINT pm_owner_relationships_platform_fee_payer_check CHECK ((platform_fee_payer = ANY (ARRAY['pm_company'::text, 'owner'::text]))),
+    CONSTRAINT pm_owner_relationships_platform_fee_billed_to_check CHECK ((platform_fee_billed_to = ANY (ARRAY['pm_company'::text, 'owner'::text]))),
     CONSTRAINT pm_owner_relationships_platform_fee_rate_to_owner_check CHECK (((platform_fee_rate_to_owner IS NULL) OR (platform_fee_rate_to_owner >= (0)::numeric))),
     CONSTRAINT pm_owner_relationships_portal_access_check CHECK ((portal_access = ANY (ARRAY['none'::text, 'active'::text, 'closed'::text]))),
     CONSTRAINT pm_owner_relationships_portal_opened_by_check CHECK ((portal_opened_by = ANY (ARRAY['owner'::text, 'pm_company'::text, 'gam'::text]))),
@@ -26770,5 +26770,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict KuUekfYJU1DGsd8yvE1EnLQOmeNOPD2MfLogZDnMKjTnnY6QRieRBTaebvFqngY
+\unrestrict 8rITZSXdFzps8YD1ehTbujcNrI0blaUuRt1Ef5NhxAxqHTpuayVPVmfiCX2lBA6
 

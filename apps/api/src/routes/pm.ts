@@ -1172,7 +1172,7 @@ pmRouter.get('/companies/:id/owners', async (req: any, res, next) => {
               r.disbursement_day           AS "disbursementDay",
               r.portal_access              AS "portalAccess",
               r.portal_opened_at           AS "portalOpenedAt",
-              r.platform_fee_payer         AS "platformFeePayer",
+              r.platform_fee_billed_to     AS "platformFeeBilledTo",
               r.platform_fee_rate_to_owner AS "platformFeeRateToOwner",
               r.notes,
               COALESCE(p.property_count, 0)::int AS "propertyCount",
@@ -1211,7 +1211,7 @@ pmRouter.patch('/companies/:id/owners/:landlordId', async (req: any, res, next) 
       // S645 (Nic, DIRECTIVE): whether the software cost sits in the manager's
       // contract or is handed to the owner. The rate is the MANAGER'S own —
       // absent one they charge exactly what GAM charged them.
-      platformFeePayer: z.enum(['pm_company', 'owner']).optional(),
+      platformFeeBilledTo: z.enum(['pm_company', 'owner']).optional(),
       platformFeeRateToOwner: z.number().min(0).max(1000).nullish(),
       notes: z.string().max(2000).nullish(),
     }).strict().parse(req.body)
@@ -1230,7 +1230,7 @@ pmRouter.patch('/companies/:id/owners/:landlordId', async (req: any, res, next) 
         WHERE pm_company_id = $1 AND landlord_id = $2
         RETURNING payout_mode AS "payoutMode", disbursement_day AS "disbursementDay",
                   portal_access AS "portalAccess",
-                  platform_fee_payer AS "platformFeePayer",
+                  platform_fee_billed_to AS "platformFeeBilledTo",
                   platform_fee_rate_to_owner AS "platformFeeRateToOwner", notes`,
       vals)
     res.json({ success: true, data: updated })

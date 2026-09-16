@@ -23,7 +23,7 @@ interface OwnerRow {
   disbursementDay: number
   portalAccess: 'none' | 'active' | 'closed'
   portalOpenedAt: string | null
-  platformFeePayer: 'pm_company' | 'owner'
+  platformFeeBilledTo: 'pm_company' | 'owner'
   platformFeeRateToOwner: string | null
   notes: string | null
   propertyCount: number
@@ -163,15 +163,15 @@ export function OwnersPage() {
                       the ones who don't want the owner to see the line. */}
                   <Td>
                     <select
-                      value={o.platformFeePayer}
+                      value={o.platformFeeBilledTo}
                       onChange={e => terms.mutate({
-                        landlordId: o.landlordId, body: { platformFeePayer: e.target.value } })}
+                        landlordId: o.landlordId, body: { platformFeeBilledTo: e.target.value } })}
                       style={selectStyle}
                     >
                       <option value="pm_company">We absorb it</option>
                       <option value="owner">Billed to the owner</option>
                     </select>
-                    {o.platformFeePayer === 'owner' && (
+                    {o.platformFeeBilledTo === 'owner' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         <input
                           type="number" step="0.01" min="0"

@@ -567,11 +567,11 @@ async function accrueOneProperty(
     // follows the MANAGER across every owner they bring.
     const pmRes = await client.query<{
       pm_company_id: string
-      platform_fee_payer: 'pm_company' | 'owner'
+      platform_fee_billed_to: 'pm_company' | 'owner'
       platform_fee_rate_to_owner: string | null
     }>(`
       SELECT p.pm_company_id,
-             COALESCE(r.platform_fee_payer, 'pm_company') AS platform_fee_payer,
+             COALESCE(r.platform_fee_billed_to, 'pm_company') AS platform_fee_billed_to,
              r.platform_fee_rate_to_owner
         FROM properties p
         LEFT JOIN pm_owner_relationships r
@@ -674,7 +674,7 @@ async function accrueOneProperty(
     // manager is the one to incentivize, because they're operating the
     // portfolio." Absent a rate they charge exactly what GAM charged them,
     // which is the honest default for a manager who only wants to be whole.
-    if (pm && pm.platform_fee_payer === 'owner' && totalBillable > 0) {
+    if (pm && pm.platform_fee_billed_to === 'owner' && totalBillable > 0) {
       const ownerRate = pm.platform_fee_rate_to_owner !== null
         ? parseFloat(pm.platform_fee_rate_to_owner)
         : ratePerUnit
