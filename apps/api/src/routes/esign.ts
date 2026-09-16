@@ -3857,7 +3857,7 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
     // 'pending' signer has not been reached yet and is waiting on somebody
     // ahead of them.
     const signer = await queryOne<any>(`
-      SELECT id, name, email, token, role, reminder_sent_at
+      SELECT id, user_id, name, email, token, role, reminder_sent_at
         FROM lease_document_signers
        WHERE document_id = $1 AND status IN ('sent','viewed')
        ORDER BY order_index LIMIT 1`, [req.params.id])

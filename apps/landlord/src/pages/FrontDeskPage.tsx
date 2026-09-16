@@ -177,13 +177,14 @@ export function FrontDeskPage() {
   // token to the address already on file, so the worst case is the resident
   // getting a second email, and the best case is the desk fixing the call while
   // the person is still on the phone.
-  const [sentTo, setSentTo] = useState<Record<string, 'sending' | 'sent' | 'error'>>({})
+  const [sentTo, setSentTo] = useState<Record<string, 'sending' | 'sent' | 'held' | 'error'>>({})
   const resend = useMutation(
     (intentId: string) => apiPatch(`/landlords/me/pending-intents/${intentId}/contact`, { resend: true }),
     {
       onMutate: (id: string) => { setSentTo(m => ({ ...m, [id]: 'sending' })) },
-      onSuccess: (_d, id) => {
-        setSentTo(m => ({ ...m, [id]: 'sent' }))
+      onSuccess: (d: any, id) => {
+        // S648: nothing is emailed before the landlord signs the lease.
+        setSentTo(m => ({ ...m, [id]: d?.resent ? 'sent' : 'held' }))
         qc.invalidateQueries('pending-tenants')
       },
       onError: (_e, id) => { setSentTo(m => ({ ...m, [id]: 'error' })) },
@@ -426,6 +427,10 @@ export function FrontDeskPage() {
                             {sentTo[r.intentId] === 'sent' ? (
                               <span style={{ fontSize: '.78rem', color: 'var(--green)', fontWeight: 600 }}>
                                 ✓ Invite re-sent
+                              </span>
+                            ) : sentTo[r.intentId] === 'held' ? (
+                              <span style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+                                Goes out when the lease is signed
                               </span>
                             ) : (
                               <button type="button" className="btn btn-primary btn-sm"

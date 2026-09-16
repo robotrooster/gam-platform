@@ -11,7 +11,8 @@ import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlor
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
 import { collectedRentMtd } from '../lib/rentCollected'
-import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue } from '../services/email'
+import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
+import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { createNotification } from '../services/notifications'
 import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
@@ -6394,8 +6395,95 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
           WHERE id = $1`,
         [intent.user_id, newEmail, body.firstName ?? null, body.lastName ?? null])
 
+      // ── S648 (Nic): the correction reaches their lease, and the email
+      // follows the one-email flow. ────────────────────────────────────────
+      //
+      // Two defects Nic hit fixing Clay Simpson: the name went onto the
+      // account but not onto the lease already drafted for him, and saving
+      // sent the OLD portal invite — a second, earlier email in a flow that
+      // has exactly one, sent when the landlord signs.
+      //
+      // The open lease this person is waiting to sign, if any.
+      const openDoc = await queryOne<{ id: string; landlord_signed: boolean; anyone_signed: boolean }>(
+        `SELECT d.id,
+                EXISTS (SELECT 1 FROM lease_document_signers l
+                         WHERE l.document_id = d.id AND l.role = 'landlord' AND l.status = 'signed') AS landlord_signed,
+                EXISTS (SELECT 1 FROM lease_document_signers a
+                         WHERE a.document_id = d.id AND a.status = 'signed') AS anyone_signed
+           FROM lease_documents d
+           JOIN lease_document_signers me ON me.document_id = d.id AND me.user_id = $1
+          WHERE d.document_type = 'original_lease'
+            AND d.status IN ('pending','sent','in_progress')
+            AND me.status NOT IN ('signed','declined')
+          ORDER BY d.created_at DESC LIMIT 1`, [intent.user_id])
+
+      if (openDoc && (newEmail || body.firstName || body.lastName)) {
+        const fullName = `${body.firstName ?? intent.first_name ?? ''} ${body.lastName ?? intent.last_name ?? ''}`.trim()
+        await query(
+          `UPDATE lease_document_signers
+              SET name = $3, email = COALESCE($4, email)
+            WHERE document_id = $1 AND user_id = $2`,
+          [openDoc.id, intent.user_id, fullName, newEmail])
+        // The printed names are the roster (esign createDocumentRecord). Only
+        // restamp them while NOBODY has signed: once a signature is on the
+        // page, what it was signed over does not change underneath it.
+        if (!openDoc.anyone_signed) {
+          const roster = await query<{ role: string; name: string; email: string }>(
+            `SELECT role, name, email FROM lease_document_signers WHERE document_id = $1`, [openDoc.id])
+          const order = ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']
+          const names = order.map(r => roster.find(x => x.role === r)?.name).filter(Boolean) as string[]
+          const cols: Record<string, string | null> = {
+            tenant_name: names[0] ?? null, tenant_2_name: names[1] ?? null,
+            tenant_3_name: names[2] ?? null, tenant_4_name: names[3] ?? null,
+            occupant_names: names.join(', ') || null,
+            tenant_email: roster.find(x => x.role === 'primary')?.email ?? null,
+          }
+          for (const [col, val] of Object.entries(cols)) {
+            if (val == null) continue
+            await query(
+              `UPDATE lease_document_fields SET value = $3 WHERE document_id = $1 AND lease_column = $2`,
+              [openDoc.id, col, val])
+          }
+        }
+      }
+
       let sent = false
-      if (body.resend !== false) {
+      let heldUntilLandlordSigns = false
+      if (openDoc && body.resend !== false) {
+        if (!openDoc.landlord_signed) {
+          // Nothing goes to the tenant before the landlord signs. The address
+          // is saved; the one email goes there when the lease is signed.
+          heldUntilLandlordSigns = true
+        } else {
+          // Signed already: send THE email — set up and sign — to wherever
+          // they are now. A changed address gets a fresh link; the old one
+          // went somewhere they may not control.
+          if (newEmail) {
+            await query(`UPDATE users SET tenant_invite_token = NULL WHERE id = $1`, [intent.user_id])
+          }
+          const sig = await queryOne<any>(
+            `SELECT s.token, s.name, s.email, d.title, d.landlord_id, un.unit_number, p.name AS property_name,
+                    COALESCE(NULLIF(la.business_name,''), lu.first_name||' '||lu.last_name) AS landlord_name
+               FROM lease_document_signers s
+               JOIN lease_documents d ON d.id = s.document_id
+               LEFT JOIN units un ON un.id = d.unit_id
+               LEFT JOIN properties p ON p.id = un.property_id
+               JOIN landlords la ON la.id = d.landlord_id
+               JOIN users lu ON lu.id = la.user_id
+              WHERE s.document_id = $1 AND s.user_id = $2`, [openDoc.id, intent.user_id])
+          const link = await tenantLeaseLink({ userId: intent.user_id, documentId: openDoc.id, signerToken: sig.token })
+          const unitLabel = sig.unit_number ? `Unit ${sig.unit_number} — ${sig.property_name}` : sig.title
+          try {
+            await emailSigningRequest(sig.email, sig.name, sig.title, unitLabel, sig.landlord_name, link.url,
+              { landlordId: sig.landlord_id, documentId: openDoc.id, needsSetup: link.needsSetup })
+            sent = true
+          } catch (e) {
+            logger.error({ err: e, to: sig.email }, '[INVITE] lease email resend failed')
+          }
+        }
+      } else if (body.resend !== false) {
+        // No lease drafted (no unit, or drafting failed): the portal invite is
+        // still the only way in, exactly as before.
         // A fresh token on every send: the old link went to an address that may
         // no longer be under their control, and it must stop working.
         const inviteToken = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
@@ -6437,6 +6525,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
         firstName: body.firstName ?? intent.first_name,
         lastName: body.lastName ?? intent.last_name,
         resent: sent,
+        heldUntilLandlordSigns,
       } })
     } catch (e) { next(e) }
   })

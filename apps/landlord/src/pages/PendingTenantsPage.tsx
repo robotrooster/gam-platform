@@ -247,7 +247,7 @@ function FixEmailModal({
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Send {name}'s invite somewhere else</div>
+        <div className="modal-title">Correct {name}&apos;s name or email</div>
         <div style={{ padding: 16, fontSize: '.88rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
           <p style={{ marginTop: 0, color: 'var(--text-2)' }}>
             Currently going to <strong style={{ color: 'var(--text-1)' }}>{current}</strong>.
@@ -278,8 +278,9 @@ function FixEmailModal({
             </div>
           </div>
           <p style={{ marginBottom: 0, marginTop: 12, fontSize: '.78rem', color: 'var(--text-3)' }}>
-            They keep their place in the queue and any space held for them. A fresh invite
-            goes to the address above and the old link stops working.
+            They keep their place in the queue and any space held for them. Nothing is emailed
+            until you sign their lease; if you already have, their lease email goes to the new
+            address and the old link stops working.
           </p>
           {error && (
             <div style={{ marginTop: 10, color: COLOR_DANGER, fontSize: '.8rem' }}>{error}</div>
@@ -289,7 +290,7 @@ function FixEmailModal({
           <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
           <button className="btn btn-primary" onClick={onConfirm}
             disabled={busy || (!changed && !firstName.trim() && !lastName.trim())}>
-            {busy ? 'Sending...' : changed ? 'Save and re-send' : 'Save'}
+            {busy ? 'Saving...' : 'Save'}
           </button>
         </div>
       </div>
@@ -834,11 +835,15 @@ export function PendingTenantsPage() {
         resend: v.resend,
       }),
     {
-      onSuccess: (_d, v) => {
+      onSuccess: (d: any) => {
         qc.invalidateQueries('pending-tenants')
         qc.invalidateQueries('pending-tenants-count')
         // S639: correcting only a spelling must not tell them an invite went out.
-        setFixDone(v.resend ? `Invite re-sent to ${v.email}` : 'Name updated')
+        // S648: and nothing goes out before you sign their lease — say so.
+        setFixDone(
+          d?.resent ? `Lease email sent to ${d.email}`
+          : d?.heldUntilLandlordSigns ? `Saved. Their lease email goes to ${d.email} when you sign it.`
+          : 'Saved')
         setFixTarget(null)
         setTimeout(() => setFixDone(null), 6000)
       },
@@ -1118,11 +1123,18 @@ export function PendingTenantsPage() {
             setFixError(null)
             const email = fixEmail.trim()
             const addressChanged = !!email && email.toLowerCase() !== fixTarget.email.toLowerCase()
+            // S648: send only what was actually changed. Sending every box
+            // re-saved whatever the row showed — which is how a corrected
+            // "Simpson" went back to "Simpsosn" from a stale list.
+            const first = fixFirst.trim(), last = fixLast.trim()
+            const nameChanged = (!!first && first !== (fixTarget.firstName || '').trim())
+              || (!!last && last !== (fixTarget.lastName || '').trim())
+            if (!addressChanged && !nameChanged) { setFixTarget(null); return }
             fixEmailMut.mutate({
               intentId: fixTarget.intentId,
               email: addressChanged ? email : undefined,
-              firstName: fixFirst.trim() || undefined,
-              lastName: fixLast.trim() || undefined,
+              firstName: first && first !== (fixTarget.firstName || '').trim() ? first : undefined,
+              lastName: last && last !== (fixTarget.lastName || '').trim() ? last : undefined,
               // Only a NEW address needs a fresh link; a spelling fix does not
               // invalidate the one they are already holding.
               resend: addressChanged,

@@ -16,12 +16,14 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-const { emailSigningRequestMock } = vi.hoisted(() => ({
+const { emailSigningRequestMock, emailSigningReminderMock } = vi.hoisted(() => ({
   emailSigningRequestMock: vi.fn(async (..._a: any[]) => undefined),
+  emailSigningReminderMock: vi.fn(async (..._a: any[]) => undefined),
 }))
 vi.mock('../services/email', async (orig) => ({
   ...(await orig() as any),
   emailSigningRequest: emailSigningRequestMock,
+  emailSigningReminder: emailSigningReminderMock,
 }))
 import express from 'express'
 import request from 'supertest'
@@ -570,5 +572,29 @@ describe('a stuck meter when the lease is signed', () => {
 
     const bills = await db.query(`SELECT 1 FROM utility_bills WHERE unit_id=$1`, [f.unitId])
     expect(bills.rows).toHaveLength(0)
+  })
+})
+
+
+// S648: the landlord's Remind button read the waiting signer without their
+// account id, so a tenant who had never set up an account was mailed a bare
+// signing link instead of the one set-up-and-sign link.
+describe('Remind', () => {
+  it('sends a tenant with no account the set-up-and-sign link', async () => {
+    const f = await fixture()
+    const documentId = await unsignedDoc(f)
+    await db.query(
+      `UPDATE users SET password_hash='$2b$10$placeholder_invite_pending', tenant_invite_accepted_at=NULL
+        WHERE id=$1`, [f.tenantUserId])
+    await signAs(documentId, f.landlordToken)
+    await db.query(`UPDATE lease_document_signers SET reminder_sent_at=NULL WHERE document_id=$1`, [documentId])
+    emailSigningReminderMock.mockClear()
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/remind`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    const [, , , , , url, meta] = emailSigningReminderMock.mock.calls[0]
+    expect(url).toContain('/accept-invite?token=')
+    expect(meta.needsSetup).toBe(true)
   })
 })
