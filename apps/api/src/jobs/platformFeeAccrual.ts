@@ -555,24 +555,58 @@ async function accrueOneProperty(
     `, [propertyId, monthIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
     const strRevenue = round2(parseFloat(strRes.rows[0].revenue ?? '0'))
 
-    // ── Rate + minimum (cascade through landlord override → platform default) ──
+    // ── S645: IS THIS PROPERTY RUN BY A MANAGER, AND ON WHAT TERMS? ──────
+    //
+    // Nic (S644, DIRECTIVE): GAM bills "the PM company — one bill" for every
+    // occupied unit across all their owners. So for a managed property the
+    // INVOICE goes to the manager, whatever the owner's own arrangement is;
+    // what the owner pays is settled between them and their manager, below.
+    //
+    // Read before the rate, because the manager's rate is the one that applies:
+    // 11,000 units under one contract is not the list price, and that deal
+    // follows the MANAGER across every owner they bring.
+    const pmRes = await client.query<{
+      pm_company_id: string
+      platform_fee_payer: 'pm_company' | 'owner'
+      platform_fee_rate_to_owner: string | null
+    }>(`
+      SELECT p.pm_company_id,
+             COALESCE(r.platform_fee_payer, 'pm_company') AS platform_fee_payer,
+             r.platform_fee_rate_to_owner
+        FROM properties p
+        LEFT JOIN pm_owner_relationships r
+               ON r.pm_company_id = p.pm_company_id
+              AND r.landlord_id   = p.landlord_id
+              AND r.status = 'active'
+       WHERE p.id = $1 AND p.pm_company_id IS NOT NULL
+    `, [propertyId])
+    const pm = pmRes.rows[0] ?? null
+
+    // ── Rate + minimum ────────────────────────────────────────────────────
+    //
+    // Cascade: the MANAGER's negotiated rate when one runs this property, else
+    // the owner's own override, else the platform default. A managed property
+    // is the manager's line of business and is priced on their contract.
     const rateRes = await client.query<{
       rate_per_unit: string
       min_per_connect_account: string
       str_fee_pct: string
     }>(`
       SELECT
-        COALESCE(o.rate_per_unit, pfc.rate_per_unit) AS rate_per_unit,
-        COALESCE(o.min_per_connect_account, pfc.min_per_connect_account)
-          AS min_per_connect_account,
+        COALESCE(pmo.rate_per_unit, o.rate_per_unit, pfc.rate_per_unit) AS rate_per_unit,
+        COALESCE(pmo.min_per_connect_account, o.min_per_connect_account,
+                 pfc.min_per_connect_account) AS min_per_connect_account,
         COALESCE(o.str_fee_pct, pfc.str_fee_pct) AS str_fee_pct
       FROM platform_fee_config pfc
       LEFT JOIN landlord_platform_fee_overrides o
              ON o.landlord_id = $1
             AND o.effective_until IS NULL
+      LEFT JOIN pm_company_platform_fee_overrides pmo
+             ON pmo.pm_company_id = $2::uuid
+            AND pmo.effective_until IS NULL
       WHERE pfc.effective_until IS NULL
       LIMIT 1
-    `, [landlordId])
+    `, [landlordId, pm?.pm_company_id ?? null])
     if (rateRes.rowCount === 0) {
       await client.query('ROLLBACK')
       throw new Error(`No active platform_fee_config row found`)
@@ -606,8 +640,9 @@ async function accrueOneProperty(
          utility_service_unit_count,
          rate_per_unit, min_per_connect_account, total_amount,
          str_revenue, str_fee_amount,
-         payer)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13)
+         payer,
+         billed_pm_company_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $14, $8, $9, $10, $11, $12, $13, $15)
       RETURNING id
     `, [
       landlordId, propertyId, monthIso,
@@ -616,8 +651,48 @@ async function accrueOneProperty(
       strRevenue, strFeeAmount,
       payer,
       utilityServiceUnitCount,
+      pm?.pm_company_id ?? null,
     ])
     const accrualId = accrualRes.rows[0].id
+
+    // ── S645: WHAT THE MANAGER HANDS ON TO THE OWNER ──────────────────────
+    //
+    // Nic (DIRECTIVE): the manager chooses whether the software cost is in
+    // their management contract or passed through. "I'm assuming most people
+    // will choose to have it included in the contract — they've priced in
+    // software to do their business. But in case anybody wants to pass it
+    // through, it lets the owner know exactly where part of that money is
+    // going."
+    //
+    // This does NOT change who GAM invoices — that is the manager either way,
+    // one bill. This is the manager re-billing their own customer, recorded
+    // here so it can appear as its own line on the owner's statement and be
+    // netted at disbursement, rather than being folded into the management fee
+    // where the owner could not see it.
+    //
+    // The rate is the MANAGER'S. Nic, on letting them mark it up: "the property
+    // manager is the one to incentivize, because they're operating the
+    // portfolio." Absent a rate they charge exactly what GAM charged them,
+    // which is the honest default for a manager who only wants to be whole.
+    if (pm && pm.platform_fee_payer === 'owner' && totalBillable > 0) {
+      const ownerRate = pm.platform_fee_rate_to_owner !== null
+        ? parseFloat(pm.platform_fee_rate_to_owner)
+        : ratePerUnit
+      await client.query(
+        `INSERT INTO pm_platform_fee_passthroughs
+           (pm_company_id, landlord_id, property_id, accrual_month,
+            occupied_unit_count, rate_per_unit, total_amount, gam_rate_per_unit)
+         VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8)
+         ON CONFLICT (property_id, accrual_month, pm_company_id) DO UPDATE
+           SET occupied_unit_count = EXCLUDED.occupied_unit_count,
+               rate_per_unit       = EXCLUDED.rate_per_unit,
+               total_amount        = EXCLUDED.total_amount,
+               gam_rate_per_unit   = EXCLUDED.gam_rate_per_unit,
+               updated_at          = now()`,
+        [pm.pm_company_id, landlordId, propertyId, monthIso,
+         totalBillable, ownerRate.toFixed(2),
+         round2(ownerRate * totalBillable).toFixed(2), ratePerUnit.toFixed(2)])
+    }
 
     // ── Post platform_revenue_ledger entry when payer='landlord' ────────
     // When payer='tenant', the accrual row stands alone and the

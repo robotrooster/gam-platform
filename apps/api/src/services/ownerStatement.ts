@@ -48,7 +48,17 @@ export interface OwnerStatementProperty {
   managementFee: number
   /** Bills paid on the owner's behalf this month. */
   expenses: number
-  /** ownerShare − expenses. What the month was worth to them. */
+  /**
+   * S645 — software the manager passed through, when their contract says the
+   * owner carries it rather than the manager. Zero when the manager absorbs it,
+   * which Nic expects most to do. Stated as its own line, never folded into the
+   * management fee: the entire point of the toggle is that the owner can see
+   * where this part of the money goes.
+   */
+  platformPassthrough: number
+  /** Units it was charged on, so the line can explain itself. */
+  platformPassthroughUnits: number
+  /** ownerShare − expenses − platformPassthrough. What the month was worth. */
   net: number
   expenseLines: Array<{
     date: string; category: string; amount: number
@@ -68,6 +78,7 @@ export interface OwnerStatement {
     ownerShare: number
     managementFee: number
     expenses: number
+    platformPassthrough: number
     net: number
   }
   /**
@@ -150,6 +161,20 @@ export async function ownerStatement(opts: {
           AND COALESCE(pay.settled_at, pay.created_at) <  ($2::date + INTERVAL '1 month')
         GROUP BY u.property_id
      ),
+     passthrough AS (
+       -- S645: the manager's re-bill of the software cost, when their contract
+       -- with this owner passes it through. Read from the accrual rather than
+       -- recomputed from a rate, for the same reason as everything else here:
+       -- the statement reports what was actually charged.
+       SELECT pt.property_id,
+              SUM(pt.total_amount)        AS passthrough,
+              SUM(pt.occupied_unit_count) AS passthrough_units
+         FROM pm_platform_fee_passthroughs pt
+         JOIN scope s ON s.id = pt.property_id
+        WHERE pt.accrual_month = $2::date
+          AND ($3::uuid IS NULL OR pt.pm_company_id = $3::uuid)
+        GROUP BY pt.property_id
+     ),
      spend AS (
        SELECT e.property_id, SUM(e.amount) AS expenses
          FROM landlord_expenses e
@@ -163,11 +188,14 @@ export async function ownerStatement(opts: {
             COALESCE(g.gross_collected, 0)::float AS gross_collected,
             COALESCE(m.owner_share, 0)::float     AS owner_share,
             COALESCE(m.pm_fee, 0)::float          AS pm_fee,
-            COALESCE(sp.expenses, 0)::float       AS expenses
+            COALESCE(sp.expenses, 0)::float       AS expenses,
+            COALESCE(pt.passthrough, 0)::float    AS passthrough,
+            COALESCE(pt.passthrough_units, 0)::int AS passthrough_units
        FROM scope s
        LEFT JOIN money m  ON m.property_id  = s.id
        LEFT JOIN gross g  ON g.property_id  = s.id
        LEFT JOIN spend sp ON sp.property_id = s.id
+       LEFT JOIN passthrough pt ON pt.property_id = s.id
       ORDER BY s.name`,
     [opts.landlordId, start, pmId])
 
@@ -199,6 +227,7 @@ export async function ownerStatement(opts: {
   const properties: OwnerStatementProperty[] = rows.map((r: any) => {
     const ownerShare = round2(Number(r.owner_share))
     const expenses = round2(Number(r.expenses))
+    const passthrough = round2(Number(r.passthrough))
     return {
       propertyId: r.property_id,
       propertyName: r.property_name,
@@ -206,7 +235,9 @@ export async function ownerStatement(opts: {
       ownerShare,
       managementFee: round2(Number(r.pm_fee)),
       expenses,
-      net: round2(ownerShare - expenses),
+      platformPassthrough: passthrough,
+      platformPassthroughUnits: Number(r.passthrough_units) || 0,
+      net: round2(ownerShare - expenses - passthrough),
       expenseLines: linesByProperty.get(r.property_id) ?? [],
     }
   })
@@ -236,6 +267,7 @@ export async function ownerStatement(opts: {
       ownerShare: ownerShareTotal,
       managementFee: sum(p => p.managementFee),
       expenses: sum(p => p.expenses),
+      platformPassthrough: sum(p => p.platformPassthrough),
       net: sum(p => p.net),
     },
     // A 'direct' owner's share left at settlement — the allocation IS the

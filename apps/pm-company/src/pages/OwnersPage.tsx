@@ -23,6 +23,8 @@ interface OwnerRow {
   disbursementDay: number
   portalAccess: 'none' | 'active' | 'closed'
   portalOpenedAt: string | null
+  platformFeePayer: 'pm_company' | 'owner'
+  platformFeeRateToOwner: string | null
   notes: string | null
   propertyCount: number
   unitCount: number
@@ -31,14 +33,15 @@ interface OwnerRow {
 interface StatementProperty {
   propertyId: string; propertyName: string
   grossCollected: number; ownerShare: number; managementFee: number
-  expenses: number; net: number
+  expenses: number; platformPassthrough: number; platformPassthroughUnits: number
+  net: number
   expenseLines: Array<{ date: string; category: string; amount: number; description: string | null; vendor: string | null }>
 }
 interface Statement {
   periodMonth: string
   payoutMode: 'direct' | 'pm_trust'
   properties: StatementProperty[]
-  totals: { grossCollected: number; ownerShare: number; managementFee: number; expenses: number; net: number }
+  totals: { grossCollected: number; ownerShare: number; managementFee: number; expenses: number; platformPassthrough: number; net: number }
   distributedInPeriod: number
   heldForOwner: number
 }
@@ -106,7 +109,7 @@ export function OwnersPage() {
             <thead>
               <tr style={{ background: 'var(--bg-2)' }}>
                 <Th>Owner</Th><Th>Portfolio</Th><Th>How they're paid</Th>
-                <Th>Portal</Th><Th>{' '}</Th>
+                <Th>Software cost</Th><Th>Portal</Th><Th>{' '}</Th>
               </tr>
             </thead>
             <tbody>
@@ -150,6 +153,40 @@ export function OwnersPage() {
                             <option key={d} value={d}>{ordinal(d)}</option>
                           ))}
                         </select>
+                      </div>
+                    )}
+                  </Td>
+                  {/* S645 (Nic, DIRECTIVE): "Make that a toggle — who pays the
+                      platform. Either the property manager, if they're including
+                      that in their contract, or it's getting passed through to
+                      the owner." Most managers price software into their fee;
+                      the ones who don't want the owner to see the line. */}
+                  <Td>
+                    <select
+                      value={o.platformFeePayer}
+                      onChange={e => terms.mutate({
+                        landlordId: o.landlordId, body: { platformFeePayer: e.target.value } })}
+                      style={selectStyle}
+                    >
+                      <option value="pm_company">We absorb it</option>
+                      <option value="owner">Billed to the owner</option>
+                    </select>
+                    {o.platformFeePayer === 'owner' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        <input
+                          type="number" step="0.01" min="0"
+                          placeholder="your rate"
+                          defaultValue={o.platformFeeRateToOwner ?? ''}
+                          onBlur={e => terms.mutate({
+                            landlordId: o.landlordId,
+                            body: { platformFeeRateToOwner:
+                              e.target.value === '' ? null : Number(e.target.value) } })}
+                          style={{ ...selectStyle, width: 74 }}
+                        />
+                        {' '}per occupied unit
+                        <div style={{ marginTop: 2 }}>
+                          {o.platformFeeRateToOwner == null && 'Blank charges them our rate.'}
+                        </div>
                       </div>
                     )}
                   </Td>
@@ -242,6 +279,9 @@ function OwnerStatement(props: {
             <Figure label="Owner's share" value={money(s.totals.ownerShare)} />
             <Figure label="Management fee" value={money(s.totals.managementFee)} />
             <Figure label="Expenses" value={money(s.totals.expenses)} />
+            {s.totals.platformPassthrough > 0 && (
+              <Figure label="Software" value={money(s.totals.platformPassthrough)} />
+            )}
             <Figure label="Net to owner" value={money(s.totals.net)} accent />
           </div>
 
@@ -256,7 +296,7 @@ function OwnerStatement(props: {
               <thead>
                 <tr style={{ background: 'var(--bg-2)' }}>
                   <Th>Property</Th><Th>Collected</Th><Th>Their share</Th>
-                  <Th>Fee</Th><Th>Expenses</Th><Th>Net</Th>
+                  <Th>Fee</Th><Th>Expenses</Th><Th>Software</Th><Th>Net</Th>
                 </tr>
               </thead>
               <tbody>
@@ -278,6 +318,16 @@ function OwnerStatement(props: {
                           ))}
                         </div>
                       )}
+                    </Td>
+                    <Td>
+                      {p.platformPassthrough > 0 ? (
+                        <>
+                          {money(p.platformPassthrough)}
+                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>
+                            {p.platformPassthroughUnits} occupied units
+                          </div>
+                        </>
+                      ) : '—'}
                     </Td>
                     <Td><strong>{money(p.net)}</strong></Td>
                   </tr>

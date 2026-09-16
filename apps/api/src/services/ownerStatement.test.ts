@@ -225,6 +225,93 @@ describe('what the owner is shown', () => {
   })
 })
 
+// S645 (Nic, DIRECTIVE): the manager decides whether the software cost sits in
+// their management contract or is handed to the owner. "In case anybody wants to
+// pass it through, it lets the owner know exactly where part of that money is
+// going." And on markup: "the property manager is the one to incentivize,
+// because they're operating the portfolio."
+describe('software the manager passes through', () => {
+  async function managed(client: any, opts: {
+    payer: 'pm_company' | 'owner'; rateToOwner?: number | null
+  }) {
+    const { userId, landlordId } = await seedLandlord(client)
+    const bankId = await seedUserBankAccount(client, { userId })
+    const pmId = await seedPmCompany(client, { bankAccountId: bankId })
+    const propertyId = await seedProperty(client, {
+      landlordId, ownerUserId: userId, managedByUserId: userId })
+    await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`, [propertyId, pmId])
+    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+    await client.query(
+      `UPDATE pm_owner_relationships
+          SET platform_fee_payer=$3, platform_fee_rate_to_owner=$4
+        WHERE pm_company_id=$1 AND landlord_id=$2`,
+      [pmId, landlordId, opts.payer, opts.rateToOwner ?? null])
+    const o = { landlordId, userId, propertyId, unitId }
+    await allocate(client, o, 'allocation_owner_share', 880)
+    return { ...o, pmCompanyId: pmId }
+  }
+
+  const passthrough = (client: any, o: any, units: number, rate: number, gamRate: number) =>
+    client.query(
+      `INSERT INTO pm_platform_fee_passthroughs
+         (pm_company_id, landlord_id, property_id, accrual_month,
+          occupied_unit_count, rate_per_unit, total_amount, gam_rate_per_unit)
+       VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8)`,
+      [o.pmCompanyId, o.landlordId, o.propertyId, M, units,
+       rate.toFixed(2), (units * rate).toFixed(2), gamRate.toFixed(2)])
+
+  it('shows nothing when the manager absorbs it', async () => {
+    const client = await getClient()
+    try {
+      const o = await managed(client, { payer: 'pm_company' })
+      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
+      expect(s.totals.platformPassthrough).toBe(0)
+      expect(s.totals.net).toBe(880)
+    } finally { client.release() }
+  })
+
+  it('shows it as its own line and takes it off the net', async () => {
+    const client = await getClient()
+    try {
+      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      await passthrough(client, o, 40, 1.00, 0.50)
+
+      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
+      expect(s.totals.platformPassthrough).toBe(40)
+      expect(s.properties[0].platformPassthroughUnits).toBe(40)
+      expect(s.totals.net).toBe(840)          // 880 − 40
+      // It is NOT folded into management. The whole point is that it is legible.
+      expect(s.totals.managementFee).toBe(0)
+    } finally { client.release() }
+  })
+
+  it('never tells the owner what GAM charged the manager', async () => {
+    // The manager's markup is their business; quoting our cost beside their
+    // price would price their business for them in front of their customer.
+    const client = await getClient()
+    try {
+      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      await passthrough(client, o, 40, 1.00, 0.50)
+      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
+      expect(JSON.stringify(s)).not.toContain('0.5')
+      expect(JSON.stringify(s)).not.toContain('gamRate')
+    } finally { client.release() }
+  })
+
+  it('stacks with expenses rather than replacing them', async () => {
+    const client = await getClient()
+    try {
+      const o = await managed(client, { payer: 'owner', rateToOwner: 1.00 })
+      await passthrough(client, o, 40, 1.00, 0.50)
+      await expense(client, o as any, 150)
+      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
+      expect(s.totals.expenses).toBe(150)
+      expect(s.totals.platformPassthrough).toBe(40)
+      expect(s.totals.net).toBe(690)          // 880 − 150 − 40
+    } finally { client.release() }
+  })
+})
+
 describe('how the owner gets paid changes what the statement claims', () => {
   it('a direct owner has already been paid what the month earned', async () => {
     const client = await getClient()

@@ -20,7 +20,7 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant,
   seedProperty, seedUnit,
-  seedLease, seedLeaseTenant,
+  seedLease, seedLeaseTenant, seedUserBankAccount, seedPmCompany,
 } from '../test/dbHelpers'
 
 beforeEach(async () => {
@@ -888,5 +888,139 @@ describe('the STR revenue fee is 3% (S616)', () => {
     const { rows } = await db.query<any>(
       `SELECT str_fee_pct::text FROM platform_fee_config WHERE effective_until IS NULL`)
     expect(Number(rows[0].str_fee_pct)).toBe(0.03)
+  })
+})
+
+// ── S645 — A MANAGED PROPERTY IS BILLED TO THE MANAGER ────────────────────
+//
+// Nic (S644, DIRECTIVE): GAM bills "the PM company — one bill" for every
+// occupied unit across all their owners. And (S645) the manager decides whether
+// that cost lives in their management contract or is handed to the owner:
+// "I'm assuming most people will choose to have it included in the contract —
+// they've priced in software to do their business. But in case anybody wants to
+// pass it through, it lets the owner know exactly where part of that money is
+// going."
+describe('a property under a property manager', () => {
+  async function managed(opts: {
+    unitCount?: number
+    payer?: 'pm_company' | 'owner'
+    rateToOwner?: number | null
+    pmRate?: number | null            // GAM's negotiated rate TO the manager
+  }) {
+    const stack = await buildPlatformStack({ unitCount: opts.unitCount ?? 1 })
+    const client = await getClient()
+    try {
+      const bankId = await seedUserBankAccount(client, { userId: stack.ownerUserId })
+      const pmId = await seedPmCompany(client, { bankAccountId: bankId, name: 'Big PM' })
+      // The trigger opens the relationship when the property joins the manager.
+      await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`,
+        [stack.propertyId, pmId])
+      await client.query(
+        `UPDATE pm_owner_relationships
+            SET platform_fee_payer=$3, platform_fee_rate_to_owner=$4
+          WHERE pm_company_id=$1 AND landlord_id=$2`,
+        [pmId, stack.landlordId, opts.payer ?? 'pm_company', opts.rateToOwner ?? null])
+      if (opts.pmRate != null) {
+        await client.query(
+          `INSERT INTO pm_company_platform_fee_overrides (pm_company_id, rate_per_unit, reason)
+           VALUES ($1,$2,'bulk deal')`, [pmId, opts.pmRate])
+      }
+      return { ...stack, pmCompanyId: pmId }
+    } finally { client.release() }
+  }
+
+  it('sends the bill to the manager, not the owner', async () => {
+    const s = await managed({})
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT billed_pm_company_id, landlord_id FROM platform_fee_accruals
+        WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].billed_pm_company_id).toBe(s.pmCompanyId)
+    // The owner's id stays on it. That is what lets ONE bill be broken down by
+    // owner without a second table.
+    expect(row.rows[0].landlord_id).toBe(s.landlordId)
+  })
+
+  it('prices it on the manager\'s deal, not the list rate', async () => {
+    // Nic's own example: 11,000 units at 50 cents rather than $2. Enough units
+    // here that the $10 per-Connect-account floor does not bind, so the rate is
+    // what is actually being tested: 25 × $0.50 = $12.50.
+    const s = await managed({ unitCount: 25, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT rate_per_unit::float AS rate, total_amount::float AS total
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].rate).toBe(0.5)
+    expect(row.rows[0].total).toBe(12.5)
+  })
+
+  it('still floors a small manager-rate property at the Connect minimum', async () => {
+    // Worth pinning because a bulk rate makes the floor bite far more often:
+    // 3 units at 50 cents is $1.50, and the $10 minimum per PAYOUT SETUP (S630)
+    // tops it up. That is existing, deliberate behaviour — the floor is on the
+    // banking setup, not the address — but a manager negotiating cents per unit
+    // should know the floor is what they will actually pay on small owners.
+    const s = await managed({ unitCount: 3, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT rate_per_unit::float AS rate, total_amount::float AS total,
+              connect_min_topup::float AS topup
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].rate).toBe(0.5)
+    expect(row.rows[0].total).toBe(10)
+    expect(row.rows[0].topup).toBe(8.5)
+  })
+
+  it('hands nothing to the owner when the manager absorbs it', async () => {
+    const s = await managed({ unitCount: 3, payer: 'pm_company', pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const pt = await db.query(
+      `SELECT 1 FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
+    expect(pt.rows).toHaveLength(0)
+  })
+
+  it('re-bills the owner at the manager\'s own rate when passed through', async () => {
+    // GAM charges the manager 50c; the manager charges the owner a dollar.
+    const s = await managed({ unitCount: 3, payer: 'owner', rateToOwner: 1.00, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+
+    const pt = await db.query(
+      `SELECT occupied_unit_count, rate_per_unit::float AS rate,
+              total_amount::float AS total, gam_rate_per_unit::float AS gam_rate
+         FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
+    expect(pt.rows[0].occupied_unit_count).toBe(3)
+    expect(pt.rows[0].rate).toBe(1)
+    expect(pt.rows[0].total).toBe(3)
+    // Recorded for GAM's own margin reporting, never shown to the owner.
+    expect(pt.rows[0].gam_rate).toBe(0.5)
+
+    // GAM's own bill still goes to the manager, at the manager's rate. (The
+    // total carries the $10 Connect-account floor on a property this small —
+    // see the floor test above; what matters here is the destination.)
+    const acc = await db.query(
+      `SELECT rate_per_unit::float AS rate, billed_pm_company_id
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(acc.rows[0].rate).toBe(0.5)
+    expect(acc.rows[0].billed_pm_company_id).toBe(s.pmCompanyId)
+  })
+
+  it('charges our rate when the manager sets none', async () => {
+    const s = await managed({ unitCount: 2, payer: 'owner', rateToOwner: null, pmRate: 0.50 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const pt = await db.query(
+      `SELECT rate_per_unit::float AS rate, total_amount::float AS total
+         FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
+    expect(pt.rows[0].rate).toBe(0.5)
+    expect(pt.rows[0].total).toBe(1)
+  })
+
+  it('leaves an unmanaged property billed to its owner exactly as before', async () => {
+    const s = await buildPlatformStack({ unitCount: 2 })
+    await processPlatformFeeAccrual(RUN_DATE)
+    const row = await db.query(
+      `SELECT billed_pm_company_id, rate_per_unit::float AS rate
+         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
+    expect(row.rows[0].billed_pm_company_id).toBeNull()
+    expect(row.rows[0].rate).toBe(2)
   })
 })
