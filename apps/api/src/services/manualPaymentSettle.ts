@@ -229,6 +229,21 @@ export async function settleManualRentPayment(
   // money can answer, and both wrong answers are expensive: defaulting to
   // change loses a resident's money, defaulting to credit says a landlord kept
   // cash they handed back. Refuse instead of guessing.
+  // S648 (Nic, DIRECTIVE): ONLY CASH GETS CHANGE.
+  //
+  //   "If somebody gives me a check that's too much, it needs to only be for
+  //    credit. They can't get change back. They can't write a check for a
+  //    hundred dollars over the rent and use it like an ATM and just get cash
+  //    out of the drawer... it looks like we brought in more money than we did."
+  //
+  // A check or money order over the balance is money on the account, full
+  // stop. Refused, not quietly converted: whoever is at the desk must not
+  // believe they recorded handing cash back.
+  if (surplus > 0 && input.method !== 'cash' && input.surplusHandling === 'change') {
+    throw new AppError(422,
+      `No change can be given on a ${input.method === 'money_order' ? 'money order' : 'check'}. ` +
+      `The $${surplus.toFixed(2)} over the balance stays on their account as credit.`)
+  }
   if (surplus > 0 && input.surplusHandling !== 'change' && input.surplusHandling !== 'credit') {
     throw new AppError(422,
       `That is $${surplus.toFixed(2)} over the $${amountSettled.toFixed(2)} owed. ` +

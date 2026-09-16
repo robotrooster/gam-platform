@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DBh9bE90AMdDeMwFTNkhacK6ZJhbtZ12VbW2vbZTnfiamIhjdwIKOefziDHAV3N
+\restrict DOgDa2cF1mzEb41MpovELq43sauWE8ppawyg3lETNhIEYOzsDKppxb80gZS5Zq0
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7573,7 +7573,7 @@ COMMENT ON COLUMN public.properties.onboarding_late_fee_waiver IS 'S648: landlor
 -- Name: COLUMN properties.estimates_stuck_meters; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.properties.estimates_stuck_meters IS 'S648: internal only, never landlord-settable. TRUE = a stuck or out-of-service submeter bills the low-end estimate from occupied neighbours (Nic''s stopgap at Mountain View during the pedestal replacement). FALSE = the meter is flagged broken and no utility bills until it is repaired.';
+COMMENT ON COLUMN public.properties.estimates_stuck_meters IS 'S648: landlord setting. TRUE = a stuck or out-of-service submeter on an occupied space bills the low-end usage of occupied neighbours until repaired. FALSE (default) = the meter is flagged broken and bills nothing until it is marked repaired with a fresh starting reading.';
 
 
 --
@@ -26726,5 +26726,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DBh9bE90AMdDeMwFTNkhacK6ZJhbtZ12VbW2vbZTnfiamIhjdwIKOefziDHAV3N
+\unrestrict DOgDa2cF1mzEb41MpovELq43sauWE8ppawyg3lETNhIEYOzsDKppxb80gZS5Zq0
 

@@ -757,6 +757,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_broken_meter_billing',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/broken-meter-estimate',
+    pathParams: ['propertyId'],
+    description:
+      'Choose, for one property, what a submeter bills once it stops reading on an occupied space: ' +
+      'nothing until it is repaired (estimate false), or the low end of what occupied neighbours used ' +
+      '(estimate true). Whether estimated billing is allowed is the landlord\u2019s call under their local ' +
+      'law — never advise on it. Read their choice back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      estimate: { type: 'boolean', description: 'true = bill the neighbours\u2019 low-end usage; false = bill nothing until repaired.' },
+    },
+    required: ['propertyId', 'estimate'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_onboarding_late_fee_waiver',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/onboarding-late-fee-waiver',

@@ -132,7 +132,8 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   const ready = !!anchor && entered && !short
     && (!needsNumber || reference.trim().length > 0)
     // Money over the balance has to be accounted for before this can be saved.
-    && (change === 0 || surplusHandling !== null)
+    // S648: only cash has a choice — a check's extra is always credit.
+    && (change === 0 || !cash || surplusHandling !== null)
 
   const mut = useMutation(
     () => apiPost(`/payments/${anchor.id}/record-manual`, {
@@ -140,7 +141,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
       reference: reference.trim() || undefined,
       // Every method carries its amount now — a check can be written over.
       ...(entered ? { amountTendered: paid } : {}),
-      ...(change > 0 && surplusHandling ? { surplusHandling } : {}),
+      ...(change > 0 ? { surplusHandling: cash ? surplusHandling : 'credit' } : {}),
     }),
     {
       onSuccess: (r: any) => {
@@ -226,17 +227,26 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
                 <div style={{ fontSize: '.9rem', fontWeight: 800, color: 'var(--gold)' }}>
                   {fmt(change)} over the balance
                 </div>
+                {!cash ? (
+                  // S648 (Nic): "They can't write a check for a hundred dollars
+                  // over the rent and use it like an ATM."
+                  <div style={{ fontSize: '.76rem', color: 'var(--text-2)', marginTop: 4 }}>
+                    Goes on their account as credit and comes off their next bill.
+                    No change is given on a {method === 'check' ? 'check' : 'money order'}.
+                  </div>
+                ) : (
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
                   Choose one — this can&apos;t be saved until you do.
                 </div>
+                )}
                 {/* S637 (Nic): "if they wanted to leave it as credit for the
                     future, that should also be a 'hey, I'm clicking that I
                     didn't give them change, add forty dollar credit to their
                     account' sort of thing." */}
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                {cash && <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
                   {([
                     { v: 'change' as const,
-                      t: cash ? 'Gave change' : 'Gave it back',
+                      t: 'Gave change',
                       d: `Handed ${fmt(change)} back` },
                     // S641 (Nic): this is NOT the same thing as issuing a
                     // credit. The money is already in the drawer — the desk is
@@ -258,7 +268,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
                       </button>
                     )
                   })}
-                </div>
+                </div>}
               </div>
             )}
           </div>

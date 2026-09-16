@@ -182,6 +182,26 @@ describe('an overpayment at the counter', () => {
     expect(res.status).toBe(200)
   })
 
+  // S648 (Nic): "They can't write a check for a hundred dollars over the rent
+  // and use it like an ATM and just get cash out of the drawer."
+  it('can never give change on a check — the extra is credit', async () => {
+    const { f, paymentId } = await openRentCharge()
+    const refused = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'check', reference: '170', amountTendered: 920, surplusHandling: 'change' })
+    expect(refused.status).toBe(422)
+    const { rows } = await db.query(`SELECT status FROM payments WHERE id=$1`, [paymentId])
+    expect(rows[0].status).toBe('pending')
+    const ok = await request(buildApp())
+      .post(`/api/payments/${paymentId}/record-manual`)
+      .set('Authorization', `Bearer ${f.deskToken}`)
+      .send({ method: 'check', reference: '170', amountTendered: 920, surplusHandling: 'credit' })
+    expect(ok.status).toBe(200)
+    expect(ok.body.data.creditId).toBeTruthy()
+    expect(ok.body.data.surplus).toBeGreaterThan(0)
+  })
+
   it('and can leave the surplus on the account for next month', async () => {
     const { f, paymentId } = await openRentCharge()
     const res = await request(buildApp())

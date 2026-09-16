@@ -21,8 +21,8 @@ beforeEach(async () => { await cleanupAllSchema() })
 const CYCLE = '2026-08-01'
 
 /** A space whose meter has not moved, plus a neighbour that used 120 kWh. */
-// S648: estimating is Mountain View's stopgap only. These fixtures stand in for
-// that property unless a test says otherwise.
+// S648: estimating is a landlord's per-property choice. These fixtures turn it
+// on unless a test says otherwise.
 async function parkWithAStuckMeter(opts: {
   unitStatus: string; withLease: boolean; existingTenancy?: boolean; leaseStart?: string
   estimates?: boolean
@@ -123,7 +123,7 @@ describe('a stuck meter on a space somebody lives in', () => {
   })
 })
 
-// ── S648 (Nic, DIRECTIVE): everywhere but Mountain View ─────────────────────
+// ── S648 (Nic, DIRECTIVE): a property that has not chosen estimates ────────
 //
 // "I do not want other landlords having the meter reads guessed on... flag if
 // there's no change in the meter and flag that it's broken... No electric bill

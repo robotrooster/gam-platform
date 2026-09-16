@@ -204,8 +204,9 @@ export async function lowestComparableUsage(args: {
 
 /** S647: the 25th percentile, nearest-rank, of an ascending list. */
 /**
- * S648 (Nic, DIRECTIVE): outside Mountain View a meter that did not move on an
- * occupied space is BROKEN — flag it and bill nothing.
+ * S648 (Nic, DIRECTIVE): unless the landlord chose estimates for the property,
+ * a meter that did not move on an occupied space is BROKEN — flag it and bill
+ * nothing.
  *
  *   "Flag if there's no change in the meter and flag that it's broken. That
  *    will encourage landlords to actually replace the meter... Other landlords
@@ -792,8 +793,9 @@ export async function generateBillsForMeter(
     stuckOnOccupied = move?.usage != null && Number(move.usage) === 0
   }
 
-  // S648 (Nic, DIRECTIVE): estimating is Mountain View's stopgap, not a
-  // platform rule. Everywhere else a broken meter bills NOTHING and is flagged.
+  // S648 (Nic, DIRECTIVE): estimating is the LANDLORD's per-property choice
+  // (properties.estimates_stuck_meters, off by default). Off: a broken meter
+  // bills NOTHING and is flagged.
   const estimates = meter.billing_method === 'submeter'
     && (meter.out_of_service || stuckOnOccupied)
     && (await queryOne<{ on: boolean }>(
@@ -2070,8 +2072,8 @@ export async function releaseSuspendedChargesForLease(args: {
                               AND sc.cancelled_at IS NULL)`,
         [args.unitId])
       for (const st of stuck) {
-        // S648: only Mountain View estimates; everywhere else the meter is
-        // flagged broken and this space gets no utility bill for it.
+        // S648: only a property whose landlord chose estimates estimates;
+        // otherwise the meter is flagged broken and bills nothing.
         if (!st.estimates) { await flagBrokenMeter(st.meter_id, (sql, p) => q<any>(sql, p)); continue }
         const est = await lowestComparableUsage({
           brokenMeterId: st.meter_id, propertyId: st.property_id,

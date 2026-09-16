@@ -512,7 +512,7 @@ describe('a stuck meter when the lease is signed', () => {
     await db.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
        VALUES ($1,$2,$3,$4,$5)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId, opts.existing])
-    // S648: estimating is Mountain View's stopgap only.
+    // S648: estimating is the landlord's per-property choice.
     await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id=$1`, [f.propertyId])
     await db.query(
       `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit)

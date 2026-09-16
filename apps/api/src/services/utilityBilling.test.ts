@@ -56,8 +56,8 @@ async function seedBaseProperty(): Promise<BaseCtx> {
   finally { c.release() }
 }
 
-// S648: a stuck or broken meter is only ESTIMATED at Mountain View (Nic's
-// stopgap during the pedestal replacement). Tests of that behaviour use this.
+// S648: a stuck or broken meter is only ESTIMATED where the landlord chose it
+// for the property. Tests of that behaviour use this.
 async function seedEstimatingProperty(): Promise<BaseCtx> {
   const base = await seedBaseProperty()
   await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])

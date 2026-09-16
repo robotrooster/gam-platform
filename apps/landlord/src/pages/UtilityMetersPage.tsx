@@ -311,6 +311,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           {/* S605: rates sit ABOVE meter setup — the price is the first thing
               you decide for a property, and every meter below bills at it. */}
           <PropertyRatesCard propertyId={propertyId} />
+          {canReview && <BrokenMeterPolicyCard property={(properties as any[]).find((p: any) => p.id === propertyId)} />}
 
           {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
           {/* Meter setup is LANDLORD-only (broken toggle, rates, links). */}
@@ -424,6 +425,34 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
 // ((1,000,000 − previous) + current); a meter swap/reset bills nothing
 // that cycle. Resolving re-bills the cycle automatically if its run
 // already completed.
+// S648 (Nic): "If they're sub-metering an RV park and their meters are broken,
+// the landlord can set if they want to bill off of an average usage of other
+// residents... that's up to them whether their area law allows it."
+function BrokenMeterPolicyCard({ property }: { property: any }) {
+  const qc = useQueryClient()
+  const set = useMutation(
+    (estimate: boolean) => apiPatch(`/properties/${property.id}/broken-meter-estimate`, { estimate }),
+    { onSuccess: () => { qc.invalidateQueries('properties'); qc.invalidateQueries(['utility-meters', property.id]) },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save') })
+  if (!property) return null
+  const on = !!property.estimatesStuckMeters
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When a submeter stops reading</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        A meter that shows no change on an occupied space is marked broken. Choose what it bills until you mark it
+        repaired. Whether estimated billing is allowed where you are is your call — check your local laws.
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => on && set.mutate(false)}>Bill nothing until repaired</button>
+        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
+          onClick={() => !on && set.mutate(true)}>Bill the low end of what neighbours used</button>
+      </div>
+    </div>
+  )
+}
+
 function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () => void }) {
   const [value, setValue] = useState('')
   const [reason, setReason] = useState<'rollover' | 'swap' | null>(null)
