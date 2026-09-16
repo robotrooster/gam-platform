@@ -13,16 +13,16 @@
 //   - Card-present PaymentIntents — create, push-to-reader (server-
 //     driven flow), capture, cancel
 //
-// All Stripe API calls fire under the LANDLORD's Connect account
-// (stripeAccount override). The Terminal reader belongs to the
-// landlord's Stripe account, not GAM's platform — same posture as the
-// rest of the POS revenue model (POS sales are landlord revenue, not
-// GAM revenue). The PaymentIntent is therefore created directly on the
-// landlord's Connect account; NO `transfer_data` / `application_fee_amount`
-// — gross stays on the landlord's balance, Stripe's IC+ fee is netted
-// by Stripe automatically, GAM's revenue from POS is the monthly per-
-// unit platform fee (billed separately via the platform subscription
-// engine), NOT a per-transaction cut.
+// S648 (Nic): "All money pools to Stripe the same way that people pay rent
+// and then that batches and pays out to the landlord on a cycle... All that
+// money needs to flow directly to GAM first." Landlord registers now work like
+// the business register (S536): readers pair to GAM's PLATFORM account inside a
+// per-property Terminal Location, card-present PaymentIntents are platform
+// charges (no transfer, no Connect account), and the landlord's share of each
+// sale — the total less the card fee, which is GAM's — is paid in the weekly
+// payout batch (services/landlordPassthrough.ts, pos_transactions.payout_owed).
+// Before S648 these ran as direct charges on the landlord's Connect account;
+// no reader was ever paired and no sale ever recorded that way.
 
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
@@ -46,18 +46,36 @@ interface ReaderRow {
  * this to authenticate with Stripe Terminal — short-lived (a few
  * minutes); the SDK fetches a fresh one on each connection attempt.
  */
-export async function createConnectionToken(
-  landlordConnectAccountId: string,
-): Promise<string> {
+export async function createConnectionToken(propertyId?: string): Promise<string> {
   const stripe = getStripe()
-  const token = await stripe.terminal.connectionTokens.create(
-    {},
-    { stripeAccount: landlordConnectAccountId },
-  )
+  const location = propertyId ? await getOrCreatePropertyLocation(propertyId) : undefined
+  const token = await stripe.terminal.connectionTokens.create(location ? { location } : {})
   if (!token.secret) {
     throw new AppError(500, 'Stripe returned a Connection Token with no secret')
   }
   return token.secret
+}
+
+/**
+ * The property's Terminal Location on GAM's platform account (Stripe requires
+ * one to pair a reader there). Made once from the property's address.
+ */
+export async function getOrCreatePropertyLocation(propertyId: string): Promise<string> {
+  const p = await queryOne<any>(
+    `SELECT name, street1, street2, city, state, zip, stripe_terminal_location_id
+       FROM properties WHERE id = $1`, [propertyId])
+  if (!p) throw new AppError(404, 'Property not found')
+  if (p.stripe_terminal_location_id) return p.stripe_terminal_location_id
+  if (!p.street1 || !p.city || !p.state || !p.zip) {
+    throw new AppError(409, 'Add the property\'s street address, city, state and ZIP before pairing a card reader')
+  }
+  const loc = await getStripe().terminal.locations.create({
+    display_name: p.name,
+    address: { line1: p.street1, line2: p.street2 ?? undefined, city: p.city, state: p.state, postal_code: p.zip, country: 'US' },
+    metadata: { gam_property_id: propertyId },
+  })
+  await query(`UPDATE properties SET stripe_terminal_location_id = $1 WHERE id = $2`, [loc.id, propertyId])
+  return loc.id
 }
 
 /**
@@ -72,20 +90,19 @@ export async function createConnectionToken(
  */
 export async function registerReader(opts: {
   landlordId: string
-  landlordConnectAccountId: string
   propertyId: string
   registrationCode: string
   nickname: string
   label?: string  // optional Stripe-side label
 }): Promise<ReaderRow> {
   const stripe = getStripe()
-  const stripeReader = await stripe.terminal.readers.create(
-    {
-      registration_code: opts.registrationCode,
-      label: opts.label ?? opts.nickname,
-    },
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
+  const location = await getOrCreatePropertyLocation(opts.propertyId)
+  const stripeReader = await stripe.terminal.readers.create({
+    registration_code: opts.registrationCode,
+    label: opts.label ?? opts.nickname,
+    location,
+    metadata: { gam_landlord_id: opts.landlordId, gam_property_id: opts.propertyId },
+  })
 
   // Persist locally. UNIQUE on (landlord_id, stripe_reader_id) catches
   // race / re-registration; turn 23505 into a clean conflict message.
@@ -153,60 +170,40 @@ export async function archiveReader(
 // ── CARD-PRESENT PAYMENT INTENTS (S242) ──────────────────────────────
 
 /**
- * Create a card-present PaymentIntent for a POS terminal sale.
- *
- * Runs under the landlord's Connect account — the PI lives there
- * entirely. `capture_method='manual'` is the card-present default;
- * the reader auths on tap/insert/swipe, transitioning the PI to
- * `requires_capture`, and the caller flips to `succeeded` via
- * `captureTerminalPaymentIntent` once the sale is finalized in POS
- * (allows cancel-after-auth if the operator voids the sale before
- * recording the transaction).
- *
- * Metadata is the dispatch key for the platform webhook handler:
- * Connect-account `payment_intent.succeeded` events with
- * `metadata.gam_purpose='pos_terminal'` are skipped by the rent
- * allocation path (defensive — they have no matching `payments` row
- * anyway, but the metadata makes the intent explicit and audit-
- * friendly).
+ * Create a card-present PaymentIntent for a register sale, on GAM's platform
+ * account. `capture_method='manual'`: the reader authorizes, the register
+ * captures once the sale is confirmed (so a voided sale can be cancelled).
+ * The amount already includes the card fee (the server priced it from the
+ * cart); GAM keeps the fee and owes the landlord the rest in the weekly batch.
+ * `gam_purpose='pos_terminal'` keeps the rent webhook path away from it.
  */
 export async function createCardPresentPaymentIntent(opts: {
-  landlordConnectAccountId: string
   landlordId:               string
   propertyId:               string
-  amountCents:              number       // total to charge in cents
-  // S648: the card fee the customer paid on top — GAM's, as on every card payment.
-  platformCutCents?:        number
+  amountCents:              number       // total to charge in cents, card fee included
+  cardFeeCents:             number       // GAM's part of it
   currency?:                string       // default 'usd'
   description?:             string
-  // Optional: stamp a draft tx id from the POS UI so the eventual
-  // POST /pos/transactions can de-dupe on PI id (we already have a
-  // UNIQUE on pos_transactions.stripe_payment_intent_id).
   posDraftRef?:             string
 }): Promise<Stripe.PaymentIntent> {
   if (!Number.isInteger(opts.amountCents) || opts.amountCents <= 0) {
     throw new AppError(400, 'amountCents must be a positive integer')
   }
   const stripe = getStripe()
-  const intent = await stripe.paymentIntents.create(
-    {
-      amount:               opts.amountCents,
-      currency:             opts.currency ?? 'usd',
-      payment_method_types: ['card_present'],
-      capture_method:       'manual',
-      ...(opts.platformCutCents && opts.platformCutCents > 0
-        ? { application_fee_amount: opts.platformCutCents } : {}),
-      description:          opts.description ?? 'GAM POS sale',
-      metadata: {
-        gam_purpose:     'pos_terminal',
-        gam_landlord_id: opts.landlordId,
-        gam_property_id: opts.propertyId,
-        ...(opts.posDraftRef ? { gam_pos_draft_ref: opts.posDraftRef } : {}),
-      },
+  return stripe.paymentIntents.create({
+    amount:               opts.amountCents,
+    currency:             opts.currency ?? 'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'GAM POS sale',
+    metadata: {
+      gam_purpose:     'pos_terminal',
+      gam_landlord_id: opts.landlordId,
+      gam_property_id: opts.propertyId,
+      gam_card_fee_cents: String(Math.max(0, Math.round(opts.cardFeeCents))),
+      ...(opts.posDraftRef ? { gam_pos_draft_ref: opts.posDraftRef } : {}),
     },
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
-  return intent
+  })
 }
 
 /**
@@ -223,7 +220,6 @@ export async function createCardPresentPaymentIntent(opts: {
  * smart readers (S700, WisePOS E, etc.).
  */
 export async function processPaymentIntentOnReader(opts: {
-  landlordConnectAccountId: string
   stripeReaderId:           string
   paymentIntentId:          string
 }): Promise<Stripe.Terminal.Reader> {
@@ -231,7 +227,6 @@ export async function processPaymentIntentOnReader(opts: {
   const reader = await stripe.terminal.readers.processPaymentIntent(
     opts.stripeReaderId,
     { payment_intent: opts.paymentIntentId },
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return reader
 }
@@ -239,18 +234,15 @@ export async function processPaymentIntentOnReader(opts: {
 /**
  * Capture a card-present PaymentIntent that's in `requires_capture`
  * after a successful reader auth. Settles the auth → flips PI to
- * `succeeded` → funds land in the landlord's Connect balance per
- * their payout schedule.
+ * `succeeded` → funds land on GAM's balance; the landlord's share goes
+ * out in the weekly payout batch.
  */
 export async function captureTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
   const intent = await stripe.paymentIntents.capture(
     opts.paymentIntentId,
-    {},
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return intent
 }
@@ -263,35 +255,27 @@ export async function captureTerminalPaymentIntent(opts: {
  * already-`canceled`. Caller handles those branches.
  */
 export async function cancelTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
   const intent = await stripe.paymentIntents.cancel(
     opts.paymentIntentId,
-    undefined,
-    { stripeAccount: opts.landlordConnectAccountId },
   )
   return intent
 }
 
 /**
- * Retrieve a PaymentIntent under the landlord's Connect account.
+ * Retrieve a register PaymentIntent (GAM platform account).
  * Used by POST /pos/transactions to verify a terminal-paid sale: the
- * caller-supplied PI id must exist on the landlord's Connect, must
+ * caller-supplied PI id must exist on GAM's account, must
  * carry the POS-terminal metadata, must be in `succeeded` status, and
  * the amount must match the POS-computed total.
  */
 export async function retrieveTerminalPaymentIntent(opts: {
-  landlordConnectAccountId: string
   paymentIntentId:          string
 }): Promise<Stripe.PaymentIntent> {
   const stripe = getStripe()
-  return stripe.paymentIntents.retrieve(
-    opts.paymentIntentId,
-    {},
-    { stripeAccount: opts.landlordConnectAccountId },
-  )
+  return stripe.paymentIntents.retrieve(opts.paymentIntentId)
 }
 
 // ═══════════════════════════════════════════════════════════════════

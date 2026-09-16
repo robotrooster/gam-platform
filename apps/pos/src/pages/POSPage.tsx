@@ -4,7 +4,7 @@ import { useAuth } from '../context/AuthContext'
 import {
   discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment,
   createTerminalIntent, processIntentOnReader, pollPiUntilTerminal,
-  captureTerminalIntent, cancelTerminalIntent,
+  cancelTerminalIntent,
   listRegisteredReaders, registerNewReader, archiveRegisteredReader,
   type RegisteredReader,
 } from '../lib/terminal'
@@ -587,7 +587,10 @@ export function POSPage() {
   // the `registeredReaders` GAM-side list, not the SDK scan.
   const discoverAndConnect = async () => {
     setTerminalStatus('discovering'); setTerminalError('')
-    try { const found = await discoverReaders(); setReaders(found); setTerminalStatus('idle') }
+    try {
+      if (!registerProperty) throw new Error('Select a property first')
+      const found = await discoverReaders(registerProperty); setReaders(found); setTerminalStatus('idle')
+    }
     catch (e: any) { setTerminalError(e.message); setTerminalStatus('error') }
   }
   const selectBluetoothReader = async (reader: any) => {
@@ -604,17 +607,16 @@ export function POSPage() {
   }
 
   // S243: full card-present charge flow.
-  // 1. Create PI on landlord's Connect account (server-side).
+  // 1. Create PI on GAM's account (server-side).
   // 2. Branch:
   //    - smart reader: push PI to reader, poll status until
   //      requires_capture / canceled / timeout.
   //    - bluetooth:    SDK collects card in-browser; SDK process
   //      returns the PI in requires_capture.
-  // 3. Capture (server-side; flips PI to succeeded).
-  // 4. POST /pos/transactions with stripePaymentIntentId — backend
-  //    validates and persists.
+  // 3. POST /pos/transactions with stripePaymentIntentId — backend
+  //    validates, records the sale and captures the card together.
   // 5. On any error, attempt PI cancel so it doesn't sit in
-  //    requires_payment_method on the landlord's account.
+  //    requires_payment_method.
   const chargeWithReader = async () => {
     if (!registerProperty) {
       setTerminalError('Select a property before charging')
@@ -649,10 +651,10 @@ export function POSPage() {
         await collectCardPayment(intent.clientSecret)
       }
 
+      // S648: recording the sale captures the card, in one server step.
       setTerminalStatus('capturing')
-      await captureTerminalIntent(intent.id)
+      await checkoutMut.mutateAsync(intent.id)
       setTerminalStatus('idle')
-      checkoutMut.mutate(intent.id)
     } catch (e: any) {
       setTerminalError(e?.response?.data?.error?.message || e?.message || 'Charge failed')
       setTerminalStatus('error')

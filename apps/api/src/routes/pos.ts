@@ -595,21 +595,27 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // route accepted any PI id without validation; a malicious or
     // misbehaving cashier could pass an arbitrary id and stamp the
     // transaction as paid.
+    // S648 (Nic): every card dollar goes through GAM — a card sale is only
+    // ever one the reader charged on GAM's account.
+    let captureOnCommit: string | null = null
+    if (paymentMethod === 'card' && !stripePaymentIntentId) {
+      throw new AppError(400, 'Card sales go through the card reader')
+    }
     if (paymentMethod === 'card' && stripePaymentIntentId) {
-      const connectId = await getLandlordConnectId(posLandlordId(req))
-      const intent = await retrieveTerminalPaymentIntent({
-        landlordConnectAccountId: connectId,
-        paymentIntentId:          stripePaymentIntentId,
-      })
+      const intent = await retrieveTerminalPaymentIntent({ paymentIntentId: stripePaymentIntentId })
       if (intent.metadata?.gam_purpose !== 'pos_terminal') {
         throw new AppError(400, 'PaymentIntent is not a POS terminal sale')
       }
       if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
         throw new AppError(403, 'PaymentIntent belongs to a different landlord')
       }
-      if (intent.status !== 'succeeded') {
-        throw new AppError(400, `PaymentIntent status is ${intent.status}, must be succeeded`)
+      // S648: the register sends the charge here still authorized-only; the
+      // sale and the capture commit together (below), so money is never taken
+      // without a sale on record to pay the landlord for.
+      if (intent.status !== 'succeeded' && intent.status !== 'requires_capture') {
+        throw new AppError(400, `The card charge is ${intent.status} — it was not approved`)
       }
+      captureOnCommit = intent.status === 'requires_capture' ? intent.id : null
       const expectedCents = Math.round(total * 100)
       if (intent.amount !== expectedCents) {
         throw new AppError(400, `PaymentIntent amount ${intent.amount} does not match transaction total ${expectedCents}`)
@@ -672,6 +678,14 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           posTransactionId: tx.id,
           amount:           total,
         }, client)
+      }
+
+      // Take the money last: a capture failure rolls the sale back and the
+      // authorization simply lapses. (A crash in the instant between capture
+      // and COMMIT is the one window left: the charge shows in Stripe with no
+      // sale, and would be found by reconciling Stripe against the register.)
+      if (captureOnCommit) {
+        await captureTerminalPaymentIntent({ paymentIntentId: captureOnCommit })
       }
 
       await client.query('COMMIT')
@@ -1605,29 +1619,31 @@ posRouter.post('/eod/regenerate', requirePerm('pos.end_of_day'), async (req, res
 // ─────────────────────────────────────────────────────────────
 //
 // Hardware-agnostic per Nic decision: "if we are using stripe api any
-// stripe hardware should work." All Stripe Terminal API calls fire under
-// the LANDLORD's Connect account — POS readers belong to the landlord's
-// Stripe account, not GAM's platform.
-//
-// Payment-processing on a reader (createPI → processPaymentIntent →
-// capture flow) is a follow-up session — this batch is just pairing
-// infrastructure (Connection Token + register/list/archive readers).
+// stripe hardware should work." S648: readers pair to GAM's platform account
+// inside the property's Terminal Location, and card sales are charged there —
+// the landlord's share is paid in the weekly batch like rent.
 
-// Helper: pull the landlord's Connect account id, throw 409 if not
-// onboarded yet — Terminal requires an active Connect account.
-async function getLandlordConnectId(profileId: string): Promise<string> {
-  // S554 Connect re-anchor: prefer the landlord ENTITY's account; fall back to
-  // the founding owner's user account during the transition (entity col is
-  // NULL until the entity completes its own KYC).
+async function assertPropertyIsLandlords(landlordId: string, propertyId: unknown): Promise<string> {
+  if (!propertyId || typeof propertyId !== 'string') throw new AppError(400, 'propertyId is required')
+  const prop = await queryOne<{ landlord_id: string }>(
+    `SELECT landlord_id FROM properties WHERE id = $1`, [propertyId])
+  if (!prop || prop.landlord_id !== landlordId) {
+    throw new AppError(400, 'propertyId does not belong to this landlord')
+  }
+  return propertyId
+}
+
+// The landlord's share is paid to their payout account, so a register can't
+// take cards until there is one to pay.
+async function assertLandlordCanBePaid(landlordId: string): Promise<void> {
   const row = await queryOne<{ stripe_connect_account_id: string | null }>(
     `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
        FROM landlords l JOIN users u ON u.id = l.user_id
       WHERE l.id = $1`,
-    [profileId])
+    [landlordId])
   if (!row?.stripe_connect_account_id) {
-    throw new AppError(409, 'Landlord has no Stripe Connect account — complete onboarding at /banking first')
+    throw new AppError(409, 'Set up your payout account under Banking before taking cards')
   }
-  return row.stripe_connect_account_id
 }
 
 // POST /api/pos/terminal/connection-token
@@ -1635,8 +1651,9 @@ async function getLandlordConnectId(profileId: string): Promise<string> {
 // Frontend fetches one each time the SDK initializes a reader connection.
 posRouter.post('/terminal/connection-token', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
-    const connectId = await getLandlordConnectId(posLandlordId(req))
-    const secret = await createConnectionToken(connectId)
+    const propertyId = req.body?.propertyId
+      ? await assertPropertyIsLandlords(posLandlordId(req), req.body.propertyId) : undefined
+    const secret = await createConnectionToken(propertyId)
     res.json({ success: true, data: { secret } })
   } catch (e) { next(e) }
 })
@@ -1652,18 +1669,10 @@ posRouter.post('/terminal/readers', requirePerm('pos.manage_inventory'), async (
     if (!registrationCode) throw new AppError(400, 'registrationCode is required (shown on the reader screen)')
     if (!nickname) throw new AppError(400, 'nickname is required')
 
-    // Validate property belongs to this landlord.
-    const prop = await queryOne<{ landlord_id: string }>(
-      `SELECT landlord_id FROM properties WHERE id = $1`,
-      [propertyId])
-    if (!prop || prop.landlord_id !== posLandlordId(req)) {
-      throw new AppError(400, 'propertyId does not belong to this landlord')
-    }
-
-    const connectId = await getLandlordConnectId(posLandlordId(req))
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    await assertLandlordCanBePaid(posLandlordId(req))
     const row = await registerReader({
       landlordId:               posLandlordId(req),
-      landlordConnectAccountId: connectId,
       propertyId,
       registrationCode:         String(registrationCode).trim(),
       nickname:                 String(nickname).trim(),
@@ -1709,6 +1718,16 @@ posRouter.delete('/terminal/readers/:id', requirePerm('pos.manage_inventory'), a
 // Cancel route exists for the void-before-capture path (operator
 // cancels at the reader prompt, customer walks, reader times out).
 
+// S648: every register's PaymentIntents now live on ONE account (GAM's), so
+// the Connect account no longer fences a landlord off from another's charge —
+// the intent's own landlord stamp does, on every call that touches it.
+async function assertOwnTerminalIntent(landlordId: string, paymentIntentId: string): Promise<void> {
+  const intent = await retrieveTerminalPaymentIntent({ paymentIntentId })
+  if (intent.metadata?.gam_purpose !== 'pos_terminal' || intent.metadata?.gam_landlord_id !== landlordId) {
+    throw new AppError(404, 'Card charge not found')
+  }
+}
+
 function assertReaderBelongsToLandlord(landlordId: string, stripeReaderId: string) {
   return queryOne<{ property_id: string }>(
     `SELECT property_id FROM pos_terminal_readers
@@ -1731,23 +1750,15 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
     const amountCents = Math.round(quoted.total * 100)
     if (amountCents <= 0) throw new AppError(400, 'Nothing to charge')
 
-    // Validate property belongs to this landlord. Same posture as the
-    // reader-registration route — prevents a cashier on landlord A from
-    // creating a PI tagged to landlord B's property.
-    const prop = await queryOne<{ landlord_id: string }>(
-      `SELECT landlord_id FROM properties WHERE id = $1`,
-      [propertyId])
-    if (!prop || prop.landlord_id !== posLandlordId(req)) {
-      throw new AppError(400, 'propertyId does not belong to this landlord')
-    }
-
-    const connectId = await getLandlordConnectId(posLandlordId(req))
+    // Same posture as reader registration — a cashier on landlord A can't
+    // tag a charge to landlord B's property.
+    await assertPropertyIsLandlords(posLandlordId(req), propertyId)
+    await assertLandlordCanBePaid(posLandlordId(req))
     const intent = await createCardPresentPaymentIntent({
-      landlordConnectAccountId: connectId,
       landlordId:               posLandlordId(req),
       propertyId,
       amountCents,
-      platformCutCents: Math.round(quoted.surcharge * 100),
+      cardFeeCents:             Math.round(quoted.surcharge * 100),
       description,
       posDraftRef,
     })
@@ -1770,11 +1781,7 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
 posRouter.get('/terminal/payment-intents/:id', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(posLandlordId(req))
-    const intent = await retrieveTerminalPaymentIntent({
-      landlordConnectAccountId: connectId,
-      paymentIntentId,
-    })
+    const intent = await retrieveTerminalPaymentIntent({ paymentIntentId })
     if (intent.metadata?.gam_landlord_id !== posLandlordId(req)) {
       throw new AppError(403, 'PaymentIntent belongs to a different landlord')
     }
@@ -1803,12 +1810,8 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
     const ownerRow = await assertReaderBelongsToLandlord(posLandlordId(req), stripeReaderId)
     if (!ownerRow) throw new AppError(404, 'Reader not registered to this landlord')
 
-    const connectId = await getLandlordConnectId(posLandlordId(req))
-    const reader = await processPaymentIntentOnReader({
-      landlordConnectAccountId: connectId,
-      stripeReaderId,
-      paymentIntentId,
-    })
+    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    const reader = await processPaymentIntentOnReader({ stripeReaderId, paymentIntentId })
     res.json({
       success: true,
       data: {
@@ -1825,11 +1828,8 @@ posRouter.post('/terminal/payment-intents/:id/process', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(posLandlordId(req))
-    const intent = await captureTerminalPaymentIntent({
-      landlordConnectAccountId: connectId,
-      paymentIntentId,
-    })
+    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    const intent = await captureTerminalPaymentIntent({ paymentIntentId })
     res.json({ success: true, data: { id: intent.id, status: intent.status, amount: intent.amount } })
   } catch (e) { next(e) }
 })
@@ -1840,11 +1840,8 @@ posRouter.post('/terminal/payment-intents/:id/capture', requirePerm('pos.ring_sa
 posRouter.post('/terminal/payment-intents/:id/cancel', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const paymentIntentId = req.params.id
-    const connectId = await getLandlordConnectId(posLandlordId(req))
-    const intent = await cancelTerminalPaymentIntent({
-      landlordConnectAccountId: connectId,
-      paymentIntentId,
-    })
+    await assertOwnTerminalIntent(posLandlordId(req), paymentIntentId)
+    const intent = await cancelTerminalPaymentIntent({ paymentIntentId })
     res.json({ success: true, data: { id: intent.id, status: intent.status } })
   } catch (e) { next(e) }
 })

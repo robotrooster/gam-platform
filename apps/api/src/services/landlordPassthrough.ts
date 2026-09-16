@@ -106,6 +106,14 @@ async function applyReversalNetting(
   return Math.round(totalNetted * 100) / 100
 }
 
+/**
+ * S648 (Nic): register card sales — the counter reader and emailed/QR pay
+ * links — are charged on GAM's account and paid out in this same batch.
+ * A sale is held while it owes the landlord something and no batch has
+ * carried it yet. Shared by the display twin and RESERVE so they can't drift.
+ */
+const HELD_POS_SALE = `AND t.payout_owed > 0 AND t.payout_intent_id IS NULL`
+
 interface ReservedBatch {
   intentId:         string
   landlordId:       string
@@ -140,7 +148,13 @@ export async function heldOwnerShareForUser(landlordUserId: string): Promise<num
         AND p.platform_held = true
         AND p.status = 'settled'`,
     [landlordUserId])
-  return Math.round(parseFloat(row?.owed_amount ?? '0') * 100) / 100
+  const pos = await queryOne<{ owed_amount: string }>(
+    `SELECT COALESCE(SUM(t.payout_owed), 0)::numeric AS owed_amount
+       FROM pos_transactions t
+       JOIN landlords l ON l.id = t.landlord_id
+      WHERE l.user_id = $1 ${HELD_POS_SALE}`,
+    [landlordUserId])
+  return Math.round((parseFloat(row?.owed_amount ?? '0') + parseFloat(pos?.owed_amount ?? '0')) * 100) / 100
 }
 
 /**
@@ -188,8 +202,12 @@ async function reservePlatformHeldBatch(
       [`platform_held_reconcile:${landlordRow.landlord_id}`]
     )
 
-    const sumRow = await client.query<{ owed_amount: string }>(
-      `SELECT COALESCE(SUM(ubl.amount), 0)::numeric AS owed_amount
+    // S648: lock and read the EXACT rows this batch pays, then stamp those ids.
+    // Summing and later stamping "everything currently held" let a payment or
+    // sale that landed between the two be marked paid out without being in
+    // the transfer — the landlord would never have been paid for it.
+    const shareRows = await client.query<{ id: string; amount: string }>(
+      `SELECT ubl.id, ubl.amount::text AS amount
          FROM payments p
          JOIN user_balance_ledger ubl
            ON ubl.reference_id = p.id
@@ -198,10 +216,21 @@ async function reservePlatformHeldBatch(
           AND ubl.stripe_transfer_id IS NULL
         WHERE p.landlord_id = $1
           AND p.platform_held = true
-          AND p.status = 'settled'`,
+          AND p.status = 'settled'
+          FOR UPDATE OF ubl`,
       [landlordRow.landlord_id]
     )
-    const owed = Math.round(parseFloat(sumRow.rows[0]?.owed_amount ?? '0') * 100) / 100
+    const saleRows = await client.query<{ id: string; payout_owed: string }>(
+      `SELECT t.id, t.payout_owed::text AS payout_owed
+         FROM pos_transactions t
+        WHERE t.landlord_id = $1 ${HELD_POS_SALE}
+          FOR UPDATE`,
+      [landlordRow.landlord_id]
+    )
+    const cents = (v: string) => Math.round(parseFloat(v) * 100)
+    const owedCents = shareRows.rows.reduce((a, r) => a + cents(r.amount), 0)
+      + saleRows.rows.reduce((a, r) => a + cents(r.payout_owed), 0)
+    const owed = owedCents / 100
     if (owed <= 0) {
       await client.query('ROLLBACK')
       return null
@@ -265,16 +294,13 @@ async function reservePlatformHeldBatch(
 
     // Stamp the reserved owner-share rows so they can never be re-summed.
     await client.query(
-      `UPDATE user_balance_ledger
-          SET stripe_transfer_id = $1
-        WHERE type = 'allocation_owner_share'
-          AND reference_type = 'payment'
-          AND stripe_transfer_id IS NULL
-          AND reference_id IN (
-            SELECT id FROM payments
-             WHERE landlord_id = $2 AND platform_held = true AND status = 'settled'
-          )`,
-      [sentinel, landlordRow.landlord_id]
+      `UPDATE user_balance_ledger SET stripe_transfer_id = $1 WHERE id = ANY($2::uuid[])`,
+      [sentinel, shareRows.rows.map(r => r.id)]
+    )
+    // Claim the register sales this batch carries.
+    await client.query(
+      `UPDATE pos_transactions SET payout_intent_id = $1 WHERE id = ANY($2::uuid[])`,
+      [intentId, saleRows.rows.map(r => r.id)]
     )
     // S602 deposit-trust: NEVER pass a deposit through to the landlord on the
     // weekly batch. A tenant deposit is held by GAM in the segregated trust pool
@@ -287,7 +313,13 @@ async function reservePlatformHeldBatch(
       `UPDATE payments
           SET platform_held = false
         WHERE landlord_id = $1 AND platform_held = true AND status = 'settled'
-          AND type <> 'deposit'`,
+          AND type <> 'deposit'
+          -- a payment whose owner share landed after this batch was read keeps
+          -- waiting for the next one
+          AND NOT EXISTS (
+            SELECT 1 FROM user_balance_ledger ubl
+             WHERE ubl.reference_id = payments.id AND ubl.reference_type = 'payment'
+               AND ubl.type = 'allocation_owner_share' AND ubl.stripe_transfer_id IS NULL)`,
       [landlordRow.landlord_id]
     )
 

@@ -110,8 +110,9 @@ describe('the public link', () => {
     const args = checkoutMock.mock.calls[0][0]
     const { fee } = payLinkCharge(20)
     expect(args.lineItems.map((l: any) => l.amountCents)).toEqual([2000, Math.round(fee * 100)])
-    expect(args.platformCutCents).toBe(Math.round(fee * 100))
-    expect(args.landlordConnectAccountId).toBe('acct_test_paylink')
+    // S648: charged on GAM's account — no Connect account, no transfer.
+    expect(args.platformCutCents).toBeUndefined()
+    expect(args.landlordConnectAccountId).toBeUndefined()
   })
 
   it('a bad or closed link never reaches the card page', async () => {
@@ -143,6 +144,9 @@ describe('when it is paid', () => {
     expect(tx[0].payment_method).toBe('card')
     expect(Number(tx[0].total)).toBe(charged)
     expect(Number(tx[0].surcharge)).toBe(fee)
+    // The landlord is owed the link total, paid in the weekly batch.
+    expect(Number(tx[0].payout_owed)).toBe(20)
+    expect(tx[0].payout_intent_id).toBeNull()
     const l = (await db.query(`SELECT status FROM pos_pay_links WHERE id = $1`, [link.id])).rows[0]
     expect(l.status).toBe('paid')
   })

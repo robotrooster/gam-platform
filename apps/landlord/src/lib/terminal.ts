@@ -12,27 +12,31 @@
 //     reader prompts the customer; the frontend polls the PI
 //     status until auth completes; backend captures.
 //
-// All four lifecycle routes (create / process / capture / cancel)
-// fire under the landlord's Stripe Connect account. POS sales are
-// landlord revenue; GAM's POS revenue is the monthly per-unit
-// platform fee, not a per-transaction cut.
+// S648: every register card charge runs on GAM's account (readers pair
+// inside the property's Terminal Location); the landlord's share is paid
+// in the weekly payout batch, the card fee on top is GAM's.
 
 import { loadStripeTerminal } from '@stripe/terminal-js'
 import { api, apiGet, apiPost, apiDel } from './api'
 
 let terminal: any = null
+// The SDK's connection token is scoped to one property's reader location.
+let terminalPropertyId: string | null = null
 
 // ── Stripe Terminal JS SDK (Bluetooth path) ─────────────────────────
 
-export async function getTerminal() {
-  if (terminal) return terminal
+export async function getTerminal(propertyId?: string) {
+  if (terminal && (!propertyId || propertyId === terminalPropertyId)) return terminal
+  if (terminal) { try { await terminal.disconnectReader() } catch { /* not connected */ } }
+  terminalPropertyId = propertyId ?? terminalPropertyId
   const StripeTerminal = await loadStripeTerminal()
   if (!StripeTerminal) throw new Error('Stripe Terminal failed to load')
   terminal = StripeTerminal.create({
     onFetchConnectionToken: async () => {
       // S243: endpoint moved to /pos/terminal/connection-token (S241).
       // Pre-S243 this called /terminal/connection-token which 404'd.
-      const res = await api.post('/pos/terminal/connection-token')
+      const res = await api.post('/pos/terminal/connection-token',
+        terminalPropertyId ? { propertyId: terminalPropertyId } : {})
       return res.data.data.secret
     },
     onUnexpectedReaderDisconnect: () => {
@@ -43,8 +47,8 @@ export async function getTerminal() {
   return terminal
 }
 
-export async function discoverReaders() {
-  const t = await getTerminal()
+export async function discoverReaders(propertyId: string) {
+  const t = await getTerminal(propertyId)
   // Vite exposes DEV via import.meta.env; process.env.NODE_ENV is
   // not defined in the browser bundle.
   const simulated = (import.meta as any).env?.DEV ?? false

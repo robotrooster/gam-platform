@@ -1006,14 +1006,12 @@ export async function createBookingDepositCheckoutSession(
 
 /**
  * S648 — a register pay link's card page (routes/posPayLinks.ts). Card only,
- * the same destination-charge shape as a stay deposit: the landlord's account
- * receives the sale, GAM keeps the card fee the customer paid on top. A standing
+ * charged on GAM's account like rent: the landlord's share goes out in the
+ * weekly batch, GAM keeps the card fee the customer paid on top. A standing
  * link (the dump-station QR) asks the payer's name, since nobody entered it.
  */
 export async function createPayLinkCheckoutSession(opts: {
-  landlordConnectAccountId: string
   lineItems: Array<{ name: string; amountCents: number }>
-  platformCutCents: number
   customerEmail?: string | null
   askName?: boolean
   successUrl: string
@@ -1028,9 +1026,9 @@ export async function createPayLinkCheckoutSession(opts: {
       quantity: 1,
       price_data: { currency: 'usd', unit_amount: l.amountCents, product_data: { name: l.name.slice(0, 250) } },
     })),
+    // S648: a platform charge — no transfer. The landlord's share is paid in
+    // the weekly batch (pos_transactions.payout_owed).
     payment_intent_data: {
-      transfer_data: { destination: opts.landlordConnectAccountId },
-      application_fee_amount: opts.platformCutCents,
       metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },
     },
     metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },

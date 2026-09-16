@@ -316,10 +316,58 @@ describe('POST /api/pos/transactions — happy paths', () => {
 
     expect(res.status).toBe(201)
     expect(res.body.data.stripe_payment_intent_id).toBe('pi_terminal_xyz')
-    expect(retrieveTerminalPaymentIntentMock).toHaveBeenCalledWith({
-      landlordConnectAccountId: 'acct_test_landlord',
-      paymentIntentId:          'pi_terminal_xyz',
+    expect(retrieveTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_terminal_xyz' })
+    // S648: the money is GAM's until the weekly batch; the landlord is owed
+    // the sale less the card fee.
+    expect(Number(res.body.data.payout_owed)).toBe(25)
+    expect(res.body.data.payout_intent_id).toBeNull()
+  })
+
+  it('S648: a card sale that didn\'t go through the reader is refused', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 25 }], paymentMethod: 'card' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/card reader/i)
+    const rows = await db.query(`SELECT 1 FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])
+    expect(rows.rows).toHaveLength(0)
+  })
+
+  it('S648: an authorized-only charge is captured together with the sale', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 999 })
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 10, taxAmount: 0, lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_auth', status: 'requires_capture', amount: withCardFee(10),
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_auth' })
+    expect(res.status).toBe(201)
+    expect(captureTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_auth' })
+  })
+
+  it('S648: if the capture fails, no sale is recorded', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 999 })
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 10, taxAmount: 0, lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_nocap', status: 'requires_capture', amount: withCardFee(10),
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    })
+    captureTerminalPaymentIntentMock.mockRejectedValueOnce(new Error('authorization expired'))
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_nocap' })
+    expect(res.status).toBe(500)
+    const rows = await db.query(`SELECT 1 FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])
+    expect(rows.rows).toHaveLength(0)
   })
 
   it('S554 bug #2: card sale with a cart discount — PI minted at NET total matches, discount persisted', async () => {
@@ -763,7 +811,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }],
     })
     retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
-      id: 'pi_pending', status: 'requires_capture', amount: 1000,
+      id: 'pi_pending', status: 'requires_payment_method', amount: 1000,
       metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
     const res = await request(buildApp())
@@ -776,7 +824,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
         stripePaymentIntentId: 'pi_pending',
       })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/status is requires_capture/i)
+    expect(res.body.error).toMatch(/not approved/i)
   })
 
   it('terminal PI amount mismatch → 400 (PI validation gate)', async () => {
@@ -1821,17 +1869,22 @@ describe('POST /api/pos/terminal/connection-token', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.secret).toBe('pst_mock_secret')
-    expect(createConnectionTokenMock).toHaveBeenCalledWith('acct_test_landlord')
+    expect(createConnectionTokenMock).toHaveBeenCalledWith(undefined)
   })
 
-  it('no Connect account → 409 (getLandlordConnectId gate)', async () => {
-    const f = await seedPosFixture()  // no withConnectAccount
-    const res = await request(buildApp())
+  // S648: readers live on GAM's account, one location per property.
+  it('scoped to the register\'s property; another landlord\'s property → 400', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const ok = await request(buildApp())
       .post('/api/pos/terminal/connection-token')
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/Connect account/i)
-    expect(createConnectionTokenMock).not.toHaveBeenCalled()
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ propertyId: f.propertyId })
+    expect(ok.status).toBe(200)
+    expect(createConnectionTokenMock).toHaveBeenLastCalledWith(f.propertyId)
+    const g = await seedPosFixture()
+    const bad = await request(buildApp())
+      .post('/api/pos/terminal/connection-token')
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ propertyId: g.propertyId })
+    expect(bad.status).toBe(400)
   })
 })
 
@@ -1854,6 +1907,17 @@ describe('POST /api/pos/terminal/readers', () => {
     expect(arg.registrationCode).toBe('abcd-efgh')  // trimmed
     expect(arg.nickname).toBe('Front Desk')
     expect(arg.label).toBe('primary')
+  })
+
+  it('no payout account → 409: the landlord\'s share would have nowhere to go', async () => {
+    const f = await seedPosFixture()
+    const res = await request(buildApp())
+      .post('/api/pos/terminal/readers')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, registrationCode: 'abc', nickname: 'X' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/payout account/i)
+    expect(registerReaderMock).not.toHaveBeenCalled()
   })
 
   it('missing registrationCode → 400, no service call', async () => {
@@ -1967,7 +2031,7 @@ describe('POST /api/pos/terminal/payment-intents', () => {
     const arg = (createCardPresentPaymentIntentMock.mock.calls as any[][])[0]![0] as any
     const fee = processingFeeFor({ amount: 15, paymentMethod: 'card' })
     expect(arg.amountCents).toBe(withCardFee(15))
-    expect(arg.platformCutCents).toBe(Math.round(fee * 100))
+    expect(arg.cardFeeCents).toBe(Math.round(fee * 100))
     expect(arg.landlordId).toBe(f.landlordId)
     expect(arg.description).toBe('Coffee + bagel')
   })
@@ -2032,6 +2096,10 @@ describe('POST /api/pos/terminal/payment-intents/:id/process', () => {
   it('happy: calls processPaymentIntentOnReader, returns reader + action', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     const { stripeReaderId } = await seedTerminalReader(f)
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_x', status: 'requires_capture', amount: 1000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    } as any)
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents/pi_x/process')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -2055,30 +2123,47 @@ describe('POST /api/pos/terminal/payment-intents/:id/process', () => {
 describe('POST /api/pos/terminal/payment-intents/:id/capture', () => {
   it('happy: returns succeeded PI', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_x', status: 'requires_capture', amount: 1000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    } as any)
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents/pi_x/capture')
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('succeeded')
-    expect(captureTerminalPaymentIntentMock).toHaveBeenCalledWith({
-      landlordConnectAccountId: 'acct_test_landlord',
-      paymentIntentId:          'pi_x',
-    })
+    expect(captureTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_x' })
+  })
+
+  // S648: every register's charges share GAM's account — the charge's own
+  // landlord stamp is the fence.
+  it('another landlord\'s charge → 404, nothing captured', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_x', status: 'requires_capture', amount: 1000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: randomUUID() },
+    } as any)
+    const res = await request(buildApp())
+      .post('/api/pos/terminal/payment-intents/pi_x/capture')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(404)
+    expect(captureTerminalPaymentIntentMock).not.toHaveBeenCalled()
   })
 })
 
 describe('POST /api/pos/terminal/payment-intents/:id/cancel', () => {
   it('happy: returns canceled PI', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_x', status: 'requires_capture', amount: 1000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    } as any)
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents/pi_x/cancel')
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('canceled')
-    expect(cancelTerminalPaymentIntentMock).toHaveBeenCalledWith({
-      landlordConnectAccountId: 'acct_test_landlord',
-      paymentIntentId:          'pi_x',
-    })
+    expect(cancelTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_x' })
   })
 })
 

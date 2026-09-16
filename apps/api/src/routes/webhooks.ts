@@ -70,14 +70,12 @@ webhooksRouter.post('/stripe', async (req, res) => {
     case 'payment_intent.succeeded': {
       const pi = event.data.object as Stripe.PaymentIntent
 
-      // S242: POS terminal card-present PIs live on the landlord's
-      // Connect account and have no matching row in `payments`. Skip the
-      // rent/utility allocation path entirely — these settle directly
-      // on the landlord's Connect balance and need no GAM-side ledger
-      // write. The `metadata.gam_purpose` stamp is set by
-      // services/posTerminal.ts when the PI is created; absence means
-      // it's a platform-rent flow and falls through to the normal path.
-      if (pi.metadata?.gam_purpose === 'pos_terminal') {
+      // Register card sales (the counter reader, S242; pay links, S648) have
+      // no row in `payments`, so they stay out of the rent allocation path.
+      // Since S648 they're charged on GAM's account; the sale row itself
+      // (written by POST /pos/transactions or finalizePayLink) carries what
+      // the landlord is owed, and the weekly batch pays it.
+      if (pi.metadata?.gam_purpose === 'pos_terminal' || pi.metadata?.gam_purpose === 'pos_pay_link') {
         // Logged for audit; the POS transaction row was already written
         // by POST /pos/transactions (which validates the PI before
         // insert). No further work to do here.
@@ -662,7 +660,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // by the operator at the POS — retry the swipe, try a different
       // card, or abandon the sale. No ledger row, no NACHA retry logic,
       // no notification. Skip.
-      if (pi.metadata?.gam_purpose === 'pos_terminal') break
+      if (pi.metadata?.gam_purpose === 'pos_terminal' || pi.metadata?.gam_purpose === 'pos_pay_link') break
 
       // S537: a failed FIFO remittance is closed out; its covered rows
       // revert / retry through the standard by-PI NACHA logic below, and
@@ -1010,6 +1008,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
               WHERE stripe_payment_intent_id = $1 AND status = 'settled'
                 AND type IN ('rent', 'utility') LIMIT 1`, [piId]
           ) : null
+          // S648: a dispute on a register card sale is the landlord's to
+          // bear, like a rent chargeback.
+          const { handlePosSaleDispute } = await import('../services/posSaleReversal')
+          await handlePosSaleDispute({
+            paymentIntentId: piId, amountCents: dispute.amount ?? 0,
+            feeCents: (dispute.balance_transactions ?? []).reduce((s, bt) => s + Math.abs(bt.fee ?? 0), 0),
+            stripeEventId: event.id, stripeDisputeId: dispute.id, rawEvent: event,
+          })
           if (settledPay) {
             const disputeRow = await queryOne<{ id: string }>(
               `SELECT id FROM connect_disputes WHERE stripe_dispute_id = $1`, [dispute.id]

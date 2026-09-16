@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict vaErw7rhyKLnU1p5OvbZ26xy8c5Y6HeG4AGvsZmMU0x564sBZ3e18dQKZPYLrCU
+\restrict HtjfGnlgbkEzSCtt0iKUoQtolni4L9Fi1skJ1Ak73Y3kbvS2yVDgMtgevptPjhO
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6005,7 +6005,7 @@ COMMENT ON COLUMN public.parts_inventory.property_id IS 'S605: the property this
 
 CREATE TABLE public.payment_reversals (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    payment_id uuid NOT NULL,
+    payment_id uuid,
     landlord_id uuid,
     tenant_id uuid,
     lease_id uuid,
@@ -6026,7 +6026,9 @@ CREATE TABLE public.payment_reversals (
     status text DEFAULT 'open'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    pos_transaction_id uuid,
     CONSTRAINT payment_reversals_late_fee_owner_check CHECK (((late_fee_owner IS NULL) OR (late_fee_owner = ANY (ARRAY['gam'::text, 'landlord'::text])))),
+    CONSTRAINT payment_reversals_one_source CHECK (((payment_id IS NULL) <> (pos_transaction_id IS NULL))),
     CONSTRAINT payment_reversals_outcome_check CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['tenant_paid'::text, 'landlord_clawback'::text, 'written_off'::text])))),
     CONSTRAINT payment_reversals_recovery_method_check CHECK (((recovery_method IS NULL) OR (recovery_method = ANY (ARRAY['netting'::text, 'ach_pull'::text])))),
     CONSTRAINT payment_reversals_recovery_status_check CHECK ((recovery_status = ANY (ARRAY['pending'::text, 'scheduled_netting'::text, 'recovered'::text, 'not_needed'::text]))),
@@ -7294,7 +7296,10 @@ CREATE TABLE public.pos_transactions (
     discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     discount_reason text,
     pay_link_id uuid,
+    payout_owed numeric(10,2) DEFAULT 0 NOT NULL,
+    payout_intent_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
+    CONSTRAINT pos_transactions_payout_owed_check CHECK ((payout_owed >= (0)::numeric)),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
 
@@ -7525,6 +7530,7 @@ CREATE TABLE public.properties (
     move_in_collects_next_period boolean DEFAULT false NOT NULL,
     rent_due_mode text DEFAULT 'fixed_day'::text NOT NULL,
     rent_due_day integer DEFAULT 1 NOT NULL,
+    stripe_terminal_location_id text,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -17347,6 +17353,13 @@ CREATE INDEX idx_pos_transactions_landlord_date ON public.pos_transactions USING
 
 
 --
+-- Name: idx_pos_transactions_payout_held; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transactions_payout_held ON public.pos_transactions USING btree (landlord_id) WHERE ((payout_owed > (0)::numeric) AND (payout_intent_id IS NULL));
+
+
+--
 -- Name: idx_pos_transactions_pos_customer; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18737,6 +18750,13 @@ CREATE INDEX lease_tenants_supersedes ON public.lease_tenants USING btree (super
 --
 
 CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id);
+
+
+--
+-- Name: payment_reversals_pos_event_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX payment_reversals_pos_event_uq ON public.payment_reversals USING btree (pos_transaction_id, stripe_object_id) WHERE (pos_transaction_id IS NOT NULL);
 
 
 --
@@ -23932,6 +23952,14 @@ ALTER TABLE ONLY public.payment_reversals
 
 
 --
+-- Name: payment_reversals payment_reversals_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT payment_reversals_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id);
+
+
+--
 -- Name: payments payments_home_sale_installment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24881,6 +24909,14 @@ ALTER TABLE ONLY public.pos_transactions
 
 ALTER TABLE ONLY public.pos_transactions
     ADD CONSTRAINT pos_transactions_pay_link_id_fkey FOREIGN KEY (pay_link_id) REFERENCES public.pos_pay_links(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_transactions pos_transactions_payout_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_payout_intent_id_fkey FOREIGN KEY (payout_intent_id) REFERENCES public.platform_transfer_intents(id);
 
 
 --
@@ -26911,5 +26947,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict vaErw7rhyKLnU1p5OvbZ26xy8c5Y6HeG4AGvsZmMU0x564sBZ3e18dQKZPYLrCU
+\unrestrict HtjfGnlgbkEzSCtt0iKUoQtolni4L9Fi1skJ1Ak73Y3kbvS2yVDgMtgevptPjhO
 

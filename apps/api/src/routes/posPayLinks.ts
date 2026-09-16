@@ -45,8 +45,10 @@ export function payLinkCharge(total: number): { fee: number; charged: number } {
 }
 
 async function connectIdFor(landlordId: string): Promise<string | null> {
-  // Same account the counter's card reader uses (S554: the entity's, else the
-  // founding owner's during the transition).
+  // The payout account the landlord's share is sent to in the weekly batch
+  // (S554: the entity's, else the founding owner's during the transition).
+  // The charge itself is GAM's (S648) — no link goes out without somewhere
+  // to pay the landlord.
   const row = await queryOne<{ id: string | null }>(
     `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS id
        FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
@@ -250,13 +252,13 @@ publicPayRouter.get('/pay/:token', async (req, res, next) => {
     }
     const { fee } = payLinkCharge(Number(link.total))
     const { createPayLinkCheckoutSession } = await import('../services/stripeConnect')
+    // S648 (Nic): the money lands with GAM; the landlord's share (the link
+    // total) is paid in the weekly batch and the card fee is GAM's.
     const session = await createPayLinkCheckoutSession({
-      landlordConnectAccountId: connectId,
       lineItems: [
         { name: `${link.label} — ${link.property_name}`, amountCents: Math.round(Number(link.total) * 100) },
         { name: 'Card processing fee', amountCents: Math.round(fee * 100) },
       ],
-      platformCutCents: Math.round(fee * 100),
       customerEmail: link.customer_email,
       askName: link.kind === 'standing',
       successUrl: `${apiBase()}/api/public/pay/${link.token}/done`,
@@ -313,6 +315,7 @@ export async function finalizePayLink(session: {
       paymentMethod: 'card', tenantId: link.tenant_id, posCustomerId: link.pos_customer_id,
       subtotal: Number(link.subtotal), taxAmount: Number(link.tax_amount), surcharge: fee,
       total: charged, platformFee: fee, stripePaymentIntentId: session.payment_intent,
+      payoutOwed: Number(link.total),
       discountAmount: Number(link.discount_amount), discountReason: null,
       items: link.items,
     })

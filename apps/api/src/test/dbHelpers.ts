@@ -171,6 +171,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // intents explicitly before properties/units are wiped below.
   await db.query(`DELETE FROM pending_tenant_intents`)
   // S580: platform_transfer_intents FKs landlords + users — clear before them.
+  // S648: a register card sale points at the payout batch that carried it.
+  await db.query(`UPDATE pos_transactions SET payout_intent_id = NULL WHERE payout_intent_id IS NOT NULL`)
   await db.query(`DELETE FROM platform_transfer_intents`)
   // S580: instant-withdrawal margin FKs landlords + disbursements; circuit is standalone.
   await db.query(`DELETE FROM landlord_instant_margins`)
