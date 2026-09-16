@@ -469,3 +469,81 @@ describe('voiding a lease the landlord already signed', () => {
     expect(again.rows[0].amt).toBe(21)
   })
 })
+
+// S647 (Nic): "Why do we keep having this problem where the stuck meters are not
+// getting billed? This is like the sixth time." A lease being signed bills its
+// first utilities down a different road from the monthly run, and that road
+// skipped any meter that did not move.
+describe('a stuck meter when the lease is signed', () => {
+  async function stuckMeter(f: Fixture, opts: { existing: boolean }) {
+    // An invite inside a landlord's first 28 days is an onboarding (existing)
+    // tenancy by trigger. A genuine new move-in needs a landlord past that.
+    if (!opts.existing) {
+      await db.query(`UPDATE landlords SET created_at = NOW() - INTERVAL '90 days' WHERE id=$1`,
+        [f.landlordId])
+    }
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
+       VALUES ($1,$2,$3,$4,$5)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId, opts.existing])
+    await db.query(
+      `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit)
+       VALUES ($1,'electric',0.21) ON CONFLICT DO NOTHING`, [f.propertyId])
+    const meter = async (unitId: string, start: number, end: number) => {
+      const m = await db.query<{ id: string }>(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method)
+         VALUES ($1,'electric','E','submeter') RETURNING id`, [f.propertyId])
+      await db.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`,
+        [m.rows[0].id, unitId])
+      await db.query(
+        `INSERT INTO utility_meter_readings
+           (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+         VALUES ($1,'2026-08-01',$2,'2026-08-01','baseline',$4),
+                ($1,'2026-09-02',$3,'2026-08-01','monthly_cycle',$4)`,
+        [m.rows[0].id, start, end, f.landlordUserId])
+    }
+    // The resident's own meter: read the same number twice.
+    await meter(f.unitId, 61808, 61808)
+    // A lived-in neighbour of the same type with real usage to estimate from.
+    const c = await db.connect()
+    try {
+      const { seedUnit: su, seedLease: sl } = await import('../test/dbHelpers')
+      const other = await su(c, { propertyId: f.propertyId, landlordId: f.landlordId })
+      await sl(c, { unitId: other, landlordId: f.landlordId, status: 'active' })
+      await meter(other, 5000, 5300)
+    } finally { c.release() }
+  }
+
+  it('bills an existing resident at the low end of what the neighbours used', async () => {
+    const f = await fixture()
+    await stuckMeter(f, { existing: true })
+    const documentId = await unsignedDoc(f)
+    // Onboarded in September, as the real ones were, so September's invoice is
+    // open to receive August's electric.
+    await db.query(`UPDATE lease_document_fields SET value='2026-09-16'
+                     WHERE document_id=$1 AND lease_column='start_date'`, [documentId])
+    await db.query(`UPDATE lease_document_fields SET value='-'
+                     WHERE document_id=$1 AND lease_column='end_date'`, [documentId])
+    await signAs(documentId, f.landlordToken)
+
+    const bill = (await db.query(
+      `SELECT usage_amount::float AS usage, charge_amount::float AS amount,
+              allocation_method, payment_id
+         FROM utility_bills WHERE unit_id=$1`, [f.unitId])).rows[0]
+    expect(bill).toBeTruthy()
+    expect(bill.usage).toBe(300)
+    expect(bill.amount).toBe(63)
+    expect(bill.allocation_method).toBe('comparable_low')
+    // On the first invoice, not left waiting for next month.
+    expect(bill.payment_id).not.toBeNull()
+  })
+
+  it('bills nothing for a new move-in — the space was empty that cycle', async () => {
+    const f = await fixture()
+    await stuckMeter(f, { existing: false })
+    const documentId = await unsignedDoc(f)
+    await signAs(documentId, f.landlordToken)
+
+    const bills = await db.query(`SELECT 1 FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+    expect(bills.rows).toHaveLength(0)
+  })
+})

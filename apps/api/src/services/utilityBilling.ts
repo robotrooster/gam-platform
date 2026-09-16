@@ -73,7 +73,7 @@ function cycleUsageFromReadings(
  *  same property, any unit type. null when no comparable has real usage — we
  *  never invent a number with no basis. Rollover-negative comparables are
  *  excluded (usage > 0 filter), as are vacant spots — see the WHERE clause. */
-async function lowestComparableUsage(args: {
+export async function lowestComparableUsage(args: {
   brokenMeterId: string; propertyId: string; utilityType: string;
   unitType: string | null; rvAmpService: string | null; cycleIso: string;
 }): Promise<number | null> {
@@ -157,6 +157,25 @@ async function lowestComparableUsage(args: {
   const floor = median * 0.10
   const credible = usages.filter(u => u >= floor)
 
+  // ── S647 (Nic, DIRECTIVE): THE LOW END OF THE CLUSTER, NOT THE MINIMUM ──
+  //
+  //   "Let's do kind of the low end of the cluster of people. Blanca and Little
+  //    Joe use more, but still less than a majority of people. That weeds out
+  //    the two outliers — we want to be at the low end of where people are
+  //    starting to cluster."
+  //
+  // The plain minimum was always going to be whoever used least, and at
+  // Mountain View in August that was Randall Cox (120) and David Shultz (197):
+  // real households, but two outliers below where everyone else sits. Martin
+  // Alvarado's household of three was estimated off them. The 25th percentile of
+  // the credible occupied usage is the low edge of the main group — 387 on that
+  // cycle, which is the number Nic picked by eye — and it stays conservative:
+  // three quarters of the neighbours used more.
+  //
+  // Nearest-rank, so the answer is always a usage somebody actually had.
+  // S637's reasoning still stands for what it covered: a genuinely frugal
+  // household stays IN the pool; it just no longer sets the price alone.
+
   // ── NOT BUILT YET (Nic, S637) — a meter that dies MID-month ──────────────
   //
   //   "Randall Cox may also have a meter that stopped working mid month... It's
@@ -177,7 +196,15 @@ async function lowestComparableUsage(args: {
 
   // If everything looked suspicious, the median is the honest answer — better a
   // typical bill than one drawn from the emptiest spot on the property.
-  return Math.floor(credible.length > 0 ? credible[0] : median)
+  if (credible.length === 0) return Math.floor(median)
+  return Math.floor(clusterLow(credible))
+}
+
+/** S647: the 25th percentile, nearest-rank, of an ascending list. */
+export function clusterLow(ascending: number[]): number {
+  if (ascending.length === 0) throw new Error('clusterLow: empty list')
+  const rank = Math.ceil(0.25 * ascending.length)
+  return ascending[Math.max(0, rank - 1)]
 }
 
 
@@ -1914,6 +1941,93 @@ export async function releaseSuspendedChargesForLease(args: {
     // the monthly run is still there behind it.
     logger.error({ err: e, unitId: args.unitId },
       '[utility] could not raise the open cycle at lease signing')
+  }
+
+  // ── S647 (Nic): "Why do we keep having this problem where the stuck meters
+  // are not getting billed? This is like the sixth time." ───────────────────
+  //
+  // Because there are TWO roads to a first utility bill and every earlier fix
+  // went down one of them. The monthly run goes through generateBillsForMeter,
+  // which has known since S637 that an occupied space whose meter did not move
+  // is a broken meter, not a free month. A lease being SIGNED goes through here
+  // instead — and the insert above requires `(cyc - base) > 0`, so a stuck
+  // meter simply produced nothing. During onboarding nearly every lease takes
+  // this road: Chris Ast (RV 07), Jared Coil (RV 23), Calvin Curtis (RV 40),
+  // MH 04, RV 41, and Martin Alvarado (RV 34) all fell through it.
+  //
+  // So the same rule applies here, with the same estimate the monthly run uses.
+  // Only for an EXISTING tenancy: those residents lived there during the cycle.
+  // A new move-in's pre-lease cycle was a vacant space, and a vacant space
+  // reading zero is correct.
+  //
+  // Contained in a savepoint when this runs inside the signing transaction —
+  // a failed statement there would otherwise abort the signature itself.
+  const sp = !!c
+  try {
+    if (sp) await q(`SAVEPOINT stuck_meter_estimate`)
+    const existing = await q1<{ existing: boolean }>(
+      `SELECT COALESCE(is_existing_tenancy, FALSE) AS existing FROM leases WHERE id = $1`,
+      [args.leaseId])
+    if (existing?.existing) {
+      const stuck = await q<any>(`
+        SELECT m.id AS meter_id, m.property_id, m.utility_type,
+               COALESCE(m.rate_per_unit, pur.rate_per_unit, 0) AS rate,
+               to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle,
+               cyc.reading_value AS end_val, cyc.reading_date AS end_date,
+               base.reading_value AS start_val, base.reading_date AS start_date,
+               un.unit_type, un.rv_amp_service
+          FROM utility_meters m
+          JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $1
+          JOIN units un ON un.id = mu.unit_id
+          JOIN LATERAL (
+            SELECT DISTINCT billing_cycle_month FROM utility_meter_readings
+             WHERE meter_id = m.id) r ON TRUE
+          LEFT JOIN property_utility_rates pur
+                 ON pur.property_id = m.property_id AND pur.utility_type = m.utility_type
+          JOIN LATERAL (
+            SELECT reading_value, reading_date FROM utility_meter_readings
+             WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
+               AND reason = 'monthly_cycle'
+             ORDER BY reading_date DESC LIMIT 1) cyc ON TRUE
+          JOIN LATERAL (
+            SELECT reading_value, reading_date FROM utility_meter_readings
+             WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
+               AND reason <> 'monthly_cycle'
+             ORDER BY reading_date ASC LIMIT 1) base ON TRUE
+         WHERE m.billing_method = 'submeter'
+           AND m.out_of_service = FALSE
+           AND cyc.reading_value = base.reading_value
+           AND NOT EXISTS (SELECT 1 FROM utility_bills b
+                            WHERE b.meter_id = m.id AND b.billing_cycle_month = r.billing_cycle_month)
+           AND NOT EXISTS (SELECT 1 FROM suspended_utility_charges sc
+                            WHERE sc.meter_id = m.id AND sc.billing_cycle_month = r.billing_cycle_month
+                              AND sc.cancelled_at IS NULL)`,
+        [args.unitId])
+      for (const st of stuck) {
+        const est = await lowestComparableUsage({
+          brokenMeterId: st.meter_id, propertyId: st.property_id,
+          utilityType: st.utility_type, unitType: st.unit_type,
+          rvAmpService: st.rv_amp_service, cycleIso: st.cycle,
+        })
+        if (est == null) continue   // nothing real to estimate from — never invent one
+        await q(`
+          INSERT INTO suspended_utility_charges
+            (meter_id, unit_id, landlord_id, billing_cycle_month, utility_type,
+             usage_amount, allocation_method, rate_per_unit, charge_amount,
+             reading_start, reading_end, reading_start_date, reading_end_date, notes)
+          VALUES ($1,$2,$3,$4::date,$5,$6,'comparable_low',$7,$8,$9,$10,$11,$12,
+                  'Meter did not move this cycle; billed at the low end of what occupied neighbours used.')
+          ON CONFLICT DO NOTHING`,
+          [st.meter_id, args.unitId, args.landlordId, st.cycle, st.utility_type,
+           est, st.rate, round2(est * Number(st.rate)),
+           st.start_val, st.end_val, st.start_date, st.end_date])
+      }
+    }
+    if (sp) await q(`RELEASE SAVEPOINT stuck_meter_estimate`)
+  } catch (e) {
+    if (sp) await q(`ROLLBACK TO SAVEPOINT stuck_meter_estimate`).catch(() => {})
+    logger.error({ err: e, unitId: args.unitId },
+      '[utility] could not estimate a stuck meter at lease signing — the monthly run still will')
   }
 
   const held = await q<any>(`
