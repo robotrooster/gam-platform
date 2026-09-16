@@ -207,6 +207,13 @@ async function tryOffSessionCharge(args: OffSessionArgs): Promise<boolean> {
                 auto_charge_last_error   = NULL
           WHERE id = $3`,
         [args.amountCents / 100, pi.id, args.invoiceId])
+      // S648: itemized like every other payment, so a refund can find it.
+      await db.query(
+        `INSERT INTO business_invoice_payments
+           (business_id, invoice_id, amount, kind, method, stripe_payment_intent_id)
+         VALUES ($1, $2, $3, 'full', 'card', $4)
+         ON CONFLICT (stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL DO NOTHING`,
+        [args.businessId, args.invoiceId, args.amountCents / 100, pi.id])
       const { recordHeldItem, businessInvoiceCutCents } = await import('./heldPayouts')
       await recordHeldItem({
         businessId: args.businessId, sourceType: 'business_invoice_payment', sourceId: pi.id,

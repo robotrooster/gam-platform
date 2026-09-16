@@ -491,8 +491,8 @@ businessInvoicesRouter.post('/:id/mark-paid', requireAuth, async (req, res, next
     const body = markPaidSchema.parse(req.body)
 
     // Pull the invoice to default amount = total_amount.
-    const inv = await queryOne<{ id: string; total_amount: string; status: string }>(
-      `SELECT id, total_amount, status
+    const inv = await queryOne<{ id: string; total_amount: string; amount_paid: string; status: string }>(
+      `SELECT id, total_amount, amount_paid, status
          FROM business_invoices
         WHERE id = $1 AND business_id = $2`,
       [req.params.id, businessId])
@@ -500,21 +500,41 @@ businessInvoicesRouter.post('/:id/mark-paid', requireAuth, async (req, res, next
     if (inv.status !== 'sent' && inv.status !== 'draft') {
       throw new AppError(409, `Cannot mark a ${inv.status} invoice as paid`)
     }
-    const amount = body.amount ?? Number(inv.total_amount)
+    // S648: this is a payment like any other — recorded on its own row, added
+    // to what was already paid online (a deposit), never overwriting it.
+    // Omitted amount = whatever is still owed.
+    const owed = Math.round((Number(inv.total_amount) - Number(inv.amount_paid)) * 100) / 100
+    const amount = body.amount ?? owed
 
-    const r = await query<{ id: string; status: string; paid_at: string }>(
-      `UPDATE business_invoices
-          SET status         = 'paid',
-              paid_at        = NOW(),
-              sent_at        = COALESCE(sent_at, NOW()),
-              amount_paid    = $1,
-              payment_method = $2
-        WHERE id = $3 AND business_id = $4
-          AND status IN ('draft', 'sent')
-        RETURNING id, status, paid_at`,
-      [amount, body.paymentMethod, req.params.id, businessId])
-    if (r.length === 0) throw new AppError(404, 'Invoice not found or already finalized')
-    res.json({ success: true, data: r[0] })
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      if (amount > 0) {
+        await client.query(
+          `INSERT INTO business_invoice_payments (business_id, invoice_id, amount, kind, method)
+           VALUES ($1, $2, $3, 'manual', $4)`,
+          [businessId, inv.id, amount, body.paymentMethod === 'ach' ? 'ach' : body.paymentMethod])
+      }
+      const r = await client.query<{ id: string; status: string; paid_at: string }>(
+        `UPDATE business_invoices bi
+            SET status         = 'paid',
+                paid_at        = NOW(),
+                sent_at        = COALESCE(sent_at, NOW()),
+                amount_paid    = (SELECT COALESCE(SUM(amount), 0) FROM business_invoice_payments WHERE invoice_id = bi.id),
+                payment_method = $1
+          WHERE id = $2 AND business_id = $3
+            AND status IN ('draft', 'sent')
+          RETURNING id, status, paid_at`,
+        [body.paymentMethod, req.params.id, businessId])
+      if (r.rows.length === 0) throw new AppError(404, 'Invoice not found or already finalized')
+      await client.query('COMMIT')
+      res.json({ success: true, data: r.rows[0] })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
   } catch (e) { next(e) }
 })
 
@@ -570,10 +590,9 @@ businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) =
     const body = refundInvoiceSchema.parse(req.body)
 
     const inv = await queryOne<{
-      id: string; status: string; amount_paid: string; refunded_amount: string;
-      stripe_payment_intent_id: string | null; invoice_number: string;
+      id: string; status: string; amount_paid: string; refunded_amount: string; invoice_number: string;
     }>(
-      `SELECT id, status, amount_paid, refunded_amount, stripe_payment_intent_id, invoice_number
+      `SELECT id, status, amount_paid, refunded_amount, invoice_number
          FROM business_invoices
         WHERE id = $1 AND business_id = $2`,
       [req.params.id, businessId])
@@ -588,58 +607,87 @@ businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) =
     const refundable = round2(paid - alreadyRefunded)
     if (refundable <= 0) throw new AppError(409, 'This invoice is already fully refunded')
 
-    const amount = body.amount ?? refundable
+    const amount = round2(body.amount ?? refundable)
     if (amount > refundable + 0.005) {
       throw new AppError(400, `Refund $${amount.toFixed(2)} exceeds the refundable $${refundable.toFixed(2)}`)
     }
 
-    const newRefunded = round2(alreadyRefunded + amount)
-    const newStatus = newRefunded >= paid - 0.005 ? 'refunded' : 'partially_refunded'
-    const isFullRemaining = round2(amount) >= refundable - 0.005
-
-    // Stripe-paid → fire the real refund first. The idempotency key is keyed
-    // on the cumulative refunded total, so a retry of THIS refund is a no-op
-    // while a later partial refund (different cumulative) is allowed through.
-    let stripeRefundId: string | null = null
-    if (inv.stripe_payment_intent_id) {
-      try {
-        const refund = await refundBusinessInvoicePayment({
-          paymentIntentId: inv.stripe_payment_intent_id,
-          // Full remaining → omit amount so Stripe refunds the exact remainder
-          // (avoids cent drift); otherwise refund this partial amount.
-          amountCents: isFullRemaining ? undefined : Math.round(amount * 100),
-          reason: body.reason.trim(),
-          idempotencyKey: `biz-inv-refund:${inv.id}:${newRefunded.toFixed(2)}`,
-          metadata: { business_invoice_id: inv.id, business_id: businessId },
-        })
-        stripeRefundId = refund.refundId
-        // S648: the refund left GAM's balance, so it comes out of what GAM
-        // holds (or will hold) for the business.
+    // S648: an invoice can be paid in parts (an online deposit, then the
+    // balance online or in cash). The refund goes back against the payments
+    // actually made — online payments first, newest first, since a Stripe
+    // refund can only return money its own charge took — and whatever is left
+    // is paid back by hand (cash/check) and only recorded.
+    const payments = await query<{ id: string; amount: string; refunded_amount: string; stripe_payment_intent_id: string | null }>(
+      `SELECT id, amount, refunded_amount, stripe_payment_intent_id
+         FROM business_invoice_payments
+        WHERE invoice_id = $1 AND amount > refunded_amount
+        ORDER BY (stripe_payment_intent_id IS NOT NULL) DESC, paid_at DESC, created_at DESC`,
+      [inv.id])
+    let left = amount
+    const stripeRefundIds: string[] = []
+    const { recordHeldItem } = await import('../services/heldPayouts')
+    for (const p of payments) {
+      if (left <= 0.005) break
+      const take = round2(Math.min(left, Number(p.amount) - Number(p.refunded_amount)))
+      if (take <= 0) continue
+      const newRowRefunded = round2(Number(p.refunded_amount) + take)
+      if (p.stripe_payment_intent_id) {
+        let refund: Awaited<ReturnType<typeof refundBusinessInvoicePayment>>
+        try {
+          refund = await refundBusinessInvoicePayment({
+            paymentIntentId: p.stripe_payment_intent_id,
+            // The whole remainder of this payment → let Stripe refund exactly
+            // what's left (no cent drift); otherwise this part.
+            amountCents: newRowRefunded >= Number(p.amount) - 0.005 ? undefined : Math.round(take * 100),
+            reason: body.reason.trim(),
+            // Keyed on this payment's cumulative refund: a retry of this refund
+            // is a no-op at Stripe, a later partial one goes through.
+            idempotencyKey: `biz-inv-refund:${p.id}:${newRowRefunded.toFixed(2)}`,
+            metadata: { business_invoice_id: inv.id, business_id: businessId },
+          })
+        } catch (e: any) {
+          logger.error({ err: e, invoiceId: inv.id, paymentId: p.id }, '[business-invoice] Stripe refund failed')
+          const done = round2(amount - left)
+          if (done > 0) await recordInvoiceRefund(inv.id, businessId, alreadyRefunded + done, paid, body.reason, stripeRefundIds.at(-1) ?? null)
+          throw new AppError(502, done > 0
+            ? `$${done.toFixed(2)} was refunded, but Stripe could not refund the rest: ${e?.message ?? 'unknown error'}.`
+            : `Stripe could not process the refund: ${e?.message ?? 'unknown error'}. Nothing was changed.`)
+        }
+        stripeRefundIds.push(refund.refundId)
+        // The refund left GAM's balance, so it comes out of what GAM holds
+        // (or will hold) for the business.
         if (refund.heldOnPlatform) {
-          const { recordHeldItem } = await import('../services/heldPayouts')
           await recordHeldItem({
             businessId, sourceType: 'refund', sourceId: refund.refundId,
-            amount: -amount, description: `Refund on invoice ${inv.invoice_number}`,
+            amount: -take, description: `Refund on invoice ${inv.invoice_number}`,
           })
         }
-      } catch (e: any) {
-        logger.error({ err: e, invoiceId: inv.id }, '[business-invoice] Stripe refund failed')
-        throw new AppError(502, `Stripe could not process the refund: ${e?.message ?? 'unknown error'}. Nothing was changed.`)
       }
+      await query(`UPDATE business_invoice_payments SET refunded_amount = $1 WHERE id = $2`, [newRowRefunded, p.id])
+      left = round2(left - take)
     }
-
-    const r = await query<any>(
-      `UPDATE business_invoices
-          SET status          = $1,
-              refunded_amount = $2,
-              refunded_at     = COALESCE(refunded_at, NOW()),
-              refund_reason   = $3,
-              stripe_refund_id = COALESCE($4, stripe_refund_id)
-        WHERE id = $5 AND business_id = $6
-          AND status IN ('paid', 'partially_refunded')
-        RETURNING id, status, refunded_amount, refunded_at, stripe_refund_id`,
-      [newStatus, newRefunded, body.reason.trim(), stripeRefundId, req.params.id, businessId])
-    if (r.length === 0) throw new AppError(404, 'Invoice not found or not refundable')
-    res.json({ success: true, data: { ...r[0], stripeRefunded: stripeRefundId != null } })
+    // Paid before payments were itemized (or marked paid with no row): the
+    // rest is a by-hand refund.
+    const r = await recordInvoiceRefund(inv.id, businessId, round2(alreadyRefunded + amount), paid, body.reason,
+      stripeRefundIds.at(-1) ?? null)
+    if (!r) throw new AppError(404, 'Invoice not found or not refundable')
+    res.json({ success: true, data: { ...r, stripeRefunded: stripeRefundIds.length > 0 } })
   } catch (e) { next(e) }
 })
+
+async function recordInvoiceRefund(invoiceId: string, businessId: string, newRefunded: number, paid: number,
+                                   reason: string, stripeRefundId: string | null) {
+  const status = newRefunded >= paid - 0.005 ? 'refunded' : 'partially_refunded'
+  const r = await query<any>(
+    `UPDATE business_invoices
+        SET status          = $1,
+            refunded_amount = $2,
+            refunded_at     = COALESCE(refunded_at, NOW()),
+            refund_reason   = $3,
+            stripe_refund_id = COALESCE($4, stripe_refund_id)
+      WHERE id = $5 AND business_id = $6
+        AND status IN ('paid', 'partially_refunded')
+      RETURNING id, status, refunded_amount, refunded_at, stripe_refund_id`,
+    [status, Math.round(newRefunded * 100) / 100, reason.trim(), stripeRefundId, invoiceId, businessId])
+  return r[0] ?? null
+}

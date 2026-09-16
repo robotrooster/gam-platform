@@ -1278,6 +1278,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
         ? session.payment_intent
         : session.payment_intent?.id ?? null
       const amountPaid = Number(session.amount_total ?? 0) / 100
+      const paidByBank = event.type === 'checkout.session.async_payment_succeeded'
       // S511: invoices can be paid in two stages (deposit, then balance), so
       // we no longer match on a single stored session id — we look the invoice
       // up by metadata and record each payment in business_invoice_payments.
@@ -1297,13 +1298,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
           `INSERT INTO business_invoice_payments
              (business_id, invoice_id, amount, kind, method,
               stripe_checkout_session_id, stripe_payment_intent_id)
-           SELECT bi.business_id, bi.id, $2, $3, 'card', $4, $5
+           SELECT bi.business_id, bi.id, $2, $3, $6, $4, $5
              FROM business_invoices bi
             WHERE bi.id = $1
            ON CONFLICT (stripe_checkout_session_id)
              WHERE stripe_checkout_session_id IS NOT NULL DO NOTHING
            RETURNING id, business_id`,
-          [invoiceId, amountPaid, paymentKind, session.id, piId],
+          // A bank payment is the only kind that clears later (S648).
+          [invoiceId, amountPaid, paymentKind, session.id, piId, paidByBank ? 'ach' : 'card'],
         )
         if (ins.length > 0) {
           // S648: GAM holds the payment for the business, less GAM's cut,
@@ -1334,14 +1336,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
                                          THEN COALESCE(bi.deposit_paid_at, NOW()) ELSE bi.deposit_paid_at END,
                   status          = CASE WHEN sub.paid >= bi.total_amount - 0.005 THEN 'paid' ELSE 'sent' END,
                   paid_at         = CASE WHEN sub.paid >= bi.total_amount - 0.005 THEN COALESCE(bi.paid_at, NOW()) ELSE bi.paid_at END,
-                  payment_method  = 'card',
+                  payment_method  = $3,
                   stripe_payment_intent_id = COALESCE(bi.stripe_payment_intent_id, $2),
                   updated_at      = NOW()
              FROM (SELECT COALESCE(SUM(amount), 0) AS paid
                      FROM business_invoice_payments WHERE invoice_id = $1) sub
             WHERE bi.id = $1
             RETURNING bi.id, bi.customer_id`,
-          [invoiceId, piId],
+          [invoiceId, piId, paidByBank ? 'ach' : 'card'],
         )
         if (r.length === 0) {
           logger.warn({ session_id: session.id, invoice_id: invoiceId },

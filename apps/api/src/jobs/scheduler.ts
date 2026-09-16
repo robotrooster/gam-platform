@@ -1717,6 +1717,18 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S648: every cent GAM takes must be recorded against someone, and nobody
+  // should owe GAM back for long without it being seen.
+  cron.schedule('45 3 * * *', async () => {
+    try {
+      const { runHeldReconcile } = await import('../services/heldReconcile')
+      const r = await runHeldReconcile()
+      if (r.unrecorded || r.floated) logger.warn(r, '[held-reconcile]')
+    } catch (e) {
+      logger.error({ err: e }, '[held-reconcile] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S120: per-occupied-unit + per-property-min platform fee accrual.
   // Fires 1st of each month at 1:30am Phoenix (just after the manager
   // fee accrual at 1am, so we don't compete for advisory locks). Posts

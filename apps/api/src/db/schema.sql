@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict E7DOEDkA6rf8dY5zeGLBWcozkbVc1ghMrjYfZSMNFeFKLbZiqssXTo3L55wzTvt
+\restrict vUe0gWW06Yezs5rGzrShFB6LSLNPwYSbc5R6DX2v8GiUKgwfDwcjCAynCkhBH5Z
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2248,8 +2248,11 @@ CREATE TABLE public.business_invoice_payments (
     stripe_payment_intent_id text,
     paid_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    refunded_amount numeric(12,2) DEFAULT 0 NOT NULL,
     CONSTRAINT business_invoice_payments_amount_pos CHECK ((amount > (0)::numeric)),
-    CONSTRAINT business_invoice_payments_kind_check CHECK ((kind = ANY (ARRAY['deposit'::text, 'balance'::text, 'full'::text, 'manual'::text])))
+    CONSTRAINT business_invoice_payments_kind_check CHECK ((kind = ANY (ARRAY['deposit'::text, 'balance'::text, 'full'::text, 'manual'::text]))),
+    CONSTRAINT business_invoice_payments_method_check CHECK ((method = ANY (ARRAY['card'::text, 'ach'::text, 'cash'::text, 'check'::text, 'other'::text]))),
+    CONSTRAINT business_invoice_payments_refund_bounds CHECK (((refunded_amount >= (0)::numeric) AND (refunded_amount <= amount)))
 );
 
 
@@ -14519,6 +14522,13 @@ CREATE UNIQUE INDEX background_checks_applicant_pi_uniq ON public.background_che
 --
 
 CREATE INDEX business_invoice_payments_invoice_idx ON public.business_invoice_payments USING btree (invoice_id);
+
+
+--
+-- Name: business_invoice_payments_pi_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX business_invoice_payments_pi_key ON public.business_invoice_payments USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
 
 
 --
@@ -27016,5 +27026,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict E7DOEDkA6rf8dY5zeGLBWcozkbVc1ghMrjYfZSMNFeFKLbZiqssXTo3L55wzTvt
+\unrestrict vUe0gWW06Yezs5rGzrShFB6LSLNPwYSbc5R6DX2v8GiUKgwfDwcjCAynCkhBH5Z
 

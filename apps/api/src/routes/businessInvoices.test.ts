@@ -824,9 +824,73 @@ describe('POST /api/business-invoices/:id/refund', () => {
   // only); a Stripe payment stamps it. Simulate the latter by setting it.
   async function stripePaidInvoice(f: Fixture) {
     const id = await paidInvoice(f)
+    // S648: payments are itemized — make this one an online card payment.
     await db.query(`UPDATE business_invoices SET stripe_payment_intent_id = $1 WHERE id = $2`, ['pi_test_x', id])
+    await db.query(
+      `UPDATE business_invoice_payments SET method = 'card', kind = 'full', stripe_payment_intent_id = 'pi_test_x'
+        WHERE invoice_id = $1`, [id])
     return id
   }
+
+  // S648: an online deposit, then the balance in cash.
+  async function splitPaidInvoice(f: Fixture) {
+    const c = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { taxAmount: 0 }))  // total 150
+    const id = c.body.data.id
+    await db.query(
+      `INSERT INTO business_invoice_payments (business_id, invoice_id, amount, kind, method, stripe_payment_intent_id)
+       VALUES ($1, $2, 50, 'deposit', 'card', 'pi_deposit')`, [f.businessId, id])
+    await db.query(`UPDATE business_invoices SET status = 'sent', sent_at = NOW(), amount_paid = 50 WHERE id = $1`, [id])
+    const mp = await request(buildApp())
+      .post(`/api/business-invoices/${id}/mark-paid`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'cash' })
+    expect(mp.status).toBe(200)
+    return id
+  }
+
+  it('marking paid after an online deposit adds to it — it never overwrites it', async () => {
+    const f = await seedFixture()
+    const id = await splitPaidInvoice(f)
+    const { rows: [inv] } = await db.query<any>(`SELECT amount_paid, status FROM business_invoices WHERE id = $1`, [id])
+    expect(Number(inv.amount_paid)).toBe(150)
+    expect(inv.status).toBe('paid')
+    const { rows } = await db.query<any>(`SELECT amount, method FROM business_invoice_payments WHERE invoice_id = $1 ORDER BY amount`, [id])
+    expect(rows).toEqual([{ amount: '50.00', method: 'card' }, { amount: '100.00', method: 'cash' }])
+  })
+
+  it('a full refund of a split-paid invoice refunds the card part through Stripe and records the cash part', async () => {
+    const f = await seedFixture()
+    const id = await splitPaidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'job canceled' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('refunded')
+    expect(refundBusinessInvoicePaymentMock).toHaveBeenCalledTimes(1)
+    const arg = refundBusinessInvoicePaymentMock.mock.calls[0][0]
+    expect(arg.paymentIntentId).toBe('pi_deposit')
+    expect(arg.amountCents).toBeUndefined()  // the whole $50 charge
+    const { rows } = await db.query<any>(`SELECT amount, refunded_amount FROM business_invoice_payments WHERE invoice_id = $1 ORDER BY amount`, [id])
+    expect(rows.map((r: any) => r.refunded_amount)).toEqual(['50.00', '100.00'])
+  })
+
+  it('a partial refund bigger than the card payment takes the card first, the rest by hand', async () => {
+    const f = await seedFixture()
+    const id = await splitPaidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'partial', amount: 70 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('partially_refunded')
+    expect(refundBusinessInvoicePaymentMock).toHaveBeenCalledTimes(1)
+    const { rows } = await db.query<any>(`SELECT amount, refunded_amount FROM business_invoice_payments WHERE invoice_id = $1 ORDER BY amount`, [id])
+    expect(rows.map((r: any) => r.refunded_amount)).toEqual(['50.00', '20.00'])
+  })
 
   it('cash/manual refund does NOT call Stripe (bookkeeping only)', async () => {
     const f = await seedFixture()
