@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R0pmnAtqdLPvgeSpk8eecmedn3D1UUaez8p2egy7LQYY6BsiUMADYwugxWKGekk
+\restrict E7DOEDkA6rf8dY5zeGLBWcozkbVc1ghMrjYfZSMNFeFKLbZiqssXTo3L55wzTvt
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7047,8 +7047,7 @@ CREATE TABLE public.pos_pay_links (
     expires_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    card_fee_payer text DEFAULT 'customer'::text NOT NULL,
-    CONSTRAINT pos_pay_links_card_fee_payer_check CHECK ((card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
+    card_fee_on_top boolean DEFAULT true NOT NULL,
     CONSTRAINT pos_pay_links_discount_amount_check CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT pos_pay_links_kind_check CHECK ((kind = ANY (ARRAY['one_time'::text, 'standing'::text]))),
     CONSTRAINT pos_pay_links_one_time_has_email CHECK (((kind <> 'one_time'::text) OR (customer_email IS NOT NULL))),
@@ -27017,5 +27016,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R0pmnAtqdLPvgeSpk8eecmedn3D1UUaez8p2egy7LQYY6BsiUMADYwugxWKGekk
+\unrestrict E7DOEDkA6rf8dY5zeGLBWcozkbVc1ghMrjYfZSMNFeFKLbZiqssXTo3L55wzTvt
 

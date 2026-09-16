@@ -794,7 +794,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
   {
     id: 'set_card_fee_payers',
     audience: 'landlord', method: 'PATCH',
-    path: '/api/properties/:propertyId/card-fee-payers',
+    path: '/api/properties/:propertyId/processing-fee-payers',
     pathParams: ['propertyId'],
     description:
       'Choose, for one property, who pays the card processing fee when someone pays by card at the ' +

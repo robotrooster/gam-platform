@@ -734,7 +734,7 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
 // who pays it at the register and on the booking site. Rent isn't affected.
 function CardFeePayerCard({ property, onSaved }: { property: any; onSaved: () => void }) {
   const save = useMutation(
-    (b: { register?: CardFeePayer; booking?: CardFeePayer }) => apiPatch(`/properties/${property.id}/card-fee-payers`, b),
+    (b: { register?: CardFeePayer; booking?: CardFeePayer }) => apiPatch(`/properties/${property.id}/processing-fee-payers`, b),
     { onSuccess: onSaved, onError: () => toast.error('Could not save the card fee setting') })
   const rows: Array<{ key: 'register' | 'booking'; label: string; value: CardFeePayer }> = [
     { key: 'register', label: 'Front counter and pay links', value: property.registerCardFeePayer || 'customer' },

@@ -36,7 +36,7 @@ async function seed() {
 }
 
 const patch = (f: { propertyId: string; token: string }, body: any) =>
-  request(buildApp()).patch(`/api/properties/${f.propertyId}/card-fee-payers`)
+  request(buildApp()).patch(`/api/properties/${f.propertyId}/processing-fee-payers`)
     .set('Authorization', `Bearer ${f.token}`).send(body)
 
 describe('who pays the card fee', () => {

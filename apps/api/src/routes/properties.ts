@@ -1092,11 +1092,11 @@ propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
-// PATCH /api/properties/:id/card-fee-payers — S648 (Nic): "landlord can
+// PATCH /api/properties/:id/processing-fee-payers — S648 (Nic): "landlord can
 // choose to absorb the processing cost... or they just price accordingly."
 // Who pays GAM's card fee at this property's register (counter card sales and
 // pay links) and on its booking site. Rent is not part of this.
-propertiesRouter.patch('/:id/card-fee-payers', requirePerm('properties.edit'), async (req, res, next) => {
+propertiesRouter.patch('/:id/processing-fee-payers', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const payer = z.enum(CARD_FEE_PAYERS)
     const body = z.object({ register: payer.optional(), booking: payer.optional() })
