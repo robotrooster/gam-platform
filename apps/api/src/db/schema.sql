@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict WC09N1kjXRwCZRTJaDo9A3gTihZj09vuQfeNc2rZOpWuLa2bX4qOjqBocphBzQq
+\restrict UGhDujabDHvFgOAhwscXVzczC5H0luWJK7MLRyyPOmcBYxxBAobE5IedshcHxgL
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7323,8 +7323,6 @@ CREATE TABLE public.pos_transactions (
     discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     discount_reason text,
     pay_link_id uuid,
-    payout_owed numeric(10,2) DEFAULT 0 NOT NULL,
-    payout_intent_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -24986,14 +24984,6 @@ ALTER TABLE ONLY public.pos_transactions
 
 
 --
--- Name: pos_transactions pos_transactions_payout_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pos_transactions
-    ADD CONSTRAINT pos_transactions_payout_intent_id_fkey FOREIGN KEY (payout_intent_id) REFERENCES public.platform_transfer_intents(id);
-
-
---
 -- Name: pos_transactions pos_transactions_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27021,5 +27011,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict WC09N1kjXRwCZRTJaDo9A3gTihZj09vuQfeNc2rZOpWuLa2bX4qOjqBocphBzQq
+\unrestrict UGhDujabDHvFgOAhwscXVzczC5H0luWJK7MLRyyPOmcBYxxBAobE5IedshcHxgL
 
