@@ -260,7 +260,6 @@ publicCustomerPortalRouter.post('/customer/:token/invoices/:invoiceId/pay', asyn
     const appBase = process.env.CUSTOMER_PORTAL_URL || 'http://localhost:3014'
     const session = await createInvoiceCheckoutSession({
       amountCents:              Math.round(due.amountDueNow * 100),
-      businessConnectAccountId: biz.stripe_connect_account_id,
       invoiceNumber:            inv.invoice_number,
       customerEmail:            cust?.email ?? null,
       successUrl:               `${appBase}/invoice-paid?invoice=${inv.invoice_number}&token=${req.params.token}`,

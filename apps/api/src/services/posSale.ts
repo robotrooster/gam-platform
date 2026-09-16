@@ -7,6 +7,7 @@
  * verbatim from the transactions route. Runs on the caller's open transaction.
  */
 import type { PoolClient } from 'pg'
+import { recordHeldItem } from './heldPayouts'
 
 export interface PosSaleInput {
   landlordId: string
@@ -51,14 +52,21 @@ export function cardPayoutOwed(s: Pick<PosSaleInput, 'paymentMethod' | 'stripePa
  */
 export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promise<{ tx: any; needsPO: any[] }> {
   const txRes = await client.query(`INSERT INTO pos_transactions
-    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,payout_owed)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
     [s.landlordId, s.tenantId || null, s.posCustomerId || null, s.cashierId,
      s.paymentMethod, s.subtotal, s.taxAmount, s.surcharge, s.total, s.changeGiven || 0, s.platformFee || 0,
-     s.stripePaymentIntentId || null, s.propertyId || null, s.discountAmount || 0, s.discountReason || null,
-     cardPayoutOwed(s)])
+     s.stripePaymentIntentId || null, s.propertyId || null, s.discountAmount || 0, s.discountReason || null])
   const tx = txRes.rows[0]
   const needsPO: any[] = []
+  // S648: a card sale's money is GAM's to hold until the weekly payout.
+  const owed = cardPayoutOwed(s)
+  if (owed > 0) {
+    await recordHeldItem({
+      landlordId: s.landlordId, sourceType: 'pos_sale', sourceId: tx.id,
+      amount: owed, description: 'Register card sale',
+    }, client)
+  }
 
   // Insert line items and decrement stock.
   // S70: scope the item lookup to the calling landlord — pre-S70 a

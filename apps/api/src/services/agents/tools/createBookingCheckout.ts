@@ -89,7 +89,10 @@ export const createBookingCheckout: AgentTool = {
         return {
           ok: true,
           checkoutUrl: r.checkoutUrl,
-          depositDueNow: r.depositAmount,
+          // S648: the deposit is charged by card with the card fee on top.
+          deposit: r.depositAmount,
+          cardFee: r.cardFee,
+          depositDueNow: Math.round((r.depositAmount + r.cardFee) * 100) / 100,
           total: r.total,
           bookingId: r.bookingId,
           siteType: siteType.name,

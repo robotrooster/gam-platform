@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict HtjfGnlgbkEzSCtt0iKUoQtolni4L9Fi1skJ1Ak73Y3kbvS2yVDgMtgevptPjhO
+\restrict WC09N1kjXRwCZRTJaDo9A3gTihZj09vuQfeNc2rZOpWuLa2bX4qOjqBocphBzQq
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4311,6 +4311,33 @@ CREATE TABLE public.generated_routes (
 
 
 --
+-- Name: held_payout_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.held_payout_items (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    business_id uuid,
+    source_type text NOT NULL,
+    source_id text NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    description text,
+    payout_intent_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT held_payout_items_amount_check CHECK ((amount <> (0)::numeric)),
+    CONSTRAINT held_payout_items_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
+    CONSTRAINT held_payout_items_source_type_check CHECK ((source_type = ANY (ARRAY['pos_sale'::text, 'booking_deposit'::text, 'business_invoice_payment'::text, 'business_pos_sale'::text, 'refund'::text, 'dispute'::text, 'platform_fee'::text])))
+);
+
+
+--
+-- Name: TABLE held_payout_items; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.held_payout_items IS 'S648: what GAM holds for a landlord or business, outside rent. Positive = owed to them; negative = owed back. Batched weekly via platform_transfer_intents.';
+
+
+--
 -- Name: home_ownerships; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6005,7 +6032,7 @@ COMMENT ON COLUMN public.parts_inventory.property_id IS 'S605: the property this
 
 CREATE TABLE public.payment_reversals (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    payment_id uuid,
+    payment_id uuid NOT NULL,
     landlord_id uuid,
     tenant_id uuid,
     lease_id uuid,
@@ -6026,9 +6053,7 @@ CREATE TABLE public.payment_reversals (
     status text DEFAULT 'open'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    pos_transaction_id uuid,
     CONSTRAINT payment_reversals_late_fee_owner_check CHECK (((late_fee_owner IS NULL) OR (late_fee_owner = ANY (ARRAY['gam'::text, 'landlord'::text])))),
-    CONSTRAINT payment_reversals_one_source CHECK (((payment_id IS NULL) <> (pos_transaction_id IS NULL))),
     CONSTRAINT payment_reversals_outcome_check CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['tenant_paid'::text, 'landlord_clawback'::text, 'written_off'::text])))),
     CONSTRAINT payment_reversals_recovery_method_check CHECK (((recovery_method IS NULL) OR (recovery_method = ANY (ARRAY['netting'::text, 'ach_pull'::text])))),
     CONSTRAINT payment_reversals_recovery_status_check CHECK ((recovery_status = ANY (ARRAY['pending'::text, 'scheduled_netting'::text, 'recovered'::text, 'not_needed'::text]))),
@@ -6559,8 +6584,8 @@ CREATE TABLE public.platform_review_status (
 
 CREATE TABLE public.platform_transfer_intents (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    landlord_id uuid NOT NULL,
-    landlord_user_id uuid NOT NULL,
+    landlord_id uuid,
+    landlord_user_id uuid,
     destination_connect_account_id text NOT NULL,
     amount numeric(12,2) NOT NULL,
     gross_owed numeric(12,2) NOT NULL,
@@ -6573,6 +6598,8 @@ CREATE TABLE public.platform_transfer_intents (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     transferred_at timestamp with time zone,
+    business_id uuid,
+    CONSTRAINT platform_transfer_intents_one_payee CHECK (((landlord_id IS NULL) <> (business_id IS NULL))),
     CONSTRAINT platform_transfer_intents_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'transferred'::text, 'failed'::text])))
 );
 
@@ -7299,7 +7326,6 @@ CREATE TABLE public.pos_transactions (
     payout_owed numeric(10,2) DEFAULT 0 NOT NULL,
     payout_intent_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
-    CONSTRAINT pos_transactions_payout_owed_check CHECK ((payout_owed >= (0)::numeric)),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
 
@@ -9838,6 +9864,7 @@ CREATE TABLE public.unit_bookings (
     required_amp_service text DEFAULT 'none'::text NOT NULL,
     site_reveal_sent_at timestamp with time zone,
     locked_to_unit boolean DEFAULT false NOT NULL,
+    stripe_payment_intent_id text,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -12239,6 +12266,22 @@ ALTER TABLE ONLY public.float_account_state
 
 ALTER TABLE ONLY public.generated_routes
     ADD CONSTRAINT generated_routes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: held_payout_items held_payout_items_one_per_source; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.held_payout_items
+    ADD CONSTRAINT held_payout_items_one_per_source UNIQUE (source_type, source_id);
+
+
+--
+-- Name: held_payout_items held_payout_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.held_payout_items
+    ADD CONSTRAINT held_payout_items_pkey PRIMARY KEY (id);
 
 
 --
@@ -16030,6 +16073,20 @@ CREATE INDEX idx_generated_routes_vehicle_date ON public.generated_routes USING 
 
 
 --
+-- Name: idx_held_payout_items_business_held; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_held_payout_items_business_held ON public.held_payout_items USING btree (business_id) WHERE ((payout_intent_id IS NULL) AND (business_id IS NOT NULL));
+
+
+--
+-- Name: idx_held_payout_items_landlord_held; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_held_payout_items_landlord_held ON public.held_payout_items USING btree (landlord_id) WHERE ((payout_intent_id IS NULL) AND (landlord_id IS NOT NULL));
+
+
+--
 -- Name: idx_home_ownerships_owner; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -17353,13 +17410,6 @@ CREATE INDEX idx_pos_transactions_landlord_date ON public.pos_transactions USING
 
 
 --
--- Name: idx_pos_transactions_payout_held; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_pos_transactions_payout_held ON public.pos_transactions USING btree (landlord_id) WHERE ((payout_owed > (0)::numeric) AND (payout_intent_id IS NULL));
-
-
---
 -- Name: idx_pos_transactions_pos_customer; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18074,6 +18124,13 @@ CREATE INDEX idx_unit_bookings_landlord_dates ON public.unit_bookings USING btre
 
 
 --
+-- Name: idx_unit_bookings_pi; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_unit_bookings_pi ON public.unit_bookings USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
+
+
+--
 -- Name: idx_unit_bookings_tenant; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -18750,13 +18807,6 @@ CREATE INDEX lease_tenants_supersedes ON public.lease_tenants USING btree (super
 --
 
 CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id);
-
-
---
--- Name: payment_reversals_pos_event_uq; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX payment_reversals_pos_event_uq ON public.payment_reversals USING btree (pos_transaction_id, stripe_object_id) WHERE (pos_transaction_id IS NOT NULL);
 
 
 --
@@ -22696,6 +22746,30 @@ ALTER TABLE ONLY public.generated_routes
 
 
 --
+-- Name: held_payout_items held_payout_items_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.held_payout_items
+    ADD CONSTRAINT held_payout_items_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id);
+
+
+--
+-- Name: held_payout_items held_payout_items_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.held_payout_items
+    ADD CONSTRAINT held_payout_items_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: held_payout_items held_payout_items_payout_intent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.held_payout_items
+    ADD CONSTRAINT held_payout_items_payout_intent_id_fkey FOREIGN KEY (payout_intent_id) REFERENCES public.platform_transfer_intents(id);
+
+
+--
 -- Name: home_ownerships home_ownerships_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23952,14 +24026,6 @@ ALTER TABLE ONLY public.payment_reversals
 
 
 --
--- Name: payment_reversals payment_reversals_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.payment_reversals
-    ADD CONSTRAINT payment_reversals_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id);
-
-
---
 -- Name: payments payments_home_sale_installment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24237,6 +24303,14 @@ ALTER TABLE ONLY public.platform_revenue_ledger
 
 ALTER TABLE ONLY public.platform_review_status
     ADD CONSTRAINT platform_review_status_verified_by_fkey FOREIGN KEY (verified_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_transfer_intents platform_transfer_intents_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_transfer_intents
+    ADD CONSTRAINT platform_transfer_intents_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id);
 
 
 --
@@ -26947,5 +27021,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict HtjfGnlgbkEzSCtt0iKUoQtolni4L9Fi1skJ1Ak73Y3kbvS2yVDgMtgevptPjhO
+\unrestrict WC09N1kjXRwCZRTJaDo9A3gTihZj09vuQfeNc2rZOpWuLa2bX4qOjqBocphBzQq
 

@@ -71,13 +71,15 @@ async function seedInvoice(opts: { total: number; deposit: number; depositType?:
 
 function checkoutCompleted(opts: {
   invoiceId?: string; amount: number; kind: string; sessionId: string; pi: string
+  paymentStatus?: string; type?: string
 }): string {
   return JSON.stringify({
-    id: 'evt_' + opts.sessionId,
-    type: 'checkout.session.completed',
+    id: 'evt_' + opts.sessionId + (opts.type ?? ''),
+    type: opts.type ?? 'checkout.session.completed',
     data: {
       object: {
         id: opts.sessionId,
+        payment_status: opts.paymentStatus ?? 'paid',
         amount_total: Math.round(opts.amount * 100),
         payment_intent: opts.pi,
         customer: null,
@@ -159,5 +161,32 @@ describe('deposit → balance two-stage payment', () => {
     expect(res.status).toBe(200)
     const { rows: [r] } = await db.query<{ n: string }>(`SELECT COUNT(*) AS n FROM business_invoice_payments`)
     expect(Number(r.n)).toBe(0)
+  })
+
+  // S648 (Nic): every cent lands with GAM and is held for the business.
+  it('holds the payment for the business, less GAM\'s cut', async () => {
+    const { invoiceId, businessId } = await seedInvoice({ total: 200, deposit: 0 })
+    await fire(checkoutCompleted({ invoiceId, amount: 200, kind: 'full', sessionId: 'cs_held', pi: 'pi_held' }))
+    const { rows } = await db.query<any>(`SELECT amount, source_type FROM held_payout_items WHERE business_id = $1`, [businessId])
+    expect(rows).toHaveLength(1)
+    // 3.25% + 30¢ of $200 = $6.80 → $193.20 held
+    expect(Number(rows[0].amount)).toBe(193.2)
+    expect(rows[0].source_type).toBe('business_invoice_payment')
+    // Re-delivery holds nothing more.
+    await fire(checkoutCompleted({ invoiceId, amount: 200, kind: 'full', sessionId: 'cs_held', pi: 'pi_held' }))
+    expect((await db.query(`SELECT 1 FROM held_payout_items WHERE business_id = $1`, [businessId])).rows).toHaveLength(1)
+  })
+
+  // A bank payment finishes checkout before the money clears; nothing is
+  // marked paid or held until it does.
+  it('a bank payment waits for the money to clear', async () => {
+    const { invoiceId, businessId } = await seedInvoice({ total: 100, deposit: 0 })
+    await fire(checkoutCompleted({ invoiceId, amount: 100, kind: 'full', sessionId: 'cs_ach', pi: 'pi_ach', paymentStatus: 'unpaid' }))
+    expect((await readInvoice(invoiceId)).status).toBe('sent')
+    expect(await paymentCount(invoiceId)).toBe(0)
+    await fire(checkoutCompleted({ invoiceId, amount: 100, kind: 'full', sessionId: 'cs_ach', pi: 'pi_ach',
+      type: 'checkout.session.async_payment_succeeded' }))
+    expect((await readInvoice(invoiceId)).status).toBe('paid')
+    expect((await db.query(`SELECT 1 FROM held_payout_items WHERE business_id = $1`, [businessId])).rows).toHaveLength(1)
   })
 })

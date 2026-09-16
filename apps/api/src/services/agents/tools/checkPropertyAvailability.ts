@@ -111,7 +111,10 @@ export const checkPropertyAvailability: AgentTool = {
         unavailableReason: a.unavailableReason,
         tier: a.tier,
         total: a.total,
-        depositDueNow: a.depositAmount,
+        // S648: card only, card fee on top.
+        deposit: a.depositAmount,
+        cardFee: a.depositCardFee,
+        depositDueNow: a.depositAmount == null ? null : Math.round((a.depositAmount + (a.depositCardFee ?? 0)) * 100) / 100,
         taxIncluded: a.taxable ? a.tax : 0,
         // If full for the whole range, the longest stay from the same check-in that WOULD fit.
         alternativeStay: a.altStay,

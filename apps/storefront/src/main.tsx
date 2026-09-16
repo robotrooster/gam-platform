@@ -330,6 +330,8 @@ interface TypeAvail {
   id: string; name: string; unitType: string
   available: boolean; unavailableReason: string | null
   total: number | null; tax: number; depositAmount: number | null
+  // S648: deposits are card only, with the card fee on top
+  depositCardFee: number | null
   minStayNights: number | null; checkInTime: string | null; checkOutTime: string | null
   monthlyBilling: { monthlyRate: number; segments: BillingSegment[] } | null
   altStay: { checkOut: string; nights: number } | null
@@ -454,7 +456,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                   {t.tax > 0 && <><br />incl. {money(t.tax)} lodging tax</>}
                 </>
               )}
-              <br />Due now: {money(t.depositAmount)} deposit
+              <br />Due now: {money(t.depositAmount)} deposit{t.depositCardFee ? <> + {money(t.depositCardFee)} card fee</> : null}
             </>
           ) : t.unavailableReason === 'booked' ? (
             <>
@@ -534,7 +536,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                     {selOpen && sel.total != null && (
                       <>
                         <span className="price" style={{ fontSize: '1.15rem', fontWeight: 700 }}>{sel.monthlyBilling ? `${money(sel.monthlyBilling.monthlyRate)}/mo${avail!.utilitiesBilled ? ' + utilities' : ''}` : money(sel.total)}</span>
-                        <span className="rate">Due now: {money(sel.depositAmount)} deposit</span>
+                        <span className="rate">Due now: {money(sel.depositAmount)} deposit{sel.depositCardFee ? <> + {money(sel.depositCardFee)} card fee</> : null}</span>
                       </>
                     )}
                   </div>
@@ -558,7 +560,7 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                   <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                     {selOpen ? (
                       <button className="btn btn-p" disabled={booking || !guest.name || !guest.email} onClick={book}>
-                        {booking ? 'Holding your dates…' : `Reserve — pay ${money(sel.depositAmount)} deposit`}
+                        {booking ? 'Holding your dates…' : `Reserve — pay ${money((sel.depositAmount ?? 0) + (sel.depositCardFee ?? 0))} by card`}
                       </button>
                     ) : (
                       <button className="btn btn-p" disabled={booking || !guest.name || !guest.email} onClick={joinWaitlist}>

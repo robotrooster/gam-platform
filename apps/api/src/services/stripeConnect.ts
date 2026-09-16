@@ -868,18 +868,16 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
 // link in their email, lands on Stripe's checkout page, pays card/ACH,
 // and Stripe routes the gross to the business's Connect account.
 //
-// Application fee (GAM platform cut) is set to 0 for now; the business
-// pays Stripe's processing fee (Stripe deducts before transfer). Per-
-// invoice fee tuning can dial this in later via a settings field.
+// S648 (Nic): "Every single cent" flows through GAM. The invoice is paid to
+// GAM's account; GAM's cut is taken when the payment is recorded (webhook →
+// held_payout_items) and the rest goes out in the business's weekly payout.
 
 interface CreateInvoiceCheckoutOpts {
   amountCents:                 number
-  businessConnectAccountId:    string
   invoiceNumber:                string
   customerEmail?:               string | null
   successUrl:                   string
   cancelUrl:                    string
-  platformCutCents?:         number
   metadata?:                    Record<string, string>
   // S508: when set, ask Stripe to create a Customer + save the card
   // for off-session charges (recurring cycles). The webhook persists
@@ -923,10 +921,6 @@ export async function createInvoiceCheckoutSession(
       },
     }],
     payment_intent_data: {
-      transfer_data: {
-        destination: opts.businessConnectAccountId,
-      },
-      application_fee_amount: opts.platformCutCents ?? 0,
       metadata: {
         gam_purpose: 'business_invoice',
         ...(opts.metadata ?? {}),
@@ -960,18 +954,18 @@ export async function createInvoiceCheckoutSession(
 }
 
 // ── Booking deposit checkout (S517 / public property booking) ──
-// A public stay-booking guest pays a deposit on Stripe's hosted Checkout;
-// the gross routes to the landlord's Connect account (destination charge),
-// GAM takes its platform cut as the application fee. The webhook confirms the
-// booking on checkout.session.completed (gam_purpose='booking_deposit').
+// A public stay-booking guest pays a deposit on Stripe's hosted Checkout.
+// S648 (Nic): card only, with the card fee on top; the charge is GAM's, the
+// deposit is held for the landlord and paid in their weekly payout. The
+// webhook confirms the booking on checkout.session.completed
+// (gam_purpose='booking_deposit').
 export interface CreateBookingDepositCheckoutOpts {
-  amountCents:                 number
-  landlordConnectAccountId:    string
+  amountCents:                 number   // the deposit
+  cardFeeCents:                number   // added on top, GAM's
   unitLabel:                   string
   guestEmail?:                 string | null
   successUrl:                  string
   cancelUrl:                   string
-  platformCutCents?:        number
   metadata?:                   Record<string, string>
 }
 
@@ -981,18 +975,14 @@ export async function createBookingDepositCheckoutSession(
   const stripe = getStripe()
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
-    payment_method_types: ['card', 'us_bank_account'],
-    line_items: [{
-      quantity: 1,
-      price_data: {
-        currency: 'usd',
-        unit_amount: opts.amountCents,
-        product_data: { name: `Stay deposit — ${opts.unitLabel}` },
-      },
-    }],
+    payment_method_types: ['card'],
+    line_items: [
+      { quantity: 1, price_data: { currency: 'usd', unit_amount: opts.amountCents,
+          product_data: { name: `Stay deposit — ${opts.unitLabel}` } } },
+      ...(opts.cardFeeCents > 0 ? [{ quantity: 1, price_data: { currency: 'usd', unit_amount: opts.cardFeeCents,
+          product_data: { name: 'Card processing fee' } } }] : []),
+    ],
     payment_intent_data: {
-      transfer_data: { destination: opts.landlordConnectAccountId },
-      application_fee_amount: opts.platformCutCents ?? 0,
       metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
     },
     metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
@@ -1045,13 +1035,14 @@ export async function createPayLinkCheckoutSession(opts: {
 }
 
 /**
- * Refund a business-invoice PaymentIntent (a Connect destination charge).
+ * Refund a business-invoice PaymentIntent.
  *
- * `reverse_transfer: true` is REQUIRED: the gross landed in the business's
- * Connect balance, so the refund must pull the money back from there — never
- * from GAM's platform balance. `refund_application_fee` is intentionally
- * OMITTED (Nic, S502): GAM keeps its platform fee on a refund, so the business
- * bears GAM's cut on the refunded amount.
+ * S648: the charge is GAM's (every cent flows through the platform), so the
+ * refund leaves GAM's balance and the caller records it against the business
+ * as a negative held item — it nets from their next payout. GAM keeps its cut
+ * on a refund (Nic, S502), so the business bears the whole refunded amount.
+ * Charges from before S648 were destination charges; `reverse_transfer` pulls
+ * those back from the business's Stripe balance as before.
  *
  * `amountCents` omitted = full remaining refund. Returns the Stripe refund id.
  * `idempotencyKey` makes a retried request safe (no double refund).
@@ -1062,11 +1053,12 @@ export async function refundBusinessInvoicePayment(opts: {
   reason?: string
   idempotencyKey?: string
   metadata?: Record<string, string>
-}): Promise<{ refundId: string; status: string | null }> {
+}): Promise<{ refundId: string; status: string | null; heldOnPlatform: boolean }> {
   const stripe = getStripe()
+  const pi = await stripe.paymentIntents.retrieve(opts.paymentIntentId)
   const params: Stripe.RefundCreateParams = {
     payment_intent: opts.paymentIntentId,
-    reverse_transfer: true,
+    ...(pi.transfer_data ? { reverse_transfer: true } : {}),
     metadata: { gam_purpose: 'business_invoice_refund', ...(opts.metadata ?? {}) },
   }
   if (opts.amountCents != null) params.amount = opts.amountCents
@@ -1076,7 +1068,7 @@ export async function refundBusinessInvoicePayment(opts: {
     params,
     opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : undefined,
   )
-  return { refundId: refund.id, status: refund.status }
+  return { refundId: refund.id, status: refund.status, heldOnPlatform: !pi.transfer_data }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────

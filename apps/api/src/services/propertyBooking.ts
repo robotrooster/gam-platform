@@ -4,10 +4,11 @@ import type { PoolClient } from 'pg'
 import { getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { createBookingDepositCheckoutSession } from './stripeConnect'
+import { recordHeldItem } from './heldPayouts'
 import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
-import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
+import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -211,7 +212,7 @@ interface GuestBooking {
   requiredAmpService?: string | null
 }
 
-export interface BookingDepositResult { bookingId: string; depositAmount: number; total: number; checkoutUrl: string }
+export interface BookingDepositResult { bookingId: string; depositAmount: number; cardFee: number; total: number; checkoutUrl: string }
 
 /**
  * Create a tentative booking holding the dates, then a Stripe deposit checkout.
@@ -284,25 +285,25 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
         [mockSession, bookingId])
       await confirmBookingDeposit(bookingId, mockSession)
       logger.warn({ bookingId }, '[propertyBooking] dev-mock checkout — landlord has no Connect account, deposit simulated, booking auto-confirmed')
-      return { bookingId, depositAmount: quote.deposit, total: quote.total,
+      return { bookingId, depositAmount: quote.deposit, cardFee: 0, total: quote.total,
                checkoutUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`) }
     }
 
+    // S648: GAM's charge; the deposit is held for the landlord (whose payout
+    // account the gate above requires) and the card fee on top is GAM's.
     const checkout = await createBookingDepositCheckoutSession({
       amountCents: Math.round(quote.deposit * 100),
-      // Non-null: the mock path returned above; without it a null Connect
-      // account already threw the 409 gate.
-      landlordConnectAccountId: connect!,
+      cardFeeCents: Math.round(processingFeeFor({ amount: quote.deposit, paymentMethod: 'card' }) * 100),
       unitLabel: `${prop.name} · Unit ${unit.unit_number}`,
       guestEmail: opts.guestEmail,
       successUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`),
       cancelUrl:  storefrontUrl(prop.booking_slug),
-      platformCutCents: 0,
-      metadata: { gam_booking_id: bookingId },
+      metadata: { gam_booking_id: bookingId, gam_landlord_id: prop.landlord_id },
     })
     await query(`UPDATE unit_bookings SET stripe_checkout_session_id=$1, updated_at=now() WHERE id=$2`,
       [checkout.sessionId, bookingId])
-    return { bookingId, depositAmount: quote.deposit, total: quote.total, checkoutUrl: checkout.hostedUrl }
+    return { bookingId, depositAmount: quote.deposit, total: quote.total, checkoutUrl: checkout.hostedUrl,
+             cardFee: processingFeeFor({ amount: quote.deposit, paymentMethod: 'card' }) }
   } catch (e) {
     try { await client.query('ROLLBACK') } catch {}
     throw e
@@ -311,14 +312,49 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
   }
 }
 
-/** Mark a booking's deposit paid + confirm it (webhook-driven, idempotent). */
-export async function confirmBookingDeposit(bookingId: string, sessionId: string): Promise<void> {
-  await query(
-    `UPDATE unit_bookings
-        SET status='confirmed', deposit_paid_at=COALESCE(deposit_paid_at, now()),
-            hold_expires_at=NULL, updated_at=now()
-      WHERE id=$1 AND stripe_checkout_session_id=$2 AND status='tentative'`,
-    [bookingId, sessionId])
+/**
+ * Mark a booking's deposit paid + confirm it (webhook-driven, idempotent).
+ * S648: the deposit is GAM's to hold until the landlord's weekly payout; the
+ * held item is written with the confirmation so neither happens without the
+ * other. `paid` carries the checkout's PaymentIntent and amount (absent for
+ * the dev mock, which moves no money).
+ */
+export async function confirmBookingDeposit(
+  bookingId: string, sessionId: string,
+  paid?: { paymentIntentId: string | null; amountTotalCents: number | null },
+): Promise<void> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const b = (await client.query<{ landlord_id: string; deposit_amount: string | null }>(
+      `UPDATE unit_bookings
+          SET status='confirmed', deposit_paid_at=COALESCE(deposit_paid_at, now()),
+              hold_expires_at=NULL, updated_at=now(),
+              stripe_payment_intent_id=COALESCE(stripe_payment_intent_id, $3)
+        WHERE id=$1 AND stripe_checkout_session_id=$2 AND status='tentative'
+        RETURNING landlord_id, deposit_amount::text AS deposit_amount`,
+      [bookingId, sessionId, paid?.paymentIntentId ?? null])).rows[0]
+    if (b && paid) {
+      const deposit = Number(b.deposit_amount ?? 0)
+      const cardFee = processingFeeFor({ amount: deposit, paymentMethod: 'card' })
+      if (paid.amountTotalCents !== Math.round((deposit + cardFee) * 100)) {
+        logger.error({ bookingId, deposit, cardFee, got: paid.amountTotalCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
+      }
+      const held = Math.round(((paid.amountTotalCents ?? 0) / 100 - cardFee) * 100) / 100
+      if (held > 0) {
+        await recordHeldItem({
+          landlordId: b.landlord_id, sourceType: 'booking_deposit', sourceId: bookingId,
+          amount: held, description: 'Stay deposit',
+        }, client)
+      }
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 // ── Waitlist ─────────────────────────────────────────────────

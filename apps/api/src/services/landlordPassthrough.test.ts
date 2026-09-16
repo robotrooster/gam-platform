@@ -27,6 +27,7 @@ vi.mock('./adminNotifications', () => ({
 }))
 
 import { db } from '../db'
+import { BUSINESS_TYPES } from '@gam/shared'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
 import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers, heldOwnerShareForUser } from './landlordPassthrough'
 
@@ -486,38 +487,31 @@ describe('heldOwnerShareForUser (S639 — display twin of the RESERVE sum)', () 
   })
 })
 
-// ── S648: REGISTER CARD SALES RIDE THE SAME BATCH ─────────────────────────
+// ── S648: EVERY CENT IS HELD, THEN BATCHED ─────────────────────────────────
 //
-// Nic: "All the propane sales throughout the week will go in a batch payment
-// ... All that money needs to flow directly to GAM first and then be dispersed
-// that way." A register card sale is charged on GAM's account; what the
-// landlord is owed for it waits on the sale row until the weekly batch.
-describe('S648 register card sales in the payout batch', () => {
-  async function seedSale(ctx: Ctx, opts: { owed: number; method?: string; pi?: string | null }): Promise<string> {
-    const { rows: [{ id }] } = await db.query<{ id: string }>(
-      `INSERT INTO pos_transactions
-         (landlord_id, cashier_id, payment_method, subtotal, total, surcharge,
-          stripe_payment_intent_id, payout_owed)
-       VALUES ($1, $2, $3, $4, $4, 0, $5, $6) RETURNING id`,
-      [ctx.landlordId, ctx.landlordUserId, opts.method ?? 'card', opts.owed,
-       opts.pi === undefined ? 'pi_' + Math.random().toString(36).slice(2) : opts.pi, opts.owed])
-    return id
+// Nic: "money all needs to flow through the platform. Every single cent...
+// We are gonna hold all funds even if briefly." Register sales, stay deposits
+// and the chargebacks against them ride the landlord's rent batch.
+describe('S648 held items in the landlord payout batch', () => {
+  async function hold(ctx: Ctx, amount: number, sourceType: any = 'pos_sale', sourceId?: string): Promise<void> {
+    const { recordHeldItem } = await import('./heldPayouts')
+    await recordHeldItem({ landlordId: ctx.landlordId, sourceType, sourceId: sourceId ?? Math.random().toString(36).slice(2), amount })
   }
 
-  it('pays rent and register sales in one transfer, and marks each sale carried', async () => {
+  it('pays rent, register sales and stay deposits in one transfer, and marks each item carried', async () => {
     const ctx = await seedCtx()
     await seedOwnerShareLedger(ctx, 950)
-    const s1 = await seedSale(ctx, { owed: 20 })
-    const s2 = await seedSale(ctx, { owed: 15.5 })
+    await hold(ctx, 20)
+    await hold(ctx, 15.5, 'booking_deposit')
     expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(985.5)
     transferMock.mockResolvedValueOnce({ id: 'tr_with_sales' } as any)
     const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
     expect(res.amount).toBe(985.5)
     expect(transferMock).toHaveBeenCalledTimes(1)
     const { rows } = await db.query<any>(
-      `SELECT t.id, i.stripe_transfer_id FROM pos_transactions t
-         JOIN platform_transfer_intents i ON i.id = t.payout_intent_id
-        WHERE t.id = ANY($1::uuid[])`, [[s1, s2]])
+      `SELECT i.stripe_transfer_id FROM held_payout_items h
+         JOIN platform_transfer_intents i ON i.id = h.payout_intent_id
+        WHERE h.landlord_id = $1`, [ctx.landlordId])
     expect(rows).toHaveLength(2)
     expect(rows.every((r: any) => r.stripe_transfer_id === 'tr_with_sales')).toBe(true)
     expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(0)
@@ -525,7 +519,7 @@ describe('S648 register card sales in the payout batch', () => {
 
   it('a week of register sales alone pays out, and never twice', async () => {
     const ctx = await seedCtx()
-    await seedSale(ctx, { owed: 42 })
+    await hold(ctx, 42)
     transferMock.mockResolvedValueOnce({ id: 'tr_sales_only' } as any)
     expect((await reconcilePlatformHeldPayments(ctx.landlordUserId)).amount).toBe(42)
     const again = await reconcilePlatformHeldPayments(ctx.landlordUserId)
@@ -533,48 +527,85 @@ describe('S648 register card sales in the payout batch', () => {
     expect(transferMock).toHaveBeenCalledTimes(1)
   })
 
-  it('cash sales owe nothing and are never in a batch', async () => {
+  it('a register-sale chargeback comes out of the next payout, recorded once', async () => {
     const ctx = await seedCtx()
-    const cash = await seedSale(ctx, { owed: 0, method: 'cash', pi: null })
-    expect(await heldOwnerShareForUser(ctx.landlordUserId)).toBe(0)
-    await reconcilePlatformHeldPayments(ctx.landlordUserId)
-    const { rows: [r] } = await db.query<any>(`SELECT payout_intent_id FROM pos_transactions WHERE id=$1`, [cash])
-    expect(r.payout_intent_id).toBeNull()
-  })
-
-  it('a register-sale chargeback is netted from the next payout', async () => {
-    const ctx = await seedCtx()
-    const sale = await seedSale(ctx, { owed: 100, pi: 'pi_disputed' })
-    const { handlePosSaleDispute } = await import('./posSaleReversal')
-    const first = await handlePosSaleDispute({
-      paymentIntentId: 'pi_disputed', amountCents: 10380, feeCents: 1500,
-      stripeEventId: 'evt_pos_dispute', stripeDisputeId: 'dp_1', rawEvent: {},
-    })
-    expect(first.handled).toBe(true)
-    // Stripe re-delivers; one receivable.
-    expect((await handlePosSaleDispute({
-      paymentIntentId: 'pi_disputed', amountCents: 10380, feeCents: 1500,
-      stripeEventId: 'evt_pos_dispute', stripeDisputeId: 'dp_1', rawEvent: {},
-    })).handled).toBe(false)
-    const { rows: [rev] } = await db.query<any>(
-      `SELECT id, pos_transaction_id, payment_id, reversed_amount FROM payment_reversals WHERE stripe_event_id='evt_pos_dispute'`)
-    expect(rev.pos_transaction_id).toBe(sale)
-    expect(rev.payment_id).toBeNull()
+    await db.query(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total, stripe_payment_intent_id)
+       VALUES ($1, $2, 'card', 100, 103.8, 'pi_disputed')`, [ctx.landlordId, ctx.landlordUserId])
+    await hold(ctx, 100)
+    const { recordChargeback } = await import('./heldPayouts')
+    const args = { paymentIntentId: 'pi_disputed', amountCents: 10380, feeCents: 1500, stripeDisputeId: 'dp_1' }
+    expect((await recordChargeback(args)).handled).toBe(true)
+    expect((await recordChargeback(args)).handled).toBe(false)  // Stripe re-delivers
+    const { rows: [d] } = await db.query<any>(`SELECT amount FROM held_payout_items WHERE source_type = 'dispute'`)
     // The whole disputed charge plus Stripe's fee — GAM absorbs nothing.
-    expect(Number(rev.reversed_amount)).toBe(118.8)
-    await db.query(`UPDATE payment_reversals SET recovery_method='netting', recovery_status='scheduled_netting', status='recovering' WHERE id=$1`, [rev.id])
+    expect(Number(d.amount)).toBe(-118.8)
     await seedOwnerShareLedger(ctx, 950)
     transferMock.mockResolvedValueOnce({ id: 'tr_after_dispute' } as any)
     const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
     expect(res.amount).toBe(Math.round((950 + 100 - 118.8) * 100) / 100)
   })
 
-  it('a dispute on something that is not a register sale is left alone', async () => {
-    const { handlePosSaleDispute } = await import('./posSaleReversal')
-    const r = await handlePosSaleDispute({
-      paymentIntentId: 'pi_rent_somewhere', amountCents: 100, feeCents: 0,
-      stripeEventId: 'evt_x', stripeDisputeId: 'dp_x', rawEvent: {},
-    })
-    expect(r).toEqual({ handled: false, reason: 'not a register sale' })
+  it('when chargebacks outweigh everything, nothing moves and it all carries', async () => {
+    const ctx = await seedCtx()
+    await hold(ctx, 20)
+    await hold(ctx, -50, 'dispute')
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(false)
+    expect(transferMock).not.toHaveBeenCalled()
+    const { rows } = await db.query(`SELECT 1 FROM held_payout_items WHERE landlord_id = $1 AND payout_intent_id IS NULL`, [ctx.landlordId])
+    expect(rows).toHaveLength(2)
+  })
+
+  it('a dispute on something GAM did not hold for anyone is left alone', async () => {
+    const { recordChargeback } = await import('./heldPayouts')
+    const r = await recordChargeback({ paymentIntentId: 'pi_rent_somewhere', amountCents: 100, feeCents: 0, stripeDisputeId: 'dp_x' })
+    expect(r).toEqual({ handled: false, reason: 'not a held charge' })
+  })
+})
+
+describe('S648 business payout batch', () => {
+  async function seedBusiness(connect: string | null = 'acct_biz_s648'): Promise<{ businessId: string }> {
+    const c = await db.connect()
+    try {
+      const { userId } = await seedLandlord(c)
+      const { rows: [b] } = await c.query<{ id: string }>(
+        `INSERT INTO businesses (owner_user_id, name, business_type, email, stripe_connect_account_id)
+         VALUES ($1, 'Test Hauling', $2, 'biz@example.com', $3) RETURNING id`, [userId, BUSINESS_TYPES[0], connect])
+      return { businessId: b.id }
+    } finally { c.release() }
+  }
+
+  it('pays what GAM holds for the business in one transfer, then nothing twice', async () => {
+    const { businessId } = await seedBusiness()
+    const { recordHeldItem, reconcileBusinessHeldFunds, heldForBusiness } = await import('./heldPayouts')
+    await recordHeldItem({ businessId, sourceType: 'business_invoice_payment', sourceId: 'cs_1', amount: 193.2 })
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_1', amount: 9.61 })
+    await recordHeldItem({ businessId, sourceType: 'refund', sourceId: 're_1', amount: -20 })
+    expect(await heldForBusiness(businessId)).toBe(182.81)
+    transferMock.mockResolvedValueOnce({ id: 'tr_biz' } as any)
+    const r = await reconcileBusinessHeldFunds(businessId)
+    expect(r.amount).toBe(182.81)
+    expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({
+      amount: 182.81, destinationConnectAccountId: 'acct_biz_s648',
+      metadata: expect.objectContaining({ gam_business_id: businessId }),
+    }))
+    const { rows: [i] } = await db.query<any>(`SELECT status, stripe_transfer_id, landlord_id FROM platform_transfer_intents WHERE business_id = $1`, [businessId])
+    expect(i).toMatchObject({ status: 'transferred', stripe_transfer_id: 'tr_biz', landlord_id: null })
+    expect((await reconcileBusinessHeldFunds(businessId)).intentId).toBeNull()
+    expect(transferMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('no payout account → nothing moves', async () => {
+    const { businessId } = await seedBusiness(null)
+    const { recordHeldItem, reconcileBusinessHeldFunds } = await import('./heldPayouts')
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_2', amount: 10 })
+    expect((await reconcileBusinessHeldFunds(businessId)).intentId).toBeNull()
+    expect(transferMock).not.toHaveBeenCalled()
+  })
+
+  it('an item names exactly one payee', async () => {
+    const { recordHeldItem } = await import('./heldPayouts')
+    await expect(recordHeldItem({ sourceType: 'refund', sourceId: 'x', amount: -1 })).rejects.toThrow(/one payee/)
   })
 })

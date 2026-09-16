@@ -53,7 +53,8 @@ function dec(n: string | number | null | undefined): number {
 
 const createSchema = z.object({
   customerId: z.string().uuid().nullable().optional(),
-  paymentMethod: z.enum(['cash', 'card_recorded', 'stripe_terminal']),
+  // S648 (Nic): every card goes through GAM's reader — no outside-card sales.
+  paymentMethod: z.enum(['cash', 'stripe_terminal']),
   // stripe_terminal only: the captured PaymentIntent backing this sale.
   stripePaymentIntentId: z.string().min(1).optional(),
   amountTendered: z.number().min(0).optional(),
@@ -198,6 +199,8 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
       const receiptNumber = fmtReceipt(thisSaleNumber)
 
       let cardSurcharge = 0
+      let captureOnCommit: string | null = null
+      let heldCents = 0
       // S536: a stripe_terminal sale must PROVE its payment — the PI
       // must exist on this business's Connect account, carry our
       // metadata, be captured (succeeded), and match the computed
@@ -209,8 +212,11 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
         const { retrieveBusinessPI } = await import('../services/posTerminal')
         const pi = await retrieveBusinessPI(body.stripePaymentIntentId)
         if (pi.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
-        if (pi.status !== 'succeeded') throw new AppError(409, `Payment is ${pi.status} — complete the card payment on the reader first`)
-        const { PLATFORM_FEES: VF } = await import('@gam/shared')
+        if (pi.status !== 'succeeded' && pi.status !== 'requires_capture') {
+          throw new AppError(409, `Payment is ${pi.status} — complete the card payment on the reader first`)
+        }
+        if (pi.status === 'requires_capture') captureOnCommit = pi.id
+
         // S561 (Nic): validate against the GRAND total (sale + tip) — the reader
         // is charged grandTotal (frontend BusinessRegisterPage charges
         // Math.round(grandTotal*100)). The prior `totalAmount` base excluded the
@@ -218,7 +224,11 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
         // captured (customer charged, sale never recorded). Tip presets are on
         // by default, so this fired constantly.
         const baseCents = Math.round(grandTotal * 100)
-        const feeCents = Math.round(baseCents * VF.BUSINESS_TERMINAL_APP_FEE_PCT) + VF.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
+        const { businessTerminalCutCents } = await import('../services/heldPayouts')
+        const feeCents = businessTerminalCutCents(baseCents)
+        // What GAM holds for the business: the charge less GAM's cut, whichever
+        // side paid the fee.
+        heldCents = pi.amount - feeCents
         if (pi.amount === baseCents + feeCents) {
           cardSurcharge = feeCents / 100  // customer-paid card fee, shown on the receipt
         } else if (pi.amount !== baseCents) {
@@ -280,6 +290,20 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
           [businessId, c.itemId, -c.quantity, c.newStockQty,
            `Sold via ${receiptNumber}`,
            req.user!.userId, txn.id])
+      }
+
+      if (heldCents > 0) {
+        const { recordHeldItem } = await import('../services/heldPayouts')
+        await recordHeldItem({
+          businessId, sourceType: 'business_pos_sale', sourceId: txn.id,
+          amount: heldCents / 100, description: `Register sale ${receiptNumber}`,
+        }, client)
+      }
+      // Take the money last: a failed capture rolls the sale back and the
+      // card authorization simply lapses.
+      if (captureOnCommit) {
+        const { captureBusinessPI } = await import('../services/posTerminal')
+        await captureBusinessPI(captureOnCommit)
       }
 
       await client.query('COMMIT')
@@ -512,8 +536,9 @@ businessPosRouter.get('/register-config', requireAuth, async (req, res, next) =>
 businessPosRouter.post('/terminal/connection-token', requireAuth, async (req, res, next) => {
   try {
     const businessId = await requireUse(req)
-    const { createConnectionToken } = await import('../services/posTerminal')
-    const secret = await createConnectionToken(await getBusinessConnectId(businessId))
+    const { createBusinessConnectionToken } = await import('../services/posTerminal')
+    await getBusinessConnectId(businessId)  // no reader without somewhere to pay the business
+    const secret = await createBusinessConnectionToken(businessId)
     res.json({ success: true, data: { secret } })
   } catch (e) { next(e) }
 })
@@ -563,10 +588,9 @@ businessPosRouter.post('/terminal/charge', requireAuth, async (req, res, next) =
     const { assertBusinessReader, createBusinessCardPresentPaymentIntent, processBusinessPIOnReader } =
       await import('../services/posTerminal')
     await assertBusinessReader(businessId, stripeReaderId)
-    const connectId = await getBusinessConnectId(businessId)
-    const { PLATFORM_FEES } = await import('@gam/shared')
-    const fee = Math.round(amountCents * PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_PCT)
-      + PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
+    await getBusinessConnectId(businessId)  // the business's share needs a payout account
+    const { businessTerminalCutCents } = await import('../services/heldPayouts')
+    const fee = businessTerminalCutCents(amountCents)
     // S536 (Nic): card_fees_paid_by toggle auto-applies to EVERY card
     // transaction — 'customer' adds the fee on top as a surcharge;
     // 'business' nets it out of the gross (default).
@@ -575,10 +599,9 @@ businessPosRouter.post('/terminal/charge', requireAuth, async (req, res, next) =
     const customerPays = biz?.card_fees_paid_by === 'customer'
     const chargeCents = customerPays ? amountCents + fee : amountCents
     const intent = await createBusinessCardPresentPaymentIntent({
-      businessConnectAccountId: connectId,
       businessId,
       amountCents: chargeCents,
-      platformCutCents: fee,
+      cardFeeCents: fee,
       description: 'POS sale',
     })
     await processBusinessPIOnReader({ stripeReaderId, paymentIntentId: intent.id })
@@ -587,17 +610,15 @@ businessPosRouter.post('/terminal/charge', requireAuth, async (req, res, next) =
 })
 
 // Poll: the reader prompts the customer asynchronously; the register
-// polls until requires_capture, then we capture — tap/swipe completes
-// the sale with no second workflow.
+// polls until the card is approved (requires_capture), then records the
+// sale — S648: recording the sale captures the card, in one step, so money
+// is never taken without a sale to pay the business for.
 businessPosRouter.get('/terminal/payment-intents/:id', requireAuth, async (req, res, next) => {
   try {
     const businessId = await requireUse(req)
-    const { retrieveBusinessPI, captureBusinessPI } = await import('../services/posTerminal')
-    let intent = await retrieveBusinessPI(req.params.id)
+    const { retrieveBusinessPI } = await import('../services/posTerminal')
+    const intent = await retrieveBusinessPI(req.params.id)
     if (intent.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
-    if (intent.status === 'requires_capture') {
-      intent = await captureBusinessPI(intent.id)
-    }
     res.json({ success: true, data: { id: intent.id, status: intent.status, amount: intent.amount } })
   } catch (e) { next(e) }
 })

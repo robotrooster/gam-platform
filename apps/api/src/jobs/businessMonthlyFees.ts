@@ -10,7 +10,8 @@
  * so a business whose Connect wasn't ready on the 1st gets collected
  * later without special-casing.
  *
- * Collection = Stripe ACCOUNT DEBIT: the platform charges the
+ * Collection (S648): netted out of money GAM holds for the business when
+ * there's enough; otherwise a Stripe ACCOUNT DEBIT: the platform charges the
  * business's Connect balance directly (source: connected account).
  * If the balance is short, Stripe lets it go negative and recovers
  * from future transfers — consistent with "all money flows through
@@ -22,6 +23,7 @@ import { PLATFORM_FEES } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { heldForBusiness, recordHeldItem } from '../services/heldPayouts'
 
 const TZ = 'America/Phoenix'
 
@@ -71,6 +73,27 @@ export async function processBusinessMonthlyFees(now: Date = new Date()): Promis
   const stripe = getStripe()
   for (const p of pending) {
     if (!p.connect || !p.ready) continue  // retried next run
+    // S648: the fee comes out of money GAM already holds for the business
+    // when there's enough (the S620 rule for landlords); a debit of their
+    // Stripe balance is only the fallback.
+    try {
+      if (await heldForBusiness(p.business_id) >= Number(p.amount)) {
+        const netted = await recordHeldItem({
+          businessId: p.business_id, sourceType: 'platform_fee', sourceId: `accrual:${p.id}`,
+          amount: -Number(p.amount), description: 'GAM invoicing fee',
+        })
+        if (netted) {
+          await query(
+            `UPDATE business_platform_fee_accruals
+                SET status='collected', stripe_charge_id='netted', collected_at=NOW()
+              WHERE id=$1 AND status='pending'`, [p.id])
+          result.collected++
+          continue
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, accrual_id: p.id }, '[business-fees] netting failed — trying the debit')
+    }
     try {
       const charge = await stripe.charges.create({
         amount:      Math.round(Number(p.amount) * 100),

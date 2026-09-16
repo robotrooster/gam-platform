@@ -300,8 +300,8 @@ interface BusinessReaderRow {
 
 // S536 rework: ALL money flows through GAM. Readers register on the
 // PLATFORM account (not the business's Connect), inside a per-business
-// Terminal Location built from the business address; charges are
-// platform destination charges. Friday payouts batch the balance out.
+// Terminal Location built from the business address. S648: charges are plain
+// platform charges, held for the business and paid in its weekly payout.
 async function getOrCreateBusinessLocation(businessId: string): Promise<string> {
   const biz = await queryOne<any>(
     `SELECT name, street1, street2, city, state, zip, stripe_terminal_location_id
@@ -375,11 +375,18 @@ export async function assertBusinessReader(businessId: string, stripeReaderId: s
   if (!row) throw new AppError(404, 'Reader not paired to this business')
 }
 
+/** Terminal SDK token for a business register, scoped to its reader location. */
+export async function createBusinessConnectionToken(businessId: string): Promise<string> {
+  const location = await getOrCreateBusinessLocation(businessId)
+  const token = await getStripe().terminal.connectionTokens.create({ location })
+  if (!token.secret) throw new AppError(500, 'Stripe returned a Connection Token with no secret')
+  return token.secret
+}
+
 export async function createBusinessCardPresentPaymentIntent(opts: {
-  businessConnectAccountId: string
   businessId:               string
   amountCents:              number
-  platformCutCents:      number
+  cardFeeCents:             number     // GAM's cut of this charge
   currency?:                string
   description?:             string
 }): Promise<Stripe.PaymentIntent> {
@@ -387,25 +394,21 @@ export async function createBusinessCardPresentPaymentIntent(opts: {
     throw new AppError(400, 'amountCents must be a positive integer')
   }
   const stripe = getStripe()
-  // Platform destination charge: GAM is the merchant, the gross (minus
-  // GAM's application fee) transfers to the business's Connect balance,
-  // and the Friday payout batch moves it to their bank.
-  return stripe.paymentIntents.create(
-    {
-      amount:                 opts.amountCents,
-      currency:               opts.currency ?? 'usd',
-      payment_method_types:   ['card_present'],
-      capture_method:         'manual',
-      application_fee_amount: Math.max(0, Math.round(opts.platformCutCents)),
-      transfer_data:          { destination: opts.businessConnectAccountId },
-      on_behalf_of:           opts.businessConnectAccountId,
-      description:            opts.description ?? 'POS sale',
-      metadata: {
-        gam_purpose:     'business_pos_terminal',
-        gam_business_id: opts.businessId,
-      },
+  // S648 (Nic): "every single cent" through GAM — a platform charge. When
+  // the sale is recorded GAM holds the total less its cut for the business,
+  // and the weekly payout sends it (services/heldPayouts.ts).
+  return stripe.paymentIntents.create({
+    amount:               opts.amountCents,
+    currency:             opts.currency ?? 'usd',
+    payment_method_types: ['card_present'],
+    capture_method:       'manual',
+    description:          opts.description ?? 'POS sale',
+    metadata: {
+      gam_purpose:        'business_pos_terminal',
+      gam_business_id:    opts.businessId,
+      gam_card_fee_cents: String(Math.max(0, Math.round(opts.cardFeeCents))),
     },
-  )
+  })
 }
 
 // Platform-account variants of the PI lifecycle (business terminal

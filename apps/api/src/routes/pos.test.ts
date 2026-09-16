@@ -319,8 +319,9 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(retrieveTerminalPaymentIntentMock).toHaveBeenCalledWith({ paymentIntentId: 'pi_terminal_xyz' })
     // S648: the money is GAM's until the weekly batch; the landlord is owed
     // the sale less the card fee.
-    expect(Number(res.body.data.payout_owed)).toBe(25)
-    expect(res.body.data.payout_intent_id).toBeNull()
+    const held = await db.query<any>(`SELECT amount, payout_intent_id FROM held_payout_items WHERE source_id = $1`, [res.body.data.id])
+    expect(Number(held.rows[0].amount)).toBe(25)
+    expect(held.rows[0].payout_intent_id).toBeNull()
   })
 
   it('S648: a card sale that didn\'t go through the reader is refused', async () => {

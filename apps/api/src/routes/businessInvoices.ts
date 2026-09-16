@@ -414,15 +414,9 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
       try {
         const { createInvoiceCheckoutSession } = await import('../services/stripeConnect')
         const appBase = process.env.MARKETING_URL || 'http://localhost:3004'
-        const { PLATFORM_FEES: BIZ_FEES } = await import('@gam/shared')
         const session = await createInvoiceCheckoutSession({
           amountCents: Math.round(due.amountDueNow * 100),
-          // S536 (Nic): all money flows through GAM — the platform fee
-          // covers Stripe's processing cost with margin (see shared
-          // PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_*). Pre-fix this was 0
-          // and GAM ate the processing cost on every hosted payment.
-          platformCutCents: Math.round((Math.round(due.amountDueNow * 100)) * BIZ_FEES.BUSINESS_INVOICE_APP_FEE_PCT) + BIZ_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS,
-          businessConnectAccountId: biz.stripe_connect_account_id,
+          // S648: GAM's cut is taken when the payment is recorded.
           invoiceNumber:            inv.invoice_number,
           customerEmail:            customer?.email ?? null,
           successUrl:               `${appBase}/invoice-paid?invoice=${inv.invoice_number}`,
@@ -577,9 +571,9 @@ businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) =
 
     const inv = await queryOne<{
       id: string; status: string; amount_paid: string; refunded_amount: string;
-      stripe_payment_intent_id: string | null;
+      stripe_payment_intent_id: string | null; invoice_number: string;
     }>(
-      `SELECT id, status, amount_paid, refunded_amount, stripe_payment_intent_id
+      `SELECT id, status, amount_paid, refunded_amount, stripe_payment_intent_id, invoice_number
          FROM business_invoices
         WHERE id = $1 AND business_id = $2`,
       [req.params.id, businessId])
@@ -619,6 +613,15 @@ businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) =
           metadata: { business_invoice_id: inv.id, business_id: businessId },
         })
         stripeRefundId = refund.refundId
+        // S648: the refund left GAM's balance, so it comes out of what GAM
+        // holds (or will hold) for the business.
+        if (refund.heldOnPlatform) {
+          const { recordHeldItem } = await import('../services/heldPayouts')
+          await recordHeldItem({
+            businessId, sourceType: 'refund', sourceId: refund.refundId,
+            amount: -amount, description: `Refund on invoice ${inv.invoice_number}`,
+          })
+        }
       } catch (e: any) {
         logger.error({ err: e, invoiceId: inv.id }, '[business-invoice] Stripe refund failed')
         throw new AppError(502, `Stripe could not process the refund: ${e?.message ?? 'unknown error'}. Nothing was changed.`)

@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { processingFeeFor } from '@gam/shared'
 
 let sessionN = 0
 vi.mock('../services/stripeConnect', async (orig) => {
@@ -84,6 +85,18 @@ describe('POST /book', () => {
     expect(Number(bk.rows[0].deposit_amount)).toBe(60) // 20% of 300
     expect(bk.rows[0].stripe_checkout_session_id).toMatch(/^cs_test_/)
     expect(bk.rows[0].hold_expires_at).not.toBeNull()
+  })
+
+  // S648 (Nic): deposits are card only with the card fee on top, charged by GAM.
+  it('the deposit checkout adds the card fee and pays nobody directly', async () => {
+    await seedSite()
+    const { createBookingDepositCheckoutSession } = await import('../services/stripeConnect')
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+    expect(res.body.data.cardFee).toBe(processingFeeFor({ amount: 60, paymentMethod: 'card' }))
+    const arg = (createBookingDepositCheckoutSession as any).mock.calls.at(-1)[0]
+    expect(arg.amountCents).toBe(6000)
+    expect(arg.cardFeeCents).toBe(Math.round(processingFeeFor({ amount: 60, paymentMethod: 'card' }) * 100))
+    expect(arg.landlordConnectAccountId).toBeUndefined()
   })
 
   it('no landlord Connect → 409 in production', async () => {
@@ -174,6 +187,20 @@ describe('deposit confirmation', () => {
     expect(bk.status).toBe('confirmed')
     expect(bk.deposit_paid_at).not.toBeNull()
     expect(bk.hold_expires_at).toBeNull()
+  })
+
+  it('S648: a paid deposit is held for the landlord, less the card fee, once', async () => {
+    const s = await seedSite()
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+    const id = res.body.data.bookingId
+    const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
+    const charged = Math.round((60 + processingFeeFor({ amount: 60, paymentMethod: 'card' })) * 100)
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_dep', amountTotalCents: charged })
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_dep', amountTotalCents: charged })
+    const held = (await db.query<any>(`SELECT amount FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(held).toEqual([{ amount: '60.00' }])
+    const bk = (await db.query<any>('SELECT stripe_payment_intent_id FROM unit_bookings WHERE id=$1', [id])).rows[0]
+    expect(bk.stripe_payment_intent_id).toBe('pi_dep')
   })
 })
 

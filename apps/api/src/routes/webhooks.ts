@@ -9,6 +9,9 @@ import {
 } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { confirmBookingDeposit } from '../services/propertyBooking'
+
+// S648: charges GAM takes for someone other than a tenant paying rent.
+const HELD_PURPOSES = new Set(['pos_terminal', 'pos_pay_link', 'booking_deposit', 'business_invoice', 'business_pos_terminal'])
 import { applyTenantSupersedence, type PostCommitTransfer } from '../services/supersedence'
 import { activateBillingForSettledRent } from '../services/billingActivation'
 import {
@@ -70,12 +73,11 @@ webhooksRouter.post('/stripe', async (req, res) => {
     case 'payment_intent.succeeded': {
       const pi = event.data.object as Stripe.PaymentIntent
 
-      // Register card sales (the counter reader, S242; pay links, S648) have
-      // no row in `payments`, so they stay out of the rent allocation path.
-      // Since S648 they're charged on GAM's account; the sale row itself
-      // (written by POST /pos/transactions or finalizePayLink) carries what
-      // the landlord is owed, and the weekly batch pays it.
-      if (pi.metadata?.gam_purpose === 'pos_terminal' || pi.metadata?.gam_purpose === 'pos_pay_link') {
+      // Non-rent charges (register sales, pay links, stay deposits, business
+      // invoices and register sales) have no row in `payments`, so they stay
+      // out of the rent allocation path. Since S648 all are GAM's charges; the
+      // flow that recorded each one also wrote what GAM holds for the payee.
+      if (HELD_PURPOSES.has(pi.metadata?.gam_purpose ?? '')) {
         // Logged for audit; the POS transaction row was already written
         // by POST /pos/transactions (which validates the PI before
         // insert). No further work to do here.
@@ -660,7 +662,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // by the operator at the POS — retry the swipe, try a different
       // card, or abandon the sale. No ledger row, no NACHA retry logic,
       // no notification. Skip.
-      if (pi.metadata?.gam_purpose === 'pos_terminal' || pi.metadata?.gam_purpose === 'pos_pay_link') break
+      if (HELD_PURPOSES.has(pi.metadata?.gam_purpose ?? '')) break
 
       // S537: a failed FIFO remittance is closed out; its covered rows
       // revert / retry through the standard by-PI NACHA logic below, and
@@ -1008,13 +1010,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
               WHERE stripe_payment_intent_id = $1 AND status = 'settled'
                 AND type IN ('rent', 'utility') LIMIT 1`, [piId]
           ) : null
-          // S648: a dispute on a register card sale is the landlord's to
-          // bear, like a rent chargeback.
-          const { handlePosSaleDispute } = await import('../services/posSaleReversal')
-          await handlePosSaleDispute({
+          // S648 (Nic): a chargeback on any non-rent charge GAM held (register
+          // sale, stay deposit, business invoice) is the payee's to bear —
+          // there's no customer to contact. Nets against their next payout.
+          const { recordChargeback } = await import('../services/heldPayouts')
+          await recordChargeback({
             paymentIntentId: piId, amountCents: dispute.amount ?? 0,
             feeCents: (dispute.balance_transactions ?? []).reduce((s, bt) => s + Math.abs(bt.fee ?? 0), 0),
-            stripeEventId: event.id, stripeDisputeId: dispute.id, rawEvent: event,
+            stripeDisputeId: dispute.id,
           })
           if (settledPay) {
             const disputeRow = await queryOne<{ id: string }>(
@@ -1219,14 +1222,26 @@ webhooksRouter.post('/stripe', async (req, res) => {
     // Sessions fire this when the customer finishes the hosted-pay
     // flow. We match on the session id we stored at send time, mark
     // the invoice paid, and stamp the PaymentIntent id for audit.
+    // S648: a bank payment completes checkout UNPAID and only clears days
+    // later (async_payment_succeeded). Nothing is marked paid — and nothing is
+    // held for a payee — until the money is actually in.
+    case 'checkout.session.async_payment_succeeded':
     case 'checkout.session.completed': {
       const session = event.data.object as Stripe.Checkout.Session
+      if (session.payment_status !== 'paid') {
+        logger.info({ session_id: session.id, payment_status: session.payment_status }, '[webhook] checkout not paid yet — waiting for the money')
+        break
+      }
       // S517: public property-booking deposit → confirm the held booking.
       if (session.metadata?.gam_purpose === 'booking_deposit') {
         const bookingId = session.metadata?.gam_booking_id ?? null
         if (bookingId) {
           try {
-            await confirmBookingDeposit(bookingId, session.id)
+            await confirmBookingDeposit(bookingId, session.id, {
+              paymentIntentId: typeof session.payment_intent === 'string'
+                ? session.payment_intent : session.payment_intent?.id ?? null,
+              amountTotalCents: session.amount_total,
+            })
             logger.info({ booking_id: bookingId, session_id: session.id }, '[webhook] booking deposit confirmed')
           } catch (e) {
             logger.error({ err: e, booking_id: bookingId }, '[webhook] booking deposit confirm failed')
@@ -1278,7 +1293,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
         // Idempotent ledger insert keyed by the Checkout Session id (Stripe
         // re-delivers events). On conflict we no-op so amount_paid (an additive
         // SUM) can't be double-credited. Insert only succeeds for a real invoice.
-        const ins = await query<{ id: string }>(
+        const ins = await query<{ id: string; business_id: string }>(
           `INSERT INTO business_invoice_payments
              (business_id, invoice_id, amount, kind, method,
               stripe_checkout_session_id, stripe_payment_intent_id)
@@ -1287,9 +1302,21 @@ webhooksRouter.post('/stripe', async (req, res) => {
             WHERE bi.id = $1
            ON CONFLICT (stripe_checkout_session_id)
              WHERE stripe_checkout_session_id IS NOT NULL DO NOTHING
-           RETURNING id`,
+           RETURNING id, business_id`,
           [invoiceId, amountPaid, paymentKind, session.id, piId],
         )
+        if (ins.length > 0) {
+          // S648: GAM holds the payment for the business, less GAM's cut,
+          // until their weekly payout.
+          const { recordHeldItem, businessInvoiceCutCents } = await import('../services/heldPayouts')
+          const cents = Math.round(amountPaid * 100)
+          await recordHeldItem({
+            businessId: ins[0].business_id,
+            sourceType: 'business_invoice_payment', sourceId: session.id,
+            amount: (cents - businessInvoiceCutCents(cents)) / 100,
+            description: `Invoice payment (${paymentKind})`,
+          })
+        }
         if (ins.length === 0) {
           // Already processed (re-delivery) or unknown invoice — no-op.
           logger.info({ session_id: session.id, invoice_id: invoiceId },

@@ -41,6 +41,7 @@ import { createPmCompanyTransfer } from './stripeConnect'
 import { netAgainstDisbursement, markBalance } from './landlordGamAccount'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
+import { lockHeldItems, stampHeldItems } from './heldPayouts'
 
 export interface PassthroughResult {
   attempted:        boolean
@@ -106,14 +107,6 @@ async function applyReversalNetting(
   return Math.round(totalNetted * 100) / 100
 }
 
-/**
- * S648 (Nic): register card sales — the counter reader and emailed/QR pay
- * links — are charged on GAM's account and paid out in this same batch.
- * A sale is held while it owes the landlord something and no batch has
- * carried it yet. Shared by the display twin and RESERVE so they can't drift.
- */
-const HELD_POS_SALE = `AND t.payout_owed > 0 AND t.payout_intent_id IS NULL`
-
 interface ReservedBatch {
   intentId:         string
   landlordId:       string
@@ -148,13 +141,13 @@ export async function heldOwnerShareForUser(landlordUserId: string): Promise<num
         AND p.platform_held = true
         AND p.status = 'settled'`,
     [landlordUserId])
-  const pos = await queryOne<{ owed_amount: string }>(
-    `SELECT COALESCE(SUM(t.payout_owed), 0)::numeric AS owed_amount
-       FROM pos_transactions t
-       JOIN landlords l ON l.id = t.landlord_id
-      WHERE l.user_id = $1 ${HELD_POS_SALE}`,
+  const held = await queryOne<{ owed_amount: string }>(
+    `SELECT COALESCE(SUM(h.amount), 0)::numeric AS owed_amount
+       FROM held_payout_items h
+       JOIN landlords l ON l.id = h.landlord_id
+      WHERE l.user_id = $1 AND h.payout_intent_id IS NULL`,
     [landlordUserId])
-  return Math.round((parseFloat(row?.owed_amount ?? '0') + parseFloat(pos?.owed_amount ?? '0')) * 100) / 100
+  return Math.round((parseFloat(row?.owed_amount ?? '0') + parseFloat(held?.owed_amount ?? '0')) * 100) / 100
 }
 
 /**
@@ -220,16 +213,11 @@ async function reservePlatformHeldBatch(
           FOR UPDATE OF ubl`,
       [landlordRow.landlord_id]
     )
-    const saleRows = await client.query<{ id: string; payout_owed: string }>(
-      `SELECT t.id, t.payout_owed::text AS payout_owed
-         FROM pos_transactions t
-        WHERE t.landlord_id = $1 ${HELD_POS_SALE}
-          FOR UPDATE`,
-      [landlordRow.landlord_id]
-    )
+    // S648: everything else GAM holds for this landlord — register sales, stay
+    // deposits, and the chargebacks/refunds that net against them.
+    const held = await lockHeldItems(client, { landlordId: landlordRow.landlord_id })
     const cents = (v: string) => Math.round(parseFloat(v) * 100)
-    const owedCents = shareRows.rows.reduce((a, r) => a + cents(r.amount), 0)
-      + saleRows.rows.reduce((a, r) => a + cents(r.payout_owed), 0)
+    const owedCents = shareRows.rows.reduce((a, r) => a + cents(r.amount), 0) + held.totalCents
     const owed = owedCents / 100
     if (owed <= 0) {
       await client.query('ROLLBACK')
@@ -297,11 +285,8 @@ async function reservePlatformHeldBatch(
       `UPDATE user_balance_ledger SET stripe_transfer_id = $1 WHERE id = ANY($2::uuid[])`,
       [sentinel, shareRows.rows.map(r => r.id)]
     )
-    // Claim the register sales this batch carries.
-    await client.query(
-      `UPDATE pos_transactions SET payout_intent_id = $1 WHERE id = ANY($2::uuid[])`,
-      [intentId, saleRows.rows.map(r => r.id)]
-    )
+    // Claim the held items this batch carries.
+    await stampHeldItems(client, held.ids, intentId)
     // S602 deposit-trust: NEVER pass a deposit through to the landlord on the
     // weekly batch. A tenant deposit is held by GAM in the segregated trust pool
     // (held_by='gam_escrow') and only leaves at move-out, when depositReturn
@@ -356,7 +341,7 @@ async function reservePlatformHeldBatch(
  */
 export async function executePlatformTransferIntent(intentId: string): Promise<string | null> {
   const intent = await queryOne<{
-    id: string; landlord_id: string; landlord_user_id: string
+    id: string; landlord_id: string | null; landlord_user_id: string | null; business_id: string | null
     destination_connect_account_id: string; amount: string
     netted_amount: string; status: string; attempts: number
   }>(`SELECT * FROM platform_transfer_intents WHERE id = $1`, [intentId])
@@ -381,11 +366,11 @@ export async function executePlatformTransferIntent(intentId: string): Promise<s
       metadata: {
         gam_kind:             'platform_held_passthrough',
         gam_intent_id:        intentId,
-        gam_landlord_id:      intent.landlord_id,
-        gam_landlord_user_id: intent.landlord_user_id,
+        ...(intent.landlord_id ? { gam_landlord_id: intent.landlord_id, gam_landlord_user_id: intent.landlord_user_id ?? '' } : {}),
+        ...(intent.business_id ? { gam_business_id: intent.business_id } : {}),
         ...(netted > 0 ? { gam_reversal_netted: String(netted) } : {}),
       },
-      description: 'Platform-held rent passthrough',
+      description: intent.business_id ? 'GAM weekly payout (business)' : 'Platform-held rent passthrough',
     })
     transferId = transfer.id
   } catch (e) {
@@ -404,7 +389,7 @@ export async function executePlatformTransferIntent(intentId: string): Promise<s
         category: 'platform_held_transfer_stuck',
         title:    `Platform-held passthrough transfer stuck after ${attempts} attempts (intent ${intentId})`,
         body:     e instanceof Error ? e.message : String(e),
-        context:  { intent_id: intentId, landlord_id: intent.landlord_id, landlord_user_id: intent.landlord_user_id, amount },
+        context:  { intent_id: intentId, landlord_id: intent.landlord_id, business_id: intent.business_id, landlord_user_id: intent.landlord_user_id, amount },
       })
     }
     logger.error({ err: e, intentId, attempts }, '[platform_held_passthrough] transfer failed (will retry)')

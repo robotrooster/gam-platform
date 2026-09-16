@@ -2,7 +2,17 @@
  * S497 — business-portal POS register coverage.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+const { piState, captureMock } = vi.hoisted(() => ({
+  piState: { pi: null as any },
+  captureMock: vi.fn(async (id: string) => ({ id, status: 'succeeded' })),
+}))
+vi.mock('../services/posTerminal', async (orig) => ({
+  ...(await orig() as any),
+  retrieveBusinessPI: vi.fn(async () => piState.pi),
+  captureBusinessPI: captureMock,
+}))
 import express from 'express'
 import request from 'supertest'
 import bcrypt from 'bcryptjs'
@@ -24,6 +34,7 @@ function buildApp() {
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_s497'
+  captureMock.mockClear()
 })
 
 interface Fixture {
@@ -139,19 +150,45 @@ describe('POST /transactions', () => {
     expect(adj[0]!.reference_type).toBe('pos_transaction')
   })
 
-  it('card_recorded: no tendered required; change_due null', async () => {
+  // S648 (Nic): every card goes through GAM's reader.
+  it('an outside-card sale is refused', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({
-        paymentMethod: 'card_recorded',
-        lines: [{ itemId: f.itemA, quantity: 1 }],
-      })
+      .send({ paymentMethod: 'card_recorded', lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(400)
+    const { rows } = await db.query(`SELECT 1 FROM business_pos_transactions WHERE business_id = $1`, [f.businessId])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('a reader sale is captured with the sale and held for the business, less GAM\'s cut', async () => {
+    const f = await seedFixture({ itemAPrice: 10, itemATax: 0 })
+    piState.pi = { id: 'pi_biz', status: 'requires_capture', amount: 1000,
+      metadata: { gam_business_id: f.businessId } }
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'stripe_terminal', stripePaymentIntentId: 'pi_biz', lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(201)
-    expect(res.body.data.payment_method).toBe('card_recorded')
-    expect(res.body.data.change_due).toBeNull()
-    expect(res.body.data.amount_tendered).toBeNull()
+    expect(captureMock).toHaveBeenCalledWith('pi_biz')
+    const { rows } = await db.query<any>(`SELECT amount FROM held_payout_items WHERE business_id = $1`, [f.businessId])
+    // $10 sale, business pays the fee: 2.9% + 10¢ = 39¢ → $9.61 held
+    expect(Number(rows[0].amount)).toBe(9.61)
+  })
+
+  it('a reader sale whose capture fails records nothing', async () => {
+    const f = await seedFixture({ itemAPrice: 10, itemATax: 0 })
+    piState.pi = { id: 'pi_nocap', status: 'requires_capture', amount: 1000,
+      metadata: { gam_business_id: f.businessId } }
+    captureMock.mockRejectedValueOnce(new Error('authorization expired'))
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'stripe_terminal', stripePaymentIntentId: 'pi_nocap', lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(500)
+    expect((await db.query(`SELECT 1 FROM business_pos_transactions WHERE business_id = $1`, [f.businessId])).rows).toHaveLength(0)
+    expect((await db.query(`SELECT 1 FROM held_payout_items WHERE business_id = $1`, [f.businessId])).rows).toHaveLength(0)
   })
 
   it('multi-line: totals across two items', async () => {
@@ -160,7 +197,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [
           { itemId: f.itemA, quantity: 2 },  // 2.00
           { itemId: f.itemB, quantity: 1 },  // 2.50 + 0.21875 ≈ 2.72
@@ -177,7 +214,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [{ itemId: f.itemA, quantity: 5 }],
       })
     expect(res.status).toBe(400)
@@ -197,7 +234,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [
           { itemId: f.itemA, quantity: 5 },   // ok
           { itemId: f.itemB, quantity: 99 },  // fails
@@ -249,7 +286,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${a.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [{ itemId: b.itemA, quantity: 1 }],
       })
     expect(res.status).toBe(404)
@@ -262,7 +299,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${a.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         customerId: b.customerId,
         lines: [{ itemId: a.itemA, quantity: 1 }],
       })
@@ -278,7 +315,7 @@ describe('POST /transactions', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [{ itemId: f.itemA, quantity: 1 }],
       })
     expect(res.status).toBe(400)
@@ -290,12 +327,12 @@ describe('POST /transactions', () => {
     const r1 = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     const r2 = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(r1.body.data.receipt_number).toBe('TXN-000001')
     expect(r2.body.data.receipt_number).toBe('TXN-000002')
@@ -306,7 +343,7 @@ describe('POST /transactions', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', lines: [] })
+      .send({ paymentMethod: 'cash', amountTendered: 100000, lines: [] })
     expect(res.status).toBe(400)
   })
 })
@@ -325,7 +362,7 @@ describe('Tax exemption (S506)', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         customerId: f.customerId,
         lines: [{ itemId: f.itemA, quantity: 1 }],
       })
@@ -340,7 +377,7 @@ describe('Tax exemption (S506)', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         customerId: f.customerId,
         lines: [{ itemId: f.itemA, quantity: 1 }],
       })
@@ -353,7 +390,7 @@ describe('Tax exemption (S506)', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [{ itemId: f.itemA, quantity: 1 }],
       })
     expect(Number(res.body.data.tax_amount)).toBeCloseTo(10)
@@ -371,7 +408,7 @@ describe('Tips (S512)', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         tipAmount: 2.50,
         lines: [{ itemId: f.itemA, quantity: 1 }],  // sale = 10.00
       })
@@ -418,7 +455,7 @@ describe('Tips (S512)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(201)
     expect(Number(res.body.data.tip_amount)).toBe(0)
@@ -429,7 +466,7 @@ describe('Tips (S512)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', tipAmount: -1,
+      .send({ paymentMethod: 'cash', amountTendered: 100000, tipAmount: -1,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(400)
   })
@@ -456,7 +493,7 @@ describe('Discounts (S513)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', discountCode: 'save',
+      .send({ paymentMethod: 'cash', amountTendered: 100000, discountCode: 'save',
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(201)
     expect(Number(res.body.data.subtotal)).toBeCloseTo(10.00)       // full price
@@ -475,7 +512,7 @@ describe('Discounts (S513)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', discountCode: 'BIG',
+      .send({ paymentMethod: 'cash', amountTendered: 100000, discountCode: 'BIG',
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(201)
     expect(Number(res.body.data.discount_amount)).toBeCloseTo(10.00)
@@ -487,7 +524,7 @@ describe('Discounts (S513)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', discountCode: 'NOPE',
+      .send({ paymentMethod: 'cash', amountTendered: 100000, discountCode: 'NOPE',
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(404)
     const { rows } = await db.query(
@@ -502,7 +539,7 @@ describe('Discounts (S513)', () => {
     const res = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', discountCode: 'ONCE',
+      .send({ paymentMethod: 'cash', amountTendered: 100000, discountCode: 'ONCE',
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     expect(res.status).toBe(409)
   })
@@ -518,13 +555,13 @@ describe('GET /transactions', () => {
     await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               customerId: f.customerId,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     const res = await request(buildApp())
       .get('/api/business-pos/transactions')
@@ -541,12 +578,12 @@ describe('GET /transactions', () => {
     await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${a.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: a.itemA, quantity: 1 }] })
     await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${b.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: b.itemA, quantity: 1 }] })
     const res = await request(buildApp())
       .get('/api/business-pos/transactions')
@@ -565,7 +602,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 4 }] })
     // After sale: stock 6
     const { rows: [mid] } = await db.query<{ stock_qty: number }>(
@@ -600,7 +637,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 4 }] })  // stock 10→6, total 40
     const lineId = sale.body.data.lines[0].id
     const res = await request(buildApp())
@@ -622,7 +659,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', lines: [{ itemId: f.itemA, quantity: 4 }] })
+      .send({ paymentMethod: 'cash', amountTendered: 100000, lines: [{ itemId: f.itemA, quantity: 4 }] })
     const lineId = sale.body.data.lines[0].id
     await request(buildApp())
       .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
@@ -642,7 +679,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', lines: [{ itemId: f.itemA, quantity: 2 }] })
+      .send({ paymentMethod: 'cash', amountTendered: 100000, lines: [{ itemId: f.itemA, quantity: 2 }] })
     const lineId = sale.body.data.lines[0].id
     const res = await request(buildApp())
       .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
@@ -659,7 +696,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded', discountCode: 'HALF',
+      .send({ paymentMethod: 'cash', amountTendered: 100000, discountCode: 'HALF',
               lines: [{ itemId: f.itemA, quantity: 2 }] })  // list 20, discounted total 10
     expect(Number(sale.body.data.total_amount)).toBeCloseTo(10)
     const res = await request(buildApp())
@@ -675,7 +712,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     await request(buildApp())
       .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
@@ -693,7 +730,7 @@ describe('POST /:id/refund', () => {
     const sale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: f.itemA, quantity: 1 }] })
     const res = await request(buildApp())
       .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
@@ -708,7 +745,7 @@ describe('POST /:id/refund', () => {
     const bsale = await request(buildApp())
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${b.ownerToken}`)
-      .send({ paymentMethod: 'card_recorded',
+      .send({ paymentMethod: 'cash', amountTendered: 100000,
               lines: [{ itemId: b.itemA, quantity: 1 }] })
     const res = await request(buildApp())
       .post(`/api/business-pos/transactions/${bsale.body.data.id}/refund`)
@@ -729,7 +766,7 @@ describe('GET /:id', () => {
       .post('/api/business-pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({
-        paymentMethod: 'card_recorded',
+        paymentMethod: 'cash', amountTendered: 100000,
         lines: [
           { itemId: f.itemA, quantity: 1 },
           { itemId: f.itemB, quantity: 2 },

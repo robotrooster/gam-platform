@@ -46,6 +46,7 @@ import { query } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { createAdminNotification } from '../services/adminNotifications'
 import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
+import { reconcileBusinessHeldFunds } from '../services/heldPayouts'
 import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
 import {
   dueTriggers, markTriggerFired,
@@ -404,9 +405,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
         AND connect_payouts_enabled    = TRUE
         AND connect_details_submitted  = TRUE`
   )
-  // S536 (Nic): business owners batch Friday the same way landlords do —
-  // all money flows through GAM (POS + invoice destination charges land
-  // on the business's Connect balance; this sweep moves it to their bank).
+  // S536 (Nic): business owners batch the same way landlords do. S648: their
+  // money is held on GAM's balance and moved to their account in this run.
   const bizRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
     `SELECT id AS entity_id, stripe_connect_account_id
        FROM businesses
@@ -543,9 +543,15 @@ async function processOneCandidate(
   //     below sweeps it to the bank in the same run. Self-gating: no-ops for
   //     non-landlord users (opt-in managers) and when nothing is owed. Only
   //     user candidates can be landlords; PM-company + business money already
-  //     lands on their own Connect at allocation/charge time.
+  //     lands on their own Connect at allocation/charge time. (S648: business
+  //     money is held on the platform now — reconciled just below.)
   if (cand.kind === 'user') {
     await reconcilePlatformHeldPayments(cand.entity_id)
+  }
+  // S648: business money is held on the platform too (invoices, register
+  // sales); move what GAM owes the business to its account first.
+  if (cand.kind === 'business') {
+    await reconcileBusinessHeldFunds(cand.entity_id)
   }
 
   // 1c. S580: collect any owed instant-withdrawal margin Connect→platform BEFORE

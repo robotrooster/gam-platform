@@ -14,7 +14,7 @@
 
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT } from '@gam/shared'
+import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor } from '@gam/shared'
 
 export interface PropertyRow {
   id: string
@@ -239,6 +239,8 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
     tax: monthlyBilling ? 0 : price.tax,
     taxable: monthlyBilling ? false : price.taxable,
     total, depositPct, depositAmount,
+    // S648 (Nic): deposits are card only, with the card fee on top.
+    depositCardFee: depositAmount == null ? null : processingFeeFor({ amount: depositAmount, paymentMethod: 'card' }),
     // Present only on monthly-tier stays: the calendar-aligned invoice plan.
     monthlyBilling: monthlyBilling
       ? { monthlyRate: Number(rates.monthly), segments: monthlyBilling.segments }

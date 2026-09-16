@@ -103,15 +103,9 @@ export async function sendGeneratedInvoice(
     try {
       const { createInvoiceCheckoutSession } = await import('./stripeConnect')
       const appBase = process.env.MARKETING_URL || 'http://localhost:3004'
-      const { PLATFORM_FEES: BIZ_FEES } = await import('@gam/shared')
       const session = await createInvoiceCheckoutSession({
         amountCents: Math.round(Number(inv.total_amount) * 100),
-        // S536 (Nic): all money flows through GAM — the platform fee
-        // covers Stripe's processing cost with margin (see shared
-        // PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_*). Pre-fix this was 0
-        // and GAM ate the processing cost on every hosted payment.
-        platformCutCents: Math.round((Math.round(Number(inv.total_amount) * 100)) * BIZ_FEES.BUSINESS_INVOICE_APP_FEE_PCT) + BIZ_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS,
-        businessConnectAccountId: biz.stripe_connect_account_id,
+        // S648: GAM's cut is taken when the payment is recorded.
         invoiceNumber:            inv.invoice_number,
         customerEmail:            customer?.email ?? null,
         successUrl:               `${appBase}/invoice-paid?invoice=${inv.invoice_number}`,
@@ -188,9 +182,7 @@ async function tryOffSessionCharge(args: OffSessionArgs): Promise<boolean> {
       payment_method: args.paymentMethodId,
       off_session:    true,
       confirm:        true,
-      transfer_data: {
-        destination: args.businessConnectAccountId,
-      },
+      // S648: GAM's charge — held for the business, paid in their weekly payout.
       metadata: {
         gam_purpose:         'business_invoice',
         business_invoice_id: args.invoiceId,
@@ -215,6 +207,12 @@ async function tryOffSessionCharge(args: OffSessionArgs): Promise<boolean> {
                 auto_charge_last_error   = NULL
           WHERE id = $3`,
         [args.amountCents / 100, pi.id, args.invoiceId])
+      const { recordHeldItem, businessInvoiceCutCents } = await import('./heldPayouts')
+      await recordHeldItem({
+        businessId: args.businessId, sourceType: 'business_invoice_payment', sourceId: pi.id,
+        amount: (args.amountCents - businessInvoiceCutCents(args.amountCents)) / 100,
+        description: 'Invoice auto-charge',
+      })
       logger.info({ invoiceId: args.invoiceId, pi: pi.id },
         '[S508] off-session auto-charge succeeded')
       return true

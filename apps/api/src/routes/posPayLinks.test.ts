@@ -145,8 +145,8 @@ describe('when it is paid', () => {
     expect(Number(tx[0].total)).toBe(charged)
     expect(Number(tx[0].surcharge)).toBe(fee)
     // The landlord is owed the link total, paid in the weekly batch.
-    expect(Number(tx[0].payout_owed)).toBe(20)
-    expect(tx[0].payout_intent_id).toBeNull()
+    const held = (await db.query(`SELECT amount FROM held_payout_items WHERE source_id = $1`, [tx[0].id])).rows
+    expect(Number(held[0].amount)).toBe(20)
     const l = (await db.query(`SELECT status FROM pos_pay_links WHERE id = $1`, [link.id])).rows[0]
     expect(l.status).toBe('paid')
   })
