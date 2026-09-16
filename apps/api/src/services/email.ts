@@ -1488,6 +1488,43 @@ export async function emailFlexsuiteEnrollment(args: {
  * email still goes out — invoice + amount + due date — but without a
  * pay-now button (operator collects via cash/check/external rails).
  */
+/**
+ * S648 — a register pay link: a charge from the property for someone not on a
+ * lease (a stay, propane, a repair). The card fee is shown up front, not
+ * discovered on the card page.
+ */
+export async function emailPayLink(args: {
+  to: string
+  name: string | null
+  propertyName: string
+  label: string
+  amount: number
+  cardFee: number
+  url: string
+  ctx?: { landlordId?: string; payLinkId?: string }
+}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  await send(args.to,
+    `${args.propertyName} — ${args.label}: ${money(args.amount)}`,
+    base(
+      h(`Payment for ${args.propertyName}`) +
+      p(`${args.name ? `Hi ${args.name}, ` : ''}${args.propertyName} sent you a charge to pay by card.`) +
+      p(`<strong style="color:#eef1f8">${args.label}:</strong> ${money(args.amount)}<br>` +
+        `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` +
+        `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
+      btn('Pay by card', args.url) +
+      p('The link works for 14 days. To pay another way, contact the office.')
+    ),
+    {
+      category: 'pos_pay_link',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'pos_pay_link',
+      relatedEntityId: args.ctx?.payLinkId ?? null,
+    },
+    'support',
+  )
+}
+
 export async function emailBusinessInvoiceSent(args: {
   to: string
   businessName: string

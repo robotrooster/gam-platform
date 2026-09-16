@@ -1,4 +1,6 @@
 import { Router } from 'express'
+import { insertPosSale } from '../services/posSale'
+import { processingFeeFor } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -457,6 +459,32 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
 // on stripe_payment_intent_id WHERE NOT NULL — a frontend retry after
 // successful capture but before this POST returned would otherwise
 // double-write; the 23505 catch turns it into a clean 409).
+/**
+ * S648 (Nic, DIRECTIVE): "any bank card, whether it's in person or at point of
+ * sale or they do it on their link that they get emailed, those all get charged
+ * the pass-through." The fee a sale carries is decided HERE, from the tender —
+ * a card pays the card fee (PROCESSING_FEES), a FlexCharge sale its 1% — never
+ * taken from the client. Everything else carries none.
+ */
+async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
+                                discountAmount: number | undefined, clientSurcharge?: number) {
+  const lines = (items || [])
+    .filter((it: any) => !!it.id)
+    .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
+  const tax = await calculateCartTax(landlordId, lines)
+  const base = aggregateCartTotals(tax, items, { surcharge: 0, discountAmount })
+  let surcharge = 0
+  if (paymentMethod === 'card') {
+    surcharge = processingFeeFor({ amount: base.total, paymentMethod: 'card' })
+  } else if (paymentMethod === 'charge') {
+    surcharge = Math.round((base.subtotal - base.discount) * 100) / 100 * 0.01
+  } else if (paymentMethod == null) {
+    surcharge = Number(clientSurcharge) || 0   // pre-S648 callers only
+  }
+  surcharge = Math.round(surcharge * 100) / 100
+  return { ...base, surcharge, total: Math.round((base.total + surcharge) * 100) / 100 }
+}
+
 // POST /api/pos/cart-quote — S554: authoritative cart total the client mints
 // the terminal PaymentIntent against. Uses the SAME computeCartTotals as
 // /transactions, so the minted PI amount always equals the recomputed
@@ -464,13 +492,13 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
 // a pos_tax_rates row differs from an item's own tax_rate). Read-only.
 posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, surcharge, discountAmount } = req.body
+    const { items, surcharge, discountAmount, paymentMethod } = req.body
     if (!Array.isArray(items)) throw new AppError(400, 'items array required')
     for (const it of items) {
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
-    const totals = await computeCartTotals(posLandlordId(req), items, { surcharge, discountAmount })
+    const totals = await serverCartTotals(posLandlordId(req), items, paymentMethod, discountAmount, surcharge)
     res.json({ success: true, data: totals })
   } catch (e) { next(e) }
 })
@@ -551,16 +579,13 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // falling back to item.tax_rate) + the pure aggregateCartTotals that the
     // POST /pos/cart-quote endpoint ALSO runs, so the terminal PI the client
     // minted (against the quote) always equals this recomputed total.
-    const cartLines = items
-      .filter((it: any) => !!it.id)
-      .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
-    const tax = await calculateCartTax(posLandlordId(req), cartLines)
+    // S648: the fee is the server's (serverCartTotals), whatever the client sent.
     const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total } =
-      aggregateCartTotals(tax, items, { surcharge, discountAmount })
+      await serverCartTotals(posLandlordId(req), items, paymentMethod ?? 'cash', discountAmount)
 
     // FlexCharge platform fee is 1% of what the customer is actually charged
-    // (net of discount), matching the surcharge the client computed.
-    const platformFee = paymentMethod === 'charge' ? Math.round((subtotal - discountAmt) * 100) / 100 * 0.01 : 0
+    // (net of discount). A card sale's card fee is GAM's, taken on the charge.
+    const platformFee = paymentMethod === 'charge' || paymentMethod === 'card' ? surchargeAmt : 0
 
     // S242: terminal-captured card sales pass a stripePaymentIntentId
     // (capture path from /terminal/payment-intents/:id/capture). Verify
@@ -609,13 +634,16 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
 
       let tx: any
       try {
-        const txRes = await client.query(`INSERT INTO pos_transactions
-          (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-          [posLandlordId(req), tenantId||null, posCustomerId||null, req.user!.userId,
-           paymentMethod, subtotal, taxAmount, surchargeAmt, total, changeGiven||0, platformFee,
-           stripePaymentIntentId || null, propertyId || null, discountAmt, discountReason || null])
-        tx = txRes.rows[0]
+        // S648: the writes live in services/posSale so a paid pay link records
+        // a sale exactly the way the counter does.
+        const sale = await insertPosSale(client, {
+          landlordId: posLandlordId(req), propertyId: propertyId || null, cashierId: req.user!.userId,
+          paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
+          changeGiven, platformFee, stripePaymentIntentId, discountAmount: discountAmt, discountReason,
+          items,
+        })
+        tx = sale.tx
+        inventoryNeedsPO.push(...sale.needsPO)
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
         // recorded a transaction. Retry-safe: ROLLBACK the (empty) txn,
@@ -631,44 +659,6 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           return res.status(200).json({ success: true, data: existing, message: 'Transaction already recorded for this payment intent' })
         }
         throw e
-      }
-
-      // Insert line items and decrement stock.
-      // S70: scope the item lookup to the calling landlord — pre-S70 a
-      // landlord could submit a transaction referencing another landlord's
-      // pos_items UUID and decrement their stock. The walk-up cash flow
-      // already only looks up items the landlord owns (catalog query is
-      // landlord-scoped), but the transaction POST didn't enforce.
-      for (const item of items) {
-        const dbItem = item.id
-          ? await client.query<any>(
-              'SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2',
-              [item.id, posLandlordId(req)],
-            ).then(r => r.rows[0] ?? null)
-          : null
-
-        await client.query(`INSERT INTO pos_transaction_items
-          (transaction_id,item_id,item_name,item_category,qty,unit_price,cost_price,tax_rate,subtotal)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-          [tx.id, item.id||null, item.name, item.cat||item.category||'misc',
-           item.qty, item.price, dbItem?.cost_price||0, item.tax||item.tax_rate||0,
-           item.price * item.qty])
-
-        // Decrement stock if tracked (not 999)
-        if (dbItem && dbItem.stock_qty < 999) {
-          const newQty = Math.max(0, dbItem.stock_qty - item.qty)
-          await client.query('UPDATE pos_items SET stock_qty=$1, updated_at=NOW() WHERE id=$2', [newQty, dbItem.id])
-          await client.query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,reference_id,stock_before,stock_after)
-            VALUES ($1,$2,$3,'sale',$4,$5,$6)`,
-            [dbItem.id, posLandlordId(req), -item.qty, tx.id, dbItem.stock_qty, newQty])
-
-          // Queue auto-PO for post-commit. dbItem snapshot here uses
-          // the pre-decrement stock_qty, matching the original pre-S341
-          // semantics at line 495 (reorderQty = stock_max - stock_qty).
-          if (newQty <= dbItem.stock_min && dbItem.vendor_id) {
-            inventoryNeedsPO.push(dbItem)
-          }
-        }
       }
 
       // S254: post the FlexCharge transaction record. Has its own row-lock
@@ -1731,11 +1721,15 @@ function assertReaderBelongsToLandlord(landlordId: string, stripeReaderId: strin
 // description?, posDraftRef? }.
 posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { amountCents, propertyId, description, posDraftRef } = req.body
-    if (!Number.isInteger(amountCents) || amountCents <= 0) {
-      throw new AppError(400, 'amountCents must be a positive integer')
-    }
+    const { propertyId, description, posDraftRef, items, discountAmount } = req.body
     if (!propertyId) throw new AppError(400, 'propertyId is required')
+    // S648 (Nic): the card reader charges the cart PLUS the card fee, and the
+    // amount is the server's, computed from the cart — not a number the
+    // register sends.
+    if (!Array.isArray(items) || items.length === 0) throw new AppError(400, 'items are required')
+    const quoted = await serverCartTotals(posLandlordId(req), items, 'card', discountAmount)
+    const amountCents = Math.round(quoted.total * 100)
+    if (amountCents <= 0) throw new AppError(400, 'Nothing to charge')
 
     // Validate property belongs to this landlord. Same posture as the
     // reader-registration route — prevents a cashier on landlord A from
@@ -1753,12 +1747,14 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
       landlordId:               posLandlordId(req),
       propertyId,
       amountCents,
+      platformCutCents: Math.round(quoted.surcharge * 100),
       description,
       posDraftRef,
     })
     res.status(201).json({
       success: true,
-      data: { id: intent.id, status: intent.status, clientSecret: intent.client_secret },
+      data: { id: intent.id, status: intent.status, clientSecret: intent.client_secret,
+              total: quoted.total, cardFee: quoted.surcharge },
     })
   } catch (e) { next(e) }
 })

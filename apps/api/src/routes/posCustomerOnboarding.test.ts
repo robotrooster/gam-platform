@@ -12,7 +12,7 @@
  * verifies token state machine + Stripe call shape + DB writes.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 vi.mock('stripe', () => {
   const customersCreate = vi.fn(async (args: any) => ({
@@ -61,6 +61,13 @@ const stripeMocks = (Stripe as any).__mocks as {
   setupIntentsCreate:   ReturnType<typeof vi.fn>
   setupIntentsRetrieve: ReturnType<typeof vi.fn>
 }
+
+// S648: the SDK is mocked, but getStripe() refuses a LIVE key under test
+// (S639) before the mock is ever reached — so this file only passed when an
+// earlier file in the same worker had left a test key behind. Pin one here.
+const realStripeKey = process.env.STRIPE_SECRET_KEY
+beforeEach(() => { process.env.STRIPE_SECRET_KEY = 'sk_test_mock_pos_onboarding' })
+afterEach(() => { process.env.STRIPE_SECRET_KEY = realStripeKey })
 
 beforeEach(async () => {
   await cleanupAllSchema()

@@ -21,6 +21,9 @@ import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
+import { processingFeeFor } from '@gam/shared'
+// S648 (Nic): every card sale carries the card fee, priced by the server.
+const withCardFee = (net: number) => Math.round((net + processingFeeFor({ amount: net, paymentMethod: 'card' })) * 100)
 import { db } from '../db'
 import {
   cleanupAllSchema,
@@ -297,7 +300,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }],
     })
     retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
-      id: 'pi_terminal_xyz', status: 'succeeded', amount: 2500,
+      id: 'pi_terminal_xyz', status: 'succeeded', amount: withCardFee(25),
       metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
 
@@ -332,7 +335,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }],
     })
     retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
-      id: 'pi_disc', status: 'succeeded', amount: 2000,
+      id: 'pi_disc', status: 'succeeded', amount: withCardFee(20),
       metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
 
@@ -351,7 +354,8 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(Number(res.body.data.subtotal)).toBe(25)          // gross for books
     expect(Number(res.body.data.discount_amount)).toBe(5)
     expect(res.body.data.discount_reason).toBe('Loyalty')
-    expect(Number(res.body.data.total)).toBe(20)             // net
+    expect(Math.round(Number(res.body.data.total) * 100)).toBe(withCardFee(20))  // net + card fee
+    expect(Number(res.body.data.surcharge)).toBe(processingFeeFor({ amount: 20, paymentMethod: 'card' }))
   })
 
   it('S554 bug #2: discount is clamped to [0, subtotal] (cannot invert a sale)', async () => {
@@ -515,14 +519,16 @@ describe('POST /api/pos/transactions — FlexCharge gate (S254)', () => {
 
     expect(res.status).toBe(201)
     expect(res.body.data.payment_method).toBe('charge')
-    // platform_fee = subtotal * 0.01 = 0.50
+    // platform_fee = subtotal * 0.01 = 0.50, added to what the customer is
+    // charged (S648: the server sets it, as the register always displayed).
     expect(Number(res.body.data.platform_fee)).toBe(0.5)
+    expect(Number(res.body.data.total)).toBe(50.5)
     // FlexCharge post called with the new pos_transaction id
     expect(postFlexChargeTransactionMock).toHaveBeenCalledTimes(1)
     const arg = (postFlexChargeTransactionMock.mock.calls as any[][])[0]![0] as any
     expect(arg.accountId).toBe('acc_fc_1')
     expect(arg.posTransactionId).toBe(res.body.data.id)
-    expect(arg.amount).toBe(50)
+    expect(arg.amount).toBe(50.5)
   })
 
   it('propertyId required on every sale → 400 (W-12; generic guard now fires before the FlexCharge one)', async () => {
@@ -720,7 +726,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       lines: [{ itemId, lineSubtotal: 20, lineTax: 0 }],
     })
     retrieveTerminalPaymentIntentMock.mockResolvedValue({
-      id: 'pi_dup', status: 'succeeded', amount: 2000,
+      id: 'pi_dup', status: 'succeeded', amount: withCardFee(20),
       metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
     const body = {
@@ -781,7 +787,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }],
     })
     retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
-      id: 'pi_wrong_amt', status: 'succeeded', amount: 999,  // expected 1000
+      id: 'pi_wrong_amt', status: 'succeeded', amount: 999,  // expected 10 + card fee
       metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
     })
     const res = await request(buildApp())
@@ -794,7 +800,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
         stripePaymentIntentId: 'pi_wrong_amt',
       })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/amount 999.*does not match.*1000/i)
+    expect(res.body.error).toMatch(new RegExp(`amount 999.*does not match.*${withCardFee(10)}`, 'i'))
   })
 
   it('terminal PI metadata gam_purpose != pos_terminal → 400', async () => {
@@ -1914,14 +1920,15 @@ describe('DELETE /api/pos/terminal/readers/:id', () => {
 })
 
 describe('POST /api/pos/terminal/payment-intents', () => {
-  it('rejects non-positive amountCents → 400', async () => {
+  // S648 (Nic): the reader charges the cart plus the card fee, priced by the
+  // server from the cart — the register no longer sends an amount.
+  it('refuses a charge with no cart', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ amountCents: 0, propertyId: f.propertyId })
+      .send({ amountCents: 1500, propertyId: f.propertyId })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/positive integer/i)
     expect(createCardPresentPaymentIntentMock).not.toHaveBeenCalled()
   })
 
@@ -1937,27 +1944,30 @@ describe('POST /api/pos/terminal/payment-intents', () => {
       })
       await otherClient.query('COMMIT')
     } finally { otherClient.release() }
-
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 0, taxAmount: 0, lines: [] })
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ amountCents: 1000, propertyId: otherPropertyId })
+      .send({ items: [{ id: null, name: 'Coffee', qty: 1, price: 10 }], propertyId: otherPropertyId })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/does not belong to this landlord/i)
     expect(createCardPresentPaymentIntentMock).not.toHaveBeenCalled()
   })
 
-  it('happy: returns id + status + clientSecret', async () => {
+  it('charges the cart plus the card fee, and the fee is GAM\'s', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 0, taxAmount: 0, lines: [] })
     const res = await request(buildApp())
       .post('/api/pos/terminal/payment-intents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ amountCents: 1500, propertyId: f.propertyId, description: 'Coffee + bagel' })
+      .send({ items: [{ id: null, name: 'Coffee + bagel', qty: 1, price: 15 }], propertyId: f.propertyId, description: 'Coffee + bagel' })
     expect(res.status).toBe(201)
     expect(res.body.data.id).toBe('pi_card_mock')
     expect(res.body.data.clientSecret).toBe('pi_card_mock_secret')
     const arg = (createCardPresentPaymentIntentMock.mock.calls as any[][])[0]![0] as any
-    expect(arg.amountCents).toBe(1500)
+    const fee = processingFeeFor({ amount: 15, paymentMethod: 'card' })
+    expect(arg.amountCents).toBe(withCardFee(15))
+    expect(arg.platformCutCents).toBe(Math.round(fee * 100))
     expect(arg.landlordId).toBe(f.landlordId)
     expect(arg.description).toBe('Coffee + bagel')
   })

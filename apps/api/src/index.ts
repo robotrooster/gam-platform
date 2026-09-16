@@ -93,6 +93,7 @@ import { workTradeRouter }    from './routes/workTrade'
 // S624: "I paid at the bank" — tenant-declared deposits, matched against the feed.
 import { declaredDepositsRouter } from './routes/declaredDeposits'
 import { posRouter }          from './routes/pos'
+import { posPayLinksRouter, publicPayRouter } from './routes/posPayLinks'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
@@ -365,6 +366,7 @@ app.use('/api/business-recurring-invoices', businessRecurringInvoicesRouter)
 app.use('/api/business-bookable-services', businessBookableServicesRouter)
 app.use('/api/public', publicBookingRouter)
 app.use('/api/public', publicPropertyBookingRouter)
+app.use('/api/public', publicPayRouter)
 app.use('/api/business-attachments', businessAttachmentsRouter)
 app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
@@ -414,6 +416,7 @@ app.use('/api/portfolio',     portfolioRouter)  // S592: PM-scoped surface (allo
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/declared-deposits', declaredDepositsRouter)
 app.use('/api/stripe',        stripeRouter)
+app.use('/api/pos/pay-links', posPayLinksRouter)
 app.use('/api/pos',           posRouter)
 app.use('/api/reports',       reportsRouter)
 // Allow PDF embedding for file routes

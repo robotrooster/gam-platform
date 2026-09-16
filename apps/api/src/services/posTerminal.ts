@@ -175,6 +175,8 @@ export async function createCardPresentPaymentIntent(opts: {
   landlordId:               string
   propertyId:               string
   amountCents:              number       // total to charge in cents
+  // S648: the card fee the customer paid on top — GAM's, as on every card payment.
+  platformCutCents?:        number
   currency?:                string       // default 'usd'
   description?:             string
   // Optional: stamp a draft tx id from the POS UI so the eventual
@@ -192,6 +194,8 @@ export async function createCardPresentPaymentIntent(opts: {
       currency:             opts.currency ?? 'usd',
       payment_method_types: ['card_present'],
       capture_method:       'manual',
+      ...(opts.platformCutCents && opts.platformCutCents > 0
+        ? { application_fee_amount: opts.platformCutCents } : {}),
       description:          opts.description ?? 'GAM POS sale',
       metadata: {
         gam_purpose:     'pos_terminal',

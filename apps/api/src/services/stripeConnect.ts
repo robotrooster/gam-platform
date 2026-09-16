@@ -1005,6 +1005,48 @@ export async function createBookingDepositCheckoutSession(
 }
 
 /**
+ * S648 — a register pay link's card page (routes/posPayLinks.ts). Card only,
+ * the same destination-charge shape as a stay deposit: the landlord's account
+ * receives the sale, GAM keeps the card fee the customer paid on top. A standing
+ * link (the dump-station QR) asks the payer's name, since nobody entered it.
+ */
+export async function createPayLinkCheckoutSession(opts: {
+  landlordConnectAccountId: string
+  lineItems: Array<{ name: string; amountCents: number }>
+  platformCutCents: number
+  customerEmail?: string | null
+  askName?: boolean
+  successUrl: string
+  cancelUrl: string
+  metadata: Record<string, string>
+}): Promise<InvoiceCheckoutResult> {
+  const stripe = getStripe()
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    line_items: opts.lineItems.filter(l => l.amountCents > 0).map(l => ({
+      quantity: 1,
+      price_data: { currency: 'usd', unit_amount: l.amountCents, product_data: { name: l.name.slice(0, 250) } },
+    })),
+    payment_intent_data: {
+      transfer_data: { destination: opts.landlordConnectAccountId },
+      application_fee_amount: opts.platformCutCents,
+      metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },
+    },
+    metadata: { gam_purpose: 'pos_pay_link', ...opts.metadata },
+    customer_email: opts.customerEmail ?? undefined,
+    phone_number_collection: { enabled: !!opts.askName },
+    custom_fields: opts.askName
+      ? [{ key: 'name', label: { type: 'custom', custom: 'Your name' }, type: 'text' }]
+      : undefined,
+    success_url: opts.successUrl,
+    cancel_url: opts.cancelUrl,
+  })
+  if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
+  return { sessionId: session.id, hostedUrl: session.url }
+}
+
+/**
  * Refund a business-invoice PaymentIntent (a Connect destination charge).
  *
  * `reverse_transfer: true` is REQUIRED: the gross landed in the business's

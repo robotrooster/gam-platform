@@ -38,6 +38,18 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── S648: register pay links ──────────────────────────────────────────────
+  // A pay link is a register cart sent as a card charge to someone's inbox. The
+  // amount is whatever the desk rang up, and the email goes to an address typed
+  // at the counter — both are exactly what a spoken sentence gets wrong, and a
+  // wrong one is a real charge landing on a stranger. Rung up on the register,
+  // where the cart and the address are on screen.
+  'posPayLinks POST /':
+    'sends a card charge to an email address for whatever the desk rang up. Rung up at the register with the cart and the address on screen; a misheard amount or address is a real charge sent to a stranger.',
+  'posPayLinks POST /:id/resend':
+    'emails an existing charge again. Done from the open-links list at the register, next to the address it goes to.',
+  'posPayLinks POST /:id/cancel':
+    'closes a link somebody may be about to pay. Done from the open-links list, where the desk can see whether it has already been paid.',
   // ── S642: pushing a signing reminder ───────────────────────────────────────
   'esign POST /documents/:id/remind':
     'emails a reminder to whoever is holding up a lease. Reachable by an agent would defeat the point: the automatic reminder already has a ceiling precisely so nobody is chased forever, and an agent that can push on request is a ceiling with a loophole. This is the landlord deciding one person is worth another nudge, on a screen showing how many have already gone.',

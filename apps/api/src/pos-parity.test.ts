@@ -17,4 +17,12 @@ describe('POS register parity (landlord tab === standalone portal)', () => {
     const standalone = readFileSync(resolve(root, 'apps/pos/src/pages/POSPage.tsx'), 'utf8')
     expect(standalone).toBe(landlord)
   })
+
+  // S648: the pay-link screens ship in both registers too.
+  it('apps/landlord and apps/pos POSPayLinks.tsx are byte-identical', () => {
+    const root = resolve(__dirname, '../../..')
+    const landlord = readFileSync(resolve(root, 'apps/landlord/src/pages/POSPayLinks.tsx'), 'utf8')
+    const standalone = readFileSync(resolve(root, 'apps/pos/src/pages/POSPayLinks.tsx'), 'utf8')
+    expect(standalone).toBe(landlord)
+  })
 })

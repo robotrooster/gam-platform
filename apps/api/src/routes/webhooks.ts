@@ -1228,6 +1228,27 @@ webhooksRouter.post('/stripe', async (req, res) => {
         }
         break
       }
+      // S648: a register pay link was paid → record the sale, close the link,
+      // confirm any stay attached to it.
+      if (session.metadata?.gam_purpose === 'pos_pay_link') {
+        try {
+          const { finalizePayLink } = await import('./posPayLinks')
+          const r = await finalizePayLink({
+            id: session.id, amount_total: session.amount_total,
+            payment_intent: typeof session.payment_intent === 'string'
+              ? session.payment_intent : session.payment_intent?.id ?? null,
+            metadata: session.metadata as any,
+            customer_details: session.customer_details as any,
+            custom_fields: (session as any).custom_fields ?? null,
+          })
+          logger.info({ session_id: session.id, ...r }, '[webhook] pay link')
+        } catch (e) {
+          logger.error({ err: e, session_id: session.id }, '[webhook] pay link finalize failed')
+          await stampWebhookError(rawEventId, e)
+          return res.status(500).json({ error: 'webhook handler failed' })
+        }
+        break
+      }
       if (session.metadata?.gam_purpose !== 'business_invoice') {
         // Not ours — fall through silently.
         break

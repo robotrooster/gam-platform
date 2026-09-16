@@ -83,7 +83,9 @@ export interface TerminalIntent {
 }
 
 export async function createTerminalIntent(args: {
-  amountCents: number
+  // S648: the server prices the charge from the cart (plus the card fee).
+  items:       Array<{ id: string | null; qty: number; price: number; tax?: number; name?: string }>
+  discountAmount?: number
   propertyId:  string
   description?: string
   posDraftRef?: string

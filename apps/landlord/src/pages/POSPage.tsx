@@ -10,9 +10,10 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { humanize } from '@gam/shared'
+import { humanize, processingFeeFor } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
 
 // S243: Active reader for the terminal flow. Two paths:
 //   - 'smart'     — server-driven (S700, WisePOS E, etc.) registered
@@ -59,7 +60,8 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 
 export function POSPage() {
   const qc = useQueryClient()
-  const [tab, setTab] = useState<'register'|'history'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
+  const [payLinkOpen, setPayLinkOpen] = useState(false)
+  const [tab, setTab] = useState<'register'|'history'|'paylinks'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S536: browser-neutral — no native alert(); transient in-app notice.
@@ -446,7 +448,11 @@ export function POSPage() {
   const discountAmt = appliedDiscount ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(appliedDiscount.value, subtotal)) : 0
   const discountedSubtotal = subtotal - discountAmt
   const taxAmount = cart.reduce((s,i) => s+i.price*i.qty*i.tax, 0)
-  const surcharge = method==='charge' ? discountedSubtotal*0.01 : 0
+  // S648 (Nic): every card payment carries the card fee. The server decides the
+  // real figure (cart-quote / transactions); this shows the same number first.
+  const surcharge = method==='charge' ? discountedSubtotal*0.01
+    : method==='card' ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
+    : 0
   const total = discountedSubtotal + taxAmount + surcharge
   const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
   const chargeBlocked = method==='charge' && cart.some(i => !i.chargeEligible)
@@ -623,14 +629,11 @@ export function POSPage() {
       // Server tax can differ from item.tax_rate when a pos_tax_rates row is
       // configured; without this the amounts diverge and the sale 400s AFTER
       // the card is captured (money taken, no sale).
-      const quote = await apiPost<{ total: number }>('/pos/cart-quote', {
-        items: cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, qty: i.qty, price: i.price, tax: i.tax })),
-        surcharge,
-        discountAmount: discountAmt,
-      })
-      const serverTotal = Number(quote.data?.total ?? total)
+      // S648: the server prices the reader charge from the cart itself, card
+      // fee included — the register no longer sends an amount.
       const intent = await createTerminalIntent({
-        amountCents: Math.round(serverTotal * 100),
+        items: cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+        discountAmount: discountAmt,
         propertyId:  registerProperty,
         description: 'GAM POS sale',
       })
@@ -687,6 +690,8 @@ export function POSPage() {
   const TABS = [
     { key:'register',  label:'Register',   perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
+    // S648: emailed pay links + QR codes — anyone who can ring a sale.
+    { key:'paylinks',  label:'Pay Links',  perm:'pos.tab.register' },
     { key:'items',     label:'Items',      perm:'pos.tab.items' },
     { key:'categories',label:'Categories', perm:'pos.tab.categories' },
     { key:'taxes',     label:'Tax Rates',  perm:'pos.tab.taxes' },
@@ -732,7 +737,7 @@ export function POSPage() {
             <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(receipt.subtotal)}</span></div>
             {receipt.discountAmt>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>-{fmt(receipt.discountAmt)}</span></div>}
             {receipt.taxAmount>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(receipt.taxAmount)}</span></div>}
-            {receipt.surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Card surcharge</span><span>{fmt(receipt.surcharge)}</span></div>}
+            {receipt.surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{receipt.method==='card' ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(receipt.surcharge)}</span></div>}
             <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'1rem',borderTop:'1px solid var(--border-1)',paddingTop:8,marginTop:4}}>
               <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(receipt.total)}</span>
             </div>
@@ -863,7 +868,7 @@ export function POSPage() {
               <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(subtotal)}</span></div>
               {discountAmt>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>-{fmt(discountAmt)}</span></div>}
               {taxAmount>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(taxAmount)}</span></div>}
-              {surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Card surcharge (1%)</span><span>{fmt(surcharge)}</span></div>}
+              {surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{method==='card' ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(surcharge)}</span></div>}
               <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',borderTop:'1px solid var(--border-1)',paddingTop:6,marginTop:2}}>
                 <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(total)}</span>
               </div>
@@ -929,9 +934,28 @@ export function POSPage() {
             } onClick={()=>method==='card'?chargeWithReader():checkoutMut.mutate(undefined)}>
               {checkoutMut.isLoading?'Processing...':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…':'Charge '+fmt(total)}
             </button>
+            {/* S648 (Nic): "generate an item, a charge and send it to a link so
+                they can pay by email." The same cart, paid later by card. */}
+            <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
+              disabled={cart.length===0 || !registerProperty}
+              onClick={()=>setPayLinkOpen(true)}>
+              Email a pay link
+            </button>
+            {payLinkOpen && (
+              <SendPayLinkModal
+                propertyId={registerProperty}
+                cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat }))}
+                discountAmount={discountAmt}
+                total={discountedSubtotal + taxAmount}
+                onClose={()=>setPayLinkOpen(false)}
+                onSent={()=>{ setPayLinkOpen(false); setCart([]); setAppliedDiscount(null) }}
+              />
+            )}
           </div>
         </div>
       )}
+
+      {tab==='paylinks' && <PayLinksTab propertyId={registerProperty} />}
 
       {tab==='history' && !!registerProperty && (
         <div className="card" style={{padding:0}}>

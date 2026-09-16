@@ -333,6 +333,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // session_items cascade on parent session delete.
   await db.query(`DELETE FROM pos_sessions`)
   await db.query(`DELETE FROM pos_transactions`)
+  // S648: register pay links FK properties, landlords, bookings and the sale.
+  await db.query(`DELETE FROM pos_pay_links`)
   await db.query(`DELETE FROM pos_purchase_orders`)
   await db.query(`DELETE FROM pos_items`)
   await db.query(`DELETE FROM pos_categories`)

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict M6ablRLeb6jW8vJxdBwdpNya0AJz7n3rvPHwTNJ7dHIc2jugE8RC0wj1h59LJ4c
+\restrict vaErw7rhyKLnU1p5OvbZ26xy8c5Y6HeG4AGvsZmMU0x564sBZ3e18dQKZPYLrCU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6989,6 +6989,46 @@ COMMENT ON COLUMN public.pos_items.property_id IS 'Property this POS item belong
 
 
 --
+-- Name: pos_pay_links; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_pay_links (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    token text NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    created_by uuid NOT NULL,
+    kind text NOT NULL,
+    label text NOT NULL,
+    items jsonb NOT NULL,
+    subtotal numeric(10,2) NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    total numeric(10,2) NOT NULL,
+    customer_name text,
+    customer_email text,
+    customer_phone text,
+    tenant_id uuid,
+    pos_customer_id uuid,
+    booking_id uuid,
+    status text DEFAULT 'open'::text NOT NULL,
+    paid_at timestamp with time zone,
+    pos_transaction_id uuid,
+    last_checkout_session_id text,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_pay_links_discount_amount_check CHECK ((discount_amount >= (0)::numeric)),
+    CONSTRAINT pos_pay_links_kind_check CHECK ((kind = ANY (ARRAY['one_time'::text, 'standing'::text]))),
+    CONSTRAINT pos_pay_links_one_time_has_email CHECK (((kind <> 'one_time'::text) OR (customer_email IS NOT NULL))),
+    CONSTRAINT pos_pay_links_status_check CHECK ((status = ANY (ARRAY['open'::text, 'paid'::text, 'cancelled'::text, 'expired'::text]))),
+    CONSTRAINT pos_pay_links_subtotal_check CHECK ((subtotal >= (0)::numeric)),
+    CONSTRAINT pos_pay_links_tax_amount_check CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT pos_pay_links_total_check CHECK ((total > (0)::numeric))
+);
+
+
+--
 -- Name: pos_price_history; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7253,6 +7293,7 @@ CREATE TABLE public.pos_transactions (
     property_id uuid,
     discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     discount_reason text,
+    pay_link_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -13107,6 +13148,22 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_pay_links pos_pay_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_pay_links pos_pay_links_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_token_key UNIQUE (token);
+
+
+--
 -- Name: pos_price_history pos_price_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17185,6 +17242,13 @@ CREATE INDEX idx_pos_items_property ON public.pos_items USING btree (property_id
 
 
 --
+-- Name: idx_pos_pay_links_property_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_pay_links_property_open ON public.pos_pay_links USING btree (property_id, created_at DESC) WHERE (status = 'open'::text);
+
+
+--
 -- Name: idx_pos_price_history_item; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -19751,6 +19815,13 @@ CREATE TRIGGER audit_pos_item_variants AFTER DELETE OR UPDATE ON public.pos_item
 --
 
 CREATE TRIGGER audit_pos_items AFTER DELETE OR UPDATE ON public.pos_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_pay_links audit_pos_pay_links; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_pay_links AFTER DELETE OR UPDATE ON public.pos_pay_links FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -24549,6 +24620,62 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_pay_links pos_pay_links_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_pay_links pos_pay_links_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_pay_links
+    ADD CONSTRAINT pos_pay_links_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
 -- Name: pos_price_history pos_price_history_changed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24746,6 +24873,14 @@ ALTER TABLE ONLY public.pos_transactions
 
 ALTER TABLE ONLY public.pos_transactions
     ADD CONSTRAINT pos_transactions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_transactions pos_transactions_pay_link_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_pay_link_id_fkey FOREIGN KEY (pay_link_id) REFERENCES public.pos_pay_links(id) ON DELETE SET NULL;
 
 
 --
@@ -26776,5 +26911,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict M6ablRLeb6jW8vJxdBwdpNya0AJz7n3rvPHwTNJ7dHIc2jugE8RC0wj1h59LJ4c
+\unrestrict vaErw7rhyKLnU1p5OvbZ26xy8c5Y6HeG4AGvsZmMU0x564sBZ3e18dQKZPYLrCU
 

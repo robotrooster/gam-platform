@@ -50,6 +50,10 @@ FRONTENDS=(
   # S605: PM-company went live because a landlord handing off to a property
   # manager is a lost landlord if the PM cannot even sign up.
   "pm-company:pm.goldassetmanagement.com"
+  # S648: the standalone register is the same screen as the landlord POS tab
+  # (pos-parity.test.ts) and was never shipped by this script, so it silently
+  # fell behind every register change.
+  "pos:pos.goldassetmanagement.com"
 )
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
