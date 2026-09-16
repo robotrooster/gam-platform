@@ -5,7 +5,7 @@ import { EntityPicker } from '../components/EntityPicker'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
-import { api, apiPost, apiGet, apiPut } from '../lib/api'
+import { api, apiPost, apiGet, apiPut, apiPatch } from '../lib/api'
 import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 
 // Backend response shape from POST /onboard-tenants-csv/validate.
@@ -101,6 +101,13 @@ function OnboardingWindowsBanner() {
     (propertyId: string) => apiPost(`/properties/${propertyId}/onboarding-complete`, {}),
     { onSuccess: () => { setConfirmingId(null); qc.invalidateQueries('onboarding-windows'); qc.invalidateQueries(['ob-window']) } },
   )
+  // S648 (Nic): waiving late fees while residents migrate is the landlord's
+  // call, per property. Unanswered = residents are billed late fees.
+  const waiverMut = useMutation(
+    ({ propertyId, waive }: { propertyId: string; waive: boolean }) =>
+      apiPatch(`/properties/${propertyId}/onboarding-late-fee-waiver`, { waive }),
+    { onSuccess: () => qc.invalidateQueries('onboarding-windows') },
+  )
   const openWins = (windows as any[]).filter(w => w?.open)
   if (openWins.length === 0) return null
   return (
@@ -114,6 +121,20 @@ function OnboardingWindowsBanner() {
           <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>
             <strong style={{ color: 'var(--text-0)' }}>{w.propertyName}</strong>
             {typeof w.daysRemaining === 'number' && <> — <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{w.daysRemaining} day{w.daysRemaining === 1 ? '' : 's'}</span> left</>}
+          </div>
+          <div style={{ flexBasis: '100%', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: '.78rem' }}>
+            <span style={{ color: w.lateFeeWaiver == null ? 'var(--gold)' : 'var(--text-2)' }}>
+              Waive late fees on each resident&apos;s first bill while they move over?
+            </span>
+            <button className={`btn btn-sm ${w.lateFeeWaiver === true ? 'btn-primary' : 'btn-ghost'}`}
+              disabled={waiverMut.isLoading}
+              onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: true })}>Yes, waive</button>
+            <button className={`btn btn-sm ${w.lateFeeWaiver === false ? 'btn-primary' : 'btn-ghost'}`}
+              disabled={waiverMut.isLoading}
+              onClick={() => waiverMut.mutate({ propertyId: w.propertyId, waive: false })}>No, charge them</button>
+            {w.lateFeeWaiver == null && (
+              <span style={{ color: 'var(--text-3)' }}>Not answered yet, so late fees apply.</span>
+            )}
           </div>
           {confirmingId === w.propertyId ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

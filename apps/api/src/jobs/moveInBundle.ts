@@ -197,10 +197,12 @@ export async function generateMoveInInvoice(
   const leaseMetaRes = await client.query<{
     lease_source: string | null; end_date: string | null
     is_existing_tenancy: boolean; first_billing_cycle: string | null
+    onboarding_late_fee_waiver: boolean
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
-            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle
+            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+            COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -366,7 +368,11 @@ export async function generateMoveInInvoice(
         //
         // Only the FIRST one. After a full cycle they are an ordinary resident
         // and their lease's own late-fee terms apply, exactly as configured.
-        !!wtAgreement || !!leaseMeta?.is_existing_tenancy,
+        //
+        // S648 (Nic): and only where the landlord chose to waive it for this
+        // property. Unanswered = the resident is billed late fees.
+        !!wtAgreement
+          || (!!leaseMeta?.is_existing_tenancy && !!leaseMeta?.onboarding_late_fee_waiver),
       ]
     )
 

@@ -415,10 +415,11 @@ export async function chargeLeaseBalance(
       ctx.connect_charges_enabled === true &&
       ctx.connect_details_submitted === true
 
-    const stripe = getStripe()
+    // Only a card needs the SDK here (issuing country for the non-US surcharge).
+    // Building the client on the ACH path made every bank payment depend on it.
     let cardCountry: string | null = null
     if (paymentMethodType === 'card') {
-      const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
+      const pm = await getStripe().paymentMethods.retrieve(paymentMethodId)
       cardCountry = pm.card?.country ?? null
     }
 

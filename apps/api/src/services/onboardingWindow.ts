@@ -108,7 +108,11 @@ export async function closeOnboardingWindow(propertyId: string, client?: Runner)
   )
 }
 
-export interface PropertyOnboardingWindow extends OnboardingWindowState { propertyName: string }
+export interface PropertyOnboardingWindow extends OnboardingWindowState {
+  propertyName: string
+  /** S648: waive late fees on each existing resident's first bill? null = not answered (no waiver). */
+  lateFeeWaiver: boolean | null
+}
 
 /** Window state for every property a landlord owns — powers the onboarding banner. */
 // S633: every company the ACCOUNT owns. Onboarding is per property, and an
@@ -121,8 +125,10 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
     onboarding_started_at: string | null
     onboarding_completed_at: string | null
     unit_count: number
+    onboarding_late_fee_waiver: boolean | null
   }>(
     `SELECT p.id, p.name, p.onboarding_started_at, p.onboarding_completed_at,
+            p.onboarding_late_fee_waiver,
             (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count
        FROM properties p WHERE p.landlord_id = ANY($1::uuid[])
        ORDER BY p.created_at DESC`,
@@ -141,7 +147,7 @@ export async function listOnboardingWindowsForLandlord(landlordIds: string[]): P
       open = Date.now() < until.getTime()
       daysRemaining = open ? Math.ceil((until.getTime() - Date.now()) / DAY_MS) : 0
     }
-    return { propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining }
+    return { propertyId: r.id, propertyName: r.name, open, startedAt, until, completedAt, windowDays, unitCount, daysRemaining, lateFeeWaiver: r.onboarding_late_fee_waiver }
   })
 }
 

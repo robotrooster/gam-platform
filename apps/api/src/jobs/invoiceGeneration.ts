@@ -36,6 +36,8 @@ interface ActiveLease {
   // S639: already living there when the park came onto GAM — their first
   // invoice is late-fee exempt however long they took to sign.
   is_existing_tenancy?: boolean
+  // S648: the landlord's answer for this property. Only TRUE waives.
+  onboarding_late_fee_waiver?: boolean
   tenant_id: string | null
   property_tz: string
   lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
@@ -226,6 +228,7 @@ export async function generateInvoices(
            -- GAM. Their first bill here is late-fee exempt however long they
            -- took to sign — see lateStartExempt below.
            l.is_existing_tenancy,
+           COALESCE(p.onboarding_late_fee_waiver, FALSE) AS onboarding_late_fee_waiver,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
@@ -749,9 +752,17 @@ async function runGeneration(
         // ordinary resident and each lease's own late-fee terms apply, exactly
         // as configured — Nic: "the late fee is set up correctly for future
         // cycles."
+        //
+        // S648 (Nic): and only where the LANDLORD chose to waive. "The tenants
+        // need to be billed late fees if the landlord doesn't agree to waive
+        // them. I did that for myself personally here but not every landlord's
+        // going to do that." properties.onboarding_late_fee_waiver; unanswered
+        // means no waiver.
         const isFirstInvoice = Number(priorInvoice.rows[0].n) === 0
+        const onboardingWaived =
+          lease.is_existing_tenancy === true && lease.onboarding_late_fee_waiver === true
         const lateStartExempt =
-          isFirstInvoice && (lease.is_existing_tenancy === true || startedAfter20th)
+          isFirstInvoice && (onboardingWaived || startedAfter20th)
 
         const invoiceRes = await client.query(
           `INSERT INTO invoices (

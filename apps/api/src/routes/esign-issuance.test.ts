@@ -250,10 +250,35 @@ describe('then the tenant signs', () => {
 // (an existing resident knows when rent is due). What must NOT follow is a late
 // fee for missing a bill nobody had sent them. invoiceGeneration has exempted
 // this since S637; the move-in invoice had not.
+// S648 (Nic): only where the landlord chose to waive late fees for the
+// property. Otherwise the first bill carries late fees like any other.
+async function papered(f: any, waiver: boolean | null) {
+  await db.query(`UPDATE properties SET onboarding_late_fee_waiver=$2 WHERE id=$1`, [f.propertyId, waiver])
+  await db.query(
+    `INSERT INTO pending_tenant_intents
+       (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
+     VALUES ($1,$2,$3,$4,TRUE)`,
+    [f.landlordId, f.tenantId, f.unitId, f.propertyId])
+}
 describe('an existing tenancy onboarded late', () => {
-  it('is not fined for a bill it had not been sent', async () => {
+  for (const waiver of [false, null]) {
+    it(`is billed late fees when the landlord's waiver answer is ${waiver}`, async () => {
+      const f = await fixture()
+      const documentId = await unsignedDoc(f)
+      await papered(f, waiver)
+      await signAs(documentId, f.landlordToken)
+      const lease = (await leasesFor(f.unitId))[0]
+      const inv = (await db.query(
+        `SELECT late_fee_exempt FROM invoices WHERE lease_id=$1 ORDER BY created_at LIMIT 1`,
+        [lease.id])).rows[0]
+      expect(inv.late_fee_exempt).toBe(false)
+    })
+  }
+
+  it('is not fined for a bill it had not been sent, when the landlord waived', async () => {
     const f = await fixture()
     const documentId = await unsignedDoc(f)
+    await db.query(`UPDATE properties SET onboarding_late_fee_waiver=TRUE WHERE id=$1`, [f.propertyId])
     // Papering a resident who has lived there for years. esign reads this off
     // the INVITE, which is where the landlord said which kind of tenancy it was.
     await db.query(

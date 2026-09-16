@@ -28,6 +28,8 @@ async function seedOverdue(opts: {
   existingTenancy: boolean
   stamped?: boolean
   priorInvoice?: boolean
+  /** S648: the property's answer. undefined = not answered. */
+  waiver?: boolean
 }) {
   const rent = 460
   const c = await db.connect()
@@ -35,7 +37,8 @@ async function seedOverdue(opts: {
     await c.query('BEGIN')
     const ll = await seedLandlord(c)
     const propertyId = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
-    await c.query(`UPDATE properties SET timezone=$2, late_fee_enabled=TRUE WHERE id=$1`, [propertyId, TZ])
+    await c.query(`UPDATE properties SET timezone=$2, late_fee_enabled=TRUE, onboarding_late_fee_waiver=$3 WHERE id=$1`,
+      [propertyId, TZ, opts.waiver ?? null])
     const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
     const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, rentAmount: rent })
     await c.query(
@@ -78,15 +81,29 @@ const feesOn = async (invoiceId: string) => {
 
 describe('S640 onboarding waiver survives an unstamped invoice', () => {
   it('charges nothing on an existing resident’s first bill, stamp or no stamp', async () => {
-    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false })
+    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false, waiver: true })
     await generateLateFeesForTimezone(TZ)
     expect(await feesOn(invoiceId)).toEqual({ count: 0, total: 0 })
+  })
+
+  // S648 (Nic): the waiver is the landlord's choice. "The tenants need to be
+  // billed late fees if the landlord doesn't agree to waive them."
+  it('charges an existing resident’s first bill when the landlord said no', async () => {
+    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false, waiver: false })
+    await generateLateFeesForTimezone(TZ)
+    expect((await feesOn(invoiceId)).total).toBeGreaterThan(0)
+  })
+
+  it('charges an existing resident’s first bill when the landlord never answered', async () => {
+    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false })
+    await generateLateFeesForTimezone(TZ)
+    expect((await feesOn(invoiceId)).total).toBeGreaterThan(0)
   })
 
   // The waiver is the FIRST cycle only. By the second they have had a full
   // month on the platform and their lease's own terms apply.
   it('charges normally on the same resident’s SECOND bill', async () => {
-    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false, priorInvoice: true })
+    const { invoiceId } = await seedOverdue({ existingTenancy: true, stamped: false, priorInvoice: true, waiver: true })
     await generateLateFeesForTimezone(TZ)
     expect((await feesOn(invoiceId)).total).toBeGreaterThan(0)
   })
@@ -94,7 +111,7 @@ describe('S640 onboarding waiver survives an unstamped invoice', () => {
   // A genuinely new applicant who signed and did not pay is not an onboarding
   // resident, and this must not have quietly waived them too.
   it('charges a NEW tenant’s first bill exactly as before', async () => {
-    const { invoiceId } = await seedOverdue({ existingTenancy: false, stamped: false })
+    const { invoiceId } = await seedOverdue({ existingTenancy: false, stamped: false, waiver: true })
     await generateLateFeesForTimezone(TZ)
     expect((await feesOn(invoiceId)).total).toBeGreaterThan(0)
   })

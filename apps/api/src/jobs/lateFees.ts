@@ -148,8 +148,13 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         -- NOT(...) filters the row out entirely — it would have silently
         -- stopped late fees on every service agreement on the platform. Two
         -- tests caught it; without them nobody would have noticed for months.
+        --
+        -- S648 (Nic): only where the landlord CHOSE the waiver for this
+        -- property ("the tenants need to be billed late fees if the landlord
+        -- doesn't agree to waive them"). Unanswered (NULL) = no waiver.
         AND NOT (
           COALESCE(l.is_existing_tenancy, FALSE)
+          AND COALESCE(p.onboarding_late_fee_waiver, FALSE)
           AND NOT EXISTS (SELECT 1 FROM invoices ip
                            WHERE ip.lease_id = l.id AND ip.due_date < i.due_date)
         )
