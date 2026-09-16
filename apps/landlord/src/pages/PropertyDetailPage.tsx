@@ -6,12 +6,14 @@ import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
-// S526: PropertyFeeScheduleSection RETIRED — fees are charged per tenant's
-// signed lease (lease_fees), not property-wide. S527: pricing lives in
+// S526: fees are charged per tenant's signed lease (lease_fees). S648: the
+// property fee list is back, per unit type, as what a new lease's fee boxes
+// start from (PropertyFeeScheduleSection). S527: pricing lives in
 // OWNER-DEFINED subtypes (UnitSubtypesSection) — blank until the owner
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyLateFeeSection } from './PropertyLateFeeSection'
+import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyLeaseSigningSection } from './PropertyLeaseSigningSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
@@ -210,6 +212,8 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PropertyFeeScheduleSection propertyId={property.id}
+        unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a

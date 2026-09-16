@@ -312,7 +312,7 @@ describe('POST /api/properties/:id/fee-schedule', () => {
     const r1 = await request(buildApp())
       .post(`/api/properties/${propId}/fee-schedule`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'cleaning_fee', amount: 150, isRefundable: false, dueTiming: 'move_out' })
+      .send({ unitType: 'rv_spot', feeType: 'cleaning_fee', amount: 150, isRefundable: false, dueTiming: 'move_out' })
     expect(r1.status).toBe(200)
     expect(Number(r1.body.data.amount)).toBe(150)
 
@@ -320,7 +320,7 @@ describe('POST /api/properties/:id/fee-schedule', () => {
     const r2 = await request(buildApp())
       .post(`/api/properties/${propId}/fee-schedule`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'cleaning_fee', amount: 200, isRefundable: false, dueTiming: 'move_out' })
+      .send({ unitType: 'rv_spot', feeType: 'cleaning_fee', amount: 200, isRefundable: false, dueTiming: 'move_out' })
     expect(r2.status).toBe(200)
     expect(Number(r2.body.data.amount)).toBe(200)
 
@@ -331,6 +331,29 @@ describe('POST /api/properties/:id/fee-schedule', () => {
     expect(rows.rows.length).toBe(1)
   })
 
+  // S648 (Nic): a fee is set per KIND of unit. The same fee for apartments and
+  // for RV spots is two rows, and a POST without a unit type is refused.
+  it('keeps each unit type separate, and requires one', async () => {
+    const f = await seedPropsFixture()
+    const propId = (await createProperty(f)).body.data.id
+    const post = (body: any) => request(buildApp())
+      .post(`/api/properties/${propId}/fee-schedule`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send(body)
+    const base = { feeType: 'pet_deposit', isRefundable: true, dueTiming: 'move_in' }
+    expect((await post({ ...base, unitType: 'apartment', amount: 350 })).status).toBe(200)
+    expect((await post({ ...base, unitType: 'rv_spot', amount: 0 })).status).toBe(200)
+    expect((await post({ ...base, amount: 350 })).status).toBe(400)
+    expect((await post({ ...base, unitType: 'apartment', feeType: 'utility_deposit', amount: 100 })).status).toBe(200)
+    const rows = await db.query<any>(
+      `SELECT unit_type, fee_type, amount::float AS amount FROM property_fee_schedules
+        WHERE property_id=$1 ORDER BY unit_type, fee_type`, [propId])
+    expect(rows.rows).toEqual([
+      { unit_type: 'apartment', fee_type: 'pet_deposit', amount: 350 },
+      { unit_type: 'apartment', fee_type: 'utility_deposit', amount: 100 },
+      { unit_type: 'rv_spot', fee_type: 'pet_deposit', amount: 0 },
+    ])
+  })
+
   it('cross-landlord property → 403', async () => {
     const a = await seedPropsFixture()
     const b = await seedPropsFixture()
@@ -338,7 +361,7 @@ describe('POST /api/properties/:id/fee-schedule', () => {
     const res = await request(buildApp())
       .post(`/api/properties/${bProp.body.data.id}/fee-schedule`)
       .set('Authorization', `Bearer ${a.landlordToken}`)
-      .send({ feeType: 'cleaning_fee', amount: 150, isRefundable: false, dueTiming: 'move_out' })
+      .send({ unitType: 'rv_spot', feeType: 'cleaning_fee', amount: 150, isRefundable: false, dueTiming: 'move_out' })
     expect(res.status).toBe(403)
   })
 })

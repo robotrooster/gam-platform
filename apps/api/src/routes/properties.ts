@@ -25,6 +25,8 @@ import {
   LISTING_MIN_PHOTOS_BY_UNIT_TYPE,
   LISTING_MIN_PHOTOS_DEFAULT,
   timezoneForState,
+  FEE_TYPES,
+  type FeeType,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -796,10 +798,11 @@ propertiesRouter.delete('/:id/unit-subtypes/:rowId', requirePerm('properties.edi
 // Anti-discrimination model: per-property standard fees that
 // pre-populate new lease documents. Lease remains the legal
 // contract; this is the policy.
-// NOTE (S526): the landlord-facing fee-schedule page is RETIRED — each
-// tenant is charged per their own signed lease (lease_fees, parsed at
-// e-sign finalize). These routes stay for the esign is_override audit
-// comparison and any legacy rows; no UI writes them anymore.
+// NOTE (S526): each tenant is charged per their own signed lease (lease_fees,
+// parsed at e-sign finalize) — that has not changed.
+// S648 (Nic): the list is back, per UNIT TYPE, as the starting values for a
+// new lease's fee boxes ("a pet deposit on an apartment is gonna only apply to
+// apartments"). It never bills anybody by itself.
 // ─────────────────────────────────────────────────────────────
 
 // GET /api/properties/:id/fee-schedule — list rows for a property
@@ -810,10 +813,10 @@ propertiesRouter.get('/:id/fee-schedule', async (req, res, next) => {
     if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
 
     const rows = await query<any>(
-      `SELECT id, fee_type, slot_index, description, amount, is_refundable, due_timing, created_at, updated_at
+      `SELECT id, unit_type, fee_type, slot_index, description, amount, is_refundable, due_timing, created_at, updated_at
          FROM property_fee_schedules
         WHERE property_id = $1
-        ORDER BY fee_type, slot_index`,
+        ORDER BY unit_type, fee_type, slot_index`,
       [req.params.id],
     )
     res.json({ success: true, data: rows })
@@ -823,15 +826,12 @@ propertiesRouter.get('/:id/fee-schedule', async (req, res, next) => {
 // POST /api/properties/:id/fee-schedule — upsert a row
 // (single-instance fee_types: slot_index implicit 0; other_fee:
 // caller passes slot_index)
+// security_deposit stays off this list: it comes from the unit (S636) and the
+// template's deposit months (S558), and two sources for one figure drift.
+const PROPERTY_FEE_TYPES = FEE_TYPES.filter(t => t !== 'security_deposit') as [FeeType, ...FeeType[]]
 const feeRowSchema = z.object({
-  feeType: z.enum([
-    'pet_deposit', 'key_deposit', 'cleaning_deposit',
-    'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
-    'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
-    'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
-    'trash_fee', 'pest_control_fee', 'technology_fee',
-    'last_month_rent', 'early_termination_fee', 'other_fee',
-  ]),
+  unitType: z.enum(UNIT_TYPES),
+  feeType: z.enum(PROPERTY_FEE_TYPES),
   slotIndex: z.number().int().min(0).optional(),
   description: z.string().max(200).optional(),
   amount: z.number().nonnegative(),
@@ -850,16 +850,16 @@ propertiesRouter.post('/:id/fee-schedule', requirePerm('properties.edit'), async
 
     const upserted = await queryOne<any>(
       `INSERT INTO property_fee_schedules
-         (property_id, fee_type, slot_index, description, amount, is_refundable, due_timing)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (property_id, fee_type, slot_index) DO UPDATE
+         (property_id, unit_type, fee_type, slot_index, description, amount, is_refundable, due_timing)
+       VALUES ($1, $8, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (property_id, unit_type, fee_type, slot_index) DO UPDATE
          SET description = EXCLUDED.description,
              amount = EXCLUDED.amount,
              is_refundable = EXCLUDED.is_refundable,
              due_timing = EXCLUDED.due_timing,
              updated_at = NOW()
        RETURNING *`,
-      [req.params.id, body.feeType, slotIndex, body.description ?? null, body.amount, body.isRefundable, body.dueTiming],
+      [req.params.id, body.feeType, slotIndex, body.description ?? null, body.amount, body.isRefundable, body.dueTiming, body.unitType],
     )
     res.json({ success: true, data: upserted })
   } catch (e) { next(e) }

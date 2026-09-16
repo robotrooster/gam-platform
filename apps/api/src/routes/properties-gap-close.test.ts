@@ -125,9 +125,9 @@ describe('GET /:id/fee-schedule', () => {
   it('happy: returns property fee rows ordered', async () => {
     const f = await seed()
     await db.query(
-      `INSERT INTO property_fee_schedules (property_id, fee_type, slot_index, amount, is_refundable, due_timing) VALUES
-        ($1, 'pet_deposit', 0, 300, TRUE, 'move_in'),
-        ($1, 'cleaning_fee', 0, 100, FALSE, 'move_out')`,
+      `INSERT INTO property_fee_schedules (property_id, unit_type, fee_type, slot_index, amount, is_refundable, due_timing) VALUES
+        ($1, 'apartment', 'pet_deposit', 0, 300, TRUE, 'move_in'),
+        ($1, 'apartment', 'cleaning_fee', 0, 100, FALSE, 'move_out')`,
       [f.propertyAId])
     const res = await request(buildApp())
       .get(`/api/properties/${f.propertyAId}/fee-schedule`)
@@ -141,8 +141,8 @@ describe('DELETE /:id/fee-schedule/:rowId', () => {
   it('cross-landlord → 403', async () => {
     const f = await seed()
     const row = await db.query<{ id: string }>(
-      `INSERT INTO property_fee_schedules (property_id, fee_type, slot_index, amount, is_refundable, due_timing)
-       VALUES ($1, 'pet_deposit', 0, 300, TRUE, 'move_in') RETURNING id`, [f.propertyBId])
+      `INSERT INTO property_fee_schedules (property_id, unit_type, fee_type, slot_index, amount, is_refundable, due_timing)
+       VALUES ($1, 'apartment', 'pet_deposit', 0, 300, TRUE, 'move_in') RETURNING id`, [f.propertyBId])
     const res = await request(buildApp())
       .delete(`/api/properties/${f.propertyBId}/fee-schedule/${row.rows[0].id}`)
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -152,8 +152,8 @@ describe('DELETE /:id/fee-schedule/:rowId', () => {
   it('happy: removes row', async () => {
     const f = await seed()
     const row = await db.query<{ id: string }>(
-      `INSERT INTO property_fee_schedules (property_id, fee_type, slot_index, amount, is_refundable, due_timing)
-       VALUES ($1, 'pet_deposit', 0, 300, TRUE, 'move_in') RETURNING id`, [f.propertyAId])
+      `INSERT INTO property_fee_schedules (property_id, unit_type, fee_type, slot_index, amount, is_refundable, due_timing)
+       VALUES ($1, 'apartment', 'pet_deposit', 0, 300, TRUE, 'move_in') RETURNING id`, [f.propertyAId])
     const res = await request(buildApp())
       .delete(`/api/properties/${f.propertyAId}/fee-schedule/${row.rows[0].id}`)
       .set('Authorization', `Bearer ${f.tokenA}`)

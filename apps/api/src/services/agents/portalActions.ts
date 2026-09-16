@@ -683,14 +683,15 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'monthly_ongoing, move_out or other. Both change what the tenant owes, so ask rather than guess.',
     params: {
       propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine ("Oak Park"). You do NOT need to look up an id first, and you must never ask them for one. A property id from a previous lookup also works.' },
-      feeType: { type: 'string', description: 'pet_deposit, key_deposit, cleaning_deposit, move_in_fee, cleaning_fee, pet_fee, application_fee, amenity_fee, hoa_transfer_fee, lease_prep_fee, pet_rent, parking_rent, storage_rent, amenity_fee_monthly, trash_fee, pest_control_fee, technology_fee, last_month_rent, early_termination_fee, other_fee' },
+      unitType: { type: 'string', description: 'Which kind of unit the fee is for — apartment, rv_spot, mobile_home, and so on. Fees are set per kind of unit, so a pet deposit for apartments does not touch RV spots. Ask if they did not say.' },
+      feeType: { type: 'string', description: 'pet_deposit, key_deposit, cleaning_deposit, utility_deposit, move_in_fee, cleaning_fee, pet_fee, application_fee, amenity_fee, hoa_transfer_fee, lease_prep_fee, pet_rent, parking_rent, storage_rent, amenity_fee_monthly, trash_fee, pest_control_fee, technology_fee, last_month_rent, early_termination_fee, other_fee' },
       amount: { type: 'number', description: 'How much, in dollars.' },
       isRefundable: { type: 'boolean', description: 'true for a deposit they get back, false for a fee they do not.' },
       dueTiming: { type: 'string', description: 'move_in, monthly_ongoing, move_out, or other.' },
       description: { type: 'string', description: 'What it is, in their words. Required in practice for other_fee.' },
       slotIndex: { type: 'integer', description: 'Only for other_fee, when there is more than one — 0, 1, 2.' },
     },
-    required: ['propertyId', 'feeType', 'amount', 'isRefundable', 'dueTiming'],
+    required: ['propertyId', 'unitType', 'feeType', 'amount', 'isRefundable', 'dueTiming'],
     confirmFirst: true,
   },
   {
@@ -753,6 +754,25 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       unitType: { type: 'string', description: 'The unit type whose policy is being removed.' },
     },
     required: ['propertyId', 'unitType'],
+    confirmFirst: true,
+  },
+  {
+    id: 'set_onboarding_late_fee_waiver',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/onboarding-late-fee-waiver',
+    pathParams: ['propertyId'],
+    description:
+      'Record the landlord\u2019s answer to "waive late fees on each existing resident\u2019s first bill ' +
+      'while they move onto the platform?" for one property. Use for "don\u2019t charge anyone late fees ' +
+      'while we\u2019re switching over" (waive true) or "they still pay late fees" (waive false).\n' +
+      'Only the FIRST bill of a resident who already lived there is affected; new tenants and later bills ' +
+      'follow the lease as normal. Until they answer, residents ARE charged late fees. Read their answer ' +
+      'back before sending it.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine. A property id from a previous lookup also works.' },
+      waive: { type: 'boolean', description: 'true = no late fee on those first bills; false = charge them.' },
+    },
+    required: ['propertyId', 'waive'],
     confirmFirst: true,
   },
   {

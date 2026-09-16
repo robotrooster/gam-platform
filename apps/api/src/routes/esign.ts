@@ -24,6 +24,8 @@ import {
   MIGRATION_WINDOW_DAYS,
   leaseColumnDisplayValue,
   isAutoFilledLeaseColumn,
+  FEE_TYPES,
+  FEE_TYPE_META,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -481,6 +483,42 @@ export async function createDocumentRecord(client: any, opts: {
         })) {
           if (val != null && Number(val) > 0 && prefillValues[col] == null) {
             prefillValues[col] = Number(val).toFixed(2)
+          }
+        }
+
+        // S648 (Nic): THE FEE BOXES START FROM THE PROPERTY'S FEE LIST.
+        //
+        //   "We want the boxes to be pre-filled in on page eight. Correctly
+        //    have them at zero for onboarding tenants."
+        //
+        // A new tenancy takes each fee this property charges for this KIND of
+        // unit (property_fee_schedules, per unit type — "a pet deposit on an
+        // apartment is gonna only apply to apartments"). The boxes stay
+        // editable; whatever is signed is what bills.
+        //
+        // An existing tenancy paid its move-in charges years ago, so every
+        // move-in fee box starts at $0 — which parses to no charge at signing.
+        // Its monthly and move-out fees are left for the landlord: a standing
+        // price for new residents is not evidence of what a sitting one pays.
+        //
+        // other_fee is skipped: the property can list several, and a lease form
+        // has one box, usually printed for something specific ("Guest fee").
+        if (opts.documentType === 'original_lease') {
+          const schedule = existingTenancy ? [] : await client.query(
+            `SELECT pfs.fee_type, pfs.amount
+               FROM property_fee_schedules pfs
+               JOIN units u ON u.property_id = pfs.property_id AND u.unit_type = pfs.unit_type
+              WHERE u.id = $1 AND pfs.fee_type <> 'other_fee'`,
+            [opts.unitId]).then((r: any) => r.rows as Array<{ fee_type: string; amount: string }>)
+          for (const r of schedule) {
+            if (prefillValues[r.fee_type] == null) prefillValues[r.fee_type] = Number(r.amount).toFixed(2)
+          }
+          if (existingTenancy) {
+            for (const tag of FEE_TYPES) {
+              if (tag === 'security_deposit' || tag === 'other_fee') continue
+              if (FEE_TYPE_META[tag].dueTiming !== 'move_in') continue
+              if (prefillValues[tag] == null) prefillValues[tag] = '0.00'
+            }
           }
         }
       }
@@ -1104,16 +1142,17 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // match a corresponding schedule row, is_override is flagged TRUE so
   // landlord can document the rationale post-finalize.
   // ────────────────────────────────────────────────────────────────────────
-  const propertyId: string | undefined = await client.query(
-    `SELECT property_id FROM units WHERE id = $1`,
+  // S648: the schedule is per unit type — compare against this unit's rows.
+  const unitRow: { property_id: string; unit_type: string } | undefined = await client.query(
+    `SELECT property_id, unit_type FROM units WHERE id = $1`,
     [doc.unit_id],
-  ).then((r: any) => r.rows[0]?.property_id)
-  const scheduleRows: any[] = propertyId
+  ).then((r: any) => r.rows[0])
+  const scheduleRows: any[] = unitRow
     ? await client.query(
         `SELECT fee_type, slot_index, description, amount, is_refundable, due_timing
            FROM property_fee_schedules
-          WHERE property_id = $1`,
-        [propertyId],
+          WHERE property_id = $1 AND unit_type = $2`,
+        [unitRow.property_id, unitRow.unit_type],
       ).then((r: any) => r.rows)
     : []
   // Index by fee_type for single-instance types (slot_index=0).

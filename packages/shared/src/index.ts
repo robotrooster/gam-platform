@@ -2872,6 +2872,8 @@ export const LEASE_COLUMNS = [
   'late_fee_cap_flat', 'late_fee_cap_percent',
   // fee_row (lease_fees table) — one row per tag at finalize
   'pet_deposit', 'key_deposit', 'cleaning_deposit',
+  // S648 (Nic): a deposit held against the utilities the tenant runs up.
+  'utility_deposit',
   'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
   'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
   'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
@@ -2941,6 +2943,7 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   late_fee_cap_percent:                 'writable',
   // fee_row
   pet_deposit:            'fee_row',
+  utility_deposit:        'fee_row',
   key_deposit:            'fee_row',
   cleaning_deposit:       'fee_row',
   move_in_fee:            'fee_row',
@@ -3075,6 +3078,7 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   late_fee_cap_flat:                    'Late fee — cap (flat $)',
   late_fee_cap_percent:                 'Late fee — cap (% of rent)',
   pet_deposit:            'Pet deposit',
+  utility_deposit:        'Utility deposit',
   key_deposit:            'Key deposit',
   cleaning_deposit:       'Cleaning deposit',
   move_in_fee:            'Move-in fee',
@@ -3156,6 +3160,7 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   late_fee_cap_flat:                    'text',
   late_fee_cap_percent:                 'text',
   pet_deposit:            'text',
+  utility_deposit:        'text',
   key_deposit:            'text',
   cleaning_deposit:       'text',
   move_in_fee:            'text',
@@ -3418,7 +3423,7 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
 
 export type FeeRowTag =
   | 'security_deposit'  // S196: was a column on leases; now a lease_fees row like the other deposits
-  | 'pet_deposit' | 'key_deposit' | 'cleaning_deposit'
+  | 'pet_deposit' | 'key_deposit' | 'cleaning_deposit' | 'utility_deposit'
   | 'move_in_fee' | 'cleaning_fee' | 'pet_fee' | 'application_fee'
   | 'amenity_fee' | 'hoa_transfer_fee' | 'lease_prep_fee'
   | 'pet_rent' | 'parking_rent' | 'storage_rent' | 'amenity_fee_monthly'
@@ -3428,7 +3433,7 @@ export type FeeRowTag =
 export type FeeType = FeeRowTag
 export const FEE_TYPES: readonly FeeType[] = [
   'security_deposit',
-  'pet_deposit', 'key_deposit', 'cleaning_deposit',
+  'pet_deposit', 'key_deposit', 'cleaning_deposit', 'utility_deposit',
   'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
   'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
   'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
@@ -3556,6 +3561,7 @@ export interface FeeTypeMeta {
 export const FEE_TYPE_META: Record<FeeType, FeeTypeMeta> = {
   security_deposit:       { isRefundable: true,  dueTiming: 'move_in' },
   pet_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
+  utility_deposit:        { isRefundable: true,  dueTiming: 'move_in' },
   key_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
   cleaning_deposit:       { isRefundable: true,  dueTiming: 'move_in' },
   move_in_fee:            { isRefundable: false, dueTiming: 'move_in' },
@@ -3634,6 +3640,7 @@ function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
 export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {
   security_deposit:       makeFeeRowSpec('security_deposit'),
   pet_deposit:            makeFeeRowSpec('pet_deposit'),
+  utility_deposit:        makeFeeRowSpec('utility_deposit'),
   key_deposit:            makeFeeRowSpec('key_deposit'),
   cleaning_deposit:       makeFeeRowSpec('cleaning_deposit'),
   move_in_fee:            makeFeeRowSpec('move_in_fee'),

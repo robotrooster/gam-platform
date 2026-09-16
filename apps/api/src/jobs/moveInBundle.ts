@@ -45,7 +45,8 @@ export interface MoveInBundleResult {
  * everything else to 'SUBSCRIP'.
  */
 function entryDescriptionForFeeType(feeType: string): 'DEPOSIT' | 'RENT' | 'SUBSCRIP' {
-  if (feeType === 'pet_deposit' || feeType === 'key_deposit' || feeType === 'cleaning_deposit') return 'DEPOSIT'
+  if (feeType === 'pet_deposit' || feeType === 'key_deposit' || feeType === 'cleaning_deposit'
+    || feeType === 'utility_deposit') return 'DEPOSIT'
   if (feeType === 'last_month_rent') return 'RENT'
   return 'SUBSCRIP'
 }
