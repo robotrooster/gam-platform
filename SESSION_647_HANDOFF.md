@@ -207,3 +207,4 @@ Native apps would also unlock Tap to Pay on iPhone and the M2 reader.
 - Every unit action is scoped to its property; unit numbers repeat across parks.
 - Rent is pay-in-full platform-wide.
 - A person with two roles gets two real email addresses.
+- **Handoff routine (Nic, S647):** write the handoff → commit → `git push origin main` → confirm nothing is left unpushed → only then clear context.
