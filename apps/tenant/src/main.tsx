@@ -604,6 +604,22 @@ function Layout() {
   // S571: My Walkthroughs is now a permanent tab inside the Communication
   // dashboard (its own empty state covers the no-videos case), so the old
   // conditional top-level nav link + its probe query were removed.
+
+  // S648 (Nic): A LEASE WAITING ON THEM IS THE ONLY THING THEY SEE.
+  //
+  //   "When they sign in, and they have not signed the lease, the lease is the
+  //    only thing to see. It just takes them straight into signing flow.
+  //    There's no way to back out of it. There's no way to log out of it. They
+  //    just have to close out the window."
+  //
+  // Only when it is THEIR turn: a resident who has signed and is waiting on a
+  // co-tenant, or whose landlord has not signed yet, has nothing to do there.
+  // The signing page lives outside this shell, so it has no nav and no sign-out;
+  // every portal route sends them back to it until their signature is in.
+  const mustSign = !!(tenantMe as any)?.pendingLeaseDocumentId
+    && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true
+  if (mustSign) return <Navigate to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} replace />
+
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />

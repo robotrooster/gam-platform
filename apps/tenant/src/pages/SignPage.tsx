@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery, useMutation } from 'react-query'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -303,6 +303,7 @@ function renderScaleFor(cssScale: number, baseWidth: number, baseHeight: number)
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
+  const qc = useQueryClient()
   // S633 (Nic): a tenant on a phone could not scroll far enough to confirm their
   // signature font. This portal locks the document on purpose — `.shell` is the
   // scrolling region and body is overflow:hidden — but a lease opened from an
@@ -389,7 +390,12 @@ export function SignPage() {
         .map(([fieldId,value])=>({ fieldId, value, fontCss: fieldFonts[fieldId] || null })) }) })
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
-    { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },
+    { onSuccess:(res:any)=>{
+        clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done')
+        // S648: the portal holds a resident on this page until they have
+        // signed. Drop the cached "still to sign" so it lets them in now.
+        qc.invalidateQueries('tenant-me-theme'); qc.invalidateQueries('tenant-me'); qc.invalidateQueries('pending-docs')
+      },
       onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
   // ── S636: A SIGNING PAGE HEALS ITSELF, IT DOES NOT ASK ──────────────
