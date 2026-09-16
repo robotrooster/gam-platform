@@ -209,10 +209,32 @@ function columnFor(ctx: string): string | null {
   // due_timing='move_in', and the move-in invoice even books it as RENT). It
   // must be tested BEFORE rent_amount, since "rent pre-payment" contains "rent".
   if (/pre-?pay|prepaid rent|last month.?s? rent|advance rent/.test(c)) return 'last_month_rent'
-  if (/installments of|monthly installments|rental rate|monthly rent|first month.?s rent/.test(c)) return 'rent_amount'
+  // S648 (Nic): the move-in cost table is the move-in invoice. Its lines are
+  // their own tags now, checked BEFORE rent_amount ("first month's rent"
+  // contains "rent") so a new landlord's upload links them the way Nic's
+  // templates are linked. The landlord can still re-tag any box in the editor.
+  if (/first month.?s rent|first month rent/.test(c)) return 'move_in_first_month_rent'
+  if (/pro-?rat/.test(c)) return 'move_in_proration'
+  if (/total (amount )?due|total move.?in|amount due (at|upon|before) move|due at (move.?in|signing)/.test(c)) return 'move_in_total_due'
+  if (/installments of|monthly installments|rental rate|monthly rent/.test(c)) return 'rent_amount'
   if (/security deposit/.test(c)) return 'security_deposit'
+  // S648: every fee type a property can list, so the boxes link to them.
   if (/pet deposit/.test(c)) return 'pet_deposit'
+  if (/pet rent/.test(c)) return 'pet_rent'
   if (/pet fee/.test(c)) return 'pet_fee'
+  if (/utility deposit/.test(c)) return 'utility_deposit'
+  if (/key (deposit|fob deposit)/.test(c)) return 'key_deposit'
+  if (/cleaning deposit/.test(c)) return 'cleaning_deposit'
+  if (/cleaning fee/.test(c)) return 'cleaning_fee'
+  if (/move.?in fee/.test(c)) return 'move_in_fee'
+  if (/lease (prep|preparation|processing) fee|admin(istrative)? fee/.test(c)) return 'lease_prep_fee'
+  if (/hoa transfer/.test(c)) return 'hoa_transfer_fee'
+  if (/parking (rent|fee)/.test(c)) return 'parking_rent'
+  if (/storage (rent|fee)/.test(c)) return 'storage_rent'
+  if (/trash (fee|service)/.test(c)) return 'trash_fee'
+  if (/pest control/.test(c)) return 'pest_control_fee'
+  if (/technology fee|tech fee/.test(c)) return 'technology_fee'
+  if (/early termination|lease break fee/.test(c)) return 'early_termination_fee'
   if (/guest fee/.test(c)) return 'other_fee'
   if (/e-?mail|email/.test(c)) return 'tenant_email'
   if (/property address|premises.*address|address of (the )?premises/.test(c)) return 'property_address'
@@ -800,7 +822,9 @@ function sanitize(r: any, t: RawTarget): Classification {
   const hCol = h.leaseColumn
   if (hCol && hCol !== col) {
     const hCat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[hCol]
-    if (hCat === 'writable' || hCat === 'fee_row') col = hCol
+    // S648: the computed page 8 lines too — a model that calls "Total due"
+    // the rent would make it the monthly rent.
+    if (hCat === 'writable' || hCat === 'fee_row' || String(hCol).startsWith('move_in_')) col = hCol
   }
   let split: 'per_tenant' | 'none' = r.split === 'per_tenant' ? 'per_tenant' : 'none'
   const label = typeof r.label === 'string' && r.label ? r.label.slice(0, 60) : h.label
@@ -1670,7 +1694,12 @@ export async function autoPlaceFields(
     const cat = (LEASE_COLUMN_CATEGORY as Record<string, string>)[col]
     if (cat !== 'writable' && cat !== 'fee_row') continue
     if (claimed.has(col)) {
-      f.leaseColumn = null   // display-only from here on
+      // S648: a second security-deposit box sitting in the move-in table is
+      // that table's deposit line — the system copies page 2 into it.
+      const inMoveInTable = col === 'security_deposit' && ordered.some(o => o.page === f.page
+        && ['move_in_first_month_rent', 'move_in_proration', 'move_in_total_due', 'last_month_rent']
+          .includes(String(o.leaseColumn)))
+      f.leaseColumn = inMoveInTable ? 'move_in_security_deposit' : null   // else display-only
       continue
     }
     claimed.add(col)

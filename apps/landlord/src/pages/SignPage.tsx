@@ -416,8 +416,8 @@ export function SignPage() {
     const want: Record<string, string> = {}
     const rent = moneyBoxValue(val('rent_amount'))
     if (existing) {
-      want.move_in_first_month_rent = rent.toFixed(2)
-      want.move_in_proration = '0.00'
+      want['move_in_first_month_rent'] = rent.toFixed(2)
+      want['move_in_proration'] = '0.00'
       for (const t of moveInFeeTags) want[t] = '0.00'
     } else {
       // Proration follows the start date and rent until the landlord types
@@ -426,15 +426,15 @@ export function SignPage() {
       const current = val('move_in_proration')
       const auto = start ? prorateMoveInRent(rent, start).toFixed(2) : null
       if (auto != null && (current == null || current === autoProration.current)) {
-        want.move_in_proration = auto
+        want['move_in_proration'] = auto
         autoProration.current = auto
       }
     }
-    const first = want.move_in_first_month_rent ?? val('move_in_first_month_rent')
-    const prorate = want.move_in_proration ?? val('move_in_proration')
+    const first = want['move_in_first_month_rent'] ?? val('move_in_first_month_rent')
+    const prorate = want['move_in_proration'] ?? val('move_in_proration')
     const deposit = moveInDepositMirror(val('security_deposit'), existing)
-    want.move_in_security_deposit = deposit.toFixed(2)
-    want.move_in_total_due = moveInTotalDue({
+    want['move_in_security_deposit'] = deposit.toFixed(2)
+    want['move_in_total_due'] = moveInTotalDue({
       firstMonthRent: first, proration: prorate, depositMirror: deposit,
       moveInFees: moveInFeeTags.map(t => want[t] ?? val(t)),
     }).toFixed(2)
