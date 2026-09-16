@@ -194,11 +194,17 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+        {/* S646 (Nic): a single flex row pushed the last button past the edge of
+            this modal — "the money order button is almost overlapping the edge
+            of the small window that pops up." Two rows of two, every button the
+            same size, so no label can crowd the others out however it is worded. */}
+        <div style={{
+          display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 12,
+        }}>
           {MANUAL_PAYMENT_METHODS.map(m => (
             <button key={m} onClick={() => { setMethod(m); setReference(''); setTendered('') }}
               className={`btn btn-sm ${method === m ? 'btn-primary' : 'btn-ghost'}`}
-              style={{ flex: 1 }}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</button>
+              style={{ width: '100%' }}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</button>
           ))}
         </div>
 

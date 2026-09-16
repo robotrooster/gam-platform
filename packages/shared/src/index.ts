@@ -4775,9 +4775,15 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
   // the fee is for a payment handled and recorded BY HAND, not for the paper it
   // arrived on, so splitting instruments would create work with no difference in
   // outcome and simply move the argument to the next one (certified check, bank
-  // draft, traveller's cheque). The label names the common variants instead, so
-  // "it doesn't say cashier's check" is not an argument anyone can make.
-  check: 'Check (incl. cashier\'s or certified)',
+  // draft, traveller's cheque).
+  //
+  // S646 (Nic) — THE LABEL LOST THE PARENTHETICAL. It used to read "Check (incl.
+  // cashier's or certified)" to head off the argument. Nic: "we should remove
+  // that part. It's either check or money order. A cashier's check is a check."
+  // The value never split, so nothing about how these are handled changed; the
+  // button just stopped explaining itself at the cost of being wider than the
+  // window it sits in.
+  check: 'Check',
   money_order: 'Money order',
 }
 // S624 (Nic): DROPPED FROM $10 TO $6 — the same flat figure as ACH.
