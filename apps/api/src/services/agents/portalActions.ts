@@ -757,6 +757,24 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_rent_due_rule',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/rent-due-rule',
+    pathParams: ['propertyId'],
+    description:
+      'Set when rent is due at one property: everyone on the same day of the month (mode fixed_day, ' +
+      'with day 1–28), or each tenant on their own move-in day with no proration (mode move_in_day — ' +
+      'a move-in on the 29th–31st is due on the 1st). It applies to leases drafted from now on; signed ' +
+      'leases keep the day they state. Read the choice back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      mode: { type: 'string', description: 'fixed_day or move_in_day.' },
+      day: { type: 'integer', description: 'For fixed_day: the day of the month, 1–28.' },
+    },
+    required: ['propertyId', 'mode'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_move_in_collection',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/move-in-collection',

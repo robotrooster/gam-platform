@@ -27,6 +27,9 @@ import {
   FEE_TYPES,
   FEE_TYPE_META,
   moveInDefaults,
+  leaseDueDay,
+  dueDayLabel,
+  parseDueDay,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -365,10 +368,24 @@ export async function createDocumentRecord(client: any, opts: {
     for (const [col, val] of Object.entries(suggested)) {
       if (val && (pv[col] == null || pv[col] === '')) pv[col] = val // caller-supplied wins
     }
-    // S582: rent due day is PLATFORM-LOCKED to the 1st — force the value so any
-    // placed rent_due_day box renders "the 1st" in the signed lease (the landlord
-    // never chooses it). Overrides any caller value on purpose.
-    pv.rent_due_day = '1st'
+    // S582 forced "1st" here. S648 (Nic): the property decides — the 1st, a
+    // fixed day, or each tenant's move-in day — and the landlord may change it
+    // for one tenant on the lease. An onboarding resident keeps the property's
+    // fixed day: their GAM start date is not when they moved in.
+    if (pv.rent_due_day == null || pv.rent_due_day === '') {
+      const rule = await client.query(
+        `SELECT p.rent_due_mode, p.rent_due_day,
+                EXISTS (SELECT 1 FROM pending_tenant_intents i WHERE i.unit_id = u.id
+                          AND i.cancelled_at IS NULL AND i.resolved_at IS NULL
+                          AND COALESCE(i.is_existing_tenancy, false)) AS existing
+           FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+        [opts.unitId]).then((r: any) => r.rows[0])
+      pv.rent_due_day = dueDayLabel(leaseDueDay({
+        mode: rule?.existing ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
+        propertyDay: rule?.rent_due_day ?? 1,
+        startIso: pv.start_date ?? null,
+      }))
+    }
   }
 
   // Copy template fields — match by signer_role, prune unused role slots
@@ -525,14 +542,16 @@ export async function createDocumentRecord(client: any, opts: {
           // S648: page 8's rent lines start from the lease's own terms. The
           // deposit copy and the total are stamped after the fields exist
           // (restampMoveInBoxes, below).
-          const collects = await client.query(
-            `SELECT p.move_in_collects_next_period AS on FROM units u
+          const prop = await client.query(
+            `SELECT p.move_in_collects_next_period AS on, p.rent_due_mode FROM units u
                JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [opts.unitId])
-            .then((r: any) => r.rows[0]?.on === true)
+            .then((r: any) => r.rows[0])
           const d = moveInDefaults({
             rent: Number(prefillValues.rent_amount ?? ctx.rent_amount ?? 0),
             startIso: prefillValues.start_date ?? null,
-            existingTenancy, collectsNextPeriod: collects,
+            existingTenancy, collectsNextPeriod: prop?.on === true,
+            dueDay: parseDueDay(prefillValues.rent_due_day) ?? 1,
+            mode: existingTenancy ? 'fixed_day' : prop?.rent_due_mode,
           })
           if (prefillValues.move_in_first_month_rent == null)
             prefillValues.move_in_first_month_rent = d.firstMonthRent.toFixed(2)
@@ -971,6 +990,23 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       writableValues.push(val)
       paramIdx++
     }
+  }
+  // S648: a lease with no readable due day takes the property's rule.
+  if (!writableCols.includes('rent_due_day')) {
+    const rule = await client.query(
+      `SELECT p.rent_due_mode, p.rent_due_day FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`, [doc.unit_id]).then((r: any) => r.rows[0])
+    const existingRule = await client.query(
+      `SELECT bool_or(COALESCE(is_existing_tenancy, false)) AS e FROM pending_tenant_intents
+        WHERE unit_id = $1 AND cancelled_at IS NULL`, [doc.unit_id]).then((r: any) => r.rows[0]?.e === true)
+    writableCols.push('rent_due_day')
+    writablePlaceholders.push('$' + paramIdx)
+    writableValues.push(leaseDueDay({
+      mode: existingRule ? 'fixed_day' : (rule?.rent_due_mode ?? 'fixed_day'),
+      propertyDay: rule?.rent_due_day ?? 1,
+      startIso: vals.start_date ? String(vals.start_date).slice(0, 10) : null,
+    }))
+    paramIdx++
   }
   // Fixed-shape tail columns (not driven by lease_column fields)
   // S647: has every non-landlord signer finished? At issuance the answer is no —
@@ -4578,7 +4614,13 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     const existing_tenancy = doc.document_type === 'original_lease'
       ? await isExistingTenancyDocument({ query: async (t: string, v: any[]) => ({ rows: await query<any>(t, v) }) }, doc.id)
       : false
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, existing_tenancy, readOnly, waitingOn, packageDocs } })
+    // S648: how this property sets due days, so the page can follow the start date.
+    const rent_due_mode = doc.unit_id
+      ? (await queryOne<{ m: string }>(
+          `SELECT p.rent_due_mode AS m FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+          [doc.unit_id]))?.m ?? 'fixed_day'
+      : 'fixed_day'
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, existing_tenancy, rent_due_mode, readOnly, waitingOn, packageDocs } })
   } catch (e) { next(e) }
 })
 

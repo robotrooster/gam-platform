@@ -66,6 +66,34 @@ export function lastBusinessDayOfMonth(year: number, month: number): string {
   }
 }
 
+/**
+ * S648 (Nic): the last business day BEFORE a date — weekends and US federal
+ * holidays skipped, the same walk as the month-end rule. "If their due date is
+ * going to be Monday, read it on Friday. If their due date is going to be on
+ * Friday, read it on Thursday... read it the last business day before the due
+ * date, but also not a holiday. Same way we do everything else."
+ */
+export function lastBusinessDayBefore(iso: string): string {
+  const d = new Date(iso.slice(0, 10) + 'T00:00:00Z')
+  for (;;) {
+    d.setUTCDate(d.getUTCDate() - 1)
+    const dow = d.getUTCDay()
+    if (dow !== 0 && dow !== 6 && !US_FEDERAL_HOLIDAYS.has(isoDate(d))) return isoDate(d)
+  }
+}
+
+/**
+ * When a meter in cycle `cycleMonth` is read: the last business day before its
+ * tenant's due date in the following month. Due on the 1st, that is the last
+ * business day of the cycle month — the day the run opens, as it always was.
+ */
+export function meterReadBy(cycleMonth: string, dueDay: number): string {
+  const y = Number(cycleMonth.slice(0, 4)), m = Number(cycleMonth.slice(5, 7))
+  const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1
+  const due = `${ny}-${String(nm).padStart(2, '0')}-${String(Math.min(Math.max(dueDay, 1), 28)).padStart(2, '0')}`
+  return lastBusinessDayBefore(due)
+}
+
 export function todayInPhoenix(): string {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -233,7 +261,7 @@ async function notifyReadingRunOpened(
  * (active lease, primary tenant, lease carries the utility).
  */
 export async function getRunMeters(runId: string) {
-  return query<any>(
+  const rows = await query<any>(
     `SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits,
             m.rubs_basis,
             -- S631: enough to render the list as a task list — what is done and
@@ -251,7 +279,12 @@ export async function getRunMeters(runId: string) {
                      WHERE mmu.meter_id = m.id) AS has_submetered_units,
             u.id AS unit_id, u.unit_number,
             (cur.id IS NOT NULL) AS is_read,
-            (t.tenant_id IS NOT NULL) AS will_bill
+            (t.tenant_id IS NOT NULL) AS will_bill,
+            to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle_month,
+            -- S648: the tenant's due day decides when their meter is read.
+            (SELECT l2.rent_due_day FROM leases l2
+              WHERE l2.unit_id = u.id AND l2.status = 'active'
+              ORDER BY l2.start_date DESC LIMIT 1) AS due_day
        FROM utility_reading_runs r
        JOIN utility_meters m ON m.property_id = r.property_id
                             AND m.billing_method IN ('submeter','rubs')
@@ -278,6 +311,15 @@ export async function getRunMeters(runId: string) {
       WHERE r.id = $1
       ORDER BY u.unit_number NULLS LAST, m.utility_type, m.label`,
     [runId])
+  // S648 (Nic): a tenant billed on their own day has their meter read the last
+  // business day before THAT day, so their usage lines up with their bill.
+  // Submeters only — a RUBS master is read off the provider's bill.
+  const today = todayInPhoenix()
+  return rows.map(r => {
+    const readBy = r.billing_method === 'submeter' && r.due_day && Number(r.due_day) !== 1
+      ? meterReadBy(r.cycle_month, Number(r.due_day)) : null
+    return { ...r, read_by: readBy, not_yet: !!readBy && !r.is_read && today < readBy }
+  })
 }
 
 // ── Double-check verification phase (S533) ───────────────────────────

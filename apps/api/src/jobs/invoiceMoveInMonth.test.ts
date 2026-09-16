@@ -48,40 +48,53 @@ async function rentDueDates(leaseId: string): Promise<string[]> {
 }
 
 describe('move-in month is never double-billed by daily generation', () => {
-  it('mid-month rent_due_day, start on the 1st: no second start-month invoice', async () => {
-    // Start May 1 (move-in bills full May), rent due on the 15th.
+  // S648 (Nic): rent can be due on a day other than the 1st, and the move-in
+  // invoice now covers the move-in day UP TO the next due date — not the whole
+  // calendar month. So a due date inside the start month is a real bill, and
+  // every period is billed exactly once. (Before S648 the move-in charged the
+  // whole start month and that due date was skipped instead.)
+  const rentsOf = async (leaseId: string) => (await db.query<{ d: string; a: number }>(
+    `SELECT to_char(due_date,'YYYY-MM-DD') AS d, amount::float AS a FROM payments
+      WHERE lease_id=$1 AND type='rent' ORDER BY due_date`, [leaseId])).rows
+
+  it('due on the 15th, start on the 1st: move-in covers May 1–14, May 15 bills', async () => {
     const s = await seedStack({ startDate: '2026-05-01', rentDueDay: 15 })
     await genMoveIn({
       lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
       landlord_id: s.landlordId, rent_amount: 1000, start_date: '2026-05-01',
     } as any)
     await backfill({ from: '2026-05-01', to: '2026-07-31', leaseId: s.leaseId })
-
-    const dates = await rentDueDates(s.leaseId)
-    // Move-in occupies May 1; NO May 15 second invoice; June 15 + July 15 bill.
-    expect(dates).toContain('2026-05-01')
-    expect(dates).not.toContain('2026-05-15')
-    expect(dates).toContain('2026-06-15')
-    expect(dates).toContain('2026-07-15')
-    // Exactly one rent row inside the start month.
-    expect(dates.filter(d => d.startsWith('2026-05'))).toHaveLength(1)
+    // Apr 15 → May 15 is 30 days; May 1–14 is 14 of them.
+    expect(await rentsOf(s.leaseId)).toEqual([
+      { d: '2026-05-01', a: 466.67 }, { d: '2026-05-15', a: 1000 },
+      { d: '2026-06-15', a: 1000 }, { d: '2026-07-15', a: 1000 },
+    ])
   })
 
-  it('mid-month start AND mid-month due day: start month billed only by move-in', async () => {
-    // Start May 5 (move-in prorates May 5–31), rent due on the 20th.
+  it('due on the 20th, start on the 5th: move-in covers May 5–19, each period once', async () => {
     const s = await seedStack({ startDate: '2026-05-05', rentDueDay: 20 })
     await genMoveIn({
       lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
       landlord_id: s.landlordId, rent_amount: 1000, start_date: '2026-05-05',
     } as any)
     await backfill({ from: '2026-05-01', to: '2026-07-31', leaseId: s.leaseId })
+    // Apr 20 → May 20 is 30 days; May 5–19 is 15 of them.
+    expect(await rentsOf(s.leaseId)).toEqual([
+      { d: '2026-05-05', a: 500 }, { d: '2026-05-20', a: 1000 },
+      { d: '2026-06-20', a: 1000 }, { d: '2026-07-20', a: 1000 },
+    ])
+  })
 
-    const dates = await rentDueDates(s.leaseId)
-    expect(dates).toContain('2026-05-05')          // move-in
-    expect(dates).not.toContain('2026-05-20')      // the bug's phantom second charge
-    expect(dates.filter(d => d.startsWith('2026-05'))).toHaveLength(1)
-    expect(dates).toContain('2026-06-20')
-    expect(dates).toContain('2026-07-20')
+  it('due on the move-in day: a full first period, then monthly on that day', async () => {
+    const s = await seedStack({ startDate: '2026-05-20', rentDueDay: 20 })
+    await genMoveIn({
+      lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
+      landlord_id: s.landlordId, rent_amount: 1000, start_date: '2026-05-20',
+    } as any)
+    await backfill({ from: '2026-05-01', to: '2026-07-31', leaseId: s.leaseId })
+    expect(await rentsOf(s.leaseId)).toEqual([
+      { d: '2026-05-20', a: 1000 }, { d: '2026-06-20', a: 1000 }, { d: '2026-07-20', a: 1000 },
+    ])
   })
 
   it('rent_due_day=1 (the common case) is unchanged: later months bill', async () => {

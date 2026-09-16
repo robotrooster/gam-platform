@@ -479,11 +479,14 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     expect(vals.rent_due_day).toBe('1st') // landlord never chooses it — forced onto the doc
   })
 
-  it('S582: rent_due_day billing is LOCKED to 1 regardless of any document value', () => {
+  // S648 (Nic) lifted the S582 lock: the lease's due day is what bills; a
+  // missing or unreadable one falls back to the property's rule at build.
+  it('S648: rent_due_day bills the day the lease states', () => {
     const parse = (WRITABLE_LEASE_COLUMN_SPECS as any).rent_due_day.parse
-    expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 1 })
-    expect(parse({ rent_due_day: '1st' })).toEqual({ rent_due_day: 1 })
-    expect(parse({})).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 15 })
+    expect(parse({ rent_due_day: 'the 1st' })).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '31st' })).toEqual({})
+    expect(parse({})).toEqual({})
   })
 
   it('leaves the deposit BLANK when the template states no deposit_months (never invents one)', async () => {

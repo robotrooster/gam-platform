@@ -1757,3 +1757,33 @@ describe('S631 a second person cannot silently replace a read', () => {
     expect(Number(kept.rows[0].v)).toBe(123)
   })
 })
+
+// S648 (Nic): a tenant billed on their own day is read the last business day
+// before it — never earlier, or their period is cut short.
+describe('S648 per-tenant read-by dates', () => {
+  it('shows the read-by date and refuses an early reading', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(`UPDATE leases SET rent_due_day = 28 WHERE id = $1`, [f.leaseAId])
+    // This month's cycle: its read-by date (the business day before the 28th
+    // of next month) is always in the future.
+    const now = new Date()
+    const cycle = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+    const opened = await request(app).post('/api/utility/reading-runs')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ propertyId: f.propertyAId, cycleMonth: cycle })
+    expect(opened.status).toBe(201)
+    const runId = opened.body.data.id
+    const meters = await request(app).get(`/api/utility/reading-runs/${runId}/meters`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    const leased = meters.body.data.find((m: any) => (m.meter_id ?? m.meterId) === f.meterLeased)
+    expect(leased.not_yet ?? leased.notYet).toBe(true)
+    expect(String(leased.read_by ?? leased.readBy)).toMatch(/-2[0-7]$/)
+    const vacant = meters.body.data.find((m: any) => (m.meter_id ?? m.meterId) === f.meterVacant)
+    expect(vacant.not_yet ?? vacant.notYet).toBe(false)
+
+    const early = await enterReading(app, f, runId, f.meterLeased, 1100)
+    expect(early.status).toBe(409)
+    const ok = await enterReading(app, f, runId, f.meterVacant, 600)
+    expect(ok.status).toBe(201)
+  })
+})

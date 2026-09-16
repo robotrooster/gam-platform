@@ -27,6 +27,7 @@ import {
   timezoneForState,
   FEE_TYPES,
   type FeeType,
+  RENT_DUE_MODES,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -1052,6 +1053,26 @@ propertiesRouter.post('/:id/onboarding-complete', requirePerm('properties.edit')
     if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
     await closeOnboardingWindow(req.params.id)
     res.json({ success: true, data: await getOnboardingWindow(req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/rent-due-rule — S648 (Nic). When rent is due at
+// this property: every lease on one fixed day (1–28), or each lease on its own
+// move-in day. Applies to leases drafted from now on; a signed lease keeps the
+// day it states, and a landlord may still set one tenant's own day on a lease.
+propertiesRouter.patch('/:id/rent-due-rule', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      mode: z.enum(RENT_DUE_MODES),
+      day: z.number().int().min(1).max(28).optional(),
+    }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(
+      `UPDATE properties SET rent_due_mode = $2, rent_due_day = COALESCE($3, rent_due_day), updated_at = NOW()
+        WHERE id = $1`, [req.params.id, body.mode, body.day ?? null])
+    res.json({ success: true, data: { propertyId: req.params.id, rentDueMode: body.mode, rentDueDay: body.day } })
   } catch (e) { next(e) }
 })
 

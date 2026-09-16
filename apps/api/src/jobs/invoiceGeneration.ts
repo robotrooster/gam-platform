@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon'
 // S624: the month-close settlement model. This file OPENS a period; the credit
 // itself is applied by jobs/workTradeSettlement.ts once the month is over.
+import { nextDueDateAfter } from '@gam/shared'
 import { proratedTarget, hourRateFor } from '../services/workTradeSettlement'
 import { formatInvoiceNumber } from '@gam/shared'
 import { getClient, query, queryOne } from '../db'
@@ -315,16 +316,29 @@ async function runGeneration(
     // lease start — so a start-month match is necessarily on/after move-in;
     // it can never drop a legitimately earlier same-month cycle.)
     const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
-    let dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
-    // S648 (Nic): a new tenant who moved in mid-month and paid page 8's
-    // "first month's rent" on top of the proration has ALREADY paid the next
-    // due date. Billing it again would charge that month twice.
+    const dueDay = Number(lease.rent_due_day) || 1
+    let dueDates: string[]
+    if (lease.is_existing_tenancy || dueDay === 1) {
+      dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
+    } else {
+      // S648 (Nic): rent due on another day (a fixed 15th, or the tenant's
+      // move-in day). The move-in invoice covers the start date up to the next
+      // due date — which may fall inside the start month — so everything
+      // before that date is already billed; the start-month rule above would
+      // skip a real due date (move in the 5th, due the 15th) or double-bill.
+      const firstRegular = nextDueDateAfter(lease.start_date, dueDay)
+      dueDates = candidateDueDates.filter(d => d >= firstRegular)
+    }
+    // S648 (Nic): a new tenant who moved in between due dates and paid page
+    // 8's "first month's rent" on top of the proration has ALREADY paid the
+    // next due date. Billing it again would charge that month twice.
     const paidNextAtMoveIn = !lease.is_existing_tenancy
       && Number(lease.move_in_first_month_rent ?? 0) > 0
-      && Number(lease.start_date.slice(8, 10)) !== Number(lease.rent_due_day)
+      && Number(lease.start_date.slice(8, 10)) !== dueDay
     if (paidNextAtMoveIn) {
-      const firstAfter = dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), lease.rent_due_day)
-        .find(d => d.slice(0, 7) !== startMonth)
+      const firstAfter = dueDay === 1
+        ? dueDatesInRange(leaseStart, leaseStart.plus({ months: 2 }), dueDay).find(d => d.slice(0, 7) !== startMonth)
+        : nextDueDateAfter(lease.start_date, dueDay)
       if (firstAfter) dueDates = dueDates.filter(d => d !== firstAfter)
     }
     if (dueDates.length === 0) continue

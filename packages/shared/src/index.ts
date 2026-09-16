@@ -660,11 +660,11 @@ export function isLateFeeColumn(col: string | null | undefined): boolean {
 }
 
 // S582: platform-locked lease columns — auto-inserted, non-editable in the
-// template editor and at signing. late-fee columns (policy-controlled) +
-// rent_due_day (LOCKED to the 1st — see WRITABLE_LEASE_COLUMN_SPECS). The landlord
-// never chooses these; they're stamped so the signed doc states them verbatim.
+// template editor and at signing: the late-fee columns (policy-controlled).
+// S648: rent_due_day is no longer locked — it starts from the property's rule
+// and a landlord may put one tenant on their own date (Nic).
 export function isLockedLeaseColumn(col: string | null | undefined): boolean {
-  return isLateFeeColumn(col) || col === 'rent_due_day'
+  return isLateFeeColumn(col)
 }
 
 // S635 (Nic, DIRECTIVE): "the tenant names and the names of the occupants both
@@ -3327,14 +3327,14 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
   // S196: security_deposit removed from WRITABLE specs. The fee_row
   // pipeline (FEE_ROW_SPECS) now handles it as a lease_fees row.
   rent_due_day: {
-    // S582 (Nic): PLATFORM-LOCKED to the 1st. Rent is always due on the 1st of
-    // the month for every lease; a mid-month move-in is prorated (moveInBundle)
-    // and full months bill from the 1st. This removes per-lease due-day drift (a
-    // past double-billing bug class) and preserves FlexPay's value prop — a
-    // move-in-day due date would give a mid-month-paid tenant no reason to enroll.
-    // Ignores any document value on purpose (the rent_due_day box is no longer
-    // placed — see services/autoFieldPlacement.ts — so no signed doc conflicts).
-    parse: () => ({ rent_due_day: 1 }),
+    // S582 locked this to the 1st. S648 (Nic) lifts it: the property decides
+    // (the 1st, a fixed day, or each tenant's move-in day) and a landlord may
+    // set one tenant's own date on the lease. What the lease says is what
+    // bills. No readable day → the builder applies the property's rule.
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => {
+      const d = parseDueDay(v.rent_due_day)
+      return d == null ? {} : { rent_due_day: d }
+    },
   },
   lease_type: {
     // S535 (Nic): no end date ('' or '-') ⇒ the lease IS month-to-month,
@@ -4757,6 +4757,7 @@ export * from './chatCadence'
 export * from './paymentAllocation'
 export * from './creditAllocation'
 export * from './moveInCharges'
+import { parseDueDay } from './moveInCharges'
 export * from './camelize'
 export * from './versionWatch'
 export * from './autoPlaceEstimate'

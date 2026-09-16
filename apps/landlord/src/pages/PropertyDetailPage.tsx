@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize } from '@gam/shared'
+import { humanize, dueDayLabel } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
@@ -719,27 +719,61 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
   )
 }
 
-// S648 (Nic): "billing a new move-in collects the mid-month and the next month
-// all at the same time, or they just want the prorated amount and bill the
-// rest on the first with the regular billing cycle." One answer per property,
-// so everyone moving in there is asked for the same up front.
+// S648 (Nic): WHEN RENT IS DUE, AND WHAT A MID-MONTH MOVE-IN PAYS.
+//   "Calendar month: prorate from the move-in date... Move-in anniversary: bill
+//    on the day of the month the tenant moved in with no proration." "Maybe
+//    their due date is just going to be the 15th of each month."
+//   "billing a new move-in collects the mid-month and the next month all at the
+//    same time, or they just want the prorated amount."
+// One answer per property, so everyone moving in there is treated alike. A
+// landlord can still set one tenant's own due day on that tenant's lease.
 function MoveInCollectionCard({ property, onSaved }: { property: any; onSaved: () => void }) {
-  const set = useMutation(
+  const collect = useMutation(
     (collectsNextPeriod: boolean) => apiPatch(`/properties/${property.id}/move-in-collection`, { collectsNextPeriod }),
     { onSuccess: onSaved })
+  const rule = useMutation(
+    (b: { mode: string; day?: number }) => apiPatch(`/properties/${property.id}/rent-due-rule`, b),
+    { onSuccess: onSaved })
   const on = !!property.moveInCollectsNextPeriod
+  const mode = property.rentDueMode || 'fixed_day'
+  const day = Number(property.rentDueDay || 1)
+  const busy = collect.isLoading || rule.isLoading
   return (
     <div className="card" style={{ padding: 14, marginBottom: 20 }}>
-      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>New tenants moving in mid-month</div>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When rent is due</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
-        What page 8 of the lease asks for at move-in. Applies to everyone moving in at this property.
+        Applies to leases drafted from now on. You can still give one tenant their own due day on their lease.
       </div>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
-          onClick={() => on && set.mutate(false)}>Prorated rent only</button>
-        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={set.isLoading}
-          onClick={() => !on && set.mutate(true)}>Prorated rent plus the next month</button>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+        <button className={`btn btn-sm ${mode === 'fixed_day' ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => mode !== 'fixed_day' && rule.mutate({ mode: 'fixed_day', day })}>Everyone on the same day</button>
+        <button className={`btn btn-sm ${mode === 'move_in_day' ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => mode !== 'move_in_day' && rule.mutate({ mode: 'move_in_day' })}>Each tenant&apos;s move-in day</button>
+        {mode === 'fixed_day' && (
+          <label style={{ fontSize: '.8rem', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            Due on the
+            <select className="input" value={day} disabled={busy} style={{ width: 80, fontSize: '.8rem', padding: '4px 6px' }}
+              onChange={e => rule.mutate({ mode: 'fixed_day', day: Number(e.target.value) })}>
+              {Array.from({ length: 28 }, (_, i) => i + 1).map(d => <option key={d} value={d}>{dueDayLabel(d)}</option>)}
+            </select>
+          </label>
+        )}
       </div>
+      {mode === 'move_in_day' ? (
+        <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+          No proration: the first month runs from the move-in day. Anyone moving in on the 29th–31st is due on the 1st.
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 6 }}>New tenants moving in between due dates pay:</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+              onClick={() => on && collect.mutate(false)}>Prorated rent only</button>
+            <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+              onClick={() => !on && collect.mutate(true)}>Prorated rent plus the next month</button>
+          </div>
+        </>
+      )}
     </div>
   )
 }

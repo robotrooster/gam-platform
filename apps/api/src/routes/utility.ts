@@ -1238,6 +1238,17 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     if (meter.billing_method !== 'rubs' && body.readingValue >= modulus) {
       throw new AppError(400, `Reading exceeds this meter's ${meter.digits}-digit capacity`)
     }
+    // S648 (Nic): a tenant billed on their own day is read the last business
+    // day before it. Reading early would cut their period short and push the
+    // difference onto next month's bill.
+    if (meter.billing_method === 'submeter') {
+      const { getRunMeters } = await import('../services/utilityReadingRuns')
+      const row = (await getRunMeters(run.id)).find((x: any) => x.meter_id === meter.id && x.not_yet)
+      if (row) {
+        throw new AppError(409,
+          `${row.unit_number || meter.label} is read on ${row.read_by}, the last business day before that tenant's due date.`)
+      }
+    }
     const isDollarMaster = meter.billing_method === 'rubs' && meter.rubs_basis === 'bill_amount'
     if (isDollarMaster && body.billAmount == null) {
       throw new AppError(400, 'This master bills from the utility bill total — enter the amount charged for this cycle')

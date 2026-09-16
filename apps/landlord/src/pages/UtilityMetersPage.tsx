@@ -1105,8 +1105,12 @@ function ReadingListForm({ run, meters, onDone, onClose }: {
       title: m.unitNumbers.length === 1 ? m.unitNumbers[0] : m.label,
       isMaster: m.billingMethod === 'rubs',
     }))
+    // S648: meters read later (tenants due on their own day) sit below the
+    // ones due now, ordered by when they are due.
     return all.sort((a, b) =>
       (a.isMaster ? 1 : 0) - (b.isMaster ? 1 : 0)
+      || (a.notYet ? 1 : 0) - (b.notYet ? 1 : 0)
+      || String(a.readBy ?? '').localeCompare(String(b.readBy ?? ''))
       || a.title.localeCompare(b.title, undefined, { numeric: true })
       || String(a.utilityType).localeCompare(String(b.utilityType)))
   }, [meters])
@@ -1165,7 +1169,8 @@ function ReadingListForm({ run, meters, onDone, onClose }: {
   }
 
   const doneCount = rows.filter(done).length
-  const leftCount = outstanding.filter(r => !savedIds.has(r.meterId)).length
+  const laterCount = outstanding.filter(r => r.notYet).length
+  const leftCount = outstanding.filter(r => !savedIds.has(r.meterId) && !r.notYet).length
   const chip = (key: string, label: string) => (
     <button key={key} type="button" onClick={() => setFilter(key)}
       style={{ padding:'3px 10px', borderRadius:20, fontSize:'.72rem', fontWeight:700, cursor:'pointer',
@@ -1216,6 +1221,12 @@ function ReadingListForm({ run, meters, onDone, onClose }: {
                   {UTILITY_ICONS[m.utilityType]} {m.utilityType}
                   {m.isMaster ? ' · master — total used this cycle, off the bill' : ` · ${m.digits}-digit read`}
                 </div>
+                {/* S648 (Nic): read the last business day before this tenant's due date. */}
+                {m.notYet && (
+                  <div style={{ fontSize:'.68rem', color:'var(--gold)' }}>
+                    Read on {new Date(m.readBy + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })} — the business day before this tenant&apos;s rent is due
+                  </div>
+                )}
                 {rowErr[m.meterId] && (
                   <div style={{ fontSize:'.68rem', color:'var(--red)' }}>{rowErr[m.meterId]}</div>
                 )}
@@ -1228,8 +1239,8 @@ function ReadingListForm({ run, meters, onDone, onClose }: {
                   // S631: once it is in, it is in. Locking the field is what stops
                   // a stray keystroke on a row you already finished — and this row
                   // is gone entirely next time the window opens.
-                  disabled={isDone}
-                  placeholder={isDone ? 'recorded' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
+                  disabled={isDone || m.notYet}
+                  placeholder={isDone ? 'recorded' : m.notYet ? 'not yet' : m.isMaster ? 'usage' : '0'.repeat(m.digits)}
                   value={values[m.meterId] ?? ''}
                   onChange={e => setValues(prev => ({ ...prev,
                     [m.meterId]: e.target.value.replace(/\D/g, '').slice(0, m.billingMethod === 'submeter' ? m.digits : 12) }))}
@@ -1257,7 +1268,8 @@ function ReadingListForm({ run, meters, onDone, onClose }: {
 
       <div className="modal-footer" style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
-          {leftCount === 0 ? 'Nothing left to read.' : `${leftCount} still to read`}
+          {leftCount === 0 ? 'Nothing left to read today.' : `${leftCount} still to read`}
+          {laterCount > 0 ? ` · ${laterCount} later this month` : ''}
         </span>
         <button className="btn btn-primary" onClick={onClose}>Done for now</button>
       </div>

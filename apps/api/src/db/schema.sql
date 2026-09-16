@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Zqejw6nNGIdyeW5FsljQVLSeU0aQFiFQ6CtHXNbBNYFcVvqFDjkfEEpauD3AfBb
+\restrict mhtNjce4ucJoFt05DfqveyVir6yzIyqTwxN3QqWKB1tteFNXnPrJD5OyY3Wqik0
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5618,6 +5618,7 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text, 'booking_draft'::text, 'application_draft'::text]))),
     CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
     CONSTRAINT leases_move_in_amounts_nonneg CHECK (((COALESCE(move_in_first_month_rent, (0)::numeric) >= (0)::numeric) AND (COALESCE(move_in_proration, (0)::numeric) >= (0)::numeric))),
+    CONSTRAINT leases_rent_due_day_range CHECK (((rent_due_day IS NULL) OR ((rent_due_day >= 1) AND (rent_due_day <= 28)))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
     CONSTRAINT leases_tenant_renewal_intent_check CHECK (((tenant_renewal_intent IS NULL) OR (tenant_renewal_intent = ANY (ARRAY['yes'::text, 'no'::text, 'unsure'::text]))))
@@ -7465,6 +7466,8 @@ CREATE TABLE public.properties (
     onboarding_late_fee_waiver boolean,
     estimates_stuck_meters boolean DEFAULT false NOT NULL,
     move_in_collects_next_period boolean DEFAULT false NOT NULL,
+    rent_due_mode text DEFAULT 'fixed_day'::text NOT NULL,
+    rent_due_day integer DEFAULT 1 NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -7482,6 +7485,8 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_propane_split_four_gte_min_check CHECK ((propane_split_four_min_gallons >= propane_split_min_gallons)),
     CONSTRAINT properties_propane_split_min_gallons_check CHECK ((propane_split_min_gallons > 0)),
     CONSTRAINT properties_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (booking_slug IS NOT NULL))),
+    CONSTRAINT properties_rent_due_day_check CHECK (((rent_due_day >= 1) AND (rent_due_day <= 28))),
+    CONSTRAINT properties_rent_due_mode_check CHECK ((rent_due_mode = ANY (ARRAY['fixed_day'::text, 'move_in_day'::text]))),
     CONSTRAINT properties_review_status_check CHECK ((review_status = ANY (ARRAY['active'::text, 'pending_review'::text, 'rejected'::text]))),
     CONSTRAINT properties_short_term_tax_rate_range CHECK (((short_term_tax_rate >= (0)::numeric) AND (short_term_tax_rate <= (100)::numeric))),
     CONSTRAINT properties_timezone_source_check CHECK ((timezone_source = ANY (ARRAY['derived'::text, 'manual'::text]))),
@@ -7585,6 +7590,13 @@ COMMENT ON COLUMN public.properties.estimates_stuck_meters IS 'S648: landlord se
 --
 
 COMMENT ON COLUMN public.properties.move_in_collects_next_period IS 'S648: TRUE = a new tenant moving in mid-cycle pays the proration AND the next full month at move-in (that regular bill is then skipped). FALSE = proration only; the next month bills on the regular cycle.';
+
+
+--
+-- Name: COLUMN properties.rent_due_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.rent_due_mode IS 'S648: fixed_day = every lease due on rent_due_day; move_in_day = each lease due on its move-in day (no proration; 29th-31st move-ins due on the 1st).';
 
 
 --
@@ -26737,5 +26749,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Zqejw6nNGIdyeW5FsljQVLSeU0aQFiFQ6CtHXNbBNYFcVvqFDjkfEEpauD3AfBb
+\unrestrict mhtNjce4ucJoFt05DfqveyVir6yzIyqTwxN3QqWKB1tteFNXnPrJD5OyY3Wqik0
 

@@ -1,4 +1,5 @@
 import { DateTime } from 'luxon'
+import { prorateMoveInRent } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
@@ -92,13 +93,17 @@ export function moveInRentAmount(
   rentAmount: number,
   startDate: string,
   isExistingTenancy = false,
+  // S648: the lease's due day. Proration runs to the NEXT due date, which is
+  // the 1st of next month only when rent is due on the 1st.
+  dueDay = 1,
 ): number {
   assertIsoDate(startDate, 'moveInRentAmount')
   // An existing tenancy always owes a whole month — the cycle it lands on is
   // decided by existingTenancyCycle(), not by how much of it had elapsed.
   if (isExistingTenancy) return roundHalfEvenCents(rentAmount)
   const dt = DateTime.fromISO(startDate, { zone: 'utc' })
-  if (dt.day === 1) return roundHalfEvenCents(rentAmount)
+  if (dt.day === dueDay) return roundHalfEvenCents(rentAmount)
+  if (dueDay !== 1) return prorateMoveInRent(rentAmount, startDate, dueDay)
   const dim = daysInMonth(dt.year, dt.month)
   const daysRemaining = dim - dt.day + 1
   return roundHalfEvenCents(rentAmount * daysRemaining / dim)
@@ -200,13 +205,15 @@ export async function generateMoveInInvoice(
     is_existing_tenancy: boolean; first_billing_cycle: string | null
     onboarding_late_fee_waiver: boolean
     move_in_first_month_rent: string | null; move_in_proration: string | null
+    rent_due_day: number
   }>(
     `SELECT l.lease_source, to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
             COALESCE(l.is_existing_tenancy, false) AS is_existing_tenancy,
             to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
             COALESCE(p.onboarding_late_fee_waiver, false) AS onboarding_late_fee_waiver,
             l.move_in_first_month_rent::text AS move_in_first_month_rent,
-            l.move_in_proration::text AS move_in_proration
+            l.move_in_proration::text AS move_in_proration,
+            COALESCE(l.rent_due_day, 1) AS rent_due_day
        FROM leases l
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
@@ -226,7 +233,8 @@ export async function generateMoveInInvoice(
     : (!leaseMeta?.is_existing_tenancy && leaseMeta?.move_in_first_month_rent != null
         && leaseMeta?.move_in_proration != null)
       ? roundHalfEvenCents(Number(leaseMeta.move_in_first_month_rent) + Number(leaseMeta.move_in_proration))
-      : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy)
+      : moveInRentAmount(inputs.rent_amount, inputs.start_date, !!leaseMeta?.is_existing_tenancy,
+          leaseMeta?.rent_due_day ?? 1)
 
   // S631: an existing tenancy's first invoice is dated the 1st of its billing
   // cycle, not the signing date. That is what makes it a September invoice for

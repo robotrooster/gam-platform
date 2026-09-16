@@ -3,7 +3,8 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone,
-  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent } from '@gam/shared'
+  FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent,
+  leaseDueDay, dueDayLabel, parseDueDay } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
 
@@ -397,6 +398,7 @@ export function SignPage() {
   // The server recomputes the same numbers when you sign (moveInBoxes.ts);
   // this is so the page you are signing already shows them.
   const autoProration = useRef<string | null>(null)
+  const autoDueDay = useRef<string | null>(null)
   useEffect(() => {
     if (!data?.fields) return
     const fs: any[] = data.fields
@@ -420,11 +422,26 @@ export function SignPage() {
       want['move_in_proration'] = '0.00'
       for (const t of moveInFeeTags) want[t] = '0.00'
     } else {
-      // Proration follows the start date and rent until the landlord types
-      // their own figure over it (a special) — then it is theirs.
       const start = toIso(val('start_date'))
+      // S648: billed on the move-in day → the due day follows the start date
+      // until the landlord types a different day for this tenant.
+      const moveInDay = data.rentDueMode === 'move_in_day'
+      if (moveInDay && start) {
+        const curDay = val('rent_due_day')
+        const autoDay = dueDayLabel(leaseDueDay({ mode: 'move_in_day', propertyDay: 1, startIso: start }))
+        if (curDay == null || curDay === autoDueDay.current || autoDueDay.current == null) {
+          want['rent_due_day'] = autoDay
+          autoDueDay.current = autoDay
+        }
+      }
+      const dueDay = parseDueDay(want['rent_due_day'] ?? val('rent_due_day')) ?? 1
+      // Proration follows the start date and rent until the landlord types
+      // their own figure over it (a special) — then it is theirs. Billed on
+      // the move-in day, there is nothing to prorate.
       const current = val('move_in_proration')
-      const auto = start ? prorateMoveInRent(rent, start).toFixed(2) : null
+      const auto = !start ? null
+        : (moveInDay || Number(start.slice(8, 10)) === dueDay) ? '0.00'
+        : prorateMoveInRent(rent, start, dueDay).toFixed(2)
       if (auto != null && (current == null || current === autoProration.current)) {
         want['move_in_proration'] = auto
         autoProration.current = auto
