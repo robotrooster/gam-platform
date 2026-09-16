@@ -47,10 +47,10 @@ interface PlatformStack {
 
 async function buildPlatformStack(opts: {
   unitCount?:      number  // number of active+leased units to seed
-  platformFeeBilledTo?: 'landlord' | 'tenant'
+  platformFeePayer?: 'landlord' | 'tenant'
 }): Promise<PlatformStack> {
   const unitCount = opts.unitCount ?? 1
-  const payer = opts.platformFeeBilledTo ?? 'landlord'
+  const payer = opts.platformFeePayer ?? 'landlord'
   const client = await getClient()
   try {
     const { userId: ownerUserId, landlordId } = await seedLandlord(client)
@@ -106,7 +106,7 @@ const RUN_DATE = new Date('2026-06-01T08:00:00Z')
 describe('processPlatformFeeAccrual', () => {
   it('landlord-payer happy: 1 LT unit × $2 floored at $10 min, posts accrual + revenue ledger', async () => {
     const stack = await buildPlatformStack({
-      unitCount: 1, platformFeeBilledTo: 'landlord',
+      unitCount: 1, platformFeePayer: 'landlord',
     })
     const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
@@ -157,7 +157,7 @@ describe('processPlatformFeeAccrual', () => {
   // properties deposit to the same Stripe account, it's only ten dollar minimum
   // for that setup." Two properties on ONE payout account owe ONE floor.
   it('two properties on one Connect account share a single $10 minimum', async () => {
-    const a = await buildPlatformStack({ unitCount: 1, platformFeeBilledTo: 'landlord' })
+    const a = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
     await db.query(
       `UPDATE landlords SET stripe_connect_account_id = 'acct_shared_s630' WHERE id = $1`,
       [a.landlordId])
@@ -193,7 +193,7 @@ describe('processPlatformFeeAccrual', () => {
   // of" billing — but this job never checked, so GAM invoiced ITSELF $10 a month
   // and booked it as platform revenue.
   it('never bills a system landlord — GAM does not invoice itself', async () => {
-    const stack = await buildPlatformStack({ unitCount: 3, platformFeeBilledTo: 'landlord' })
+    const stack = await buildPlatformStack({ unitCount: 3, platformFeePayer: 'landlord' })
     await db.query(`UPDATE landlords SET is_system = TRUE WHERE id = $1`, [stack.landlordId])
 
     const result = await processPlatformFeeAccrual(RUN_DATE)
@@ -209,7 +209,7 @@ describe('processPlatformFeeAccrual', () => {
 
   it('above-min: 6 LT units × $2 = $12 (clears the $10 min, exact rate × count applies)', async () => {
     const stack = await buildPlatformStack({
-      unitCount: 6, platformFeeBilledTo: 'landlord',
+      unitCount: 6, platformFeePayer: 'landlord',
     })
     const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
@@ -234,12 +234,12 @@ describe('processPlatformFeeAccrual', () => {
   // revenue post. That scenario can no longer exist, so asserting it would be
   // asserting fiction. What is worth guarding is the LOCK itself.
   it('a property can no longer be set to bill the platform fee to tenants', async () => {
-    await expect(buildPlatformStack({ unitCount: 1, platformFeeBilledTo: 'tenant' as any }))
+    await expect(buildPlatformStack({ unitCount: 1, platformFeePayer: 'tenant' as any }))
       .rejects.toThrow(/platform_fee_payer/)
   })
 
   it('every accrual posts against the landlord', async () => {
-    const stack = await buildPlatformStack({ unitCount: 1, platformFeeBilledTo: 'landlord' })
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
     const result = await processPlatformFeeAccrual(RUN_DATE)
     expect(result.feesAccrued).toBe(1)
     const accrual = await db.query<{ payer: string }>(
@@ -249,7 +249,7 @@ describe('processPlatformFeeAccrual', () => {
 
   it('idempotent: re-running the same month returns skippedAlreadyAccrued and writes no extra rows', async () => {
     const stack = await buildPlatformStack({
-      unitCount: 1, platformFeeBilledTo: 'landlord',
+      unitCount: 1, platformFeePayer: 'landlord',
     })
     const r1 = await processPlatformFeeAccrual(RUN_DATE)
     expect(r1.feesAccrued).toBe(1)
@@ -903,8 +903,6 @@ describe('the STR revenue fee is 3% (S616)', () => {
 describe('a property under a property manager', () => {
   async function managed(opts: {
     unitCount?: number
-    billedTo?: 'pm_company' | 'owner'
-    rateToOwner?: number | null
     pmRate?: number | null            // GAM's negotiated rate TO the manager
   }) {
     const stack = await buildPlatformStack({ unitCount: opts.unitCount ?? 1 })
@@ -915,11 +913,6 @@ describe('a property under a property manager', () => {
       // The trigger opens the relationship when the property joins the manager.
       await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`,
         [stack.propertyId, pmId])
-      await client.query(
-        `UPDATE pm_owner_relationships
-            SET platform_fee_billed_to=$3, platform_fee_rate_to_owner=$4
-          WHERE pm_company_id=$1 AND landlord_id=$2`,
-        [pmId, stack.landlordId, opts.billedTo ?? 'pm_company', opts.rateToOwner ?? null])
       if (opts.pmRate != null) {
         await client.query(
           `INSERT INTO pm_company_platform_fee_overrides (pm_company_id, rate_per_unit, reason)
@@ -971,48 +964,8 @@ describe('a property under a property manager', () => {
     expect(row.rows[0].topup).toBe(8.5)
   })
 
-  it('hands nothing to the owner when the manager absorbs it', async () => {
-    const s = await managed({ unitCount: 3, billedTo: 'pm_company', pmRate: 0.50 })
-    await processPlatformFeeAccrual(RUN_DATE)
-    const pt = await db.query(
-      `SELECT 1 FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
-    expect(pt.rows).toHaveLength(0)
-  })
 
-  it('re-bills the owner at the manager\'s own rate when passed through', async () => {
-    // GAM charges the manager 50c; the manager charges the owner a dollar.
-    const s = await managed({ unitCount: 3, billedTo: 'owner', rateToOwner: 1.00, pmRate: 0.50 })
-    await processPlatformFeeAccrual(RUN_DATE)
 
-    const pt = await db.query(
-      `SELECT occupied_unit_count, rate_per_unit::float AS rate,
-              total_amount::float AS total, gam_rate_per_unit::float AS gam_rate
-         FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
-    expect(pt.rows[0].occupied_unit_count).toBe(3)
-    expect(pt.rows[0].rate).toBe(1)
-    expect(pt.rows[0].total).toBe(3)
-    // Recorded for GAM's own margin reporting, never shown to the owner.
-    expect(pt.rows[0].gam_rate).toBe(0.5)
-
-    // GAM's own bill still goes to the manager, at the manager's rate. (The
-    // total carries the $10 Connect-account floor on a property this small —
-    // see the floor test above; what matters here is the destination.)
-    const acc = await db.query(
-      `SELECT rate_per_unit::float AS rate, billed_pm_company_id
-         FROM platform_fee_accruals WHERE property_id=$1`, [s.propertyId])
-    expect(acc.rows[0].rate).toBe(0.5)
-    expect(acc.rows[0].billed_pm_company_id).toBe(s.pmCompanyId)
-  })
-
-  it('charges our rate when the manager sets none', async () => {
-    const s = await managed({ unitCount: 2, billedTo: 'owner', rateToOwner: null, pmRate: 0.50 })
-    await processPlatformFeeAccrual(RUN_DATE)
-    const pt = await db.query(
-      `SELECT rate_per_unit::float AS rate, total_amount::float AS total
-         FROM pm_platform_fee_passthroughs WHERE property_id=$1`, [s.propertyId])
-    expect(pt.rows[0].rate).toBe(0.5)
-    expect(pt.rows[0].total).toBe(1)
-  })
 
   it('leaves an unmanaged property billed to its owner exactly as before', async () => {
     const s = await buildPlatformStack({ unitCount: 2 })

@@ -14,7 +14,7 @@ import { getClient } from '../db'
 import { ownerStatement, monthStart } from './ownerStatement'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedUserBankAccount,
-  seedPmCompany,
+  seedPmCompany, seedPmFeePlan,
 } from '../test/dbHelpers'
 
 beforeEach(cleanupAllSchema)
@@ -225,89 +225,86 @@ describe('what the owner is shown', () => {
   })
 })
 
-// S645 (Nic, DIRECTIVE): the manager decides whether the software cost sits in
-// their management contract or is handed to the owner. "In case anybody wants to
-// pass it through, it lets the owner know exactly where part of that money is
-// going." And on markup: "the property manager is the one to incentivize,
-// because they're operating the portfolio."
-describe('software the manager passes through', () => {
-  async function managed(client: any, opts: {
-    billedTo: 'pm_company' | 'owner'; rateToOwner?: number | null
-  }) {
+// S646 (Nic, DIRECTIVE): "Take off the pass-through thing on that. The
+// pass-through should only be for the regular self-hosted landlords passing it
+// through to the tenants." A manager who wants to recover their software cost
+// raises their OWN fee — "the property manager sets the percentage or flat rate
+// or per-unit count, that price. So the owner sees what the property manager
+// sets on the owner's statement."
+//
+// Which means the statement has to add up a fee plan in every shape it comes in.
+// Percent-of-rent is taken per payment and lands on the balance ledger; flat and
+// per-unit are taken once a month and land on the accrual. Reading only the
+// first reported a manager on a per-unit plan as charging the owner nothing.
+describe('what the manager charged, whatever shape their plan is', () => {
+  async function managed(client: any) {
     const { userId, landlordId } = await seedLandlord(client)
     const bankId = await seedUserBankAccount(client, { userId })
     const pmId = await seedPmCompany(client, { bankAccountId: bankId })
     const propertyId = await seedProperty(client, {
       landlordId, ownerUserId: userId, managedByUserId: userId })
-    await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`, [propertyId, pmId])
-    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+    const planId = await seedPmFeePlan(client, {
+      pmCompanyId: pmId, feeType: 'per_unit', flatAmount: 45 })
     await client.query(
-      `UPDATE pm_owner_relationships
-          SET platform_fee_billed_to=$3, platform_fee_rate_to_owner=$4
-        WHERE pm_company_id=$1 AND landlord_id=$2`,
-      [pmId, landlordId, opts.billedTo, opts.rateToOwner ?? null])
-    const o = { landlordId, userId, propertyId, unitId }
+      `UPDATE properties SET pm_company_id=$2, pm_fee_plan_id=$3 WHERE id=$1`,
+      [propertyId, pmId, planId])
+    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+    const o = { landlordId, userId, propertyId, unitId, pmCompanyId: pmId, planId }
     await allocate(client, o, 'allocation_owner_share', 880)
-    return { ...o, pmCompanyId: pmId }
+    return o
   }
 
-  const passthrough = (client: any, o: any, units: number, rate: number, gamRate: number) =>
+  const monthlyFee = (client: any, o: any, amount: number, feeType = 'per_unit') =>
     client.query(
-      `INSERT INTO pm_platform_fee_passthroughs
-         (pm_company_id, landlord_id, property_id, accrual_month,
-          occupied_unit_count, rate_per_unit, total_amount, gam_rate_per_unit)
-       VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8)`,
-      [o.pmCompanyId, o.landlordId, o.propertyId, M, units,
-       rate.toFixed(2), (units * rate).toFixed(2), gamRate.toFixed(2)])
+      `INSERT INTO pm_monthly_fee_accruals
+         (property_id, pm_company_id, pm_fee_plan_id, accrual_month, fee_type,
+          per_unit_amount, occupied_unit_count, total_amount, pm_payout_user_id)
+       VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9)`,
+      [o.propertyId, o.pmCompanyId, o.planId, M, feeType,
+       amount.toFixed(2), 1, amount.toFixed(2), o.userId])
 
-  it('shows nothing when the manager absorbs it', async () => {
+  it('counts a per-unit plan the owner would otherwise never see', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { billedTo: 'pm_company' })
+      const o = await managed(client)
+      await monthlyFee(client, o, 45)
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
-      expect(s.totals.platformPassthrough).toBe(0)
-      expect(s.totals.net).toBe(880)
+      expect(s.totals.managementFee).toBe(45)
     } finally { client.release() }
   })
 
-  it('shows it as its own line and takes it off the net', async () => {
+  it('adds a percent-of-rent cut and a monthly fee into one number', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
-      await passthrough(client, o, 40, 1.00, 0.50)
-
+      const o = await managed(client)
+      await allocate(client, o, 'allocation_pm_company_fee', 100)  // per payment
+      await monthlyFee(client, o, 45, 'flat_monthly')              // once a month
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
-      expect(s.totals.platformPassthrough).toBe(40)
-      expect(s.properties[0].platformPassthroughUnits).toBe(40)
-      expect(s.totals.net).toBe(840)          // 880 − 40
-      // It is NOT folded into management. The whole point is that it is legible.
-      expect(s.totals.managementFee).toBe(0)
+      expect(s.totals.managementFee).toBe(145)
     } finally { client.release() }
   })
 
-  it('never tells the owner what GAM charged the manager', async () => {
-    // The manager's markup is their business; quoting our cost beside their
-    // price would price their business for them in front of their customer.
+  it('does not bill the owner for GAM\'s contract with their manager', async () => {
+    // Nic: "the owner's statement would not see our contract between the
+    // property manager and the platform." The manager's GAM bill is theirs.
     const client = await getClient()
     try {
-      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
-      await passthrough(client, o, 40, 1.00, 0.50)
+      const o = await managed(client)
+      await monthlyFee(client, o, 45)
       const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
-      expect(JSON.stringify(s)).not.toContain('0.5')
-      expect(JSON.stringify(s)).not.toContain('gamRate')
+      expect(s.totals.net).toBe(880)               // untouched by GAM's fee
+      expect(JSON.stringify(s)).not.toContain('platformPassthrough')
     } finally { client.release() }
   })
 
-  it('stacks with expenses rather than replacing them', async () => {
+  it('scopes the monthly fee to the manager being reported on', async () => {
     const client = await getClient()
     try {
-      const o = await managed(client, { billedTo: 'owner', rateToOwner: 1.00 })
-      await passthrough(client, o, 40, 1.00, 0.50)
-      await expense(client, o as any, 150)
-      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
-      expect(s.totals.expenses).toBe(150)
-      expect(s.totals.platformPassthrough).toBe(40)
-      expect(s.totals.net).toBe(690)          // 880 − 150 − 40
+      const o = await managed(client)
+      await monthlyFee(client, o, 45)
+      const mine = await ownerStatement({
+        landlordId: o.landlordId, periodMonth: M, pmCompanyId: o.pmCompanyId })
+      expect(mine.totals.managementFee).toBe(45)
     } finally { client.release() }
   })
 })

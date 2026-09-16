@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8rITZSXdFzps8YD1ehTbujcNrI0blaUuRt1Ef5NhxAxqHTpuayVPVmfiCX2lBA6
+\restrict 3fC7m4c2k5mA7vySFeGoOILaHvGCkkyS4BTtqGMaSNcfe9T4D7WxWN981vR0Hyp
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6686,37 +6686,11 @@ CREATE TABLE public.pm_owner_relationships (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    platform_fee_billed_to text DEFAULT 'pm_company'::text NOT NULL,
-    platform_fee_rate_to_owner numeric(10,2),
     CONSTRAINT pm_owner_relationships_disbursement_day_check CHECK (((disbursement_day >= 1) AND (disbursement_day <= 28))),
     CONSTRAINT pm_owner_relationships_payout_mode_check CHECK ((payout_mode = ANY (ARRAY['direct'::text, 'pm_trust'::text]))),
-    CONSTRAINT pm_owner_relationships_platform_fee_billed_to_check CHECK ((platform_fee_billed_to = ANY (ARRAY['pm_company'::text, 'owner'::text]))),
-    CONSTRAINT pm_owner_relationships_platform_fee_rate_to_owner_check CHECK (((platform_fee_rate_to_owner IS NULL) OR (platform_fee_rate_to_owner >= (0)::numeric))),
     CONSTRAINT pm_owner_relationships_portal_access_check CHECK ((portal_access = ANY (ARRAY['none'::text, 'active'::text, 'closed'::text]))),
     CONSTRAINT pm_owner_relationships_portal_opened_by_check CHECK ((portal_opened_by = ANY (ARRAY['owner'::text, 'pm_company'::text, 'gam'::text]))),
     CONSTRAINT pm_owner_relationships_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
-);
-
-
---
--- Name: pm_platform_fee_passthroughs; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.pm_platform_fee_passthroughs (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    pm_company_id uuid NOT NULL,
-    landlord_id uuid NOT NULL,
-    property_id uuid NOT NULL,
-    accrual_month date NOT NULL,
-    occupied_unit_count integer NOT NULL,
-    rate_per_unit numeric(10,2) NOT NULL,
-    total_amount numeric(12,2) NOT NULL,
-    gam_rate_per_unit numeric(10,2),
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pm_platform_fee_passthroughs_occupied_unit_count_check CHECK ((occupied_unit_count >= 0)),
-    CONSTRAINT pm_platform_fee_passthroughs_rate_per_unit_check CHECK ((rate_per_unit >= (0)::numeric)),
-    CONSTRAINT pm_platform_fee_passthroughs_total_amount_check CHECK ((total_amount >= (0)::numeric))
 );
 
 
@@ -12933,22 +12907,6 @@ ALTER TABLE ONLY public.pm_owner_relationships
 
 
 --
--- Name: pm_platform_fee_passthroughs pm_platform_fee_passthroughs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pm_platform_fee_passthroughs
-    ADD CONSTRAINT pm_platform_fee_passthroughs_pkey PRIMARY KEY (id);
-
-
---
--- Name: pm_platform_fee_passthroughs pm_platform_fee_passthroughs_property_id_accrual_month_pm_c_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pm_platform_fee_passthroughs
-    ADD CONSTRAINT pm_platform_fee_passthroughs_property_id_accrual_month_pm_c_key UNIQUE (property_id, accrual_month, pm_company_id);
-
-
---
 -- Name: pm_property_invitations pm_property_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16963,13 +16921,6 @@ CREATE INDEX idx_pm_owner_rel_landlord ON public.pm_owner_relationships USING bt
 --
 
 CREATE INDEX idx_pm_owner_rel_trust_day ON public.pm_owner_relationships USING btree (disbursement_day) WHERE ((payout_mode = 'pm_trust'::text) AND (status = 'active'::text));
-
-
---
--- Name: idx_pm_passthrough_statement; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_pm_passthrough_statement ON public.pm_platform_fee_passthroughs USING btree (landlord_id, accrual_month);
 
 
 --
@@ -24263,30 +24214,6 @@ ALTER TABLE ONLY public.pm_owner_relationships
 
 
 --
--- Name: pm_platform_fee_passthroughs pm_platform_fee_passthroughs_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pm_platform_fee_passthroughs
-    ADD CONSTRAINT pm_platform_fee_passthroughs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
-
-
---
--- Name: pm_platform_fee_passthroughs pm_platform_fee_passthroughs_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pm_platform_fee_passthroughs
-    ADD CONSTRAINT pm_platform_fee_passthroughs_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
-
-
---
--- Name: pm_platform_fee_passthroughs pm_platform_fee_passthroughs_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pm_platform_fee_passthroughs
-    ADD CONSTRAINT pm_platform_fee_passthroughs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
-
-
---
 -- Name: pm_property_invitations pm_property_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26770,5 +26697,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8rITZSXdFzps8YD1ehTbujcNrI0blaUuRt1Ef5NhxAxqHTpuayVPVmfiCX2lBA6
+\unrestrict 3fC7m4c2k5mA7vySFeGoOILaHvGCkkyS4BTtqGMaSNcfe9T4D7WxWN981vR0Hyp
 

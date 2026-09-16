@@ -17,8 +17,17 @@
  *                the owner's bank will ever agree with.
  *   gross      — the settled payments those allocations came from, so the owner
  *                can see what the resident actually paid before anyone's cut.
- *   manager    — 'allocation_pm_company_fee' for the same period. Stated
- *                plainly: an owner is entitled to see what management cost.
+ *   manager    — everything the manager charged, in both the shapes a fee plan
+ *                can take: 'allocation_pm_company_fee' on the balance ledger for
+ *                a percent-of-rent plan (taken per payment, at settlement), plus
+ *                pm_monthly_fee_accruals for a flat-monthly or per-unit plan
+ *                (taken once, on the 1st). Reading only the first reported a
+ *                manager on a per-unit plan as charging nothing.
+ *
+ *                Nic (S646): "The property manager sets the percentage or flat
+ *                rate or per-unit count, that price. So the owner sees what the
+ *                property manager sets on the owner's statement." One number,
+ *                whatever shape their plan is.
  *   expenses   — landlord_expenses, which is where a bill paid on the owner's
  *                behalf is recorded. Voided rows are excluded, never netted.
  *
@@ -48,17 +57,7 @@ export interface OwnerStatementProperty {
   managementFee: number
   /** Bills paid on the owner's behalf this month. */
   expenses: number
-  /**
-   * S645 — software the manager passed through, when their contract says the
-   * owner carries it rather than the manager. Zero when the manager absorbs it,
-   * which Nic expects most to do. Stated as its own line, never folded into the
-   * management fee: the entire point of the toggle is that the owner can see
-   * where this part of the money goes.
-   */
-  platformPassthrough: number
-  /** Units it was charged on, so the line can explain itself. */
-  platformPassthroughUnits: number
-  /** ownerShare − expenses − platformPassthrough. What the month was worth. */
+  /** ownerShare - expenses. What the month was worth to them. */
   net: number
   expenseLines: Array<{
     date: string; category: string; amount: number
@@ -78,7 +77,6 @@ export interface OwnerStatement {
     ownerShare: number
     managementFee: number
     expenses: number
-    platformPassthrough: number
     net: number
   }
   /**
@@ -161,19 +159,17 @@ export async function ownerStatement(opts: {
           AND COALESCE(pay.settled_at, pay.created_at) <  ($2::date + INTERVAL '1 month')
         GROUP BY u.property_id
      ),
-     passthrough AS (
-       -- S645: the manager's re-bill of the software cost, when their contract
-       -- with this owner passes it through. Read from the accrual rather than
-       -- recomputed from a rate, for the same reason as everything else here:
-       -- the statement reports what was actually charged.
-       SELECT pt.property_id,
-              SUM(pt.total_amount)        AS passthrough,
-              SUM(pt.occupied_unit_count) AS passthrough_units
-         FROM pm_platform_fee_passthroughs pt
-         JOIN scope s ON s.id = pt.property_id
-        WHERE pt.accrual_month = $2::date
-          AND ($3::uuid IS NULL OR pt.pm_company_id = $3::uuid)
-        GROUP BY pt.property_id
+     monthly_fee AS (
+       -- The other half of what a manager charges. A percent-of-rent plan is
+       -- taken per payment and lands on the balance ledger above; a flat or
+       -- per-unit plan is taken once a month and lands here. An owner's
+       -- statement has to add both or it understates their manager's price.
+       SELECT a.property_id, SUM(a.total_amount) AS monthly_fee
+         FROM pm_monthly_fee_accruals a
+         JOIN scope s ON s.id = a.property_id
+        WHERE a.accrual_month = $2::date
+          AND ($3::uuid IS NULL OR a.pm_company_id = $3::uuid)
+        GROUP BY a.property_id
      ),
      spend AS (
        SELECT e.property_id, SUM(e.amount) AS expenses
@@ -189,13 +185,12 @@ export async function ownerStatement(opts: {
             COALESCE(m.owner_share, 0)::float     AS owner_share,
             COALESCE(m.pm_fee, 0)::float          AS pm_fee,
             COALESCE(sp.expenses, 0)::float       AS expenses,
-            COALESCE(pt.passthrough, 0)::float    AS passthrough,
-            COALESCE(pt.passthrough_units, 0)::int AS passthrough_units
+            COALESCE(mf.monthly_fee, 0)::float    AS monthly_fee
        FROM scope s
        LEFT JOIN money m  ON m.property_id  = s.id
        LEFT JOIN gross g  ON g.property_id  = s.id
        LEFT JOIN spend sp ON sp.property_id = s.id
-       LEFT JOIN passthrough pt ON pt.property_id = s.id
+       LEFT JOIN monthly_fee mf ON mf.property_id = s.id
       ORDER BY s.name`,
     [opts.landlordId, start, pmId])
 
@@ -227,17 +222,14 @@ export async function ownerStatement(opts: {
   const properties: OwnerStatementProperty[] = rows.map((r: any) => {
     const ownerShare = round2(Number(r.owner_share))
     const expenses = round2(Number(r.expenses))
-    const passthrough = round2(Number(r.passthrough))
     return {
       propertyId: r.property_id,
       propertyName: r.property_name,
       grossCollected: round2(Number(r.gross_collected)),
       ownerShare,
-      managementFee: round2(Number(r.pm_fee)),
+      managementFee: round2(Number(r.pm_fee) + Number(r.monthly_fee)),
       expenses,
-      platformPassthrough: passthrough,
-      platformPassthroughUnits: Number(r.passthrough_units) || 0,
-      net: round2(ownerShare - expenses - passthrough),
+      net: round2(ownerShare - expenses),
       expenseLines: linesByProperty.get(r.property_id) ?? [],
     }
   })
@@ -267,7 +259,6 @@ export async function ownerStatement(opts: {
       ownerShare: ownerShareTotal,
       managementFee: sum(p => p.managementFee),
       expenses: sum(p => p.expenses),
-      platformPassthrough: sum(p => p.platformPassthrough),
       net: sum(p => p.net),
     },
     // A 'direct' owner's share left at settlement — the allocation IS the
