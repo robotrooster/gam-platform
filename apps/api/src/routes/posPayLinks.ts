@@ -21,7 +21,7 @@ import { Router } from 'express'
 import crypto from 'crypto'
 import QRCode from 'qrcode'
 import { z } from 'zod'
-import { processingFeeFor } from '@gam/shared'
+import { cardFeeSplit, type CardFeePayer } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
@@ -38,10 +38,13 @@ export const payLinkUrl = (token: string) => `${apiBase()}/api/public/pay/${toke
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
-/** What the customer pays by card: the cart plus the card fee. */
-export function payLinkCharge(total: number): { fee: number; charged: number } {
-  const fee = processingFeeFor({ amount: total, paymentMethod: 'card' })
-  return { fee, charged: round2(total + fee) }
+/**
+ * What a link charges by card. GAM's fee is always taken; the property's
+ * setting when the link was made decides whether it's added on top (S648).
+ */
+export function payLinkCharge(total: number, payer: CardFeePayer = 'customer'): { fee: number; charged: number; held: number; customerFee: number } {
+  const split = cardFeeSplit(total, payer)
+  return { ...split, customerFee: payer === 'customer' ? split.fee : 0 }
 }
 
 async function connectIdFor(landlordId: string): Promise<string | null> {
@@ -81,8 +84,8 @@ const createSchema = z.object({
 })
 
 async function propertyFor(req: any, propertyId: string) {
-  const prop = await queryOne<{ id: string; name: string; landlord_id: string }>(
-    `SELECT id, name, landlord_id FROM properties WHERE id = $1`, [propertyId])
+  const prop = await queryOne<{ id: string; name: string; landlord_id: string; register_card_fee_payer: CardFeePayer }>(
+    `SELECT id, name, landlord_id, register_card_fee_payer FROM properties WHERE id = $1`, [propertyId])
   if (!prop) throw new AppError(404, 'Property not found')
   if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
   await assertPropertyInScope(req.user, propertyId)
@@ -120,25 +123,26 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
        (token, landlord_id, property_id, created_by, kind, label, items,
         subtotal, tax_amount, discount_amount, total,
         customer_name, customer_email, customer_phone, tenant_id, pos_customer_id, booking_id,
-        expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+        card_fee_payer, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
              CASE WHEN $5 = 'one_time' THEN NOW() + INTERVAL '14 days' ELSE NULL END)
      RETURNING *`,
     [token, prop.landlord_id, prop.id, req.user.userId, body.kind, label.slice(0, 120),
      JSON.stringify(body.items), totals.subtotal, totals.taxAmount, totals.discount, totals.total,
      body.customer?.name ?? null, body.customer?.email?.toLowerCase() ?? null, body.customer?.phone ?? null,
-     body.tenantId ?? null, body.posCustomerId ?? null, body.bookingId ?? null])
+     body.tenantId ?? null, body.posCustomerId ?? null, body.bookingId ?? null,
+     prop.register_card_fee_payer])
 
-  const { fee, charged } = payLinkCharge(Number(link.total))
+  const { customerFee, charged } = payLinkCharge(Number(link.total), link.card_fee_payer)
   if (link.kind === 'one_time') {
     const { emailPayLink } = await import('../services/email')
     await emailPayLink({
       to: link.customer_email, name: link.customer_name, propertyName: prop.name,
-      label: link.label, amount: Number(link.total), cardFee: fee, url: payLinkUrl(token),
+      label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(token),
       ctx: { landlordId: prop.landlord_id, payLinkId: link.id },
     }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[pay-link] email failed'))
   }
-  return { ...link, url: payLinkUrl(token), card_fee: fee, charged }
+  return { ...link, url: payLinkUrl(token), card_fee: customerFee, charged }
 }
 
 posPayLinksRouter.post('/', requirePerm('pos.ring_sale'), async (req, res, next) => {
@@ -162,7 +166,7 @@ posPayLinksRouter.get('/', requirePerm('pos.ring_sale'), async (req, res, next) 
         ORDER BY (l.kind = 'standing') DESC, l.created_at DESC
         LIMIT 100`, [propertyId])
     res.json({ success: true, data: rows.map(r => ({
-      ...r, url: payLinkUrl(r.token), ...payLinkCharge(Number(r.total)) })) })
+      ...r, url: payLinkUrl(r.token), ...payLinkCharge(Number(r.total), r.card_fee_payer) })) })
   } catch (e) { next(e) }
 })
 
@@ -186,10 +190,10 @@ posPayLinksRouter.post('/:id/resend', requirePerm('pos.ring_sale'), async (req, 
     const prop = await propertyFor(req, link.property_id)
     if (link.kind !== 'one_time' || link.status !== 'open') throw new AppError(409, 'Only an open emailed link can be re-sent.')
     const { emailPayLink } = await import('../services/email')
-    const { fee } = payLinkCharge(Number(link.total))
+    const { customerFee } = payLinkCharge(Number(link.total), link.card_fee_payer)
     await emailPayLink({
       to: link.customer_email, name: link.customer_name, propertyName: prop.name,
-      label: link.label, amount: Number(link.total), cardFee: fee, url: payLinkUrl(link.token),
+      label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
       ctx: { landlordId: link.landlord_id, payLinkId: link.id },
     })
     await query(`UPDATE pos_pay_links SET expires_at = NOW() + INTERVAL '14 days', updated_at = NOW() WHERE id = $1`, [link.id])
@@ -250,14 +254,14 @@ publicPayRouter.get('/pay/:token', async (req, res, next) => {
     if (!connectId) {
       return res.status(503).send(page('Not available', `<h1>Card payment isn’t available right now</h1><p>Please pay ${escapeHtml(link.property_name)} directly.</p>`))
     }
-    const { fee } = payLinkCharge(Number(link.total))
+    const { customerFee } = payLinkCharge(Number(link.total), link.card_fee_payer)
     const { createPayLinkCheckoutSession } = await import('../services/stripeConnect')
     // S648 (Nic): the money lands with GAM; the landlord's share (the link
     // total) is paid in the weekly batch and the card fee is GAM's.
     const session = await createPayLinkCheckoutSession({
       lineItems: [
         { name: `${link.label} — ${link.property_name}`, amountCents: Math.round(Number(link.total) * 100) },
-        { name: 'Card processing fee', amountCents: Math.round(fee * 100) },
+        { name: 'Card processing fee', amountCents: Math.round(customerFee * 100) },
       ],
       customerEmail: link.customer_email,
       askName: link.kind === 'standing',
@@ -304,7 +308,7 @@ export async function finalizePayLink(session: {
     if (!link) { await client.query('ROLLBACK'); return { recorded: false, reason: 'link gone' } }
     const dup = await client.query(`SELECT 1 FROM pos_transactions WHERE stripe_payment_intent_id = $1`, [session.payment_intent])
     if (dup.rows.length) { await client.query('ROLLBACK'); return { recorded: false, reason: 'already recorded' } }
-    const { fee, charged } = payLinkCharge(Number(link.total))
+    const { fee, charged, held, customerFee } = payLinkCharge(Number(link.total), link.card_fee_payer)
     if (Math.round(charged * 100) !== Number(session.amount_total)) {
       await client.query('ROLLBACK')
       logger.error({ linkId, expected: charged, got: session.amount_total }, '[pay-link] amount mismatch — not recorded')
@@ -313,9 +317,9 @@ export async function finalizePayLink(session: {
     const { tx } = await insertPosSale(client, {
       landlordId: link.landlord_id, propertyId: link.property_id, cashierId: link.created_by,
       paymentMethod: 'card', tenantId: link.tenant_id, posCustomerId: link.pos_customer_id,
-      subtotal: Number(link.subtotal), taxAmount: Number(link.tax_amount), surcharge: fee,
+      subtotal: Number(link.subtotal), taxAmount: Number(link.tax_amount), surcharge: customerFee,
       total: charged, platformFee: fee, stripePaymentIntentId: session.payment_intent,
-      payoutOwed: Number(link.total),
+      payoutOwed: held,
       discountAmount: Number(link.discount_amount), discountReason: null,
       items: link.items,
     })

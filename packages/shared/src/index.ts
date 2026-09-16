@@ -4364,6 +4364,28 @@ export function processingFeeFor(opts: {
   return round2(opts.amount * pct + PROCESSING_FEES.CARD_FLAT)
 }
 
+// S648 (Nic): "landlord can choose to absorb the processing cost... or they
+// just price accordingly." GAM's card fee is on every card payment; per
+// property the landlord picks who pays it at the register (incl. pay links)
+// and on the booking site. Rent is never covered by this: tenants pay it.
+export const CARD_FEE_PAYERS = ['customer', 'landlord'] as const
+export type CardFeePayer = typeof CARD_FEE_PAYERS[number]
+export const CARD_FEE_PAYER_LABEL: Record<CardFeePayer, string> = {
+  customer: 'Customer pays the card fee',
+  landlord: 'We absorb the card fee',
+}
+
+/**
+ * A card charge for `amount` (the price): what GAM's fee is, what the customer
+ * is charged, and what GAM holds for the landlord afterwards. The fee is the
+ * same either way — only who pays it moves.
+ */
+export function cardFeeSplit(amount: number, payer: CardFeePayer): { fee: number; charged: number; held: number } {
+  const fee = processingFeeFor({ amount, paymentMethod: 'card' })
+  const charged = payer === 'customer' ? round2(amount + fee) : round2(amount)
+  return { fee, charged, held: round2(charged - fee) }
+}
+
 export interface PaymentMethodCost {
   method: 'ach' | 'card' | 'manual'
   /** Short label for the row, e.g. "Bank account". */

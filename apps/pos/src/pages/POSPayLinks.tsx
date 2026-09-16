@@ -17,12 +17,14 @@ const fmt = (n: number) => '$' + (Number(n) || 0).toFixed(2)
 export interface PayLinkCartLine { id: string | null; name: string; qty: number; price: number; tax?: number; cat?: string }
 
 /** "Email a pay link" — the current cart, sent to one person to pay by card. */
-export function SendPayLinkModal({ propertyId, cart, discountAmount, total, onClose, onSent }: {
+export function SendPayLinkModal({ propertyId, cart, discountAmount, total, customerPaysFee = true, onClose, onSent }: {
   propertyId: string
   cart: PayLinkCartLine[]
   discountAmount: number
   /** The cart total before any card fee, as the register shows it. */
   total: number
+  /** S648: false when this property absorbs the card fee. */
+  customerPaysFee?: boolean
   onClose: () => void
   onSent: () => void
 }) {
@@ -30,7 +32,7 @@ export function SendPayLinkModal({ propertyId, cart, discountAmount, total, onCl
   const [email, setEmail] = useState('')
   const [phone, setPhone] = useState('')
   const [err, setErr] = useState<string | null>(null)
-  const fee = processingFeeFor({ amount: total, paymentMethod: 'card' })
+  const fee = customerPaysFee ? processingFeeFor({ amount: total, paymentMethod: 'card' }) : 0
   const send = useMutation(
     () => apiPost('/pos/pay-links', {
       propertyId, items: cart, discountAmount,
@@ -50,7 +52,7 @@ export function SendPayLinkModal({ propertyId, cart, discountAmount, total, onCl
         </div>
         <div style={{ display: 'grid', gap: 4, fontSize: '.85rem', marginBottom: 12 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Cart</span><span className="mono">{fmt(total)}</span></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Card processing fee</span><span className="mono">{fmt(fee)}</span></div>
+          {fee > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Card processing fee</span><span className="mono">{fmt(fee)}</span></div>}
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700 }}><span>They pay</span><span className="mono" style={{ color: 'var(--gold)' }}>{fmt(total + fee)}</span></div>
         </div>
         <div style={{ display: 'grid', gap: 8 }}>
@@ -88,7 +90,7 @@ function QrImage({ linkId }: { linkId: string }) {
 const esc = (t: string) => String(t).replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
 
-function printQr(label: string, price: number, linkId: string) {
+function printQr(label: string, price: number, linkId: string, feeOnTop: boolean) {
   api.get(`/pos/pay-links/${linkId}/qr.png`, { responseType: 'blob' }).then(r => {
     const reader = new FileReader()
     reader.onload = () => {
@@ -97,7 +99,7 @@ function printQr(label: string, price: number, linkId: string) {
       w.document.write(`<!doctype html><title>${esc(label)}</title>
         <body style="font-family:system-ui,sans-serif;text-align:center;padding:40px">
         <h1 style="font-size:40px;margin:0 0 6px">${esc(label)}</h1>
-        <div style="font-size:28px;margin-bottom:18px">$${price.toFixed(2)} + card fee</div>
+        <div style="font-size:28px;margin-bottom:18px">$${price.toFixed(2)}${feeOnTop ? ' + card fee' : ''}</div>
         <img src="${reader.result}" style="width:360px;height:360px">
         <p style="font-size:22px">Scan to pay by card</p>
         <script>window.onload=()=>window.print()</script></body>`)
@@ -174,7 +176,8 @@ export function PayLinksTab({ propertyId }: { propertyId: string }) {
         <div style={{ fontWeight: 700, marginBottom: 4 }}>QR codes</div>
         <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
           A code anyone can scan to pay a set price by card — the dump station after hours, for example.
-          Each payment is recorded as its own sale. The card fee is added on top.
+          Each payment is recorded as its own sale. The card fee is added on top unless this property absorbs it
+          (the property&apos;s Card fees setting when the code is made).
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
           <input id="qr-label" className="form-input" placeholder="What it's for (e.g. Dump station)" value={qrLabel}
@@ -189,9 +192,9 @@ export function PayLinksTab({ propertyId }: { propertyId: string }) {
             <div key={l.id} style={{ border: '1px solid var(--border-0)', borderRadius: 12, padding: 12, display: 'grid', gap: 8, justifyItems: 'center' }}>
               <QrImage linkId={l.id} />
               <div style={{ fontWeight: 600 }}>{l.label}</div>
-              <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmt(Number(l.total))} + {fmt(l.fee)} card fee · paid {l.timesPaid}×</div>
+              <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmt(Number(l.total))}{l.customerFee > 0 ? <> + {fmt(l.customerFee)} card fee</> : null} · paid {l.timesPaid}×</div>
               <div style={{ display: 'flex', gap: 6 }}>
-                <button className="btn btn-primary btn-sm" onClick={() => printQr(l.label, Number(l.total), l.id)}>Print sign</button>
+                <button className="btn btn-primary btn-sm" onClick={() => printQr(l.label, Number(l.total), l.id, l.customerFee > 0)}>Print sign</button>
                 <button className="btn btn-ghost btn-sm" disabled={cancel.isLoading} onClick={() => cancel.mutate(l.id)}>Retire</button>
               </div>
             </div>

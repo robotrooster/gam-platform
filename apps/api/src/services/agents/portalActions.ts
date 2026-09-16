@@ -792,6 +792,25 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_card_fee_payers',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/card-fee-payers',
+    pathParams: ['propertyId'],
+    description:
+      'Choose, for one property, who pays the card processing fee when someone pays by card at the ' +
+      'register (counter card sales and emailed or QR pay links) and on the booking site (stay deposits). ' +
+      'Each is either "customer" (the fee is added on top, the default) or "landlord" (the customer pays ' +
+      'just the price and the fee comes out of the payout). Rent is not affected. Send only the setting(s) ' +
+      'the landlord named, and read the choice back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      register: { type: 'string', description: 'Who pays the card fee at the register and on pay links: "customer" or "landlord".' },
+      booking: { type: 'string', description: 'Who pays the card fee on stay deposits: "customer" or "landlord".' },
+    },
+    required: ['propertyId'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_broken_meter_billing',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/broken-meter-estimate',

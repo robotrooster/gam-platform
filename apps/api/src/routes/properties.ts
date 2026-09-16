@@ -28,6 +28,7 @@ import {
   FEE_TYPES,
   type FeeType,
   RENT_DUE_MODES,
+  CARD_FEE_PAYERS,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -1088,6 +1089,31 @@ propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit')
     await query(`UPDATE properties SET move_in_collects_next_period = $2, updated_at = NOW() WHERE id = $1`,
       [req.params.id, collectsNextPeriod])
     res.json({ success: true, data: { propertyId: req.params.id, moveInCollectsNextPeriod: collectsNextPeriod } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/card-fee-payers — S648 (Nic): "landlord can
+// choose to absorb the processing cost... or they just price accordingly."
+// Who pays GAM's card fee at this property's register (counter card sales and
+// pay links) and on its booking site. Rent is not part of this.
+propertiesRouter.patch('/:id/card-fee-payers', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const payer = z.enum(CARD_FEE_PAYERS)
+    const body = z.object({ register: payer.optional(), booking: payer.optional() })
+      .refine(b => b.register || b.booking, 'Say which setting to change').parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    const row = await queryOne<{ register_card_fee_payer: string; booking_card_fee_payer: string }>(
+      `UPDATE properties
+          SET register_card_fee_payer = COALESCE($2, register_card_fee_payer),
+              booking_card_fee_payer  = COALESCE($3, booking_card_fee_payer),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING register_card_fee_payer, booking_card_fee_payer`,
+      [req.params.id, body.register ?? null, body.booking ?? null])
+    res.json({ success: true, data: { propertyId: req.params.id,
+      registerCardFeePayer: row!.register_card_fee_payer, bookingCardFeePayer: row!.booking_card_fee_payer } })
   } catch (e) { next(e) }
 })
 

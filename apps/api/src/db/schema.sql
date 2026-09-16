@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict UGhDujabDHvFgOAhwscXVzczC5H0luWJK7MLRyyPOmcBYxxBAobE5IedshcHxgL
+\restrict R0pmnAtqdLPvgeSpk8eecmedn3D1UUaez8p2egy7LQYY6BsiUMADYwugxWKGekk
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7047,6 +7047,8 @@ CREATE TABLE public.pos_pay_links (
     expires_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    card_fee_payer text DEFAULT 'customer'::text NOT NULL,
+    CONSTRAINT pos_pay_links_card_fee_payer_check CHECK ((card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT pos_pay_links_discount_amount_check CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT pos_pay_links_kind_check CHECK ((kind = ANY (ARRAY['one_time'::text, 'standing'::text]))),
     CONSTRAINT pos_pay_links_one_time_has_email CHECK (((kind <> 'one_time'::text) OR (customer_email IS NOT NULL))),
@@ -7555,7 +7557,10 @@ CREATE TABLE public.properties (
     rent_due_mode text DEFAULT 'fixed_day'::text NOT NULL,
     rent_due_day integer DEFAULT 1 NOT NULL,
     stripe_terminal_location_id text,
+    register_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
+    booking_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
+    CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_default_occupancy_mode_check CHECK ((default_occupancy_mode = ANY (ARRAY['whole_unit'::text, 'by_room'::text]))),
@@ -7572,6 +7577,7 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_propane_split_four_gte_min_check CHECK ((propane_split_four_min_gallons >= propane_split_min_gallons)),
     CONSTRAINT properties_propane_split_min_gallons_check CHECK ((propane_split_min_gallons > 0)),
     CONSTRAINT properties_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (booking_slug IS NOT NULL))),
+    CONSTRAINT properties_register_card_fee_payer_check CHECK ((register_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_rent_due_day_check CHECK (((rent_due_day >= 1) AND (rent_due_day <= 28))),
     CONSTRAINT properties_rent_due_mode_check CHECK ((rent_due_mode = ANY (ARRAY['fixed_day'::text, 'move_in_day'::text]))),
     CONSTRAINT properties_review_status_check CHECK ((review_status = ANY (ARRAY['active'::text, 'pending_review'::text, 'rejected'::text]))),
@@ -27011,5 +27017,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict UGhDujabDHvFgOAhwscXVzczC5H0luWJK7MLRyyPOmcBYxxBAobE5IedshcHxgL
+\unrestrict R0pmnAtqdLPvgeSpk8eecmedn3D1UUaez8p2egy7LQYY6BsiUMADYwugxWKGekk
 

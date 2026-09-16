@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import { insertPosSale } from '../services/posSale'
-import { processingFeeFor } from '@gam/shared'
+import { cardFeeSplit, type CardFeePayer } from '@gam/shared'
+
+const round2 = (n: number) => Math.round(n * 100) / 100
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -467,22 +469,31 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
  * taken from the client. Everything else carries none.
  */
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
-                                discountAmount: number | undefined, clientSurcharge?: number) {
+                                discountAmount: number | undefined, clientSurcharge?: number,
+                                propertyId?: string | null) {
   const lines = (items || [])
     .filter((it: any) => !!it.id)
     .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
   const tax = await calculateCartTax(landlordId, lines)
   const base = aggregateCartTotals(tax, items, { surcharge: 0, discountAmount })
   let surcharge = 0
+  // S648 (Nic): GAM's card fee is on every card sale; the property decides
+  // whether the customer pays it on top or the landlord absorbs it.
+  let cardFee = 0
   if (paymentMethod === 'card') {
-    surcharge = processingFeeFor({ amount: base.total, paymentMethod: 'card' })
+    const prop = propertyId ? await queryOne<{ register_card_fee_payer: CardFeePayer }>(
+      `SELECT register_card_fee_payer FROM properties WHERE id = $1 AND landlord_id = $2`,
+      [propertyId, landlordId]) : null
+    const split = cardFeeSplit(base.total, prop?.register_card_fee_payer ?? 'customer')
+    cardFee = split.fee
+    surcharge = round2(split.charged - base.total)
   } else if (paymentMethod === 'charge') {
     surcharge = Math.round((base.subtotal - base.discount) * 100) / 100 * 0.01
   } else if (paymentMethod == null) {
     surcharge = Number(clientSurcharge) || 0   // pre-S648 callers only
   }
   surcharge = Math.round(surcharge * 100) / 100
-  return { ...base, surcharge, total: Math.round((base.total + surcharge) * 100) / 100 }
+  return { ...base, surcharge, cardFee, total: Math.round((base.total + surcharge) * 100) / 100 }
 }
 
 // POST /api/pos/cart-quote — S554: authoritative cart total the client mints
@@ -498,7 +509,7 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
-    const totals = await serverCartTotals(posLandlordId(req), items, paymentMethod, discountAmount, surcharge)
+    const totals = await serverCartTotals(posLandlordId(req), items, paymentMethod, discountAmount, surcharge, req.body.propertyId ?? null)
     res.json({ success: true, data: totals })
   } catch (e) { next(e) }
 })
@@ -580,12 +591,12 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // POST /pos/cart-quote endpoint ALSO runs, so the terminal PI the client
     // minted (against the quote) always equals this recomputed total.
     // S648: the fee is the server's (serverCartTotals), whatever the client sent.
-    const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total } =
-      await serverCartTotals(posLandlordId(req), items, paymentMethod ?? 'cash', discountAmount)
+    const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total, cardFee } =
+      await serverCartTotals(posLandlordId(req), items, paymentMethod ?? 'cash', discountAmount, undefined, propertyId)
 
     // FlexCharge platform fee is 1% of what the customer is actually charged
-    // (net of discount). A card sale's card fee is GAM's, taken on the charge.
-    const platformFee = paymentMethod === 'charge' || paymentMethod === 'card' ? surchargeAmt : 0
+    // (net of discount). A card sale's card fee is GAM's whoever paid it.
+    const platformFee = paymentMethod === 'card' ? cardFee : paymentMethod === 'charge' ? surchargeAmt : 0
 
     // S242: terminal-captured card sales pass a stripePaymentIntentId
     // (capture path from /terminal/payment-intents/:id/capture). Verify
@@ -646,6 +657,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           landlordId: posLandlordId(req), propertyId: propertyId || null, cashierId: req.user!.userId,
           paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId, discountAmount: discountAmt, discountReason,
+          ...(paymentMethod === 'card' ? { payoutOwed: round2(total - cardFee) } : {}),
           items,
         })
         tx = sale.tx
@@ -1742,11 +1754,11 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
   try {
     const { propertyId, description, posDraftRef, items, discountAmount } = req.body
     if (!propertyId) throw new AppError(400, 'propertyId is required')
-    // S648 (Nic): the card reader charges the cart PLUS the card fee, and the
-    // amount is the server's, computed from the cart — not a number the
-    // register sends.
+    // S648 (Nic): the card reader charges the cart (plus the card fee when the
+    // property passes it on), and the amount is the server's, computed from
+    // the cart — not a number the register sends.
     if (!Array.isArray(items) || items.length === 0) throw new AppError(400, 'items are required')
-    const quoted = await serverCartTotals(posLandlordId(req), items, 'card', discountAmount)
+    const quoted = await serverCartTotals(posLandlordId(req), items, 'card', discountAmount, undefined, propertyId)
     const amountCents = Math.round(quoted.total * 100)
     if (amountCents <= 0) throw new AppError(400, 'Nothing to charge')
 
@@ -1758,14 +1770,14 @@ posRouter.post('/terminal/payment-intents', requirePerm('pos.ring_sale'), async 
       landlordId:               posLandlordId(req),
       propertyId,
       amountCents,
-      cardFeeCents:             Math.round(quoted.surcharge * 100),
+      cardFeeCents:             Math.round(quoted.cardFee * 100),
       description,
       posDraftRef,
     })
     res.status(201).json({
       success: true,
       data: { id: intent.id, status: intent.status, clientSecret: intent.client_secret,
-              total: quoted.total, cardFee: quoted.surcharge },
+              total: quoted.total, cardFee: quoted.surcharge },  // what the customer sees
     })
   } catch (e) { next(e) }
 })

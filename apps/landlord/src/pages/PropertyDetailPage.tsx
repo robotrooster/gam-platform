@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel } from '@gam/shared'
+import { humanize, dueDayLabel, CARD_FEE_PAYERS, CARD_FEE_PAYER_LABEL, type CardFeePayer } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
+import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
@@ -213,6 +214,7 @@ export function PropertyDetailPage() {
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -727,6 +729,38 @@ function PropertyAlerts({ propertyId, onGoTab }: { propertyId: string; onGoTab: 
 //    same time, or they just want the prorated amount."
 // One answer per property, so everyone moving in there is treated alike. A
 // landlord can still set one tenant's own due day on that tenant's lease.
+// S648 (Nic): "landlord can choose to absorb the processing cost... or they
+// just price accordingly." GAM's card fee is on every card payment; this picks
+// who pays it at the register and on the booking site. Rent isn't affected.
+function CardFeePayerCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (b: { register?: CardFeePayer; booking?: CardFeePayer }) => apiPatch(`/properties/${property.id}/card-fee-payers`, b),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the card fee setting') })
+  const rows: Array<{ key: 'register' | 'booking'; label: string; value: CardFeePayer }> = [
+    { key: 'register', label: 'Front counter and pay links', value: property.registerCardFeePayer || 'customer' },
+    { key: 'booking', label: 'Booking site deposits', value: property.bookingCardFeePayer || 'customer' },
+  ]
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Card fees</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 10 }}>
+        Every card payment has a processing fee of 3.5% + $0.55. Add it to what the customer pays, or absorb it
+        and price your items and stays to cover it — it then comes out of your payout. Tenants paying rent by card
+        always pay it.
+      </div>
+      {rows.map(r => (
+        <div key={r.key} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+          <span style={{ fontSize: '.8rem', color: 'var(--text-1)', minWidth: 200 }}>{r.label}</span>
+          {CARD_FEE_PAYERS.map(v => (
+            <button key={v} className={`btn btn-sm ${r.value === v ? 'btn-primary' : 'btn-ghost'}`} disabled={save.isLoading}
+              onClick={() => r.value !== v && save.mutate({ [r.key]: v })}>{CARD_FEE_PAYER_LABEL[v]}</button>
+          ))}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function MoveInCollectionCard({ property, onSaved }: { property: any; onSaved: () => void }) {
   const collect = useMutation(
     (collectsNextPeriod: boolean) => apiPatch(`/properties/${property.id}/move-in-collection`, { collectsNextPeriod }),

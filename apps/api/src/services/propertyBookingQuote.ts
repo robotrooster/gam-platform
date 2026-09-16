@@ -14,7 +14,7 @@
 
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor } from '@gam/shared'
+import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, type CardFeePayer } from '@gam/shared'
 
 export interface PropertyRow {
   id: string
@@ -28,6 +28,7 @@ export interface PropertyRow {
   booking_area: string | null
   booking_deposit_pct: string
   booking_monthly_deposit: string | null
+  booking_card_fee_payer: CardFeePayer
   booking_utilities_billed: boolean
   street1: string | null
   zip: string | null
@@ -44,7 +45,7 @@ export interface PropertyRow {
 export async function resolveProperty(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
-            booking_monthly_deposit, booking_utilities_billed,
+            booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
             nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
        FROM properties
@@ -58,7 +59,7 @@ export async function resolveProperty(slug: string): Promise<PropertyRow> {
 export async function resolvePropertyById(propertyId: string): Promise<PropertyRow | null> {
   return queryOne<PropertyRow>(
     `SELECT id, landlord_id, booking_slug, name, city, state, booking_intro, booking_about, booking_area, booking_deposit_pct,
-            booking_monthly_deposit, booking_utilities_billed,
+            booking_monthly_deposit, booking_utilities_billed, booking_card_fee_payer,
             street1, zip, office_phone, office_email, office_hours,
             nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
        FROM properties
@@ -239,8 +240,11 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
     tax: monthlyBilling ? 0 : price.tax,
     taxable: monthlyBilling ? false : price.taxable,
     total, depositPct, depositAmount,
-    // S648 (Nic): deposits are card only, with the card fee on top.
-    depositCardFee: depositAmount == null ? null : processingFeeFor({ amount: depositAmount, paymentMethod: 'card' }),
+    // S648 (Nic): deposits are card only; the card fee is added on top unless
+    // the landlord absorbs it (then this is 0).
+    depositCardFee: depositAmount == null ? null
+      : prop.booking_card_fee_payer === 'landlord' ? 0
+      : processingFeeFor({ amount: depositAmount, paymentMethod: 'card' }),
     // Present only on monthly-tier stays: the calendar-aligned invoice plan.
     monthlyBilling: monthlyBilling
       ? { monthlyRate: Number(rates.monthly), segments: monthlyBilling.segments }

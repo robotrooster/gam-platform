@@ -448,10 +448,12 @@ export function POSPage() {
   const discountAmt = appliedDiscount ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(appliedDiscount.value, subtotal)) : 0
   const discountedSubtotal = subtotal - discountAmt
   const taxAmount = cart.reduce((s,i) => s+i.price*i.qty*i.tax, 0)
-  // S648 (Nic): every card payment carries the card fee. The server decides the
-  // real figure (cart-quote / transactions); this shows the same number first.
+  // S648 (Nic): every card payment carries the card fee; the property decides
+  // whether the customer pays it on top or the landlord absorbs it. The server
+  // decides the real figure (cart-quote / transactions); this shows it first.
+  const absorbsCardFee = (allProperties as any[]).find(p => p.id === registerProperty)?.registerCardFeePayer === 'landlord'
   const surcharge = method==='charge' ? discountedSubtotal*0.01
-    : method==='card' ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
+    : method==='card' && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
     : 0
   const total = discountedSubtotal + taxAmount + surcharge
   const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
@@ -949,6 +951,7 @@ export function POSPage() {
                 cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat }))}
                 discountAmount={discountAmt}
                 total={discountedSubtotal + taxAmount}
+                customerPaysFee={!absorbsCardFee}
                 onClose={()=>setPayLinkOpen(false)}
                 onSent={()=>{ setPayLinkOpen(false); setCart([]); setAppliedDiscount(null) }}
               />

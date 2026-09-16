@@ -1510,7 +1510,7 @@ export async function emailPayLink(args: {
       h(`Payment for ${args.propertyName}`) +
       p(`${args.name ? `Hi ${args.name}, ` : ''}${args.propertyName} sent you a charge to pay by card.`) +
       p(`<strong style="color:#eef1f8">${args.label}:</strong> ${money(args.amount)}<br>` +
-        `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` +
+        (args.cardFee > 0 ? `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` : '') +
         `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
       btn('Pay by card', args.url) +
       p('The link works for 14 days. To pay another way, contact the office.')

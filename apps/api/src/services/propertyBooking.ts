@@ -8,7 +8,7 @@ import { recordHeldItem } from './heldPayouts'
 import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
-import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor } from '@gam/shared'
+import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, cardFeeSplit, type CardFeePayer } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -79,6 +79,7 @@ interface PropertyRow {
   id: string; landlord_id: string; name: string; booking_slug: string
   booking_deposit_pct: string
   booking_monthly_deposit: string | null
+  booking_card_fee_payer: CardFeePayer
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
   short_term_tax_rate: string | null
 }
@@ -90,7 +91,7 @@ interface UnitRow {
 
 async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
-    `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct, booking_monthly_deposit,
+    `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct, booking_monthly_deposit, booking_card_fee_payer,
             nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
        FROM properties WHERE booking_slug=$1 AND public_booking_enabled=TRUE`, [slug])
   if (!prop) throw new AppError(404, 'Booking site not found')
@@ -290,10 +291,12 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
     }
 
     // S648: GAM's charge; the deposit is held for the landlord (whose payout
-    // account the gate above requires) and the card fee on top is GAM's.
+    // account the gate above requires). GAM's card fee is added on top unless
+    // the property absorbs it, in which case it comes out of the payout.
+    const guestCardFee = cardFeeSplit(quote.deposit, prop.booking_card_fee_payer).charged - quote.deposit
     const checkout = await createBookingDepositCheckoutSession({
       amountCents: Math.round(quote.deposit * 100),
-      cardFeeCents: Math.round(processingFeeFor({ amount: quote.deposit, paymentMethod: 'card' }) * 100),
+      cardFeeCents: Math.round(guestCardFee * 100),
       unitLabel: `${prop.name} · Unit ${unit.unit_number}`,
       guestEmail: opts.guestEmail,
       successUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`),
@@ -303,7 +306,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
     await query(`UPDATE unit_bookings SET stripe_checkout_session_id=$1, updated_at=now() WHERE id=$2`,
       [checkout.sessionId, bookingId])
     return { bookingId, depositAmount: quote.deposit, total: quote.total, checkoutUrl: checkout.hostedUrl,
-             cardFee: processingFeeFor({ amount: quote.deposit, paymentMethod: 'card' }) }
+             cardFee: Math.round(guestCardFee * 100) / 100 }
   } catch (e) {
     try { await client.query('ROLLBACK') } catch {}
     throw e
@@ -336,8 +339,11 @@ export async function confirmBookingDeposit(
       [bookingId, sessionId, paid?.paymentIntentId ?? null])).rows[0]
     if (b && paid) {
       const deposit = Number(b.deposit_amount ?? 0)
+      // GAM's fee comes out whoever paid it: on top (charged = deposit + fee)
+      // or absorbed (charged = deposit).
       const cardFee = processingFeeFor({ amount: deposit, paymentMethod: 'card' })
-      if (paid.amountTotalCents !== Math.round((deposit + cardFee) * 100)) {
+      const depositCents = Math.round(deposit * 100)
+      if (paid.amountTotalCents !== depositCents && paid.amountTotalCents !== depositCents + Math.round(cardFee * 100)) {
         logger.error({ bookingId, deposit, cardFee, got: paid.amountTotalCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
       }
       const held = Math.round(((paid.amountTotalCents ?? 0) / 100 - cardFee) * 100) / 100

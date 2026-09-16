@@ -115,6 +115,28 @@ describe('the public link', () => {
     expect(args.landlordConnectAccountId).toBeUndefined()
   })
 
+  // S648 (Nic): the landlord can absorb the card fee instead.
+  it('a property that absorbs the fee sends a link for the price alone, and holds price less fee', async () => {
+    const f = await seed()
+    await db.query(`UPDATE properties SET register_card_fee_payer = 'landlord' WHERE id = $1`, [f.propertyId])
+    const link = (await create(f, { items: [{ id: f.itemId, name: 'Propane', qty: 1, price: 20 }],
+      customer: { email: 'pat@example.com' } })).body.data
+    expect(emailPayLinkMock.mock.calls[0][0]).toMatchObject({ amount: 20, cardFee: 0 })
+    await request(buildApp()).get(`/api/public/pay/${link.token}`)
+    expect(checkoutMock.mock.calls[0][0].lineItems.map((l: any) => l.amountCents)).toEqual([2000, 0])
+    // Changing the setting later doesn't change a link already sent.
+    await db.query(`UPDATE properties SET register_card_fee_payer = 'customer' WHERE id = $1`, [f.propertyId])
+    const r = await finalizePayLink({ id: 'cs_abs', amount_total: 2000, payment_intent: 'pi_abs',
+      metadata: { gam_purpose: 'pos_pay_link', gam_pay_link_id: link.id } })
+    expect(r.recorded).toBe(true)
+    const { fee, held } = payLinkCharge(20, 'landlord')
+    const tx = (await db.query<any>(`SELECT id, surcharge, platform_fee FROM pos_transactions WHERE pay_link_id = $1`, [link.id])).rows[0]
+    expect(Number(tx.surcharge)).toBe(0)
+    expect(Number(tx.platform_fee)).toBe(fee)
+    const h = (await db.query<any>(`SELECT amount FROM held_payout_items WHERE source_id = $1`, [tx.id])).rows[0]
+    expect(Number(h.amount)).toBe(held)
+  })
+
   it('a bad or closed link never reaches the card page', async () => {
     const f = await seed()
     expect((await request(buildApp()).get('/api/public/pay/nope')).status).toBe(404)

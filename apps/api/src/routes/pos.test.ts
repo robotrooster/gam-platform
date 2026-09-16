@@ -324,6 +324,28 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(held.rows[0].payout_intent_id).toBeNull()
   })
 
+  it('S648: an absorbed-fee card sale holds the sale less GAM\'s fee for the landlord', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    await db.query(`UPDATE properties SET register_card_fee_payer = 'landlord' WHERE id = $1`, [f.propertyId])
+    const itemId = await seedPosItem(f, { sellPrice: 20, stockQty: 999 })
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 20, taxAmount: 0, lines: [{ itemId, lineSubtotal: 20, lineTax: 0 }] })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_absorb', status: 'succeeded', amount: 2000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    })
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 20 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_absorb' })
+    expect(res.status).toBe(201)
+    const fee = processingFeeFor({ amount: 20, paymentMethod: 'card' })
+    expect(Number(res.body.data.total)).toBe(20)
+    expect(Number(res.body.data.surcharge)).toBe(0)
+    expect(Number(res.body.data.platform_fee)).toBe(fee)
+    const held = await db.query<any>(`SELECT amount FROM held_payout_items WHERE source_id = $1`, [res.body.data.id])
+    expect(Number(held.rows[0].amount)).toBe(Math.round((20 - fee) * 100) / 100)
+  })
+
   it('S648: a card sale that didn\'t go through the reader is refused', async () => {
     const f = await seedPosFixture({ withConnectAccount: true })
     const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })
@@ -2017,6 +2039,21 @@ describe('POST /api/pos/terminal/payment-intents', () => {
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/does not belong to this landlord/i)
     expect(createCardPresentPaymentIntentMock).not.toHaveBeenCalled()
+  })
+
+  it('S648: a property that absorbs the fee charges the cart alone; GAM\'s fee still comes out', async () => {
+    const f = await seedPosFixture({ withConnectAccount: true })
+    await db.query(`UPDATE properties SET register_card_fee_payer = 'landlord' WHERE id = $1`, [f.propertyId])
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 0, taxAmount: 0, lines: [] })
+    const res = await request(buildApp())
+      .post('/api/pos/terminal/payment-intents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ items: [{ id: null, name: 'Propane', qty: 1, price: 20 }], propertyId: f.propertyId })
+    expect(res.status).toBe(201)
+    const arg = (createCardPresentPaymentIntentMock.mock.calls as any[][])[0]![0] as any
+    expect(arg.amountCents).toBe(2000)
+    expect(arg.cardFeeCents).toBe(Math.round(processingFeeFor({ amount: 20, paymentMethod: 'card' }) * 100))
+    expect(res.body.data.cardFee).toBe(0)
   })
 
   it('charges the cart plus the card fee, and the fee is GAM\'s', async () => {

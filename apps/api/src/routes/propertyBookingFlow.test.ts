@@ -189,6 +189,20 @@ describe('deposit confirmation', () => {
     expect(bk.hold_expires_at).toBeNull()
   })
 
+  it('S648: when the landlord absorbs the fee the guest pays the deposit alone, and the fee comes out of the payout', async () => {
+    const s = await seedSite()
+    await db.query(`UPDATE properties SET booking_card_fee_payer = 'landlord' WHERE id = $1`, [s.propertyId])
+    const { createBookingDepositCheckoutSession } = await import('../services/stripeConnect')
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+    expect(res.body.data.cardFee).toBe(0)
+    expect((createBookingDepositCheckoutSession as any).mock.calls.at(-1)[0].cardFeeCents).toBe(0)
+    const id = res.body.data.bookingId
+    const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
+    await confirmBookingDeposit(id, sess, { paymentIntentId: 'pi_abs', amountTotalCents: 6000 })
+    const held = (await db.query<any>(`SELECT amount FROM held_payout_items WHERE landlord_id = $1`, [s.landlordId])).rows
+    expect(Number(held[0].amount)).toBe(Math.round((60 - processingFeeFor({ amount: 60, paymentMethod: 'card' })) * 100) / 100)
+  })
+
   it('S648: a paid deposit is held for the landlord, less the card fee, once', async () => {
     const s = await seedSite()
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
