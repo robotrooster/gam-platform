@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
 
 vi.mock('node-cron', () => ({ default: { schedule: vi.fn() }, schedule: vi.fn() }))
 vi.mock('../services/email', async (orig) => ({
@@ -37,6 +37,8 @@ async function seedDoc(opts: {
   landlordSignedHoursAgo?: number
   tenantInvitedHoursAgo?: number
   tenantRemindedHoursAgo?: number | null
+  /** S647: a tenant who accepted their invite, i.e. someone actually waiting on the landlord. */
+  tenantAcceptedHoursAgo?: number
 }) {
   const c = await db.connect()
   try {
@@ -64,6 +66,14 @@ async function seedDoc(opts: {
                  ${opts.tenantRemindedHoursAgo != null ? HOURS_AGO(opts.tenantRemindedHoursAgo) : 'NULL'})`,
         [docId, userId, `tt-${randomUUID()}@t.dev`, randomUUID()])
     }
+    if (opts.tenantAcceptedHoursAgo != null) {
+      const tenantId = await seedTenant(c)
+      await c.query(
+        `INSERT INTO pending_tenant_intents
+           (landlord_id, tenant_id, unit_id, property_id, draft_document_id, accepted_at)
+         VALUES ($1,$2,$3,$4,$5, ${HOURS_AGO(opts.tenantAcceptedHoursAgo)})`,
+        [landlordId, tenantId, unitId, propertyId, docId])
+    }
     await c.query('COMMIT')
     return docId
   } catch (e) { await c.query('ROLLBACK'); throw e }
@@ -84,10 +94,29 @@ beforeEach(async () => {
 })
 
 describe('S636 — window A: waiting on the landlord', () => {
-  it('voids a document the landlord left unsigned for 48 hours', async () => {
-    const id = await seedDoc({ status: 'sent', sentHoursAgo: 49 })
+  // S647: window A is "from the time the tenant accepts the portal invite to
+  // the time the landlord signs". These fixtures now include the accepted
+  // tenant that makes somebody actually be waiting.
+  it('voids a document the landlord left unsigned for 48 hours after a tenant accepted', async () => {
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 49, tenantAcceptedHoursAgo: 49 })
     await processEsignTimeouts()
     expect(await statusOf(id)).toBe('voided')
+  })
+
+  // S647 (Nic, DIRECTIVE): onboarding drafts leases for the landlord to sign
+  // BEFORE anyone is told. Nobody is waiting on those, and voiding them after
+  // two days would wipe an onboarding batch the landlord had not reached yet.
+  it('never voids a draft that no tenant has accepted — it is the landlord\'s own queue', async () => {
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 200 })
+    await processEsignTimeouts()
+    expect(await statusOf(id)).toBe('sent')
+  })
+
+  it('measures from the acceptance, not from when the draft was made', async () => {
+    // Drafted a week ago at onboarding; the tenant accepted yesterday.
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 170, tenantAcceptedHoursAgo: 24 })
+    await processEsignTimeouts()
+    expect(await statusOf(id)).toBe('sent')
   })
 
   it('leaves one still inside the window alone', async () => {
@@ -132,7 +161,7 @@ describe('S636 — window B: waiting on the tenant', () => {
   // The landlord's own inaction is still his problem: nothing of his is at
   // stake, so the original window stands.
   it('still voids when the LANDLORD is the one who has not signed', async () => {
-    const id = await seedDoc({ status: 'sent', sentHoursAgo: 50 })
+    const id = await seedDoc({ status: 'sent', sentHoursAgo: 50, tenantAcceptedHoursAgo: 50 })
     await processEsignTimeouts()
     expect(await statusOf(id)).toBe('voided')
   })

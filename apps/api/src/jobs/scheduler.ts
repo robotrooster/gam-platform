@@ -5,6 +5,7 @@ import {
   emailSigningReminder, emailDocumentAutoVoided, emailSigningRequest,
   sendLatePaymentNotice,
 } from '../services/email'
+import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { query, queryOne } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
@@ -407,7 +408,7 @@ export async function processEsignTimeouts() {
     // email. `landlordSigned` distinguishes them in a single query so
     // the relay ordering stays in one place.
     const remind = await query<any>(`
-      SELECT s.id, s.email, s.name, s.role, s.token,
+      SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
              d.id as doc_id, d.title, d.landlord_id,
              u.unit_number, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
@@ -475,11 +476,11 @@ export async function processEsignTimeouts() {
         //
         // Same helper the send path uses, so there is one definition of what a
         // signing link is.
-        const appUrl = r.role === 'landlord'
-          ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
-          : (process.env.TENANT_APP_URL || 'http://localhost:3002')
-        const signingUrl = `${appUrl}/sign/${r.token || r.doc_id}`
-        await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id })
+        const { url: signingUrl, needsSetup } = r.role === 'landlord'
+          ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
+          // S647: one link that sets up their account and opens the lease.
+          : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
+        await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup })
         await query(
           `UPDATE lease_document_signers
               SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
@@ -520,9 +521,22 @@ export async function processEsignTimeouts() {
       LEFT JOIN properties p ON p.id = u.property_id
       WHERE d.renews_lease_id IS NULL
         AND (
+          -- Window A — waiting on the LANDLORD. S647: only while a TENANT is
+          -- actually waiting. Nic's S636 rule is "from the time the tenant
+          -- accepts the portal invite to the time the landlord signs", and it
+          -- was anchored on sent_at only because a draft used to be sent the
+          -- instant a tenant accepted. Since S647 drafts are made and sent at
+          -- ONBOARDING, before any tenant has been told anything, and they wait
+          -- in the landlord's queue at the landlord's pace. Voiding those after
+          -- 48 hours would wipe a whole onboarding batch the landlord had not
+          -- reached yet, and strand each household behind a voided draft.
           (d.status='sent'
              AND d.sent_at IS NOT NULL
-             AND GREATEST(d.sent_at, $1::timestamptz) < NOW() - INTERVAL '48 hours')
+             AND EXISTS (
+               SELECT 1 FROM pending_tenant_intents pa
+                WHERE pa.draft_document_id = d.id AND pa.accepted_at IS NOT NULL
+                  AND GREATEST(d.sent_at, pa.accepted_at, $1::timestamptz)
+                        < NOW() - INTERVAL '48 hours'))
           OR
           (d.status='in_progress'
              AND EXISTS (
@@ -592,13 +606,13 @@ export async function processEsignTimeouts() {
             try {
               // Same shape the reminder uses — the token IS the identity, so
               // the link works without a login (S629).
-              const appUrl = s.role === 'landlord'
-                ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
-                : (process.env.TENANT_APP_URL || 'http://localhost:3002')
-              const url = `${appUrl}/sign/${s.token || d.id}`
+              // S647: tenant-only here (onlyTenantsLeft), so always the
+              // one-link rule — set up the account and open the lease.
+              const link = await tenantLeaseLink({
+                userId: s.user_id, documentId: d.id, signerToken: s.token })
               await emailSigningRequest(s.email, s.name, d.title, unitLabel,
-                ll?.name || 'Your landlord', url,
-                { landlordId: d.landlord_id, documentId: d.id })
+                ll?.name || 'Your landlord', link.url,
+                { landlordId: d.landlord_id, documentId: d.id, needsSetup: link.needsSetup })
               await query(
                 `UPDATE lease_document_signers
                     SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1`, [s.id])
@@ -709,7 +723,7 @@ export async function processEsignTimeouts() {
     if (hour === 8 || hour === 9 || hour === 16) {
       const landlordPass = hour === 8
       const renewalRemind = await query<any>(`
-        SELECT s.id, s.email, s.name, s.role, s.token,
+        SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
                d.id as doc_id, d.title, d.landlord_id,
                u.unit_number, p.name as property_name,
                lu.first_name || ' ' || lu.last_name as landlord_name
@@ -735,11 +749,12 @@ export async function processEsignTimeouts() {
       for (const r of renewalRemind as any[]) {
         try {
           const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
-          const appUrl = r.role === 'landlord'
-            ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
-            : (process.env.TENANT_APP_URL || 'http://localhost:3002')
-          // S629: the signer's token, not the document id — see the reminder above.
-          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, `${appUrl}/sign/${r.token || r.doc_id}`, { landlordId: r.landlord_id, documentId: r.doc_id })
+          // S629: the signer's token, not the document id. S647: a tenant gets
+          // the one-link form (services/tenantLeaseLink).
+          const { url, needsSetup } = r.role === 'landlord'
+            ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
+            : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
+          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, url, { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup })
           await query(
             `UPDATE lease_document_signers
                 SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1

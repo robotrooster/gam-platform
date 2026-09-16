@@ -2490,36 +2490,6 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
 
     await client.query('COMMIT')
 
-    // Post-commit; a mail failure never rolls back the onboarding.
-    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
-    const landlord = await queryOne<any>(
-      `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
-    const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
-    const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
-    const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
-    try {
-      if (alreadyOnPlatform) {
-        // S616: they have a login. Tell them a lease is waiting, in the account
-        // they already use — never "set a password".
-        const { createNotification } = await import('../services/notifications')
-        await createNotification({
-          userId,
-          landlordId,
-          type: 'lease_drafted',
-          title: `${landlordName} added a lease for ${unitLabel}`,
-          body: `A lease for ${propertyAddress} is ready for you to review and sign. Sign in as usual — you already have an account.`,
-          data: { unitId, tenantId },
-          actionUrl: '/lease',
-        })
-      } else {
-        await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!, { landlordId, tenantId })
-      }
-    } catch (emailErr) {
-      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] notify failed for')
-      if (activationUrl) logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
-    }
-
     // S579: this flow onboards a SITTING tenant (the page is explicitly "tenants
     // who already live in your units"). If the landlord attests they're an
     // existing resident AND the property's onboarding window is open, grandfather
@@ -2568,6 +2538,52 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       logger.error({ err: draftErr, ctx: unitId }, '[ONBOARD-NEW-LEASE] invite-time draft failed')
     } finally {
       draftClient.release()
+    }
+
+    // S647 (Nic, DIRECTIVE): "When I type in a bunch of names to send invites
+    // to, it doesn't send them. It drafts up a bunch of leases for me to sign.
+    // After I sign it, they click the email, and acceptance and signing all
+    // becomes one flow."
+    //
+    // So when a lease WAS drafted, the tenant hears nothing yet. Their one email
+    // goes out when the landlord signs (the relay in routes/esign.ts, through
+    // services/tenantLeaseLink). Mailing the portal invite now is exactly how a
+    // resident ends up accepting an invite, finding no lease, and believing the
+    // acceptance was the signature.
+    //
+    // Only if drafting did NOT happen — the unit's template is missing or
+    // refused — does the old invite still go, so nobody is left with nothing.
+    // Accepting it retries the draft.
+    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
+    const activationUrl = inviteToken ? `${tenantAppUrl}/accept-invite?token=${inviteToken}` : null
+    if (draftedDocumentIds.length === 0) {
+      // Post-commit; a mail failure never rolls back the onboarding.
+      const landlord = await queryOne<any>(
+        `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
+      const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
+      const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
+      const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
+      try {
+        if (alreadyOnPlatform) {
+          // S616: they have a login. Tell them a lease is waiting, in the account
+          // they already use — never "set a password".
+          const { createNotification } = await import('../services/notifications')
+          await createNotification({
+            userId,
+            landlordId,
+            type: 'lease_drafted',
+            title: `${landlordName} added a lease for ${unitLabel}`,
+            body: `A lease for ${propertyAddress} is ready for you to review and sign. Sign in as usual — you already have an account.`,
+            data: { unitId, tenantId },
+            actionUrl: '/lease',
+          })
+        } else {
+          await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl!, { landlordId, tenantId })
+        }
+      } catch (emailErr) {
+        logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] notify failed for')
+        if (activationUrl) logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
+      }
     }
 
     // S616: the landlord is told which of the two actually happened, so the

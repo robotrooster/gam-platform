@@ -14,7 +14,15 @@
  * failure modes are both expensive: billing nobody (the old behaviour) and
  * billing twice (the obvious way to get the new one wrong).
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+const { emailSigningRequestMock } = vi.hoisted(() => ({
+  emailSigningRequestMock: vi.fn(async (..._a: any[]) => undefined),
+}))
+vi.mock('../services/email', async (orig) => ({
+  ...(await orig() as any),
+  emailSigningRequest: emailSigningRequestMock,
+}))
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -29,6 +37,7 @@ import { errorHandler } from '../middleware/errorHandler'
 
 beforeEach(async () => {
   await cleanupAllSchema()
+  emailSigningRequestMock.mockClear()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_issuance'
 })
 
@@ -280,5 +289,45 @@ describe('a lease that never gets a tenant signature', () => {
     expect(lease).toBeTruthy()
     expect(lease.status).toBe('active')
     expect((await invoicesFor(f.unitId)).length).toBeGreaterThan(0)
+  })
+})
+
+// S647 (Nic, DIRECTIVE): "After I sign it, they click the email, and
+// acceptance and signing all becomes one flow for the tenant."
+describe('the email the tenant gets when the landlord signs', () => {
+  it('sets up their account and opens the lease, if they never set one up', async () => {
+    const f = await fixture()
+    await db.query(
+      `UPDATE users SET password_hash='$2b$10$placeholder_invite_pending',
+                        tenant_invite_accepted_at=NULL WHERE id=$1`, [f.tenantUserId])
+    const documentId = await unsignedDoc(f)
+    // As drafted for real: the tenant is not asked until the landlord signs.
+    await db.query(`UPDATE lease_document_signers SET status='pending', invite_sent=FALSE
+                     WHERE document_id=$1 AND role='primary'`, [documentId])
+    await signAs(documentId, f.landlordToken)
+
+    const toTenant = emailSigningRequestMock.mock.calls.filter(c => c[0] === f.tenantEmail)
+    expect(toTenant).toHaveLength(1)
+    const [, , , , , url, ctx] = toTenant[0] as any[]
+    expect(url).toContain('/accept-invite?token=')
+    expect(url).toContain(encodeURIComponent(`/sign/${documentId}`))
+    expect(ctx.needsSetup).toBe(true)
+  })
+
+  it('is the ordinary signing link for someone who already has a login', async () => {
+    const f = await fixture()
+    await db.query(`UPDATE users SET tenant_invite_accepted_at=NOW() WHERE id=$1`, [f.tenantUserId])
+    const documentId = await unsignedDoc(f)
+    // As drafted for real: the tenant is not asked until the landlord signs.
+    await db.query(`UPDATE lease_document_signers SET status='pending', invite_sent=FALSE
+                     WHERE document_id=$1 AND role='primary'`, [documentId])
+    await signAs(documentId, f.landlordToken)
+
+    const toTenant = emailSigningRequestMock.mock.calls.filter(c => c[0] === f.tenantEmail)
+    expect(toTenant).toHaveLength(1)
+    const [, , , , , url, ctx] = toTenant[0] as any[]
+    expect(url).toMatch(/\/sign\//)
+    expect(url).not.toContain('accept-invite')
+    expect(ctx.needsSetup).toBe(false)
   })
 })

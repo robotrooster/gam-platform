@@ -387,3 +387,24 @@ describe('S647 the front desk after drafting moved to invite time', () => {
     expect(await pending(f)).toHaveLength(0)
   })
 })
+
+// S647 (Nic, DIRECTIVE): "When I type in a bunch of names to send invites to,
+// it doesn't send them. It drafts up a bunch of leases for me to sign."
+describe('S647 onboarding sends the tenant nothing until the landlord signs', () => {
+  it('drafts the lease and does NOT email the tenant', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1, 12)
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds.length).toBe(1)
+    expect(emailTenantOnboardedMock).not.toHaveBeenCalled()
+  })
+
+  it('still sends the old invite if the lease could not be drafted, so nobody gets nothing', async () => {
+    const f = await seedBase('whole_unit')   // no default template
+    const res = await onboard(f, `a-${randomUUID().slice(0, 6)}@x.dev`, 'Aaa')
+    expect(res.status).toBe(200)
+    expect(res.body.data.draftedDocumentIds).toEqual([])
+    expect(emailTenantOnboardedMock).toHaveBeenCalledTimes(1)
+  })
+})

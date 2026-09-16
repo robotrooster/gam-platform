@@ -3832,11 +3832,19 @@ esignRouter.post('/documents/:id/remind', requireAuth, requirePerm('esign.send')
     }
 
     const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
-    const appUrl = signer.role === 'landlord' ? portalUrl('landlord') : portalUrl('tenant')
-    const signingUrl = `${appUrl}/sign/${signer.token || doc.id}`
+    // S647: same one-link rule as the relay (services/tenantLeaseLink).
+    let signingUrl = `${portalUrl('landlord')}/sign/${signer.token || doc.id}`
+    let needsSetup = false
+    if (signer.role !== 'landlord' && signer.role !== 'witness') {
+      const { tenantLeaseLink } = await import('../services/tenantLeaseLink')
+      const link = await tenantLeaseLink({
+        userId: signer.user_id, documentId: doc.id, signerToken: signer.token })
+      signingUrl = link.url
+      needsSetup = link.needsSetup
+    }
 
     await emailSigningReminder(signer.email, signer.name, doc.title, unitLabel,
-      doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
+      doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
 
     await query(
       `UPDATE lease_document_signers
@@ -5032,10 +5040,22 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         ORDER BY order_index LIMIT 1`, [doc.id])
       if (nextSigner) {
         const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
-        // S410 (S377): read tenant_invite_token (was email_verify_token).
-        const nextSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [nextSigner.user_id])
-        const nextSigningUrl = signingUrlFor(nextSigner, doc.id, nextSignerUser)
-        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id })
+        // S647: a tenant who has not set up their account gets ONE email that
+        // sets it up and lands them on this lease (services/tenantLeaseLink) —
+        // not a bare signing link on top of the portal invite they already got.
+        let nextSigningUrl: string
+        let needsSetup = false
+        if (nextSigner.role === 'landlord' || nextSigner.role === 'witness') {
+          const nextSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [nextSigner.user_id])
+          nextSigningUrl = signingUrlFor(nextSigner, doc.id, nextSignerUser)
+        } else {
+          const { tenantLeaseLink } = await import('../services/tenantLeaseLink')
+          const link = await tenantLeaseLink({
+            userId: nextSigner.user_id, documentId: doc.id, signerToken: nextSigner.token })
+          nextSigningUrl = link.url
+          needsSetup = link.needsSetup
+        }
+        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id, needsSetup })
         await createNotification({
           userId: nextSigner.user_id,
           type: 'esign_request',

@@ -389,19 +389,28 @@ export async function emailPoolTenantInterested(landlordEmail: string, landlordN
 
 // ── E-SIGN EMAILS ─────────────────────────────────────────────
 
-export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string }) {
-  await send(to, `Please sign: ${documentTitle}`,
+export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean }) {
+  // S647: a resident who has never set up their account gets ONE email that
+  // does both — set a password, then land on the lease (services/
+  // tenantLeaseLink). Saying so plainly is the point: "accept" and "sign" used
+  // to arrive as two emails, and people believed the first was the second.
+  const setup = !!ctx?.needsSetup
+  await send(to, setup ? `Your lease is ready to sign — ${unitLabel}` : `Please sign: ${documentTitle}`,
     base(
-      h('Document Ready for Your Signature') +
+      h(setup ? 'Your Lease Is Ready to Sign' : 'Document Ready for Your Signature') +
       p(`Hi ${signerName},`) +
-      p(`<strong style="color:#eef1f8">${landlordName}</strong> has sent you a document to review and sign:`) +
+      (setup
+        ? p(`<strong style="color:#eef1f8">${landlordName}</strong> has signed your lease and it is ready for you. The button below sets up your GAM account and takes you straight to your signature — it is one step, and your lease is not signed until you finish it:`)
+        : p(`<strong style="color:#eef1f8">${landlordName}</strong> has sent you a document to review and sign:`)) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
       </div>` +
       p('Please review the document carefully before signing. This is a legally binding agreement under UETA and the federal E-SIGN Act.') +
-      btn('Review & Sign Document', signingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+      btn(setup ? 'Set Up Account & Sign Lease' : 'Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${setup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to access this document.'}</div>`
     ),
     {
       category: 'esign_signing_request',
@@ -471,7 +480,7 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
 
 // ── ESIGN REMINDER + AUTO-VOID EMAILS (S29) ───────────────
 
-export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string }) {
+export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean }) {
   await send(to, `Reminder: please sign ${documentTitle}`,
     base(
       h('Reminder: Document Awaiting Your Signature') +
@@ -485,8 +494,10 @@ export async function emailSigningReminder(to: string, signerName: string, docum
       // follow. He read his own auto-void email and thought the rule had been
       // reverted: "I thought we changed it to be forty eight hours."
       p('If the document is not signed within 48 hours of being sent, it will be automatically voided.') +
-      btn('Review & Sign Document', signingUrl) +
-      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+      btn(ctx?.needsSetup ? 'Set Up Account & Sign Lease' : 'Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">${ctx?.needsSetup
+        ? 'You will choose a password and enter a code we email you, then your lease opens.'
+        : 'Sign in to your GAM account to access this document.'}</div>`
     ),
     {
       category: 'esign_signing_reminder',
