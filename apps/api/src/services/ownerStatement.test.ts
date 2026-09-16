@@ -309,46 +309,6 @@ describe('what the manager charged, whatever shape their plan is', () => {
   })
 })
 
-describe('how the owner gets paid changes what the statement claims', () => {
-  it('a direct owner has already been paid what the month earned', async () => {
-    const client = await getClient()
-    try {
-      const o = await seedOwnerWithProperty(client)
-      await allocate(client, o, 'allocation_owner_share', 880)
-      const s = await ownerStatement({ landlordId: o.landlordId, periodMonth: M })
-      expect(s.payoutMode).toBe('direct')
-      expect(s.distributedInPeriod).toBe(880)
-      expect(s.heldForOwner).toBe(0)
-    } finally { client.release() }
-  })
-
-  it('a trust owner is owed it, not paid it', async () => {
-    const client = await getClient()
-    try {
-      const { userId, landlordId } = await seedLandlord(client)
-      const bankId = await seedUserBankAccount(client, { userId })
-      const pmId = await seedPmCompany(client, { bankAccountId: bankId })
-      const propertyId = await seedProperty(client, {
-        landlordId, ownerUserId: userId, managedByUserId: userId })
-      await client.query(`UPDATE properties SET pm_company_id=$2 WHERE id=$1`,
-        [propertyId, pmId])
-      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-      // The properties trigger opens the relationship; the manager then sets
-      // this owner to be paid on a run rather than at settlement.
-      await client.query(
-        `UPDATE pm_owner_relationships SET payout_mode='pm_trust'
-          WHERE pm_company_id=$1 AND landlord_id=$2`, [pmId, landlordId])
-      await allocate(client, { landlordId, userId, propertyId, unitId },
-        'allocation_owner_share', 880)
-
-      const s = await ownerStatement({ landlordId, periodMonth: M, pmCompanyId: pmId })
-      expect(s.payoutMode).toBe('pm_trust')
-      expect(s.distributedInPeriod).toBe(0)
-      expect(s.heldForOwner).toBe(880)
-    } finally { client.release() }
-  })
-})
-
 describe('the relationship opens itself', () => {
   it('a property joining a manager creates the owner relationship', async () => {
     const client = await getClient()
@@ -367,11 +327,10 @@ describe('the relationship opens itself', () => {
         [propertyId, pmId])
 
       const after = await client.query(
-        `SELECT payout_mode, portal_access FROM pm_owner_relationships
+        `SELECT portal_access FROM pm_owner_relationships
           WHERE pm_company_id=$1 AND landlord_id=$2`, [pmId, landlordId])
       expect(after.rows).toHaveLength(1)
-      // Defaults are exactly today's behaviour: paid at settlement, no portal.
-      expect(after.rows[0].payout_mode).toBe('direct')
+      // The default is exactly today's behaviour: no portal until someone asks.
       expect(after.rows[0].portal_access).toBe('none')
     } finally { client.release() }
   })

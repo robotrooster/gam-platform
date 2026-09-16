@@ -12,15 +12,13 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useAuth } from '../context/AuthContext'
-import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { apiGet, apiPost } from '../lib/api'
 import { Check } from 'lucide-react'
 
 interface OwnerRow {
   landlordId: string
   businessName: string | null
   ownerEmail: string | null
-  payoutMode: 'direct' | 'pm_trust'
-  disbursementDay: number
   portalAccess: 'none' | 'active' | 'closed'
   portalOpenedAt: string | null
   notes: string | null
@@ -36,11 +34,8 @@ interface StatementProperty {
 }
 interface Statement {
   periodMonth: string
-  payoutMode: 'direct' | 'pm_trust'
   properties: StatementProperty[]
   totals: { grossCollected: number; ownerShare: number; managementFee: number; expenses: number; net: number }
-  distributedInPeriod: number
-  heldForOwner: number
 }
 
 const money = (n: number) =>
@@ -48,11 +43,6 @@ const money = (n: number) =>
 
 /** This month, as the API wants it. */
 const thisMonth = () => new Date().toISOString().slice(0, 7)
-
-const PAYOUT_LABEL: Record<OwnerRow['payoutMode'], string> = {
-  direct: 'Paid at settlement',
-  pm_trust: 'Held, paid on a run',
-}
 
 export function OwnersPage() {
   const { activePmCompany } = useAuth()
@@ -65,12 +55,6 @@ export function OwnersPage() {
     ['pm-owners', cid],
     () => apiGet<OwnerRow[]>(`/pm/companies/${cid}/owners`),
     { enabled: !!cid },
-  )
-
-  const terms = useMutation(
-    (v: { landlordId: string; body: any }) =>
-      apiPatch(`/pm/companies/${cid}/owners/${v.landlordId}`, v.body),
-    { onSuccess: () => qc.invalidateQueries(['pm-owners', cid]) },
   )
 
   const openPortal = useMutation(
@@ -105,8 +89,7 @@ export function OwnersPage() {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: 'var(--bg-2)' }}>
-                <Th>Owner</Th><Th>Portfolio</Th><Th>How they're paid</Th>
-                <Th>Portal</Th><Th>{' '}</Th>
+                <Th>Owner</Th><Th>Portfolio</Th><Th>Portal</Th><Th>{' '}</Th>
               </tr>
             </thead>
             <tbody>
@@ -121,37 +104,6 @@ export function OwnersPage() {
                   <Td>
                     {o.propertyCount} {o.propertyCount === 1 ? 'property' : 'properties'}
                     <span style={{ color: 'var(--text-3)' }}> · {o.unitCount} units</span>
-                  </Td>
-                  <Td>
-                    <select
-                      value={o.payoutMode}
-                      onChange={e => terms.mutate({
-                        landlordId: o.landlordId, body: { payoutMode: e.target.value } })}
-                      style={selectStyle}
-                    >
-                      <option value="direct">{PAYOUT_LABEL.direct}</option>
-                      {/* A local label map keyed by the enum VALUE the API serves,
-                          not a field read off a response — the value stays snake
-                          because that is what the column stores, the label is what
-                          a human sees. Annotation must sit on the read's own line. */}
-                      <option value="pm_trust">{PAYOUT_LABEL.pm_trust /* wire-ok */}</option>
-                    </select>
-                    {o.payoutMode === 'pm_trust' && (
-                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
-                        Paid out on the{' '}
-                        <select
-                          value={o.disbursementDay}
-                          onChange={e => terms.mutate({
-                            landlordId: o.landlordId,
-                            body: { disbursementDay: Number(e.target.value) } })}
-                          style={{ ...selectStyle, padding: '1px 4px' }}
-                        >
-                          {Array.from({ length: 28 }, (_, i) => i + 1).map(d => (
-                            <option key={d} value={d}>{ordinal(d)}</option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
                   </Td>
                   <Td>
                     {o.portalAccess === 'active' ? (
@@ -245,11 +197,7 @@ function OwnerStatement(props: {
             <Figure label="Net to owner" value={money(s.totals.net)} accent />
           </div>
 
-          <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.5 }}>
-            {s.payoutMode === 'direct'
-              ? `Paid at settlement — ${money(s.distributedInPeriod)} already went to their account this period.`
-              : `Held for disbursement — ${money(s.heldForOwner)} is owed to them and has not been paid out yet.`}
-          </div>
+
 
           {s.properties.length > 0 && (
             <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 16 }}>
@@ -295,12 +243,6 @@ function OwnerStatement(props: {
       )}
     </div>
   )
-}
-
-function ordinal(n: number): string {
-  const s = ['th', 'st', 'nd', 'rd']
-  const v = n % 100
-  return n + (s[(v - 20) % 10] || s[v] || s[0])
 }
 
 const selectStyle: React.CSSProperties = {

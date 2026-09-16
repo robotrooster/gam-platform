@@ -1168,8 +1168,6 @@ pmRouter.get('/companies/:id/owners', async (req: any, res, next) => {
       `SELECT r.landlord_id                AS "landlordId",
               l.business_name              AS "businessName",
               u.email                      AS "ownerEmail",
-              r.payout_mode                AS "payoutMode",
-              r.disbursement_day           AS "disbursementDay",
               r.portal_access              AS "portalAccess",
               r.portal_opened_at           AS "portalOpenedAt",
               r.notes,
@@ -1196,16 +1194,17 @@ pmRouter.get('/companies/:id/owners', async (req: any, res, next) => {
 
 // PATCH /api/pm/companies/:id/owners/:landlordId — the terms of the relationship.
 //
-// Nic (S644, DIRECTIVE) on the money: per-owner choice. 'direct' pays the owner
-// their share the moment a resident's rent settles, which is what allocation.ts
-// already does. 'pm_trust' holds it to the manager and pays out on a run.
+// S646: this used to carry a payout mode and a manager-chosen payday. Nic threw
+// both out — "if we're holding the money, why would the property manager choose
+// when the owner gets paid? It's our schedule as the payment processor." GAM's
+// books hold every landlord's money until GAM's own payout run; a manager does
+// not move that date, and with custody settled the two modes described the same
+// event anyway.
 pmRouter.patch('/companies/:id/owners/:landlordId', async (req: any, res, next) => {
   try {
     await assertPmStaffRole(req.user!.userId, req.params.id, ['owner', 'manager'])
     await requireOwnerRelationship(req.params.id, req.params.landlordId)
     const body = z.object({
-      payoutMode: z.enum(['direct', 'pm_trust']).optional(),
-      disbursementDay: z.number().int().min(1).max(28).optional(),
       notes: z.string().max(2000).nullish(),
     }).strict().parse(req.body)
 
@@ -1221,9 +1220,7 @@ pmRouter.patch('/companies/:id/owners/:landlordId', async (req: any, res, next) 
     const updated = await queryOne<any>(
       `UPDATE pm_owner_relationships SET ${sets.join(', ')}, updated_at = now()
         WHERE pm_company_id = $1 AND landlord_id = $2
-        RETURNING payout_mode AS "payoutMode", disbursement_day AS "disbursementDay",
-                  portal_access AS "portalAccess",
-                  notes`,
+        RETURNING portal_access AS "portalAccess", notes`,
       vals)
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

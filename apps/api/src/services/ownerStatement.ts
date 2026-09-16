@@ -70,7 +70,6 @@ export interface OwnerStatement {
   pmCompanyId: string | null
   /** ISO first-of-month. */
   periodMonth: string
-  payoutMode: 'direct' | 'pm_trust'
   properties: OwnerStatementProperty[]
   totals: {
     grossCollected: number
@@ -79,19 +78,6 @@ export interface OwnerStatement {
     expenses: number
     net: number
   }
-  /**
-   * Money that actually reached the owner during the period.
-   *
-   * For a 'direct' owner this is their share leaving at settlement, so it
-   * tracks `ownerShare` closely and the statement is a description of
-   * something already finished. For a 'pm_trust' owner it is the disbursement
-   * run, which happens after the month ends — so their statement legitimately
-   * shows a month's earnings with nothing paid out yet, and the closing balance
-   * is what they are owed.
-   */
-  distributedInPeriod: number
-  /** Owed but not yet paid out. Always 0 for a 'direct' owner. */
-  heldForOwner: number
 }
 
 /** ISO first-of-month for the month containing `month` (accepts 'YYYY-MM' too). */
@@ -237,35 +223,17 @@ export async function ownerStatement(opts: {
   const sum = (pick: (p: OwnerStatementProperty) => number) =>
     round2(properties.reduce((s, p) => s + pick(p), 0))
 
-  const rel = await query<any>(
-    `SELECT payout_mode FROM pm_owner_relationships
-      WHERE landlord_id = $1 AND ($2::uuid IS NULL OR pm_company_id = $2::uuid)
-        AND status = 'active'
-      ORDER BY updated_at DESC LIMIT 1`,
-    [opts.landlordId, pmId])
-  const payoutMode: 'direct' | 'pm_trust' = rel[0]?.payout_mode === 'pm_trust'
-    ? 'pm_trust' : 'direct'
-
-  const ownerShareTotal = sum(p => p.ownerShare)
-
   return {
     landlordId: opts.landlordId,
     pmCompanyId: pmId,
     periodMonth: start,
-    payoutMode,
     properties,
     totals: {
       grossCollected: sum(p => p.grossCollected),
-      ownerShare: ownerShareTotal,
+      ownerShare: sum(p => p.ownerShare),
       managementFee: sum(p => p.managementFee),
       expenses: sum(p => p.expenses),
       net: sum(p => p.net),
     },
-    // A 'direct' owner's share left at settlement — the allocation IS the
-    // payment, so the month's share is the month's distribution. A 'pm_trust'
-    // owner is paid on a disbursement run, which is a separate act and is not
-    // reported here until it has actually happened.
-    distributedInPeriod: payoutMode === 'direct' ? ownerShareTotal : 0,
-    heldForOwner: payoutMode === 'direct' ? 0 : ownerShareTotal,
   }
 }

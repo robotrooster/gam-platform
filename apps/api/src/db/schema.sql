@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3fC7m4c2k5mA7vySFeGoOILaHvGCkkyS4BTtqGMaSNcfe9T4D7WxWN981vR0Hyp
+\restrict a5ANdH5YGPfVSfUSVgYBN9LA6OhghamR8yhO8hJJrOzCIx3K9sirVeJALezSzjl
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6675,8 +6675,6 @@ CREATE TABLE public.pm_owner_relationships (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     pm_company_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
-    payout_mode text DEFAULT 'direct'::text NOT NULL,
-    disbursement_day smallint DEFAULT 10 NOT NULL,
     portal_access text DEFAULT 'none'::text NOT NULL,
     portal_opened_at timestamp with time zone,
     portal_opened_by text,
@@ -6686,8 +6684,6 @@ CREATE TABLE public.pm_owner_relationships (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pm_owner_relationships_disbursement_day_check CHECK (((disbursement_day >= 1) AND (disbursement_day <= 28))),
-    CONSTRAINT pm_owner_relationships_payout_mode_check CHECK ((payout_mode = ANY (ARRAY['direct'::text, 'pm_trust'::text]))),
     CONSTRAINT pm_owner_relationships_portal_access_check CHECK ((portal_access = ANY (ARRAY['none'::text, 'active'::text, 'closed'::text]))),
     CONSTRAINT pm_owner_relationships_portal_opened_by_check CHECK ((portal_opened_by = ANY (ARRAY['owner'::text, 'pm_company'::text, 'gam'::text]))),
     CONSTRAINT pm_owner_relationships_status_check CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))
@@ -16917,13 +16913,6 @@ CREATE INDEX idx_pm_owner_rel_landlord ON public.pm_owner_relationships USING bt
 
 
 --
--- Name: idx_pm_owner_rel_trust_day; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_pm_owner_rel_trust_day ON public.pm_owner_relationships USING btree (disbursement_day) WHERE ((payout_mode = 'pm_trust'::text) AND (status = 'active'::text));
-
-
---
 -- Name: idx_pm_property_invitations_email_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26697,5 +26686,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3fC7m4c2k5mA7vySFeGoOILaHvGCkkyS4BTtqGMaSNcfe9T4D7WxWN981vR0Hyp
+\unrestrict a5ANdH5YGPfVSfUSVgYBN9LA6OhghamR8yhO8hJJrOzCIx3K9sirVeJALezSzjl
 

@@ -88,7 +88,6 @@ describe('the manager\'s owner list', () => {
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].landlordId).toBe(o.landlordId)
-    expect(res.body.data[0].payoutMode).toBe('direct')
     expect(res.body.data[0].portalAccess).toBe('none')
     expect(res.body.data[0].unitCount).toBe(1)
   })
@@ -126,55 +125,12 @@ describe('reaching for an owner the company does not manage', () => {
     const res = await request(buildApp())
       .patch(`/api/pm/companies/${mine.pmCompanyId}/owners/${theirs.landlordId}`)
       .set('Authorization', `Bearer ${staff.token}`)
-      .send({ payoutMode: 'pm_trust' })
+      .send({ notes: 'not mine to annotate' })
     expect(res.status).toBe(404)
     const row = await db.query(
-      `SELECT payout_mode FROM pm_owner_relationships WHERE landlord_id=$1`,
+      `SELECT notes FROM pm_owner_relationships WHERE landlord_id=$1`,
       [theirs.landlordId])
-    expect(row.rows[0].payout_mode).toBe('direct')
-  })
-})
-
-describe('how an owner gets paid', () => {
-  it('a manager can put one owner on a disbursement run without touching the rest', async () => {
-    const a = await managedOwner()
-    const b = await managedOwner(a.pmCompanyId)
-    const staff = await pmStaffUser()
-    await makeStaff(a.pmCompanyId, staff.userId)
-
-    const res = await request(buildApp())
-      .patch(`/api/pm/companies/${a.pmCompanyId}/owners/${a.landlordId}`)
-      .set('Authorization', `Bearer ${staff.token}`)
-      .send({ payoutMode: 'pm_trust', disbursementDay: 12 })
-    expect(res.status).toBe(200)
-    expect(res.body.data.payoutMode).toBe('pm_trust')
-    expect(res.body.data.disbursementDay).toBe(12)
-
-    const other = await db.query(
-      `SELECT payout_mode FROM pm_owner_relationships WHERE landlord_id=$1`, [b.landlordId])
-    expect(other.rows[0].payout_mode).toBe('direct')
-  })
-
-  it('refuses a disbursement day that does not exist in February', async () => {
-    const o = await managedOwner()
-    const staff = await pmStaffUser()
-    await makeStaff(o.pmCompanyId, staff.userId)
-    const res = await request(buildApp())
-      .patch(`/api/pm/companies/${o.pmCompanyId}/owners/${o.landlordId}`)
-      .set('Authorization', `Bearer ${staff.token}`)
-      .send({ disbursementDay: 31 })
-    expect(res.status).toBe(400)
-  })
-
-  it('a staff member cannot change the money terms — owner or manager only', async () => {
-    const o = await managedOwner()
-    const staff = await pmStaffUser()
-    await makeStaff(o.pmCompanyId, staff.userId, 'staff')
-    const res = await request(buildApp())
-      .patch(`/api/pm/companies/${o.pmCompanyId}/owners/${o.landlordId}`)
-      .set('Authorization', `Bearer ${staff.token}`)
-      .send({ payoutMode: 'pm_trust' })
-    expect(res.status).toBe(403)
+    expect(row.rows[0].notes).toBeNull()
   })
 })
 
