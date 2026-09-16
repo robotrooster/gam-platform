@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon'
-import { prorateMoveInRent } from '@gam/shared'
+import { prorateMoveInRent, nextDueDateAfter } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
@@ -605,13 +605,21 @@ export async function generateMoveInInvoice(
         // settle, but the period is what carries the credit onto the invoice —
         // skipping it would leave the move-in charges suspended forever with
         // nothing to release them.
+        // S648: a tenant due on another day works from move-in to the day
+        // before their first due date; the 1st keeps the calendar month.
+        const wtDueDay = leaseMeta?.is_existing_tenancy ? 1 : (leaseMeta?.rent_due_day ?? 1)
+        const periodStart = wtDueDay === 1 ? monthStart : invoiceDueDate
+        const periodEnd = wtDueDay === 1
+          ? DateTime.fromISO(monthStart).endOf('month').toISODate()!
+          : DateTime.fromISO(nextDueDateAfter(invoiceDueDate, wtDueDay)).minus({ days: 1 }).toISODate()!
         await client.query(
           `INSERT INTO work_trade_settlements
-             (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount)
-           VALUES ($1, $2, $3::date, $4, $5, $6)
-           ON CONFLICT (agreement_id, period_month) DO NOTHING`,
+             (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount,
+              period_start, period_end)
+           VALUES ($1, $2, $3::date, $4, $5, $6, $7::date, $8::date)
+           ON CONFLICT (agreement_id, period_start) DO NOTHING`,
           [wtAgreement.id, invoiceId, monthStart, target.toFixed(2),
-           hourRateFor(basis, target).toFixed(4), basis.toFixed(2)])
+           hourRateFor(basis, target).toFixed(4), basis.toFixed(2), periodStart, periodEnd])
       }
     }
 

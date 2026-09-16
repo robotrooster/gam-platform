@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict mhtNjce4ucJoFt05DfqveyVir6yzIyqTwxN3QqWKB1tteFNXnPrJD5OyY3Wqik0
+\restrict M6ablRLeb6jW8vJxdBwdpNya0AJz7n3rvPHwTNJ7dHIc2jugE8RC0wj1h59LJ4c
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -991,6 +991,22 @@ CREATE FUNCTION public.update_updated_at() RETURNS trigger
     AS $$
 BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
 $$;
+
+
+--
+-- Name: work_trade_period_default_dates(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.work_trade_period_default_dates() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.period_start IS NULL THEN NEW.period_start := NEW.period_month; END IF;
+  IF NEW.period_end IS NULL THEN
+    NEW.period_end := (date_trunc('month', NEW.period_start) + INTERVAL '1 month' - INTERVAL '1 day')::date;
+  END IF;
+  RETURN NEW;
+END $$;
 
 
 SET default_tablespace = '';
@@ -10967,9 +10983,13 @@ CREATE TABLE public.work_trade_settlements (
     billed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    period_start date NOT NULL,
+    period_end date NOT NULL,
+    close_run_at timestamp with time zone,
     CONSTRAINT work_trade_settlements_applied_within_target CHECK ((hours_applied <= target_hours)),
     CONSTRAINT work_trade_settlements_credit_nonneg CHECK (((credit_applied >= (0)::numeric) AND (credit_applied <= basis_amount))),
     CONSTRAINT work_trade_settlements_hours_nonneg CHECK (((hours_worked >= (0)::numeric) AND (hours_applied >= (0)::numeric))),
+    CONSTRAINT work_trade_settlements_period_dates CHECK ((period_end >= period_start)),
     CONSTRAINT work_trade_settlements_period_is_month_start CHECK ((period_month = (date_trunc('month'::text, (period_month)::timestamp with time zone))::date)),
     CONSTRAINT work_trade_settlements_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'billed'::text]))),
     CONSTRAINT work_trade_settlements_target_nonnegative CHECK ((target_hours >= (0)::numeric))
@@ -19202,10 +19222,10 @@ CREATE UNIQUE INDEX ux_utility_service_agreement_live ON public.utility_service_
 
 
 --
--- Name: ux_work_trade_settlements_agreement_month; Type: INDEX; Schema: public; Owner: -
+-- Name: ux_work_trade_settlements_agreement_start; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_work_trade_settlements_agreement_month ON public.work_trade_settlements USING btree (agreement_id, period_month);
+CREATE UNIQUE INDEX ux_work_trade_settlements_agreement_start ON public.work_trade_settlements USING btree (agreement_id, period_start);
 
 
 --
@@ -20543,6 +20563,13 @@ CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW E
 --
 
 CREATE TRIGGER trg_vehicles_updated_at BEFORE UPDATE ON public.vehicles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: work_trade_settlements trg_work_trade_period_default_dates; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_work_trade_period_default_dates BEFORE INSERT ON public.work_trade_settlements FOR EACH ROW EXECUTE FUNCTION public.work_trade_period_default_dates();
 
 
 --
@@ -26749,5 +26776,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict mhtNjce4ucJoFt05DfqveyVir6yzIyqTwxN3QqWKB1tteFNXnPrJD5OyY3Wqik0
+\unrestrict M6ablRLeb6jW8vJxdBwdpNya0AJz7n3rvPHwTNJ7dHIc2jugE8RC0wj1h59LJ4c
 

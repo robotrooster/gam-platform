@@ -33,11 +33,17 @@ export interface SettlementRunResult {
 const ROW_PRIORITY = `CASE p.type WHEN 'rent' THEN 0 WHEN 'utility' THEN 1
                                   WHEN 'fee'  THEN 2 ELSE 3 END`
 
+// S648: a period's identity is its START date. With the 1st as the due day
+// that is the month label itself, so nothing changes for calendar tenants; a
+// tenant due on the 15th can have two periods labelled with one month (the
+// move-in stub and the first full period), and the start tells them apart.
 async function loadOpenPeriods(
   client: PoolClient, agreementId: string, throughMonth: string,
-): Promise<Array<SettlementPeriod & { id: string; invoiceId: string | null }>> {
+  throughStart: string | null = null,
+): Promise<Array<SettlementPeriod & { id: string; invoiceId: string | null; label: string }>> {
   const { rows } = await client.query(
-    `SELECT id, invoice_id, to_char(period_month,'YYYY-MM-DD') AS period_month,
+    `SELECT id, invoice_id, to_char(period_start,'YYYY-MM-DD') AS period_month,
+            to_char(period_month,'YYYY-MM-DD') AS label,
             target_hours::float  AS target_hours,
             hours_applied::float AS hours_applied,
             basis_amount::float  AS basis_amount,
@@ -50,10 +56,11 @@ async function loadOpenPeriods(
             )::int AS aged_closes
        FROM work_trade_settlements
       WHERE agreement_id = $1 AND status = 'open' AND period_month <= $2::date
-      ORDER BY period_month`,
-    [agreementId, throughMonth])
+        AND ($3::date IS NULL OR period_start <= $3::date)
+      ORDER BY period_start`,
+    [agreementId, throughMonth, throughStart])
   return rows.map((r: any) => ({
-    id: r.id, invoiceId: r.invoice_id,
+    id: r.id, invoiceId: r.invoice_id, label: r.label,
     periodMonth: r.period_month,
     targetHours: Number(r.target_hours),
     hoursApplied: Number(r.hours_applied),
@@ -224,7 +231,10 @@ async function persist(
 
     await client.query(
       `UPDATE work_trade_settlements
-          SET hours_worked   = $2,
+          -- S648: only the period being closed learns its hours. A carried-over
+          -- older period keeps the hours it was closed with — this used to
+          -- overwrite them with 0 on every later close (and on ending).
+          SET hours_worked   = COALESCE($2, hours_worked),
               hours_applied  = $3,
               credit_applied = $4,
               status         = $5,
@@ -232,7 +242,8 @@ async function persist(
               updated_at     = NOW()
         WHERE id = $1`,
       [row.id,
-       round2h(hoursWorkedByMonth.get(out.periodMonth) ?? 0).toFixed(2),
+       hoursWorkedByMonth.has(out.periodMonth)
+         ? round2h(hoursWorkedByMonth.get(out.periodMonth) ?? 0).toFixed(2) : null,
        out.hoursAppliedTotal.toFixed(2),
        out.creditTotal.toFixed(2),
        out.status === 'billed' ? 'open' : out.status])
@@ -289,7 +300,11 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         WHERE wta.status = 'active'
           AND EXISTS (SELECT 1 FROM work_trade_settlements ws
                        WHERE ws.agreement_id = wta.id AND ws.status = 'open'
-                         AND ws.period_month <= $1::date)`,
+                         AND ws.period_month <= $1::date)
+          -- S648: calendar-month agreements only (rent due on the 1st). A
+          -- tenant due on another day is closed by runDueWorkTradeSettlements.
+          AND NOT EXISTS (SELECT 1 FROM work_trade_settlements ws2
+                           WHERE ws2.agreement_id = wta.id AND ws2.period_start <> ws2.period_month)`,
       [periodMonth])
 
     for (const a of agreements) {
@@ -303,9 +318,9 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         // has no period (no invoice that month), the newest open period stands in
         // as the closing one, which is correct: it is the month whose hours we
         // are about to count.
-        const closingIdx = periods.findIndex(p => p.periodMonth === periodMonth)
+        const closingIdx = periods.findIndex(p => p.label === periodMonth)
         const ordered = closingIdx >= 0
-          ? [...periods.filter(p => p.periodMonth !== periodMonth), periods[closingIdx]]
+          ? [...periods.filter((_, i) => i !== closingIdx), periods[closingIdx]]
           : periods
 
         const { rows: hrs } = await client.query(
@@ -327,6 +342,9 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         })
 
         await persist(client, a, ordered, hoursWorkedByMonth, result, run)
+        await client.query(
+          `UPDATE work_trade_settlements SET close_run_at = COALESCE(close_run_at, NOW())
+            WHERE agreement_id = $1 AND period_month = $2::date`, [a.id, periodMonth])
         await client.query('COMMIT')
         run.agreementsProcessed++
       } catch (e: unknown) {
@@ -334,6 +352,87 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
         const error = e instanceof Error ? e.message : String(e)
         run.errors.push({ agreement_id: a.id, error })
         logger.error({ err: e, agreement_id: a.id }, '[WorkTradeSettlement] agreement failed')
+      }
+    }
+  } finally {
+    client.release()
+  }
+  return run
+}
+
+/**
+ * S648 (Nic): "work trade settlement for anniversary tenants should count from
+ * each tenant's own due date."
+ *
+ * Closes every period that runs due-date to due-date (not a calendar month)
+ * and ended before `todayIso`, exactly once. Hours logged between the period's
+ * own start and end pay for it; everything after that — the bank, older
+ * deficits carried forward, billing one that outlived the landlord's window —
+ * is the same settleMonth arithmetic the calendar close uses.
+ */
+export async function runDueWorkTradeSettlements(todayIso: string): Promise<SettlementRunResult> {
+  const run: SettlementRunResult = {
+    agreementsProcessed: 0, periodsSettled: 0, periodsBilled: 0,
+    agreementsEnded: 0, errors: [],
+  }
+  const client = await getClient()
+  try {
+    const { rows: closing } = await client.query(
+      `SELECT ws.id, ws.agreement_id,
+              to_char(ws.period_start,'YYYY-MM-DD') AS period_start,
+              to_char(ws.period_end,'YYYY-MM-DD') AS period_end,
+              to_char(ws.period_month,'YYYY-MM-DD') AS period_month
+         FROM work_trade_settlements ws
+         JOIN work_trade_agreements wta ON wta.id = ws.agreement_id AND wta.status = 'active'
+        WHERE ws.close_run_at IS NULL
+          AND ws.period_start <> ws.period_month
+          AND ws.period_end < $1::date
+        ORDER BY ws.agreement_id, ws.period_start`, [todayIso])
+
+    for (const c of closing) {
+      try {
+        await client.query('BEGIN')
+        const { rows } = await client.query(
+          `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
+                  wta.banked_hours::float AS banked_hours, wta.carry_forward_months,
+                  (SELECT l.id FROM leases l
+                     JOIN lease_tenants lt ON lt.lease_id = l.id
+                    WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
+                      AND lt.status = 'active'
+                    ORDER BY l.start_date DESC LIMIT 1) AS lease_id
+             FROM work_trade_agreements wta WHERE wta.id = $1 AND wta.status = 'active'`,
+          [c.agreement_id])
+        const a = rows[0]
+        const periods = a ? await loadOpenPeriods(client, a.id, c.period_month, c.period_start) : []
+        const closingIdx = periods.findIndex(p => p.id === c.id)
+        if (!a || closingIdx < 0) {
+          // Already settled or billed by an earlier pass — just record the close.
+          await client.query(`UPDATE work_trade_settlements SET close_run_at = NOW() WHERE id = $1`, [c.id])
+          await client.query('COMMIT')
+          continue
+        }
+        const ordered = [...periods.filter((_, i) => i !== closingIdx), periods[closingIdx]]
+        const { rows: hrs } = await client.query(
+          `SELECT COALESCE(SUM(hours), 0)::float AS h FROM work_trade_logs
+            WHERE agreement_id = $1 AND status = 'approved'
+              AND work_date BETWEEN $2::date AND $3::date`,
+          [a.id, c.period_start, c.period_end])
+        const worked = Number(hrs[0]?.h ?? 0)
+        const result = settleMonth({
+          periods: ordered,
+          hoursWorked: worked,
+          bankedHours: Number(a.banked_hours),
+          carryForwardMonths: Number(a.carry_forward_months),
+        })
+        await persist(client, a, ordered, new Map([[c.period_start, worked]]), result, run)
+        await client.query(`UPDATE work_trade_settlements SET close_run_at = NOW() WHERE id = $1`, [c.id])
+        await client.query('COMMIT')
+        run.agreementsProcessed++
+      } catch (e: unknown) {
+        await client.query('ROLLBACK').catch(() => {})
+        const error = e instanceof Error ? e.message : String(e)
+        run.errors.push({ agreement_id: c.agreement_id, error })
+        logger.error({ err: e, agreement_id: c.agreement_id }, '[WorkTradeSettlement] due-date close failed')
       }
     }
   } finally {

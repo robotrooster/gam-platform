@@ -1691,15 +1691,29 @@ export function schedulerInit() {
   // that you're gonna be staying." That is only expressible once the month is
   // over — September's hours do not exist on September 1st — which is why this
   // is a job and not part of billing.
-  cron.schedule('15 2 1 * *', async () => {
+  //
+  // S648 (Nic): tenants due on another day settle the day after each of their
+  // own periods ends — so this now fires DAILY. The calendar close still runs
+  // only on the 1st, unchanged.
+  cron.schedule('15 2 * * *', async () => {
+    const now = DateTime.now().setZone('America/Phoenix')
+    const { runWorkTradeSettlement, runDueWorkTradeSettlements } = await import('./workTradeSettlement')
+    if (now.day === 1) {
+      try {
+        const closed = now.minus({ months: 1 }).startOf('month').toISODate()!
+        const result = await runWorkTradeSettlement(closed)
+        logger.info({ ...result, period: closed }, '[work-trade-settlement]')
+      } catch (e) {
+        logger.error({ err: e }, '[work-trade-settlement] fatal')
+      }
+    }
     try {
-      const { runWorkTradeSettlement } = await import('./workTradeSettlement')
-      const closed = DateTime.now().setZone('America/Phoenix')
-        .minus({ months: 1 }).startOf('month').toISODate()!
-      const result = await runWorkTradeSettlement(closed)
-      logger.info({ ...result, period: closed }, '[work-trade-settlement]')
+      const result = await runDueWorkTradeSettlements(now.toISODate()!)
+      if (result.agreementsProcessed > 0 || result.errors.length > 0) {
+        logger.info(result, '[work-trade-settlement:due-date]')
+      }
     } catch (e) {
-      logger.error({ err: e }, '[work-trade-settlement] fatal')
+      logger.error({ err: e }, '[work-trade-settlement:due-date] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 

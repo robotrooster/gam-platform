@@ -859,14 +859,21 @@ async function runGeneration(
             (rentCovered ? Number(lease.rent_amount ?? effectiveRentAmount) : 0)
             + (creditBasis - (rentCovered ? rentAmountNum : 0)))
           const target = proratedTarget(wt.target, creditBasis, fullMonthBasis)
+          // S648 (Nic): the hours that count run from THIS due date to the day
+          // before the next — the calendar month when rent is due on the 1st.
+          const periodStart = dueDay === 1 ? monthStart : dueDate
+          const periodEnd = dueDay === 1
+            ? DateTime.fromISO(monthStart).endOf('month').toISODate()!
+            : DateTime.fromISO(nextDueDateAfter(dueDate, dueDay)).minus({ days: 1 }).toISODate()!
           await client.query(
             `INSERT INTO work_trade_settlements
                (agreement_id, invoice_id, period_month, target_hours,
-                hour_rate, basis_amount)
-             VALUES ($1, $2, $3::date, $4, $5, $6)
-             ON CONFLICT (agreement_id, period_month) DO NOTHING`,
+                hour_rate, basis_amount, period_start, period_end)
+             VALUES ($1, $2, $3::date, $4, $5, $6, $7::date, $8::date)
+             ON CONFLICT (agreement_id, period_start) DO NOTHING`,
             [wt.agreementId, invoiceId, monthStart, target.toFixed(2),
-             hourRateFor(creditBasis, target).toFixed(4), creditBasis.toFixed(2)])
+             hourRateFor(creditBasis, target).toFixed(4), creditBasis.toFixed(2),
+             periodStart, periodEnd])
         }
 
         // Rent child row at the work-trade-NET amount. entry_description is the

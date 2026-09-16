@@ -10,7 +10,7 @@
 import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
-import { runWorkTradeSettlement, settleAgreementOnEnd } from './workTradeSettlement'
+import { runWorkTradeSettlement, settleAgreementOnEnd, runDueWorkTradeSettlements } from './workTradeSettlement'
 import { hourRateFor } from '../services/workTradeSettlement'
 import { loadWorkTradeStanding } from '../services/workTradeStanding'
 import {
@@ -29,6 +29,8 @@ interface Stack {
 async function buildStack(opts: {
   target?: number; basis?: number; carryForwardMonths?: number
   periodMonth?: string; suspended?: boolean; tracksHours?: boolean
+  /** S648: a due-date period instead of the calendar month. */
+  periodStart?: string; periodEnd?: string
 } = {}): Promise<Stack> {
   // S643: `target` is what the PERIOD asks for. The agreement's own
   // monthly_hours_target must stay positive (DB check) even when the landlord
@@ -82,10 +84,12 @@ async function buildStack(opts: {
 
     await client.query(
       `INSERT INTO work_trade_settlements
-         (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount)
-       VALUES ($1,$2,$3::date,$4,$5,$6)`,
+         (agreement_id, invoice_id, period_month, target_hours, hour_rate, basis_amount,
+          period_start, period_end)
+       VALUES ($1,$2,$3::date,$4,$5,$6,$7::date,$8::date)`,
       [agreementId, invoiceId, periodMonth, target.toFixed(2),
-       hourRateFor(basis, target).toFixed(4), basis.toFixed(2)])
+       hourRateFor(basis, target).toFixed(4), basis.toFixed(2),
+       opts.periodStart ?? null, opts.periodEnd ?? null])
 
     return { landlordId, tenantId, unitId, leaseId, agreementId, invoiceId, userId }
   } finally { client.release() }
@@ -291,5 +295,75 @@ describe('what the tenant is told next month', () => {
     // The period settled, so nothing is open and nothing is owed.
     expect(standing!.catchUpHours).toBe(0)
     expect(standing!.carriedHours).toBe(0)
+  })
+})
+
+
+// ── S648 (Nic): "work trade settlement for anniversary tenants should count
+// from each tenant's own due date." A tenant due on the 15th works the 15th to
+// the 14th; that period closes the day after it ends, once.
+describe('S648 due-date periods', () => {
+  const due15 = { periodMonth: '2026-09-01', periodStart: '2026-09-15', periodEnd: '2026-10-14' }
+
+  it('counts only hours inside the period and closes the day after it ends', async () => {
+    const s = await buildStack(due15)
+    await logHours(s, '2026-09-10', 30)   // before the period — not this one's
+    await logHours(s, '2026-09-20', 50)
+    await logHours(s, '2026-10-14', 30)
+    await logHours(s, '2026-10-15', 40)   // the next period's
+
+    const early = await runDueWorkTradeSettlements('2026-10-14')
+    expect(early.agreementsProcessed).toBe(0)   // not over yet
+
+    const r = await runDueWorkTradeSettlements('2026-10-15')
+    expect(r.errors).toEqual([])
+    expect(r.periodsSettled).toBe(1)
+    const st = (await db.query(
+      `SELECT status, hours_worked::float AS worked FROM work_trade_settlements WHERE agreement_id=$1`,
+      [s.agreementId])).rows[0]
+    expect(st.status).toBe('settled')
+    expect(st.worked).toBe(80)
+    expect((await invoiceOf(s.invoiceId)).total).toBe(0)
+  })
+
+  it('a short period stays open to catch up but is never counted twice', async () => {
+    const s = await buildStack(due15)
+    await logHours(s, '2026-09-20', 60)
+    await runDueWorkTradeSettlements('2026-10-15')
+    await runDueWorkTradeSettlements('2026-10-16')
+    await runDueWorkTradeSettlements('2026-11-20')
+    const inv = await invoiceOf(s.invoiceId)
+    expect(inv.credit).toBe(375)       // 60 × $6.25, once
+    expect(inv.total).toBe(125)
+  })
+
+  it('the calendar close leaves a due-date tenant alone, and the due-date close leaves calendar tenants alone', async () => {
+    const dated = await buildStack(due15)
+    const calendar = await buildStack()
+    await logHours(dated, '2026-09-20', 80)
+    await logHours(calendar, '2026-09-20', 80)
+
+    await runWorkTradeSettlement('2026-09-01')
+    expect((await invoiceOf(dated.invoiceId)).credit).toBe(0)
+    expect((await invoiceOf(calendar.invoiceId)).credit).toBe(500)
+
+    await runDueWorkTradeSettlements('2026-10-15')
+    expect((await invoiceOf(dated.invoiceId)).credit).toBe(500)
+    expect((await invoiceOf(calendar.invoiceId)).credit).toBe(500)
+  })
+})
+
+// S648: an older period carried into a later close keeps the hours it was
+// closed with. They used to be overwritten with 0.
+describe('carried periods keep their hours', () => {
+  it('a later close does not zero an earlier month\'s hours worked', async () => {
+    const s = await buildStack({ carryForwardMonths: 3 })
+    await logHours(s, '2026-09-10', 60)
+    await runWorkTradeSettlement('2026-09-01')
+    await runWorkTradeSettlement('2026-10-01')
+    const st = (await db.query(
+      `SELECT hours_worked::float AS worked FROM work_trade_settlements
+        WHERE agreement_id=$1 AND period_month='2026-09-01'`, [s.agreementId])).rows[0]
+    expect(st.worked).toBe(60)
   })
 })
