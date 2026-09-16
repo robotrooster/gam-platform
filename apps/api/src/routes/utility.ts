@@ -128,6 +128,9 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
     }
     const meters = await query<any>(`
       SELECT m.*, p.name AS property_name,
+        -- S648: whether a broken meter here bills an estimate (Mountain View's
+        -- stopgap) or nothing — only so the page describes it truthfully.
+        p.estimates_stuck_meters,
         (SELECT COUNT(*)::int FROM utility_meter_units WHERE meter_id = m.id) AS unit_count,
         (SELECT MAX(billing_cycle_month) FROM utility_meter_readings WHERE meter_id = m.id) AS last_reading_cycle,
         -- S605 (Nic): a submeter with no read at all cannot produce a bill —
@@ -401,7 +404,27 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // comparable usage and are never flagged for reread. Stamps the "since"
       // date going in, clears it on repair.
       outOfService:   z.boolean().optional(),
+      // S648 (Nic): "for the meters marked broken and then marked as repaired,
+      // they also need a new fresh meter read. If they bought a brand new
+      // meter, the read's going to be zero. But if they bought a refurbished
+      // one somewhere, it may have some number on it. And we need to set that
+      // as the starting point for the next billing cycle."
+      repairedStartingReading: z.number().nonnegative().optional(),
     }).parse(req.body)
+    // S648: marking a broken meter repaired REQUIRES what the new meter reads
+    // now. Without it, the first bill after the repair would be measured from
+    // the old meter's last number — a meaningless difference between two
+    // different devices.
+    const repairing = body.outOfService === false && meter.out_of_service === true
+    if (repairing && body.repairedStartingReading == null) {
+      throw new AppError(400,
+        'Enter what the repaired or replaced meter reads right now (0 for a brand-new meter). Its next bill is measured from that number.')
+    }
+    if (repairing && meter.digits != null
+        && body.repairedStartingReading! >= meterReadingModulus(Number(meter.digits))) {
+      throw new AppError(400,
+        `${body.repairedStartingReading} does not fit on a ${meter.digits}-digit meter — check the number, or change the meter's digits first.`)
+    }
     // What a meter has actually DONE. Unit and lease assignments are config, not
     // history — they deliberately survive an edit, which is the whole point:
     // fixing a wrong setup must not mean redoing the assignments too.
@@ -475,58 +498,79 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       }
     }
 
-    const updated = await queryOne<any>(`
-      UPDATE utility_meters SET
-        utility_type = COALESCE($16, utility_type),
-        billing_method = COALESCE($17, billing_method),
-        label = COALESCE($1, label),
-        rate_per_unit = COALESCE($2, rate_per_unit),
-        base_fee = COALESCE($3, base_fee),
-        rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
-        -- S613: a meter that BECOMES trash or a flat rate loses its width (the
-        -- constraint requires NULL there); one that stops being either needs a
-        -- width again, so it falls back to the default rather than failing the
-        -- save with a constraint error the landlord can do nothing about.
-        reading_multiplier = COALESCE($20, reading_multiplier),
-        digits = CASE
-          WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
-          ELSE COALESCE($6, digits, 6)
-        END,
-        sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
-        rubs_basis = COALESCE($11, rubs_basis),
-        rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
-        rubs_exclusion_mode = COALESCE($13, rubs_exclusion_mode),
-        rubs_weights = CASE WHEN $14::text = '__keep__' THEN rubs_weights ELSE $15::jsonb END,
-        out_of_service = COALESCE($10, out_of_service),
-        out_of_service_since = CASE
-          WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
-          WHEN $10::boolean IS FALSE THEN NULL
-          ELSE out_of_service_since END,
-        updated_at = NOW()
-      WHERE id = $9 RETURNING *`,
-      [
-        body.label ?? null,
-        body.ratePerUnit ?? null,
-        body.baseFee ?? null,
-        body.rubsAllocationMethod === undefined ? '__keep__' : 'set',
-        body.rubsAllocationMethod === undefined ? null : (body.rubsAllocationMethod ?? null),
-        body.digits ?? null,
-        body.sewerRatePerUnit === undefined ? '__keep__' : 'set',
-        body.sewerRatePerUnit === undefined ? null : body.sewerRatePerUnit,
-        req.params.id,
-        body.outOfService ?? null,
-        body.rubsBasis ?? null,
-        body.rubsSubmeterRate ?? null,
-        body.rubsExclusionMode ?? null,
-        body.rubsWeights === undefined ? '__keep__' : 'set',
-        body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
-        body.utilityType ?? null,
-        body.billingMethod ?? null,
-        // $18/$19: what the meter is BECOMING, for the digits rule above.
-        nextUtility,
-        nextMethod,
-        body.readingMultiplier ?? null,
-      ])
+    const tx = await getClient()
+    let updated: any
+    try {
+      await tx.query('BEGIN')
+      updated = (await tx.query(`
+        UPDATE utility_meters SET
+          utility_type = COALESCE($16, utility_type),
+          billing_method = COALESCE($17, billing_method),
+          label = COALESCE($1, label),
+          rate_per_unit = COALESCE($2, rate_per_unit),
+          base_fee = COALESCE($3, base_fee),
+          rubs_allocation_method = CASE WHEN $4::text = '__keep__' THEN rubs_allocation_method ELSE $5 END,
+          -- S613: a meter that BECOMES trash or a flat rate loses its width (the
+          -- constraint requires NULL there); one that stops being either needs a
+          -- width again, so it falls back to the default rather than failing the
+          -- save with a constraint error the landlord can do nothing about.
+          reading_multiplier = COALESCE($20, reading_multiplier),
+          digits = CASE
+            WHEN $18::text = 'trash' OR $19::text = 'flat_rate' THEN NULL
+            ELSE COALESCE($6, digits, 6)
+          END,
+          sewer_rate_per_unit = CASE WHEN $7::text = '__keep__' THEN sewer_rate_per_unit ELSE $8::numeric END,
+          rubs_basis = COALESCE($11, rubs_basis),
+          rubs_submeter_rate = COALESCE($12, rubs_submeter_rate),
+          rubs_exclusion_mode = COALESCE($13, rubs_exclusion_mode),
+          rubs_weights = CASE WHEN $14::text = '__keep__' THEN rubs_weights ELSE $15::jsonb END,
+          out_of_service = COALESCE($10, out_of_service),
+          out_of_service_since = CASE
+            WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
+            WHEN $10::boolean IS FALSE THEN NULL
+            ELSE out_of_service_since END,
+          updated_at = NOW()
+        WHERE id = $9 RETURNING *`,
+        [
+          body.label ?? null,
+          body.ratePerUnit ?? null,
+          body.baseFee ?? null,
+          body.rubsAllocationMethod === undefined ? '__keep__' : 'set',
+          body.rubsAllocationMethod === undefined ? null : (body.rubsAllocationMethod ?? null),
+          body.digits ?? null,
+          body.sewerRatePerUnit === undefined ? '__keep__' : 'set',
+          body.sewerRatePerUnit === undefined ? null : body.sewerRatePerUnit,
+          req.params.id,
+          body.outOfService ?? null,
+          body.rubsBasis ?? null,
+          body.rubsSubmeterRate ?? null,
+          body.rubsExclusionMode ?? null,
+          body.rubsWeights === undefined ? '__keep__' : 'set',
+          body.rubsWeights === undefined ? null : (body.rubsWeights ? JSON.stringify(body.rubsWeights) : null),
+          body.utilityType ?? null,
+          body.billingMethod ?? null,
+          // $18/$19: what the meter is BECOMING, for the digits rule above.
+          nextUtility,
+          nextMethod,
+          body.readingMultiplier ?? null,
+        ])).rows[0]
+      if (repairing) {
+        // The fresh starting point, dated today at the property. Recorded as a
+        // replacement read: it starts the next measurement and bills nothing.
+        await tx.query(`
+          INSERT INTO utility_meter_readings
+            (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+          SELECT $1, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, $2,
+                 date_trunc('month', NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date,
+                 'meter_replaced', $3
+            FROM properties p WHERE p.id = $4`,
+          [req.params.id, body.repairedStartingReading, req.user!.userId, meter.property_id])
+      }
+      await tx.query('COMMIT')
+    } catch (e) {
+      await tx.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { tx.release() }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

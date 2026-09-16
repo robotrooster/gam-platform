@@ -2707,6 +2707,8 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       readingMultiplier: { type: 'number', description: 'What one turn of the last digit is worth. Frozen once it has history.' },
       rubsAllocationMethod: { type: 'string', description: 'How a RUBS pool is split.' },
       rubsBasis: { type: 'string', description: 'How the pool is priced.' },
+      outOfService: { type: 'boolean', description: 'true = mark it broken, false = mark it repaired.' },
+      repairedStartingReading: { type: 'number', description: 'Required when marking it repaired: what the repaired or replaced meter reads now (0 for a brand-new meter). Ask for it — never assume 0.' },
     },
     required: ['meterId'],
     confirmFirst: true,

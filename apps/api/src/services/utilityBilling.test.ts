@@ -56,6 +56,14 @@ async function seedBaseProperty(): Promise<BaseCtx> {
   finally { c.release() }
 }
 
+// S648: a stuck or broken meter is only ESTIMATED at Mountain View (Nic's
+// stopgap during the pedestal replacement). Tests of that behaviour use this.
+async function seedEstimatingProperty(): Promise<BaseCtx> {
+  const base = await seedBaseProperty()
+  await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])
+  return base
+}
+
 async function seedUnitWithActiveTenant(
   base: BaseCtx,
   opts: { sqft?: number; bedrooms?: number; tenantResponsible?: boolean } = {}
@@ -1121,7 +1129,7 @@ describe('S559 point-in-time baseline reset', () => {
 
 describe('S559 broken-meter comparable-low billing', () => {
   it('a broken submeter bills the LOWEST comparable usage (same property + unit type), as a normal charge', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     // Two comparable units (default unit_type/amp match). One good meter with
     // real usage of 120; one broken meter with no read.
     const good = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
@@ -1155,7 +1163,7 @@ describe('S559 broken-meter comparable-low billing', () => {
   })
 
   it('a broken submeter with no comparable usage produces no bill (never invents a number)', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     const broken = await seedUnitWithActiveTenant(base, { tenantResponsible: true })
     const c = await db.connect()
     let brokenMeter = ''
@@ -2533,7 +2541,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   }
 
   it('estimates from the lowest OCCUPIED comparable rather than billing zero', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV A electric', 1000, 1120, true)   // lived-in, used 120
     await spot(base, 'RV B electric', 5000, 5400, true)   // lived-in, used 400
     await spot(base, 'RV C electric',  700,  700, false)  // VACANT, zero — must be ignored
@@ -2558,7 +2566,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // DELINQUENT. A resident behind on rent is exactly who must not quietly get a
   // free month of power and then a double bill when somebody notices.
   it('estimates for a DELINQUENT spot — behind on rent is still lived in', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV G electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV H electric', 44999, 44999, true)
     await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
@@ -2573,7 +2581,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   })
 
   it('estimates for a SUSPENDED spot too', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV I electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV J electric', 500, 500, true)
     await db.query(`UPDATE units SET status='suspended' WHERE id=$1`, [stuck.unitId])
@@ -2586,7 +2594,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // empty row and skipped. An empty, un-invoiced bill is the absence of a
   // reading filed as a fact — it gets replaced, not kept.
   it('replaces an empty $0 bill a prior run left behind', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV K electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV L electric', 44999, 44999, true)
     await db.query(`UPDATE units SET status='delinquent' WHERE id=$1`, [stuck.unitId])
@@ -2606,7 +2614,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // An invoiced bill is money the resident has already been told about. Even at
   // zero it stays — reversing a sent charge is the landlord's call, not a job's.
   it('leaves an already-billed row alone', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV M electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV N electric', 44999, 44999, true)
     await seedEmptyBill(base, stuck.meterId, stuck.unitId, 'billed')
@@ -2627,7 +2635,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // Free rent costs the landlord nothing they had. The power bill is a cheque
   // they write, and a broken meter meant that number was never even estimated.
   it('records the absorption on an OWNER-OCCUPIED spot instead of billing nobody', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV O electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV P electric', 700, 700, true)
     await db.query(`UPDATE units SET status='owner_use', owner_household_size=2 WHERE id=$1`, [stuck.unitId])
@@ -2654,7 +2662,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // owner-occupied unit has no tenant and no lease, so the charge used to be
   // dropped on the floor — the property audit could not reconcile.
   it('records the absorption on an owner-occupied spot whose meter reads fine', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     const owner = await spot(base, 'RV Q electric', 1000, 1300, true)
     await db.query(`UPDATE units SET status='owner_use' WHERE id=$1`, [owner.unitId])
 
@@ -2672,7 +2680,7 @@ describe('S637 stuck meter on an occupied spot', () => {
   // A vacant spot reading zero is simply a vacant spot. 33 read zero at Mountain
   // View this cycle and every one of those bills is correct.
   it('leaves a stuck meter on a VACANT spot alone', async () => {
-    const base = await seedBaseProperty()
+    const base = await seedEstimatingProperty()
     await spot(base, 'RV E electric', 1000, 1120, true)
     const stuck = await spot(base, 'RV F electric', 700, 700, false)
     await generateBillsForMeter(stuck.meterId, new Date(CYCLE + 'T00:00:00Z'))

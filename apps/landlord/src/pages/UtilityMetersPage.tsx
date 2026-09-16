@@ -4,7 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
 import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
-import { toast, appConfirm } from '../components/dialogs'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -2309,8 +2309,24 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const assign = useMutation(({ id, unitId }: any) => apiPost(`/utility/meters/${id}/units`, { unitId }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not assign unit') })
   const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
-  const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
+  const setBroken = useMutation(({ id, broken, startingReading }: any) => apiPatch(`/utility/meters/${id}`, {
+      outOfService: broken,
+      ...(startingReading != null ? { repairedStartingReading: startingReading } : {}),
+    }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  // S648 (Nic): a repaired or replaced meter starts from what it reads NOW —
+  // 0 for a new one, whatever is on the dial for a refurbished one.
+  const markRepaired = (m: any) => {
+    appPrompt(
+      'What does the repaired or replaced meter read right now? Enter 0 for a brand-new meter. Its next bill is measured from this number.',
+      { title: `Mark ${m.label} repaired` },
+    ).then(v => {
+      if (v == null) return
+      const n = Number(String(v).replace(/[,\s]/g, ''))
+      if (String(v).trim() === '' || !Number.isFinite(n) || n < 0) { toast.error('Enter the number shown on the meter.'); return }
+      setBroken.mutate({ id: m.id, broken: false, startingReading: n })
+    })
+  }
   // S613 (Nic): a meter can be configured perfectly and bill nothing, because a
   // unit bills a utility only where its LEASE passes it through. Assigning
   // twenty-seven units to a brand-new trash charge hits that on twenty-seven
@@ -2565,13 +2581,17 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
               {methodLabel(m)}
-              {m.outOfService && <> · billed from the lowest comparable spot until repaired</>}
+              {m.outOfService && (m.estimatesStuckMeters
+                ? <> · billed from the lowest comparable spot until repaired</>
+                : <> · not billing until repaired</>)}
             </div>
             {(m.hasBaseline === false || m.openingRead) && <BaselineFixer m={m} />}
           </div>
           {m.billingMethod === 'submeter' && (
-            <button className="btn btn-ghost btn-sm" title={m.outOfService ? 'Mark repaired' : 'Mark broken — bills from comparable spots'}
-              onClick={() => setBroken.mutate({ id: m.id, broken: !m.outOfService })}>
+            <button className="btn btn-ghost btn-sm"
+              title={m.outOfService ? 'Mark repaired — enter the new reading'
+                : m.estimatesStuckMeters ? 'Mark broken — bills from comparable spots' : 'Mark broken — stops billing until repaired'}
+              onClick={() => m.outOfService ? markRepaired(m) : setBroken.mutate({ id: m.id, broken: true })}>
               <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
             </button>
           )}

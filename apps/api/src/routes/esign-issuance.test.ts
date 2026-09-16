@@ -512,6 +512,8 @@ describe('a stuck meter when the lease is signed', () => {
     await db.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
        VALUES ($1,$2,$3,$4,$5)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId, opts.existing])
+    // S648: estimating is Mountain View's stopgap only.
+    await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id=$1`, [f.propertyId])
     await db.query(
       `INSERT INTO property_utility_rates (property_id, utility_type, rate_per_unit)
        VALUES ($1,'electric',0.21) ON CONFLICT DO NOTHING`, [f.propertyId])
@@ -562,6 +564,24 @@ describe('a stuck meter when the lease is signed', () => {
     expect(bill.allocation_method).toBe('comparable_low')
     // On the first invoice, not left waiting for next month.
     expect(bill.payment_id).not.toBeNull()
+  })
+
+  it('elsewhere bills nothing and flags the meter broken', async () => {
+    const f = await fixture()
+    await stuckMeter(f, { existing: true })
+    await db.query(`UPDATE properties SET estimates_stuck_meters = FALSE WHERE id=$1`, [f.propertyId])
+    const documentId = await unsignedDoc(f)
+    await db.query(`UPDATE lease_document_fields SET value='2026-09-16'
+                     WHERE document_id=$1 AND lease_column='start_date'`, [documentId])
+    await db.query(`UPDATE lease_document_fields SET value='-'
+                     WHERE document_id=$1 AND lease_column='end_date'`, [documentId])
+    await signAs(documentId, f.landlordToken)
+    const bills = await db.query(`SELECT 1 FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+    expect(bills.rows).toHaveLength(0)
+    const m = await db.query(
+      `SELECT m.out_of_service FROM utility_meters m JOIN utility_meter_units mu ON mu.meter_id=m.id
+        WHERE mu.unit_id=$1`, [f.unitId])
+    expect(m.rows[0].out_of_service).toBe(true)
   })
 
   it('bills nothing for a new move-in — the space was empty that cycle', async () => {

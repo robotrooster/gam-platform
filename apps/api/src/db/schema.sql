@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 0qEHydYsfLLjgqki2p8sJy6fDb4uPm5tMRYFThuoTBIu6kJqfygMoIE4hcYJfEQ
+\restrict DBh9bE90AMdDeMwFTNkhacK6ZJhbtZ12VbW2vbZTnfiamIhjdwIKOefziDHAV3N
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7460,6 +7460,7 @@ CREATE TABLE public.properties (
     propane_markup_per_gallon numeric(8,4) DEFAULT 0 NOT NULL,
     first_billing_cycle date,
     onboarding_late_fee_waiver boolean,
+    estimates_stuck_meters boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -7566,6 +7567,13 @@ COMMENT ON COLUMN public.properties.first_billing_cycle IS 'S632: the first mont
 --
 
 COMMENT ON COLUMN public.properties.onboarding_late_fee_waiver IS 'S648: landlord''s answer to "waive late fees on each existing resident''s first bill while they migrate?". TRUE = that first invoice never accrues late fees. FALSE or NULL (unanswered) = late fees apply per the lease.';
+
+
+--
+-- Name: COLUMN properties.estimates_stuck_meters; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.estimates_stuck_meters IS 'S648: internal only, never landlord-settable. TRUE = a stuck or out-of-service submeter bills the low-end estimate from occupied neighbours (Nic''s stopgap at Mountain View during the pedestal replacement). FALSE = the meter is flagged broken and no utility bills until it is repaired.';
 
 
 --
@@ -26718,5 +26726,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 0qEHydYsfLLjgqki2p8sJy6fDb4uPm5tMRYFThuoTBIu6kJqfygMoIE4hcYJfEQ
+\unrestrict DBh9bE90AMdDeMwFTNkhacK6ZJhbtZ12VbW2vbZTnfiamIhjdwIKOefziDHAV3N
 

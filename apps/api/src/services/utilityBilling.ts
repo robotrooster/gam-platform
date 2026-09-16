@@ -2,6 +2,8 @@ import { meterReadingModulus } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import { createNotification } from './notifications'
+import { UTILITY_TYPE_LABEL, type UtilityType } from '@gam/shared'
 
 // S90: utility bill generation engine.
 //
@@ -201,6 +203,57 @@ export async function lowestComparableUsage(args: {
 }
 
 /** S647: the 25th percentile, nearest-rank, of an ascending list. */
+/**
+ * S648 (Nic, DIRECTIVE): outside Mountain View a meter that did not move on an
+ * occupied space is BROKEN — flag it and bill nothing.
+ *
+ *   "Flag if there's no change in the meter and flag that it's broken. That
+ *    will encourage landlords to actually replace the meter... Other landlords
+ *    can just do it the right way or not bill the person for electricity."
+ *
+ * Marks it out of service (the same mark the meters screen already shows, with
+ * its "Mark repaired" button) and tells the landlord once. Nothing bills from
+ * it until somebody marks it repaired.
+ */
+export async function flagBrokenMeter(
+  meterId: string,
+  exec?: (sql: string, params: any[]) => Promise<any[]>,
+): Promise<void> {
+  const run = exec ?? ((sql: string, params: any[]) => query<any>(sql, params))
+  const flipped = await run(
+    `UPDATE utility_meters
+        SET out_of_service = TRUE,
+            out_of_service_since = COALESCE(out_of_service_since, CURRENT_DATE),
+            updated_at = NOW()
+      WHERE id = $1 AND out_of_service = FALSE
+      RETURNING property_id, utility_type, label`, [meterId])
+  if (!flipped.length) return
+  const m = flipped[0]
+  const who = await run(
+    `SELECT l.user_id, l.id AS landlord_id, p.name AS property_name,
+            (SELECT string_agg(u.unit_number, ', ') FROM utility_meter_units mu
+               JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = $2) AS units
+       FROM properties p JOIN landlords l ON l.id = p.landlord_id
+      WHERE p.id = $1`, [m.property_id, meterId])
+  if (!who.length) return
+  const w = who[0]
+  const what = UTILITY_TYPE_LABEL[m.utility_type as UtilityType] ?? m.utility_type
+  const where = w.units ? `${w.units} at ${w.property_name}` : (m.label || w.property_name)
+  try {
+    await createNotification({
+      userId: w.user_id, landlordId: w.landlord_id, type: 'utility_meter_broken',
+      title: `${what} meter not reading — ${where}`,
+      body: `The ${what.toLowerCase()} meter for ${where} read the same number twice while the space was occupied, `
+        + `so it has been marked broken and no ${what.toLowerCase()} is being billed for it. `
+        + `Replace or repair it, then mark it repaired on the Utilities page to resume billing.`,
+      data: { meterId, propertyId: m.property_id },
+      actionUrl: '/utilities',
+    })
+  } catch (e) {
+    logger.error({ err: e, meterId }, '[utility] could not notify the landlord about a broken meter')
+  }
+}
+
 export function clusterLow(ascending: number[]): number {
   if (ascending.length === 0) throw new Error('clusterLow: empty list')
   const rank = Math.ceil(0.25 * ascending.length)
@@ -737,6 +790,18 @@ export async function generateBillsForMeter(
     // below. Swallowing it here would bill an estimate for what is really a
     // data-entry problem somebody needs to look at.
     stuckOnOccupied = move?.usage != null && Number(move.usage) === 0
+  }
+
+  // S648 (Nic, DIRECTIVE): estimating is Mountain View's stopgap, not a
+  // platform rule. Everywhere else a broken meter bills NOTHING and is flagged.
+  const estimates = meter.billing_method === 'submeter'
+    && (meter.out_of_service || stuckOnOccupied)
+    && (await queryOne<{ on: boolean }>(
+         `SELECT estimates_stuck_meters AS on FROM properties WHERE id = $1`, [meter.property_id]))?.on === true
+  if (meter.billing_method === 'submeter' && (meter.out_of_service || stuckOnOccupied) && !estimates) {
+    if (stuckOnOccupied) await flagBrokenMeter(meterId)
+    return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+      reason: 'meter not reading — marked broken, nothing billed until it is repaired' }
   }
 
   if (meter.billing_method === 'submeter' && (meter.out_of_service || stuckOnOccupied)) {
@@ -1975,7 +2040,7 @@ export async function releaseSuspendedChargesForLease(args: {
                to_char(r.billing_cycle_month, 'YYYY-MM-DD') AS cycle,
                cyc.reading_value AS end_val, cyc.reading_date AS end_date,
                base.reading_value AS start_val, base.reading_date AS start_date,
-               un.unit_type, un.rv_amp_service
+               un.unit_type, un.rv_amp_service, pp.estimates_stuck_meters AS estimates
           FROM utility_meters m
           JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $1
           JOIN units un ON un.id = mu.unit_id
@@ -1994,6 +2059,7 @@ export async function releaseSuspendedChargesForLease(args: {
              WHERE meter_id = m.id AND billing_cycle_month = r.billing_cycle_month
                AND reason <> 'monthly_cycle'
              ORDER BY reading_date ASC LIMIT 1) base ON TRUE
+          JOIN properties pp ON pp.id = m.property_id
          WHERE m.billing_method = 'submeter'
            AND m.out_of_service = FALSE
            AND cyc.reading_value = base.reading_value
@@ -2004,6 +2070,9 @@ export async function releaseSuspendedChargesForLease(args: {
                               AND sc.cancelled_at IS NULL)`,
         [args.unitId])
       for (const st of stuck) {
+        // S648: only Mountain View estimates; everywhere else the meter is
+        // flagged broken and this space gets no utility bill for it.
+        if (!st.estimates) { await flagBrokenMeter(st.meter_id, (sql, p) => q<any>(sql, p)); continue }
         const est = await lowestComparableUsage({
           brokenMeterId: st.meter_id, propertyId: st.property_id,
           utilityType: st.utility_type, unitType: st.unit_type,

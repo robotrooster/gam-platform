@@ -1396,3 +1396,42 @@ describe('S632 POST /utility/opening-reads — one date, many meters, one save',
     expect(rows.rows).toHaveLength(0)
   })
 })
+
+// S648 (Nic): "For the meters marked broken and then marked as repaired, they
+// also need a new fresh meter read... we need to set that as the starting point
+// for the next billing cycle so that it reflects an accurate amount."
+describe('marking a broken meter repaired', () => {
+  const patch = (token: string, id: string, body: any) =>
+    request(buildApp()).patch(`/api/utility/meters/${id}`).set('Authorization', `Bearer ${token}`).send(body)
+
+  it('refuses without the new reading, and changes nothing', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    await db.query(`UPDATE utility_meters SET out_of_service=TRUE, out_of_service_since=CURRENT_DATE WHERE id=$1`, [m])
+    const res = await patch(f.tokenA, m, { outOfService: false })
+    expect(res.status).toBe(400)
+    const row = (await db.query(`SELECT out_of_service FROM utility_meters WHERE id=$1`, [m])).rows[0]
+    expect(row.out_of_service).toBe(true)
+  })
+
+  it('records the new reading as the starting point', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    await db.query(`UPDATE utility_meters SET out_of_service=TRUE, out_of_service_since=CURRENT_DATE WHERE id=$1`, [m])
+    const res = await patch(f.tokenA, m, { outOfService: false, repairedStartingReading: 1250 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.out_of_service ?? res.body.data.outOfService).toBe(false)
+    const reads = (await db.query(
+      `SELECT reading_value::float AS v, reason FROM utility_meter_readings WHERE meter_id=$1`, [m])).rows
+    expect(reads).toEqual([{ v: 1250, reason: 'meter_replaced' }])
+  })
+
+  it('a meter that was never broken needs no reading to stay working', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    const res = await patch(f.tokenA, m, { outOfService: false })
+    expect(res.status).toBe(200)
+    const reads = await db.query(`SELECT 1 FROM utility_meter_readings WHERE meter_id=$1`, [m])
+    expect(reads.rows).toHaveLength(0)
+  })
+})

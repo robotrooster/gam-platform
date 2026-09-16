@@ -21,15 +21,19 @@ beforeEach(async () => { await cleanupAllSchema() })
 const CYCLE = '2026-08-01'
 
 /** A space whose meter has not moved, plus a neighbour that used 120 kWh. */
+// S648: estimating is Mountain View's stopgap only. These fixtures stand in for
+// that property unless a test says otherwise.
 async function parkWithAStuckMeter(opts: {
   unitStatus: string; withLease: boolean; existingTenancy?: boolean; leaseStart?: string
+  estimates?: boolean
 }) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
     const ll = await seedLandlord(c)
     const propertyId = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
-    await c.query(`UPDATE properties SET timezone='America/Phoenix' WHERE id=$1`, [propertyId])
+    await c.query(`UPDATE properties SET timezone='America/Phoenix', estimates_stuck_meters=$2 WHERE id=$1`,
+      [propertyId, opts.estimates ?? true])
 
     const mkMeter = async (unitId: string, label: string, rate: number) => {
       const m = await c.query<{ id: string }>(
@@ -116,6 +120,56 @@ describe('a stuck meter on a space somebody lives in', () => {
       expect(b.allocation_method).not.toBe('comparable_low')
       expect(Number(b.charge_amount)).toBe(0)
     }
+  })
+})
+
+// ── S648 (Nic, DIRECTIVE): everywhere but Mountain View ─────────────────────
+//
+// "I do not want other landlords having the meter reads guessed on... flag if
+// there's no change in the meter and flag that it's broken... No electric bill
+// if the meter isn't working."
+describe('a stuck meter at any other property', () => {
+  it('bills nothing and marks the meter broken, telling the landlord once', async () => {
+    const w = await parkWithAStuckMeter({ unitStatus: 'active', withLease: true, estimates: false })
+    const r = await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    expect(r.billsCreated).toBe(0)
+    expect(await billFor(w.stuckUnit)).toBeUndefined()
+    const m = (await db.query(`SELECT out_of_service, out_of_service_since FROM utility_meters WHERE id=$1`,
+      [w.stuckMeter])).rows[0]
+    expect(m.out_of_service).toBe(true)
+    expect(m.out_of_service_since).not.toBeNull()
+    await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    const notes = await db.query(`SELECT title FROM notifications WHERE type='utility_meter_broken'`)
+    expect(notes.rows).toHaveLength(1)
+    expect(notes.rows[0].title).toContain('RV 40')
+  })
+
+  // S648 (Nic): the repaired meter's own number is the next bill's start.
+  it('after repair, bills from the new meter\'s starting reading', async () => {
+    const w = await parkWithAStuckMeter({ unitStatus: 'active', withLease: true, estimates: false })
+    await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    // replaced with a refurbished meter reading 700 on Sept 10, marked repaired
+    await db.query(`UPDATE utility_meters SET out_of_service=FALSE, out_of_service_since=NULL WHERE id=$1`, [w.stuckMeter])
+    const uid = (await db.query(`SELECT user_id FROM landlords LIMIT 1`)).rows[0].user_id
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
+       VALUES ($1,'2026-09-10',700,'2026-09-01','meter_replaced',$2),
+              ($1,'2026-10-01',950,'2026-09-01','monthly_cycle',$2)`, [w.stuckMeter, uid])
+    const r = await generateBillsForMeter(w.stuckMeter, new Date('2026-09-01T00:00:00Z'))
+    expect(r.billsCreated).toBe(1)
+    const b = (await db.query(
+      `SELECT usage_amount::float AS usage, allocation_method FROM utility_bills
+        WHERE unit_id=$1 AND billing_cycle_month='2026-09-01'`, [w.stuckUnit])).rows[0]
+    expect(b.usage).toBe(250)
+    expect(b.allocation_method).not.toBe('comparable_low')
+  })
+
+  it('keeps billing nothing while it is marked broken', async () => {
+    const w = await parkWithAStuckMeter({ unitStatus: 'active', withLease: true, estimates: false })
+    await db.query(`UPDATE utility_meters SET out_of_service=TRUE WHERE id=$1`, [w.stuckMeter])
+    const r = await generateBillsForMeter(w.stuckMeter, new Date(CYCLE + 'T00:00:00Z'))
+    expect(r.billsCreated).toBe(0)
+    expect(await billFor(w.stuckUnit)).toBeUndefined()
   })
 })
 
