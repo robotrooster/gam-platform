@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict a5ANdH5YGPfVSfUSVgYBN9LA6OhghamR8yhO8hJJrOzCIx3K9sirVeJALezSzjl
+\restrict RPCJN2LBKCgkRD0IjcjagQSARYFVNdnCJadljg4tjGdbHCtKCZkzalpMWh3qFjA
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5135,6 +5135,7 @@ CREATE TABLE public.lease_documents (
     package_group_id uuid,
     package_id uuid,
     package_sort_order integer,
+    issued_at timestamp with time zone,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_delivery_mode_check CHECK ((delivery_mode = ANY (ARRAY['agreement'::text, 'notice'::text]))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text]))),
@@ -5154,6 +5155,13 @@ COMMENT ON COLUMN public.lease_documents.deposit_already_held IS 'S604: TRUE = t
 --
 
 COMMENT ON COLUMN public.lease_documents.signing_window_restarted_at IS 'S637: when the 48h signing window was last restarted by resending to outstanding tenant signers. Anchors the auto-void clock alongside the landlord signature.';
+
+
+--
+-- Name: COLUMN lease_documents.issued_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.issued_at IS 'S647: when the landlord signed and the lease + move-in invoice were created. NULL means not yet issued. completed_at still means every signer is done.';
 
 
 --
@@ -16178,6 +16186,13 @@ CREATE INDEX idx_lease_documents_batch ON public.lease_documents USING btree (ba
 
 
 --
+-- Name: idx_lease_documents_issued_unexecuted; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_documents_issued_unexecuted ON public.lease_documents USING btree (landlord_id, issued_at) WHERE ((issued_at IS NOT NULL) AND (completed_at IS NULL));
+
+
+--
 -- Name: idx_lease_documents_package_group; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26686,5 +26701,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict a5ANdH5YGPfVSfUSVgYBN9LA6OhghamR8yhO8hJJrOzCIx3K9sirVeJALezSzjl
+\unrestrict RPCJN2LBKCgkRD0IjcjagQSARYFVNdnCJadljg4tjGdbHCtKCZkzalpMWh3qFjA
 

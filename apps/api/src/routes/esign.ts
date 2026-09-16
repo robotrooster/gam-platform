@@ -912,6 +912,13 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     }
   }
   // Fixed-shape tail columns (not driven by lease_column fields)
+  // S647: has every non-landlord signer finished? At issuance the answer is no —
+  // the landlord has just signed and the tenant has not seen it yet.
+  const tenantHasSigned = await client.query(
+    `SELECT COUNT(*)::int AS outstanding FROM lease_document_signers
+      WHERE document_id = $1 AND role <> 'landlord' AND status <> 'signed'`,
+    [doc.id]).then((r: any) => r.rows[0].outstanding === 0)
+
   const tailCols = ['unit_id', 'landlord_id', 'status']
   const tailValues: (string | null)[] = [doc.unit_id, doc.landlord_id, leaseStatus]
   const tailPlaceholders = tailCols.map((_, i) => '$' + (paramIdx + i))
@@ -925,10 +932,15 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
      ) VALUES (
        ${writablePlaceholders.join(', ')},
        ${tailPlaceholders.join(', ')},
-       TRUE, TRUE, NOW(),
+       TRUE, $${paramIdx + tailCols.length}, $${paramIdx + tailCols.length + 1},
        FALSE
      ) RETURNING id, status`,
-    [...writableValues, ...tailValues]
+    // S647: these used to be hardcoded TRUE, TRUE, NOW() because a lease could
+    // only be built once every signer was done. The landlord's signature now
+    // builds it, so the tenant's may genuinely still be outstanding — and the
+    // lease PDF prints these two flags as the signature block. Writing TRUE
+    // there would put a signature on a document nobody signed.
+    [...writableValues, ...tailValues, tenantHasSigned, tenantHasSigned ? new Date() : null]
   ).then((r: any) => r.rows[0])
 
   // S631 (Nic): carry "this papers an existing tenancy" from the invite onto the
@@ -3843,7 +3855,13 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
-        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal && endVal.trim() !== '-' ? endVal : null)
+        // S647: exclude this document's own lease for the same reason as the
+        // sign path — after issuance the document has one, and re-sending it
+        // must not read that as a conflict with itself.
+        const ov = await canTenantsSignNewLease(
+          allTenantIds, doc.unit_id, startVal,
+          endVal && endVal.trim() !== '-' ? endVal : null,
+          doc.lease_id ?? undefined)
         if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
 
         // ────────────────────────────────────────────────────────────────────
@@ -4524,6 +4542,13 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // Re-check overlap on EVERY signing (another roommate may have taken a conflicting lease
     // between send time and now). Helpers below use non-transactional query() —
     // same pattern as platform block, acceptable race window.
+    //
+    // S647: EXCLUDE THIS DOCUMENT'S OWN LEASE. Since the landlord's signature
+    // issues the lease, by the time the tenant signs there IS an active lease
+    // on this unit for these people — the one they are about to sign. Without
+    // the exclusion this guard reads that as a double-booking and refuses the
+    // tenant their own signature, which is how issuance quietly became "the
+    // tenant can never execute anything.
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
     if (primary && doc.unit_id) {
       const valsRes = await client.query(`
@@ -4535,7 +4560,10 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
         // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
-        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal && endVal.trim() !== '-' ? endVal : null)
+        const ov = await canTenantsSignNewLease(
+          allTenantIds, doc.unit_id, startVal,
+          endVal && endVal.trim() !== '-' ? endVal : null,
+          doc.lease_id ?? undefined)
         if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
       }
     }
@@ -4660,6 +4688,73 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // at this point; downstream failures (email, PDF stamp, lease build) get
     // their own handling without rolling back the signature.
 
+    // S576 (B-8): standalone contracts and work-trade addenda produce NO lease —
+    // the signed PDF is the legal instrument. Hoisted out of the completion
+    // block in S647 because issuance below needs the same test.
+    const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+
+    // ── S647: THE LANDLORD'S SIGNATURE ISSUES THE LEASE ──────────────────
+    //
+    // Nic (DIRECTIVE): "Bill it out to everybody upon my signature." And on the
+    // ordering: "My signature is done before they even accept — that way their
+    // accept and sign is all one flow."
+    //
+    // The lease and its move-in invoice used to wait for the LAST signer, so a
+    // household that accepted a portal invite and never signed produced nothing
+    // billable at all. Thirteen are sitting in that state today. Now the
+    // landlord's signature is what makes the tenancy real; the tenant's
+    // signature executes the document and is recorded honestly, but no longer
+    // decides whether anyone can be billed.
+    //
+    // This is NOT a second billing path. generateMoveInInvoice is still called
+    // from exactly one place — buildLeaseFromDocument — and all that changed is
+    // when that runs. A tenant finishing later hits the builder's own
+    // finalized_at short-circuit and bills nobody twice.
+    if (signer.role === 'landlord' && !isNoLeaseDoc) {
+      try {
+        const issued = await buildLeaseFromDocument(doc.id)
+        await query(
+          `UPDATE lease_documents SET issued_at = COALESCE(issued_at, NOW()), updated_at = NOW()
+            WHERE id = $1`, [doc.id])
+
+        // The held utility shares belong on the first invoice, and the first
+        // invoice now exists (S629's rule, applied at the moment it becomes
+        // true rather than at execution). Best-effort: a failure leaves them
+        // HELD and visible, never written off.
+        if (issued.leaseId && doc.unit_id && !issued.alreadyBuilt) {
+          try {
+            const lease = await queryOne<{ landlord_id: string }>(
+              `SELECT landlord_id FROM leases WHERE id = $1`, [issued.leaseId])
+            const primary = await queryOne<{ tenant_id: string }>(
+              `SELECT tenant_id FROM lease_tenants WHERE lease_id = $1 AND role = 'primary' LIMIT 1`,
+              [issued.leaseId])
+            if (lease && primary) {
+              await releaseSuspendedChargesForLease({
+                unitId: doc.unit_id, leaseId: issued.leaseId,
+                tenantId: primary.tenant_id, landlordId: lease.landlord_id,
+              })
+            }
+          } catch (e) {
+            logger.error({ err: e, leaseId: issued.leaseId },
+              '[utility] releasing held shares at issuance failed — they stay held')
+          }
+        }
+      } catch (e: any) {
+        // The landlord's signature is durable and stays. What failed is the
+        // lease materialising, which is the same condition the execution path
+        // already treats as critical — surfaced, not swallowed.
+        logger.error({ err: e, documentId: doc.id, reason: e.message },
+          '[ESIGN] issuance build failed')
+        await createAdminNotification({
+          severity: 'critical',
+          category: 'esign_issuance_build_failed',
+          title:    `Lease did not issue on landlord signature for document ${doc.id}`,
+          body:     e.message,
+          context:  { document_id: doc.id },
+        }).catch(() => {})
+      }
+    }
+
     const remaining = await queryOne<any>(
       "SELECT COUNT(*)::int as count FROM lease_document_signers WHERE document_id=$1 AND status != 'signed'",
       [doc.id])
@@ -4677,8 +4772,6 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // and would throw 'Unknown document_type', dumping a fully-signed doc into
       // execution_failed. Skip the build entirely; these complete cleanly and
       // still get their PDF stamped below. leaseResult stays null (no lease id).
-      const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
-
       let leaseResult: { leaseId: string; status: string; primaryTenantId: string; alreadyBuilt: boolean } | null = null
       if (!isNoLeaseDoc) {
         try {
@@ -4701,12 +4794,36 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
         }
 
-        // S581: a deduped (already-built) result means a concurrent final
-        // signature won the finalization race — the winner already ran the
-        // one-time side effects (PM transfer, PDF stamp, completion emails) and
-        // marked the doc completed. Do NOT re-run them; just report done.
-        if (leaseResult?.alreadyBuilt) {
-          return res.json({ success: true, data: { completed: true, leaseId: leaseResult.leaseId, deduped: true } })
+        // S581 guarded the one-time side effects (PM transfer, PDF stamp,
+        // completion emails) against a concurrent final signature by testing
+        // `alreadyBuilt`. S647 broke that test: the landlord's signature now
+        // builds every lease at issuance, so `alreadyBuilt` is TRUE on every
+        // ordinary execution and this would have skipped the stamp and the
+        // emails for all of them.
+        //
+        // The thing actually being guarded is the completion TRANSITION, so
+        // guard that instead: claim it with a compare-and-swap and let whoever
+        // wins run the side effects. This is strictly stronger than the old
+        // test — it also catches a race between two finalizers where neither
+        // had built anything.
+        const claimed = await query<{ id: string }>(
+          `UPDATE lease_documents
+              SET status='completed', completed_at=NOW(), updated_at=NOW()
+            WHERE id=$1 AND status <> 'completed'
+            RETURNING id`, [doc.id])
+        if (claimed.length === 0) {
+          return res.json({ success: true, data: { completed: true, leaseId: leaseResult?.leaseId, deduped: true } })
+        }
+
+        // S647: everyone has signed, so say so on the lease. It was written
+        // signed_by_tenant = FALSE at issuance, and the lease PDF prints these
+        // two flags as its signature block.
+        if (leaseResult?.leaseId) {
+          await query(
+            `UPDATE leases SET signed_by_tenant = TRUE,
+                               signed_at = COALESCE(signed_at, NOW()),
+                               updated_at = NOW()
+              WHERE id = $1`, [leaseResult.leaseId])
         }
 
         // S119 post-commit: fire Stripe Transfer for any PM company leasing
@@ -4729,7 +4846,18 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         }
       }
 
-      await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+      // (completion was claimed above for lease-producing docs; a no-lease doc
+      // has no builder to run, so it claims here instead.)
+      if (isNoLeaseDoc) {
+        const claimedNoLease = await query<{ id: string }>(
+          `UPDATE lease_documents
+              SET status='completed', completed_at=NOW(), updated_at=NOW()
+            WHERE id=$1 AND status <> 'completed'
+            RETURNING id`, [doc.id])
+        if (claimedNoLease.length === 0) {
+          return res.json({ success: true, data: { completed: true, deduped: true } })
+        }
+      }
 
       // S629 (Nic): "a pending unit should have the amount of water show as
       // temporary suspension back end and be billed with the first invoice as

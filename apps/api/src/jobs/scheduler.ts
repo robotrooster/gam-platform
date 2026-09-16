@@ -87,7 +87,13 @@ export async function activatePendingLeases() {
     const due = await query<any>(`
       SELECT id, unit_id FROM leases
       WHERE status='pending'
-        AND signed_by_landlord=TRUE AND signed_by_tenant=TRUE
+        -- S647: the LANDLORD's signature is what makes a tenancy real and
+        -- billable now (Nic: "bill it out to everybody upon my signature").
+        -- Requiring the tenant's too would strand a future-dated lease in
+        -- 'pending' forever if they never got around to signing — never
+        -- activating, and therefore never billing, which is the exact failure
+        -- issuance exists to end.
+        AND signed_by_landlord=TRUE
         AND start_date <= CURRENT_DATE`)
     for (const l of due) {
       await query(`UPDATE leases SET status='active', updated_at=NOW() WHERE id=$1`, [l.id])
@@ -148,7 +154,15 @@ export async function processLeaseEnds() {
           SELECT id FROM leases
           WHERE unit_id=$1 AND status IN ('pending','active') AND id != $2
             AND start_date > $3
-            AND signed_by_landlord=TRUE AND signed_by_tenant=TRUE
+            -- S647: landlord signature only, for the same reason as
+            -- activatePendingLeases. A renewal is issued the moment the
+            -- landlord signs it, so requiring the tenant's signature here would
+            -- treat a renewal they simply had not opened yet as a MOVE-OUT:
+            -- unit vacated, tenants removed, deposit-return draft created, on a
+            -- resident who is not leaving. Reading it as a handoff is the
+            -- recoverable direction — if they really do go, terminating the
+            -- successor produces the deposit return then.
+            AND signed_by_landlord=TRUE
           ORDER BY start_date ASC LIMIT 1`,
           [lease.unit_id, lease.id, lease.start_date])
         await query(`UPDATE leases SET status='expired', terminated_at=NOW() WHERE id=$1`, [lease.id])
