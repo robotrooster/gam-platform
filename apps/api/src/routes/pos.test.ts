@@ -2232,3 +2232,35 @@ describe('GET/PATCH /api/pos/settings (default margin)', () => {
   })
 })
 
+
+// ── S649 (Nic): "there's no item at all" ──────────────────────────────────
+// An account that owns two companies got "You own more than one company" from
+// every register call, so the register was empty. The property names the
+// company; the register must work from it.
+describe('S649 a two-company account uses the register by property', () => {
+  it('lists and rings items for the property\'s own company', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let secondLandlord = ''
+    try {
+      secondLandlord = (await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Second Park LLC') RETURNING id`,
+        [f.landlordUserId])).rows[0].id
+    } finally { c.release() }
+    const itemId = await seedPosItem(f, { sellPrice: 12, stockQty: 999 })
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId, secondLandlord], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const bare = await request(buildApp()).get('/api/pos/items').set('Authorization', `Bearer ${token}`)
+    expect(bare.status).toBe(400)   // no property, no company: still refused, never guessed
+    const res = await request(buildApp()).get(`/api/pos/items?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((i: any) => i.id)).toContain(itemId)
+    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 12, taxAmount: 0, lines: [{ itemId, lineSubtotal: 12, lineTax: 0 }] })
+    const sale = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${token}`)
+      .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'I', qty: 1, price: 12 }], paymentMethod: 'cash' })
+    expect(sale.status).toBe(201)
+    expect(sale.body.data.landlord_id).toBe(f.landlordId)
+  })
+})

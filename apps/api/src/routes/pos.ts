@@ -15,10 +15,30 @@ import {
 } from '../services/posTerminal'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
-import { resolveLandlordTarget, ownsLandlord } from '../lib/landlordScope'
+import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
+
+// S649 (Nic): "there's no item at all" — an account that owns two companies
+// (Mountain View + Oak Park) got "You own more than one company" from every
+// register call that didn't name one, so the register showed nothing. Nearly
+// every call already names the PROPERTY, and the property says which company
+// it is: derive it from there (only for a company the caller may act on).
+posRouter.use(async (req: any, _res, next) => {
+  try {
+    // Only when the account actually spans companies — a single-company
+    // account (and a cashier) resolves exactly as before.
+    if (!req.body?.landlordId && !req.query?.landlordId && landlordScopeIds(req.user).length > 1) {
+      const pid = String(req.query?.propertyId ?? req.body?.propertyId ?? '')
+      if (/^[0-9a-f-]{36}$/i.test(pid)) {
+        const row = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id = $1`, [pid])
+        if (row && ownsLandlord(req.user, row.landlord_id)) req.posPropertyLandlordId = row.landlord_id
+      }
+    }
+    next()
+  } catch (e) { next(e) }
+})
 
 /**
  * S633 — WHICH COMPANY'S REGISTER IS THIS?
@@ -40,7 +60,7 @@ posRouter.use(requireAuth)
  * naming the problem rather than a silently mis-filed sale.
  */
 function posLandlordId(req: any): string {
-  return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId, 'register')
+  return resolveLandlordTarget(req.user!, req.body?.landlordId ?? req.query?.landlordId ?? req.posPropertyLandlordId, 'register')
 }
 
 // POS money/quantity fields are never negative. Mirrors the client-side nonNeg
