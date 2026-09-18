@@ -466,7 +466,7 @@ async function runGeneration(
       )
       const effectiveTenantId = sublease?.sublessee_tenant_id ?? lease.tenant_id
       // S548: booking-sourced leases bill the calendar-aligned schedule —
-      // flat monthly for full months, prorated (monthly/30) for the final
+      // flat monthly for full months, prorated (by days in the month) for the final
       // partial month; a due date starting no segment owes no rent that
       // cycle. Matches the guest's quote exactly (shared schedule math).
       // Sublease pricing, when active, still wins (explicit contract).

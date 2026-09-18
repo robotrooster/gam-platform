@@ -5,7 +5,7 @@
 // logins (business_owner / business_staff) land here. Keep the two
 // copies in sync when register behavior changes.
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { humanize } from '@gam/shared'
+import { humanize, processingFeeFor } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { Modal } from '../components/Modal'
 import { useAuth } from '../context/AuthContext'
@@ -544,9 +544,10 @@ function CheckoutModal({
   const [err, setErr] = useState<string | null>(null)
 
   // Keep tendered tracking the grand total until the cashier edits it.
-  // Customer-paid card fee (2.9% + 10¢) — added on top at the reader;
+  // Customer-paid card fee (3.5% + $0.55, platform-wide) — added on top at the reader;
   // the server computes the authoritative amount, this mirrors it.
-  const cardFee = customerPaysCardFee ? Math.round(grandTotal * 2.9) / 100 + 0.10 : 0
+  // S649: one card fee platform-wide (3.5% + $0.55)
+  const cardFee = customerPaysCardFee ? processingFeeFor({ amount: grandTotal, paymentMethod: 'card' }) : 0
   const tenderedNum = tenderedTouched ? Number(tendered) : grandTotal
   const change = method === 'cash' ? Math.max(0, tenderedNum - grandTotal) : 0
 

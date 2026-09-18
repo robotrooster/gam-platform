@@ -316,6 +316,7 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM lot_rent_charges`)
   // S568: landlord_expenses FK units/properties/landlords/users. Clear before units.
   await db.query(`DELETE FROM landlord_expenses`)
+  await db.query(`DELETE FROM unit_out_of_order`)
   await db.query(`DELETE FROM units`)
   await db.query(`DELETE FROM property_allocation_rules`)
   // S338: POS chain. All landlord-FK'd with ON DELETE RESTRICT;

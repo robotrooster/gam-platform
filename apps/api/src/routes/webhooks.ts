@@ -1315,7 +1315,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           await recordHeldItem({
             businessId: ins[0].business_id,
             sourceType: 'business_invoice_payment', sourceId: session.id,
-            amount: (cents - businessInvoiceCutCents(cents)) / 100,
+            amount: (cents - businessInvoiceCutCents(cents, paidByBank)) / 100,
             description: `Invoice payment (${paymentKind})`,
           })
         }

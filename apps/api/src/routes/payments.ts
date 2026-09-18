@@ -1139,8 +1139,16 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     // I gated the surplus here first and was wrong: it read as "issuing credit"
     // because the word matched, and blocked a desk from recording the truth
     // about cash they were holding.
-    if (pmt.type !== 'rent') {
-      throw new AppError(409, 'Only rent charges can be recorded as a manual payment')
+    // S649 (Nic): "we need to be able to settle any outstanding balances at any
+    // time. If it's outstanding, we should be able to reconcile it." Jeremy
+    // Parker's September electric ($96.81) came after his rent was already
+    // paid, and with no open rent to anchor on it could not be recorded at all.
+    // The payment settles the household's whole balance either way (S636), so
+    // any open charge can carry it. A work-trade row is excluded: it is not owed
+    // now, it settles against hours at month close.
+    if ((await client.query(
+      `SELECT 1 FROM payments WHERE id = $1 AND work_trade_suspended_at IS NOT NULL`, [pmt.id])).rows.length) {
+      throw new AppError(409, 'This charge is covered by work trade and settles at month close')
     }
     if (pmt.status !== 'pending' && pmt.status !== 'failed') {
       throw new AppError(409, `This charge is not open (status: ${pmt.status})`)

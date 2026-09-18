@@ -814,6 +814,59 @@ export const UNIT_CLONE_RESET: Record<string, string> = {
 // leaving a phantom space listed as vacant and bookable forever. Omit
 // `unitNumber` and the unit retires on its own: retired_at is what makes "never
 // billed" structural, so a decommissioned site stops being billable either way.
+// S649 (Nic): "we need a way to mark RV sites out of order." A window during
+// which the site can't take a stay; the schedule, the booking site and staff
+// bookings all route around it (services/outOfOrder).
+unitsRouter.get('/:id/out-of-order', async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT landlord_id, property_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, unit.property_id)
+    const rows = await query<any>(
+      `SELECT id, to_char(starts_on, 'YYYY-MM-DD') AS starts_on, to_char(ends_on, 'YYYY-MM-DD') AS ends_on,
+              reason, created_at
+         FROM unit_out_of_order WHERE unit_id = $1 AND cleared_at IS NULL
+        ORDER BY starts_on`, [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+unitsRouter.post('/:id/out-of-order', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      startsOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+      endsOn:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+      reason:   z.string().trim().max(500).nullish(),
+    }).parse(req.body)
+    const unit = await queryOne<any>('SELECT landlord_id, property_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, unit.property_id)
+    if (body.startsOn && body.endsOn && body.endsOn <= body.startsOn) {
+      throw new AppError(400, 'The back-in-service date has to be after the start date')
+    }
+    const { markOutOfOrder } = await import('../services/outOfOrder')
+    const row = await markOutOfOrder({
+      unitId: req.params.id, landlordId: unit.landlord_id, userId: req.user!.userId,
+      startsOn: body.startsOn, endsOn: body.endsOn, reason: body.reason,
+    })
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+unitsRouter.post('/:id/out-of-order/:oooId/clear', requirePerm('units.edit'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT landlord_id, property_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, unit.property_id)
+    const { clearOutOfOrder } = await import('../services/outOfOrder')
+    res.json({ success: true, data: await clearOutOfOrder({
+      id: req.params.oooId, landlordId: unit.landlord_id, userId: req.user!.userId }) })
+  } catch (e) { next(e) }
+})
+
 unitsRouter.post('/:id/retire', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const { unitNumber, reason } = z.object({
@@ -2064,7 +2117,19 @@ unitsRouter.get('/schedule/master', requirePerm(
         AND ($5::uuid IS NULL OR u.property_id = $5)
       ORDER BY l.start_date`, [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
 
-    res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
+    // S649: out-of-order windows, drawn on the schedule as blocked time.
+    const outOfOrder = await query<any>(`
+      SELECT o.id, o.unit_id, to_char(o.starts_on, 'YYYY-MM-DD') AS starts_on,
+             to_char(o.ends_on, 'YYYY-MM-DD') AS ends_on, o.reason
+        FROM unit_out_of_order o
+        JOIN units u ON u.id = o.unit_id
+       WHERE u.landlord_id = ANY($1::uuid[]) AND o.cleared_at IS NULL
+         AND (o.ends_on IS NULL OR o.ends_on > $2) AND o.starts_on <= $3
+         AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
+         AND ($5::uuid IS NULL OR u.property_id = $5)`,
+      [callerLandlordIds, fromDate, toDate, scopedIds, oneProperty])
+
+    res.json({ success: true, data: { units, bookings, leases, outOfOrder, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }
 })
 

@@ -16,7 +16,7 @@
  */
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
-import { PLATFORM_FEES } from '@gam/shared'
+import { processingFeeFor } from '@gam/shared'
 import { logger } from '../lib/logger'
 
 export const HELD_ITEM_SOURCES = [
@@ -36,16 +36,18 @@ export interface HeldItem {
 
 type Runner = Pick<PoolClient, 'query'>
 
-/** GAM's cut of a business invoice paid online (covers Stripe's cost, S536). */
-export function businessInvoiceCutCents(amountCents: number): number {
-  return Math.round(amountCents * PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_PCT)
-    + PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS
+// S649 (Nic): "Card fees are the same platform wide, no matter where they pay,
+// no matter who's paying it." A business pays GAM the same processing fee as
+// everyone else: 3.5% + $0.55 on a card, the flat $6 on a bank payment.
+
+/** GAM's cut of a business invoice paid online. */
+export function businessInvoiceCutCents(amountCents: number, paidByBank = false): number {
+  return Math.round(processingFeeFor({ amount: amountCents / 100, paymentMethod: paidByBank ? 'ach' : 'card' }) * 100)
 }
 
-/** GAM's cut of a business register card sale (S536). */
+/** GAM's cut of a business register card sale. */
 export function businessTerminalCutCents(amountCents: number): number {
-  return Math.round(amountCents * PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_PCT)
-    + PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
+  return Math.round(processingFeeFor({ amount: amountCents / 100, paymentMethod: 'card' }) * 100)
 }
 
 /**

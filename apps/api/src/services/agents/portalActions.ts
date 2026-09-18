@@ -792,6 +792,40 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'mark_site_out_of_order',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/out-of-order',
+    pathParams: ['unitId'],
+    description:
+      'Mark one site or unit out of order so nothing can be booked on it: the booking site, staff bookings ' +
+      'and the schedule all route around it, and stays already on it are moved to another open site where ' +
+      'one fits. startsOn defaults to today; leave endsOn empty when the landlord does not know when it will ' +
+      'be back (they clear it then). Read the site and dates back before sending.',
+    params: {
+      unitId: { type: 'string', description: 'The site as the landlord names it, with its property — unit numbers repeat across parks.' },
+      startsOn: { type: 'string', description: 'First day out of order, YYYY-MM-DD. Optional (today).' },
+      endsOn: { type: 'string', description: 'The day it is back in service, YYYY-MM-DD. Optional (open-ended).' },
+      reason: { type: 'string', description: 'What is wrong, in the landlord\u2019s words. Optional.' },
+    },
+    required: ['unitId'],
+    confirmFirst: true,
+  },
+  {
+    id: 'put_site_back_in_service',
+    audience: 'landlord', method: 'POST',
+    path: '/api/units/:unitId/out-of-order/:outOfOrderId/clear',
+    pathParams: ['unitId', 'outOfOrderId'],
+    description:
+      'Put a site that was marked out of order back in service, so it can be booked again. ' +
+      'Read the site back before sending.',
+    params: {
+      unitId: { type: 'string', description: 'The site as the landlord names it, with its property.' },
+      outOfOrderId: { type: 'string', description: 'Which out-of-order window — from the site\u2019s out-of-order list.' },
+    },
+    required: ['unitId', 'outOfOrderId'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_card_fee_payers',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/processing-fee-payers',

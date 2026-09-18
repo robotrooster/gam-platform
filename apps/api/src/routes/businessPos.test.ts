@@ -173,8 +173,8 @@ describe('POST /transactions', () => {
     expect(res.status).toBe(201)
     expect(captureMock).toHaveBeenCalledWith('pi_biz')
     const { rows } = await db.query<any>(`SELECT amount FROM held_payout_items WHERE business_id = $1`, [f.businessId])
-    // $10 sale, business pays the fee: 2.9% + 10¢ = 39¢ → $9.61 held
-    expect(Number(rows[0].amount)).toBe(9.61)
+    // $10 sale, business pays the fee: 3.5% + 55¢ = 90¢ → $9.10 held
+    expect(Number(rows[0].amount)).toBe(9.1)
   })
 
   it('a reader sale whose capture fails records nothing', async () => {

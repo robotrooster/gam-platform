@@ -124,7 +124,9 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   // payment", 409). This posted charges[0], and charges are pushed in whatever
   // order the payments list arrives — for Russ Fuller that first row is a
   // utility, so the button hit a 409 every time.
-  const anchor = group.charges.find((c: any) => c.type === 'rent') ?? null
+  // S649: any open charge can carry the payment — it settles the whole balance
+  // regardless — so a household owing only a utility can still be recorded.
+  const anchor = group.charges.find((c: any) => c.type === 'rent') ?? group.charges[0] ?? null
   // A check or money order is identified by its number — that number IS the
   // receipt if the payment is ever questioned, so it is required, not optional.
   const needsNumber = method === 'check' || method === 'money_order'
@@ -284,13 +286,6 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           )}
         </>
 
-        {!anchor && (
-          <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>
-            This household has no outstanding rent charge, and an off-platform
-            payment is recorded against rent. Charge the rent first, or take
-            this one through the tenant&rsquo;s portal.
-          </div>
-        )}
         {err && <div className="alert alert-warning" style={{ fontSize: '.8rem', marginBottom: 10 }}>{err}</div>}
 
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
@@ -320,7 +315,7 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
   // moves no money — the row just flips to settled. The tenant's first rent
   // payment is fee-free; subsequent ones bill a manual-payment fee (the
   // server decides + returns feeWaived). Only open, unpaid RENT rows qualify.
-  const isManualRecordable = canRecord && p.type === 'rent' &&
+  const isManualRecordable = canRecord &&
     (p.status === 'pending' || p.status === 'failed')
   const [recordOpen, setRecordOpen] = useState(false)
   const [method, setMethod] = useState<ManualPaymentMethod>('check')

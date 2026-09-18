@@ -190,7 +190,7 @@ function CardFeesSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }
     }}>
       <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>Card processing fees</h2>
       <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 14 }}>
-        Card payments carry a 2.9% + 10¢ processing fee. Choose who pays it — applied
+        Card payments carry a 3.5% + $0.55 processing fee. Choose who pays it — applied
         automatically to every card transaction at the register.
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, maxWidth: 420 }}>

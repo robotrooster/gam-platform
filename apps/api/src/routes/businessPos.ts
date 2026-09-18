@@ -457,7 +457,7 @@ businessPosRouter.get('/transactions/:id/pdf', requireAuth, async (req, res, nex
 //  settings; swiping or tapping completes the transaction." Direct
 //  charges on the business's Connect account (business pays Stripe's
 //  card-present cost); GAM's markup rides as application_fee_amount
-//  (shared PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_*) — GAM cannot
+//  (the platform-wide card fee, processingFeeFor) — GAM cannot
 //  lose money on a sale. Mirrors the property flow in routes/pos.ts.
 // ═══════════════════════════════════════════════════════════════
 

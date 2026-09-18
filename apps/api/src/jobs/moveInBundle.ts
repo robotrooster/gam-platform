@@ -162,7 +162,7 @@ export async function generateMoveInInvoice(
   inputs: MoveInInputs,
   externalClient?: PoolClient
 ): Promise<MoveInBundleResult> {
-  // S548: booking-sourced leases prorate the arrival month at monthly/30
+  // S548: booking-sourced leases prorate the arrival month by the days in it
   // (the calendar schedule the guest was quoted); regular leases keep the
   // long-standing days-remaining/days-in-month proration.
   // S28: optional caller-owned transaction. When externalClient is provided,

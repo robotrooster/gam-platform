@@ -169,8 +169,8 @@ describe('deposit → balance two-stage payment', () => {
     await fire(checkoutCompleted({ invoiceId, amount: 200, kind: 'full', sessionId: 'cs_held', pi: 'pi_held' }))
     const { rows } = await db.query<any>(`SELECT amount, source_type FROM held_payout_items WHERE business_id = $1`, [businessId])
     expect(rows).toHaveLength(1)
-    // 3.25% + 30¢ of $200 = $6.80 → $193.20 held
-    expect(Number(rows[0].amount)).toBe(193.2)
+    // one card fee platform-wide: 3.5% + 55¢ of $200 = $7.55 → $192.45 held
+    expect(Number(rows[0].amount)).toBe(192.45)
     expect(rows[0].source_type).toBe('business_invoice_payment')
     // Re-delivery holds nothing more.
     await fire(checkoutCompleted({ invoiceId, amount: 200, kind: 'full', sessionId: 'cs_held', pi: 'pi_held' }))

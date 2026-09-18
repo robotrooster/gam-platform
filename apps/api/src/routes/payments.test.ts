@@ -786,12 +786,16 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(res.body.data.feePaymentId).toBeFalsy()
   })
 
-  it('non-rent charge → 409', async () => {
+  // S649 (Nic): "we need to be able to settle any outstanding balances at any
+  // time." A household owing only a utility must still be recordable.
+  it('a lone utility charge can be recorded', async () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'utility', amount: 50 })
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
-    expect(res.status).toBe(409)
+    expect(res.status).toBe(200)
+    const { rows: [p] } = await db.query<any>(`SELECT status, manual_method FROM payments WHERE id = $1`, [pid])
+    expect(p).toEqual({ status: 'settled', manual_method: 'cash' })
   })
 
   it('already-settled charge → 409', async () => {
@@ -1360,30 +1364,32 @@ describe('S622: one tenant, two units, separate ledgers', () => {
 // record-manual settled `WHERE id = $1`, so a landlord holding a resident's cash
 // picked which of their charges it cleared — and could leave the oldest one
 // standing while marking a newer one paid.
-// ── S637: the settle is ANCHORED ON RENT ─────────────────────────────
+// ── S637: the settle covers the WHOLE balance, whichever charge carries it ─
 //
-// Nic: "submit button to record payment doesnt click and do anything."
-//
-// record-manual settles a household's whole balance but is anchored on one
-// charge, and refuses anything that is not rent. The landlord UI was posting
-// the FIRST charge in the outstanding group — and /payments orders by due_date
-// with no tiebreaker, so with rent and utilities all due the same day, which
-// one came first was arbitrary. Sometimes it was a utility, and the button
-// 409'd. The UI now finds the rent charge; this pins the contract it relies on.
-describe('S637 record-manual only anchors on rent', () => {
-  it('409s on a utility charge, however it was reached', async () => {
+// Nic: "submit button to record payment doesnt click and do anything." The UI
+// posted an arbitrary first charge and the route refused anything but rent.
+// S649 (Nic): any open charge may carry it now — "if it's outstanding, we
+// should be able to reconcile it" — and it still clears the whole balance.
+describe('S637 record-manual settles the whole balance from any charge', () => {
+  it('a utility charge carries the payment and clears the rent with it', async () => {
     const f = await seed()
     const { rows: [{ id }] } = await db.query<{ id: string }>(
       `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
                              status, entry_description, due_date)
        VALUES ($1,$2,$3,$4,'utility',84,'pending','UTILITY',CURRENT_DATE) RETURNING id`,
       [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    const { rows: [{ id: rentId }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount,
+                             status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',440,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
     const res = await request(buildApp())
       .post(`/api/payments/${id}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'cash' })
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/rent/i)
+    expect(res.status).toBe(200)
+    const { rows: [r] } = await db.query<any>(`SELECT status FROM payments WHERE id = $1`, [rentId])
+    expect(r.status).toBe('settled')
   })
 
   it('accepts the rent charge and clears the utilities with it', async () => {

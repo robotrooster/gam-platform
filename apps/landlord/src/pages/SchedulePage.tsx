@@ -6,6 +6,7 @@ import { usePerms } from '../lib/permissions'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
+import { OutOfOrderModal } from './OutOfOrderModal'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -597,6 +598,13 @@ export function SchedulePage() {
 
   const bookings: any[] = schedule?.bookings || []
   const leases: any[] = schedule?.leases || []
+  // S649: out-of-order windows — blocked time on a site (ends_on exclusive).
+  const outOfOrder: any[] = schedule?.outOfOrder || []
+  const oooFor = (unitId: string, date: string) =>
+    outOfOrder.find((o: any) => o.unitId === unitId && date >= o.startsOn && (!o.endsOn || date < o.endsOn))
+  const oooOverlaps = (unitId: string, ci: string, co: string) =>
+    outOfOrder.some((o: any) => o.unitId === unitId && o.startsOn < co && (!o.endsOn || o.endsOn > ci))
+  const [oooUnit, setOooUnit] = useState<any | null>(null)
   const days = getDaysInRange(fromDate, toDate)
 
   // S526 (Nic): the create form is contact + dates ONLY. No total input (the
@@ -1017,7 +1025,7 @@ export function SchedulePage() {
     if (!u.isBookable) return false
     const bookingConflict = bookings.some((b: any) => b.unitId === u.id && b.status !== 'cancelled' && dayOnly(b.checkIn) < co && dayOnly(b.checkOut) > ci)
     const leaseConflict = leases.some((l: any) => l.unitId === u.id && dayOnly(l.startDate) < co && (!l.endDate || dayOnly(l.endDate) > ci))
-    return !bookingConflict && !leaseConflict
+    return !bookingConflict && !leaseConflict && !oooOverlaps(u.id, ci, co)
   })
 
   // Reservation search — match guest/tenant name, unit number, guest email or
@@ -1108,6 +1116,7 @@ export function SchedulePage() {
     const hasLeaseConflict = leases.some(l =>
       l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && (!l.endDate || d <= dayOnly(l.endDate))))
     if (hasBookingConflict || hasLeaseConflict) { toast.error('That unit is already occupied for those dates.'); return }
+    if (oooOverlaps(tUnitId, newCheckIn, newCheckOut)) { toast.error('That site is out of order for those dates.'); return }
     const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
     const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
     if (mismatchReasons.length) {
@@ -1417,6 +1426,7 @@ export function SchedulePage() {
                       <div style={{display:'flex',gap:4}}>
                         {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
                         {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
+                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" title="Out of order" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>setOooUnit(unit)}>⛔</button>}
                       </div>
                     </div>
                   </td>
@@ -1482,7 +1492,7 @@ export function SchedulePage() {
                           ;(e.currentTarget.closest('table') as HTMLElement)?.focus()
                         }}
                         onDoubleClick={() => {
-                          if (!isBooked && unit.isBookable) openBookingModal(unit, d)
+                          if (!isBooked && unit.isBookable && !oooFor(unit.id, d)) openBookingModal(unit, d)
                         }}
                       >
                         {showPreviewBlock ? (
@@ -1596,9 +1606,16 @@ export function SchedulePage() {
                             )
                           })()
                         ) : (
+                          oooFor(unit.id, d) ? (
+                            // S649: out of order — striped, never a place to drop a stay
+                            <div title={`Out of order${oooFor(unit.id, d)?.reason ? ` — ${oooFor(unit.id, d)?.reason}` : ''}`}
+                              style={{height:24, borderRadius:3, opacity:.55,
+                                background:'repeating-linear-gradient(45deg, var(--red) 0 4px, transparent 4px 9px)'}} />
+                          ) : (
                           <div
                             style={{height:24, background: unit.isBookable ? 'transparent' : 'var(--bg-3)', borderRadius:3, opacity:.3}}
                           />
+                          )
                         )}
                       </td>
                     )
@@ -2200,6 +2217,7 @@ export function SchedulePage() {
       )}
 
       {/* ── RESERVATION DETAIL ── click a bar to view */}
+      {oooUnit && <OutOfOrderModal unit={oooUnit} onClose={() => setOooUnit(null)} />}
       {detailBooking && (() => {
         const d = detailBooking
         const isLease = !!d.isLease

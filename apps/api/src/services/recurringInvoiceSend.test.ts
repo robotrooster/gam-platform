@@ -133,7 +133,7 @@ describe('sendGeneratedInvoice — auto-charge path (S508)', () => {
     // S648: GAM's charge — nothing goes straight to the business.
     expect(piArgs.transfer_data).toBeUndefined()
     const { rows: held } = await db.query<any>(`SELECT amount FROM held_payout_items WHERE business_id = $1`, [f.businessId])
-    expect(Number(held[0].amount)).toBe(96.45)  // $100 less 3.25% + 30¢
+    expect(Number(held[0].amount)).toBe(95.95)  // $100 less 3.5% + 55¢
 
     const { rows: [inv] } = await db.query<{
       status: string; amount_paid: string; stripe_payment_intent_id: string;

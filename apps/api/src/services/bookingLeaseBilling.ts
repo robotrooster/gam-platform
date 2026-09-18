@@ -2,7 +2,7 @@
 // S548 — calendar-aligned billing for booking-sourced leases (Nic).
 //
 // A 30+ night stay books at a monthly rate, billed like a resident:
-// prorated arrival month (days × monthly/30), flat monthly on the 1st
+// prorated arrival month (days × monthly / days in that month), flat monthly on the 1st
 // with all tenants, prorated departure month. The public quote, the
 // booking's stored total, and the INVOICES all come from the same
 // shared computeMonthlyStaySchedule — they can never disagree.

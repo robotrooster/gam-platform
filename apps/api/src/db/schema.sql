@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict vUe0gWW06Yezs5rGzrShFB6LSLNPwYSbc5R6DX2v8GiUKgwfDwcjCAynCkhBH5Z
+\restrict xkPlvsBchLAAhPc1RESfq6FvR7Jrhhp3YQ7GXwMCwgd7fuVrxJEsdZKVajvTatH
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -965,6 +965,21 @@ CREATE FUNCTION public.unit_number_on(p_unit_id uuid, p_when timestamp with time
      AND (h.effective_to IS NULL OR h.effective_to > p_when)
    ORDER BY h.effective_from DESC
    LIMIT 1
+$$;
+
+
+--
+-- Name: unit_out_of_order_overlaps(uuid, date, date); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.unit_out_of_order_overlaps(p_unit uuid, p_from date, p_to date) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM unit_out_of_order o
+     WHERE o.unit_id = p_unit AND o.cleared_at IS NULL
+       AND (p_to IS NULL OR o.starts_on < p_to)
+       AND (o.ends_on IS NULL OR o.ends_on > p_from))
 $$;
 
 
@@ -9871,6 +9886,9 @@ CREATE TABLE public.unit_bookings (
     site_reveal_sent_at timestamp with time zone,
     locked_to_unit boolean DEFAULT false NOT NULL,
     stripe_payment_intent_id text,
+    balance_pay_link_id uuid,
+    balance_billed_at timestamp with time zone,
+    balance_paid_at timestamp with time zone,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -10049,6 +10067,25 @@ CREATE TABLE public.unit_number_history (
     changed_by_user_id uuid,
     reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: unit_out_of_order; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_out_of_order (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    starts_on date DEFAULT CURRENT_DATE NOT NULL,
+    ends_on date,
+    reason text,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    cleared_at timestamp with time zone,
+    cleared_by uuid,
+    CONSTRAINT unit_out_of_order_window CHECK (((ends_on IS NULL) OR (ends_on > starts_on)))
 );
 
 
@@ -14243,6 +14280,14 @@ ALTER TABLE ONLY public.unit_number_history
 
 
 --
+-- Name: unit_out_of_order unit_out_of_order_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_out_of_order
+    ADD CONSTRAINT unit_out_of_order_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: unit_photos unit_photos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -18281,6 +18326,13 @@ CREATE INDEX idx_unit_inspections_unit ON public.unit_inspections USING btree (u
 --
 
 CREATE INDEX idx_unit_number_history_unit ON public.unit_number_history USING btree (unit_id, effective_from DESC);
+
+
+--
+-- Name: idx_unit_out_of_order_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_out_of_order_open ON public.unit_out_of_order USING btree (unit_id) WHERE (cleared_at IS NULL);
 
 
 --
@@ -26335,6 +26387,14 @@ ALTER TABLE ONLY public.unit_booking_waitlists
 
 
 --
+-- Name: unit_bookings unit_bookings_balance_pay_link_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_balance_pay_link_id_fkey FOREIGN KEY (balance_pay_link_id) REFERENCES public.pos_pay_links(id);
+
+
+--
 -- Name: unit_bookings unit_bookings_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26572,6 +26632,38 @@ ALTER TABLE ONLY public.unit_number_history
 
 ALTER TABLE ONLY public.unit_number_history
     ADD CONSTRAINT unit_number_history_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_out_of_order unit_out_of_order_cleared_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_out_of_order
+    ADD CONSTRAINT unit_out_of_order_cleared_by_fkey FOREIGN KEY (cleared_by) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_out_of_order unit_out_of_order_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_out_of_order
+    ADD CONSTRAINT unit_out_of_order_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_out_of_order unit_out_of_order_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_out_of_order
+    ADD CONSTRAINT unit_out_of_order_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: unit_out_of_order unit_out_of_order_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_out_of_order
+    ADD CONSTRAINT unit_out_of_order_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
 
 
 --
@@ -27026,5 +27118,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict vUe0gWW06Yezs5rGzrShFB6LSLNPwYSbc5R6DX2v8GiUKgwfDwcjCAynCkhBH5Z
+\unrestrict xkPlvsBchLAAhPc1RESfq6FvR7Jrhhp3YQ7GXwMCwgd7fuVrxJEsdZKVajvTatH
 

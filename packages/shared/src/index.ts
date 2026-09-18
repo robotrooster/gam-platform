@@ -3529,7 +3529,7 @@ export function computeStayPrice(rates: StayRates, taxRatePct: number, nights: n
 
 // ── S547: calendar-aligned monthly-stay billing (Nic) ──
 // A 30+ night stay bills like a resident, not a lump sum: the arrival month
-// is prorated (days × monthly/30) from check-in to the 1st, every full
+// is prorated from check-in to the 1st, every full
 // calendar month is the flat monthly rate invoiced on the 1st with all
 // tenants, and a mid-month departure prorates the final month. The stay
 // TOTAL is the sum of those segments — the quote and the invoice schedule
@@ -3539,7 +3539,7 @@ export interface MonthlyStaySegment {
   to: string            // YYYY-MM-DD exclusive (next segment start / check-out)
   nights: number
   amount: number
-  fullMonth: boolean    // true = flat monthly rate, false = prorated at monthly/30
+  fullMonth: boolean    // true = flat monthly rate, false = prorated by the days in that month
 }
 export interface MonthlyStaySchedule { segments: MonthlyStaySegment[]; total: number }
 
@@ -3559,11 +3559,15 @@ export function computeMonthlyStaySchedule(checkIn: string, checkOut: string, mo
     const segEnd = boundary < end ? boundary : end
     const nights = nightsBetween(cur, segEnd)
     // Flat month = 1st → 1st. Anything else (arrival month, departure month,
-    // or a stay contained inside one month) prorates at monthly/30.
+    // or a stay contained inside one month) prorates by the days actually in
+    // that month. S649 (Nic): "divided by how many days are actually in the
+    // month by the rent. That way they're paying the right amount." (Was /30,
+    // which over-billed a 31-day month and under-billed February.)
     const fullMonth = cur.getUTCDate() === 1 && segEnd.getTime() === boundary.getTime()
+    const daysInMonth = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth() + 1, 0)).getUTCDate()
     segments.push({
       from: iso(cur), to: iso(segEnd), nights,
-      amount: fullMonth ? round2(monthlyRate) : round2(monthlyRate * nights / 30),
+      amount: fullMonth ? round2(monthlyRate) : round2(monthlyRate * nights / daysInMonth),
       fullMonth,
     })
     cur = segEnd
@@ -4440,18 +4444,11 @@ export const PLATFORM_FEES = {
   REINSTATEMENT:   25.00,     // After FlexDeposit default
   BG_CHECK_NET:     5.00,     // GAM's NET margin per background check — matches SCREENING_GAM_MARGIN_USD ($5). Applicant pays Checkr cost + $5 + processing (pass-through). Was 15 (stale — old model).
 
-  // S536 (Nic): ALL money flows through GAM — business charges are
-  // platform DESTINATION charges (GAM = merchant of record; gross
-  // routes to the business's Connect balance; GAM keeps the
-  // application fee below and pays Stripe's processing cost out of
-  // it; businesses get Friday-batched payouts like landlords).
-  // Card-present: fee 2.9% + 10¢, Stripe costs ~2.7% + 5¢ → GAM nets
-  // ~0.2% + 5¢. Hosted invoice (card or ACH): fee 3.25% + 30¢, worst
-  // Stripe cost (card) 2.9% + 30¢ → GAM nets ≥0.35%.
-  BUSINESS_TERMINAL_APP_FEE_PCT:         0.029,  // card-present, % of sale
-  BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS: 10,     // card-present, fixed
-  BUSINESS_INVOICE_APP_FEE_PCT:          0.0325, // hosted invoice, % of amount
-  BUSINESS_INVOICE_APP_FEE_FIXED_CENTS:  30,     // hosted invoice, fixed
+  // S649 (Nic): "Card fees are the same platform wide, no matter where they
+  // pay, no matter who's paying it." The separate business card rates
+  // (2.9% + 10¢ at the register, 3.25% + 30¢ on invoices) are gone — every card
+  // payment is PROCESSING_FEES' 3.5% + $0.55 and a bank payment its flat $6,
+  // via processingFeeFor().
   // S536 (Nic): register is FREE; invoicing = $10/mo in any month the
   // business sends ≥1 invoice (usage-based). jobs/businessMonthlyFees.
   BUSINESS_INVOICING_MONTHLY:            10.00,

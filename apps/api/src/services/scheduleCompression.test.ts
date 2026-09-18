@@ -196,3 +196,56 @@ describe('compressPropertySchedule', () => {
     expect(await unitOf(b1)).toBe(p.s1)
   })
 })
+
+// ── S649 (Nic): out-of-order sites ───────────────────────────────────────
+//
+// "I want the compression and expansion to be able to detect out of order
+// sites and not push something in there when there's no reservation."
+describe('out-of-order sites', () => {
+  async function markOoo(p: any, unitId: string, startsOn: string, endsOn: string | null = null) {
+    const { markOutOfOrder } = await import('./outOfOrder')
+    const u = await db.query<any>(`SELECT l.user_id FROM landlords l WHERE l.id = $1`, [p.landlordId])
+    return markOutOfOrder({ unitId, landlordId: p.landlordId, userId: u.rows[0].user_id, startsOn, endsOn, reason: 'broken pedestal' })
+  }
+
+  it('the packer never moves a stay onto an out-of-order site', async () => {
+    const p = await seedPark()
+    await markOoo(p, p.s1, plusDays(0))
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8))
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(b)).toBe(p.s2)   // RV 01 would be best, but it's out of order
+  })
+
+  it('marking a site out of order moves a movable stay off it right away', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8))
+    await markOoo(p, p.s1, plusDays(1), plusDays(20))
+    expect(await unitOf(b)).not.toBe(p.s1)
+  })
+
+  it('a stay that cannot move is left in place and the landlord is told, once', async () => {
+    const p = await seedPark()
+    const b = await booking(p.s1, p.landlordId, plusDays(5), plusDays(8), { locked_to_unit: true })
+    await markOoo(p, p.s1, plusDays(1))
+    expect(await unitOf(b)).toBe(p.s1)
+    const { alertStaysOnOutOfOrderSites } = await import('./outOfOrder')
+    expect(await alertStaysOnOutOfOrderSites(p.propertyId)).toBe(0)   // already told when it was marked
+    const n = await db.query(`SELECT 1 FROM notifications WHERE type = 'site_out_of_order_stay' AND data->>'bookingId' = $1`, [b])
+    expect(n.rows).toHaveLength(1)
+  })
+
+  it('new stays and the unit picker route around it; back in service, it books again', async () => {
+    const p = await seedPark()
+    const row = await markOoo(p, p.s1, plusDays(0), plusDays(10))
+    const { findStayConflict, findAvailableUnits } = await import('./unitAvailability')
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(2), checkOut: plusDays(4) })).toBe('out_of_order')
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(10), checkOut: plusDays(12) })).toBeNull()  // after it's back
+    expect(await rankUnitsBestFit([p.s1, p.s2], { checkIn: plusDays(2), checkOut: plusDays(4) })).toEqual([p.s2])
+    const avail = await findAvailableUnits({ landlordIds: [p.landlordId], window: { checkIn: plusDays(2), checkOut: plusDays(4) } })
+    expect(avail.map((u: any) => u.id)).not.toContain(p.s1)
+    const { clearOutOfOrder } = await import('./outOfOrder')
+    const u = await db.query<any>(`SELECT user_id FROM landlords WHERE id = $1`, [p.landlordId])
+    await clearOutOfOrder({ id: row.id, landlordId: p.landlordId, userId: u.rows[0].user_id })
+    expect(await findStayConflict(p.s1, { checkIn: plusDays(2), checkOut: plusDays(4) })).toBeNull()
+  })
+})

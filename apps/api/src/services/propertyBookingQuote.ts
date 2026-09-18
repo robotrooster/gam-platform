@@ -155,6 +155,8 @@ export async function typeAvailability(prop: PropertyRow, siteType: SiteType, ni
             WHERE unit_id = $1 AND status IN ('active','pending')
               AND start_date < $2::date AND (end_date IS NULL OR end_date > $3::date)
          )
+         -- S649: out-of-order sites are never offered
+         OR unit_out_of_order_overlaps($1, $3::date, $2::date)
        LIMIT 1`,
       [u.id, checkOut, checkIn])
     if (!conflict) { freeUnit = u; break }

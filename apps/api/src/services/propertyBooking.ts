@@ -188,6 +188,8 @@ async function hasConflict(client: PoolClient, unitId: string, checkIn: string, 
           WHERE unit_id=$1 AND status IN ('active','pending')
             AND start_date < $2::date AND (end_date IS NULL OR end_date > $3::date)
        )
+       -- S649: an out-of-order site can't take a stay
+       OR unit_out_of_order_overlaps($1, $3::date, $2::date)
      LIMIT 1`,
     [unitId, checkOut, checkIn])
   return c.rows.length > 0

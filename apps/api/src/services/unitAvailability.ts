@@ -21,7 +21,7 @@ export interface StayWindow {
   excludeBookingId?: string | null
 }
 
-export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | null
+export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | 'out_of_order' | null
 
 export async function findStayConflict(unitId: string, w: StayWindow): Promise<StayConflict> {
   const booking = await queryOne<any>(`
@@ -40,6 +40,11 @@ export async function findStayConflict(unitId: string, w: StayWindow): Promise<S
       AND (end_date IS NULL OR end_date > $4)`,
     [unitId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn])
   if (lease) return 'lease'
+  // S649 (Nic): a site marked out of order can't take a stay in that window.
+  const ooo = await queryOne<any>(
+    `SELECT 1 WHERE unit_out_of_order_overlaps($1, $2::date, $3::date)`,
+    [unitId, w.checkIn, w.checkOut ?? null])
+  if (ooo) return 'out_of_order'
   // W-27 (S531): a unit bound to an OPEN pending-tenant intent is occupied
   // by a tenant completing onboarding (portfolio migration) — not bookable
   // regardless of window. Lifts when the intent resolves or is removed.
@@ -53,6 +58,7 @@ export const STAY_CONFLICT_MESSAGE: Record<Exclude<StayConflict, null>, string> 
   booking: 'Unit is already booked for those dates',
   lease:   'Unit has an active lease covering those dates',
   pending_tenant: 'Unit is held for a tenant completing onboarding',
+  out_of_order: 'That site is out of order for those dates',
 }
 
 // Every unit of the landlord that is free for the window. RV compatibility
@@ -106,5 +112,6 @@ export async function findAvailableUnits(opts: {
       AND NOT EXISTS (
         SELECT 1 FROM pending_tenant_intents pti
         WHERE pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL)
+      AND NOT unit_out_of_order_overlaps(u.id, $4::date, $3::date)
     ORDER BY p.name, u.unit_number`, params)
 }

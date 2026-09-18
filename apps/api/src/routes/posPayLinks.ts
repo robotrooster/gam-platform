@@ -147,6 +147,58 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   return { ...link, url: payLinkUrl(token), card_fee: customerFee, charged }
 }
 
+/**
+ * S649 — the balance of a short stay, billed on arrival day (services/stayBalance).
+ * A one-time link tied to the booking; the card fee follows the property's
+ * booking-site setting. Idempotent per booking: the booking row is claimed
+ * first, so a second run never sends a second link.
+ */
+export async function createStayBalanceLink(opts: {
+  bookingId: string; landlordId: string; propertyId: string; label: string
+  amount: number; guestName: string | null; guestEmail: string
+}): Promise<{ id: string } | null> {
+  if (!(opts.amount > 0)) return null
+  if (!(await connectIdFor(opts.landlordId))) throw new AppError(409, 'No payout account to pay the landlord')
+  const client = await getClient()
+  let link: any
+  let propName = ''
+  try {
+    await client.query('BEGIN')
+    const claimed = await client.query(
+      `UPDATE unit_bookings SET balance_billed_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND balance_billed_at IS NULL RETURNING id`, [opts.bookingId])
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return null }
+    const prop = (await client.query<{ name: string; booking_card_fee_payer: CardFeePayer }>(
+      `SELECT name, booking_card_fee_payer FROM properties WHERE id = $1`, [opts.propertyId])).rows[0]
+    propName = prop.name
+    const owner = (await client.query<{ user_id: string }>(`SELECT user_id FROM landlords WHERE id = $1`, [opts.landlordId])).rows[0]
+    const items = [{ id: null, name: opts.label.slice(0, 120), qty: 1, price: opts.amount, tax: 0 }]
+    link = (await client.query(
+      `INSERT INTO pos_pay_links
+         (token, landlord_id, property_id, created_by, kind, label, items,
+          subtotal, tax_amount, discount_amount, total,
+          customer_name, customer_email, booking_id, card_fee_on_top, expires_at)
+       VALUES ($1,$2,$3,$4,'one_time',$5,$6::jsonb,$7,0,0,$7,$8,$9,$10,$11, NOW() + INTERVAL '14 days')
+       RETURNING *`,
+      [crypto.randomBytes(24).toString('hex'), opts.landlordId, opts.propertyId, owner.user_id,
+       'Stay balance', JSON.stringify(items), opts.amount, opts.guestName, opts.guestEmail.toLowerCase(),
+       opts.bookingId, prop.booking_card_fee_payer === 'customer'])).rows[0]
+    await client.query(`UPDATE unit_bookings SET balance_pay_link_id = $2 WHERE id = $1`, [opts.bookingId, link.id])
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { emailPayLink } = await import('../services/email')
+  await emailPayLink({
+    to: link.customer_email, name: link.customer_name, propertyName: propName,
+    label: opts.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
+    ctx: { landlordId: opts.landlordId, payLinkId: link.id },
+  }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[stay-balance] email failed'))
+  return { id: link.id }
+}
+
 posPayLinksRouter.post('/', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
@@ -331,6 +383,10 @@ export async function finalizePayLink(session: {
         `UPDATE pos_pay_links SET status = 'paid', paid_at = NOW(), pos_transaction_id = $2, updated_at = NOW()
           WHERE id = $1`, [link.id, tx.id])
     }
+    // S649: the arrival-day balance of a stay.
+    await client.query(
+      `UPDATE unit_bookings SET balance_paid_at = COALESCE(balance_paid_at, NOW()), updated_at = NOW()
+        WHERE balance_pay_link_id = $1`, [link.id])
     if (link.booking_id) {
       const name = session.custom_fields?.find(f => f.key === 'name')?.text?.value
         ?? session.customer_details?.name ?? null

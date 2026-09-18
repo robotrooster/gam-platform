@@ -75,6 +75,15 @@ export function slackScore(timeline: Interval[], win: Interval): number {
   return before + after
 }
 
+/** S649: out-of-order windows as timeline obstacles (open-ended = forever). */
+async function outOfOrderWindows(unitIds: string[]): Promise<Array<{ unit_id: string; check_in: string; check_out: string }>> {
+  if (!unitIds.length) return []
+  return query<any>(`
+    SELECT unit_id, starts_on::text AS check_in, COALESCE(ends_on::text, '9999-12-31') AS check_out
+      FROM unit_out_of_order
+     WHERE unit_id = ANY($1::uuid[]) AND cleared_at IS NULL`, [unitIds])
+}
+
 export interface CompressionMove {
   bookingId: string
   guestName: string | null
@@ -106,6 +115,11 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
     [sites.map(s => s.id)])
   for (const l of leaseRows) {
     siteById.get(l.unit_id)?.timeline.push({ checkIn: l.check_in, checkOut: l.check_out })
+  }
+  // S649 (Nic): an out-of-order site is an obstacle like a lease — nothing is
+  // packed onto it, and a stay already on it moves off when there's room.
+  for (const o of await outOfOrderWindows(sites.map(s => s.id))) {
+    siteById.get(o.unit_id)?.timeline.push({ checkIn: o.check_in, checkOut: o.check_out })
   }
 
   const bookingRows = await query<any>(`
@@ -224,7 +238,8 @@ export async function rankUnitsBestFit(
      WHERE unit_id = ANY($1::uuid[]) AND status IN ('active','pending')`,
     [unitIds])
   const timelines = new Map<string, Interval[]>(unitIds.map(id => [id, []]))
-  for (const r of [...bookingRows, ...leaseRows]) {
+  const oooRows = await outOfOrderWindows(unitIds)
+  for (const r of [...bookingRows, ...leaseRows, ...oooRows]) {
     timelines.get(r.unit_id)?.push({ checkIn: r.check_in, checkOut: r.check_out })
   }
   const w: Interval = { checkIn: winN.checkIn, checkOut: winN.checkOut }

@@ -1717,6 +1717,19 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S649 (Nic): the rest of a short stay goes out on arrival day. Hourly, so
+  // each property's arrival day starts in its own time zone; the booking row
+  // is claimed first, so a stay is only ever billed once.
+  cron.schedule('5 * * * *', async () => {
+    try {
+      const { billStayBalances } = await import('../services/stayBalance')
+      const r = await billStayBalances()
+      if (r.billed || r.failed) logger.info(r, '[stay-balance]')
+    } catch (e) {
+      logger.error({ err: e }, '[stay-balance] fatal')
+    }
+  })
+
   // S648: every cent GAM takes must be recorded against someone, and nobody
   // should owe GAM back for long without it being seen.
   cron.schedule('45 3 * * *', async () => {
@@ -2324,6 +2337,13 @@ export function schedulerInit() {
       const { compressAllSchedules } = await import('../services/scheduleCompression')
       const moved = await compressAllSchedules()
       if (moved > 0) logger.info(`[compress] nightly pass moved ${moved} booking(s)`)
+      // S649: stays the pack couldn't move off an out-of-order site
+      const { alertStaysOnOutOfOrderSites } = await import('../services/outOfOrder')
+      const { query: q } = await import('../db')
+      for (const p of await q<{ property_id: string }>(
+        `SELECT DISTINCT u.property_id FROM unit_out_of_order o JOIN units u ON u.id = o.unit_id WHERE o.cleared_at IS NULL`)) {
+        await alertStaysOnOutOfOrderSites(p.property_id)
+      }
     } catch (e) { logger.error({ err: e }, '[SCHEDULER] schedule compression') }
   })
   cron.schedule('*/15 * * * *', revealTodaysSites)

@@ -78,10 +78,10 @@ async function rentByDueDate(leaseId: string): Promise<Record<string, number>> {
 
 describe('bookingRentForDueDate', () => {
   it('segments: prorated arrival, flat months, prorated final, null off-boundary', () => {
-    expect(bookingRentForDueDate(START, END, RENT, '2026-08-10')).toBe(696.67)  // 22n × 950/30
+    expect(bookingRentForDueDate(START, END, RENT, '2026-08-10')).toBe(674.19)  // 22n × 950/31 — August has 31 days (S649)
     expect(bookingRentForDueDate(START, END, RENT, '2026-09-01')).toBe(950)
     expect(bookingRentForDueDate(START, END, RENT, '2026-10-01')).toBe(950)    // 31-day month still flat
-    expect(bookingRentForDueDate(START, END, RENT, '2027-01-01')).toBe(855)    // 27n × 950/30
+    expect(bookingRentForDueDate(START, END, RENT, '2027-01-01')).toBe(827.42)  // 27n × 950/31 — January has 31 days
     expect(bookingRentForDueDate(START, END, RENT, '2026-09-15')).toBeNull()
   })
 })
@@ -96,7 +96,7 @@ describe('invoice generation (calendar schedule)', () => {
     expect(rents['2026-10-01']).toBe(950)
     expect(rents['2026-11-01']).toBe(950)
     expect(rents['2026-12-01']).toBe(950)
-    expect(rents['2027-01-01']).toBe(855)  // Jan 1→28 prorated — the departure month
+    expect(rents['2027-01-01']).toBe(827.42)  // Jan 1→28 prorated by January's 31 days
   })
 
   it('regular lease keeps full-rent behavior (no proration)', async () => {
@@ -108,13 +108,13 @@ describe('invoice generation (calendar schedule)', () => {
 })
 
 describe('move-in invoice (arrival month)', () => {
-  it('booking-sourced lease prorates arrival at monthly/30', async () => {
+  it('booking-sourced lease prorates arrival by the days in the month', async () => {
     const s = await seedStack()
     const r = await generateMoveInInvoice({
       lease_id: s.leaseId, unit_id: s.unitId, tenant_id: s.tenantId,
       landlord_id: s.landlordId, rent_amount: RENT, start_date: START,
     } as any)
-    expect(r.rentAmount).toBe(696.67)      // 22 nights × 950/30 — matches the quote
+    expect(r.rentAmount).toBe(674.19)      // 22 nights × 950/31 — matches the quote
   })
 
   it('regular lease keeps days-in-month proration', async () => {
@@ -162,13 +162,13 @@ describe('Master Schedule → lease sync', () => {
     expect(rents['2026-10-01']).toBeUndefined()
     expect(rents['2026-09-01']).toBe(950)
 
-    // Owed now: 696.67 (arrival) + 19n × 950/30 = 601.67 → 1298.34.
-    // Settled 1646.67 → credit 348.33, banked for the final bill.
+    // Owed now: 674.19 (arrival, 22n × 950/31) + 19n × 950/30 (September) = 601.67 → 1275.86.
+    // Settled 1646.67 → credit 370.81, banked for the final bill.
     const credit = await db.query<any>(
       `SELECT amount_original::numeric AS a, amount_remaining::numeric AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
     expect(credit.rows).toHaveLength(1)
-    expect(Number(credit.rows[0].a)).toBe(348.33)
-    expect(Number(credit.rows[0].r)).toBe(348.33)
+    expect(Number(credit.rows[0].a)).toBe(370.81)
+    expect(Number(credit.rows[0].r)).toBe(370.81)
   })
 
   it('S637: a credit too small for the rent leaves the charge whole', async () => {
