@@ -816,8 +816,9 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     path: '/api/units/:unitId/out-of-order/:outOfOrderId/clear',
     pathParams: ['unitId', 'outOfOrderId'],
     description:
-      'Put a site that was marked out of order back in service, so it can be booked again. ' +
-      'Read the site back before sending.',
+      'Put a site or unit that was marked out of order back in service, so the booking site, staff bookings ' +
+      'and the schedule can use it again from today. Use when the landlord says a broken site is fixed or ' +
+      'repaired. Read the site back before sending.',
     params: {
       unitId: { type: 'string', description: 'The site as the landlord names it, with its property.' },
       outOfOrderId: { type: 'string', description: 'Which out-of-order window — from the site\u2019s out-of-order list.' },

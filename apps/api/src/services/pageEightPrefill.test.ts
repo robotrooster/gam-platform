@@ -32,7 +32,7 @@ async function seed(unitType: string) {
     const tpl = await c.query<{ id: string }>(
       `INSERT INTO lease_templates (landlord_id, name, unit_type, is_unit_type_default, base_pdf_url, is_active)
        VALUES ($1,'Lease',$2,TRUE,'/uploads/lease.pdf',TRUE) RETURNING id`, [landlordId, unitType])
-    await c.query(`UPDATE units SET rent_amount=500, security_deposit=350, available_date='2026-09-16' WHERE id=$1`, [unitId])
+    await c.query(`UPDATE units SET rent_amount=500, security_deposit=350, available_date='2099-09-16' WHERE id=$1`, [unitId])
     for (const [i, tag] of [...PAGE2].entries()) {
       await c.query(
         `INSERT INTO lease_template_fields
@@ -137,7 +137,7 @@ describe('S648 page 8 rent lines, deposit copy and total', () => {
   it('a new mid-month tenant: proration, deposit copied, total adds up', async () => {
     const f = await seed('apartment')
     await draft(f)
-    // 500/month from Sept 16 = 250; deposit 350; fees 350 + 100 + 50
+    // 500/month from Sept 16 = 250 (a far-future September, so the start date can't drift to today); deposit 350; fees 350 + 100 + 50
     expect(await page8()).toEqual({
       move_in_first_month_rent: '0.00', move_in_proration: '250.00',
       move_in_security_deposit: '350.00', move_in_total_due: '1100.00',
