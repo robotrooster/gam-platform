@@ -74,3 +74,10 @@ Everything is committed and pushed. The API and the landlord portal are live.
     - Nic appears twice. Tyler Rhoades (co-owner only) shows as a separate landlord. Nic and Blu Haws co-own one property, but each also owns properties the other doesn't.
     - Rule: count someone as a standalone landlord only if they bring their own property to the platform. Co-owners of only someone else's properties don't inflate the landlord count. Portal access is unaffected; this is counting only.
 17. **Still open from earlier:** Ray Artiaga's RV 09 meter (off-platform), the Stripe rep question, and ordering the card reader.
+
+## Added late 2026-09-18
+- **Onboarding Get Paid step fixed.** It rendered empty because it was keyed to the wrong step index; a new landlord, Nicholas Fausett, was stuck. Hotfixed live.
+- **Property address can be changed** from Edit Property. It refuses another landlord's registered address, updates the timezone for a new state, and keeps the old address in audit_log. This reverses the S631 lock.
+- **David (landlord agent) went unresponsive.** The mlx model server (com.gam.model, :8080) crashed with METAL "Insufficient Memory" (GPU out of memory); launchd restarted it and it works again.
+  - **TODO, permanent fix:** cap the KV/prompt cache (mlx_lm.server prompt-cache limits or an MLX memory limit), and add a watchdog that restarts it cleanly before memory fills.
+  - Background: memory gam-agent-gpu-memory-limits — mlx never evicts its cache and aborts rather than queueing.
