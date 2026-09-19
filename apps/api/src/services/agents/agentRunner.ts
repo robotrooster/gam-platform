@@ -1325,6 +1325,22 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     const plan = readsOnly ? routePlan(message, profile.audience, profile.toolNames ?? []) : planForTurn
     const routedTools = plan.tools
     if (!routedTools.length) return false
+    // S650: never re-run LAST turn's lookup unchanged. The table's drill-down
+    // stage reuses the previous route so "which of those are at Sunset Palms?"
+    // narrows it — fine when this message adds a filter. With nothing new
+    // ("yes, cancel it", "sign me up", "put together a notice for frank") it
+    // handed the model the same rows again and it repeated its last answer
+    // instead of acting: four of the eval's failures. Left to the forced retry,
+    // the model chooses — which is what an action needs.
+    if (!readsOnly && lastUserMessage) {
+      const own = routePlan(message, profile.audience, profile.toolNames ?? [])
+      const prev = routePlan(String((lastUserMessage as any).content), profile.audience, profile.toolNames ?? [])
+      const sameAsLastTurn = own.tools.length === 0
+        && prev.tools.length > 0
+        && routedTools.every((t) => prev.tools.includes(t))
+      const narrows = !!plan.args && Object.values(plan.args).some((v) => v != null && v !== '')
+      if (sameAsLastTurn && !narrows) return false
+    }
     // Every lookup this wording calls for that needs no argument from the
     // model. "Is my landlord gonna renew?" runs BOTH the lease and the
     // renewal tendency, because neither answers it alone.
