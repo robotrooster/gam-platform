@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'
 import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { X, Landmark } from 'lucide-react'
+import { X } from 'lucide-react'
 import { PropertySelect } from '../components/ListControls'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -86,6 +86,7 @@ export function DisbursementsPage() {
         </div>
       </div>
 
+      <NextPayoutFlow />
       <BalanceWithdrawSection />
 
       {can('disbursements.pm_impact_view') && <PmImpactSection />}
@@ -204,43 +205,107 @@ export function DisbursementsPage() {
   )
 }
 
+// S650 (Nic): "Clicking the tile gives no details ... collected / held for
+// payout / held until your bank is linked / available now / link your bank as
+// disconnected pieces. It needs to read as one continuous flow and show what
+// the $495 is made of."
+//
+// One card, left to right: still clearing at the tenant's bank → cleared and
+// held for you → sent to your bank on the next run. Below it, every payment in
+// the next payout, so the number is never a mystery.
+const TYPE_LABEL: Record<string, string> = { rent: 'Rent', utility: 'Utilities', deposit: 'Deposit', fee: 'Fee', late_fee: 'Late fee' }
+function NextPayoutFlow() {
+  const { data, isLoading } = useQuery<any>('next-payout', () => apiGet('/landlords/me/next-payout'))
+  const [showClearing, setShowClearing] = useState(false)
+  if (isLoading || !data) return null
+  const ready = data.ready ?? { total: 0, rows: [] }
+  const clearing = data.clearing ?? { total: 0, rows: [] }
+  const when = data.nextPayoutDate
+    ? new Date(data.nextPayoutDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
+    : 'the next weekly run'
+  const step = (label: string, amount: number, sub: React.ReactNode, tone: string, active: boolean) => (
+    <div style={{ flex: '1 1 180px', padding: '14px 16px', borderRadius: 10, background: active ? 'var(--bg-3)' : 'transparent',
+                  border: '1px solid var(--border-1)', opacity: active ? 1 : .6 }}>
+      <div style={{ fontSize: '.7rem', textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--text-3)' }}>{label}</div>
+      <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.5rem', fontWeight: 800, color: tone, margin: '4px 0' }}>{fmt(amount)}</div>
+      <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.45 }}>{sub}</div>
+    </div>
+  )
+  const arrow = <div style={{ alignSelf: 'center', color: 'var(--text-3)', fontSize: '1.2rem' }}>→</div>
+  const row = (r: any) => (
+    <tr key={r.id}>
+      <td className="mono" style={{ fontSize: '.78rem' }}>{new Date(r.dated).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</td>
+      <td>{r.kind === 'held' ? (r.description || 'Register sale') : (r.tenantName || '—')}</td>
+      <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>{r.kind === 'held' ? '' : [r.propertyName, r.unitNumber].filter(Boolean).join(' · ')}</td>
+      <td style={{ fontSize: '.78rem' }}>{r.kind === 'held' ? 'Card sale' : (TYPE_LABEL[r.type] || humanize(r.type || ''))}</td>
+      <td className="mono" style={{ textAlign: 'right' }}>{fmt(r.paid)}</td>
+      <td className="mono" style={{ textAlign: 'right', fontWeight: 700, color: 'var(--green)' }}>{fmt(r.kind === 'held' ? r.toYou : (r.status === 'processing' ? r.paid : r.toYou))}</td>
+    </tr>
+  )
+  return (
+    <div className="card" id="next-payout" style={{ marginBottom: 24 }}>
+      <div className="card-header"><span className="card-title">Your next payout</span></div>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
+        {step('Clearing at tenants\' banks', clearing.total,
+          clearing.rows.length ? `${clearing.rows.length} payment${clearing.rows.length === 1 ? '' : 's'} — bank payments take a few days to clear` : 'Nothing clearing right now',
+          'var(--amber)', clearing.rows.length > 0)}
+        {arrow}
+        {step('Cleared — held for you', ready.total,
+          ready.rows.length ? `${ready.rows.length} payment${ready.rows.length === 1 ? '' : 's'}, listed below` : 'Nothing waiting yet',
+          'var(--gold)', ready.rows.length > 0)}
+        {arrow}
+        {step(data.bankLinked ? `Sent to your bank ${when}` : 'Waiting for your bank', ready.total,
+          data.bankLinked
+            ? 'Paid out automatically on the weekly run'
+            : <>Link your bank at <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking</Link> and it goes out on the next run</>,
+          'var(--green)', ready.rows.length > 0)}
+      </div>
+      {ready.rows.length > 0 && (
+        <table className="data-table" style={{ marginTop: 16 }}>
+          <thead><tr><th>Date</th><th>From</th><th>Where</th><th>For</th><th style={{ textAlign: 'right' }}>Paid</th><th style={{ textAlign: 'right' }}>To you</th></tr></thead>
+          <tbody>{ready.rows.map(row)}</tbody>
+          <tfoot><tr><td colSpan={5} style={{ textAlign: 'right', fontWeight: 600 }}>Next payout</td><td className="mono" style={{ textAlign: 'right', fontWeight: 800, color: 'var(--green)' }}>{fmt(ready.total)}</td></tr></tfoot>
+        </table>
+      )}
+      {clearing.rows.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setShowClearing(v => !v)}>{showClearing ? 'Hide' : 'Show'} what is still clearing</button>
+          {showClearing && (
+            <table className="data-table" style={{ marginTop: 8 }}>
+              <thead><tr><th>Date</th><th>From</th><th>Where</th><th>For</th><th style={{ textAlign: 'right' }}>Paid</th><th style={{ textAlign: 'right' }}>Clearing</th></tr></thead>
+              <tbody>{clearing.rows.map(row)}</tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // S574 (Nic): on-demand withdrawal retired — the platform holds the balance and
 // pays it out on the automatic Friday batch, so this is a read-only balance
 // summary now (no "Withdraw Now" flow, no payout banner).
 function BalanceWithdrawSection() {
   const { data, isLoading } = useQuery<any>('me-finances-summary', () => apiGet('/users/me/finances?limit=1'))
   if (isLoading || !data) return null
+  if (!(Number(data.currentBalance ?? 0) > 0) && !(Number(data.pendingBalance ?? 0) > 0)) return null
 
   const balance = Number(data.currentBalance ?? 0)
   const pending = Number(data.pendingBalance ?? 0)
-  const held = Number(data.heldBalance ?? 0)
-  const nextPayout = data.nextPayout ?? null
-  const connectReady = data.connectReady === true
 
   return (
     <div style={{ marginBottom: 24 }}>
       <div className="kpi-grid">
-        {/* S639: under platform-holds, rent sits with GAM until the batch —
-            the Connect balance below is ~$0 by design, so this card is the
-            one that says where the money actually is. */}
-        {held > 0 && (
+        {/* S650: only when something is actually sitting there — under
+            platform holds this is $0 by design, and the flow above says where
+            the money is. */}
+        {balance > 0 && (
           <div className="kpi-card">
-            <div className="kpi-label">Collected — Held for Payout</div>
-            <div className="kpi-value gold">{fmt(held)}</div>
-            <div className="kpi-sub">
-              {nextPayout
-                ? `Payout scheduled for ${new Date(nextPayout.scheduledFor + 'T00:00:00').toLocaleDateString()}`
-                : connectReady
-                  ? 'Pays out on your next automatic batch'
-                  : 'Held until your bank is linked'}
-            </div>
+            <div className="kpi-label">In your payout account</div>
+            <div className="kpi-value gold">{fmt(balance)}</div>
+            <div className="kpi-sub">Goes to your bank automatically</div>
           </div>
         )}
-        <div className="kpi-card">
-          <div className="kpi-label">Available Now</div>
-          <div className="kpi-value gold">{fmt(balance)}</div>
-          <div className="kpi-sub">{connectReady ? 'Paid out automatically each week — in your bank by Friday' : 'Link your bank to get paid'}</div>
-        </div>
         {pending > 0 && (
           <div className="kpi-card">
             <div className="kpi-label">Pending Settlement</div>
@@ -250,14 +315,6 @@ function BalanceWithdrawSection() {
         )}
       </div>
 
-      {!connectReady && (
-        <div className="card" style={{ padding: 14, marginTop: 12, fontSize: '.82rem' }}>
-          <Landmark size={14} color="var(--gold)" style={{ verticalAlign: 'middle', marginRight: 8 }} />
-          Link your bank account at{' '}
-          <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking →</Link>
-          {' '}to receive your automatic payouts.
-        </div>
-      )}
     </div>
   )
 }

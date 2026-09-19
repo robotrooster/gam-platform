@@ -236,6 +236,23 @@ describe('S640 next disbursement says what is coming', () => {
     expect(Number(res.body.data.next_payout_clearing)).toBeCloseTo(460, 2)
   })
 
+  // S650 (Nic): "show what the $495 is made of" — the Disbursements page's
+  // breakdown lists exactly the payments the dashboard card adds up.
+  it('the next-payout breakdown itemises the same money the card shows', async () => {
+    const f = await seedHeld({ settled: 495, processing: 120 })
+    const card = await request(buildApp())
+      .get('/api/landlords/me/dashboard').set('Authorization', `Bearer ${f.token}`)
+    const res = await request(buildApp())
+      .get('/api/landlords/me/next-payout').set('Authorization', `Bearer ${f.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.ready.total).toBeCloseTo(Number(card.body.data.next_payout_ready), 2)
+    expect(res.body.data.ready.rows).toHaveLength(1)
+    expect(res.body.data.ready.rows[0].to_you).toBeCloseTo(495, 2)
+    expect(res.body.data.ready.rows[0].type).toBe('rent')
+    expect(res.body.data.clearing.total).toBeCloseTo(120, 2)
+    expect(res.body.data.next_payout_date).toBeTruthy()
+  })
+
   // Once swept, it is no longer "about to hit their bank" — it already left.
   it('drops an owner share that has already been transferred out', async () => {
     const f = await seedHeld({ settled: 700, processing: 0 })

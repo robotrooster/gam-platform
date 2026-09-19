@@ -775,6 +775,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
          AND p.platform_held = TRUE
          AND ($2::uuid IS NULL OR p.unit_id IN (
                SELECT id FROM units WHERE property_id = $2))`, [scopeIds, propertyFilter])
+    const [heldForRun] = propertyFilter ? [{ amount: 0 }] : await query<{ amount: number }>(`
+      SELECT COALESCE(SUM(amount), 0)::float AS amount FROM held_payout_items
+       WHERE landlord_id = ANY($1) AND payout_intent_id IS NULL`, [scopeIds])
     // disbursements carry no unit or property — a payout is an entity-level
     // movement of money, so it stays blended even when a property is chosen.
     // ── S639: THE TREND AND THE KPI CARD HAVE TO AGREE ─────────────────────
@@ -1026,7 +1029,9 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       work_trade_suspended: outstandingRow?.work_trade_suspended||0,
       // S640: what is actually going out on the next weekly run, and what is
       // still clearing behind it.
-      next_payout_ready: pipeline?.ready||0,
+      // S650: register and pay-link card sales are held for the same weekly
+      // run; the Disbursements breakdown lists them, so the card counts them.
+      next_payout_ready: Math.round(((pipeline?.ready||0) + (heldForRun?.amount||0)) * 100) / 100,
       next_payout_clearing: pipeline?.clearing||0,
       // S640: the date comes from the PAYOUT ENGINE, not from the card
       // re-deriving the schedule. That duplication has been wrong three times —
@@ -1051,6 +1056,60 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
 // formula as monthly_rent_volume in /:id/dashboard (SUM of u.rent_amount
 // over occupied statuses), so the KPI and this page can never disagree.
 // Financial view — same gate as the dashboard rollup.
+/**
+ * S650 (Nic): "Clicking the tile gives no details ... It needs to read as one
+ * continuous flow and show what the $495 is made of."
+ *
+ * Everything headed for the landlord's bank on the next weekly run, item by
+ * item: rent that has cleared and is held for payout, register and pay-link
+ * card sales held the same way, and — separately — payments still clearing at
+ * the tenant's bank. Same sources as the dashboard's Next Disbursement card.
+ */
+landlordsRouter.get('/:id/next-payout', async (req, res, next) => {
+  try {
+    const ids = req.params.id === 'me' && req.user!.role === 'landlord'
+      ? landlordScopeIds(req.user!) : [req.params.id]
+    if (!ids.every(x => canViewLandlordFinances(req.user, x))) throw new AppError(403, 'Forbidden')
+    const payments = await query<any>(`
+      SELECT p.id, p.status, p.type, p.amount::float AS paid,
+             COALESCE(ubl.amount, 0)::float AS to_you,
+             COALESCE(p.settled_at, p.processed_at, p.created_at) AS dated,
+             u.unit_number, pr.name AS property_name, ll.business_name AS company_name,
+             (SELECT us.first_name || ' ' || us.last_name FROM tenants t JOIN users us ON us.id = t.user_id
+               WHERE t.id = p.tenant_id) AS tenant_name
+        FROM payments p
+        JOIN landlords ll ON ll.id = p.landlord_id
+        LEFT JOIN units u ON u.id = p.unit_id
+        LEFT JOIN properties pr ON pr.id = u.property_id
+        LEFT JOIN user_balance_ledger ubl
+               ON ubl.reference_id = p.id AND ubl.reference_type = 'payment'
+              AND ubl.type = 'allocation_owner_share' AND ubl.stripe_transfer_id IS NULL
+       WHERE p.landlord_id = ANY($1) AND p.platform_held = TRUE
+         AND (p.status = 'processing' OR (p.status = 'settled' AND ubl.id IS NOT NULL))
+       ORDER BY dated`, [ids])
+    const held = await query<any>(`
+      SELECT h.id, h.source_type, h.description, h.amount::float AS to_you, h.created_at AS dated,
+             ll.business_name AS company_name
+        FROM held_payout_items h JOIN landlords ll ON ll.id = h.landlord_id
+       WHERE h.landlord_id = ANY($1) AND h.payout_intent_id IS NULL
+       ORDER BY h.created_at`, [ids])
+    const [bank] = await query<{ ready: boolean }>(
+      `SELECT bool_or(connect_payouts_enabled) AS ready FROM landlords WHERE id = ANY($1)`, [ids])
+    const ready = [
+      ...payments.filter((r: any) => r.status === 'settled').map((r: any) => ({ ...r, kind: 'payment' })),
+      ...held.map((h: any) => ({ ...h, kind: 'held', paid: h.to_you })),
+    ]
+    const clearing = payments.filter((r: any) => r.status === 'processing')
+    const sum = (rows: any[], k: string) => Math.round(rows.reduce((a, r) => a + Number(r[k] || 0), 0) * 100) / 100
+    res.json({ success: true, data: {
+      next_payout_date: nextPayoutDateUtc(),
+      bank_linked: !!bank?.ready,
+      ready: { total: sum(ready, 'to_you'), rows: ready },
+      clearing: { total: sum(clearing, 'paid'), rows: clearing },
+    } })
+  } catch (e) { next(e) }
+})
+
 landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
   try {
     // S633: a rent roll is a list of what is rented — an account's, across every
