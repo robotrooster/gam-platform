@@ -816,8 +816,8 @@ describe('POST /api/public/properties/apply — landlord resolution', () => {
 
 // S631 (Nic, DIRECTIVE): "We should maybe lock the street address once it's set.
 // That way it's not altering our future heat map that we're gonna build."
-describe('S631 property address is fixed once set', () => {
-  it('refuses a changed street address, but still allows a rename', async () => {
+describe('S631/S649 property address changes', () => {
+  it('allows a changed street address (audited), and a rename leaves it alone', async () => {
     const app = buildApp()
     const fx = await seedPropsFixture()
     const client = await db.connect()
@@ -830,12 +830,15 @@ describe('S631 property address is fixed once set', () => {
       })
     } finally { client.release() }
 
+    // S649 (Nic): "edit property window needs to be able to change property
+    // address" — allowed now, with the old address kept in the audit log.
     const moved = await request(app)
       .patch(`/api/properties/${propertyId!}`)
       .set('Authorization', `Bearer ${fx.landlordToken}`)
       .send({ street1: '999 Somewhere Else Rd' })
-    expect(moved.status).toBe(409)
-    expect(String(moved.body.error)).toMatch(/address is fixed/i)
+    expect(moved.status).toBe(200)
+    const audit = await db.query(`SELECT 1 FROM audit_log WHERE action = 'property_address_changed' AND entity_id = $1`, [propertyId!])
+    expect(audit.rows).toHaveLength(1)
 
     // The edit form posts the whole record back on every save, so an UNCHANGED
     // address must not be mistaken for an attempt to move the property.
@@ -850,5 +853,26 @@ describe('S631 property address is fixed once set', () => {
       `SELECT name, street1 FROM properties WHERE id=$1`, [propertyId!])
     expect(after.rows[0].name).toBe('Renamed Park')
     expect(after.rows[0].street1).toBe(cur.rows[0].street1)
+  })
+})
+
+describe('S649 an address change cannot land on another landlord\'s property', () => {
+  it('refuses moving onto an address registered to someone else', async () => {
+    const app = buildApp()
+    const fx = await seedPropsFixture()
+    const other = await seedPropsFixture()
+    const client = await db.connect()
+    let mine = '', theirs = ''
+    try {
+      mine = await seedProperty(client, { landlordId: fx.landlordId, ownerUserId: fx.landlordUserId, managedByUserId: fx.landlordUserId })
+      theirs = await seedProperty(client, { landlordId: other.landlordId, ownerUserId: other.landlordUserId, managedByUserId: other.landlordUserId })
+    } finally { client.release() }
+    await db.query(`UPDATE properties SET street1 = '77 Their Park Rd' WHERE id = $1`, [theirs])
+    const t = (await db.query<any>(`SELECT street1, city, state, street2 FROM properties WHERE id = $1`, [theirs])).rows[0]
+    const res = await request(app).patch(`/api/properties/${mine}`)
+      .set('Authorization', `Bearer ${fx.landlordToken}`)
+      .send({ street1: t.street1, city: t.city, state: t.state })
+    expect(res.status).toBe(409)
+    expect(String(res.body.error)).toMatch(/already registered/i)
   })
 })

@@ -257,6 +257,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   const [addrSuggestions, setAddrSuggestions] = useState<any[]>([])
   const [showAddrSugg, setShowAddrSugg] = useState(false)
   const [addrVerified, setAddrVerified] = useState(false)
+  // S649: the address is shown read-only until the landlord chooses to change it
+  const [editAddress, setEditAddress] = useState(false)
   const MAPBOX_TOKEN = (import.meta as any).env?.VITE_MAPBOX_TOKEN || ''
   const addrTimer = useRef<any>(null)
   // Step 2: unit groups — one per selected type
@@ -541,7 +543,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 due in, and whether two landlords are claiming the same park — so
                 it is stated once and then read-only. The server refuses a change
                 too; this is the half that explains why. */}
-            {isEdit ? (
+            {isEdit && !editAddress ? (
               <div style={{ marginBottom: 10 }}>
                 <label style={lbl}>Address</label>
                 <div style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)',
@@ -549,9 +551,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                   {[form.street1, form.street2].filter(Boolean).join(' ')}<br />
                   {form.city}{form.city && form.state ? ', ' : ''}{form.state} {form.zip}
                 </div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
-                  Fixed once set — it decides which state&apos;s rules apply and which timezone rent is
-                  due in. If it&apos;s wrong, contact support and we&apos;ll correct it.
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', flex: 1 }}>
+                    It decides which state&apos;s rules apply and which timezone rent is due in.
+                  </div>
+                  {/* S649 (Nic): landlords can correct the address; the server
+                      re-checks it isn't another landlord's property, moves the
+                      timezone with the state, and keeps the old one on record. */}
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => setEditAddress(true)}>Change address</button>
                 </div>
               </div>
             ) : (<>

@@ -1174,6 +1174,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     //
     // super_admin can still correct one, which is the escape hatch for a real
     // typo, and it leaves an audit row naming who changed it.
+    let addressChangedState: string | null = null
     const addressFieldsSent = ['street1', 'street2', 'city', 'state', 'zip']
       .filter(f => raw[f] !== undefined)
     if (addressFieldsSent.length) {
@@ -1183,13 +1184,41 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
       const proposed: Record<string, any> = { street1, street2, city, state, zip }
       const norm = (v: any) => String(v ?? '').trim().toLowerCase()
       const changed = addressFieldsSent.filter(f => norm(proposed[f]) !== norm(cur?.[f]))
-      // Only a real CHANGE is refused — the edit form posts the whole record
-      // back, so an unchanged address arrives on every save of the name.
-      if (changed.length && req.user!.role !== 'super_admin') {
-        throw new AppError(409,
-          'A property\'s address is fixed once it is set — it decides which state\'s laws apply, ' +
-          'which timezone rent is due in, and stops two landlords claiming the same place. ' +
-          'If this one is wrong, contact support and we will correct it.')
+      // S649 (Nic): "edit property window needs to be able to change property
+      // address" — the landlord may now change it, WITH the safeguards the lock
+      // stood in for (S631): it may not land on another landlord's property,
+      // the timezone follows a new state, and the old address is kept in the
+      // audit log. (An unchanged address arrives on every save — ignored.)
+      if (changed.length) {
+        const own = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id = $1`, [req.params.id])
+        const clash = await queryOne<{ id: string; landlord_id: string; name: string }>(
+          `SELECT id, landlord_id, name FROM properties
+            WHERE id <> $1 AND landlord_id <> $2
+              AND LOWER(TRIM(street1)) = LOWER(TRIM($3)) AND LOWER(TRIM(city)) = LOWER(TRIM($4))
+              AND LOWER(TRIM(state)) = LOWER(TRIM($5))
+              AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($6)), '')
+            LIMIT 1`,
+          [req.params.id, own?.landlord_id, proposed.street1 ?? cur?.street1, proposed.city ?? cur?.city,
+           proposed.state ?? cur?.state, proposed.street2 ?? cur?.street2 ?? ''])
+        if (clash) {
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          await createAdminNotification({
+            severity: 'warn', category: 'duplicate_property_claim',
+            title: `Blocked address change onto another landlord's property`,
+            body: `Property ${req.params.id} tried to move to an address already registered as "${clash.name}" ` +
+                  `under landlord ${clash.landlord_id} (property ${clash.id}).`,
+            context: { propertyId: req.params.id, existingPropertyId: clash.id },
+          }).catch(() => {})
+          throw new AppError(409,
+            'That address is already registered on GAM to another account. If it\'s a different suite or ' +
+            'building, include its suite/unit line — or contact support if you believe this is an error.')
+        }
+        await query(
+          `INSERT INTO audit_log (user_id, action, entity_type, entity_id, old_value, new_value)
+           VALUES ($1, 'property_address_changed', 'property', $2, $3::jsonb, $4::jsonb)`,
+          [req.user!.userId, req.params.id, JSON.stringify(cur ?? {}),
+           JSON.stringify(Object.fromEntries(addressFieldsSent.map(f => [f, proposed[f]])))]).catch(() => {})
+        addressChangedState = changed.includes('state') ? (proposed.state as string) : null
       }
     }
 
@@ -1331,6 +1360,11 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null,
        signingEmailSent, signingEmail, signingNameSent, signingName]
     )
+    // S649: a property that moved states is due in the new state's timezone.
+    if (addressChangedState) {
+      await query(`UPDATE properties SET timezone = $2 WHERE id = $1`,
+        [req.params.id, timezoneForState(addressChangedState)])
+    }
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
     // pattern above can't distinguish "preserve" from "clear", and
