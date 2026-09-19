@@ -213,3 +213,25 @@ describe('when it is paid', () => {
     expect(b.hold_expires_at).toBeNull()
   })
 })
+
+// S649 (Nic): find the person for a bill. Your own tenants by any part of a
+// name; someone else's only by their full email — never browsable.
+describe('finding who to send a link to', () => {
+  it('finds your invited tenant by part of a name, and a stranger only by their full email', async () => {
+    const f = await seed()
+    const mkTenant = async (first: string, last: string, email: string) => {
+      const u = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1,'x','tenant',$2,$3,TRUE) RETURNING id`, [email, first, last])
+      return (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])).rows[0].id
+    }
+    const mine = await mkTenant('Andres', 'Razo', 'razo@example.com')
+    await db.query(`INSERT INTO pending_tenant_intents (landlord_id, tenant_id, property_id) VALUES ($1, $2, $3)`, [f.landlordId, mine, f.propertyId])
+    await mkTenant('Stella', 'Stranger', 'stella@elsewhere.com')
+    const find = async (q: string) => (await request(buildApp()).get(`/api/pos/pay-links/people?q=${encodeURIComponent(q)}`)
+      .set('Authorization', `Bearer ${f.token}`)).body.data.map((p: any) => p.email)
+    expect(await find('raz')).toEqual(['razo@example.com'])
+    expect(await find('stel')).toEqual([])                          // not yours: no browsing
+    expect(await find('stella@elsewhere.com')).toEqual(['stella@elsewhere.com'])  // exact email: that one person
+  })
+})

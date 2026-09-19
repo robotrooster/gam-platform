@@ -1,13 +1,16 @@
 import { Fragment, useState } from 'react'
 import { useQuery } from 'react-query'
-import { apiGet } from '../lib/api'
+import { apiGet, apiPost } from '../lib/api'
 import { PropertySelect } from '../components/ListControls'
 
 // Front-desk "who owes" view. Read-only list of tenants with an unpaid balance
 // + contact info, so a front-counter person knows who to call. Data from
 // GET /balances (unpaid invoice balances, per the platform's outstanding def).
 interface Owed {
-  tenantId: string
+  tenantId: string | null
+  // S649: an open emailed pay link (someone with no lease, or a one-off bill)
+  payLinkId?: string | null
+  payLink?: { label: string; items: Array<{ name: string; qty: number; price: number }> } | null
   firstName: string | null
   lastName: string | null
   phone: string | null
@@ -23,6 +26,31 @@ interface Owed {
   // their credit (spent once, oldest bill first).
   spaces?: Array<{ leaseId: string | null; unitNumber: string | null; propertyId: string | null
     propertyName: string | null; balance: number; creditApplied: number; openInvoices: number }>
+}
+
+// S649: what an open pay link is for, with the two ways to chase it.
+function PayLinkBreakdown({ id, link }: { id: string; link?: Owed['payLink'] }) {
+  const [msg, setMsg] = useState<string | null>(null)
+  const resend = async () => {
+    try { await apiPost(`/pos/pay-links/${id}/resend`, {}); setMsg('Sent again.') }
+    catch (e: any) { setMsg(e?.response?.data?.error || 'Could not send it again.') }
+  }
+  return (
+    <div style={{ padding: '10px 16px 14px 32px' }}>
+      <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 6 }}>{link?.label}</div>
+      {(link?.items || []).map((it, i) => (
+        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.8rem', maxWidth: 420 }}>
+          <span>{it.name}{Number(it.qty) !== 1 ? ` × ${it.qty}` : ''}</span>
+          <span className="mono">{fmt(Number(it.price) * Number(it.qty))}</span>
+        </div>
+      ))}
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '6px 0 10px' }}>Card fee is added when they pay by card.</div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button className="btn btn-primary btn-sm" onClick={resend}>Send again</button>
+        {msg && <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{msg}</span>}
+      </div>
+    </div>
+  )
 }
 
 const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -201,7 +229,8 @@ export function BalancesPage() {
               {shown.map(r => {
                 const od = daysOverdue(r.oldestDueDate)
                 const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
-                const rowKey = r.tenantId
+                const rowKey = r.payLinkId || r.tenantId || ''
+
                 const isOpen = openRow === rowKey
                 return (
                   <Fragment key={rowKey}>
@@ -224,14 +253,14 @@ export function BalancesPage() {
                           </div>
                         ))
                       ) : (
-                        <>{r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
+                        <>{r.payLinkId ? 'Pay link' : r.unitNumber ? `Unit ${r.unitNumber}` : '—'}</>
                       )}
                       {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: 'var(--gold)' }}>
                       {fmt(Number(r.balance))}
                       <div style={{ fontSize: '.68rem', color: 'var(--text-3)', fontWeight: 400 }}>
-                        {r.openInvoices} invoice{r.openInvoices === 1 ? '' : 's'}
+                        {r.payLinkId ? 'emailed pay link' : `${r.openInvoices} invoice${r.openInvoices === 1 ? '' : 's'}`}
                       </div>
                     </td>
                     <td style={{ fontSize: '.82rem' }}>
@@ -251,7 +280,9 @@ export function BalancesPage() {
                   {isOpen && (
                     <tr>
                       <td colSpan={5} style={{ padding: 0, background: 'rgba(255,255,255,.015)' }}>
-                        <InvoiceBreakdown tenantId={r.tenantId} />
+                        {r.payLinkId
+                          ? <PayLinkBreakdown id={r.payLinkId} link={r.payLink} />
+                          : <InvoiceBreakdown tenantId={r.tenantId!} />}
                       </td>
                     </tr>
                   )}

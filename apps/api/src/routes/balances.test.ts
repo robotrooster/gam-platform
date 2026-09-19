@@ -224,3 +224,28 @@ describe('S637 outstanding excludes money in flight', () => {
     expect(await balanceFor(f)).toBe(owed)
   })
 })
+
+// S649 (Nic): "make sure POS pay links and outstanding tickets show in
+// outstanding. That way we can follow through on collecting."
+describe('open pay links are outstanding', () => {
+  it('lists an emailed pay link as its own line, and drops it once paid; a QR sign never shows', async () => {
+    const f = await seedOwedTenant()
+    const prop = (await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [f.unitId])).rows[0].property_id
+    const mk = (kind: string, email: string | null) => db.query<{ id: string }>(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email)
+       VALUES (md5(random()::text) || md5(random()::text), $1, $2, $3, $4, 'Move-out', $5::jsonb, 670.27, 670.27, 'Andres Razo', $6) RETURNING id`,
+      [f.landlordId, prop, f.userId, kind, JSON.stringify([{ name: 'RV site — monthly', qty: 1, price: 589 }, { name: 'Electric (per kWh)', qty: 387, price: 0.21 }]), email])
+    const link = (await mk('one_time', 'razo@example.com')).rows[0].id
+    await mk('standing', null)
+    const get = () => request(buildApp()).get('/api/balances').set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    let rows = (await get()).body.data
+    const row = rows.find((r: any) => r.pay_link_id === link)
+    expect(row).toMatchObject({ first_name: 'Andres', last_name: 'Razo', email: 'razo@example.com', balance: '670.27' })
+    expect(rows.filter((r: any) => r.pay_link_id)).toHaveLength(1)
+    // The tenant's own ledger line is untouched by it.
+    expect(Number(rows.find((r: any) => r.tenant_id === f.tenantId).balance)).toBe(616.40)
+    await db.query(`UPDATE pos_pay_links SET status = 'paid', paid_at = NOW() WHERE id = $1`, [link])
+    rows = (await get()).body.data
+    expect(rows.find((r: any) => r.pay_link_id === link)).toBeUndefined()
+  })
+})

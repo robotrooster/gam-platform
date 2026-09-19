@@ -119,6 +119,38 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
         spaces: breakdown,
       })
     }
+    // S649 (Nic): "make sure POS pay links and outstanding tickets show in
+    // outstanding. That way we can follow through on collecting." An emailed
+    // pay link is money owed by someone who may have no lease at all (Andres
+    // Razo's move-out bill). It is its own line — never folded into a rent
+    // ledger — and leaves the list the moment it's paid or closed. Standing QR
+    // links (the dump-station sign) are owed by no one in particular: excluded.
+    const links = await query<any>(`
+      SELECT l.id, l.label, l.items, l.total::float AS total, l.customer_name, l.customer_email,
+             l.customer_phone, l.property_id, p.name AS property_name,
+             to_char(l.created_at, 'YYYY-MM-DD') AS sent_on
+        FROM pos_pay_links l
+        JOIN properties p ON p.id = l.property_id
+       WHERE l.landlord_id = ANY($1::uuid[])
+         AND l.kind = 'one_time' AND l.status = 'open'
+         AND (l.expires_at IS NULL OR l.expires_at > NOW())
+         AND ($2::uuid[] IS NULL OR l.property_id = ANY($2::uuid[]))`, [landlordIds, scopedIds])
+    for (const l of links) {
+      const [first, ...rest] = String(l.customer_name || '').trim().split(/\s+/)
+      out.push({
+        tenant_id: null,
+        pay_link_id: l.id,
+        first_name: first || l.customer_email, last_name: rest.join(' ') || null,
+        phone: l.customer_phone, email: l.customer_email,
+        unit_number: null,
+        property_id: l.property_id, property_ids: [l.property_id], property_name: l.property_name,
+        balance: Number(l.total).toFixed(2),
+        credit_on_account: 0,
+        open_invoices: 1,
+        oldest_due_date: l.sent_on,
+        pay_link: { label: l.label, items: l.items },
+      })
+    }
     out.sort((a, b) => Number(b.balance) - Number(a.balance))
     res.json({ success: true, data: out })
   } catch (e) { next(e) }

@@ -43,6 +43,14 @@ export function SendPayLinkModal({ propertyId, cart, discountAmount, total, cust
       onError: (e: any) => setErr(e?.response?.data?.error || 'Could not send the link'),
     })
   const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  // S649 (Nic): find the person instead of retyping them. Your own tenants and
+  // customers by any part of a name/email/phone; anyone else on GAM only by
+  // their full email or phone (server-side rule — nothing to browse).
+  const [lookup, setLookup] = useState('')
+  const { data: people = [] } = useQuery<any[]>(['paylink-people', lookup],
+    () => apiGet(`/pos/pay-links/people?q=${encodeURIComponent(lookup.trim())}`),
+    { enabled: lookup.trim().length >= 2, keepPreviousData: true })
+  const pick = (p: any) => { setName(p.name || ''); setEmail(p.email || ''); setPhone(p.phone || ''); setLookup('') }
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
@@ -54,6 +62,28 @@ export function SendPayLinkModal({ propertyId, cart, discountAmount, total, cust
           <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Cart</span><span className="mono">{fmt(total)}</span></div>
           {fee > 0 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-3)' }}>Card processing fee</span><span className="mono">{fmt(fee)}</span></div>}
           <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700 }}><span>They pay</span><span className="mono" style={{ color: 'var(--gold)' }}>{fmt(total + fee)}</span></div>
+        </div>
+        <div style={{ position: 'relative', marginBottom: 8 }}>
+          <input id="paylink-lookup" className="form-input" placeholder="Find someone — name, email or phone"
+            value={lookup} onChange={e => setLookup(e.target.value)} style={{ width: '100%' }} />
+          {lookup.trim().length >= 2 && (people as any[]).length > 0 && (
+            <div style={{ position: 'absolute', zIndex: 5, left: 0, right: 0, top: '100%', background: 'var(--bg-1)',
+              border: '1px solid var(--border-1)', borderRadius: 8, marginTop: 4, maxHeight: 220, overflowY: 'auto' }}>
+              {(people as any[]).map((p: any, i: number) => (
+                <button key={i} type="button" onClick={() => pick(p)}
+                  style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 10px', background: 'transparent',
+                    border: 'none', borderBottom: '1px solid var(--border-0)', cursor: 'pointer', color: 'var(--text-0)' }}>
+                  <div style={{ fontSize: '.84rem', fontWeight: 600 }}>{p.name || p.email}</div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{[p.email, p.phone].filter(Boolean).join(' · ')}</div>
+                </button>
+              ))}
+            </div>
+          )}
+          {lookup.trim().length >= 2 && (people as any[]).length === 0 && (
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+              No match. Someone who isn&apos;t your tenant shows up only by their full email or phone number.
+            </div>
+          )}
         </div>
         <div style={{ display: 'grid', gap: 8 }}>
           <input id="paylink-name" className="form-input" placeholder="Name" value={name} onChange={e => setName(e.target.value)} />

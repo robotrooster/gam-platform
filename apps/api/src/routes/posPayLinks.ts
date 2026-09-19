@@ -199,6 +199,58 @@ export async function createStayBalanceLink(opts: {
   return { id: link.id }
 }
 
+// GET /api/pos/pay-links/people?q= — S649 (Nic): who to send a bill to.
+//
+// Nic wanted "anybody that's in the database a searchable customer even cross
+// landlord". Browsing every landlord's tenants would hand any landlord another's
+// names, emails and phones (the audience-isolation rule), so, as agreed:
+//   • YOUR people — tenants (leased or invited) and register customers of any
+//     company the account owns — match on part of a name, email or phone.
+//   • ANYONE ELSE on GAM — only on their FULL email or phone number, returning
+//     just that one person, so there is nothing to browse.
+posPayLinksRouter.get('/people', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const q = String(req.query.q ?? '').trim()
+    if (q.length < 2) return res.json({ success: true, data: [] })
+    const { landlordScopeIds } = await import('../lib/landlordScope')
+    const mine = landlordScopeIds(req.user)
+    const like = `%${q.replace(/[%_\\]/g, '')}%`
+    const digits = q.replace(/\D/g, '')
+    const own = await query<any>(`
+      WITH my_tenants AS (
+        SELECT DISTINCT t.user_id FROM tenants t
+          JOIN lease_tenants lt ON lt.tenant_id = t.id
+          JOIN leases l ON l.id = lt.lease_id
+         WHERE l.landlord_id = ANY($1::uuid[])
+        UNION
+        SELECT DISTINCT t.user_id FROM tenants t
+          JOIN pending_tenant_intents i ON i.tenant_id = t.id
+         WHERE i.landlord_id = ANY($1::uuid[]) AND i.cancelled_at IS NULL
+      )
+      SELECT u.first_name, u.last_name, u.email, u.phone, 'tenant' AS kind
+        FROM users u JOIN my_tenants m ON m.user_id = u.id
+       WHERE (u.first_name || ' ' || u.last_name) ILIKE $2 OR u.email ILIKE $2
+          OR ($3 <> '' AND regexp_replace(COALESCE(u.phone, ''), '\\D', '', 'g') LIKE '%' || $3 || '%')
+      UNION
+      SELECT c.first_name, c.last_name, c.email, c.phone, 'customer' AS kind
+        FROM pos_customers c
+       WHERE c.landlord_id = ANY($1::uuid[]) AND c.archived_at IS NULL
+         AND ((c.first_name || ' ' || c.last_name) ILIKE $2 OR c.email ILIKE $2
+              OR ($3 <> '' AND regexp_replace(COALESCE(c.phone, ''), '\\D', '', 'g') LIKE '%' || $3 || '%'))
+      LIMIT 10`, [mine, like, digits.length >= 3 ? digits : ''])
+    // Anyone else: exact email, or a full phone number, only.
+    const exact = (q.includes('@') || digits.length >= 10) ? await query<any>(`
+      SELECT first_name, last_name, email, phone, 'gam' AS kind FROM users
+       WHERE role IN ('tenant', 'guest')
+         AND (lower(email) = lower($1)
+              OR ($2 <> '' AND right(regexp_replace(COALESCE(phone, ''), '\\D', '', 'g'), 10) = right($2, 10)))
+       LIMIT 1`, [q, digits.length >= 10 ? digits : '']) : []
+    const seen = new Set(own.map((r: any) => (r.email || '').toLowerCase()))
+    res.json({ success: true, data: [...own, ...exact.filter((r: any) => !seen.has((r.email || '').toLowerCase()))]
+      .map((r: any) => ({ name: [r.first_name, r.last_name].filter(Boolean).join(' '), email: r.email, phone: r.phone, kind: r.kind })) })
+  } catch (e) { next(e) }
+})
+
 posPayLinksRouter.post('/', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
