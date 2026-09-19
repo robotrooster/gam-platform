@@ -76,7 +76,11 @@ export async function recommendMaintenancePriority(input: {
   const categoryLabel = MAINTENANCE_CATEGORY_LABEL[category as MaintenanceCategory] || category
 
   try {
-    const out = await chatCompletion(
+    // S650: bounded. The model serves one request at a time; while a long
+    // agent turn (or an eval) holds it, this waited the full LLM timeout — up
+    // to three minutes with a tenant staring at "submitting". The keyword
+    // heuristic is a fine answer; a hung form is not.
+    const out = await withTimeout(chatCompletion(
       [
         { role: 'system', content: SYSTEM_PROMPT },
         {
@@ -87,7 +91,7 @@ export async function recommendMaintenancePriority(input: {
       // Deterministic — this is a classifier, not a chat. (max_tokens is
       // capped by the engine config; the reply is a short JSON object.)
       { sampler: { temperature: 0 } },
-    )
+    ), PRIORITY_TIMEOUT_MS)
     const parsed = parsePriority(out.content)
     if (parsed) return { priority: parsed, source: 'agent' }
     logger.warn({ raw: out.content }, '[maint-priority] agent output unparseable, using heuristic')
@@ -96,6 +100,15 @@ export async function recommendMaintenancePriority(input: {
   }
 
   return { priority: heuristicPriority(category, title, description), source: 'heuristic' }
+}
+
+const PRIORITY_TIMEOUT_MS = Number(process.env.MAINT_PRIORITY_TIMEOUT_MS) || 8_000
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`priority recommendation timed out after ${ms} ms`)), ms)
+    p.then((v) => { clearTimeout(t); resolve(v) }, (e) => { clearTimeout(t); reject(e) })
+  })
 }
 
 /** Pull a valid priority out of the model's reply (tolerant of stray text). */
