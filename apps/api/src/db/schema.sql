@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict xkPlvsBchLAAhPc1RESfq6FvR7Jrhhp3YQ7GXwMCwgd7fuVrxJEsdZKVajvTatH
+\restrict Z8shIJBYZbh95JqstZSPGetbTTbxb8Yee8HUziInxWpJWKJg22OUxGAY0LkpyDX
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7262,11 +7262,13 @@ CREATE TABLE public.pos_tax_rates (
     landlord_id uuid NOT NULL,
     name text NOT NULL,
     rate numeric(7,4) NOT NULL,
-    tax_type text NOT NULL,
+    tax_type text DEFAULT 'sales'::text NOT NULL,
     applies_to text[] DEFAULT ARRAY['all'::text] NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    property_id uuid
+    property_id uuid,
+    category_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    item_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL
 );
 
 
@@ -7342,6 +7344,7 @@ CREATE TABLE public.pos_transactions (
     discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     discount_reason text,
     pay_link_id uuid,
+    tax_breakdown jsonb,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -27118,5 +27121,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict xkPlvsBchLAAhPc1RESfq6FvR7Jrhhp3YQ7GXwMCwgd7fuVrxJEsdZKVajvTatH
+\unrestrict Z8shIJBYZbh95JqstZSPGetbTTbxb8Yee8HUziInxWpJWKJg22OUxGAY0LkpyDX
 

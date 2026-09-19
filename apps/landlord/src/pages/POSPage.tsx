@@ -33,7 +33,6 @@ const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue
 // rest of the Flex Suite. The button is filtered out of the register picker so
 // a clerk can only ring cash/card; all charge code stays for post-launch.
 const LAUNCH_HIDE_CHARGE = true
-const TAX_TYPES = ['state','city','county','special']
 // S218: pos_categories is the source of truth for the category list.
 // Pre-S218 this file used a hardcoded ['fuel','amenity','laundry',
 // 'parking','fee','misc']. The DB pos_categories table + /api/pos/
@@ -129,10 +128,12 @@ export function POSPage() {
     setItemSort(s => s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' })
   // S227: form now stores categoryId (uuid). Default '' until categories
   // load, then we auto-pick the first available (see useEffect below).
-  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
-  const [newTax, setNewTax] = useState({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' as string })
+  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
+  // S650 (Nic): one list of named taxes, each applied to everything, to whole
+  // categories, or to single items. The name is what the receipt prints.
+  const blankTax = { id:'' as string, name:'', ratePct:'', all:true, categoryIds:[] as string[], itemIds:[] as string[] }
+  const [taxDraft, setTaxDraft] = useState(blankTax)
   // S217: tax-rate list filter on the taxes tab.
-  const [filterTaxProperty, setFilterTaxProperty] = useState<string>('all')
   const [newDiscount, setNewDiscount] = useState({ name:'', type:'percent', value:'', code:'' })
   const [newVendor, setNewVendor] = useState({ name:'', contactName:'', email:'', phone:'', address:'', leadTimeDays:'3', notes:'' })
   const [editVendor, setEditVendor] = useState<any>(null)
@@ -177,8 +178,6 @@ export function POSPage() {
   // S254: pos_customers roster for FlexCharge non-tenant picker
   const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge' })
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
-  // Tax categories (simple: name + one rate). Items pick a tax category → rate.
-  const { data: posTaxCategories = [] } = useQuery<any[]>('pos-tax-categories', () => apiGet('/pos/tax-categories'), { enabled: tab==='taxes'||tab==='items'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
   const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty], () => apiGet(`/pos/transactions${propQ}`), { enabled: tab==='history' })
   const { data: vendors = [] } = useQuery<any[]>('pos-vendors', () => apiGet('/pos/vendors'), { enabled: tab==='vendors'||tab==='orders' })
@@ -255,7 +254,6 @@ export function POSPage() {
   // W-12: new tax rates default to the page property; "All locations"
   // stays available as an explicit choice in the dropdown.
   useEffect(() => {
-    if (registerProperty) setNewTax(s => ({ ...s, propertyId: registerProperty }))
   }, [registerProperty])
 
   // S263: open-tab query (cross-terminal pickup + crash recovery). When
@@ -448,6 +446,19 @@ export function POSPage() {
   const discountAmt = appliedDiscount ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(appliedDiscount.value, subtotal)) : 0
   const discountedSubtotal = subtotal - discountAmt
   const taxAmount = cart.reduce((s,i) => s+i.price*i.qty*i.tax, 0)
+  // S650: the cart's tax by name ("Lodging tax"), from each item's taxes.
+  const cartTaxLines = (() => {
+    const by = new Map<string, number>()
+    for (const c of cart as any[]) {
+      const it = (items as any[]).find((x:any) => x.id === c.id)
+      for (const t of (it?.taxes || [])) {
+        const name = t.name === 'Item tax rate' ? 'Tax' : t.name
+        by.set(name, (by.get(name) || 0) + c.price * c.qty * Number(t.rate))
+      }
+    }
+    return Array.from(by.entries()).map(([name, amount]) => ({ name, amount }))
+  })()
+  const namedTaxTotal = cartTaxLines.reduce((a, l) => a + l.amount, 0)
   // S648 (Nic): every card payment carries the card fee; the property decides
   // whether the customer pays it on top or the landlord absorbs it. The server
   // decides the real figure (cart-quote / transactions); this shows it first.
@@ -507,7 +518,7 @@ export function POSPage() {
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
 
   // POS #1 auto-pricing helpers. Margin is gross % of sell price:
   // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
@@ -573,12 +584,34 @@ export function POSPage() {
 
   // W-12: '' in the form means "All locations" — an explicit choice; the
   // form's default is the page property (synced by the effect below).
-  const createTaxMut = useMutation(() => apiPost('/pos/tax-rates', { ...newTax, propertyId: newTax.propertyId || null, rate:Number(newTax.rate)/100, taxType:newTax.taxType, appliesTo:newTax.appliesTo==='all'?['all']:[newTax.appliesTo] }), { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); setNewTax({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' }) } })
-  const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => qc.invalidateQueries('pos-tax-rates') })
-  // Tax categories: add + edit-rate. Rates entered as % in the UI, stored as decimals.
-  const [newTaxCat, setNewTaxCat] = useState({ name:'', ratePct:'' })
-  const createTaxCatMut = useMutation(() => apiPost('/pos/tax-categories', { name:newTaxCat.name, rate:Number(newTaxCat.ratePct||0)/100 }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); setNewTaxCat({ name:'', ratePct:'' }) }, onError:(e:any)=>toast.error(e?.response?.data?.error?.message||e?.response?.data?.error||'Could not add tax category') })
-  const updateTaxCatMut = useMutation((v:any) => apiPatch(`/pos/tax-categories/${v.id}`, { rate:v.rate, isActive:v.isActive }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); qc.invalidateQueries('pos-items') } })
+  const taxBody = (d: typeof blankTax) => ({
+    name: d.name.trim(), rate: Number(d.ratePct) / 100,
+    appliesTo: d.all ? ['all'] : [],
+    categoryIds: d.all ? [] : d.categoryIds, itemIds: d.all ? [] : d.itemIds,
+  })
+  const saveTaxMut = useMutation(() => taxDraft.id
+    ? apiPatch(`/pos/tax-rates/${taxDraft.id}`, taxBody(taxDraft))
+    : apiPost('/pos/tax-rates', { ...taxBody(taxDraft), propertyId: registerProperty || null }),
+    { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); qc.invalidateQueries('pos-items'); setTaxDraft(blankTax) },
+      onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not save the tax') })
+  const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); qc.invalidateQueries('pos-items') } })
+  // Turn one tax on or off for one item (the item editor's checkboxes).
+  const setItemTaxMut = useMutation((v: { tax: any; itemId: string; on: boolean }) => {
+    const ids: string[] = v.tax.itemIds || []
+    const next = v.on ? Array.from(new Set([...ids, v.itemId])) : ids.filter((x: string) => x !== v.itemId)
+    return apiPatch(`/pos/tax-rates/${v.tax.id}`, { itemIds: next })
+  }, { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); qc.invalidateQueries('pos-items') } })
+  // Taxes that belong to the register's property (or every location).
+  const propertyTaxes = (taxRates as any[]).filter((r: any) => r.isActive !== false && (!r.propertyId || r.propertyId === registerProperty))
+  const taxAppliesToAll = (t: any) => Array.isArray(t.appliesTo) && t.appliesTo.some((x: string) => String(x).toLowerCase() === 'all')
+  /** How a tax reaches an item: 'all', 'category', 'item', or null. */
+  const taxReach = (t: any, item: any): 'all' | 'category' | 'item' | null => {
+    if (taxAppliesToAll(t)) return 'all'
+    if ((t.categoryIds || []).includes(item.categoryId)
+      || (Array.isArray(t.appliesTo) && t.appliesTo.some((x: string) => String(x).toLowerCase() === String(item.category || '').toLowerCase()))) return 'category'
+    if ((t.itemIds || []).includes(item.id)) return 'item'
+    return null
+  }
   const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value), propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
   const deleteDiscountMut = useMutation((id:string) => apiDel(`/pos/discounts/${id}`), { onSuccess: () => qc.invalidateQueries('pos-discounts') })
   const refundMut = useMutation(() => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }), { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash') } })
@@ -740,7 +773,9 @@ export function POSPage() {
           <div style={{display:'grid',gap:4,fontSize:'.88rem',marginBottom:16}}>
             <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(receipt.subtotal)}</span></div>
             {receipt.discountAmt>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>-{fmt(receipt.discountAmt)}</span></div>}
-            {receipt.taxAmount>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(receipt.taxAmount)}</span></div>}
+            {receipt.taxAmount>0&&(Array.isArray(receipt.taxBreakdown)&&receipt.taxBreakdown.length
+              ? receipt.taxBreakdown.map((l:any)=><div key={l.name} style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{l.name}</span><span>{fmt(Number(l.amount))}</span></div>)
+              : <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(receipt.taxAmount)}</span></div>)}
             {receipt.surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{receipt.method==='card' ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(receipt.surcharge)}</span></div>}
             <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'1rem',borderTop:'1px solid var(--border-1)',paddingTop:8,marginTop:4}}>
               <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(receipt.total)}</span>
@@ -861,7 +896,8 @@ export function POSPage() {
                 </div>))}
               </div>
             )}
-            {appliedDiscount?(<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--gold-bg)',borderRadius:6,padding:'6px 10px',marginBottom:10,fontSize:'.8rem'}}>
+            {/* S650: the discount box is for staff allowed to discount; the server refuses it otherwise. */}
+            {!(isOwner || (user?.permissions as any)?.['pos.discount'] === true || (user?.permissions as any)?.['pos.manage_inventory'] === true) ? null : appliedDiscount?(<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--gold-bg)',borderRadius:6,padding:'6px 10px',marginBottom:10,fontSize:'.8rem'}}>
               <span style={{color:'var(--gold)',fontWeight:600}}>discount: {appliedDiscount.name}</span>
               <button onClick={()=>setAppliedDiscount(null)} style={{background:'none',border:'none',cursor:'pointer',color:'var(--text-3)'}}>x</button>
             </div>):(<div style={{display:'flex',gap:6,marginBottom:10}}>
@@ -871,7 +907,9 @@ export function POSPage() {
             <div style={{fontSize:'.82rem',display:'grid',gap:3,marginBottom:12}}>
               <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(subtotal)}</span></div>
               {discountAmt>0&&<div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>-{fmt(discountAmt)}</span></div>}
-              {taxAmount>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(taxAmount)}</span></div>}
+              {taxAmount>0&&(Math.abs(namedTaxTotal-taxAmount)<0.01 && cartTaxLines.length
+                ? cartTaxLines.map(l=><div key={l.name} style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{l.name}</span><span>{fmt(l.amount)}</span></div>)
+                : <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(taxAmount)}</span></div>)}
               {surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{method==='card' ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(surcharge)}</span></div>}
               <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',borderTop:'1px solid var(--border-1)',paddingTop:6,marginTop:2}}>
                 <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(total)}</span>
@@ -1008,7 +1046,7 @@ export function POSPage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" {...nonNeg} value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" value={newItem.taxCategoryId} onChange={e=>setNewItem(s=>({...s,taxCategoryId:e.target.value}))} style={{width:'100%'}}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax</div><div style={{fontSize:'.75rem',color:'var(--text-3)',paddingTop:8}}>Taxes on the item's category apply automatically. Tick single-item taxes in Edit after saving.</div></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" {...nonNeg} value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
               {!LAUNCH_HIDE_CHARGE && <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>}
               {/* S192: property selector. Empty = company-wide. */}
@@ -1058,7 +1096,7 @@ export function POSPage() {
                   <td className="mono">{item.stockQty>=999?'inf':item.stockQty}</td>
                   {!LAUNCH_HIDE_CHARGE && <td><button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.chargeEligible})} style={{background:item.chargeEligible?'var(--gold-bg)':'var(--bg-3)',border:"1px solid "+(item.chargeEligible?'var(--gold)':'var(--border-1)'),borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.chargeEligible?'var(--gold)':'var(--text-3)'}}>{item.chargeEligible?'Yes':'No'}</button></td>}
                   <td><button onClick={()=>toggleActiveMut.mutate({id:item.id,val:!item.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.isActive?'var(--green)':'var(--text-3)'}}>{item.isActive?'Active':'Off'}</button></td>
-                  <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item,_sell:String(item.sellPrice),_cost:String(item.costPrice),_taxCategoryId:item.taxCategoryId||'',_stock:String(item.stockQty),_min:String(item.stockMin),_max:String(item.stockMax)})}>Edit</button></td>
+                  <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item,_sell:String(item.sellPrice),_cost:String(item.costPrice),_stock:String(item.stockQty),_min:String(item.stockMin),_max:String(item.stockMax)})}>Edit</button></td>
                 </tr>)})}
               </tbody>
             </table>
@@ -1160,87 +1198,63 @@ export function POSPage() {
       {tab==='taxes' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
-            <div className="card-header"><span className="card-title">Tax Categories</span></div>
-            <div style={{fontSize:'.72rem',color:'var(--text-3)',margin:'4px 0 10px'}}>Set one rate per category. Items pick a tax category and use its rate — no need to type tax on each item.</div>
+            <div className="card-header"><span className="card-title">Taxes</span></div>
+            <div style={{fontSize:'.75rem',color:'var(--text-3)',margin:'4px 0 12px'}}>Make a tax once, then choose what it applies to: everything, whole categories, or single items. Its name is what the receipt shows.</div>
             <table className="data-table">
-              <thead><tr><th>Category</th><th style={{width:150}}>Rate %</th><th style={{width:90}}>Status</th></tr></thead>
+              <thead><tr><th>Name</th><th style={{width:90}}>Rate</th><th>Applies to</th><th style={{width:150}}></th></tr></thead>
               <tbody>
-                {(posTaxCategories as any[]).map((t:any)=>(
-                  <tr key={t.id}>
+                {propertyTaxes.length ? propertyTaxes.map((t:any)=>{
+                  const cats = categoriesForProperty(registerProperty).filter(c=>(t.categoryIds||[]).includes(c.id)).map(c=>c.name)
+                  const legacy = Array.isArray(t.appliesTo) ? t.appliesTo.filter((x:string)=>String(x).toLowerCase()!=='all') : []
+                  const its = (items as any[]).filter((i:any)=>i.propertyId===registerProperty).filter((i:any)=>(t.itemIds||[]).includes(i.id)).map((i:any)=>i.name)
+                  const reach = taxAppliesToAll(t) ? 'Everything' : [...cats, ...legacy].map(n=>`${n} (category)`).concat(its).join(', ') || 'Nothing yet'
+                  return (<tr key={t.id}>
                     <td style={{fontWeight:500}}>{t.name}</td>
-                    <td><input className="form-input" type="number" {...nonNeg} step="0.01" key={t.rate} defaultValue={(Number(t.rate)*100).toFixed(2)} onBlur={e=>{const v=Number(e.target.value)/100; if(v!==Number(t.rate)) updateTaxCatMut.mutate({id:t.id,rate:v})}} style={{width:100}} /></td>
-                    <td><button onClick={()=>updateTaxCatMut.mutate({id:t.id,isActive:!t.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:t.isActive?'var(--green)':'var(--text-3)'}}>{t.isActive?'Active':'Off'}</button></td>
-                  </tr>
-                ))}
+                    <td className="mono">{pct(t.rate)}</td>
+                    <td style={{fontSize:'.82rem'}}>{reach}</td>
+                    <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>setTaxDraft({ id:t.id, name:t.name, ratePct:String(+(Number(t.rate)*100).toFixed(4)), all:taxAppliesToAll(t), categoryIds:t.categoryIds||[], itemIds:t.itemIds||[] })}>Edit</button>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>deleteTaxMut.mutate(t.id)}>Remove</button>
+                    </td>
+                  </tr>)
+                }) : <tr><td colSpan={4} style={{textAlign:'center',color:'var(--text-3)',padding:24}}>No taxes yet.</td></tr>}
               </tbody>
             </table>
-            <div style={{display:'flex',gap:8,marginTop:12,alignItems:'center'}}>
-              <input className="form-input" placeholder="New tax category (e.g. Candy)" value={newTaxCat.name} onChange={e=>setNewTaxCat(s=>({...s,name:e.target.value}))} style={{flex:1}} />
-              <input className="form-input" type="number" {...nonNeg} step="0.01" placeholder="Rate %" value={newTaxCat.ratePct} onChange={e=>setNewTaxCat(s=>({...s,ratePct:e.target.value}))} style={{width:110}} />
-              <button className="btn btn-primary" onClick={()=>createTaxCatMut.mutate()} disabled={!newTaxCat.name||createTaxCatMut.isLoading}>{createTaxCatMut.isLoading?'Adding…':'Add'}</button>
-            </div>
           </div>
           <div className="card">
-            <div className="card-header"><span className="card-title">Add Tax Rate</span></div>
-            <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" {...nonNeg} value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>{TAX_TYPES.map(t=><option key={t} value={t}>{humanize(t)}</option>)}</select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div><select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}><option value="all">All categories</option>{categoriesForProperty(newTax.propertyId).map(c=><option key={c.name} value={c.name}>{c.name}</option>)}</select></div>
-              {/* S217: property selector. Empty = company-wide library. */}
-              <div style={{gridColumn:'span 2'}}>
-                <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
-                  Property <span style={{color:'var(--text-3)'}}>(scopes which properties this rate is configured at)</span>
-                </div>
-                <select className="form-select" value={newTax.propertyId} onChange={e=>setNewTax(s=>({...s,propertyId:e.target.value}))} style={{width:'100%'}}>
-                  <option value="">All locations</option>
-                  {(properties as any[]).map((p:any)=>(<option key={p.id} value={p.id}>{p.name}</option>))}
-                </select>
-              </div>
+            <div className="card-header"><span className="card-title">{taxDraft.id ? 'Edit tax' : 'Add a tax'}</span></div>
+            <div style={{display:'grid',gridTemplateColumns:'2fr 1fr',gap:12,marginTop:12}}>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name (printed on the receipt)</div><input className="form-input" placeholder="Lodging tax" value={taxDraft.name} onChange={e=>setTaxDraft(d=>({...d,name:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" {...nonNeg} step="0.01" placeholder="6.35" value={taxDraft.ratePct} onChange={e=>setTaxDraft(d=>({...d,ratePct:e.target.value}))} style={{width:'100%'}} /></div>
             </div>
-            <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createTaxMut.mutate()} disabled={!newTax.name||!newTax.rate}>Add Rate</button>
-          </div>
-          {/* S217: tax-rate list filter mirrors the items-tab S216 filter. */}
-          <div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 4px 0'}}>
-            <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
-            <select className="form-select" value={filterTaxProperty} onChange={e=>setFilterTaxProperty(e.target.value)} style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}>
-              <option value="all">All ({(taxRates as any[]).length})</option>
-              <option value="company-wide">All locations ({(taxRates as any[]).filter((r:any)=>!r.propertyId).length})</option>
-              {(properties as any[]).map((p:any)=>{
-                const n = (taxRates as any[]).filter((r:any)=>r.propertyId===p.id).length
-                return <option key={p.id} value={p.id}>{p.name} ({n})</option>
-              })}
-            </select>
-          </div>
-          <div className="card" style={{padding:0}}>
-            <table className="data-table">
-              <thead><tr><th>Name</th><th>Type</th><th>Property</th><th>Rate</th><th>Applies To</th><th>Status</th><th></th></tr></thead>
-              <tbody>
-                {(() => {
-                  const filtered = (taxRates as any[]).filter((r:any) =>
-                    filterTaxProperty === 'all' ||
-                    (filterTaxProperty === 'company-wide' && !r.propertyId) ||
-                    r.propertyId === filterTaxProperty
-                  )
-                  return filtered.length ? filtered.map((r:any)=>{
-                    const propName = r.propertyId
-                      ? (properties as any[]).find((p:any)=>p.id===r.propertyId)?.name ?? '(unknown)'
-                      : null
-                    return (<tr key={r.id}>
-                      <td style={{fontWeight:500}}>{r.name}</td><td><span className="badge badge-muted">{humanize(r.taxType)}</span></td>
-                      <td>{propName
-                        ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{propName}</span>
-                        : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>All locations</span>
-                      }</td>
-                      <td className="mono">{pct(r.rate)}</td>
-                      <td style={{fontSize:'.82rem'}}>{Array.isArray(r.appliesTo)?r.appliesTo.join(', '):r.appliesTo}</td>
-                      <td><span className={"badge "+(r.isActive?'badge-green':'badge-red')}>{r.isActive?'active':'inactive'}</span></td>
-                      <td><button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>deleteTaxMut.mutate(r.id)}>Remove</button></td>
-                    </tr>)
-                  }) : <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No tax rates configured.</td></tr>
-                })()}
-              </tbody>
-            </table>
+            <div style={{marginTop:12,display:'flex',gap:16,fontSize:'.85rem'}}>
+              <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:true}))} /> Everything sold here</label>
+              <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={!taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:false}))} /> Only what I choose</label>
+            </div>
+            {!taxDraft.all && (
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginTop:12}}>
+                <div>
+                  <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Whole categories</div>
+                  {categoriesForProperty(registerProperty).map(c=>(
+                    <label key={c.id} style={{display:'flex',gap:8,alignItems:'center',fontSize:'.82rem',marginBottom:4}}>
+                      <input type="checkbox" checked={taxDraft.categoryIds.includes(c.id)} onChange={e=>setTaxDraft(d=>({...d,categoryIds:e.target.checked?[...d.categoryIds,c.id]:d.categoryIds.filter(x=>x!==c.id)}))} />
+                      {c.icon} {c.name}
+                    </label>))}
+                </div>
+                <div>
+                  <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Single items</div>
+                  {(items as any[]).filter((i:any)=>i.propertyId===registerProperty).map((i:any)=>(
+                    <label key={i.id} style={{display:'flex',gap:8,alignItems:'center',fontSize:'.82rem',marginBottom:4}}>
+                      <input type="checkbox" checked={taxDraft.itemIds.includes(i.id)} onChange={e=>setTaxDraft(d=>({...d,itemIds:e.target.checked?[...d.itemIds,i.id]:d.itemIds.filter(x=>x!==i.id)}))} />
+                      {i.name} <span style={{color:'var(--text-3)',fontSize:'.72rem'}}>{i.category}</span>
+                    </label>))}
+                </div>
+              </div>
+            )}
+            <div style={{display:'flex',gap:8,marginTop:14}}>
+              <button className="btn btn-primary" onClick={()=>saveTaxMut.mutate()} disabled={!taxDraft.name.trim()||taxDraft.ratePct===''||saveTaxMut.isLoading}>{saveTaxMut.isLoading?'Saving…':taxDraft.id?'Save tax':'Add tax'}</button>
+              {taxDraft.id && <button className="btn btn-ghost" onClick={()=>setTaxDraft(blankTax)}>Cancel</button>}
+            </div>
           </div>
         </div>
       )}
@@ -1525,7 +1539,21 @@ export function POSPage() {
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" style={{width:'100%'}} value={editItem.categoryId} onChange={e=>setEditItem((s:any)=>({...s,categoryId:e.target.value}))}>{categoriesForProperty(editItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._sell} onChange={e=>setEditItem((s:any)=>({...s,_sell:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._cost} onChange={e=>setEditItem((s:any)=>({...s,_cost:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" style={{width:'100%'}} value={editItem._taxCategoryId} onChange={e=>setEditItem((s:any)=>({...s,_taxCategoryId:e.target.value}))}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
+          {/* S650: tick the taxes this item carries. A tax on everything or on the
+              item's whole category shows ticked and is changed on the Taxes tab. */}
+          <div style={{gridColumn:'1/-1'}}><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Taxes</div>
+            {propertyTaxes.length === 0
+              ? <div style={{fontSize:'.78rem',color:'var(--text-3)'}}>No taxes set up for this property yet — add one on the Taxes tab.</div>
+              : <div style={{display:'grid',gap:4}}>{propertyTaxes.map((t:any)=>{
+                  const reach = taxReach(t, editItem)
+                  const inherited = reach === 'all' || reach === 'category'
+                  return (<label key={t.id} style={{display:'flex',alignItems:'center',gap:8,fontSize:'.82rem',color:inherited?'var(--text-3)':'var(--text-1)'}}>
+                    <input type="checkbox" checked={!!reach} disabled={inherited || setItemTaxMut.isLoading}
+                      onChange={e=>setItemTaxMut.mutate({ tax: t, itemId: editItem.id, on: e.target.checked })} />
+                    {t.name} ({pct(t.rate)}){reach === 'all' ? ' — on everything' : reach === 'category' ? ' — on the whole category' : ''}
+                  </label>)
+                })}</div>}
+          </div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._stock} onChange={e=>setEditItem((s:any)=>({...s,_stock:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Min</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._min} onChange={e=>setEditItem((s:any)=>({...s,_min:e.target.value}))} /></div>
           {/* S192: property reassignment. null = company-wide. */}
@@ -1545,7 +1573,7 @@ export function POSPage() {
               ))}
             </select>
           </div>
-          <div style={{gridColumn:'1/-1',marginTop:8}}><button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateItemMut.mutate({name:editItem.name,icon:editItem.icon,categoryId:editItem.categoryId,sellPrice:Number(editItem._sell),costPrice:Number(editItem._cost),taxCategoryId:editItem._taxCategoryId||null,stockQty:Number(editItem._stock),stockMin:Number(editItem._min),chargeEligible:editItem.chargeEligible,propertyId:editItem.propertyId || null})} disabled={updateItemMut.isLoading}>{updateItemMut.isLoading?'Saving...':'Save Changes'}</button></div>
+          <div style={{gridColumn:'1/-1',marginTop:8}}><button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateItemMut.mutate({name:editItem.name,icon:editItem.icon,categoryId:editItem.categoryId,sellPrice:Number(editItem._sell),costPrice:Number(editItem._cost),stockQty:Number(editItem._stock),stockMin:Number(editItem._min),chargeEligible:editItem.chargeEligible,propertyId:editItem.propertyId || null})} disabled={updateItemMut.isLoading}>{updateItemMut.isLoading?'Saving...':'Save Changes'}</button></div>
         </div>
       </div></div>)}
 

@@ -6,7 +6,7 @@ const round2 = (n: number) => Math.round(n * 100) / 100
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { calculateCartTax, computeCartTotals, aggregateCartTotals } from '../services/posTax'
+import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
 import {
   createConnectionToken, registerReader, listReaders, archiveReader,
   createCardPresentPaymentIntent, processPaymentIntentOnReader,
@@ -135,11 +135,9 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
     let items: any[]
     if (propertyFilter) {
       items = await query<any>(
-        `SELECT pi.*, pc.name AS category, tc.name AS tax_category,
-                COALESCE(tc.rate, pi.tax_rate, 0) AS tax_rate
+        `SELECT pi.*, pc.name AS category
           FROM pos_items pi
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
-          LEFT JOIN pos_tax_categories tc ON tc.id = pi.tax_category_id
           WHERE pi.landlord_id = $1
             AND pi.is_active = TRUE
             AND pi.property_id = $2
@@ -148,11 +146,9 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
       )
     } else {
       items = await query<any>(
-        `SELECT pi.*, pc.name AS category, tc.name AS tax_category,
-                COALESCE(tc.rate, pi.tax_rate, 0) AS tax_rate
+        `SELECT pi.*, pc.name AS category
           FROM pos_items pi
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
-          LEFT JOIN pos_tax_categories tc ON tc.id = pi.tax_category_id
           WHERE pi.landlord_id=$1 AND pi.is_active=TRUE
           ORDER BY pc.name, pi.name`,
         [posLandlordId(req)],
@@ -197,6 +193,14 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
         [posLandlordId(req), propertyFilter],
       )
     }
+
+    // S650: each item carries the tax it will actually be charged — the same
+    // resolution the sale uses — and the names behind it, so the register's
+    // cart estimate is what the server charges.
+    const eff = await effectiveItemTaxes(posLandlordId(req), items.map((i: any) => i.id))
+    items = items.map((i: any) => ({ ...i,
+      tax_rate: eff.get(i.id)?.rate ?? 0,
+      taxes: eff.get(i.id)?.taxes ?? [] }))
 
     res.json({ success: true, data: items })
   } catch (e) { next(e) }
@@ -488,6 +492,45 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
  * a card pays the card fee (PROCESSING_FEES), a FlexCharge sale its 1% — never
  * taken from the client. Everything else carries none.
  */
+/**
+ * S650 (Nic): the front counter rings sales and sends pay links — no
+ * discounts, no editing prices. The cart's prices come from the browser, so
+ * the server holds a cashier to the catalog: a catalog item sells at its own
+ * price (or one of its variants' prices), and a discount needs the "Apply
+ * discounts" permission. Owners, and staff trusted with discounts or item
+ * setup, may set prices as before.
+ */
+function canSetPrices(user: any): boolean {
+  if (!user) return false
+  if (['admin', 'super_admin', 'landlord'].includes(user.role)) return true
+  const perms = user.permissions || {}
+  return perms['pos.discount'] === true || perms['pos.manage_inventory'] === true
+}
+async function assertCashierPricing(req: any, lines: { itemId?: string | null; price: any }[],
+                                    discountAmount?: any): Promise<void> {
+  if (canSetPrices(req.user)) return
+  if (Number(discountAmount) > 0) {
+    throw new AppError(403, 'Discounts need the "Apply discounts" permission — ask the owner or a manager.')
+  }
+  const ids = [...new Set(lines.map((l) => l.itemId).filter((x): x is string =>
+    typeof x === 'string' && /^[0-9a-f-]{36}$/i.test(x)))]
+  if (!ids.length) return
+  const rows = await query<{ id: string; prices: string[] }>(
+    `SELECT i.id, ARRAY[i.sell_price::text] || COALESCE(
+              (SELECT array_agg(v.sell_price::text) FROM pos_item_variants v
+                WHERE v.item_id = i.id AND v.is_active = TRUE), '{}') AS prices
+       FROM pos_items i WHERE i.id = ANY($1::uuid[]) AND i.landlord_id = $2`,
+    [ids, posLandlordId(req)])
+  const allowed = new Map(rows.map((r) => [r.id, r.prices.map(Number)]))
+  for (const l of lines) {
+    if (!l.itemId || !allowed.has(l.itemId)) continue
+    const price = Number(l.price)
+    if (!allowed.get(l.itemId)!.some((p) => Math.abs(p - price) < 0.005)) {
+      throw new AppError(403, 'That price differs from the item\'s price. Changing a price needs the "Apply discounts" permission.')
+    }
+  }
+}
+
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
                                 discountAmount: number | undefined, clientSurcharge?: number,
                                 propertyId?: string | null) {
@@ -513,7 +556,32 @@ async function serverCartTotals(landlordId: string, items: any[], paymentMethod:
     surcharge = Number(clientSurcharge) || 0   // pre-S648 callers only
   }
   surcharge = Math.round(surcharge * 100) / 100
-  return { ...base, surcharge, cardFee, total: Math.round((base.total + surcharge) * 100) / 100 }
+  return { ...base, surcharge, cardFee, total: Math.round((base.total + surcharge) * 100) / 100,
+           taxBreakdown: taxBreakdownFor(tax, base.taxAmount) }
+}
+
+/**
+ * S650: the sale's taxes by name, summing exactly to the tax charged. Built
+ * from the server's per-line rates; a discount scales the taxable base, so the
+ * named amounts are scaled to match and the rounding cent lands on the largest.
+ */
+function taxBreakdownFor(tax: { lines: { appliedRates: { name: string; rate: number; amount: number }[] }[] },
+                         taxAmount: number): { name: string; rate: number; amount: number }[] {
+  if (!(taxAmount > 0)) return []
+  const byName = new Map<string, { name: string; rate: number; amount: number }>()
+  for (const l of tax.lines ?? []) for (const r of l.appliedRates ?? []) {
+    const key = `${r.name}|${r.rate}`
+    const e = byName.get(key) ?? { name: r.name === 'Item tax rate' ? 'Tax' : r.name, rate: r.rate, amount: 0 }
+    e.amount += r.amount
+    byName.set(key, e)
+  }
+  const entries = [...byName.values()]
+  const sum = entries.reduce((a, e) => a + e.amount, 0)
+  if (!entries.length || sum <= 0) return [{ name: 'Tax', rate: 0, amount: taxAmount }]
+  for (const e of entries) e.amount = round2(e.amount * taxAmount / sum)
+  const drift = round2(taxAmount - entries.reduce((a, e) => a + e.amount, 0))
+  if (drift !== 0) entries.sort((a, b) => b.amount - a.amount)[0].amount = round2(entries[0].amount + drift)
+  return entries
 }
 
 // POST /api/pos/cart-quote — S554: authoritative cart total the client mints
@@ -547,6 +615,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'])
+    await assertCashierPricing(req, items.map((it: any) => ({ itemId: it.id, price: it.price })), discountAmount)
     // W-12 (S531): propertyId is REQUIRED — every sale belongs to a
     // property (per-property books, EOD drawers, sales history).
     if (!propertyId) throw new AppError(400, 'A property must be selected — sales are per-property')
@@ -611,7 +680,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // POST /pos/cart-quote endpoint ALSO runs, so the terminal PI the client
     // minted (against the quote) always equals this recomputed total.
     // S648: the fee is the server's (serverCartTotals), whatever the client sent.
-    const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total, cardFee } =
+    const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total, cardFee, taxBreakdown } =
       await serverCartTotals(posLandlordId(req), items, paymentMethod ?? 'cash', discountAmount, undefined, propertyId)
 
     // FlexCharge platform fee is 1% of what the customer is actually charged
@@ -678,7 +747,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId, discountAmount: discountAmt, discountReason,
           ...(paymentMethod === 'card' ? { payoutOwed: round2(total - cardFee) } : {}),
-          items,
+          items, taxBreakdown,
         })
         tx = sale.tx
         inventoryNeedsPO.push(...sale.needsPO)
@@ -1175,6 +1244,22 @@ posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory')
   } catch (e) { next(e) }
 })
 
+/**
+ * S650: a tax's category and item targets must be this landlord's own rows.
+ * undefined → leave as is; an array → validated and returned de-duplicated.
+ */
+async function ownedTaxTargets(req: any, table: 'pos_categories' | 'pos_items',
+                               ids: unknown): Promise<string[] | undefined> {
+  if (ids === undefined) return undefined
+  if (!Array.isArray(ids)) throw new AppError(400, `${table === 'pos_items' ? 'itemIds' : 'categoryIds'} must be a list`)
+  const uniq = [...new Set(ids.filter((x) => typeof x === 'string' && x))] as string[]
+  if (!uniq.length) return []
+  const owned = await query<{ id: string }>(
+    `SELECT id FROM ${table} WHERE id = ANY($1::uuid[]) AND landlord_id = $2`, [uniq, posLandlordId(req)])
+  if (owned.length !== uniq.length) throw new AppError(400, 'A chosen item or category does not belong to this account')
+  return uniq
+}
+
 posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, rate, taxType, appliesTo, propertyId } = req.body
@@ -1192,9 +1277,15 @@ posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, re
       }
     }
 
-    const r = await queryOne<any>(`INSERT INTO pos_tax_rates (landlord_id,property_id,name,rate,tax_type,applies_to)
-      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [posLandlordId(req), propertyId||null, name, rate, taxType, appliesTo||['all']])
+    // S650: a tax applies to everything ('all'), or to the categories and
+    // items it names. Naming any means it is not 'all'.
+    const categoryIds = (await ownedTaxTargets(req, 'pos_categories', req.body.categoryIds)) ?? []
+    const itemIds = (await ownedTaxTargets(req, 'pos_items', req.body.itemIds)) ?? []
+    const targeted = categoryIds.length > 0 || itemIds.length > 0
+    const r = await queryOne<any>(`INSERT INTO pos_tax_rates (landlord_id,property_id,name,rate,tax_type,applies_to,category_ids,item_ids)
+      VALUES ($1,$2,$3,$4,$5,$6,$7::uuid[],$8::uuid[]) RETURNING *`,
+      [posLandlordId(req), propertyId||null, name, rate, taxType || 'sales',
+       targeted ? [] : (appliesTo || ['all']), categoryIds, itemIds])
     res.status(201).json({ success: true, data: r })
   } catch (e) { next(e) }
 })
@@ -1226,12 +1317,16 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
       newPropertyId = propertyId
     }
 
+    const categoryIds = await ownedTaxTargets(req, 'pos_categories', req.body.categoryIds)
+    const itemIds = await ownedTaxTargets(req, 'pos_items', req.body.itemIds)
     const r = await queryOne<any>(`UPDATE pos_tax_rates SET
       name=COALESCE($1,name), rate=COALESCE($2,rate), tax_type=COALESCE($3,tax_type),
       applies_to=COALESCE($4,applies_to), is_active=COALESCE($5,is_active),
-      property_id=$6
+      property_id=$6,
+      category_ids=COALESCE($9::uuid[],category_ids), item_ids=COALESCE($10::uuid[],item_ids)
       WHERE id=$7 AND landlord_id=$8 RETURNING *`,
-      [name, rate, taxType, appliesTo, isActive, newPropertyId, req.params.id, posLandlordId(req)])
+      [name, rate, taxType, appliesTo, isActive, newPropertyId, req.params.id, posLandlordId(req),
+       categoryIds ?? null, itemIds ?? null])
     res.json({ success: true, data: r })
   } catch (e) { next(e) }
 })
@@ -1996,6 +2091,7 @@ posRouter.patch('/sessions/:id', requirePerm('pos.ring_sale'), async (req, res, 
     if (discountAmount !== undefined) {
       const d = Number(discountAmount)
       if (!Number.isFinite(d) || d < 0) throw new AppError(400, 'discountAmount must be a non-negative number')
+      await assertCashierPricing(req, [], d)
       params.push(d.toFixed(2)); sets.push(`discount_amount = $${params.length}`)
     }
     if (notes !== undefined) { params.push(notes); sets.push(`notes = $${params.length}`) }
@@ -2032,6 +2128,7 @@ posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, 
     if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new AppError(400, 'unitPrice must be non-negative')
     assertNonNeg([b.taxRate, 'Tax rate'], [b.costPrice, 'Cost price'])
 
+    await assertCashierPricing(req, [{ itemId: b.itemId, price: unitPrice }])
     const taxRate = Number(b.taxRate) || 0
     const costPrice = Number(b.costPrice) || 0
     const subtotal = Math.round(qty * unitPrice * 100) / 100
@@ -2075,6 +2172,10 @@ posRouter.patch('/sessions/:id/items/:itemId', requirePerm('pos.ring_sale'), asy
     if (b.unitPrice !== undefined) {
       const u = Number(b.unitPrice)
       if (!Number.isFinite(u) || u < 0) throw new AppError(400, 'unitPrice must be non-negative')
+      const line = await queryOne<{ item_id: string | null }>(
+        `SELECT item_id FROM pos_session_items WHERE id = $1 AND session_id = $2`,
+        [req.params.itemId, req.params.id])
+      await assertCashierPricing(req, [{ itemId: line?.item_id, price: u }])
       params.push(u.toFixed(2)); sets.push(`unit_price = $${params.length}`)
     }
     if (b.notes !== undefined) { params.push(b.notes); sets.push(`notes = $${params.length}`) }

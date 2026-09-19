@@ -130,3 +130,53 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     expect(res.body.data.property_id).toBe(f.propBId)
   })
 })
+
+// S650 (Nic): the front counter rings sales and sends pay links — it does not
+// discount and it does not change prices. Prices arrive from the browser, so
+// the server holds a cashier to the catalog.
+describe('front-counter pricing lockdown', () => {
+  async function catalogItem(f: Fixture, price: number): Promise<string> {
+    const cat = await db.query<{ id: string }>(
+      `INSERT INTO pos_categories (landlord_id, name, property_id) VALUES ($1, 'Stays', $2) RETURNING id`,
+      [f.landlordId, f.propAId])
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO pos_items (landlord_id, name, sell_price, cost_price, tax_rate, stock_qty, property_id, category_id)
+       VALUES ($1, 'RV site — daily', $2, 0, 0, 999, $3, $4) RETURNING id`, [f.landlordId, price, f.propAId, cat.rows[0].id])
+    return r.rows[0].id
+  }
+  const ring = (f: Fixture, token: string, body: any) => request(buildApp())
+    .post('/api/pos/transactions').set('Authorization', `Bearer ${token}`)
+    .send({ paymentMethod: 'cash', propertyId: f.propAId, ...body })
+
+  it('a cashier rings a catalog item at its own price', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, { items: [{ id, name: 'RV site — daily', qty: 1, price: 49, tax: 0 }] })
+    expect(res.status).toBe(201)
+  })
+
+  it('a cashier cannot ring it at a lower price', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, { items: [{ id, name: 'RV site — daily', qty: 1, price: 10, tax: 0 }] })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/differs from the item's price/)
+  })
+
+  it('a cashier cannot apply a discount', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.cashierToken, {
+      items: [{ id, name: 'RV site — daily', qty: 1, price: 49, tax: 0 }], discountAmount: 5 })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/Apply discounts/)
+  })
+
+  it('the owner can still change a price and discount', async () => {
+    const f = await seed()
+    const id = await catalogItem(f, 49)
+    const res = await ring(f, f.ownerToken, {
+      items: [{ id, name: 'RV site — daily', qty: 1, price: 40, tax: 0 }], discountAmount: 5 })
+    expect(res.status).toBe(201)
+  })
+})

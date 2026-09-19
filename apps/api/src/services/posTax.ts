@@ -121,8 +121,11 @@ export async function calculateCartTax(
     rate: string
     applies_to: string[]
     property_id: string | null
+    category_ids: string[]
+    item_ids: string[]
   }>(
-    `SELECT id, name, rate::text AS rate, applies_to, property_id
+    `SELECT id, name, rate::text AS rate, applies_to, property_id,
+            category_ids::text[] AS category_ids, item_ids::text[] AS item_ids
        FROM pos_tax_rates
       WHERE landlord_id = $1
         AND is_active = TRUE
@@ -178,8 +181,11 @@ export async function calculateCartTax(
         lineTax = round2(amt)
       }
     } else {
+      // S650 (Nic): a tax applies to whole categories and/or single items.
       const matchingRates = applicableRates.filter(r =>
-        rateAppliesToCategory(r.applies_to, item.category_name))
+        rateAppliesToCategory(r.applies_to, item.category_name)
+        || (r.category_ids ?? []).includes(item.category_id)
+        || (r.item_ids ?? []).includes(item.id))
       for (const r of matchingRates) {
         const rateNum = Number(r.rate)
         const amt = round2(subtotal * rateNum)
@@ -285,4 +291,24 @@ export async function computeCartTotals(
     .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
   const tax = await calculateCartTax(landlordId, cartLines)
   return aggregateCartTotals(tax, items, opts)
+}
+
+/**
+ * S650: the combined tax rate each catalog item will actually be charged, and
+ * the names of the taxes behind it — the same resolution calculateCartTax
+ * uses, run for a list of items. The register estimates its cart from this, so
+ * what it shows is what the server charges.
+ */
+export async function effectiveItemTaxes(
+  landlordId: string,
+  itemIds: string[],
+): Promise<Map<string, { rate: number; taxes: { id: string; name: string; rate: number }[] }>> {
+  const out = new Map<string, { rate: number; taxes: { id: string; name: string; rate: number }[] }>()
+  if (!itemIds.length) return out
+  const res = await calculateCartTax(landlordId, itemIds.map((id) => ({ itemId: id, qty: 1, unitPrice: 1 })))
+  for (const l of res.lines) {
+    const taxes = l.appliedRates.map((r) => ({ id: r.rateId, name: r.name, rate: r.rate }))
+    out.set(l.itemId, { rate: taxes.reduce((sum, t) => sum + t.rate, 0), taxes })
+  }
+  return out
 }
