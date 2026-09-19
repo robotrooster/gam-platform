@@ -315,6 +315,11 @@ const ABOUT_THE_AGENT = new RegExp([
   /\bis\s+th(?:is|at)\s+(?:an?\s+)?(?:real\s+)?(?:bot|robot|human|person|ai|a\.i\.|automated)\b/,
   // you're a bot, aren't you
   /\byou'?re\s+(?:an?\s+)?(?:bot|robot|ai|a\.i\.|machine|computer)\b/,
+  // S650: "Are you there?" / "you still there?" / "hello??" is a presence
+  // check. Nic's own "Are you there?" to David was classed as an account
+  // question, forced a lookup retry, and cost a second model call.
+  /^\s*(?:(?:are|r)\s+)?(?:you|u)\s+(?:still\s+)?(?:there|here|around|awake|working)\b[\s!.,?]*$/,
+  /^\s*(?:hello|hi|hey)\s*\?+[\s!.,?]*$/,
 ].map((r) => r.source).join('|'), 'i')
 
 /**
@@ -1295,6 +1300,106 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       'agent runner: tool payload narrowed to this turn')
   }
 
+  /**
+   * Run the lookups the phrase table routed this wording to, and feed their
+   * results back as an ordinary tool turn. See S618 at the fallback call site.
+   */
+  const runRoutedLookups = async (readsOnly: boolean, logMessage: string): Promise<boolean> => {
+    if (!routedTool || toolInvocations.length > 0 || ranRoutedToolDirectly) return false
+    if (!demandsAToolCall(message, profile.audience)) return false
+    // Every lookup this wording calls for that needs no argument from the
+    // model. "Is my landlord gonna renew?" runs BOTH the lease and the
+    // renewal tendency, because neither answers it alone.
+    // Runnable = the profile holds it, AND every argument it requires is
+    // either unnecessary or supplied by the wording itself.
+    const runnable = routedTools.filter((name) => {
+      const t = getTool(name)
+      if (!t || !getToolsForProfile(profile).some((pt) => pt.name === name)) return false
+      if (readsOnly && isActionTool(name)) return false
+      const req = ((t.parameters as any)?.required ?? []) as string[]
+      if (req.length === 0) return true
+      return req.every((k) => plan.args && plan.args[k] != null && plan.args[k] !== '')
+    })
+    if (!runnable.length) return false
+    ranRoutedToolDirectly = true
+    const calls: ToolCall[] = runnable.map((name) => {
+      const t = getTool(name)
+      const req = ((t?.parameters as any)?.required ?? []) as string[]
+      const args = req.length && plan.args
+        ? Object.fromEntries(req.map((k) => [k, plan.args![k]]))
+        : {}
+      return {
+        id: `routed_${name}`,
+        type: 'function' as const,
+        function: { name, arguments: JSON.stringify(args) },
+      }
+    })
+    logger.warn({ profile: profile.id, tools: runnable, message }, logMessage)
+    // content: null, DELIBERATELY.
+    //
+    // S618, and this was a real regression caught by the battery. This
+    // used to carry `out.content` — the model's own tool-less reply — into
+    // the conversation ahead of the real result. That reply is precisely
+    // the ungrounded guess we are stepping in to correct: "You have 6
+    // vacant units" when there are 13, "26 units across 4 properties"
+    // against 21 across 3. Handed its own claim and then the true rows,
+    // the model restated the claim and the tools became decoration.
+    //
+    // The assistant turn is the CALL and nothing else, which is also the
+    // ordinary shape of a tool-calling turn. The nudge path below still
+    // keeps the text on purpose — there the model is being shown what it
+    // said in order to correct it — but here the text is not evidence of
+    // anything except the error.
+    messages.push({ role: 'assistant', content: null, tool_calls: calls })
+    for (const call of calls) {
+      const args = parseArgs(call.function.arguments)
+      // S628: refuse an action this conversation has ALREADY carried out with
+      // exactly these arguments. See repeatedAction.ts — the run caught the
+      // agent filing a second maintenance request for one leaking sink while
+      // correctly telling the tenant it was already logged.
+      const repeat = alreadyDone(call.function.name, args, priorToolCalls)
+      // S628: and refuse an action carrying an id the agent never saw. See
+      // idTraceability.ts — the run caught set_eviction_mode being called with
+      // a made-up unit_12345. Reads are exempt: a wrong id there returns
+      // nothing, and lookups are how ids are found.
+      const invented = repeat || !isActionTool(call.function.name)
+  ? []
+  : untraceableIdArgs(args, seenForIds())
+      const result = repeat
+  ? (logger.warn({ profile: profile.id, tool: call.function.name },
+      'agent runner: refused a repeat of an action already taken this conversation'),
+     { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
+  : invented.length
+  ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
+      'agent runner: refused an action carrying an invented id'),
+     { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
+  : await executeToolCall(call, profile, actor, args, { message, history })
+      if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
+      toolInvocations.push({ name: call.function.name, args, result })
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        name: call.function.name,
+        content: JSON.stringify(result),
+      })
+    }
+    return true
+  }
+
+  // S650: ...and when it is plain up front, do it BEFORE the first model call.
+  //
+  // Measured on David: the model skipped the lookup on most data questions, the
+  // S618 fallback then ran it anyway, and the turn first paid for a whole wasted
+  // model call — 30-45 s of reading the prompt and writing a reply that was
+  // thrown away. The conditions are the fallback's own (the phrase table named
+  // the lookup, the wording demands data, no argument has to be guessed),
+  // restricted to READS: an action never runs without the model choosing it.
+  // The model still writes the reply from these rows and is free to call
+  // something else. AGENT_PRERUN_LOOKUPS=0 turns it off.
+  if (process.env.AGENT_PRERUN_LOOKUPS !== '0') {
+    await runRoutedLookups(true, 'agent runner: ran the routed lookup before the first model call')
+  }
+
   for (let step = 0; step < maxSteps; step++) {
     // Every iteration produces a fresh draft, and every draft gets composed.
     // See the declaration for what a turn-scoped latch cost us.
@@ -1508,91 +1613,10 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       // The result is fed back as an ordinary tool result, so the model still
       // writes the reply out of real data and stays free to call something
       // else if this was not what the person meant.
-      if (
-        routedTool &&
-        toolInvocations.length === 0 &&
-        demandsAToolCall(message, profile.audience) &&
-        !ranRoutedToolDirectly
-      ) {
-        // Every lookup this wording calls for that needs no argument from the
-        // model. "Is my landlord gonna renew?" runs BOTH the lease and the
-        // renewal tendency, because neither answers it alone.
-        // Runnable = the profile holds it, AND every argument it requires is
-        // either unnecessary or supplied by the wording itself.
-        const runnable = routedTools.filter((name) => {
-          const t = getTool(name)
-          if (!t || !getToolsForProfile(profile).some((pt) => pt.name === name)) return false
-          const req = ((t.parameters as any)?.required ?? []) as string[]
-          if (req.length === 0) return true
-          return req.every((k) => plan.args && plan.args[k] != null && plan.args[k] !== '')
-        })
-        if (runnable.length) {
-          ranRoutedToolDirectly = true
-          const calls: ToolCall[] = runnable.map((name) => {
-            const t = getTool(name)
-            const req = ((t?.parameters as any)?.required ?? []) as string[]
-            const args = req.length && plan.args
-              ? Object.fromEntries(req.map((k) => [k, plan.args![k]]))
-              : {}
-            return {
-              id: `routed_${name}`,
-              type: 'function' as const,
-              function: { name, arguments: JSON.stringify(args) },
-            }
-          })
-          logger.warn({ profile: profile.id, tools: runnable, message },
-            'agent runner: model would not call the lookup — ran it directly from the phrase table')
-          // content: null, DELIBERATELY.
-          //
-          // S618, and this was a real regression caught by the battery. This
-          // used to carry `out.content` — the model's own tool-less reply — into
-          // the conversation ahead of the real result. That reply is precisely
-          // the ungrounded guess we are stepping in to correct: "You have 6
-          // vacant units" when there are 13, "26 units across 4 properties"
-          // against 21 across 3. Handed its own claim and then the true rows,
-          // the model restated the claim and the tools became decoration.
-          //
-          // The assistant turn is the CALL and nothing else, which is also the
-          // ordinary shape of a tool-calling turn. The nudge path below still
-          // keeps the text on purpose — there the model is being shown what it
-          // said in order to correct it — but here the text is not evidence of
-          // anything except the error.
-          messages.push({ role: 'assistant', content: null, tool_calls: calls })
-          for (const call of calls) {
-            const args = parseArgs(call.function.arguments)
-            // S628: refuse an action this conversation has ALREADY carried out with
-      // exactly these arguments. See repeatedAction.ts — the run caught the
-      // agent filing a second maintenance request for one leaking sink while
-      // correctly telling the tenant it was already logged.
-      const repeat = alreadyDone(call.function.name, args, priorToolCalls)
-      // S628: and refuse an action carrying an id the agent never saw. See
-      // idTraceability.ts — the run caught set_eviction_mode being called with
-      // a made-up unit_12345. Reads are exempt: a wrong id there returns
-      // nothing, and lookups are how ids are found.
-      const invented = repeat || !isActionTool(call.function.name)
-        ? []
-        : untraceableIdArgs(args, seenForIds())
-      const result = repeat
-        ? (logger.warn({ profile: profile.id, tool: call.function.name },
-            'agent runner: refused a repeat of an action already taken this conversation'),
-           { ok: true, alreadyDone: true, tellThem: repeat.tellThem })
-        : invented.length
-        ? (logger.error({ profile: profile.id, tool: call.function.name, invented, args },
-            'agent runner: refused an action carrying an invented id'),
-           { ok: false, refused: 'invented_id', error: lookItUpFirst(invented) })
-        : await executeToolCall(call, profile, actor, args, { message, history })
-      if (!repeat && !invented.length) priorToolCalls.push({ name: call.function.name, args })
-            toolInvocations.push({ name: call.function.name, args, result })
-            messages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              name: call.function.name,
-              content: JSON.stringify(result),
-            })
-          }
-          forceToolThisTurn = false
-          continue
-        }
+      if (await runRoutedLookups(false,
+        'agent runner: model would not call the lookup — ran it directly from the phrase table')) {
+        forceToolThisTurn = false
+        continue
       }
       // S626: ...and the reply must actually DO the thing this net exists to
       // correct. The STOP text below opens "your last answer stated

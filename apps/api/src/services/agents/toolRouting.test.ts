@@ -36,6 +36,7 @@ const LANDLORD_TOOLS = [
   'get_service_interruptions', 'get_background_check_status', 'get_work_trade_status',
   'get_profit_and_loss',
   'get_lease_expirations', 'get_pending_maintenance', 'get_property_rent_roll',
+  'get_setup_progress',
 ]
 
 const tenant = (m: string) => routeToTool(m, 'tenant', TENANT_TOOLS)
@@ -303,6 +304,16 @@ describe('portfolio analytics', () => {
       'how old are my tenants',
       'how am I doing',
     ]) expect(landlord(m), m).toBe('get_portfolio_stats')
+  })
+
+  // S650: "Get Paid" on the setup screen is a step, not a payout question.
+  it('sends the Get Paid setup step to setup progress, and payout timing to payouts', () => {
+    for (const m of [
+      'It says get paid what do i do?',
+      'I am stuck on the get paid step',
+      'help me get set up',
+    ]) expect(landlord(m), m).toBe('get_setup_progress')
+    expect(landlord('when do i get paid?')).toBe('get_my_payouts')
   })
 
   // The distinction that matters: a rate is one number, a ranking is names.

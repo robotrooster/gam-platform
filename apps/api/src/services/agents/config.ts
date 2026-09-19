@@ -61,7 +61,11 @@ export function getLlmConfig(): LlmConfig {
   const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 180_000
 
   const rawMaxTokens = Number(process.env.LLM_MAX_TOKENS)
-  const maxTokens = Number.isFinite(rawMaxTokens) && rawMaxTokens > 0 ? rawMaxTokens : 1024
+  // S650: 1024 → 600. Replies are one to three sentences and the longest
+  // legitimate output is a drafted notice (~300-400 tokens). The model writes
+  // ~18 tokens/s here, and a benchmark turn ran away to the full 1024 — 75 s of
+  // text that was thrown away. 600 still fits any real reply or tool call.
+  const maxTokens = Number.isFinite(rawMaxTokens) && rawMaxTokens > 0 ? rawMaxTokens : 600
 
   return { endpoints, model, timeoutMs, maxTokens }
 }

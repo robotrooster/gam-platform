@@ -87,6 +87,22 @@ export function isActionTool(name: string): boolean {
     && name !== 'escalate_to_human'
 }
 
+/**
+ * S650: the escalation tools go LAST, always.
+ *
+ * The chat template renders every tool into the system header, ahead of the
+ * conversation, and mlx reuses a cached prompt only up to the first token that
+ * differs. On a forced turn the runner takes the escalation tools off the
+ * table. With them in the middle of the list that changed the header right
+ * after the system prompt, and the server re-read everything behind it: 11,300
+ * tokens, about a minute, measured on "It says get paid what do i do?". Last in
+ * the list, removing them changes only the tail.
+ */
+const isEscalation = (name: string) => name === 'escalate' || name === 'escalate_to_human'
+function escalationLast(tools: AgentTool[]): AgentTool[] {
+  return [...tools.filter((t) => !isEscalation(t.name)), ...tools.filter((t) => isEscalation(t.name))]
+}
+
 /** Below this many tools the payload is not the problem and nothing is cut. */
 export const SELECTION_THRESHOLD = 90
 
@@ -123,7 +139,12 @@ export function selectToolsForTurn(
     previousMessage?: string
   } = {},
 ): Selection {
-  const maxActions = opts.maxActions ?? 24
+  // S650: 24 → 10. Every action offered is ~1.3 KB of schema the model must
+  // read on EVERY turn, because this block changes turn to turn and cannot be
+  // served from the prompt cache; 24 of them was ~9k tokens, about 50 seconds
+  // at this machine's ~180 tokens/s. Ranked, the right action lands in the top
+  // five for every reachability case and ninth for the pronoun-only follow-up.
+  const maxActions = opts.maxActions ?? 10
   const pinned = new Set(opts.alwaysInclude ?? [])
 
   // A SMALL PROFILE IS LEFT ENTIRELY ALONE.
@@ -132,11 +153,11 @@ export function selectToolsForTurn(
   // what broke. Selecting there would add a second thing that can go wrong in
   // exchange for nothing, so the cut applies only where the payload is actually
   // the problem. The landlord agent at 239 is; anything of this size is not.
-  if (all.length <= SELECTION_THRESHOLD) return { tools: [...all], droppedActions: 0 }
+  if (all.length <= SELECTION_THRESHOLD) return { tools: escalationLast([...all]), droppedActions: 0 }
 
   const reads = all.filter((t) => !isActionTool(t.name))
   const actions = all.filter((t) => isActionTool(t.name))
-  if (actions.length <= maxActions) return { tools: [...all], droppedActions: 0 }
+  if (actions.length <= maxActions) return { tools: escalationLast([...all]), droppedActions: 0 }
 
   const want = new Set(tokens(message).map(stem))
   // Carried context, at half weight — see previousMessage above.
@@ -153,6 +174,10 @@ export function selectToolsForTurn(
     // tool's description is likely a cross-reference to this one.
     const nameWords = new Set(tokens(t.name.replace(/_/g, ' ')).map(stem))
     for (const w of want) if (nameWords.has(w)) score += 2
+    // The same holds for the carried turn, at half weight: after "run the
+    // water bills", a "send that one out" should favour the tool NAMED for
+    // bills over one that mentions them in passing.
+    for (const w of carried) if (nameWords.has(w)) score += 1
     return { t, score }
   })
 
@@ -163,7 +188,7 @@ export function selectToolsForTurn(
     .map((x) => x.t)
 
   return {
-    tools: [...reads, ...chosen],
+    tools: escalationLast([...reads, ...chosen]),
     droppedActions: actions.length - chosen.length,
   }
 }

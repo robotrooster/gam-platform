@@ -164,6 +164,7 @@ export async function chatCompletion(
   if (opts.toolChoice) body.tool_choice = opts.toolChoice
 
   // Spread across the worker fleet; fail over on transient errors.
+  const startedAt = Date.now()
   const data = await getPool(endpoints).run(async (endpoint) => {
     let res: Response
     try {
@@ -186,6 +187,17 @@ export async function chatCompletion(
     }
     return (await res.json()) as RawChatResponse
   })
+  // S650: one line per model call, so prompt size and latency are visible in
+  // the API log. David's turns reached 75k prompt tokens and 277 s before
+  // anyone could see where the tokens came from.
+  logger.info({
+    promptTokens: data.usage?.prompt_tokens,
+    cachedTokens: (data.usage as any)?.prompt_tokens_details?.cached_tokens,
+    completionTokens: data.usage?.completion_tokens,
+    ms: Date.now() - startedAt,
+    tools: opts.tools?.length ?? 0,
+    messages: messages.length,
+  }, 'agent engine: model call')
   const choice = data.choices?.[0]
   const toolCalls = choice?.message?.tool_calls?.length
     ? choice.message.tool_calls

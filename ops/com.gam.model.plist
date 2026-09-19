@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.model</string>
+  <!-- Hermes chat model (the in-house agents' LLM). ~27GB into RAM, ~1-2 min to load. -->
+  <key>ProgramArguments</key>
+  <array>
+    <!-- S650: launched through ops/mlx_server.py, which caps the prompt cache
+         by BYTES on every path (mlx_lm only honours prompt-cache-bytes when
+         batching) and bounds MLX's freed-buffer cache. See that file. -->
+    <string>/Users/nicholasrhoades/gam-mlx-env/bin/python3</string>
+    <string>/Users/nicholasrhoades/gam/ops/mlx_server.py</string>
+    <string>--model</string>
+    <string>/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8080</string>
+    <!-- S628: CAP THE PROMPT CACHE. Launched without these, mlx_lm.server holds
+         every KV cache it has ever built and never evicts one. Measured on
+         2026-08-28: 5.5 GB per cached sequence, climbing monotonically —
+         0, 5.5, 11.0, 16.5 … 49.9 — and then
+
+           [METAL] Command buffer execution failed: Insufficient Memory
+           (kIOGPUCommandBufferCallbackErrorOutOfMemory)
+
+         The arithmetic is exact on a 96 GB machine: the model is 27.7 GB
+         resident, the default GPU wired limit is about 72 GB, and 27.7 + 51
+         does not fit. It died twice in fifteen minutes, roughly every ninth
+         conversation, and restarted clean at 0 GB each time.
+
+         THIS IS WHY PACING NEVER HELPED. S626 added idle gaps between eval
+         cases after the kernel panics, reasoning about cadence. The variable is
+         not time, it is the NUMBER of distinct sequences cached — a job spread
+         over three hours OOMs at exactly the same request count as one run
+         flat out. That is also why the panics landed mid-run rather than
+         between jobs.
+
+         16 GiB is about three sequences: enough that a follow-up turn still
+         hits a warm cache, with ~28 GB of headroom for the OS, WindowServer and
+         anything else on the GPU. Eviction costs a prompt re-computation, which
+         is slower and never wrong. -->
+    <!-- S628: --prompt-cache-SIZE is the one that works. It is applied where the
+         LRU is constructed (server.py:1743), so it binds on EVERY code path.
+         --prompt-cache-bytes is applied at server.py:798, inside the BATCHED
+         path only — these requests are single and sequential, take
+         _serve_single, and never reach that trim. Set to 16 GiB and the cache
+         still climbed to 44.7 GB.
+
+         The default size is 10, and 10 is exactly where it died every time:
+
+             10 sequences, 39.79 GB
+             10 sequences, 45.57 GB
+             10 sequences, 51.05 GB
+              0 sequences,  0.00 GB   <- Metal OOM, launchd restart
+
+         Capped by COUNT and not by bytes, so ten conversations at ~5 GB each
+         overruns a 96 GB machine holding a 27.7 GB model under a ~72 GB wired
+         limit.
+
+         SIX, to match AGENT_MAX_CONCURRENT in concurrencyGate.ts — one warm
+         cache per conversation the gate will admit, so nobody loses their cache
+         mid-conversation and has their prompt reprocessed. 6 x 4.51 GB worst
+         case is 27 GB, plus the model is 55 GB, comfortably inside the limit.
+
+         This is also what makes Nic's "when the conversation is done it
+         disappears" true: the seventh conversation evicts the first instead of
+         the server dying. -->
+    <string>--prompt-cache-size</string>
+    <string>6</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GAM_MLX_PROMPT_CACHE_GB</key>
+    <string>20</string>
+    <key>GAM_MLX_BUFFER_CACHE_GB</key>
+    <string>4</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-mlx.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-mlx.log</string>
+</dict>
+</plist>

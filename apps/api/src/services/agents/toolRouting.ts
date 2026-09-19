@@ -864,6 +864,23 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
     ],
   },
   {
+    // S650: "It says get paid what do i do?" — Nic, on the onboarding screen.
+    // "Get Paid" is the SETUP step (connect a bank so payouts can land), not a
+    // question about payouts. Unrouted, the account-data net forced a lookup,
+    // the model found none to call, and the reply was a canned "which property
+    // or tenant do you mean?". Above the payouts route, which owns "get paid"
+    // in the WHEN-do-I-get-paid sense.
+    tools: ['get_setup_progress'],
+    audience: 'landlord',
+    means: 'where they are in setting up the account, and the next step',
+    patterns: [
+      /\b(says?|saying|shows?|showing|on the|stuck on|at the)\b[^?]{0,15}\bget paid\b/i,
+      /\bget paid\b[^?]{0,15}\b(step|page|screen|section|tab|part|button)\b/i,
+      /\b(set ?up|setup|onboarding)\b[^?]{0,40}\b(what (do|should) i|next|stuck|how do i|help)\b/i,
+      /\b(help me )?get (me )?set ?up\b/i,
+    ],
+  },
+  {
     // S626: unrouted until now — see routeCoverage.test.ts.
     tools: ['get_my_payouts'],
     audience: 'landlord',
