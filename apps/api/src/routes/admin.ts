@@ -1531,6 +1531,63 @@ export const tenantsListHandler = async (req: any, res: any, next: any) => {
 adminRouter.get('/tenants', tenantsListHandler)
 
 // ── PROJECTED PLATFORM INCOME ─────────────────────────────────
+/**
+ * S650 (Nic): "I want to see somewhere where our subscription to the platform
+ * fee and our card markups — where that money is pooling. I don't want it to
+ * just sit in the payments balance and then just look like money has to be
+ * paid out."
+ *
+ * One balance holds three different people's money: rent on its way to
+ * landlords, tenant deposits GAM holds in trust, and GAM's own earnings. This
+ * splits it, so the number that is actually GAM's is a number you can see.
+ */
+adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    let available: number | null = null
+    let pending: number | null = null
+    try {
+      const { getStripe } = await import('../lib/stripe')
+      const bal = await getStripe().balance.retrieve()
+      const usd = (a: any[]) => (a ?? []).filter((x: any) => x.currency === 'usd')
+        .reduce((sum: number, x: any) => sum + Number(x.amount || 0), 0) / 100
+      available = usd(bal.available as any)
+      pending = usd(bal.pending as any)
+    } catch {
+      // Stripe unreachable — the split still renders from GAM's own records.
+    }
+    const [owed] = await query<any>(`
+      SELECT COALESCE(SUM(ubl.amount), 0)::float AS amt
+        FROM payments p
+        JOIN user_balance_ledger ubl
+          ON ubl.reference_id = p.id AND ubl.reference_type = 'payment'
+         AND ubl.type = 'allocation_owner_share' AND ubl.stripe_transfer_id IS NULL
+       WHERE p.platform_held = TRUE AND p.status = 'settled'`)
+    const [heldItems] = await query<any>(`
+      SELECT COALESCE(SUM(amount), 0)::float AS amt FROM held_payout_items WHERE payout_intent_id IS NULL`)
+    const [deposits] = await query<any>(`
+      SELECT COALESCE(SUM(amount), 0)::float AS amt FROM payments
+       WHERE type = 'deposit' AND platform_held = TRUE AND status = 'settled'`)
+    const [reserved] = await query<any>(`
+      SELECT COALESCE(SUM(amount), 0)::float AS amt FROM platform_transfer_intents WHERE status = 'pending'`)
+    const revenue = await query<any>(`
+      SELECT type,
+             COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0)::float AS this_month,
+             COALESCE(SUM(amount), 0)::float AS all_time
+        FROM platform_revenue_ledger GROUP BY type ORDER BY all_time DESC`)
+    const onBalance = (available ?? 0) + (pending ?? 0)
+    const others = Number(owed.amt) + Number(heldItems.amt) + Number(deposits.amt) + Number(reserved.amt)
+    res.json({ success: true, data: {
+      stripe_available: available, stripe_pending: pending,
+      owed_to_landlords: Number(owed.amt) + Number(heldItems.amt) + Number(reserved.amt),
+      deposits_in_trust: Number(deposits.amt),
+      gams_own: available == null ? null : Math.round((onBalance - others) * 100) / 100,
+      revenue_by_type: revenue,
+      revenue_this_month: Math.round(revenue.reduce((a: number, r: any) => a + Number(r.this_month), 0) * 100) / 100,
+      revenue_all_time: Math.round(revenue.reduce((a: number, r: any) => a + Number(r.all_time), 0) * 100) / 100,
+    } })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/income/projection', requireSuperAdmin, async (_req, res, next) => {
   try {
     // Unit counts

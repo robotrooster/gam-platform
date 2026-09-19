@@ -16,6 +16,7 @@ import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { recordScreeningEarnings } from '../services/platformRevenue'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import crypto from 'crypto'
 import multer from 'multer'
@@ -494,7 +495,6 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       userId: req.user!.userId,
     })
     const amountChargedUsd = chargedCents === null ? null : chargedCents / 100
-
     let ssnClean: string | null = null
     let ssnLast4: string | null = null
     let ssnEncrypted: string | null = null
@@ -613,6 +613,20 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       }
       throw e
     }
+
+    // S650 (Nic): "Where is that $5 from that first background check?" The
+    // applicant's payment settles 100% to GAM (no landlord split since S636),
+    // so GAM's margin inside it is earnings — recorded the moment the check
+    // exists, instead of being estimated later by counting checks.
+    void (async () => {
+      const priced = await screeningIntakeFee(state)
+      await recordScreeningEarnings({
+        backgroundCheckId: check!.id,
+        gamMarginUsd: priced.gamFee,
+        processingChargedUsd: priced.processing,
+        totalChargedUsd: amountChargedUsd ?? priced.total,
+      })
+    })()
 
     // Risk score (intake-fraud only — disposable email, SSN patterns, IP velocity, prior denials)
     let riskLevel: string | null = null

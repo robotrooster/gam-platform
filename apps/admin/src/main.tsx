@@ -1017,6 +1017,8 @@ function Overview(){
   const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
   const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
   const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // S650 (Nic): whose money is actually on the Stripe balance, and what part of it is GAM's.
+  const{data:bal}=useQuery('platform-balance',()=>get<any>('/admin/platform-balance'),{enabled:!!user&&isSuperAdmin,staleTime:60000})
   const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
   const{data:openDisputes=[]}=useQuery<any[]>('overview-open-disputes',()=>get<any[]>('/credit/disputes?status=open'),{enabled:!!user,staleTime:60000,refetchInterval:60000})
   // FlexPay float bankroll = rent of INCOME-VERIFIED FlexPay tenants (approved
@@ -1135,6 +1137,15 @@ function Overview(){
             the Pending Disbursements count beside it an amount, which it never
             had. */}
         <div className="kpi"><div className="kl">Held for Landlords</div><div className="kv gold">{formatCurrency(stats?.heldForLandlords||0)}</div><div className="ks">collected, not yet paid out{(stats?.paymentsInFlight||0)>0?` · ${stats.paymentsInFlight} more in ACH flight (${formatCurrency(stats?.paymentsInFlightAmount||0)})`:''}</div></div>
+        {/* S650 (Nic): "I want to see somewhere where our subscription to the
+            platform fee and our card markups — where that money is pooling."
+            One Stripe balance holds three people's money; this is the split. */}
+        {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">GAM's Own Money</div>
+          <div className="kv g">{bal.gamsOwn==null?'—':formatCurrency(bal.gamsOwn)}</div>
+          <div className="ks">on the balance after everyone else is paid · earned {formatCurrency(bal.revenueThisMonth||0)} this month, {formatCurrency(bal.revenueAllTime||0)} all time</div></div>}
+        {isSuperAdmin&&bal&&<div className="kpi"><div className="kl">Not GAM's</div>
+          <div className="kv gold">{formatCurrency((bal.owedToLandlords||0)+(bal.depositsInTrust||0))}</div>
+          <div className="ks">{formatCurrency(bal.owedToLandlords||0)} owed to landlords{(bal.depositsInTrust||0)>0?` · ${formatCurrency(bal.depositsInTrust)} tenant deposits in trust`:''} · Stripe: {bal.stripeAvailable==null?'—':formatCurrency(bal.stripeAvailable)} available, {formatCurrency(bal.stripePending||0)} still clearing</div></div>}
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
 

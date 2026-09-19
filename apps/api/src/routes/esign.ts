@@ -4839,6 +4839,20 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       WHERE id=$3`,
       [ip, ua, signer.id])
 
+    // S650 (Nic): signing IS the verification. "These people are not gonna get
+    // on there and verify an account later on." The signing link went to their
+    // inbox and they opened it and signed a lease with it — a stronger proof of
+    // the address than a verification click — so the account stops being one
+    // that login will refuse. Ellen Gregory (Oak Park MH 02) hit exactly that
+    // wall with a password she had just reset.
+    if (signer.user_id) {
+      await client.query(
+        `UPDATE users SET email_verified = TRUE,
+                          email_verified_at = COALESCE(email_verified_at, NOW()),
+                          updated_at = NOW()
+          WHERE id = $1 AND email_verified = FALSE`, [signer.user_id])
+    }
+
     await client.query("UPDATE lease_documents SET status='in_progress', updated_at=NOW() WHERE id=$1", [doc.id])
 
     await client.query('COMMIT')

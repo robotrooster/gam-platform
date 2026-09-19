@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Z8shIJBYZbh95JqstZSPGetbTTbxb8Yee8HUziInxWpJWKJg22OUxGAY0LkpyDX
+\restrict lp8N8tOm6qYcjlPAsp7qPudfxhrrxmUSGSWaRw4bYd5NBivMbDSKeUeyMVxtEou
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6574,7 +6574,7 @@ CREATE TABLE public.platform_revenue_ledger (
     property_id uuid,
     notes text,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'adjustment'::text])))
+    CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'screening_margin'::text, 'adjustment'::text])))
 );
 
 
@@ -27121,5 +27121,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Z8shIJBYZbh95JqstZSPGetbTTbxb8Yee8HUziInxWpJWKJg22OUxGAY0LkpyDX
+\unrestrict lp8N8tOm6qYcjlPAsp7qPudfxhrrxmUSGSWaRw4bYd5NBivMbDSKeUeyMVxtEou
 
