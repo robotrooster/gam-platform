@@ -481,7 +481,10 @@ app.listen(PORT, () => {
     adminApp:     process.env.ADMIN_APP_URL    || 'http://localhost:3003',
     marketing:    process.env.MARKETING_URL    || 'http://localhost:3004',
   }, 'GAM API listening')
-  schedulerInit()
+  // S650: a second API instance (a local preview against gam_demo) must not
+  // run the nightly jobs a second time.
+  if (process.env.GAM_DISABLE_SCHEDULER === '1') logger.warn('scheduler disabled (GAM_DISABLE_SCHEDULER=1)')
+  else schedulerInit()
 })
 
 export default app
