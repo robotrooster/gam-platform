@@ -450,10 +450,12 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(Number(res.body.data.total)).toBe(0)
   })
 
-  it('walk-up item (no catalog id): client-supplied price + tax pass through, no stock decrement', async () => {
+  // S650 (Nic): "Items are set prices. There's no custom item thing." A cart
+  // line with no catalog item behind it is refused — a one-off goes on the
+  // lease, or out as a pay link to somebody without one.
+  it('refuses a line with no catalog item behind it', async () => {
     const f = await seedPosFixture()
-    // No item seeded; this is a free-form cart line.
-    calculateCartTaxMock.mockResolvedValueOnce({ subtotal: 0, taxAmount: 0, lines: [] })
+    // No tax mock queued on purpose: the refusal lands before the cart is priced.
 
     const res = await request(buildApp())
       .post('/api/pos/transactions')
@@ -464,23 +466,14 @@ describe('POST /api/pos/transactions — happy paths', () => {
         paymentMethod: 'cash',
       })
 
-    expect(res.status).toBe(201)
-    // walkUpSubtotal=15, walkUpTax=15*0.07=1.05, surcharge=0 → total=16.05
-    expect(Number(res.body.data.subtotal)).toBe(15)
-    expect(Number(res.body.data.tax_amount)).toBe(1.05)
-    expect(Number(res.body.data.total)).toBe(16.05)
-    // No inventory log
-    const log = await db.query(`SELECT id FROM pos_inventory_log`)
-    expect(log.rows.length).toBe(0)
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/every register item is one you set up/i)
+    expect((await db.query(`SELECT id FROM pos_transactions`)).rows).toHaveLength(0)
   })
 
-  it('mixed cart (catalog + walk-up): server tax on catalog, client tax on walk-up', async () => {
+  it('refuses the whole sale when one line of a mixed cart is not a catalog item', async () => {
     const f = await seedPosFixture()
     const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 999 })
-    calculateCartTaxMock.mockResolvedValueOnce({
-      subtotal: 10, taxAmount: 0.80,
-      lines: [{ itemId, lineSubtotal: 10, lineTax: 0.80 }],
-    })
 
     const res = await request(buildApp())
       .post('/api/pos/transactions')
@@ -494,11 +487,8 @@ describe('POST /api/pos/transactions — happy paths', () => {
         paymentMethod: 'cash',
       })
 
-    expect(res.status).toBe(201)
-    // Catalog: subtotal 10, tax 0.80. Walk-up: subtotal 10, tax 1.00.
-    expect(Number(res.body.data.subtotal)).toBe(20)
-    expect(Number(res.body.data.tax_amount)).toBe(1.80)
-    expect(Number(res.body.data.total)).toBe(21.80)
+    expect(res.status).toBe(400)
+    expect((await db.query(`SELECT id FROM pos_transactions`)).rows).toHaveLength(0)
   })
 
   it('auto-draft PO fires when stock decrement hits stock_min and vendor is set', async () => {
@@ -646,7 +636,7 @@ describe('POST /api/pos/transactions — FlexCharge gate (S254)', () => {
         tenantId: randomUUID(),
       })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Walk-up items.*FlexCharge/i)
+    expect(res.body.error).toMatch(/every register item is one you set up/i)
   })
 
   it('cart contains a non-charge-eligible item → 400', async () => {
@@ -1700,7 +1690,7 @@ describe('Session items: add / patch / delete + recompute', () => {
     const res = await request(buildApp())
       .post(`/api/pos/sessions/${sId}/items`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ itemName: 'Burger', qty: 2, unitPrice: 5, taxRate: 0.08 })
+      .send({ itemId: await seedPosItem(f, { sellPrice: 5, stockQty: 999 }), itemName: 'Burger', qty: 2, unitPrice: 5, taxRate: 0.08 })
     expect(res.status).toBe(200)
     const sess = await db.query<{ subtotal: string; tax_amount: string; total: string }>(
       `SELECT subtotal, tax_amount, total FROM pos_sessions WHERE id = $1`, [sId])
@@ -1715,7 +1705,7 @@ describe('Session items: add / patch / delete + recompute', () => {
     const res = await request(buildApp())
       .post(`/api/pos/sessions/${sId}/items`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ itemName: 'X', qty: 0, unitPrice: 5 })
+      .send({ itemId: await seedPosItem(f, { sellPrice: 5, stockQty: 999 }), itemName: 'X', qty: 0, unitPrice: 5 })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/qty must be positive/i)
   })
@@ -1727,7 +1717,7 @@ describe('Session items: add / patch / delete + recompute', () => {
     const add = await request(buildApp())
       .post(`/api/pos/sessions/${sId}/items`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ itemName: 'X', qty: 1, unitPrice: 10 })
+      .send({ itemId: await seedPosItem(f, { sellPrice: 10, stockQty: 999 }), itemName: 'X', qty: 1, unitPrice: 10 })
     const itemId = add.body.data.id
 
     const res = await request(buildApp())
@@ -1751,7 +1741,7 @@ describe('Session items: add / patch / delete + recompute', () => {
     const add = await request(buildApp())
       .post(`/api/pos/sessions/${sId}/items`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ itemName: 'X', qty: 1, unitPrice: 10 })
+      .send({ itemId: await seedPosItem(f, { sellPrice: 10, stockQty: 999 }), itemName: 'X', qty: 1, unitPrice: 10 })
     const itemId = add.body.data.id
 
     const res = await request(buildApp())

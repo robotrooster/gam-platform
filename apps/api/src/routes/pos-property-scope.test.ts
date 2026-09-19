@@ -73,12 +73,22 @@ async function seed(opts: { allProperties?: boolean } = {}): Promise<Fixture> {
   finally { client.release() }
 }
 
-// A minimal walk-up cash sale (no catalog id → server trusts the line).
-const sale = (propertyId: string | null) => ({
-  items: [{ id: null, name: 'Propane', qty: 1, price: 20, tax: 0, cat: 'misc' }],
+// S650: every register line is a catalog item, so the scope tests ring a real
+// one. `catalogItem` (below) seeds it against the fixture's property A.
+const sale = (itemId: string, propertyId: string | null) => ({
+  items: [{ id: itemId, name: 'Propane', qty: 1, price: 20, tax: 0, cat: 'misc' }],
   paymentMethod: 'cash',
   propertyId,
 })
+async function propaneAt(f: Fixture, propertyId: string): Promise<string> {
+  const cat = await db.query<{ id: string }>(
+    `INSERT INTO pos_categories (landlord_id, name, property_id) VALUES ($1, $2, $3) RETURNING id`,
+    [f.landlordId, `Fuel ${propertyId.slice(0, 8)}`, propertyId])
+  const r = await db.query<{ id: string }>(
+    `INSERT INTO pos_items (landlord_id, name, sell_price, cost_price, tax_rate, stock_qty, property_id, category_id)
+     VALUES ($1, 'Propane', 20, 0, 0, 999, $2, $3) RETURNING id`, [f.landlordId, propertyId, cat.rows[0].id])
+  return r.rows[0].id
+}
 
 describe('POS property-lock (assertPropertyInScope)', () => {
   it('cashier can ring on their assigned property (A)', async () => {
@@ -86,7 +96,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propAId))
+      .send(sale(await propaneAt(f, f.propAId), f.propAId))
     expect(res.status).toBe(201)
     expect(res.body.data.property_id).toBe(f.propAId)   // sale persists its property
   })
@@ -96,7 +106,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(403)
     expect(res.body.error).toMatch(/not assigned to this property/i)
   })
@@ -106,7 +116,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(null))
+      .send(sale(await propaneAt(f, f.propAId), null))
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/property must be selected/i)
   })
@@ -116,7 +126,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.cashierToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(201)
   })
 
@@ -125,7 +135,7 @@ describe('POS property-lock (assertPropertyInScope)', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.ownerToken}`)
-      .send(sale(f.propBId))
+      .send(sale(await propaneAt(f, f.propBId), f.propBId))
     expect(res.status).toBe(201)
     expect(res.body.data.property_id).toBe(f.propBId)
   })

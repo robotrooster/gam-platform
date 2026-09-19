@@ -500,6 +500,19 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
  * discounts" permission. Owners, and staff trusted with discounts or item
  * setup, may set prices as before.
  */
+/**
+ * S650 (Nic): "Items are set prices. There's no custom item thing." Everything
+ * the register sells is a button somebody set up, so a line with no catalog
+ * item behind it is refused. A one-off (they ran over the pedestal) is a charge
+ * on the lease, or a pay link for somebody without one.
+ */
+function assertCatalogItems(lines: { itemId?: string | null }[]): void {
+  if (lines.some((l) => !l.itemId)) {
+    throw new AppError(400,
+      'Every register item is one you set up. For a one-off charge, bill it to the lease or send a pay link.')
+  }
+}
+
 function canSetPrices(user: any): boolean {
   if (!user) return false
   if (['admin', 'super_admin', 'landlord'].includes(user.role)) return true
@@ -615,6 +628,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'])
+    assertCatalogItems(items.map((it: any) => ({ itemId: it.id })))
     await assertCashierPricing(req, items.map((it: any) => ({ itemId: it.id, price: it.price })), discountAmount)
     // W-12 (S531): propertyId is REQUIRED — every sale belongs to a
     // property (per-property books, EOD drawers, sales history).
@@ -2128,6 +2142,7 @@ posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, 
     if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new AppError(400, 'unitPrice must be non-negative')
     assertNonNeg([b.taxRate, 'Tax rate'], [b.costPrice, 'Cost price'])
 
+    assertCatalogItems([{ itemId: b.itemId }])
     await assertCashierPricing(req, [{ itemId: b.itemId, price: unitPrice }])
     const taxRate = Number(b.taxRate) || 0
     const costPrice = Number(b.costPrice) || 0

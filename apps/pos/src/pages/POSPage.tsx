@@ -88,7 +88,6 @@ export function POSPage() {
   const [receipt, setReceipt] = useState<any>(null)
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
-  const [openItem, setOpenItem] = useState({ name:'', price:'', show:false })
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
@@ -382,24 +381,6 @@ export function POSPage() {
       if (ex) return c.map(x => x.id===item.id ? {...x,qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
       return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, _sessionItemId: clientItemId } as any]
     })
-  }
-  const addOpenItem = async () => {
-    if (!openItem.name || !openItem.price) return
-    const csid = ensureSession()
-    if (!csid) return
-    const clientItemId = mintClientId()
-    void enqueueSync({
-      op: 'ADD_ITEM',
-      clientSessionId: csid,
-      clientItemId,
-      payload: {
-        itemName: openItem.name,
-        qty: 1,
-        unitPrice: Number(openItem.price),
-      },
-    })
-    setCart(c => [...c, { id:'open-'+Date.now(), name:openItem.name, price:Number(openItem.price), qty:1, tax:0, cat:'misc', icon:'📝', chargeEligible:false, _sessionItemId: clientItemId } as any])
-    setOpenItem({ name:'', price:'', show:false })
   }
   // S536 (Nic): absolute-quantity setter — the register quantity is
   // typeable (selling 40 gallons shouldn't take 40 clicks) and every
@@ -844,7 +825,9 @@ export function POSPage() {
             )}
             <div style={{display:'flex',gap:6,marginBottom:12,flexWrap:'wrap'}}>
               {categories.map(c => (<button key={c} onClick={()=>setFilterCat(c)} className={"tab-btn "+(filterCat===c?'active':'')} style={{fontSize:'.78rem',padding:'4px 12px',textTransform:'capitalize'}}>{c}</button>))}
-              <button onClick={()=>setOpenItem(o=>({...o,show:true}))} className="tab-btn" style={{fontSize:'.78rem',padding:'4px 12px',marginLeft:'auto'}}>+ Open Item</button>
+              {/* S650 (Nic): no open items. "Items are set prices. There's no
+                  custom item thing." Anything sold here is a button somebody
+                  set up; a one-off goes on the lease or out as a pay link. */}
             </div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(130px,1fr))',gap:10}}>
               {visibleItems.filter((i:any)=>i.isActive).map((item:any) => (
@@ -1667,14 +1650,7 @@ export function POSPage() {
         </div>
       </div></div>)}
 
-      {openItem.show&&(<div className="modal-overlay" onClick={()=>setOpenItem(o=>({...o,show:false}))}><div className="modal" style={{maxWidth:360}} onClick={e=>e.stopPropagation()}>
-        <div className="modal-header"><span className="modal-title">Open Item</span><button className="btn btn-ghost btn-sm" onClick={()=>setOpenItem(o=>({...o,show:false}))}>x</button></div>
-        <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Description</div><input className="form-input" style={{width:'100%'}} placeholder="Item name" value={openItem.name} onChange={e=>setOpenItem(o=>({...o,name:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={openItem.price} onChange={e=>setOpenItem(o=>({...o,price:e.target.value}))} /></div>
-          <button className="btn btn-primary" onClick={addOpenItem} disabled={!openItem.name||!openItem.price}>Add to Cart</button>
-        </div>
-      </div></div>)}
+
 
       {refundModal.show&&(<div className="modal-overlay" onClick={()=>setRefundModal({show:false,tx:null})}><div className="modal" style={{maxWidth:380}} onClick={e=>e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">Refund Transaction</span><button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:false,tx:null})}>x</button></div>
