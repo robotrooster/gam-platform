@@ -536,7 +536,10 @@ export function OnboardingPage() {
             )}
 
             {/* ── STEP 3: GET PAID (Stripe Connect) ── */}
-            {step === 4 && (
+            {/* S649: this was `step === 4` — the Bank Feed step's index — since
+                Add Your Units was inserted ahead of it, so Get Paid rendered an
+                empty screen with Next disabled (Nicholas Fausett, stuck). */}
+            {step === 3 && (
               <div>
                 {payoutsReady ? (
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: 12 }}>
