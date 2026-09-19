@@ -1730,6 +1730,19 @@ export function schedulerInit() {
     }
   })
 
+  // S650 (Nic): "we only move the money that was paid to us" — a second daily
+  // pass at any landlord batch still waiting on GAM's Stripe balance, so a
+  // missed 01:00 UTC payout run cannot cost a landlord another whole day.
+  cron.schedule('0 8 * * *', async () => {
+    try {
+      const { recoverPendingPlatformTransfers } = await import('../services/landlordPassthrough')
+      const r = await recoverPendingPlatformTransfers()
+      if (r.recovered || r.stillPending) logger.info(r, '[passthrough-recovery]')
+    } catch (e) {
+      logger.error({ err: e }, '[passthrough-recovery] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S650 (Nic): held utilities nobody claimed by the time a property's
   // onboarding window closes are presumed settled off-platform.
   cron.schedule('40 3 * * *', async () => {

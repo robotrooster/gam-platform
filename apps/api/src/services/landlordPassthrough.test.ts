@@ -25,6 +25,11 @@ vi.mock('./stripeConnect', () => ({
 vi.mock('./adminNotifications', () => ({
   createAdminNotification: adminNotifyMock,
 }))
+// S650: GAM's own available balance at Stripe — what the batch may claim.
+const balanceMock = vi.hoisted(() => vi.fn(async () => ({ available: [{ currency: 'usd', amount: 100_000_00 }] })))
+vi.mock('../lib/stripe', () => ({
+  getStripe: () => ({ balance: { retrieve: balanceMock } }),
+}))
 
 import { db } from '../db'
 import { BUSINESS_TYPES } from '@gam/shared'
@@ -36,6 +41,8 @@ beforeEach(async () => {
   transferMock.mockClear()
   adminNotifyMock.mockClear()
   transferMock.mockResolvedValue({ id: 'tr_mock_default' } as any)
+  balanceMock.mockClear()
+  balanceMock.mockResolvedValue({ available: [{ currency: 'usd', amount: 100_000_00 }] } as any)
 })
 
 interface Ctx {
@@ -143,6 +150,80 @@ describe('S640 a batch with several payments in it', () => {
     const held = await db.query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM payments WHERE platform_held = TRUE`)
     expect(Number(held.rows[0].n)).toBe(0)
+  })
+})
+
+// ── S650: A BATCH NEVER CLAIMS MORE THAN GAM ACTUALLY HAS ──────────────────
+//
+// Nic: "Why the fuck would money fail to move for insufficient funds? We only
+// move the money that was paid to us."
+//
+// Because `settled` here means the tenant's bank cleared it, and Stripe makes
+// an ACH's funds available about four business days later. On 2026-09-16 the
+// batch claimed $4,154.89 of Mountain View rent whose newest payments were
+// still ripening; Stripe refused the whole Transfer and the older, available
+// money sat stuck behind the newer for three days.
+describe('S650 the batch is capped by the available balance', () => {
+  async function seedExtraPayment(ctx: Ctx, amount: number, daysAgo: number): Promise<string> {
+    const { rows: [p] } = await db.query<{ id: string }>(
+      `INSERT INTO payments
+         (unit_id, tenant_id, landlord_id, type, amount, status, entry_description,
+          due_date, platform_held, settled_at)
+       VALUES ($1,$2,$3,'rent',$4,'settled','RENT', CURRENT_DATE - $5::int, TRUE, NOW())
+       RETURNING id`,
+      [ctx.unitId, ctx.tenantId, ctx.landlordId, amount, daysAgo])
+    await db.query(
+      `INSERT INTO user_balance_ledger
+         (user_id, type, amount, balance_after, reference_id, reference_type, notes, created_at)
+       VALUES ($1,'allocation_owner_share',$2,$2,$3,'payment','S650', NOW() - ($4 || ' days')::interval)`,
+      [ctx.landlordUserId, amount, p.id, String(daysAgo)])
+    return p.id
+  }
+
+  it('moves the money that has cleared and leaves the rest claimable', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 500)
+    await db.query(`UPDATE user_balance_ledger SET created_at = NOW() - interval '9 days'
+                     WHERE reference_id = $1`, [ctx.paymentId])   // the oldest money
+    await seedExtraPayment(ctx, 300, 5)
+    const newest = await seedExtraPayment(ctx, 400, 1)      // still ripening at Stripe
+    balanceMock.mockResolvedValue({ available: [{ currency: 'usd', amount: 800_00 }] } as any)
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(true)
+    expect(res.amount).toBe(800)                            // 500 + 300, not 1200
+    expect(transferMock).toHaveBeenCalledTimes(1)
+
+    // The newest payment was NOT claimed — it goes out on the next run.
+    const still = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE platform_held = TRUE AND id = $1`, [newest])
+    expect(Number(still.rows[0].n)).toBe(1)
+    const unstamped = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM user_balance_ledger
+        WHERE type='allocation_owner_share' AND reference_id = $1 AND stripe_transfer_id IS NULL`, [newest])
+    expect(Number(unstamped.rows[0].n)).toBe(1)
+  })
+
+  it('claims nothing at all when none of it has cleared yet', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 500)
+    balanceMock.mockResolvedValue({ available: [{ currency: 'usd', amount: 0 }] } as any)
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(false)
+    expect(transferMock).not.toHaveBeenCalled()
+    const held = await db.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM payments WHERE platform_held = TRUE`)
+    expect(Number(held.rows[0].n)).toBe(1)                  // nothing was claimed
+  })
+
+  it('still pays out when the balance cannot be read (Stripe down)', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 500)
+    balanceMock.mockRejectedValue(new Error('stripe unreachable'))
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.attempted).toBe(true)
+    expect(res.amount).toBe(500)
   })
 })
 

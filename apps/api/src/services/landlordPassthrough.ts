@@ -151,6 +151,24 @@ export async function heldOwnerShareForUser(landlordUserId: string): Promise<num
 }
 
 /**
+ * S650: GAM's own AVAILABLE balance at Stripe, in cents — what can actually be
+ * transferred right now. `null` means we could not ask (no key, Stripe down),
+ * and the caller then behaves exactly as it did before rather than stalling
+ * every payout on a failed balance call.
+ */
+async function platformAvailableCents(): Promise<number | null> {
+  try {
+    const { getStripe } = await import('../lib/stripe')
+    const bal = await getStripe().balance.retrieve()
+    const usd = (bal.available ?? []).filter((b: any) => b.currency === 'usd')
+    return usd.reduce((a: number, b: any) => a + Number(b.amount || 0), 0)
+  } catch (e) {
+    logger.error({ err: e }, '[platform_held_passthrough] could not read the platform balance — proceeding uncapped')
+    return null
+  }
+}
+
+/**
  * RESERVE — claim the landlord's unfired owner-share into a durable pending
  * intent inside one transaction, then commit. Returns null when there is
  * nothing to do (unknown user, no Connect account, nothing owed).
@@ -199,7 +217,7 @@ async function reservePlatformHeldBatch(
     // Summing and later stamping "everything currently held" let a payment or
     // sale that landed between the two be marked paid out without being in
     // the transfer — the landlord would never have been paid for it.
-    const shareRows = await client.query<{ id: string; amount: string }>(
+    const allShareRows = await client.query<{ id: string; amount: string }>(
       `SELECT ubl.id, ubl.amount::text AS amount
          FROM payments p
          JOIN user_balance_ledger ubl
@@ -210,14 +228,46 @@ async function reservePlatformHeldBatch(
         WHERE p.landlord_id = $1
           AND p.platform_held = true
           AND p.status = 'settled'
+        ORDER BY ubl.created_at ASC
           FOR UPDATE OF ubl`,
       [landlordRow.landlord_id]
     )
+    // ── S650 (Nic): NEVER RESERVE MORE THAN GAM ACTUALLY HAS ────────────────
+    //
+    //   "Why the fuck would money fail to move for insufficient funds? We only
+    //    move the money that was paid to us."
+    //
+    // Because a payment is `settled` here the moment the tenant's bank clears
+    // it, and Stripe does not make an ACH's funds AVAILABLE for about four
+    // business days after that. The batch was built from GAM's records alone,
+    // so on 2026-09-16 it claimed $4,154.89 of rent whose newest $1,300 was
+    // still ripening at Stripe. A Transfer is all-or-nothing: Stripe refused
+    // the whole thing, and the older money that WAS available sat stuck behind
+    // the newest — twelve payments, three days, no payout.
+    //
+    // So the batch is now capped by GAM's own available balance, oldest money
+    // first. What is not yet available is simply not claimed; it goes out on
+    // the next run, the day it ripens. Nothing is lost and nothing is stuck.
+    const cents = (v: string) => Math.round(parseFloat(v) * 100)
+    const availableCents = await platformAvailableCents()
+    const shareRows = { rows: [] as { id: string; amount: string }[] }
+    let claimedCents = 0
+    for (const r of allShareRows.rows) {
+      const c = cents(r.amount)
+      if (availableCents != null && claimedCents + c > availableCents) break
+      shareRows.rows.push(r)
+      claimedCents += c
+    }
+    const skippedShares = allShareRows.rows.length - shareRows.rows.length
     // S648: everything else GAM holds for this landlord — register sales, stay
     // deposits, and the chargebacks/refunds that net against them.
-    const held = await lockHeldItems(client, { landlordId: landlordRow.landlord_id })
-    const cents = (v: string) => Math.round(parseFloat(v) * 100)
-    const owedCents = shareRows.rows.reduce((a, r) => a + cents(r.amount), 0) + held.totalCents
+    const held = await lockHeldItems(client, { landlordId: landlordRow.landlord_id },
+      availableCents == null ? undefined : Math.max(0, availableCents - claimedCents))
+    if (skippedShares > 0 || (availableCents != null && claimedCents === 0)) {
+      logger.info({ landlordId: landlordRow.landlord_id, availableCents, claimedCents, skippedShares },
+        '[platform_held_passthrough] capped to GAM\'s available balance — the rest goes out when it clears')
+    }
+    const owedCents = claimedCents + held.totalCents
     const owed = owedCents / 100
     if (owed <= 0) {
       await client.query('ROLLBACK')
@@ -492,6 +542,24 @@ export async function recoverPendingPlatformTransfers(graceMinutes = 5): Promise
     const tid = await executePlatformTransferIntent(r.id)
     if (tid && tid !== 'already') recovered++
     else if (!tid) stillPending++
+  }
+  // S650 (Nic): money owed to a landlord must never sit quietly. Mountain
+  // View's $4,154.89 was reserved on the 16th, failed twice on GAM's available
+  // balance, and nothing said so — the escalation only fires at three attempts,
+  // and a retry that never ran cannot reach three. A day is the alarm.
+  const stale = await query<{ id: string; amount: string; landlord_id: string; hours: string }>(
+    `SELECT id, amount::text AS amount, landlord_id,
+            ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)::text AS hours
+       FROM platform_transfer_intents
+      WHERE status = 'pending' AND amount > 0 AND created_at < NOW() - interval '24 hours'`)
+  for (const st of stale) {
+    await createAdminNotification({
+      severity: 'critical',
+      category: 'platform_held_transfer_stuck',
+      title:    `$${Number(st.amount).toFixed(2)} owed to a landlord has been stuck ${st.hours}h`,
+      body:     'A platform→Connect batch is still pending. Most often GAM\'s Stripe balance had not caught up; it retries daily, but check it.',
+      context:  { intent_id: st.id, landlord_id: st.landlord_id, amount: st.amount, hours: st.hours },
+    }).catch(() => {})
   }
   return { scanned: rows.length, recovered, stillPending }
 }

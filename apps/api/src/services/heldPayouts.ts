@@ -70,17 +70,25 @@ export async function recordHeldItem(item: HeldItem, runner?: Runner): Promise<b
 /** Held, unbatched items for one payee, locked for a batch transaction. */
 export async function lockHeldItems(
   client: PoolClient, payee: { landlordId: string } | { businessId: string },
+  /** S650: stop once the running total would pass this (GAM's available funds). */
+  capCents?: number,
 ): Promise<{ ids: string[]; totalCents: number }> {
   const col = 'landlordId' in payee ? 'landlord_id' : 'business_id'
   const id = 'landlordId' in payee ? payee.landlordId : payee.businessId
   const rows = (await client.query<{ id: string; amount: string }>(
     `SELECT id, amount::text AS amount FROM held_payout_items
       WHERE ${col} = $1 AND payout_intent_id IS NULL
+      ORDER BY created_at ASC
       FOR UPDATE`, [id])).rows
-  return {
-    ids: rows.map(r => r.id),
-    totalCents: rows.reduce((a, r) => a + Math.round(parseFloat(r.amount) * 100), 0),
+  const ids: string[] = []
+  let totalCents = 0
+  for (const r of rows) {
+    const c = Math.round(parseFloat(r.amount) * 100)
+    if (capCents != null && totalCents + c > capCents) break   // oldest first; the rest waits
+    ids.push(r.id)
+    totalCents += c
   }
+  return { ids, totalCents }
 }
 
 export async function stampHeldItems(client: PoolClient, ids: string[], intentId: string): Promise<void> {
