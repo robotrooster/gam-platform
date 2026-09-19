@@ -40,7 +40,24 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
   try {
     const [platform] = await query<any>(`
       SELECT
-        (SELECT COUNT(*)::int FROM landlords) AS total_landlords,
+        -- S650 (Nic): a LANDLORD is a person who brought a property to GAM.
+        -- Not a company (Nic's two LLCs counted him twice), and not a co-owner
+        -- of somebody else's property (Tyler Rhoades on Oak Park). Counting
+        -- only; portal access is unaffected.
+        (SELECT COUNT(DISTINCT l.user_id)::int
+           FROM landlords l
+           JOIN users u ON u.id = l.user_id
+          WHERE u.email NOT LIKE '%@gam.internal'
+            AND EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = l.id)) AS total_landlords,
+        -- ...and the accounts that signed up but have no property on GAM at
+        -- all, under their own company or as a co-owner, shown beside it.
+        (SELECT COUNT(*)::int FROM users u
+          WHERE u.role = 'landlord' AND u.email NOT LIKE '%@gam.internal'
+            AND NOT EXISTS (
+              SELECT 1 FROM landlords l JOIN properties p ON p.landlord_id = l.id
+               WHERE l.user_id = u.id
+                  OR l.id IN (SELECT m.landlord_id FROM landlord_members m WHERE m.user_id = u.id))
+        ) AS landlords_without_property,
         (SELECT COUNT(*)::int FROM users WHERE role='tenant')   AS total_tenants,
         (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
         (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,

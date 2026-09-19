@@ -107,7 +107,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
   const login = async (email: string, password: string): Promise<LoginResult> => {
-    const res = await axios.post(API + '/api/auth/login', { email, password })
+    const res = await axios.post(API + '/api/auth/login', { email, password, portal: 'admin' })
     const data = res.data.data
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
@@ -1098,7 +1098,7 @@ function Overview(){
 
       {/* ── Row 1: Landlords + Tenants ── */}
       <div className="grid2" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Landlords</div><div className="kv gold">{(stats?.totalLandlords||0).toLocaleString()}</div><div className="ks">on platform</div></div>
+        <div className="kpi"><div className="kl">Landlords</div><div className="kv gold">{(stats?.totalLandlords||0).toLocaleString()}</div><div className="ks">brought a property{(stats?.landlordsWithoutProperty||0)>0?` · ${stats.landlordsWithoutProperty} more signed up, no property yet`:''}</div></div>
         <div className="kpi"><div className="kl">Total Tenants</div><div className="kv b">{(stats?.totalTenants||0).toLocaleString()}</div><div className="ks">across all properties</div></div>
       </div>
 
@@ -3286,7 +3286,7 @@ function LoginPage(){
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <form onSubmit={onCredentialsSubmit}>
-            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
+            <div style={{marginBottom:14}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="email" name="gam-admin-login" autoComplete="off" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
             <div style={{marginBottom:16}}><label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label><input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',fontFamily:'var(--font-b)',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
             <button className="bp btn" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center'}}>
               {loading?<span className="spinner"/>:'Sign in'}

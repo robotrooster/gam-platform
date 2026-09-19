@@ -842,6 +842,52 @@ describe('S639 login is case- and whitespace-insensitive on the address', () => 
   })
 })
 
+// ─── S650: THE ADMIN CONSOLE SIGNS IN STAFF ONLY ─────────────────────────────
+// A browser autofilled Nic's landlord address into the admin login; the
+// password matched the landlord account and the 2FA code went to the landlord
+// inbox. The console now says which portal it is, and a non-staff account is
+// refused BEFORE any code is issued.
+describe('S650 staff consoles refuse non-staff accounts before sending a code', () => {
+  async function user(role: string): Promise<{ email: string; password: string }> {
+    const email = `s650-${role}-${randomUUID().slice(0, 8)}@test.dev`
+    const password = 'CorrectHorse!2026'
+    await db.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, $2, $3, 'A', 'B', TRUE)`, [email, await bcrypt.hash(password, 10), role])
+    return { email, password }
+  }
+
+  it('a landlord at the admin console gets a 403 and no code', async () => {
+    const { email, password } = await user('landlord')
+    const res = await request(buildApp()).post('/api/auth/login').send({ email, password, portal: 'admin' })
+    expect(res.status).toBe(403)
+    expect(res.body.data?.emailOtpSession).toBeUndefined()
+    const codes = await db.query(
+      `SELECT 1 FROM login_email_otps c JOIN users u ON u.id = c.user_id WHERE u.email = $1`, [email])
+    expect(codes.rows).toHaveLength(0)
+  })
+
+  it('an admin at the admin console proceeds to the second factor', async () => {
+    const { email, password } = await user('admin')
+    const res = await request(buildApp()).post('/api/auth/login').send({ email, password, portal: 'admin' })
+    expect(res.status).toBe(200)
+  })
+
+  it('a portfolio manager may use admin-ops but not the full admin console', async () => {
+    const { email, password } = await user('portfolio_manager')
+    const ops = await request(buildApp()).post('/api/auth/login').send({ email, password, portal: 'admin_ops' })
+    expect(ops.status).toBe(200)
+    const full = await request(buildApp()).post('/api/auth/login').send({ email, password, portal: 'admin' })
+    expect(full.status).toBe(403)
+  })
+
+  it('a landlord signing in with no portal named is unaffected', async () => {
+    const { email, password } = await user('landlord')
+    const res = await request(buildApp()).post('/api/auth/login').send({ email, password })
+    expect(res.status).toBe(200)
+  })
+})
+
 // ─── S639: A RESET LINK GOES TO THE PORTAL YOU ACTUALLY SIGN IN TO ──────────
 //
 // Nic: "the link you sent me is a password reset request for the landlord page,

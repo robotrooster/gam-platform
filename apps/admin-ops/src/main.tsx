@@ -69,7 +69,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   // on the account. Doesn't set user state until the full JWT lands —
   // a totp_session JWT is not a valid auth token.
   const login = async (email: string, password: string): Promise<LoginResult> => {
-    const res = await axios.post(`${API}/api/auth/login`, { email, password })
+    const res = await axios.post(`${API}/api/auth/login`, { email, password, portal: 'admin_ops' })
     const data = res.data.data
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }

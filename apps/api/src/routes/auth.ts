@@ -152,6 +152,9 @@ const registerSchema = z.object({
 const loginSchema = z.object({
   email:    z.string().trim().toLowerCase().pipe(z.string().email()),
   password: z.string(),
+  // S650: the portal the sign-in came from. Only the staff consoles change
+  // anything — see the staff gate in /login.
+  portal:   z.enum(['admin', 'admin_ops']).optional(),
 })
 
 function signToken(payload: object) {
@@ -369,7 +372,7 @@ const LOGIN_LOCK_MINUTES = 15
 // POST /api/auth/login
 authRouter.post('/login', async (req, res, next) => {
   try {
-    const { email, password } = loginSchema.parse(req.body)
+    const { email, password, portal } = loginSchema.parse(req.body)
     const user = await queryOne<any>(
       `SELECT u.*,
               COALESCE(t.id, b.id) AS profile_id,
@@ -452,6 +455,19 @@ authRouter.post('/login', async (req, res, next) => {
         401,
         'Please verify your email before signing in. A new verification link was just sent.'
       )
+    }
+
+    // S650: the admin console signs in STAFF only, and says so before any
+    // second factor goes out. It used to share this route blind: a browser
+    // autofilled Nic's landlord address into the admin login, the password
+    // matched that landlord account, and the 2FA code was emailed to the
+    // landlord inbox — only to be refused after it was typed in.
+    const STAFF_ROLES: Record<string, string[]> = {
+      admin: ['admin', 'super_admin'],
+      admin_ops: ['admin', 'super_admin', 'portfolio_manager'],
+    }
+    if (portal && !STAFF_ROLES[portal].includes(user.role)) {
+      throw new AppError(403, 'This sign-in is for GAM staff accounts. Check the email address — landlords sign in at the landlord portal.')
     }
 
     // For landlord-assignable roles + business_staff, look up the scope

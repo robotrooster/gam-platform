@@ -195,8 +195,31 @@ describe('GET /api/admin/overview', () => {
     expect(typeof d.open_maintenance).toBe('number')
     expect(typeof d.zero_tolerance_events).toBe('number')
     expect(typeof d.csv_imports_pending_review).toBe('number')
-    // Fixture has 1 landlord
-    expect(d.total_landlords).toBe(1)
+    // S650: the fixture's landlord has signed up but brought no property yet.
+    expect(d.total_landlords).toBe(0)
+    expect(d.landlords_without_property).toBe(1)
+  })
+
+  it('S650: counts PEOPLE who brought a property — not companies, not co-owners', async () => {
+    const f = await seedAFixture()
+    const c = await db.connect()
+    try {
+      // The fixture landlord brings a property under a SECOND company too.
+      const second = await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [f.landlordUserId])
+      await seedProperty(c, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      await seedProperty(c, { landlordId: second.rows[0].id, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      // A co-owner who owns nothing of their own.
+      const co = await c.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'landlord', 'Co', 'Owner', TRUE) RETURNING id`, [`co-${randomUUID()}@test.dev`])
+      await c.query(`INSERT INTO landlords (user_id) VALUES ($1)`, [co.rows[0].id])
+      await c.query(`INSERT INTO landlord_members (landlord_id, user_id) VALUES ($1, $2)`, [f.landlordId, co.rows[0].id])
+    } finally { c.release() }
+    const res = await request(buildApp()).get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.body.data.total_landlords).toBe(1)            // one person, two companies
+    expect(res.body.data.landlords_without_property).toBe(0) // the co-owner is not a "no property" signup
   })
 
   it('plain admin (portfolio manager) → 403 (financials are super_admin only)', async () => {
