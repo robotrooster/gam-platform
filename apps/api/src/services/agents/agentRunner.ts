@@ -1271,6 +1271,7 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     message, profile.audience, profile.toolNames ?? [],
     lastUserMessage ? String((lastUserMessage as any).content) : undefined,
   )
+  const planForTurn = plan
   const routedTools = plan.tools
   const routedTool = routedTools[0]
 
@@ -1307,6 +1308,14 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   const runRoutedLookups = async (readsOnly: boolean, logMessage: string): Promise<boolean> => {
     if (!routedTool || toolInvocations.length > 0 || ranRoutedToolDirectly) return false
     if (!demandsAToolCall(message, profile.audience)) return false
+    // S650: up front, only what THIS message asks for. The table's follow-up
+    // fallback borrows the previous turn's subject, which is right for "and
+    // after that?" but wrong for "no thanks, I'll sort it out myself" — the
+    // eval caught a balance lookup re-run on a decline. The model still has the
+    // whole conversation and can call the lookup itself.
+    const plan = readsOnly ? routePlan(message, profile.audience, profile.toolNames ?? []) : planForTurn
+    const routedTools = plan.tools
+    if (!routedTools.length) return false
     // Every lookup this wording calls for that needs no argument from the
     // model. "Is my landlord gonna renew?" runs BOTH the lease and the
     // renewal tendency, because neither answers it alone.
