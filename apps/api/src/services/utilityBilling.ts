@@ -2105,6 +2105,49 @@ export async function releaseSuspendedChargesForLease(args: {
     SELECT * FROM suspended_utility_charges
      WHERE unit_id = $1 AND released_at IS NULL AND cancelled_at IS NULL
      ORDER BY billing_cycle_month`, [args.unitId])
+  // S649 (Nic): "We're not charging somebody that wasn't here for stuff they
+  // didn't use." A share is held because nobody on the site had a lease yet.
+  // For a resident being ONBOARDED, that usage is theirs — they lived there
+  // before they signed — so it releases onto their lease. For a NEW tenant it
+  // is somebody else's: once their lease exists their own usage bills to them
+  // directly, so anything held from before belongs to whoever was there. It is
+  // closed out (kept, with the reason — never on the newcomer's bill, never
+  // waiting for a later one) and the landlord is told the amount and dates, so
+  // they can bill the person who actually used it.
+  const leaseRow = await q1<{ is_existing_tenancy: boolean; start_date: string }>(
+    `SELECT is_existing_tenancy, to_char(start_date, 'YYYY-MM-DD') AS start_date FROM leases WHERE id = $1`, [args.leaseId])
+  if (held.length && leaseRow && !leaseRow.is_existing_tenancy) {
+    const total = round2(held.reduce((sum: number, h: any) => sum + Number(h.charge_amount || 0), 0))
+    await q(`
+      UPDATE suspended_utility_charges
+         SET cancelled_at = now(), updated_at = now(),
+             cancelled_reason = 'Used before the new tenant moved in — bill the prior occupant directly'
+       WHERE id = ANY($1::uuid[])`, [held.map((h: any) => h.id)])
+    const periods = held.map((h: any) =>
+      `${h.utility_type} ${h.reading_start_date ? String(h.reading_start_date).slice(0, 10) : cycleLabel(h.billing_cycle_month)}` +
+      `${h.reading_end_date ? ' to ' + String(h.reading_end_date).slice(0, 10) : ''} $${Number(h.charge_amount).toFixed(2)}`).join('; ')
+    try {
+      const owner = await q1<{ user_id: string; unit_number: string }>(
+        `SELECT l.user_id, u.unit_number FROM landlords l JOIN units u ON u.id = $2 WHERE l.id = $1`,
+        [args.landlordId, args.unitId])
+      if (owner) {
+        const { createNotification } = await import('./notifications')
+        await createNotification({
+          userId: owner.user_id, landlordId: args.landlordId, type: 'held_utility_prior_occupant',
+          title: `Unit ${owner.unit_number}: $${total.toFixed(2)} of utilities from before the new tenant moved in`,
+          body: `${periods}. That usage happened while nobody had a lease on the unit, so it is NOT on the new ` +
+            `tenant's bill and won't be put on anyone's automatically. Bill the person who was there — a pay link ` +
+            `from the register works.`,
+          data: { unitId: args.unitId, leaseId: args.leaseId, heldIds: held.map((h: any) => h.id) },
+        })
+      }
+    } catch (e) {
+      logger.error({ err: e, unitId: args.unitId }, '[utility] could not tell the landlord about prior-occupant usage')
+    }
+    logger.info({ unitId: args.unitId, leaseId: args.leaseId, count: held.length, total },
+      'utility billing: held shares closed out — a new tenant is not billed for usage before they moved in')
+    return { released: 0, amount: 0 }
+  }
   let released = 0
   let amount = 0
   for (const h of held) {

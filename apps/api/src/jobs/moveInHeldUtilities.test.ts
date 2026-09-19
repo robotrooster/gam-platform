@@ -40,6 +40,8 @@ async function seedStack(heldAmount = 185.01) {
       `UPDATE utility_meters SET utility_type='electric' WHERE id=$1`, [meterId])
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 500, startDate: '2026-09-02' })
     await seedLeaseTenant(client, { leaseId, tenantId })
+    // S649: held usage only ever belongs to a resident being onboarded
+    await client.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
     // The share held while the unit was mid-onboarding: real usage the
     // neighbours were already charged around.
     await client.query(

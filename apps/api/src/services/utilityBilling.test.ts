@@ -2132,6 +2132,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // The signed lease passes water through — release consults the terms.
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
@@ -2186,6 +2188,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // The lease EXPLICITLY refuses water, so releasing on signature cancels
       // the hold rather than billing it — lease is law.
       await c.query(
@@ -2249,6 +2253,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
         startDate: '2026-06-01',
       })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
          VALUES ($1,'water',true)`, [leaseId])
@@ -2333,6 +2339,8 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query('BEGIN')
       leaseId = await seedLease(c, { unitId: invited.unitId, landlordId: base.landlordId, rentAmount: 500 })
       await seedLeaseTenant(c, { leaseId, tenantId: invited.tenantId, role: 'primary' })
+      // S649: held usage only ever belongs to a resident being onboarded
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
       // Their signed lease says the LANDLORD covers water.
       await c.query(
         `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
