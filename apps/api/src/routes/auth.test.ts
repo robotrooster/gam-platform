@@ -842,6 +842,32 @@ describe('S639 login is case- and whitespace-insensitive on the address', () => 
   })
 })
 
+// ─── S650: A COMPLETED PASSWORD RESET PROVES THE ADDRESS ────────────────────
+// Ellen Gregory (Oak Park MH 02) reset her password from the link in her inbox
+// and then could not sign in: her account was never email-verified, so login
+// answered "verify your email first" on a password she had just set.
+describe('S650 resetting the password verifies the email', () => {
+  it('signs in straight after a reset on a never-verified account', async () => {
+    const email = `s650-reset-${randomUUID().slice(0, 8)}@test.dev`
+    const { rows: [u] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified, reset_token, reset_token_expires)
+       VALUES ($1, 'x', 'tenant', 'Ellen', 'Gregory', FALSE, 'tok-s650', NOW() + interval '1 hour') RETURNING id`, [email])
+    await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
+
+    const reset = await request(buildApp()).post('/api/auth/reset-password')
+      .send({ token: 'tok-s650', newPassword: 'CorrectHorse!2026' })
+    expect(reset.status).toBe(200)
+    const after = (await db.query(`SELECT email_verified, email_verified_at FROM users WHERE id=$1`, [u.id])).rows[0]
+    expect(after.email_verified).toBe(true)
+    expect(after.email_verified_at).not.toBeNull()
+
+    const login = await request(buildApp()).post('/api/auth/login')
+      .send({ email, password: 'CorrectHorse!2026' })
+    expect(login.status).toBe(200)            // reaches the 2FA step, not the verify wall
+    expect(login.body.data.requiresEmailOtp).toBe(true)
+  })
+})
+
 // ─── S650: THE ADMIN CONSOLE SIGNS IN STAFF ONLY ─────────────────────────────
 // A browser autofilled Nic's landlord address into the admin login; the
 // password matched the landlord account and the 2FA code went to the landlord

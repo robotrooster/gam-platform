@@ -128,7 +128,11 @@ function AuthedVideo({ path, style }: { path: string; style?: React.CSSPropertie
 const LAUNCH_HIDDEN = new Set<string>(['/credit', '/my-disputes'])
 const LAUNCH_HIDE_FITNESS = true
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e => { if(e.response?.status===401){localStorage.removeItem('gam_tenant_token');window.location.href='/login'} return Promise.reject(e) })
+// S650 (Ellen Gregory, Oak Park MH 02): REMOVED — a SECOND 401 handler on the
+// same axios client, without lib/api.ts's /auth/ carve-out. A refused sign-in
+// (hers: "verify your email first") wiped the token and reloaded /login before
+// the form could show the message, so the page just blinked and said nothing.
+// lib/api.ts already installs the correct one.
 // S312: snake_case → camelCase response transform (see lib/api.ts comment + packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)

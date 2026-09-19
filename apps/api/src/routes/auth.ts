@@ -1074,6 +1074,13 @@ authRouter.post('/reset-password', async (req, res, next) => {
               reset_token_expires = NULL,
               failed_login_count = 0,
               locked_until = NULL,
+              -- S650 (Ellen Gregory, Oak Park MH 02): the reset link went to
+              -- her inbox and she used it, which proves the address as surely
+              -- as a verification link does. Leaving email_verified FALSE sent
+              -- her straight into "verify your email first" on a password she
+              -- had just set, with no way out but another email.
+              email_verified = TRUE,
+              email_verified_at = COALESCE(email_verified_at, NOW()),
               updated_at = NOW()
         WHERE id = $2`,
       [hash, user.id],

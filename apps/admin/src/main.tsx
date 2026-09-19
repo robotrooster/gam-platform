@@ -36,7 +36,7 @@ const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
 const api = axios.create({ baseURL: `${API}/api` })
 api.interceptors.request.use(c => { const t=localStorage.getItem('gam_admin_token'); if(t)c.headers.Authorization=`Bearer ${t}`; return c })
-api.interceptors.response.use(r=>r, e=>{if(e.response?.status===401&&!e.config.url.includes('/auth/me')&&!e.config.url.includes('/auth/login')){localStorage.removeItem('gam_admin_token');window.location.href='/login'}return Promise.reject(e)})
+api.interceptors.response.use(r=>r, e=>{if(e.response?.status===401&&!String(e.config?.url||'').includes('/auth/')){localStorage.removeItem('gam_admin_token');window.location.href='/login'}return Promise.reject(e)})
 // S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
 applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>{const t=localStorage.getItem('gam_admin_token');if(t)api.defaults.headers.common['Authorization']='Bearer '+t;return api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)}

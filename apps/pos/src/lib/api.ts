@@ -23,7 +23,10 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
+    // S650: a 401 on an /auth/ call is a sign-in answer (wrong password, wrong
+    // code, unverified email) that the form shows inline. Hard-navigating here
+    // RELOADS the page and destroys that message — the screen just blinks.
+    if (err.response?.status === 401 && !String(err.config?.url || '').includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
     }
