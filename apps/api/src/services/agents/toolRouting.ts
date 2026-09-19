@@ -763,6 +763,25 @@ const LANDLORD_ROUTES: PhraseRoute[] = [
     ],
   },
   {
+    // S650: "can you waive the late fee on 204?" — the agent never waives (the
+    // landlord applies a credit), but it has to look at 204 first so it can say
+    // which fee, how much and where to credit it. Without a route the model
+    // answered from nothing and the claim guard replaced it with "which unit?".
+    tools: ['get_unit_lease'],
+    audience: 'landlord',
+    means: 'the unit a landlord wants a fee waived or credited on',
+    extractArgs: (m) => {
+      const u = UNIT_RE.exec(m)
+      if (u) return { unit: `${u[1]} ${u[2]}` }
+      const bare = /\b(?:on|for|in|at)\s+#?(\d{1,5}[a-z]?)\b/i.exec(m)
+      return bare ? { unit: bare[1] } : undefined
+    },
+    patterns: [
+      /\b(waive|forgive|remove|drop|take off|credit( back)?|reverse)\b[^?]{0,40}\b(late )?fees?\b/i,
+      /\blate fees?\b[^?]{0,30}\b(waive|waived|forgive|removed?|credit)\b/i,
+    ],
+  },
+  {
     // ONE named unit's lease. Above get_lease_expirations, which is "ending
     // SOON" — a lease that ends in two years is invisible to that one.
     tools: ['get_unit_lease'],

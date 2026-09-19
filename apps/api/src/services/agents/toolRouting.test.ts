@@ -306,6 +306,12 @@ describe('portfolio analytics', () => {
     ]) expect(landlord(m), m).toBe('get_portfolio_stats')
   })
 
+  // S650: a waiver request looks at the unit first (the landlord applies the credit).
+  it('looks up the unit a landlord wants a late fee waived on', () => {
+    expect(landlord('can you waive the late fee on 204?')).toBe('get_unit_lease')
+    expect(landlord('please remove the late fee on RV 12')).toBe('get_unit_lease')
+  })
+
   // S650: "Get Paid" on the setup screen is a step, not a payout question.
   it('sends the Get Paid setup step to setup progress, and payout timing to payouts', () => {
     for (const m of [
