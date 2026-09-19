@@ -81,3 +81,21 @@ Everything is committed and pushed. The API and the landlord portal are live.
 - **David (landlord agent) went unresponsive.** The mlx model server (com.gam.model, :8080) crashed with METAL "Insufficient Memory" (GPU out of memory); launchd restarted it and it works again.
   - **TODO, permanent fix:** cap the KV/prompt cache (mlx_lm.server prompt-cache limits or an MLX memory limit), and add a watchdog that restarts it cleanly before memory fills.
   - Background: memory gam-agent-gpu-memory-limits — mlx never evicts its cache and aborts rather than queueing.
+
+## PRIORITY next session: David (landlord agent) is slow and crashes the model
+Measured 2026-09-18, from agent_interaction_logs:
+- **Prompt tokens per turn:** 32,769 for "Are you there?" (31 s); 47,371 for a background-check question (141 s); 75,861 for "It says get paid what do i do?" (277 s, with a get_my_payouts call).
+- **Where it comes from, for the landlord entry profile:**
+  - System prompt: 30,944 chars.
+  - Selected tools: 38 of 237, about 28,400 chars of schema.
+  - Plus the knowledge context block, tool results and history.
+- **Why it hurts:** the model prefills at roughly 1,000 tok/s. Two concurrent turns exhausted Metal memory, so the model server aborted (OOM crash above).
+- **S628 measurement:** tool-calling breaks above about 8 KB of system prompt. The two-pass flag (AGENT_TWO_PASS) exists but is off.
+
+**Fix plan:**
+1. Shrink the landlord and tenant system prompts to a small core (under 8 KB) and move the reference material into knowledge-base articles.
+2. Cap the knowledge context block and each tool result (truncate or summarize large payloads).
+3. Turn on mlx prompt-prefix caching so the static system prompt and tool block aren't re-prefilled every turn.
+4. Evaluate AGENT_TWO_PASS for turning it on.
+5. Keep the concurrency gate at 1 per model until memory is fixed.
+6. Log prompt_tokens per turn to the API log so this is visible.
