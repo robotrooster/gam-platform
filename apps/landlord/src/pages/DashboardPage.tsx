@@ -116,7 +116,8 @@ export function DashboardPage() {
   // money. It is out of Expected and out of Outstanding, and stands on its own
   // so the landlord can still see what the trades are worth.
   const workTradeUnits = Number(stats?.workTradeUnits ?? 0)
-  const payableUnits   = Math.max(rentRollUnits - workTradeUnits, 0)
+  // S650: hibernating leases are asleep — occupied, never payable.
+  const payableUnits   = Math.max(rentRollUnits - workTradeUnits - Number((stats as any)?.hibernatingUnits ?? 0), 0)
   const platformFee = stats?.platformFee ?? 0
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
@@ -268,11 +269,8 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
-          <div className="kpi-sub">
-            unpaid invoice balances
-            {Number(stats?.workTradeSuspended ?? 0) > 0
-              && ` · ${fmtWhole(Number(stats?.workTradeSuspended))} more suspended while it is worked off`}
-          </div>
+          {/* S650 (Nic): no small print about work-trade balances here. */}
+          <div className="kpi-sub">unpaid invoice balances</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
         <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>

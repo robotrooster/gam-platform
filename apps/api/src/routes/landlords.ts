@@ -700,8 +700,14 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         --
         -- So it comes out of both and gets its own figure. Not deleted, not
         -- hidden: a landlord should be able to see what the trades are worth.
+        -- S650 (Nic): a HIBERNATING lease is asleep — the space stays occupied
+        -- and unavailable, and nothing bills. Out of Expected, like work trade.
         COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
-                            AND NOT COALESCE(wt.trades_rent, FALSE) THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+                            AND NOT COALESCE(wt.trades_rent, FALSE)
+                            AND NOT COALESCE(hb.asleep, FALSE) THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        COUNT(*) FILTER (WHERE u.status IN ('active','delinquent','suspended')
+                           AND NOT COALESCE(wt.trades_rent, FALSE)
+                           AND COALESCE(hb.asleep, FALSE))::int AS hibernating_units,
         COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended')
                             AND COALESCE(wt.trades_rent, FALSE) THEN u.rent_amount ELSE 0 END),0) AS work_trade_rent,
         COUNT(*) FILTER (WHERE u.status IN ('active','delinquent','suspended')
@@ -717,6 +723,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
          WHERE a.unit_id = u.id AND a.status = 'active'
            AND 'rent' = ANY(a.covered_charges) LIMIT 1
       ) wt ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT TRUE AS asleep FROM leases hl
+         WHERE hl.unit_id = u.id AND hl.status = 'active' AND hl.is_hibernating LIMIT 1
+      ) hb ON TRUE
       WHERE u.landlord_id = ANY($1)
         AND ($2::uuid IS NULL OR p.id = $2)`, [scopeIds, propertyFilter])
     // S605 (Nic): the dashboard never said that payouts were unverified, so a
@@ -1085,7 +1095,9 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
         -- the list — it IS rented, and hiding it would make the roll disagree
         -- with the unit count beside it — but its rent is labelled and totalled
         -- separately, because it is never arriving as money.
-        COALESCE(wt.trades_rent, FALSE) AS work_trade
+        COALESCE(wt.trades_rent, FALSE) AS work_trade,
+        -- S650: asleep — listed, totalled apart, never payable.
+        COALESCE(l.is_hibernating, FALSE) AS hibernating
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN LATERAL (
@@ -1096,7 +1108,7 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
       -- LATERAL + LIMIT 1: nothing enforces one active lease per unit at the
       -- schema layer, and a stray duplicate would double-count the roll.
       LEFT JOIN LATERAL (
-        SELECT id, start_date, end_date, lease_type FROM leases
+        SELECT id, start_date, end_date, lease_type, is_hibernating FROM leases
         WHERE unit_id = u.id AND status = 'active'
         ORDER BY start_date DESC LIMIT 1
       ) l ON TRUE
@@ -1117,7 +1129,10 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
       WHERE u.landlord_id = ANY($1::uuid[])
         AND u.status IN ('active','delinquent','suspended')
       ORDER BY p.name, u.unit_number`, [rentRollIds])
-    const cash = rows.filter((r: any) => !r.work_trade)
+    // A hibernating lease with a (paused) trade is asleep first: nothing is
+    // owed in money OR in hours while it sleeps.
+    for (const r of rows as any[]) if (r.hibernating) r.work_trade = false
+    const cash = rows.filter((r: any) => !r.work_trade && !r.hibernating)
         .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
     const traded = rows.filter((r: any) => r.work_trade)
         .reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
@@ -1126,6 +1141,7 @@ landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
       total: Math.round(cash * 100) / 100,
       work_trade_total: Math.round(traded * 100) / 100,
       work_trade_units: rows.filter((r: any) => r.work_trade).length,
+      hibernating_units: rows.filter((r: any) => r.hibernating).length,
     } })
   } catch (e) { next(e) }
 })

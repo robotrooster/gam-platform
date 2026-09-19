@@ -39,8 +39,10 @@ export function RentRollPage() {
   // don't keep track of it in the outstanding balance or the expected monthly
   // rent." The traded spaces stay on the roll — they ARE rented — but their
   // rent is its own figure, never folded into what the landlord is expecting.
-  const cashRows   = rows.filter((r: any) => !r.workTrade)
-  const tradedRows = rows.filter((r: any) => r.workTrade)
+  // S650: a hibernating lease is asleep — listed, never payable, not traded.
+  const cashRows   = rows.filter((r: any) => !r.workTrade && !r.hibernating)
+  const tradedRows = rows.filter((r: any) => r.workTrade && !r.hibernating)
+  const asleepRows = rows.filter((r: any) => r.hibernating)
   const total  = cashRows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
   const traded = tradedRows.reduce((s: number, r: any) => s + Number(r.rentAmount || 0), 0)
 
@@ -64,6 +66,13 @@ export function RentRollPage() {
           <div className="kpi-value gold">{fmt(total)}</div>
           <div className="kpi-sub">payable across {cashRows.length} occupied unit{cashRows.length === 1 ? '' : 's'}</div>
         </div>
+        {asleepRows.length > 0 && (
+          <div className="kpi-card">
+            <div className="kpi-label">Hibernating</div>
+            <div className="kpi-value">{asleepRows.length}</div>
+            <div className="kpi-sub">occupied and held — nothing bills while asleep</div>
+          </div>
+        )}
         {tradedRows.length > 0 && (
           <div className="kpi-card">
             <div className="kpi-label">Traded For Work</div>
@@ -90,7 +99,7 @@ export function RentRollPage() {
       ) : (
         Object.entries(byProperty).map(([propertyName, propRows]) => {
           const subtotal = (propRows as any[])
-            .filter(r => !r.workTrade)
+            .filter(r => !r.workTrade && !r.hibernating)
             .reduce((s, r) => s + Number(r.rentAmount || 0), 0)
           return (
             <div key={propertyName} style={{ marginBottom: 20 }}>
@@ -118,7 +127,9 @@ export function RentRollPage() {
                         <td><span className={`badge ${STATUS_COLORS[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
                         <td className="mono" style={{ textAlign: 'right', fontWeight: 600 }}>
                           {fmt(r.rentAmount)}
-                          {r.workTrade && (
+                          {r.hibernating ? (
+                            <div style={{ fontSize: '.68rem', fontWeight: 400, color: 'var(--text-3)' }}>hibernating — not billed</div>
+                          ) : r.workTrade && (
                             <div style={{ fontSize: '.68rem', fontWeight: 400, color: 'var(--text-3)' }}>traded for work</div>
                           )}
                         </td>

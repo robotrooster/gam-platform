@@ -403,7 +403,9 @@ async function allocationBases(
        WHERE EXISTS (
          SELECT 1 FROM leases l
           WHERE l.id = v_lease_active_tenants.lease_id
-            AND l.unit_id = $1 AND l.status = 'active')`, [unitId])
+            AND l.unit_id = $1 AND l.status = 'active'
+            -- S650: asleep for the whole cycle → nobody there to count.
+            AND NOT (COALESCE(l.is_hibernating, FALSE) AND l.hibernated_at <= $2::date))`, [unitId, cycleIso])
     const signed = Number(c?.count || 0)
     if (signed > 0) return signed
     const pending = await queryOne<{ count: string }>(`
@@ -423,7 +425,9 @@ async function allocationBases(
        WHERE l.unit_id = $1
          AND l.status IN ('active', 'expired', 'terminated')
          AND l.start_date <= $2::date
-         AND COALESCE(l.end_date, '9999-12-31'::date) > $2::date`, [unitId, cycleIso])
+         AND COALESCE(l.end_date, '9999-12-31'::date) > $2::date
+         -- S650: a lease asleep for the whole cycle takes no share.
+         AND NOT (COALESCE(l.is_hibernating, FALSE) AND l.hibernated_at <= $2::date)`, [unitId, cycleIso])
     return Number(r?.n || 0) > 0
   }
 
@@ -1530,6 +1534,58 @@ interface InsertBillArgs {
  * re-runnable by design, so a second run for the same cycle must not hold the
  * same share twice.
  */
+/**
+ * S650: is the onboarding window open for this unit's property? Same rule as
+ * services/onboardingWindow.getOnboardingWindow — started, not completed, and
+ * inside 14 days + 1 per 10 units (capped at 30) — in one query.
+ */
+async function onboardingWindowOpenForUnit(unitId: string): Promise<boolean> {
+  const { ONBOARDING_WINDOW_BASE_DAYS, ONBOARDING_WINDOW_DAYS_PER_UNITS, ONBOARDING_WINDOW_CAP_DAYS } =
+    await import('./onboardingWindow')
+  const row = await queryOne<{ open: boolean }>(`
+    SELECT (p.onboarding_started_at IS NOT NULL AND p.onboarding_completed_at IS NULL
+            AND now() < p.onboarding_started_at + make_interval(days => LEAST($4::int,
+                  $2::int + (SELECT COUNT(*)::int FROM units x WHERE x.property_id = p.id) / $3::int)))
+           AS open
+      FROM units u JOIN properties p ON p.id = u.property_id
+     WHERE u.id = $1`,
+    [unitId, ONBOARDING_WINDOW_BASE_DAYS, ONBOARDING_WINDOW_DAYS_PER_UNITS, ONBOARDING_WINDOW_CAP_DAYS])
+  return !!row?.open
+}
+
+/**
+ * S650 (Nic): held utilities expire with the onboarding window.
+ *
+ * "When it closes, electric that's held that nobody claims, or any other
+ * utilities held that nobody claims, we'll just anticipate those to be settled
+ * off platform because somebody moved out just before or in the middle of the
+ * onboarding window ... we will not bill that to anybody else." Mountain View
+ * RV 16 (Harold Cunningham, billed off-platform) and RV 30 were the first two.
+ *
+ * Closed out, never deleted — the row keeps its amount, dates and the reason.
+ * Runs nightly; idempotent.
+ */
+export async function expireHeldChargesAfterOnboarding(): Promise<{ closed: number; amount: number }> {
+  const { ONBOARDING_WINDOW_BASE_DAYS, ONBOARDING_WINDOW_DAYS_PER_UNITS, ONBOARDING_WINDOW_CAP_DAYS } =
+    await import('./onboardingWindow')
+  const rows = await query<{ id: string; charge_amount: string }>(`
+    UPDATE suspended_utility_charges sc
+       SET cancelled_at = now(), updated_at = now(),
+           cancelled_reason = 'Onboarding window closed with nobody claiming it — presumed settled off-platform (resident left before signing)'
+      FROM units u JOIN properties p ON p.id = u.property_id
+     WHERE sc.unit_id = u.id
+       AND sc.released_at IS NULL AND sc.cancelled_at IS NULL
+       AND (p.onboarding_completed_at IS NOT NULL
+            OR (p.onboarding_started_at IS NOT NULL
+                AND now() >= p.onboarding_started_at + make_interval(days => LEAST($3::int,
+                      $1::int + (SELECT COUNT(*)::int FROM units x WHERE x.property_id = p.id) / $2::int))))
+    RETURNING sc.id, sc.charge_amount`,
+    [ONBOARDING_WINDOW_BASE_DAYS, ONBOARDING_WINDOW_DAYS_PER_UNITS, ONBOARDING_WINDOW_CAP_DAYS])
+  const amount = round2(rows.reduce((sum, r) => sum + Number(r.charge_amount || 0), 0))
+  if (rows.length) logger.info({ closed: rows.length, amount }, 'utility billing: unclaimed holds expired with the onboarding window')
+  return { closed: rows.length, amount }
+}
+
 async function holdChargeForPendingUnit(args: InsertBillArgs): Promise<boolean> {
   const pending = await queryOne<{ n: string; landlord_id: string }>(`
     SELECT COUNT(pti.id)::text AS n, u.landlord_id
@@ -1539,6 +1595,10 @@ async function holdChargeForPendingUnit(args: InsertBillArgs): Promise<boolean> 
      WHERE u.id = $1
      GROUP BY u.landlord_id`, [args.unitId])
   if (!pending || Number(pending.n) === 0) return false
+  // S650 (Nic): a share is held only DURING the property's onboarding window.
+  // Holding exists so a resident being onboarded is billed their pre-lease
+  // usage; once the window has closed there is nobody that could belong to.
+  if (!await onboardingWindowOpenForUnit(args.unitId)) return false
 
   try {
     await query(`
@@ -1691,6 +1751,17 @@ export async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
     serviceAgreementId = sa.id
     lt = { lease_id: null as any, tenant_id: sa.tenant_id }
   } else {
+    // S650 (Nic): a HIBERNATING lease is asleep — "nothing bills". Asleep for
+    // the whole cycle means no utility bill either; the landlord absorbs any
+    // draw, as for an empty space.
+    const asleep = await queryOne<{ asleep: boolean }>(`
+      SELECT (COALESCE(is_hibernating, FALSE) AND hibernated_at <= $2::date) AS asleep
+        FROM leases WHERE id = $1`, [lt.lease_id, args.cycleMonth])
+    if (asleep?.asleep) {
+      logger.info({ leaseId: lt.lease_id, unitId: args.unitId, cycle: args.cycleMonth },
+        'utility billing: lease hibernating for the cycle — not billed')
+      return false
+    }
     // Tenant responsibility gate — leases only. See the S610 handoff §1a.
     if (!await tenantOwesUtility(lt.lease_id, args.utilityType, args.meterId)) return false
   }

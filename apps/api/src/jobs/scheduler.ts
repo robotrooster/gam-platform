@@ -1730,6 +1730,18 @@ export function schedulerInit() {
     }
   })
 
+  // S650 (Nic): held utilities nobody claimed by the time a property's
+  // onboarding window closes are presumed settled off-platform.
+  cron.schedule('40 3 * * *', async () => {
+    try {
+      const { expireHeldChargesAfterOnboarding } = await import('../services/utilityBilling')
+      const r = await expireHeldChargesAfterOnboarding()
+      if (r.closed) logger.info(r, '[held-utility-expiry]')
+    } catch (e) {
+      logger.error({ err: e }, '[held-utility-expiry] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S648: every cent GAM takes must be recorded against someone, and nobody
   // should owe GAM back for long without it being seen.
   cron.schedule('45 3 * * *', async () => {

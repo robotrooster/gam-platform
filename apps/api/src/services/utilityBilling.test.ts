@@ -27,6 +27,7 @@ import {
 } from '../test/dbHelpers'
 import {
   generateBillsForMeter, generateBillsForProperty, generateBillsForLandlord,
+  expireHeldChargesAfterOnboarding,
   billMoveOutRead, ensureBillsForUnit, releaseSuspendedChargesForLease,
 } from './utilityBilling'
 
@@ -2056,6 +2057,33 @@ describe('S616 a serviced space bills by every method', () => {
  * dropped from the pool. With 6 of 30 signed, those 6 split the water for all
  * 30 — a 5x overcharge on the people who signed on time.
  */
+describe('S650 hibernating leases are asleep — nothing bills', () => {
+  it('takes no RUBS share and gets no bill; the awake neighbour carries the whole master', async () => {
+    const base = await seedBaseProperty()
+    const c = await db.connect()
+    let meterId = ''
+    try {
+      await c.query('BEGIN')
+      meterId = await seedUtilityMeter(c, { propertyId: base.propertyId, billingMethod: 'submeter' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await setMeterRubs(meterId, 'occupant_count')
+    await setMeterRateBase(meterId, 1, 0)
+    const awake = await seedUnitWithActiveTenant(base)
+    const asleep = await seedUnitWithActiveTenant(base)
+    await db.query(`UPDATE leases SET is_hibernating = TRUE, hibernated_at = '2026-04-15' WHERE id = $1`, [asleep.leaseId])
+    await attachMeterToUnit(meterId, awake.unitId)
+    await attachMeterToUnit(meterId, asleep.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const bills = await db.query<any>(`SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    expect(bills.rows).toHaveLength(1)
+    expect(bills.rows[0].unit_id).toBe(awake.unitId)
+    expect(Number(bills.rows[0].charge_amount)).toBe(100)
+  })
+})
+
 describe('suspended utility charges for units mid-onboarding', () => {
   async function rubsMeter(base: BaseCtx): Promise<string> {
     const c = await db.connect()
@@ -2079,6 +2107,10 @@ describe('suspended utility charges for units mid-onboarding', () => {
       await c.query(
         `INSERT INTO pending_tenant_intents (unit_id, tenant_id, landlord_id, property_id)
          VALUES ($1,$2,$3,$4)`, [unitId, tenantId, base.landlordId, base.propertyId])
+      // S650: shares are only held while the property is being onboarded.
+      await c.query(
+        `UPDATE properties SET onboarding_started_at = COALESCE(onboarding_started_at, now())
+          WHERE id = $1`, [base.propertyId])
       await c.query('COMMIT')
       return { unitId, tenantId }
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
@@ -2112,6 +2144,60 @@ describe('suspended utility charges for units mid-onboarding', () => {
     expect(held.rows).toHaveLength(1)
     expect(Number(held.rows[0].charge_amount)).toBe(50)
     expect(held.rows[0].released_at).toBeNull()
+  })
+
+  // S650 (Nic): held only DURING the onboarding window, and anything nobody
+  // claimed by the time it closes is presumed settled off-platform.
+  it('holds nothing once the onboarding window has closed', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await db.query(`UPDATE properties SET onboarding_completed_at = now() WHERE id = $1`, [base.propertyId])
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    const held = await db.query(`SELECT 1 FROM suspended_utility_charges WHERE unit_id=$1`, [invited.unitId])
+    expect(held.rows).toHaveLength(0)
+  })
+
+  it('expires unclaimed holds when the window closes, and leaves open windows alone', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await rubsMeter(base)
+    await setMeterRateBase(meterId, 1, 0)
+    const signed = await seedUnitWithActiveTenant(base)
+    const invited = await seedInvitedUnit(base)
+    await attachMeterToUnit(meterId, signed.unitId)
+    await attachMeterToUnit(meterId, invited.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+
+    // Window still open: nothing expires.
+    await expireHeldChargesAfterOnboarding()
+    let held = await db.query<any>(
+      `SELECT charge_amount, cancelled_at, cancelled_reason FROM suspended_utility_charges WHERE unit_id=$1`,
+      [invited.unitId])
+    expect(held.rows).toHaveLength(1)
+    expect(held.rows[0].cancelled_at).toBeNull()
+
+    // 60 days on, the window (at most 30) has long closed.
+    await db.query(`UPDATE properties SET onboarding_started_at = now() - interval '60 days' WHERE id = $1`,
+      [base.propertyId])
+    await expireHeldChargesAfterOnboarding()
+    held = await db.query<any>(
+      `SELECT charge_amount, cancelled_at, cancelled_reason, released_at FROM suspended_utility_charges WHERE unit_id=$1`,
+      [invited.unitId])
+    expect(held.rows).toHaveLength(1)                       // kept, never deleted
+    expect(held.rows[0].cancelled_at).not.toBeNull()
+    expect(held.rows[0].released_at).toBeNull()
+    expect(held.rows[0].cancelled_reason).toMatch(/settled off-platform/)
+    expect(Number(held.rows[0].charge_amount)).toBe(50)
+    // ...and it is on nobody's bill.
+    const bills = await db.query(`SELECT 1 FROM utility_bills WHERE unit_id=$1`, [invited.unitId])
+    expect(bills.rows).toHaveLength(0)
   })
 
   it('releases the held share onto the lease when it is signed', async () => {
