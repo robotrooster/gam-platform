@@ -352,9 +352,18 @@ const ABOUT_THE_AGENT = new RegExp([
  * and returns the truth; a skipped one is how a tenant hears a number that was
  * never in the database.
  */
+/**
+ * S650: a DECLINE is not a request. "no thanks, I'll sort it out myself later"
+ * was classed as an account question, so the S618 fallback re-ran the balance
+ * lookup the person had just turned down and the reply re-sold it.
+ */
+const A_DECLINE =
+  /^\s*(?:no|nope|nah|not now|not right now|no need)\b[\s,.!-]*(?:thanks?|thank you|ty|i'?m (?:good|ok|okay|fine)|that'?s (?:ok|okay|fine|all)|i'?ll\b|maybe later|later|all good)\b/i
+
 export function demandsAToolCall(message: string, audience?: string): boolean {
   if (!message || !message.trim()) return false
   if (NOT_A_REQUEST.test(message)) return false
+  if (A_DECLINE.test(message)) return false
   // S624: a question ABOUT THE AGENT is not a question about the customer's
   // account, and no tool can answer it.
   if (ABOUT_THE_AGENT.test(message)) return false

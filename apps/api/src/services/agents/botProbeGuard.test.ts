@@ -58,6 +58,14 @@ describe('questions about the agent', () => {
     expect(demandsAToolCall('are you there with my balance', 'tenant')).toBe(true)
   })
 
+  // S650: turning down an offer is not asking for data.
+  it('a decline is not an account question', () => {
+    for (const m of ["no thanks, I'll sort it out myself later", 'no thank you', "nah I'm good", 'not now, thanks', "no, I'll handle it"])
+      expect(demandsAToolCall(m, 'tenant'), m).toBe(false)
+    // ...but "no" followed by a real question still is.
+    expect(demandsAToolCall('no, what do I owe?', 'tenant')).toBe(true)
+  })
+
   it('greetings are still exempt, as before', () => {
     expect(demandsAToolCall('hey', 'tenant')).toBe(false)
     expect(demandsAToolCall('thanks!', 'tenant')).toBe(false)
