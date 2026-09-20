@@ -34,10 +34,11 @@
  * A landlord with no usable bank link cannot be debited. That is a COLLECTION
  * FAILURE, not an exemption: it alerts, and the debt stays owed.
  *
- * WHAT THE LANDLORD SEES, and why it is two numbers:
- *   Platform fee — September    $130.00
- *   Bank transfer cost          $  1.04
- * rather than one $131.04 they can't reconcile against anything. The cost is a
+ * WHAT THE LANDLORD SEES, and why it is two numbers. Mountain View's September
+ * platform fee was $82 (41 spots) — one landlord, one company, one park:
+ *   Platform fee — September    $82.00
+ *   Bank transfer cost          $ 6.00
+ * rather than one $88.00 they can't reconcile against anything. The cost is a
  * real landlord_gam_charges row (kind 'bank_debit_cost') so it lands in the
  * same statement as everything else, gets collected the same way, and shows up
  * in the same total. A number a landlord can argue with is a number they don't
@@ -49,25 +50,35 @@ import { getStripe } from '../lib/stripe'
 import { getClient, query, queryOne } from '../db'
 import { logger } from '../lib/logger'
 import { chargeLandlord, outstandingForLandlord, debitThresholdForLandlord } from './landlordGamAccount'
+// GAM has ONE ACH price — $6 flat — and a fee debit is not allowed to invent a
+// second one. See ACH_DEBIT_FLAT below.
+import { PROCESSING_FEES } from '@gam/shared'
 
 /**
- * Stripe's ACH debit price: 0.8% of the amount, capped at $5.00.
+ * An ACH transfer costs $6 flat. GAM has exactly one ACH price and this is it.
  *
- * Hardcoded rather than read from Stripe because Stripe does not expose it per
- * charge — on unbundled pricing it attributes no cost to an individual pull and
- * bills the real total as a daily aggregate (the same thing that makes the
- * per-payment margin an estimate, see the daily true-up). This number is
- * therefore the PUBLISHED price, which is what the landlord is being shown and
- * charged. If Stripe's published price changes, change it here.
+ * $6 flat at any amount — no percentage, no cap, no second answer depending on
+ * the size of the transfer. It is the only bank number anyone at GAM states, on
+ * rent and here alike, and a fee debit is not allowed to invent a different
+ * one: a landlord reading some other figure beside the $6 on their own tenant's
+ * rent would be right to ask which of the two was the lie.
+ *
+ * Read from the shared schedule rather than copied, so a reprice carries this
+ * with it instead of leaving it behind. Do not replace this with a processor's
+ * published rate card; GAM's schedule is the schedule.
+ * (memory: gam-ach-fee-schedule-untouchable)
+ *
+ * NOTE THE PROPORTION, because it is the argument for the threshold: $6 against
+ * Oak Park's $48 September fee is 12.5%. Collecting little and often by bank
+ * transfer is expensive for the landlord, which is exactly why the debt waits
+ * below the threshold and why netting is always tried first.
  */
-export const ACH_DEBIT_RATE = 0.008
-export const ACH_DEBIT_CAP = 5.0
+export const ACH_DEBIT_FLAT = PROCESSING_FEES.ACH_FLAT
 
-/** What the pull itself will cost, to the cent. Never more than the cap. */
+/** What the transfer itself costs. Flat, at any amount. */
 export function bankCostFor(amount: number): number {
   if (amount <= 0) return 0
-  const raw = amount * ACH_DEBIT_RATE
-  return Math.round(Math.min(raw, ACH_DEBIT_CAP) * 100) / 100
+  return ACH_DEBIT_FLAT
 }
 
 export interface DebitOutcome {
@@ -184,7 +195,7 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
         // deterministic per pull: the in-flight guard above already stops a
         // second pull, and a retry of THIS one must not add a second cost line
         sourceId: null,
-        notes: `What the bank transfer cost to collect $${owed.toFixed(2)} of GAM charges`,
+        notes: `Bank transfer to collect $${owed.toFixed(2)} of GAM charges — $6 flat, GAM's one ACH price`,
       })
       if (costChargeId) chargeIds.push(costChargeId)
     }

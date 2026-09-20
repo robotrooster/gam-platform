@@ -97,8 +97,9 @@ function GamChargesSection() {
         which is why a payout can land smaller than the rent collected. The difference is itemised
         below. If a property takes only cash there’s no payout to take them from, and once the
         balance passes {fmt(banks[0]?.threshold ?? 100)} they’re transferred from your linked bank
-        instead{banks[0]?.gam_debit_bank_last4 ? ` (ending ${banks[0].gam_debit_bank_last4})` : ''}.
-        That transfer’s own cost is charged as its own line, so you can check both numbers.
+        instead{banks[0]?.gam_debit_bank_last4 ? ` (ending ${banks[0].gam_debit_bank_last4})` : ''},
+        plus {fmt(data?.bankTransferCost ?? 6)} for the transfer, shown as its own line so you can
+        check both numbers.
       </div>
 
       {missingBank.length > 0 && (

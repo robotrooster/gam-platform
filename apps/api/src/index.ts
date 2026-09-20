@@ -99,6 +99,8 @@ import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { signingPackagesRouter } from './routes/signingPackages'
 import { backgroundRouter }   from './routes/background'
+// S651: the renter's own view of the pool — places near THEM, no company involved.
+import { renterPoolRouter }   from './routes/renterPool'
 import { emergencyContactsRouter } from './routes/emergencyContacts'
 import { announcementsRouter }  from './routes/announcements'
 import { surveysRouter }        from './routes/surveys'
@@ -448,6 +450,7 @@ app.use('/api/bank-accounts',  bankAccountsRouter)
 app.use('/api/admin',          adminBankAccountsRouter)
 app.use('/api/users',          financesRouter)
 app.use('/api/books',          booksRouter)
+app.use('/api/renter-pool',    renterPoolRouter)
 app.use('/api/scopes',         scopesRouter)
 app.use('/api/invitations',    invitationsRouter)
 app.use('/api/pm',             pmRouter)

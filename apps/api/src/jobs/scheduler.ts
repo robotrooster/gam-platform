@@ -1762,6 +1762,19 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S651: a park with no coordinates is invisible to every renter searching
+  // nearby, and creation only ever tries to geocode once. Retry the stragglers
+  // nightly, and shout about any that keep refusing to resolve.
+  cron.schedule('50 3 * * *', async () => {
+    try {
+      const { backfillPropertyCoordinates } = await import('./geocodeBackfill')
+      const r = await backfillPropertyCoordinates()
+      if (r.missing) logger.info({ missing: r.missing, placed: r.placed }, '[geocode-backfill]')
+    } catch (e) {
+      logger.error({ err: e }, '[geocode-backfill] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S651: the last-resort bank pull, deliberately scheduled 30 minutes AFTER
   // the passthrough recovery above. Netting gets every chance first — that is
   // the whole order of preference Nic set out — so by the time this runs,

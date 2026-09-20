@@ -18,9 +18,9 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest'
 import { query, getClient } from '../db'
 import { seedLandlord } from '../test/dbHelpers'
 import { chargeLandlord } from './landlordGamAccount'
+import { PROCESSING_FEES } from '@gam/shared'
 import {
-  bankCostFor, debitLandlordForCharges, settleGamDebit,
-  ACH_DEBIT_RATE, ACH_DEBIT_CAP,
+  bankCostFor, debitLandlordForCharges, settleGamDebit, ACH_DEBIT_FLAT,
 } from './landlordGamDebit'
 
 let landlordId: string
@@ -43,15 +43,19 @@ async function withLinkedBank() {
       WHERE id = $1`, [landlordId])
 }
 
-describe('what the bank pull costs', () => {
-  it('is Stripe’s published ACH price', () => {
-    expect(bankCostFor(130)).toBe(Math.round(130 * ACH_DEBIT_RATE * 100) / 100)
-    expect(bankCostFor(130)).toBe(1.04)
+describe('what the bank transfer costs', () => {
+  it('is $6 — GAM has one ACH price and this is not allowed to be a second one', () => {
+    // Nic: "Our ACH cost is fucking $6 flat." Pinned against the shared
+    // schedule rather than a literal, so this fails loudly if the two ever
+    // drift apart. (memory: gam-ach-fee-schedule-untouchable)
+    expect(bankCostFor(130)).toBe(6)
+    expect(ACH_DEBIT_FLAT).toBe(PROCESSING_FEES.ACH_FLAT)
   })
 
-  it('never exceeds the cap, however big the debt', () => {
-    // 0.8% of $10,000 would be $80; Stripe caps ACH debit at $5.
-    expect(bankCostFor(10_000)).toBe(ACH_DEBIT_CAP)
+  it('is the same $6 at any size — no percentage, no cap, no second answer', () => {
+    expect(bankCostFor(48)).toBe(6)
+    expect(bankCostFor(82)).toBe(6)
+    expect(bankCostFor(10_000)).toBe(6)
   })
 
   it('is nothing when nothing is owed', () => {
@@ -125,12 +129,12 @@ describe('settling a pull', () => {
   })
 
   it('marks the charges collected only when the money actually lands', async () => {
-    const chargeId = await owe(130, '55555555-5555-5555-5555-555555555555')
+    const chargeId = await owe(82, '55555555-5555-5555-5555-555555555555')
     await query(
       `INSERT INTO landlord_gam_debits
          (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
           stripe_payment_intent_id, charge_ids)
-       VALUES ($1, 130, 1.04, 131.04, 'pending', 'pi_ok', ARRAY[$2::uuid])`,
+       VALUES ($1, 82, 6, 88, 'pending', 'pi_ok', ARRAY[$2::uuid])`,
       [landlordId, chargeId])
 
     await settleGamDebit('pi_ok', true)
@@ -138,19 +142,19 @@ describe('settling a pull', () => {
     const [c] = await query<any>(
       `SELECT collected_amount::text AS collected, collected_at
          FROM landlord_gam_charges WHERE id = $1`, [chargeId])
-    expect(parseFloat(c.collected)).toBe(130)
+    expect(parseFloat(c.collected)).toBe(82)
     expect(c.collected_at).toBeTruthy()
   })
 
   it('leaves the charges owed when the bank refuses', async () => {
     // The pull bouncing days later must not leave a fee marked paid — next
     // month's would accrue on top of a debt that never cleared.
-    const chargeId = await owe(130, '66666666-6666-6666-6666-666666666666')
+    const chargeId = await owe(82, '66666666-6666-6666-6666-666666666666')
     await query(
       `INSERT INTO landlord_gam_debits
          (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
           stripe_payment_intent_id, charge_ids)
-       VALUES ($1, 130, 1.04, 131.04, 'pending', 'pi_nsf', ARRAY[$2::uuid])`,
+       VALUES ($1, 82, 6, 88, 'pending', 'pi_nsf', ARRAY[$2::uuid])`,
       [landlordId, chargeId])
 
     await settleGamDebit('pi_nsf', false, 'insufficient funds')
@@ -166,12 +170,12 @@ describe('settling a pull', () => {
   })
 
   it('ignores a webhook replayed after the debit already settled', async () => {
-    const chargeId = await owe(130, '77777777-7777-7777-7777-777777777777')
+    const chargeId = await owe(82, '77777777-7777-7777-7777-777777777777')
     await query(
       `INSERT INTO landlord_gam_debits
          (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
           stripe_payment_intent_id, charge_ids)
-       VALUES ($1, 130, 1.04, 131.04, 'succeeded', 'pi_dupe', ARRAY[$2::uuid])`,
+       VALUES ($1, 82, 6, 88, 'succeeded', 'pi_dupe', ARRAY[$2::uuid])`,
       [landlordId, chargeId])
 
     await settleGamDebit('pi_dupe', false, 'late failure')
@@ -203,20 +207,26 @@ describe('the bank cost is charged as its own line', () => {
     }))
     const { debitLandlordForCharges: debit } = await import('./landlordGamDebit')
 
+    // Two months of Mountain View's platform fee ($82 for 41 spots), which is
+    // how an all-cash park actually reaches the $100 threshold — one month
+    // alone never does, and that is the design working.
     await withLinkedBank()
-    await owe(130, '88888888-8888-8888-8888-888888888888')
+    await owe(82, '88888888-8888-8888-8888-888888888888')
+    await owe(82, '88888888-8888-8888-8888-888888888889')
     const out = await debit(landlordId)
 
     expect(out.status).toBe('debited')
-    expect(out.chargesAmount).toBe(130)
-    expect(out.bankCost).toBe(1.04)
-    expect(out.total).toBe(131.04)
+    expect(out.chargesAmount).toBe(164)
+    expect(out.bankCost).toBe(6)
+    expect(out.total).toBe(170)
 
     const lines = await query<any>(
       `SELECT kind, amount::text AS amount FROM landlord_gam_charges
         WHERE landlord_id = $1 ORDER BY created_at`, [landlordId])
-    expect(lines.map((l: any) => l.kind)).toEqual(['subscription', 'bank_debit_cost'])
-    expect(parseFloat(lines[1].amount)).toBe(1.04)
+    // The transfer's $6 is its OWN row, not folded into either fee.
+    expect(lines.map((l: any) => l.kind))
+      .toEqual(['subscription', 'subscription', 'bank_debit_cost'])
+    expect(parseFloat(lines[2].amount)).toBe(6)
     vi.doUnmock('../lib/stripe')
   })
 })

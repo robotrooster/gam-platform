@@ -6699,15 +6699,18 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
 
 // ── S651: what the landlord owes GAM, and how GAM gets it ─────────────────
 //
-// Until now this ledger was invisible. GAM netted $130 of platform fees out of
-// Mountain View's next payout and the landlord saw a deposit short by $130 with
-// nothing anywhere explaining it. That is the dispute Nic was describing, and
-// it starts one step before the bank debit: a number you cannot see is a number
-// you can only argue with.
+// Until now this ledger was invisible. September's platform fee went to two
+// SEPARATE landlords — Mountain View RV Park Ranch LLC $82 for 41 spots, Oak
+// Park Motel and RV LLC $48 for 24 — each netting out of that company's own
+// next payout, with nothing anywhere explaining why either deposit came up
+// short. They are two companies and two bills, not one $130 charge; running
+// them together is itself the kind of blurred number that turns a
+// reconciliation question into a dispute.
 //
-// So the statement comes first, then the authorization sits under it. Each
-// charge says what it was for and how it was collected — netted out of a
-// payout, or pulled from the bank — and the bank pull's own cost is its own
+// That is the dispute Nic was describing, and it starts one step before the
+// bank debit: a number you cannot see is a number you can only argue with. Each
+// charge here says what it was for and how it was collected — netted out of a
+// payout, or pulled from the bank — and the bank transfer's own $6 is its own
 // line rather than a rounding difference in somebody's total.
 
 landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (req: any, res, next) => {
@@ -6770,10 +6773,13 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
         charges,
         debits,
         banks,
-        // What a pull would cost today, so the landlord can see that letting
-        // money run through the platform is the cheaper of the two routes
-        // before they decide anything.
-        bankCostIfDebitedToday: bankCostFor(Math.round(outstanding * 100) / 100),
+        // The $6 flat transfer cost, named rather than left as a surprise on a
+        // future statement. Not a choice being offered — the landlord cannot
+        // decline collection — but it IS avoidable: money running through the
+        // platform is netted for nothing, and the transfer only happens when
+        // there is none. Sent as a figure rather than hardcoded in the page so
+        // a reprice moves it here too.
+        bankTransferCost: bankCostFor(1),
       },
     })
   } catch (e) { next(e) }
