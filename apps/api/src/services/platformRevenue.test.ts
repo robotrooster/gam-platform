@@ -12,12 +12,14 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
-import { cleanupAllSchema } from '../test/dbHelpers'
-import { recordPlatformRevenue, recordScreeningEarnings } from './platformRevenue'
+import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { recordPlatformRevenue, recordScreeningEarnings, trueUpProcessingMargin } from './platformRevenue'
 
 beforeEach(async () => {
   await cleanupAllSchema()
   await db.query(`DELETE FROM platform_revenue_ledger`)
+  await db.query(`DELETE FROM stripe_processing_costs`)
+  await db.query(`DELETE FROM tenant_remittances`)
   await db.query(`DELETE FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL`)
   // The live card row: customer 3.5% + $0.55, Stripe's cost 2.9% + $0.26.
   await db.query(
@@ -66,5 +68,67 @@ describe('what a background check earns GAM', () => {
   it('never throws when the books cannot be written — the money still landed', async () => {
     await expect(recordPlatformRevenue({ type: 'adjustment', amount: 1, referenceId: 'not-a-uuid' }))
       .resolves.toBeUndefined()
+  })
+})
+
+// S650 (Nic): "That KPI card doesn't match any of the numbers you said."
+// The per-payment estimate runs low against Stripe's real invoices; the
+// monthly true-up makes the ledger equal what actually happened.
+describe('the monthly true-up', () => {
+  const MONTH = '2026-07-01'
+  async function seedMonth(feesCharged: number, stripeCost: number, estimated: number) {
+    const c = await db.connect()
+    let landlordId = ''
+    try { landlordId = (await seedLandlord(c)).landlordId } finally { c.release() }
+    const { rows: [t] } = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ('s650-remit-' || gen_random_uuid() || '@test.dev', 'x', 'tenant', 'T', 'R', TRUE) RETURNING id`)
+    const { rows: [tt] } = await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [t.id])
+    await db.query(
+      `INSERT INTO tenant_remittances (tenant_id, landlord_id, amount, applied_amount, unapplied_amount,
+                                       status, processing_fee_amount, settled_at, created_at)
+       VALUES ($3, $4, 1000, 1000, 0, 'settled', $1, $2::date, $2::date)`, [feesCharged, MONTH, tt.id, landlordId])
+    await db.query(
+      `INSERT INTO stripe_processing_costs (stripe_txn_id, txn_type, category, amount, description, posted_at, period_start)
+       VALUES ('txn_s650_' || gen_random_uuid(), 'stripe_fee', 'card_interchange', $1, 'S650 test', $2::date, $2::date)`,
+      [stripeCost, MONTH])
+    if (estimated > 0) {
+      await db.query(
+        `INSERT INTO platform_revenue_ledger (type, amount, balance_after, notes, created_at)
+         VALUES ('banking_spread', $1, $1, 'S650 test estimate', $2::date)`, [estimated, MONTH])
+    }
+  }
+
+  it('adds what the estimates missed, so the month equals fees minus Stripe', async () => {
+    await seedMonth(238.31, 163.45, 41.75)
+    const r = await trueUpProcessingMargin(MONTH)
+    expect(r.actualMargin).toBeCloseTo(74.86, 2)
+    expect(r.adjustment).toBeCloseTo(33.11, 2)          // 74.86 − 41.75
+    const [sum] = (await db.query<{ s: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS s FROM platform_revenue_ledger
+        WHERE to_char(date_trunc('month', created_at), 'YYYY-MM') = '2026-07'`)).rows
+    expect(Number(sum.s)).toBeCloseTo(74.86, 2)
+  })
+
+  it('running it twice does not double the adjustment', async () => {
+    await seedMonth(238.31, 163.45, 41.75)
+    await trueUpProcessingMargin(MONTH)
+    await trueUpProcessingMargin(MONTH)
+    // It REPLACES its own previous row rather than stacking a second one.
+    const [rows] = (await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM platform_revenue_ledger
+        WHERE reference_type = 'processing_margin_true_up'`)).rows
+    expect(Number(rows.n)).toBe(1)
+    const [sum] = (await db.query<{ s: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS s FROM platform_revenue_ledger
+        WHERE to_char(date_trunc('month', created_at), 'YYYY-MM') = '2026-07'`)).rows
+    expect(Number(sum.s)).toBeCloseTo(74.86, 2)
+  })
+
+  it('takes money back off when the estimates ran HIGH', async () => {
+    await seedMonth(100, 80, 35)                        // real margin 20, estimated 35
+    const r = await trueUpProcessingMargin(MONTH)
+    expect(r.adjustment).toBeCloseTo(-15, 2)
   })
 })

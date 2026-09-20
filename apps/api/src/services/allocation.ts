@@ -466,6 +466,9 @@ export async function executeRentAllocation(
     await postPlatformLedgerEntry(client, {
       type: 'banking_spread',
       amount: bankingSpread,
+      // S650: what the customer actually paid, so the month can be trued up
+      // against Stripe's real invoices (the estimate above is conservative).
+      customerFeeCharged: customerFacingFee,
       referenceId: payment.id,
       referenceType: 'payment',
       propertyId: prop.property_id,
@@ -713,6 +716,8 @@ async function postUserLedgerEntry(client: PoolClient, p: UserLedgerInsert): Pro
 
 interface PlatformLedgerInsert {
   type: 'banking_spread' | 'manual_withdrawal_fee' | 'placement_fee_share' | 'adjustment'
+  /** S650: the processing fee the customer paid on this charge (spread rows). */
+  customerFeeCharged?: number
   amount: number
   referenceId: string
   referenceType: string
@@ -734,10 +739,11 @@ async function postPlatformLedgerEntry(client: PoolClient, p: PlatformLedgerInse
   const newBalance = round2(prevBalance + p.amount)
   await client.query(
     `INSERT INTO platform_revenue_ledger
-      (type, amount, balance_after, reference_id, reference_type, property_id, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      (type, amount, balance_after, reference_id, reference_type, property_id, notes, customer_fee_charged)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [p.type, p.amount, newBalance,
-     p.referenceId, p.referenceType, p.propertyId ?? null, p.notes ?? null]
+     p.referenceId, p.referenceType, p.propertyId ?? null, p.notes ?? null,
+     p.customerFeeCharged ?? null]
   )
 }
 

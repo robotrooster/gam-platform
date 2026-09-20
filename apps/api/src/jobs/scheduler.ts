@@ -1730,6 +1730,24 @@ export function schedulerInit() {
     }
   })
 
+  // S650 (Nic): "I want those numbers to match up." On the 5th, once Stripe's
+  // invoices for last month have landed, true the revenue ledger up to what
+  // actually happened — and do the month before as well, in case an invoice
+  // arrived late.
+  cron.schedule('0 6 5 * *', async () => {
+    try {
+      const { trueUpProcessingMargin } = await import('../services/platformRevenue')
+      const now = new Date()
+      for (const back of [1, 2]) {
+        const m = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1))
+        const r = await trueUpProcessingMargin(m.toISOString().slice(0, 10))
+        if (r.adjustment !== 0) logger.info(r, '[processing-margin-true-up]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[processing-margin-true-up] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S650 (Nic): "we only move the money that was paid to us" — a second daily
   // pass at any landlord batch still waiting on GAM's Stripe balance, so a
   // missed 01:00 UTC payout run cannot cost a landlord another whole day.

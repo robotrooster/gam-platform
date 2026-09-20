@@ -28,6 +28,8 @@ export interface PlatformRevenueEntry {
   referenceType?: string | null
   propertyId?: string | null
   notes?: string | null
+  /** S650: the processing fee the customer paid, for the monthly true-up. */
+  customerFeeCharged?: number | null
 }
 
 /**
@@ -54,10 +56,10 @@ export async function recordPlatformRevenue(e: PlatformRevenueEntry): Promise<vo
     const balanceAfter = Math.round(((prev ? parseFloat(prev.balance_after) : 0) + e.amount) * 100) / 100
     await query(
       `INSERT INTO platform_revenue_ledger
-         (type, amount, balance_after, reference_id, reference_type, property_id, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+         (type, amount, balance_after, reference_id, reference_type, property_id, notes, customer_fee_charged)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [e.type, e.amount, balanceAfter, e.referenceId ?? null, e.referenceType ?? null,
-       e.propertyId ?? null, e.notes ?? null])
+       e.propertyId ?? null, e.notes ?? null, e.customerFeeCharged ?? null])
   } catch (err) {
     logger.error({ err, type: e.type, referenceId: e.referenceId },
       '[platform-revenue] could not record earnings — the money landed, the row did not')
@@ -110,6 +112,7 @@ export async function recordScreeningEarnings(args: {
         amount: spread,
         referenceId: args.backgroundCheckId,
         referenceType: 'background_check',
+        customerFeeCharged: args.processingChargedUsd,
         notes: 'Card spread on a background check',
       })
     }
@@ -120,3 +123,76 @@ export async function recordScreeningEarnings(args: {
 }
 
 function round2(n: number): number { return Math.round(n * 100) / 100 }
+
+/**
+ * S650 (Nic): "I want those numbers to match up."
+ *
+ * The per-payment `banking_spread` rows are an ESTIMATE — Stripe is on
+ * unbundled pricing, so it attributes no cost to an individual charge and bills
+ * the real cost as daily aggregates. The estimate uses a deliberately
+ * conservative cost (2.9% + $0.26), so it runs LOW: September's estimate was
+ * $41.75 against a real margin of $74.86.
+ *
+ * Once Stripe's invoices for a month are recorded (stripe_processing_costs),
+ * this posts ONE adjustment that makes the ledger's month equal what actually
+ * happened: every processing fee customers paid, minus every processing cost
+ * Stripe billed. After it runs, the revenue ledger and the Processing Margin
+ * card are the same number.
+ *
+ * Idempotent: re-running replaces its own previous true-up for that month.
+ */
+export async function trueUpProcessingMargin(monthIso: string): Promise<{
+  month: string; feesCharged: number; stripeCost: number; actualMargin: number
+  alreadyRecorded: number; adjustment: number
+}> {
+  const month = monthIso.slice(0, 7)
+  const [fees] = await query<{ rent: string; other: string }>(
+    `SELECT
+       (SELECT COALESCE(SUM(processing_fee_amount), 0)
+          FROM tenant_remittances
+         WHERE status IN ('settled','processing')
+           AND to_char(date_trunc('month', COALESCE(settled_at, created_at)), 'YYYY-MM') = $1)::text AS rent,
+       -- everything else that carried a processing fee (screenings today)
+       (SELECT COALESCE(SUM(customer_fee_charged), 0)
+          FROM platform_revenue_ledger
+         WHERE type = 'banking_spread' AND reference_type <> 'payment'
+           AND to_char(date_trunc('month', created_at), 'YYYY-MM') = $1)::text AS other`,
+    [month])
+  const [costs] = await query<{ amt: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS amt FROM stripe_processing_costs
+      WHERE to_char(date_trunc('month', COALESCE(period_start, posted_at::date)), 'YYYY-MM') = $1`,
+    [month])
+  // Its own previous true-up for the month is REPLACED, not added to — so the
+  // figure is recomputed from scratch every time and running it twice cannot
+  // double anything.
+  await query(
+    `DELETE FROM platform_revenue_ledger
+      WHERE type = 'adjustment' AND reference_type = 'processing_margin_true_up'
+        AND to_char(date_trunc('month', created_at), 'YYYY-MM') = $1`, [month])
+  const [recorded] = await query<{ amt: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS amt FROM platform_revenue_ledger
+      WHERE to_char(date_trunc('month', created_at), 'YYYY-MM') = $1
+        AND type = 'banking_spread'`,
+    [month])
+  const feesCharged = round2(parseFloat(fees.rent) + parseFloat(fees.other))
+  const stripeCost = round2(parseFloat(costs.amt))
+  const actualMargin = round2(feesCharged - stripeCost)
+  const alreadyRecorded = round2(parseFloat(recorded.amt))
+  const adjustment = round2(actualMargin - alreadyRecorded)
+  if (adjustment !== 0) {
+    const prev = await queryOne<{ balance_after: string }>(
+      `SELECT balance_after FROM platform_revenue_ledger ORDER BY created_at DESC, id DESC LIMIT 1`)
+    const balanceAfter = round2((prev ? parseFloat(prev.balance_after) : 0) + adjustment)
+    await query(
+      `INSERT INTO platform_revenue_ledger
+         (type, amount, balance_after, reference_id, reference_type, notes, created_at)
+       VALUES ('adjustment', $1, $2, NULL, 'processing_margin_true_up', $3,
+               date_trunc('month', $4::date) + interval '1 month' - interval '1 second')`,
+      [adjustment, balanceAfter,
+       `True-up for ${month}: customers paid ${feesCharged.toFixed(2)} in processing fees, Stripe billed ${stripeCost.toFixed(2)} — the estimates on the day came to ${alreadyRecorded.toFixed(2)}.`,
+       `${month}-01`])
+    logger.info({ month, feesCharged, stripeCost, actualMargin, alreadyRecorded, adjustment },
+      '[platform-revenue] processing margin trued up to Stripe\'s real invoices')
+  }
+  return { month, feesCharged, stripeCost, actualMargin, alreadyRecorded, adjustment }
+}

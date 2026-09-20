@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict lp8N8tOm6qYcjlPAsp7qPudfxhrrxmUSGSWaRw4bYd5NBivMbDSKeUeyMVxtEou
+\restrict qdbrYzcoM4eVPCJYKFS9i5v4oA24YrqDYG8I2R3oYfSBggHONSEkJX7d7a2KTnc
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6574,8 +6574,16 @@ CREATE TABLE public.platform_revenue_ledger (
     property_id uuid,
     notes text,
     created_at timestamp with time zone DEFAULT now(),
+    customer_fee_charged numeric(12,2),
     CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'screening_margin'::text, 'adjustment'::text])))
 );
+
+
+--
+-- Name: COLUMN platform_revenue_ledger.customer_fee_charged; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_revenue_ledger.customer_fee_charged IS 'S650: the processing fee the customer actually paid on this charge. Set on banking_spread rows; NULL elsewhere.';
 
 
 --
@@ -27121,5 +27129,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict lp8N8tOm6qYcjlPAsp7qPudfxhrrxmUSGSWaRw4bYd5NBivMbDSKeUeyMVxtEou
+\unrestrict qdbrYzcoM4eVPCJYKFS9i5v4oA24YrqDYG8I2R3oYfSBggHONSEkJX7d7a2KTnc
 
