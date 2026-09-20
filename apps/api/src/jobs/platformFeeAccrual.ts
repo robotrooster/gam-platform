@@ -56,6 +56,7 @@
 import { getClient, query } from '../db'
 import { chargeLandlord } from '../services/landlordGamAccount'
 import { activateBillingForOccupancy } from '../services/billingActivation'
+import { billableUnitsForProperty } from '../services/billableUnits'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
@@ -462,132 +463,14 @@ async function accrueOneProperty(
       return 'pre_billing'
     }
 
-    // ── Long-term unit count ─────────────────────────────────────────────
-    // Distinct units with an active lease overlapping the billing month.
-    const ltRes = await client.query<{ c: number }>(`
-      SELECT COUNT(DISTINCT l.unit_id)::int AS c
-        FROM leases l
-        JOIN units u ON u.id = l.unit_id
-       WHERE u.property_id = $1
-         AND l.status = 'active'
-         -- ── S650 (Nic), REPLACING S576 ────────────────────────────────────
-         -- A hibernating lease DOES carry the platform fee. Nic: "The
-         -- hibernating leases don't get billed anything from the landlord to
-         -- the tenant, but we bill from the platform to the landlord. Those
-         -- are still an active spot... I cannot put another lease in that spot
-         -- while there's the hibernated spot."
-         --
-         -- Hibernation suspends the landlord's billing of the TENANT (no rent,
-         -- no utilities). It does not free the space, so GAM still charges the
-         -- landlord for it. The old rule dropped two Mountain View spots that
-         -- are occupied and unavailable.
-         AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
-         AND (l.end_date IS NULL OR l.end_date >= $2::date)
-    `, [propertyId, monthIso])
-
-    // ── S652: OWNER-OCCUPIED SPACES ARE OCCUPIED ─────────────────────────
-    //
-    // Nic: "we absolutely charge the landlords for owner occupied units. We
-    // don't charge for vacant units. We charge for anything occupied, no matter
-    // the status."
-    //
-    // This count is lease-driven, and an owner_use space deliberately has no
-    // lease — that is the anti-cheat, so a landlord cannot park a relative in a
-    // space and call it rented. But "no lease" was quietly doing a second job it
-    // was never meant to do: making the space free to run. The space is full,
-    // the landlord cannot rent it to anybody else, and GAM is carrying it in
-    // every report and every screen exactly like a tenanted one.
-    //
-    // Counted separately and added, rather than folded into the lease query: an
-    // owner_use unit has nothing to join to, and a LEFT JOIN that tried would
-    // put the anti-cheat and the billing rule in one expression where the next
-    // person to touch either would break the other.
-    const ownerRes = await client.query<{ c: number }>(`
-      SELECT COUNT(*)::int AS c FROM units
-       WHERE property_id = $1 AND status = 'owner_use' AND retired_at IS NULL`,
-      [propertyId])
-    const ownerOccupiedCount = ownerRes.rows[0].c
-
-    const longTermUnitCount = ltRes.rows[0].c + ownerOccupiedCount
-
-    // ── Utility-service spaces (S615) ────────────────────────────────────
-    // Nic: "It is technically a unit, so it needs to be billed at two dollars."
-    // A space next door that this landlord supplies power or trash to is
-    // OCCUPIED BY HIM, because of the utilities — it holds meter assignments
-    // and a payer exactly like a leased unit does.
-    //
-    // The live estimate has counted these since S614; this job did not, so the
-    // number GAM showed the landlord was one higher than the bill GAM then
-    // sent, and GAM under-collected its own revenue every month.
-    //
-    // S616 (Nic): "$2 per occupied unit next door THAT IS ON SOME SORT OF
-    // UTILITY CHARGE — trash or electric or whatever."
-    //
-    // Counted per SPACE, never per utility: a neighbour on both trash and
-    // electric is $2, not $4. That is what COUNT(DISTINCT sa.unit_id) buys.
-    //
-    // Two conditions decide whether GAM has earned it, and neither is an event
-    // test — deliberately. This job runs 1:30am on the 1st and invoices
-    // generate at 7am, so any "was something billed this month" check would
-    // find nothing and silently zero the fee forever. Both of these are STATE:
-    //
-    //   · the payer has agreed — accepted their invite, or the landlord
-    //     attested to an arrangement that predates GAM. Without that no invoice
-    //     is issued at all (see serviceAgreementInvoices), so GAM would be
-    //     charging for a bill it never delivered.
-    //
-    // NOT gated on a meter assignment, which an earlier version tried. Nic:
-    // "we're not assigning the spaces to a meter. Trash is a flat rate. Water
-    // is a RUBS system. There is not always going to be a meter, and there
-    // probably won't ever be a meter when we're in this particular type of
-    // situation." The agreement existing IS the statement that this space is on
-    // a utility charge; requiring a meter row would have silently zeroed the
-    // fee for the exact arrangement it exists to bill.
-    //
-    // superseded_by_lease_id drops it the moment the space's real owner
-    // onboards: the $2 follows the unit to them and is never charged twice for
-    // one space. No mid-month conflict — the incoming landlord sits inside the
-    // no-double-bill grace until their second cycle, and that cycle is wholly
-    // theirs.
-    const usRes = await client.query<{ c: number }>(`
-      SELECT COUNT(DISTINCT sa.unit_id)::int AS c
-        FROM utility_service_agreements sa
-        JOIN units u ON u.id = sa.unit_id
-       WHERE u.property_id = $1
-         AND sa.status = 'active'
-         AND sa.superseded_by_lease_id IS NULL
-         AND sa.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
-         AND (sa.end_date IS NULL OR sa.end_date >= $2::date)
-         AND (sa.payer_accepted_at IS NOT NULL OR sa.payer_attested_at IS NOT NULL)
-    `, [propertyId, monthIso])
-    const utilityServiceUnitCount = usRes.rows[0].c
-
-    // ── Short-stay nights ────────────────────────────────────────────────
-    // SUM of nights in the billing month across all short-stay bookings
-    // on this property. Every night counts; bookings on units that ALSO
-    // had a lease this month still contribute their nights (no exclusion).
-    const ssRes = await client.query<{ nights: number | null }>(`
-      SELECT COALESCE(SUM(
-          GREATEST(
-            LEAST(b.check_out, $2::date + INTERVAL '1 month')::date
-              - GREATEST(b.check_in, $2::date)::date,
-            0
-          )
-        ), 0)::int AS nights
-        FROM unit_bookings b
-        JOIN units u ON u.id = b.unit_id
-       WHERE u.property_id = $1
-         AND u.unit_type = ANY($3::text[])
-         AND b.lease_type IN ('nightly', 'weekly')
-         AND b.status NOT IN ('cancelled', 'no_show')
-         AND b.check_in  <  $2::date + INTERVAL '1 month'
-         AND b.check_out >  $2::date
-      -- S650: nights are billed IN ARREARS — you cannot count them before the
-      -- month is over — so this query reads the month just ended while the
-      -- lease side above bills the month starting.
-    `, [propertyId, arrearsIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
-    const shortStayNights = ssRes.rows[0].nights ?? 0
-    const shortStayEquivalent = Math.ceil(shortStayNights / 30)
+    // S652: the count lives in services/billableUnits so the admin estimate and
+    // this bill cannot disagree. See that file for what counts and why.
+    const billable = await billableUnitsForProperty(
+      client, propertyId, monthIso, arrearsIso, NIGHTS_AGGREGATION_UNIT_TYPES)
+    const longTermUnitCount = billable.longTerm
+    const utilityServiceUnitCount = billable.utilityService
+    const shortStayNights = billable.shortStayNights
+    const shortStayEquivalent = billable.shortStayEquivalent
 
     const totalBillable = longTermUnitCount + shortStayEquivalent + utilityServiceUnitCount
 

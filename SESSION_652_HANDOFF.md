@@ -147,6 +147,30 @@ bill that actually went out ($130) rather than a re-derivation from current
 occupancy ($120) — "active now" is not the set that was billable when the bill
 was raised.
 
+**What GAM bills for, counted in one place.** Nic spotted the admin page saying
+$120/month recurring when September actually billed $130, and neither of my
+explanations survived contact with the arithmetic. The estimate counted units
+with `status = 'active'` and handed the result to a function whose parameter is
+named `occupiedUnits` — dropping ten DELINQUENT spaces, one at Mountain View and
+nine at Oak Park, each with somebody living in it who owes rent. My first fix
+counted everything not vacant and promptly invented $10 for Springville, whose
+single unit is marked `active` with **zero leases**: the landlord set that status
+by hand three days ago, clicking vacant → available → active in three seconds,
+and no tenant has ever existed there.
+
+The lesson is the session's own theme. A unit's status is a claim somebody typed;
+a lease is a thing that happened. The accrual has always counted leases, which is
+why it was right both times. The count now lives in one function that the accrual
+and the estimate both call, so the two cannot disagree again.
+
+**Chasing it found a real hole.** An `owner_use` space has no lease by design —
+that is the anti-cheat, so nobody parks a relative in a spot and calls it rented.
+But the billable count is lease-driven, so "no lease" was quietly also making the
+space free to run. Worse, the grace ends on occupancy measured the same way, so a
+landlord whose only occupancy was owner-use would have sat in grace forever:
+never activated, never billed, however many spaces were full. Both now count
+owner-use. Nothing to back-bill — none exist yet.
+
 **One packet, two signatures, on a brand-new tenancy.** Nic: *"I don't understand
 why it's any different for a brand new tenancy or onboarding."* It isn't. Two
 things stood in the way and only one was the lease: ticking an installment-sale
@@ -214,6 +238,14 @@ either way.
    wired to a landlord-less background check and nobody has taken one.
 10. **Everything built today is unexercised by a real person** — the reservation
     flow, the card on file, the tickets, the packet.
+
+### Waiting on a decision from Nic
+- **Should the portal let a landlord set a unit `active` with no lease?** That is
+  what happened at Springville, and it fed a wrong number onto GAM's own
+  dashboard. The status asserts a tenancy that does not exist. Billing no longer
+  reads it, so nothing is at stake financially — but it is a claim the product
+  accepts without evidence, and it cuts both ways: the same control could mark
+  occupied spaces vacant. Unchanged pending his call.
 
 ### Design items Nic holds
 11. **Screening: check availability BEFORE the paid background check** — unit

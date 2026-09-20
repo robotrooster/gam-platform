@@ -1697,69 +1697,52 @@ const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
 }
 
 /**
- * S652 — OCCUPIED MEANS NOT VACANT. It does not mean 'active'.
+ * S652 — the forward estimate stopped computing anything.
  *
- * Nic: "we absolutely charge the landlords for owner occupied units. We don't
- * charge for vacant units. We charge for anything occupied, no matter the
- * status."
+ * This asked the database its own question and got a different answer from the
+ * bill. First it counted `status='active'`, dropping ten DELINQUENT spaces —
+ * somebody lives in each and owes rent, which is the opposite of vacant — and
+ * showed $120 where $130 was billed. Then I "fixed" it to count everything not
+ * vacant, and it invented $10 for Springville, whose single unit is marked
+ * active and has no lease at all. Nic: "The Springville property is not being
+ * billed $10 right now. It has nobody in it."
  *
- * This counted `status='active'` and handed the result to a function whose
- * parameter is literally named `occupiedUnits`. Ten delinquent spaces —
- * one at Mountain View, nine at Oak Park — were silently dropped: somebody
- * lives in every one of them and owes rent, which is the opposite of vacant.
- * That is the whole of the $120-versus-$130 gap Nic spotted, and both of my
- * explanations for it (owner-occupancy, onboarding grace) were wrong. The
- * arithmetic: 40 + 15 active plus Springville's $10 floor = $120; add the ten
- * delinquent spaces at $2 and it is the $130 that was actually billed.
- *
- * The accrual itself was always right — it counts units with an ACTIVE LEASE,
- * and a delinquent tenant still has one. This estimate was the thing that
- * disagreed with it.
+ * A unit's status is a label somebody typed. A lease is a thing that happened.
+ * So this no longer decides — it runs the same `billableUnitsForProperty` the
+ * accrual runs, against the same months, and applies the same per-property
+ * floor. A property GAM would not bill contributes nothing, because the
+ * function that says what GAM bills is the one being asked.
  */
 async function currentPlatformRunRate(): Promise<number> {
-  const propRows = await query<{ occ: string }>(`
-    SELECT COUNT(*) FILTER (WHERE u.status <> 'vacant')::int AS occ
+  const props = await query<{ id: string }>(`
+    SELECT p.id
       FROM properties p
       JOIN landlords l ON l.id = p.landlord_id
-      LEFT JOIN units u ON u.property_id = p.id AND u.retired_at IS NULL
      WHERE l.is_system IS NOT TRUE
-     GROUP BY p.id
-    HAVING COUNT(*) FILTER (WHERE u.status <> 'vacant') > 0
-  `)
-  return propRows.reduce((s, r) => s + launchPlatformFeeForProperty(+r.occ), 0)
+       -- Only landlords GAM has actually started billing. Somebody still in
+       -- the money-movement grace is not revenue, forecast or otherwise.
+       AND l.billing_starts_at IS NOT NULL
+       AND l.billing_starts_at <= date_trunc('month', CURRENT_DATE)::date`)
+  if (!props.length) return 0
+
+  const { billableUnitsForProperty } = await import('../services/billableUnits')
+  const { NIGHTS_AGGREGATION_UNIT_TYPES } = await import('@gam/shared')
+  const monthIso = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))
+    .toISOString().slice(0, 10)
+  const arrears = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() - 1, 1))
+    .toISOString().slice(0, 10)
+
+  const client = await getClient()
+  try {
+    let total = 0
+    for (const p of props) {
+      const b = await billableUnitsForProperty(client, p.id, monthIso, arrears, NIGHTS_AGGREGATION_UNIT_TYPES)
+      if (b.total > 0) total += launchPlatformFeeForProperty(b.total)
+    }
+    return total
+  } finally { client.release() }
 }
 
-/**
- * S652 — WHAT GAM ACTUALLY EARNED, FROM ONE BOOK.
- *
- * Nic: "all the KPI cards are not linked up to each other... the pie charts at
- * the bottom are showing all-time money $172.72 versus the KPI card up near the
- * top that says GAM's own money... $218.87 all time, which is about a $50
- * difference... just reconcile all the different KPI cards where they're getting
- * their numbers from the same source. That way, everything balances out."
- *
- * He reproduced the discrepancy to the cent, and the cause was that these pies
- * and that card were reading three different books:
- *
- *  1. PLATFORM FEES came from `platform_fee_accruals` for past months PLUS a
- *     live run-rate for the current one. A run-rate is a forecast of a month
- *     that has not been billed yet, so an "all time" total containing one is
- *     part history and part guess — and the guess said $120 while September was
- *     actually billed $130 ($48 Oak Park + $82 Mountain View).
- *  2. BACKGROUND CHECKS were a COUNT times a constant, not the margin actually
- *     recorded. One check at an assumed net, rather than the $5 on the books.
- *  3. ADJUSTMENTS (−$13.85 of them) existed only in the ledger and appeared in
- *     no pie at all, so the two could not have matched even in principle.
- *
- * Now every slice is `platform_revenue_ledger`, which is what that table was
- * built to be (S650: "one helper, so anything that earns GAM money records it
- * the same way and the running balance stays a real running balance"). The pie
- * sums to the card because they are the same rows.
- *
- * The run-rate did not disappear — a forward number is genuinely useful. It is
- * returned beside the actuals as `runRate`, labelled as what it is, and it is
- * never added to a historical total.
- */
 const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recurring: boolean }> = [
   { key: 'platform_unit',      label: 'Platform Fees',       types: ['platform_fee_subscription'], recurring: true },
   { key: 'processing',         label: 'Processing / ACH',    types: ['banking_spread'],            recurring: true },
