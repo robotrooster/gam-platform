@@ -7,7 +7,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource, canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { createHomeSaleContract } from '../services/homeSale'
+import { createHomeSaleContract, assertUnitIsSaleable, assertBuyerIsKnown } from '../services/homeSale'
 
 export const homeSaleRouter = Router()
 homeSaleRouter.use(requireAuth)
@@ -68,27 +68,11 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     // The unit + lease must belong to this landlord, and the dwelling must be
     // landlord-owned (you can only finance-sell a home the park owns; it flips
     // to tenant-owned on payoff).
-    const unit = await queryOne<any>(
-      `SELECT u.id, u.landlord_id, u.dwelling_ownership, u.unit_type, u.unit_number
-         FROM units u WHERE u.id = $1`, [body.unitId])
-    if (!unit) throw new AppError(404, 'Unit not found')
+    // S652: these two checks moved into services/homeSale so the lease-packet
+    // path runs the identical ones. They read the same and they ARE the same —
+    // the next change to either applies to both doors at once.
+    const unit = await assertUnitIsSaleable({ query }, body.unitId)
     if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
-    if (unit.dwelling_ownership !== 'landlord') {
-      throw new AppError(409, 'This unit is already tenant-owned — there is no park-owned home to finance.')
-    }
-    // S613 (Nic, DIRECTIVE): "Financed sales scope needs to be limited to
-    // converting park owned homes to tenant owned homes. We don't want it to be
-    // anything to do with RVs."
-    //
-    // The shape only makes sense for a HOME: the park owns a house sitting on
-    // its own lot, the household living in it buys it over time, and on payoff
-    // the dwelling flips to tenant-owned and the lot becomes space rent. An RV
-    // is towed away — there is nothing to convert, and financing one would make
-    // GAM the lender on a vehicle that can leave the property.
-    if (unit.unit_type !== 'mobile_home') {
-      throw new AppError(400,
-        'A financed sale converts a park-owned HOME to tenant-owned. It is only offered on mobile homes.')
-    }
     // A lease, when there is one, still has to be this unit's.
     if (body.leaseId) {
       const lease = await queryOne<any>(`SELECT id, landlord_id, unit_id FROM leases WHERE id=$1`, [body.leaseId])
@@ -106,20 +90,7 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     // this person: a lease of any status, an open onboarding invite, or a
     // utility agreement. A buyer who rents nowhere still reaches GAM through an
     // invite from the seller, so they have one. A stranger's tenant id does not.
-    const known = await queryOne<any>(
-      `SELECT 1 WHERE
-         EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
-                  WHERE lt.tenant_id = $1 AND l.landlord_id = $2)
-         OR EXISTS (SELECT 1 FROM pending_tenant_intents pti
-                     WHERE pti.tenant_id = $1 AND pti.landlord_id = $2
-                       AND pti.cancelled_at IS NULL)
-         OR EXISTS (SELECT 1 FROM utility_service_agreements sa
-                     WHERE sa.tenant_id = $1 AND sa.landlord_id = $2)
-       LIMIT 1`, [body.tenantId, unit.landlord_id])
-    if (!known) {
-      throw new AppError(400,
-        'That buyer has no record with you — invite them first, then sell them the home.')
-    }
+    await assertBuyerIsKnown({ query }, body.tenantId, unit.landlord_id)
     if (body.leaseId) {
       // When a lease IS given, the buyer should genuinely be on it; a mismatch
       // is a mistake worth stopping rather than quietly recording.

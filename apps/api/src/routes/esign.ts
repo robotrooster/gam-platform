@@ -1180,6 +1180,37 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // Link document → lease
   await client.query('UPDATE lease_documents SET lease_id=$1 WHERE id=$2', [lease.id, doc.id])
 
+  // S652 — A HOME SALE DRAFTED BEFORE THE LEASE EXISTED NOW GETS ITS LEASE.
+  //
+  // Nic, on sending a lease and an installment contract as one packet to a
+  // brand-new tenant: "I don't understand why it's any different for a brand
+  // new tenancy or onboarding. It's still two signatures for two separate
+  // documents. What does being a new tenant have to do with it?"
+  //
+  // Nothing, is the answer — but the plumbing assumed otherwise. A purchase
+  // agreement can be drafted with no lease (home_sale_contracts.lease_id is
+  // nullable and POST /home-sales has never required one), and for a NEW
+  // tenancy there is nothing to point at yet, because the lease does not exist
+  // until this signature creates it. Left alone, the contract would bill
+  // installments against a null lease for the rest of its term: charges with
+  // nothing to group them under, on a tenant portal built around a lease.
+  //
+  // So the lease adopts them the moment it exists. Scoped to this unit and the
+  // people on this lease — a contract for a DIFFERENT tenant on the same unit
+  // (the previous owner still paying off a home) must not be dragged onto a new
+  // resident's lease.
+  await client.query(
+    `UPDATE home_sale_contracts hsc
+        SET lease_id = $1, updated_at = NOW()
+      WHERE hsc.lease_id IS NULL
+        AND hsc.unit_id = $2
+        AND hsc.status IN ('pending_signature', 'active')
+        AND EXISTS (
+          SELECT 1 FROM lease_tenants lt
+           WHERE lt.lease_id = $1 AND lt.tenant_id = hsc.tenant_id)`,
+    [lease.id, doc.unit_id])
+
+
   // ────────────────────────────────────────────────────────────────────────
   // S111: PM company leasing fee. If this property is contracted to a PM
   // company on a plan with leasing_fee_amount set, post a one-time
@@ -2622,6 +2653,77 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       for (const d of defined) orderById.set(d.template_id, Number(d.sort_order))
       extras.sort((a: any, b: any) => (orderById.get(a.id) ?? 999) - (orderById.get(b.id) ?? 999))
 
+      // S652 — AN INSTALLMENT SALE IN THE PACKET NEEDS ITS CONTRACT, OR IT
+      // BILLS NOTHING AND SAYS NOTHING.
+      //
+      // Nic wants one packet, two documents, two signatures, and for that to
+      // work on a brand-new tenancy exactly as it does on an old one: "It's
+      // still two signatures for two separate documents. What does being a new
+      // tenant have to do with it?"
+      //
+      // The trap is that ticking an installment-sale template produced a
+      // beautiful signable agreement with NO home_sale_contracts row behind it.
+      // Signing it called activateHomeSaleContract, which found nothing on that
+      // document and returned quietly. Signed by everybody, billing nobody, and
+      // silent about it — which is how Country Acres ended up with eleven
+      // contracts that had to be voided.
+      //
+      // So the terms come in with the draft, or the draft is refused. A refusal
+      // is recoverable; a signed agreement that bills nothing is discovered
+      // months later by somebody wondering where the money is.
+      const installmentTemplate = extras.find((t: any) => t.purpose === 'installment_sale')
+      let homeSaleContract: any = null
+      let homeSalePrefill: Record<string, string> = {}
+      if (installmentTemplate) {
+        const {
+          createHomeSaleContract, homeSaleTermsSchema, assertUnitIsSaleable, assertBuyerIsKnown,
+        } = await import('../services/homeSale')
+        if (!req.body?.homeSale) {
+          throw new AppError(400,
+            'That package includes an installment sale, so it needs the terms — price, down payment, '
+            + 'term and first billing month. Without them the agreement would be signed and bill nothing.')
+        }
+        const terms = homeSaleTermsSchema.parse(req.body.homeSale)
+        const tenantIdForSale = terms.tenantId
+          ?? signers.find((sg: any) => sg.role === 'tenant')?.tenantId
+          ?? null
+        if (!tenantIdForSale) {
+          throw new AppError(400, 'A purchase agreement needs to say who is buying.')
+        }
+        if (!finalUnitId) throw new AppError(400, 'An installment sale needs a unit.')
+        // The SAME guards POST /api/home-sales runs. A second door into a home
+        // sale must not be a way around the first door's rules.
+        await assertUnitIsSaleable(client, finalUnitId)
+        await assertBuyerIsKnown(client, tenantIdForSale, docLandlordId)
+        homeSaleContract = await createHomeSaleContract(client, {
+          unitId: finalUnitId!,
+          // Null on a new tenancy — there is no lease until this packet is
+          // signed. The lease adopts the contract when it is created
+          // (buildLeaseFromDocument), so the billing anchor arrives on its own.
+          leaseId: docLeaseId ?? null,
+          tenantId: tenantIdForSale,
+          landlordId: docLandlordId,
+          salePrice: terms.salePrice,
+          downPayment: terms.downPayment,
+          annualInterestRate: terms.annualInterestRate,
+          termMonths: terms.termMonths,
+          startMonth: terms.startMonth,
+          planType: terms.planType,
+          pendingSignature: true,
+        })
+        // The document states the same numbers the billing will use. The
+        // contract is the source; the signed page is the proof.
+        homeSalePrefill = {
+          sale_price:               Number(terms.salePrice).toFixed(2),
+          sale_down_payment:        Number(terms.downPayment).toFixed(2),
+          sale_financed_amount:     Number(homeSaleContract.financed_amount).toFixed(2),
+          sale_monthly_payment:     Number(homeSaleContract.monthly_payment).toFixed(2),
+          sale_term_months:         String(terms.termMonths),
+          sale_interest_rate:       String(terms.annualInterestRate),
+          sale_first_payment_month: String(terms.startMonth),
+        }
+      }
+
       let order = 1
       for (const t of extras) {
         packageDocs.push(await createDocumentRecord(client, {
@@ -2639,12 +2741,25 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
           targetLeaseTenantId: null,
           promoteLeaseTenantId: null,
           signers,
-          prefillValues: prefillValues || {},
+          prefillValues: t.purpose === 'installment_sale'
+            ? { ...(prefillValues || {}), ...homeSalePrefill }
+            : (prefillValues || {}),
           packageGroupId: groupId,
           packageId: req.body?.packageId ?? null,
           packageSortOrder: order++,
           templateVersion: Number(t.version) || 1,
         } as any))
+      }
+
+      // Bind the contract to the agreement that proves it. Done after the loop
+      // because the document does not exist until createDocumentRecord runs,
+      // and activateHomeSaleContract finds the contract BY that document id.
+      if (homeSaleContract) {
+        const saleDoc = packageDocs.find((d: any) => d.document_type === 'purchase_agreement')
+        if (!saleDoc) throw new AppError(500, 'The purchase agreement was not created')
+        await client.query(
+          `UPDATE home_sale_contracts SET purchase_document_id=$2, updated_at=NOW() WHERE id=$1`,
+          [homeSaleContract.id, saleDoc.id])
       }
     }
 

@@ -3847,3 +3847,75 @@ describe('S637 the signing view respects the turn', () => {
     // the template's roles — this fixture's fields are all the landlord's.)
   })
 })
+
+/**
+ * S652 — a home sale drafted before its lease existed gets the lease when one
+ * is created.
+ *
+ * Nic, on sending a lease and an installment contract as one packet to a
+ * brand-new tenant: "I don't understand why it's any different for a brand new
+ * tenancy or onboarding. It's still two signatures for two separate documents.
+ * What does being a new tenant have to do with it?"
+ *
+ * Nothing — but the contract had nowhere to point until the lease existed, and
+ * would otherwise have billed its whole term against a null lease: charges with
+ * nothing to group them under, on a portal built around a lease.
+ */
+describe('the lease adopts a home sale that predates it', () => {
+  it('fills in lease_id the moment the lease is created', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='mobile_home', dwelling_ownership='landlord' WHERE id=$1`, [f.unitId])
+    const contract = await db.query<{ id: string }>(
+      `INSERT INTO home_sale_contracts
+         (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1, NULL, $2, $3, 24000, 2000, 22000, 0, 55, 400, '2026-11-01', 'pending_signature', 55)
+       RETURNING id`,
+      [f.unitId, f.tenantId, f.landlordId])
+
+    const { documentId } = await seedCompleteableDoc(f, { fields: defaultLeaseFields() })
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+
+    const leaseId = (await db.query<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])).rows[0].id
+    const { rows } = await db.query<{ lease_id: string | null }>(
+      `SELECT lease_id FROM home_sale_contracts WHERE id = $1`, [contract.rows[0].id])
+    expect(rows[0].lease_id).toBe(leaseId)
+  })
+
+  it('does not drag somebody else\'s contract onto this lease', async () => {
+    // The previous owner may still be paying off the home on this very lot.
+    // Their contract is not the new resident's problem, and pointing it at the
+    // new lease would bill the wrong household.
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='mobile_home', dwelling_ownership='landlord' WHERE id=$1`, [f.unitId])
+    const strangerUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('prev-owner-652@t.dev','x','tenant','Prev','Owner') RETURNING id`)
+    const stranger = await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [strangerUser.rows[0].id])
+    const contract = await db.query<{ id: string }>(
+      `INSERT INTO home_sale_contracts
+         (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1, NULL, $2, $3, 24000, 2000, 22000, 0, 55, 400, '2026-11-01', 'pending_signature', 55)
+       RETURNING id`,
+      [f.unitId, stranger.rows[0].id, f.landlordId])
+
+    const { documentId } = await seedCompleteableDoc(f, { fields: defaultLeaseFields() })
+    await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+
+    const { rows } = await db.query<{ lease_id: string | null }>(
+      `SELECT lease_id FROM home_sale_contracts WHERE id = $1`, [contract.rows[0].id])
+    expect(rows[0].lease_id).toBeNull()
+  })
+})

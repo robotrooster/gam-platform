@@ -13,6 +13,7 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { computeAmortization } from '@gam/shared'
+import { z } from 'zod'
 
 type Client = PoolClient
 
@@ -257,4 +258,114 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
   }
   for (const cid of touchedContracts) await reconcileHomeSaleContract(cid)
   return billed
+}
+
+/**
+ * S652 — the terms of an installment sale, and the checks that must run before
+ * one can exist. Shared, because there are now two doors into a home sale.
+ *
+ * POST /api/home-sales is one: a landlord papering a sale on its own. The other
+ * is a lease packet with an installment-sale template ticked, which is what Nic
+ * asked for — "one packet, two documents, two signatures" — and which must NOT
+ * be a way around the rules the first door enforces.
+ *
+ * Every guard below exists because of a specific decision, and duplicating them
+ * at the second door would mean the next change to one of them silently applies
+ * to half the product.
+ */
+export const homeSaleTermsSchema = z.object({
+  startMonth:         z.string().regex(/^\d{4}-\d{2}-01$/),
+  planType:           z.enum(['amortized', 'flat']).default('amortized'),
+  salePrice:          z.number().positive().optional(),
+  downPayment:        z.number().min(0).default(0),
+  annualInterestRate: z.number().min(0).max(60).default(0),
+  termMonths:         z.number().int().positive().max(600).optional(),
+  monthlyAmount:      z.number().positive().optional(),
+  numberOfPayments:   z.number().int().positive().max(600).optional(),
+  tenantId:           z.string().uuid().optional(),
+}).transform((b) => {
+  // A flat plan is 0% interest with each installment equal to the flat amount;
+  // the sale price is that amount times the number of payments.
+  if (b.planType === 'flat') {
+    if (b.monthlyAmount == null || b.numberOfPayments == null) {
+      throw new AppError(400, 'A flat plan needs a monthly amount and a number of payments.')
+    }
+    return {
+      ...b,
+      salePrice: Math.round(b.monthlyAmount * b.numberOfPayments * 100) / 100,
+      downPayment: 0,
+      annualInterestRate: 0,
+      termMonths: b.numberOfPayments,
+    }
+  }
+  if (b.salePrice == null || b.termMonths == null) {
+    throw new AppError(400, 'An amortized plan needs a sale price and a term.')
+  }
+  return { ...b, salePrice: b.salePrice, termMonths: b.termMonths }
+})
+
+/**
+ * Can this unit be sold on installments at all?
+ *
+ * S613 (Nic, DIRECTIVE): "Financed sales scope needs to be limited to
+ * converting park owned homes to tenant owned homes. We don't want it to be
+ * anything to do with RVs." An RV is towed away — there is nothing to convert,
+ * and financing one would make GAM the lender on a vehicle that can leave.
+ */
+/**
+ * Both callers pass a different thing: a PoolClient (whose .query returns
+ * `{ rows }`) inside a transaction, and db's `query` (which returns the rows
+ * themselves) outside one. Normalising here rather than making each caller
+ * remember is the difference between a shared guard and a trap — TypeScript
+ * cannot see the mismatch through `{ query: Function }`, so nothing would have
+ * told anybody until it threw in production.
+ */
+async function rowsFrom(q: { query: Function }, sql: string, params: any[]): Promise<any[]> {
+  const out = await q.query(sql, params)
+  return Array.isArray(out) ? out : (out?.rows ?? [])
+}
+
+export async function assertUnitIsSaleable(
+  client: { query: Function }, unitId: string,
+): Promise<{ id: string; landlord_id: string; unit_number: string }> {
+  const unit = (await rowsFrom(client,
+    `SELECT u.id, u.landlord_id, u.dwelling_ownership, u.unit_type, u.unit_number
+       FROM units u WHERE u.id = $1`, [unitId]))[0]
+  if (!unit) throw new AppError(404, 'Unit not found')
+  if (unit.dwelling_ownership !== 'landlord') {
+    throw new AppError(409, 'This unit is already tenant-owned — there is no park-owned home to finance.')
+  }
+  if (unit.unit_type !== 'mobile_home') {
+    throw new AppError(400,
+      'A financed sale converts a park-owned HOME to tenant-owned. It is only offered on mobile homes.')
+  }
+  return unit
+}
+
+/**
+ * Does this landlord have any standing with this buyer?
+ *
+ * tenantId becomes the billed obligor on every installment, so it can never be
+ * an arbitrary id out of a request body (memory: gam-foreign-ref-write-scope).
+ * What is required is a relationship of SOME kind — a lease of any status, an
+ * open onboarding invite, or a utility agreement — not a tenancy, because a
+ * buyer may own a home they do not live in.
+ */
+export async function assertBuyerIsKnown(
+  client: { query: Function }, tenantId: string, landlordId: string,
+): Promise<void> {
+  const known = (await rowsFrom(client,
+    `SELECT 1 WHERE
+       EXISTS (SELECT 1 FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
+                WHERE lt.tenant_id = $1 AND l.landlord_id = $2)
+       OR EXISTS (SELECT 1 FROM pending_tenant_intents pti
+                   WHERE pti.tenant_id = $1 AND pti.landlord_id = $2
+                     AND pti.cancelled_at IS NULL)
+       OR EXISTS (SELECT 1 FROM utility_service_agreements sa
+                   WHERE sa.tenant_id = $1 AND sa.landlord_id = $2)
+     LIMIT 1`, [tenantId, landlordId]))[0]
+  if (!known) {
+    throw new AppError(400,
+      'That buyer has no record with you — invite them first, then sell them the home.')
+  }
 }
