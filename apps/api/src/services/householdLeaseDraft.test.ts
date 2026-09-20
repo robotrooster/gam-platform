@@ -73,7 +73,12 @@ describe('draftHouseholdLease', () => {
       [res.documentId])
     expect(rows[0].role).toBe('landlord')
     expect(Number(rows[0].order_index)).toBe(1)
-    expect(rows[1].role).toBe('tenant')
+    // S652: residents are 'primary' then 'co_tenant_N' — the roles lease
+    // templates actually bind their fields to. This test asserted 'tenant',
+    // which is exactly the value that matched no field and silently stripped
+    // every tenant name, initial and signature date off thirteen Country Acres
+    // leases before Blu Haws noticed they were blank.
+    expect(rows[1].role).toBe('primary')
     expect(Number(rows[1].order_index)).toBe(2)
   })
 
@@ -98,7 +103,9 @@ describe('draftHouseholdLease', () => {
     const { rows } = await db.query<any>(
       `SELECT role FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index`, [res.documentId])
     expect(rows).toHaveLength(3)                 // landlord + two residents
-    expect(rows.filter((r: any) => r.role === 'tenant')).toHaveLength(2)
+    // S652: primary first, then co_tenant_1 — household order, in the
+    // vocabulary the templates bind to.
+    expect(rows.map((r: any) => r.role)).toEqual(['landlord', 'primary', 'co_tenant_1'])
   })
 
   // Re-inviting must not stack a second unsigned lease on the same unit.

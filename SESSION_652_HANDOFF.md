@@ -253,6 +253,55 @@ cancel on the 30th. Now exempt only if cancelled before the check-in date, with
 a database trigger stamping the moment so no call site can forget it. No-show is
 out of billing entirely, per Nic: the site was held either way.
 
+**Mattoon's leases were unsignable, and the cause was not Mattoon.** Blu read
+the thirteen and reported that tenant names did not populate on pages 1, 5 and
+7, and that the date area could not be filled. They were not blank — those
+fields were **absent**. 70 of the template's 125 fields never reached the
+documents, because `draftHouseholdLease` labels every resident with signer role
+`tenant` while templates bind to `primary` and `co_tenant_1..3`. Nothing matched,
+so every tenant field was pruned as an unused role slot. That drafter is the
+normal invite path, so every household lease drafted through it carried this.
+
+The thirteen were **deleted**, not voided — no signature existed on any of them
+and nothing referenced them, and a voided row would sit in Blu's history forever
+implying something had happened. Lot 1 was then reissued alone, as the real
+packet: lease + installment contract (\$11,000 over 55 months, no down payment)
++ the SALE version of the lead-paint addendum. Delivered to Blu only.
+
+**The packet now knows a sale from a rental.** A live home-sale contract means a
+sale — it beats the ownership flag, because the home stays the park's on paper
+until payoff. A tenant-owned dwelling means the landlord is renting land, so
+neither lead-paint version is suggested. Everything else is a rental. That sorts
+Country Acres exactly: eleven on installments, two who own their homes (Lots 6
+and 17), no plain rentals yet.
+
+**Disclosure slots: 45 categories, drawn from the acts.** GAM holds 49,161
+statute sections across all fifty states — I had wrongly reported that corpus as
+nearly empty, having looked at the structured-rules table (3 rows) instead of
+the text. Every category was measured against it. The first pass found 28 and
+Nic caught it missing the acknowledgement block on Blu's own lease; the second
+pass found fifteen more, and the gap was framing rather than recall — the first
+search asked what can be WRONG with a building, never what a landlord must TELL
+or HAND to a tenant. Security deposit terms (41 states) and park rules (38)
+outrank almost everything found first time. Park rules is the fourth line of the
+acknowledgement Blu was reading.
+
+A template also carries which transaction it belongs to (sale/rental/any) and
+which state it was written for. Lead paint is federal, so one form travels;
+Washington legislates the FORMAT of its disclosure statement and Minnesota,
+Michigan, Ohio and Nebraska each prescribe their own, so those do not.
+Most-specific-wins, and the general form shows as superseded rather than
+vanishing. **Nothing anywhere claims a disclosure is required** — a test fails
+on the words "required", "must" and "compliance" appearing in the API response.
+
+**A name on a lease is never shortened again.** Blu saw "S-H-E dot dot dot". The
+signing screen shrinks text, stops at a 6px floor and lets CSS hide the rest;
+the PDF stamper sized on the box's HEIGHT alone and would have drawn the whole
+name straight out past its box. The page he was reading and the page that would
+be filed disagreed about what the lease said. Both now shrink on width, nothing
+truncates, and below the floor it overflows visibly — because a name spilling
+out of a box gets fixed and "She…" does not.
+
 ### Waiting on a decision from Nic
 - **The rent-free charitable tenancy.** Nic's real scale worry: a large operator
   housing three or four families rent-free across many properties. Owner-use is
@@ -264,6 +313,15 @@ out of billing entirely, per Nic: the site was held either way.
   leaves no money trail at all, so the bank feed is useless — but utility
   consumption on a unit the schedule calls empty is close to un-fakeable, and
   GAM already holds the readings.
+- **Blu is double-checking the template.** Nic's read: "I'm thinking he didn't
+  save some of the boxes he edited." Two open items from his list are template
+  AUTHORING, not code — the lot-number box sits off to the right of its line on
+  one page, and the tenant-name box on Exhibit A was too narrow. The narrowness
+  no longer truncates anything, but the box is still small. Nothing to do until
+  he reports back.
+- **The other twelve are ready to go** once Blu blesses Lot 1 — eleven as
+  rent-to-own packets, and Lots 6 and 17 as lot leases with no lead-paint
+  addendum, since those two households already own their homes.
 - **Should the portal let a landlord set a unit `active` with no lease?** Nic's
   answer: yes — "active just means available", and blocking it would stop
   somebody taking an RV reservation. Settled; billing simply ignores the column. That is
