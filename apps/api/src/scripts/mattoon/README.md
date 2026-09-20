@@ -30,14 +30,38 @@ tenant is reachable until Blu has signed.
 installment contract ($11,000 over 55 months), never the original sale price or
 the down payment, so those fields are blank for Blu to fill from the originals.
 
-**Curtis Clabough's work trade was not created.** Nic asked for it, but the
-sheet gives no hours and `work_trade_agreements.monthly_hours_target` is
-`NOT NULL CHECK (> 0)`. Hours are never derived from a dollar amount
-(`gam-work-trade-is-hours-not-wages`), so the lot carries a note instead and it
-needs one number from Nic.
+**Curtis Clabough is deliberately NOT on a work-trade agreement.** Nic, after
+seeing the sheet had no hours: "let's just leave him not on a work trade
+agreement for now... I think the guy is only going to get a partial coverage of
+the rent for some work. So Blu can just apply a credit as needed." Lot 6 carries
+a note saying so; it moves to a real agreement when Blu decides the hours.
 
-**Lot 1 was skipped entirely.** Its mailbox, the5ways2005@yahoo.com, already
-belongs to a GAM account — Nancy Sheptock, role `landlord`, created the day the
-property was set up, never logged in, owning nothing. Almost certainly a
-mis-click during setup, but changing somebody's account role unattended is not
-a call to make at 4am.
+**The installment contracts were drafted and then voided.** They are the reason
+to read the next section.
+
+## The RTO billing order — found by checking, and it matters
+
+A signed purchase agreement calls `activateHomeSaleContract(documentId)`, which
+looks for a `home_sale_contracts` row on that document. Drafting the agreement
+on its own creates no such row, and `createHomeSaleContract` cannot be called
+yet either: it requires the tenant's space-rent LEASE as its billing anchor, and
+no lease row exists until Blu signs.
+
+So an agreement drafted at the same time as the lease would have been signed by
+everybody and billed **nothing** — `activateHomeSaleContract` returns
+`{activated: false}` and says nothing at all. The eleven drafted here are voided
+for that reason.
+
+The order that works, which `POST /home-sale` already does in one step:
+
+    lease signed  →  home-sale contract created (anchored to the lease)
+                  →  purchase agreement drafted against that contract
+                  →  agreement signed  →  installments written and billed
+
+**This constrains the signing bundle.** Nic's intent is one packet — lease and
+installment contract out together, two separate documents and two separate
+signatures. That works for a tenant who already has a lease. It cannot work on a
+brand-new tenancy, because the contract has nothing to anchor to until the lease
+exists. Worth a decision: either the bundle sends in two passes for new
+tenancies, or `home_sale_contracts.lease_id` (already nullable in the database,
+though not in the TypeScript input) gets filled in when the lease completes.

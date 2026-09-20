@@ -109,9 +109,8 @@ sheet is the seller from before closing. Source is sheet 1 of
 | Lots live / retired | 31 / 16 |
 | Occupied | 13 |
 | Tenant accounts created | 13 (no invite token, no email) |
-| Lease documents drafted | 12 |
-| Installment contracts drafted | 10 |
-| Signing bundles | 10 |
+| Lease documents drafted | 13, all pending Blu |
+| Installment contracts | 11 drafted, then **voided** — see below |
 | Water meters / readings | 13 / 26 |
 | Readings flagged for a read | 3 |
 | First billing cycle | October 2026 |
@@ -120,9 +119,23 @@ Lots 12–14 and 25–26 exist and are retired — the city removed them, and a 
 the numbering would otherwise read as a missing record. Lots 5 and 27 are out of
 order pending a trailer rotation.
 
-**The signing package got its first real use.** Each RTO household's lease and
-installment contract share a `package_group_id`, which is the S641 feature
-nobody had run in anger.
+**The installment contracts had to be voided, and that is the useful finding.**
+Nic asked me to "double check that when they have a lease and a rent to own
+contract, that everything is billed correctly." It would not have been. A signed
+purchase agreement calls `activateHomeSaleContract`, which looks for a
+`home_sale_contracts` row on that document; drafting the agreement alone creates
+none, and `createHomeSaleContract` cannot run yet either because it needs the
+tenant's LEASE as its billing anchor. Signed by everybody, billed nothing, and
+silent about it. The right order — which `POST /home-sale` already does in one
+step — is lease signed → contract created → agreement drafted → agreement
+signed → installments billed.
+
+**This constrains the signing bundle.** Nic's intent is one packet, two
+documents, two signatures. That works for a tenant who already has a lease; it
+cannot work on a brand-new tenancy. Either the bundle sends in two passes for
+new tenancies, or `home_sale_contracts.lease_id` — already nullable in the
+database, though not in the TypeScript input — gets filled when the lease
+completes. Worth a decision before Mattoon's leases come back signed.
 
 **Water reconciles to the cent.** Every row is (current − prior) × $16.50,
 $572.55 across the park. The sheet records 1044.9 where a seven-digit face reads
@@ -170,27 +183,25 @@ Sources: [Mattoon water rates 2026](https://mattoon.illinois.gov/wp-content/uplo
 
 ## Needs Nic
 
-1. **Curtis Clabough's work-trade hours.** One number and it is done. The schema
-   requires hours > 0 and hours are never derived from a dollar amount, so the
-   lot carries a note instead of a guess.
-2. **Lot 1 (Sheptock) is not loaded.** Its mailbox, the5ways2005@yahoo.com,
-   already belongs to a GAM account — **Nancy Sheptock, role `landlord`**,
-   created the day the property was set up, never logged in, owning nothing.
-   Almost certainly a mis-click. Fixing it means changing a real person's
-   account role, which is not a 4am decision.
-3. **Send the drafts to Blu?** 22 documents sit drafted and unsent. Firing the
-   signing requests would put 22 emails in his inbox; one note asking him to
-   look at his queue may be kinder. Nothing goes to a tenant either way until he
-   signs.
-4. **The installment contracts' money fields are blank on purpose** — the sheet
-   has what is LEFT, never the original price or down payment. Note GAM's own
-   prefill put `rent_amount = $450` (the lot rent) on those contracts; on an
-   installment sale that box may well mean the instalment. Blu should check it.
-5. **The water rate**, per the section above.
-6. **Onboarding window expired 9/11** with onboarding never completed. Left
+1. **Send the 13 leases to Blu?** They sit drafted and unsent. Firing the
+   signing requests puts 13 emails in his inbox; one note pointing him at his
+   queue may land better. Nothing reaches a tenant either way until he signs.
+2. **The bundle question above**, before those leases come back.
+3. **The water rate** against Blu's actual bill, per the Illinois section.
+4. **Onboarding window expired 9/11** with onboarding never completed. Left
    alone — extending it moves GAM's own revenue timing.
-7. **Oak Park has no Stays items**, so it cannot sell a register stay until Blu
-   or Nic adds them at Oak Park's prices.
+5. **Oak Park has no Stays items**, so it cannot sell a register stay until
+   somebody adds them at Oak Park's prices.
+
+## Closed after Nic read the first draft
+- **Nancy Sheptock** had accidentally created a landlord account and was sent
+  two landlord onboarding emails. Profile removed, role corrected to tenant,
+  her email history kept. Lot 1 is loaded — she is the account holder, John is
+  the occupant.
+- **Curtis Clabough** stays off a work-trade agreement by decision; Blu applies
+  a credit as needed until he settles what he wants.
+- **The 5-day late-fee grace** was never a problem — the statutory minimum is 5
+  and the property is set to 5. I listed a pass among things needing attention.
 
 ## Still on the list
 Property settings questionnaire · work-trade redesign · native apps · agent
