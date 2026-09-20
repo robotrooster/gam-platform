@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict UjaPYFfeA2czXCdHDyKXGVc2r8BJceHtjtdXxTQ4gsEfg9Z3B7zyGefbCoLV93o
+\restrict clrGROcSWgptccoCF9IufgjX8rZ0z4Z3HosGWozINr4b4v1yveKoFgkM3a9RwBB
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5588,6 +5588,7 @@ CREATE TABLE public.lease_templates (
     late_fee_terms jsonb,
     version integer DEFAULT 1 NOT NULL,
     applies_to text DEFAULT 'any'::text NOT NULL,
+    disclosure_type text,
     CONSTRAINT lease_templates_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'sale'::text, 'rental'::text]))),
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
@@ -5601,6 +5602,13 @@ CREATE TABLE public.lease_templates (
 --
 
 COMMENT ON COLUMN public.lease_templates.applies_to IS 'S652: sale = the dwelling is being bought (rent-to-own); rental = the landlord is renting out a dwelling; any = both. Drives which disclosure the packet suggests.';
+
+
+--
+-- Name: COLUMN lease_templates.disclosure_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_templates.disclosure_type IS 'S652: which disclosure this document IS (lead_based_paint, bed_bugs, ...). NULL = not a disclosure. Carries no requirement claim — see DISCLOSURE_TYPES in @gam/shared.';
 
 
 --
@@ -19099,6 +19107,13 @@ CREATE UNIQUE INDEX landlords_stripe_connect_account_id_uniq ON public.landlords
 
 
 --
+-- Name: lease_templates_disclosure_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_templates_disclosure_idx ON public.lease_templates USING btree (landlord_id, disclosure_type) WHERE (disclosure_type IS NOT NULL);
+
+
+--
 -- Name: lease_templates_unit_type_default_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -27530,5 +27545,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict UjaPYFfeA2czXCdHDyKXGVc2r8BJceHtjtdXxTQ4gsEfg9Z3B7zyGefbCoLV93o
+\unrestrict clrGROcSWgptccoCF9IufgjX8rZ0z4Z3HosGWozINr4b4v1yveKoFgkM3a9RwBB
 

@@ -2718,6 +2718,104 @@ export type NoLeaseDocumentType = typeof NO_LEASE_DOCUMENT_TYPES[number]
 // nothing else to call it, which is exactly the confusion Nic wants gone: "a
 // lot of people are gonna be like, well, I already signed the lease, what's
 // this for? And it's like, okay, that's your installment sale contract."
+/**
+ * S652 — the disclosures that exist somewhere, so a landlord can hold whichever
+ * ones they want.
+ *
+ * Nic: "These are categories to be filled. If you want a bed bug disclosure, if
+ * you want a lead based paint disclosure, if you want these other types of
+ * disclosures — some of these are required in some areas. WE DON'T POLICE WHAT'S
+ * REQUIRED WHERE... We have the table set up because of flexibility where we
+ * don't enforce it, but we have all those different options available. And maybe
+ * there's something that's not required in one state that a landlord decides,
+ * hey, it might be a good idea if I had this."
+ *
+ * So this list is not a compliance matrix and must never become one. It is a set
+ * of SLOTS. A landlord with fifteen categories in front of them, two of which
+ * their state cares about, may fill all fifteen — Nic's own example — and GAM
+ * says nothing about which two. Every entry here exists because the document
+ * exists somewhere in the country, not because anybody must have it.
+ *
+ * THE LIST IS EVIDENCE-BASED, NOT REMEMBERED. Nic: "let's figure out all the
+ * disclosures that are required at least at one point across the country and
+ * then make our field based off of that." Rather than write down what I could
+ * recall, the 49,161 statute sections GAM already holds were searched for each
+ * candidate topic, and every entry below appears in at least two states' acts.
+ * That turned up categories no amount of recollection would have produced —
+ * defective drywall, outstanding condemnation orders, military air
+ * installations — and, more to the point for GAM, the two that are squarely its
+ * own market: a park's statement of policy or prospectus (15 states) and notice
+ * of a park closing or changing use (17).
+ *
+ * A COUNT OF STATES WHOSE ACT MENTIONS A TOPIC IS NOT A COUNT OF STATES THAT
+ * REQUIRE IT, and nothing here should ever be presented as the latter.
+ *
+ * The categories carry no legal opinion, no state mapping and no requirement
+ * flag, deliberately. GAM holds all 50 landlord-tenant acts as text, which is
+ * enough to SHOW somebody the statute and nowhere near enough to tell them what
+ * they must sign. (memory: gam-never-gate-on-legality)
+ *
+ * Pairs with lease_templates.applies_to — a disclosure belongs to a sale, a
+ * rental, or both — so the packet can put the sale version in front of a buyer
+ * and the rental version in front of a renter.
+ */
+export const DISCLOSURE_TYPES = [
+  // Ordered roughly by how widely the topic appears in the acts.
+  'owner_agent_identity', 'foreclosure_status', 'death_on_premises',
+  'septic_system', 'well_water', 'flood_zone', 'radon', 'mold',
+  'sex_offender_registry', 'asbestos', 'meth_contamination',
+  'park_change_of_use', 'park_statement_of_policy', 'lead_based_paint',
+  'smoke_co_detector', 'zoning_designation', 'insurance_requirement',
+  'bed_bugs', 'defective_drywall', 'utility_billing_method',
+  'military_ordnance', 'condemnation_orders', 'shared_utilities', 'fire_damage',
+  // Common on the sale side, where the seller describes the property itself.
+  'property_condition', 'pest_control', 'rent_control', 'energy_efficiency',
+  'other',
+] as const
+export type DisclosureType = typeof DISCLOSURE_TYPES[number]
+
+export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
+  owner_agent_identity:     'Owner / agent identity and address',
+  foreclosure_status:       'Foreclosure proceedings',
+  death_on_premises:        'Death on the premises',
+  septic_system:            'Septic system',
+  well_water:               'Well water / water quality',
+  flood_zone:               'Flood zone or flood history',
+  radon:                    'Radon',
+  mold:                     'Mould',
+  sex_offender_registry:    'Sex offender registry',
+  asbestos:                 'Asbestos',
+  meth_contamination:       'Methamphetamine contamination',
+  park_change_of_use:       'Park closure or change of use',
+  park_statement_of_policy: 'Park statement of policy / prospectus',
+  lead_based_paint:         'Lead-based paint',
+  smoke_co_detector:        'Smoke & carbon monoxide detectors',
+  zoning_designation:       'Zoning designation',
+  insurance_requirement:    'Insurance',
+  bed_bugs:                 'Bed bugs',
+  defective_drywall:        'Defective drywall',
+  utility_billing_method:   'How utilities are billed',
+  military_ordnance:        'Military air installation / ordnance area',
+  condemnation_orders:      'Outstanding inspection or condemnation orders',
+  shared_utilities:         'Shared or unmetered utilities',
+  fire_damage:              'Fire damage history',
+  property_condition:       'Property condition',
+  pest_control:             'Periodic pest control',
+  rent_control:             'Rent control / just cause',
+  energy_efficiency:        'Energy efficiency',
+  other:                    'Other disclosure',
+}
+
+/** Which transaction a document belongs to. A disclosure often differs between
+ *  selling a home and renting one; 'any' means it does not. */
+export const TEMPLATE_APPLIES_TO = ['any', 'sale', 'rental'] as const
+export type TemplateAppliesTo = typeof TEMPLATE_APPLIES_TO[number]
+export const TEMPLATE_APPLIES_TO_LABEL: Record<TemplateAppliesTo, string> = {
+  any:    'Sales and rentals',
+  sale:   'When the home is being sold',
+  rental: 'When the home is being rented',
+}
+
 export const LEASE_TEMPLATE_PURPOSES = [
   'lease', 'work_trade_addendum', 'installment_sale',
   'park_rules', 'state_disclosure', 'addendum', 'other',

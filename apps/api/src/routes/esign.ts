@@ -31,6 +31,9 @@ import {
   dueDayLabel,
   parseDueDay,
   GENERIC_SIGNER_ROLES,
+  DISCLOSURE_TYPES,
+  DISCLOSURE_TYPE_LABEL,
+  TEMPLATE_APPLIES_TO,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -2023,9 +2026,46 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
   } catch (e) { next(e) }
 })
 
+/**
+ * GET /api/esign/disclosures — every slot, and whether this landlord filled it.
+ *
+ * S652 (Nic): "Say there's 15 different disclosures, maybe only two of them are
+ * required in their area. We're not enforcing it, but they could upload the
+ * other 13 to kind of fill out the robustness of their operation."
+ *
+ * So this returns the whole list with what they hold against each, and says
+ * NOTHING about which ones they need. No state, no requirement, no warning
+ * colour — a landlord looking at an empty slot is looking at a document they
+ * have not uploaded, not a compliance failure. What they do about it is theirs.
+ */
+esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async (req: any, res, next) => {
+  try {
+    const held = await query<{ disclosure_type: string; applies_to: string; id: string; name: string }>(
+      `SELECT disclosure_type, applies_to, id, name
+         FROM lease_templates
+        WHERE landlord_id = ANY($1::uuid[]) AND is_active = TRUE AND disclosure_type IS NOT NULL
+        ORDER BY name`,
+      [landlordScopeIds(req.user!)])
+    res.json({ success: true, data: DISCLOSURE_TYPES.map(type => {
+      const docs = held.filter(h => h.disclosure_type === type)
+      return {
+        type,
+        label: DISCLOSURE_TYPE_LABEL[type],
+        documents: docs.map(d => ({ id: d.id, name: d.name, appliesTo: d.applies_to })),
+        // A disclosure that reads differently for a sale than for a rental
+        // needs both to be complete. Stated as a fact about what they hold,
+        // never as something they are missing.
+        hasSale:   docs.some(d => d.applies_to === 'sale'   || d.applies_to === 'any'),
+        hasRental: docs.some(d => d.applies_to === 'rental' || d.applies_to === 'any'),
+      }
+    }) })
+  } catch (e) { next(e) }
+})
+
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose } = req.body
+    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose,
+            disclosureType, appliesTo } = req.body
     if (!name) throw new AppError(400, 'Template name required')
     // S576 (B-8): 'lease' (default) or 'work_trade_addendum' — the landlord's
     // own work-trade addendum form, auto-attached to a renewal on lease expiry.
@@ -2033,6 +2073,22 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     if (!(LEASE_TEMPLATE_PURPOSES as readonly string[]).includes(tmplPurpose)) {
       throw new AppError(400, `purpose must be one of ${LEASE_TEMPLATE_PURPOSES.join(', ')}`)
     }
+    // S652 (Nic): "These are categories to be filled... some of these are
+    // required in some areas. We don't police what's required where." A slot a
+    // landlord chose to fill, and nothing more — no state mapping, no required
+    // flag. `appliesTo` is the one that does real work: the SALE version of a
+    // disclosure belongs in front of a buyer and the RENTAL version in front of
+    // a renter, which is what lets a packet assemble itself.
+    const disclosure = disclosureType == null || disclosureType === ''
+      ? null : String(disclosureType)
+    if (disclosure != null && !(DISCLOSURE_TYPES as readonly string[]).includes(disclosure)) {
+      throw new AppError(400, `disclosureType must be one of ${DISCLOSURE_TYPES.join(', ')}, or null`)
+    }
+    const applies = appliesTo == null || appliesTo === '' ? 'any' : String(appliesTo)
+    if (!(TEMPLATE_APPLIES_TO as readonly string[]).includes(applies)) {
+      throw new AppError(400, `appliesTo must be one of ${TEMPLATE_APPLIES_TO.join(', ')}`)
+    }
+
     // S558: the deposit multiplier ("N months' rent") is a lease term on the
     // template. Optional (NULL = landlord fills the deposit manually); 0..12.
     const depMonths = depositMonths === undefined || depositMonths === null || depositMonths === ''
@@ -2063,9 +2119,11 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       ? await landlordIdForProperty(req.user!, String(propertyId), query)
       : resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
     const t = await queryOne<any>(`
-      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [templateLandlordId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose])
+      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose,
+                                   disclosure_type, applies_to)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [templateLandlordId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose,
+       disclosure, applies])
 
     // S629 (Nic): "when you add a template for a unit type and there is no
     // default, it should automatically become the default."

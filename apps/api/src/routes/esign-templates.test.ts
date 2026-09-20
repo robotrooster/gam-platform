@@ -364,3 +364,74 @@ describe('DELETE /templates/:id/fields/:fieldId — S393 scope fix', () => {
     expect(row.rows).toHaveLength(0)
   })
 })
+
+/**
+ * S652 — slots for the disclosures that exist, filled at the landlord's
+ * discretion, policed by nobody.
+ *
+ * Nic: "These are categories to be filled... some of these are required in some
+ * areas. We don't police what's required where... maybe there's something
+ * that's not required in one state that a landlord decides, hey, it might be a
+ * good idea if I had this. Say there's 15 different disclosures, maybe only two
+ * of them are required in their area. We're not enforcing it, but they could
+ * upload the other 13 to kind of fill out the robustness of their operation."
+ */
+describe('S652: disclosure categories', () => {
+  it('offers every category and says nothing about which are required', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.length).toBeGreaterThanOrEqual(15)
+
+    const blob = JSON.stringify(res.body.data).toLowerCase()
+    // The words that would turn a checklist into a compliance claim.
+    expect(blob).not.toMatch(/required|must|mandatory|violation|complian/)
+    // And no state ever appears — GAM holds the acts, it does not rule on them.
+    expect(res.body.data[0]).not.toHaveProperty('states')
+  })
+
+  it('shows a landlord what they hold, per category and per transaction', async () => {
+    const f = await seed()
+    const mk = (name: string, appliesTo: string) =>
+      request(buildApp()).post('/api/esign/templates')
+        .set('Authorization', `Bearer ${f.tokenA}`)
+        .send({ name, disclosureType: 'lead_based_paint', appliesTo, unitType: null })
+
+    expect((await mk('LBP — sale', 'sale')).status).toBe(201)
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const lbp = res.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp.documents).toHaveLength(1)
+    expect(lbp.hasSale).toBe(true)
+    // Held for a sale, not for a rental. A FACT about what they have — the
+    // landlord decides whether that matters to them.
+    expect(lbp.hasRental).toBe(false)
+
+    expect((await mk('LBP — lease', 'rental')).status).toBe(201)
+    const after = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const lbp2 = after.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp2.hasRental).toBe(true)
+    expect(lbp2.documents).toHaveLength(2)
+  })
+
+  it('refuses a category nobody has heard of', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Made up', disclosureType: 'dragons', unitType: null })
+    expect(res.status).toBe(400)
+  })
+
+  it('a template with no category is simply not a disclosure', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ name: 'Plain lease', unitType: null })
+    expect(res.status).toBe(201)
+    expect(res.body.data.disclosure_type ?? res.body.data.disclosureType).toBeFalsy()
+    expect(res.body.data.applies_to ?? res.body.data.appliesTo).toBe('any')
+  })
+})
