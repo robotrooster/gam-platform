@@ -6,9 +6,13 @@
  * flowing through. When the debit is built for all-cash properties, the bank
  * cost is its own line item so the landlord doesn't dispute the charge."
  *
- * The gates are what this file is mostly about. A debit that fires when it
- * should not have is not a bug you find in staging — it is money out of
- * somebody's bank account, and the first person to notice is them.
+ * "By default" means not first, NOT optional. Nic, on a draft that had a
+ * consent toggle: "That's not a landlord choice to fucking pay us. It's
+ * mandatory." So there is no test here for refusing an unwilling landlord —
+ * there is no such state. What IS tested is that it cannot fire twice, cannot
+ * fire under the threshold, and cannot mark a fee paid before the money lands.
+ * Each of those is real money out of somebody's account, and the first person
+ * to notice would be them.
  */
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest'
 import { query, getClient } from '../db'
@@ -27,12 +31,14 @@ const owe = (amount: number, sourceId: string) =>
     sourceType: 'test_fee', sourceId,
   })
 
-/** Put the landlord in the one state where a debit is allowed to happen. */
-async function authorize() {
+/**
+ * Give the landlord a bank GAM can reach. Not consent — plumbing. Without a
+ * usable link the pull cannot happen at all, which is its own tested case.
+ */
+async function withLinkedBank() {
   await query(
     `UPDATE landlords
-        SET gam_debit_authorized_at = NOW(), gam_debit_revoked_at = NULL,
-            gam_debit_payment_method_id = 'pm_test_bank',
+        SET gam_debit_payment_method_id = 'pm_test_bank',
             stripe_fc_customer_id = 'cus_test'
       WHERE id = $1`, [landlordId])
 }
@@ -64,49 +70,47 @@ describe('the gates on a landlord debit', () => {
     await query(`DELETE FROM landlord_gam_debits WHERE landlord_id = $1`, [landlordId])
     await query(`DELETE FROM landlord_gam_charges WHERE landlord_id = $1`, [landlordId])
     await query(
-      `UPDATE landlords
-          SET gam_debit_authorized_at = NULL, gam_debit_revoked_at = NULL,
-              gam_debit_payment_method_id = NULL
-        WHERE id = $1`, [landlordId])
-  })
-
-  it('refuses when the landlord never authorized it — the default', async () => {
-    await owe(500, '11111111-1111-1111-1111-111111111111')
-    const out = await debitLandlordForCharges(landlordId)
-    expect(out).toEqual({ status: 'skipped', reason: 'not_authorized' })
-  })
-
-  it('refuses after the authorization is revoked', async () => {
-    await authorize()
-    await query(
-      `UPDATE landlords SET gam_debit_revoked_at = NOW() WHERE id = $1`, [landlordId])
-    await owe(500, '22222222-2222-2222-2222-222222222222')
-    expect((await debitLandlordForCharges(landlordId)).reason).toBe('not_authorized')
+      `UPDATE landlords SET gam_debit_payment_method_id = NULL WHERE id = $1`, [landlordId])
   })
 
   it('refuses when the balance is under the property threshold', async () => {
     // Carrying $20 to next month is cheaper than a bank pull. That is the
-    // whole reason the threshold exists.
-    await authorize()
+    // whole reason the threshold exists, and it is the only reason a solvent
+    // debt is ever left uncollected.
+    await withLinkedBank()
     await owe(20, '33333333-3333-3333-3333-333333333333')
     expect((await debitLandlordForCharges(landlordId)).reason).toBe('under_threshold')
   })
 
   it('refuses when nothing is owed', async () => {
-    await authorize()
+    await withLinkedBank()
     expect((await debitLandlordForCharges(landlordId)).reason).toBe('nothing_owed')
   })
 
   it('refuses while a pull is still settling', async () => {
     // ACH takes days. A daily job that cannot see yesterday's pull would take
     // the same fees again on day two — and the landlord would be down twice.
-    await authorize()
+    await withLinkedBank()
     await owe(500, '44444444-4444-4444-4444-444444444444')
     await query(
       `INSERT INTO landlord_gam_debits
          (landlord_id, charges_amount, bank_cost_amount, total_amount, status)
        VALUES ($1, 500, 4, 504, 'pending')`, [landlordId])
     expect((await debitLandlordForCharges(landlordId)).reason).toBe('debit_in_flight')
+  })
+
+  it('reports an uncollectable landlord rather than writing the debt off', async () => {
+    // No bank GAM can reach. The fee is still owed — this is a collection
+    // failure somebody has to act on, not an exemption the landlord earned by
+    // never linking an account.
+    await owe(500, '99999999-9999-9999-9999-999999999999')
+    const out = await debitLandlordForCharges(landlordId)
+    expect(out.reason).toBe('no_bank_link')
+
+    const [c] = await query<any>(
+      `SELECT collected_amount::text AS collected FROM landlord_gam_charges
+        WHERE landlord_id = $1`, [landlordId])
+    expect(parseFloat(c.collected)).toBe(0)
   })
 })
 
@@ -199,7 +203,7 @@ describe('the bank cost is charged as its own line', () => {
     }))
     const { debitLandlordForCharges: debit } = await import('./landlordGamDebit')
 
-    await authorize()
+    await withLinkedBank()
     await owe(130, '88888888-8888-8888-8888-888888888888')
     const out = await debit(landlordId)
 

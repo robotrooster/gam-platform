@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict VZiJr1R5JapOQq71GAjnwDoqw8B4h3orbhABdSeSTYPfTwjoNTYKVoo68FrDIvg
+\restrict jqP3Cu1n5xLPoCNtxdIuJN3LZ3CkDXiKS9DTgKpf5ZofHIG8mIlMCVbtUnCaN2m
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5141,7 +5141,21 @@ COMMENT ON COLUMN public.landlords.first_billing_cycle IS 'S632 SUPERSEDED by pr
 -- Name: COLUMN landlords.gam_debit_authorized_at; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.landlords.gam_debit_authorized_at IS 'S651: when this landlord authorized GAM to ACH-debit them for GAM charges that could not be netted out of a payout. NULL = never authorized or since revoked; debitLandlordForCharges() refuses. Linking a bank for the transaction feed does NOT set this.';
+COMMENT ON COLUMN public.landlords.gam_debit_authorized_at IS 'S651: when GAM first set up a debit path against this landlord''s linked bank. AUDIT ONLY — it is not consent and nothing gates on it. Fee collection is mandatory per the landlord agreement; a debit is simply what happens when there is no payout to net against and the balance crosses the threshold. See services/landlordGamDebit.ts.';
+
+
+--
+-- Name: COLUMN landlords.gam_debit_payment_method_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.gam_debit_payment_method_id IS 'S651: the us_bank_account PaymentMethod GAM pulls fees from, minted from the bank the landlord linked. Filled lazily at the first debit rather than by any landlord action. NULL means no usable link — which blocks collection and raises an alert, it does not excuse the debt.';
+
+
+--
+-- Name: COLUMN landlords.gam_debit_revoked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.gam_debit_revoked_at IS 'S651: DEAD. A landlord cannot revoke fee collection. Kept only so an existing row is not lost; nothing reads it.';
 
 
 --
@@ -27228,5 +27242,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict VZiJr1R5JapOQq71GAjnwDoqw8B4h3orbhABdSeSTYPfTwjoNTYKVoo68FrDIvg
+\unrestrict jqP3Cu1n5xLPoCNtxdIuJN3LZ3CkDXiKS9DTgKpf5ZofHIG8mIlMCVbtUnCaN2m
 

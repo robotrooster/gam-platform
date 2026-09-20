@@ -12,15 +12,27 @@
  * flowing through. When the debit is built for all-cash properties, the bank
  * cost is its own line item so the landlord doesn't dispute the charge."
  *
- * THREE GATES, all of which must be open:
- *   1. The landlord authorized it. Explicitly, for this. Having linked a bank
- *      so GAM can read the transaction feed is NOT authorization to take money
- *      out of it, and treating it as such would be the kind of thing that ends
- *      a company.
- *   2. The balance is at or over the property threshold. Below it, the debt
+ * "BY DEFAULT" MEANS NOT AS THE FIRST RESORT. It does not mean the landlord
+ * gets to decline. Nic, on an earlier draft of this file that had a consent
+ * toggle on it: "That's not a landlord choice to fucking pay us. It's
+ * mandatory. If there's no electronic charges to debit against, then when it
+ * hits the threshold, we debit from their account that they have linked."
+ *
+ * Which is obviously right. The fee is owed for running the park, however the
+ * rent arrived. Netting is preferred because it moves no extra money — a cost
+ * preference, not a permission structure — and a landlord who could switch off
+ * the only remaining route could simply never pay at all. The landlord agreed
+ * to be billed when they signed up. That is the authorization, and it is not
+ * re-asked per pull.
+ *
+ * TWO GATES, both of which must be open:
+ *   1. The balance is at or over the property threshold. Below it, the debt
  *      waits — carrying $20 to next month is cheaper than a bank pull.
- *   3. Netting had its chance first. This runs on its own schedule, after the
+ *   2. Netting had its chance first. This runs on its own schedule, after the
  *      passthrough batch, so anything collectable from a payout already was.
+ *
+ * A landlord with no usable bank link cannot be debited. That is a COLLECTION
+ * FAILURE, not an exemption: it alerts, and the debt stays owed.
  *
  * WHAT THE LANDLORD SEES, and why it is two numbers:
  *   Platform fee — September    $130.00
@@ -61,11 +73,11 @@ export function bankCostFor(amount: number): number {
 export interface DebitOutcome {
   status: 'debited' | 'skipped'
   reason?:
-    | 'not_authorized'
     | 'under_threshold'
     | 'nothing_owed'
     | 'debit_in_flight'
-    | 'no_payment_method'
+    /** no usable bank link — the debt stays owed and this alerts */
+    | 'no_bank_link'
     | 'stripe_failed'
   debitId?: string
   chargesAmount?: number
@@ -77,8 +89,6 @@ export interface DebitOutcome {
 interface LandlordDebitRow {
   id: string
   business_name: string | null
-  gam_debit_authorized_at: Date | null
-  gam_debit_revoked_at: Date | null
   gam_debit_payment_method_id: string | null
   stripe_fc_customer_id: string | null
 }
@@ -92,21 +102,13 @@ interface LandlordDebitRow {
  */
 export async function debitLandlordForCharges(landlordId: string): Promise<DebitOutcome> {
   const l = await queryOne<LandlordDebitRow>(
-    `SELECT id, business_name, gam_debit_authorized_at, gam_debit_revoked_at,
-            gam_debit_payment_method_id, stripe_fc_customer_id
+    `SELECT id, business_name, gam_debit_payment_method_id, stripe_fc_customer_id
        FROM landlords WHERE id = $1`,
     [landlordId])
-  if (!l) return { status: 'skipped', reason: 'not_authorized' }
+  if (!l) return { status: 'skipped', reason: 'nothing_owed' }
 
-  // GATE 1 — they said yes, and have not since said no.
-  if (!l.gam_debit_authorized_at || l.gam_debit_revoked_at) {
-    return { status: 'skipped', reason: 'not_authorized' }
-  }
-  if (!l.gam_debit_payment_method_id || !l.stripe_fc_customer_id) {
-    return { status: 'skipped', reason: 'no_payment_method' }
-  }
-
-  // GATE 2 — worth a bank pull at all.
+  // GATE 1 — worth a bank pull at all. Below the threshold the debt waits;
+  // carrying $20 to next month is cheaper than the transfer to collect it.
   const [owed, threshold] = await Promise.all([
     outstandingForLandlord(landlordId),
     debitThresholdForLandlord(landlordId),
@@ -114,13 +116,42 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
   if (owed <= 0) return { status: 'skipped', reason: 'nothing_owed' }
   if (owed < threshold) return { status: 'skipped', reason: 'under_threshold' }
 
-  // GATE 3 — an ACH pull takes days to settle. Firing a second one tomorrow
+  // GATE 2 — an ACH pull takes days to settle. Firing a second one tomorrow
   // for the same fees is how a landlord gets double-debited, so the unique
   // partial index and this check both guard it.
   const inFlight = await queryOne<{ id: string }>(
     `SELECT id FROM landlord_gam_debits WHERE landlord_id = $1 AND status = 'pending' LIMIT 1`,
     [landlordId])
   if (inFlight) return { status: 'skipped', reason: 'debit_in_flight' }
+
+  // The bank to pull from is the one they already linked. Minted on first use
+  // rather than at link time, so a landlord who never owes anything never has a
+  // payment method sitting on their account.
+  //
+  // No usable link is a COLLECTION FAILURE, not an exemption. It alerts loudly
+  // and the debt stays exactly where it is — the alternative is a park running
+  // for free because nobody noticed a bank was never connected.
+  let paymentMethodId = l.gam_debit_payment_method_id
+  if (!paymentMethodId) {
+    const { createDebitPaymentMethod } = await import('./bankFeed')
+    const pm = await createDebitPaymentMethod(landlordId).catch(() => null)
+    if (!pm) {
+      logger.error({ landlordId, owed, threshold },
+        '[gam-debit] OWES GAM AND CANNOT BE COLLECTED FROM — no usable bank link')
+      return { status: 'skipped', reason: 'no_bank_link' }
+    }
+    paymentMethodId = pm.paymentMethodId
+    await query(
+      `UPDATE landlords
+          SET gam_debit_payment_method_id = $2, gam_debit_bank_last4 = $3,
+              gam_debit_bank_name = $4,
+              gam_debit_authorized_at = COALESCE(gam_debit_authorized_at, NOW()),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [landlordId, pm.paymentMethodId, pm.last4, pm.bankName])
+  }
+  const customerId = l.stripe_fc_customer_id
+    ?? await (await import('./bankFeed')).getOrCreateFcCustomer(landlordId)
 
   const bankCost = bankCostFor(owed)
   const stripe = getStripe()
@@ -167,7 +198,7 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id`,
       [landlordId, owed.toFixed(2), bankCost.toFixed(2), total.toFixed(2),
-       l.gam_debit_payment_method_id, chargeIds, threshold.toFixed(2)])
+       paymentMethodId, chargeIds, threshold.toFixed(2)])
     debitId = ins.rows[0].id
 
     await client.query('COMMIT')
@@ -186,8 +217,8 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
     const pi = await stripe.paymentIntents.create({
       amount: Math.round(total * 100),
       currency: 'usd',
-      customer: l.stripe_fc_customer_id,
-      payment_method: l.gam_debit_payment_method_id,
+      customer: customerId,
+      payment_method: paymentMethodId,
       payment_method_types: ['us_bank_account'],
       confirm: true,
       off_session: true,
@@ -289,15 +320,17 @@ export async function settleGamDebit(
 }
 
 /**
- * The nightly sweep. Only landlords who authorized a debit are even considered,
- * which is why this is cheap and why it does nothing at all on a normal night.
+ * The nightly sweep — every landlord who owes GAM anything.
+ *
+ * Cheap and usually silent, because almost everyone is under their threshold:
+ * one ACH rent payment at Oak Park offsets roughly 44 cash fees and the park
+ * does not have 44 spaces. The ones that surface here are the all-cash
+ * properties, which is exactly who this was built for.
  */
 export async function runGamDebitSweep(): Promise<{ considered: number; debited: number; skipped: Record<string, number> }> {
   const rows = await query<{ id: string }>(
     `SELECT l.id FROM landlords l
-      WHERE l.gam_debit_authorized_at IS NOT NULL
-        AND l.gam_debit_revoked_at IS NULL
-        AND l.is_demo = FALSE
+      WHERE l.is_demo = FALSE
         AND EXISTS (SELECT 1 FROM landlord_gam_charges c
                      WHERE c.landlord_id = l.id AND c.collected_amount < c.amount)`)
 
@@ -309,6 +342,13 @@ export async function runGamDebitSweep(): Promise<{ considered: number; debited:
     }))
     if (out.status === 'debited') debited++
     else skipped[out.reason ?? 'unknown'] = (skipped[out.reason ?? 'unknown'] ?? 0) + 1
+  }
+  // A landlord over their threshold with no bank GAM can reach is money that
+  // will never arrive unless somebody acts. It does not belong in an info log
+  // nobody reads.
+  if (skipped.no_bank_link) {
+    logger.error({ count: skipped.no_bank_link },
+      '[gam-debit-sweep] landlords owe GAM and have no bank link to collect from')
   }
   return { considered: rows.length, debited, skipped }
 }

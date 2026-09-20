@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useQuery, useQueryClient } from 'react-query'
+import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { humanize } from '@gam/shared'
-import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
 import { PropertySelect } from '../components/ListControls'
@@ -76,30 +76,15 @@ const GAM_CHARGE_LABEL: Record<string, string> = {
 }
 
 function GamChargesSection() {
-  const qc = useQueryClient()
   const { data } = useQuery<any>('gam-charges', () => apiGet('/landlords/me/gam-charges'))
-  const [confirming, setConfirming] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
 
   const charges: any[] = data?.charges ?? []
   const debits: any[] = data?.debits ?? []
-  const auths: any[] = data?.authorizations ?? []
+  const banks: any[] = data?.banks ?? []
   if (!charges.length && !debits.length) return null
 
   const outstanding = Number(data?.outstanding ?? 0)
-
-  const setAuth = async (landlordId: string, on: boolean) => {
-    setBusy(true); setErr(null)
-    try {
-      if (on) await apiPost('/landlords/me/gam-debit-authorization', { landlordId, agree: true })
-      else    await apiDelete('/landlords/me/gam-debit-authorization')
-      await qc.invalidateQueries('gam-charges')
-      setConfirming(null)
-    } catch (e: any) {
-      setErr(e?.response?.data?.error || e?.response?.data?.message || 'That didn’t go through.')
-    } finally { setBusy(false) }
-  }
+  const missingBank = banks.filter((b: any) => !b.has_bank_link)
 
   return (
     <div className="card" style={{ marginBottom: 16 }}>
@@ -108,12 +93,26 @@ function GamChargesSection() {
         <span style={{ fontWeight: 700 }}>{outstanding > 0 ? fmt(outstanding) : 'Nothing owed'}</span>
       </div>
       <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
-        GAM takes what you owe out of money already on its way to you, so it costs you no extra
-        transfer. That’s why a payout can land smaller than the rent collected — the difference
-        is itemised below.
+        These come out of money already on its way to you, so they cost you no extra transfer —
+        which is why a payout can land smaller than the rent collected. The difference is itemised
+        below. If a property takes only cash there’s no payout to take them from, and once the
+        balance passes {fmt(banks[0]?.threshold ?? 100)} they’re transferred from your linked bank
+        instead{banks[0]?.gam_debit_bank_last4 ? ` (ending ${banks[0].gam_debit_bank_last4})` : ''}.
+        That transfer’s own cost is charged as its own line, so you can check both numbers.
       </div>
 
-      <div style={{ maxHeight: 260, overflowY: 'auto', marginBottom: 12 }}>
+      {missingBank.length > 0 && (
+        // Not a way out of the bill — a thing that will stop working. Said
+        // plainly and early, because the alternative is a landlord finding out
+        // when collection fails.
+        <div style={{ fontSize: '.78rem', color: 'var(--amber)', lineHeight: 1.55, marginBottom: 10 }}>
+          {missingBank.map((b: any) => b.business_name || 'Your company').join(', ')} has no bank
+          linked. These charges still stand — link a bank so they can be settled without anyone
+          chasing it. <Link to="/bank">Link a bank</Link>
+        </div>
+      )}
+
+      <div style={{ maxHeight: 260, overflowY: 'auto', marginBottom: debits.length ? 12 : 0 }}>
         {charges.map((c: any) => {
           const amount = Number(c.amount)
           const collected = Number(c.collected_amount)
@@ -140,8 +139,8 @@ function GamChargesSection() {
       </div>
 
       {debits.length > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4 }}>Taken straight from your bank</div>
+        <div>
+          <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4 }}>Taken from your bank</div>
           {debits.map((d: any) => (
             <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
                                      padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
@@ -155,49 +154,6 @@ function GamChargesSection() {
           ))}
         </div>
       )}
-
-      {/* The authorization. Off unless the landlord turns it on — Nic: "never
-          ACH-debit a landlord by default." */}
-      {auths.map((a: any) => {
-        const on = !!a.gam_debit_authorized_at
-        return (
-          <div key={a.landlord_id} style={{ borderTop: '1px solid var(--border-0)', paddingTop: 10, marginTop: 4 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
-              <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55 }}>
-                <b>{a.business_name || 'Your company'}</b>{' — '}
-                {on
-                  ? <>if there’s ever no payout to take these out of, GAM may transfer them from your
-                      bank ending {a.gam_debit_bank_last4 ?? '—'}. The transfer’s own cost is charged
-                      as its own line, so you can see both numbers.</>
-                  : <>if every tenant at a property pays cash, there’s no payout to take these out of
-                      and the balance just sits. You can let GAM transfer it from your linked bank
-                      instead. It only ever happens when netting can’t —{' '}
-                      today that would be {fmt(data?.bankCostIfDebitedToday)} of bank transfer cost
-                      on top, charged as its own line.</>}
-              </div>
-              {on ? (
-                <button className="btn btn-ghost btn-sm" disabled={busy}
-                        onClick={() => setAuth(a.landlord_id, false)}>Turn off</button>
-              ) : confirming === a.landlord_id ? (
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <button className="btn btn-primary btn-sm" disabled={busy}
-                          onClick={() => setAuth(a.landlord_id, true)}>
-                    {busy ? 'Saving…' : 'Yes, allow it'}
-                  </button>
-                  <button className="btn btn-ghost btn-sm" disabled={busy}
-                          onClick={() => { setConfirming(null); setErr(null) }}>Cancel</button>
-                </div>
-              ) : (
-                <button className="btn btn-primary btn-sm"
-                        onClick={() => setConfirming(a.landlord_id)}>Allow bank transfers</button>
-              )}
-            </div>
-            {err && confirming === a.landlord_id && (
-              <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>
-            )}
-          </div>
-        )
-      })}
     </div>
   )
 }

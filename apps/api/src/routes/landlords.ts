@@ -6740,14 +6740,20 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
         LIMIT 50`,
       [landlordIds])
 
-    // The authorization is per company, and a read spans every company the
-    // account owns — so say which of them have authorized rather than
-    // flattening it into one yes/no that would be wrong for the other.
-    const auth = await query<any>(
+    // Per company, because a read spans every company the account owns and the
+    // bank behind each one is a different bank. Not a consent state — where the
+    // money would come from if netting cannot cover it, and whether a bank is
+    // actually reachable. A company with no link is the one that needs saying
+    // out loud: the debt does not go away, it just cannot be collected.
+    const banks = await query<any>(
       `SELECT l.id AS landlord_id, l.business_name,
-              l.gam_debit_authorized_at, l.gam_debit_revoked_at,
               l.gam_debit_bank_last4, l.gam_debit_bank_name,
-              (l.gam_debit_payment_method_id IS NOT NULL) AS has_payment_method,
+              -- the LOWEST threshold across the company's properties, matching
+              -- debitThresholdForLandlord — if any property is set cautious,
+              -- the account inherits that caution, so that is the number to
+              -- show rather than an average nothing uses
+              (SELECT MIN(p.gam_debit_threshold) FROM properties p
+                WHERE p.landlord_id = l.id)::text AS threshold,
               EXISTS (SELECT 1 FROM bank_connections bc
                        WHERE bc.landlord_id = l.id AND bc.status = 'active') AS has_bank_link
          FROM landlords l WHERE l.id = ANY($1::uuid[])
@@ -6763,7 +6769,7 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
         outstanding: Math.round(outstanding * 100) / 100,
         charges,
         debits,
-        authorizations: auth,
+        banks,
         // What a pull would cost today, so the landlord can see that letting
         // money run through the platform is the cheaper of the two routes
         // before they decide anything.
@@ -6773,67 +6779,15 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
   } catch (e) { next(e) }
 })
 
-const gamDebitAuthSchema = z.object({
-  landlordId: z.string().uuid().optional(),
-  bankConnectionId: z.string().uuid().optional(),
-  /** must be literally true — an unchecked box is not consent */
-  agree: z.literal(true),
-})
-
-// POST /api/landlords/me/gam-debit-authorization
+// There is no authorization endpoint, and that is deliberate.
 //
-// requireLandlord + ownsLandlord, not a permission: authorizing somebody to
-// take money out of the company's bank account is an owner's act. An onsite
-// manager with payments.view_all can read the statement above and cannot do
-// this.
-landlordsRouter.post('/me/gam-debit-authorization', requireLandlord, async (req: any, res, next) => {
-  try {
-    const body = gamDebitAuthSchema.parse(req.body)
-    const landlordId = resolveLandlordTarget(req.user!, body.landlordId, 'company')
-    if (!ownsLandlord(req.user!, landlordId)) throw new AppError(403, 'Not your company')
-
-    const { createDebitPaymentMethod } = await import('../services/bankFeed')
-    const pm = await createDebitPaymentMethod(landlordId, body.bankConnectionId)
-    if (!pm) {
-      // Deliberately specific. "Something went wrong" here would have the
-      // landlord calling their bank about a permission GAM never asked for.
-      throw new AppError(400,
-        'Your bank is linked for reading transactions only. Re-link it once and you’ll be asked ' +
-        'to allow payments from that account — then you can turn this on.')
-    }
-
-    await query(
-      `UPDATE landlords
-          SET gam_debit_authorized_at = NOW(),
-              gam_debit_authorized_by_user_id = $2,
-              gam_debit_authorized_ip = $3,
-              gam_debit_payment_method_id = $4,
-              gam_debit_bank_last4 = $5,
-              gam_debit_bank_name = $6,
-              gam_debit_revoked_at = NULL,
-              updated_at = NOW()
-        WHERE id = $1`,
-      [landlordId, req.user!.userId, (req.ip ?? '').slice(0, 64),
-       pm.paymentMethodId, pm.last4, pm.bankName])
-
-    logger.warn({ landlordId, userId: req.user!.userId, last4: pm.last4 },
-      '[gam-debit] landlord authorized GAM to debit for uncollectable charges')
-    res.json({ success: true, data: { bankLast4: pm.last4, bankName: pm.bankName } })
-  } catch (e) { next(e) }
-})
-
-// DELETE — revoking is one click and takes effect immediately. A debit already
-// submitted to the bank keeps settling; it was authorized when it was made.
-landlordsRouter.delete('/me/gam-debit-authorization', requireLandlord, async (req: any, res, next) => {
-  try {
-    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
-    if (!ownsLandlord(req.user!, landlordId)) throw new AppError(403, 'Not your company')
-    await query(
-      `UPDATE landlords
-          SET gam_debit_revoked_at = NOW(), gam_debit_authorized_at = NULL,
-              gam_debit_payment_method_id = NULL, updated_at = NOW()
-        WHERE id = $1`, [landlordId])
-    logger.warn({ landlordId, userId: req.user!.userId }, '[gam-debit] authorization revoked')
-    res.json({ success: true })
-  } catch (e) { next(e) }
-})
+// An earlier draft of this had one — a toggle the landlord flipped before GAM
+// could ever pull fees. Nic, on seeing it: "That's not a landlord choice to
+// fucking pay us. It's mandatory." The fee is owed for running the park
+// however the rent arrived; netting is preferred because it moves no extra
+// money, not because the landlord granted permission for it. A switch that
+// turns off the only remaining collection route is a switch that makes an
+// all-cash property free to run.
+//
+// So the portal DISCLOSES this rather than asking about it. The section above
+// is the disclosure: what is owed, what has been taken, and out of where.
