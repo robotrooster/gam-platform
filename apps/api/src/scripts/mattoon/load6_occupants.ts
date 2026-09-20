@@ -15,6 +15,11 @@
  * financially liable — which is what the sheet actually records them as. A
  * signing co-tenant needs their own address and can be added by addendum later.
  */
+// S652: this read signers with role='tenant'. Residents are now 'primary' and
+// 'co_tenant_N' — the roles templates actually bind to — so the old filter
+// matched nobody and would have listed every signer as a non-signing occupant.
+// A one-off script left pointing at a vocabulary that no longer exists is a
+// trap for whoever runs it next.
 import { query } from '../../db'
 import fs from 'fs'
 
@@ -40,7 +45,7 @@ async function main() {
       `SELECT d.id,
               (SELECT array_agg(s.name ORDER BY s.order_index)
                  FROM lease_document_signers s
-                WHERE s.document_id = d.id AND s.role = 'tenant') AS signers
+                WHERE s.document_id = d.id AND s.role <> 'landlord') AS signers
          FROM lease_documents d JOIN units u ON u.id = d.unit_id
         WHERE u.property_id = $1 AND u.unit_number = $2
           AND d.document_type = 'original_lease' AND d.voided_at IS NULL`,

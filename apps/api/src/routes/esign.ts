@@ -604,7 +604,22 @@ export async function createDocumentRecord(client: any, opts: {
     // Filled from the signers, and OMITTED where there is no such tenant, the
     // same way a co-tenant's signature field is already omitted. Nobody types a
     // name that the system took at invite time.
-    const TENANT_NAME_COLUMNS = ['tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name']
+    /**
+ * S652 — everybody who lives here, once each, signers first.
+ *
+ * Case-insensitive on the compare so "nancy sheptock" from a sheet does not
+ * become a second Nancy beside the signer.
+ */
+function mergeNames(roster: string[], supplied: unknown): string {
+  const extra = String(supplied ?? '').split(',').map(n => n.trim()).filter(Boolean)
+  const out: string[] = []
+  for (const n of [...roster, ...extra]) {
+    if (!out.some(o => o.toLowerCase() === n.toLowerCase())) out.push(n)
+  }
+  return out.join(', ')
+}
+
+const TENANT_NAME_COLUMNS = ['tenant_name', 'tenant_2_name', 'tenant_3_name', 'tenant_4_name']
     const TENANT_ORDER = ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']
     const rosterNames = TENANT_ORDER
       .map(role => (docSigners as any[]).find((s: any) => s.role === role)?.name)
@@ -632,7 +647,19 @@ export async function createDocumentRecord(client: any, opts: {
           // S635: one line naming the whole household, in invite order. The
           // form asks who lives here; the roster is the answer, and the
           // landlord does not retype it.
-          ? (rosterNames.join(', ') || null)
+          //
+          // S652 — THE ROSTER IS NOT THE WHOLE HOUSEHOLD, and this box was the
+          // one place that mattered. An adult with no email address never
+          // becomes a signer, so they are not in rosterNames — and this line
+          // overrode anything the caller supplied, silently, which is how John
+          // Sheptock came off his own lease twice. Nic, both times: "you didn't
+          // add john as authorized occupant. why?"
+          //
+          // A caller who names the household KNOWS something this function
+          // cannot: who lives there without an account. So their value wins,
+          // and is merged with the roster rather than replacing it, because the
+          // form is asking who lives here and the answer is everybody.
+          ? (mergeNames(rosterNames, prefillValues.occupant_names) || null)
           : f.lease_column && prefillValues[f.lease_column] != null
             ? leaseColumnDisplayValue(f.lease_column, prefillValues[f.lease_column])
             // S641 (Nic): the template's own starting answer, for the boxes that

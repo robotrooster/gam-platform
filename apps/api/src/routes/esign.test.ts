@@ -107,7 +107,7 @@ vi.mock('../services/pdfStamp', async (importOriginal) => {
   return { ...actual, stampPdf: stampPdfMock }
 })
 
-import { esignRouter, buildLeaseFromDocument, signingUrlFor } from './esign'
+import { esignRouter, buildLeaseFromDocument, signingUrlFor, createDocumentRecord } from './esign'
 import { WRITABLE_LEASE_COLUMN_SPECS } from '@gam/shared'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -3917,5 +3917,82 @@ describe('the lease adopts a home sale that predates it', () => {
     const { rows } = await db.query<{ lease_id: string | null }>(
       `SELECT lease_id FROM home_sale_contracts WHERE id = $1`, [contract.rows[0].id])
     expect(rows[0].lease_id).toBeNull()
+  })
+})
+
+/**
+ * S652 — the adults who do not sign are still on the lease.
+ *
+ * Nic, catching the same omission a second time: "you didn't add john as
+ * authorized occupant. why?" Because the packet was built from SIGNERS, and
+ * John Sheptock has no email so he is not one.
+ *
+ * The occupant box was filled from the signer roster and sat ABOVE the caller's
+ * own value in the precedence chain, so a caller who knew the household — the
+ * only party who can know about somebody with no account — had their answer
+ * discarded without a word.
+ */
+describe('S652: the occupant box names the whole household', () => {
+  async function docWithOccupantField(f: SeedFixture, occupantNames?: string) {
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Occupants ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`,
+      [f.landlordId])
+    await db.query(
+      `INSERT INTO lease_template_fields
+         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+       VALUES ($1,'text',NULL,'Authorized occupants','occupant_names',1,10,10,200,20,FALSE,99)`,
+      [tpl.rows[0].id])
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'Blu Haws', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'Nancy Sheptock', email: f.tenantEmail, orderIndex: 2 },
+        ],
+        ...(occupantNames ? { prefillValues: { occupant_names: occupantNames } } : {}),
+      } as any)
+      await client.query('COMMIT')
+      return doc.id
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
+  }
+
+  const occupantValue = async (documentId: string) => {
+    const { rows } = await db.query<{ value: string }>(
+      `SELECT value FROM lease_document_fields
+        WHERE document_id=$1 AND lease_column='occupant_names'`, [documentId])
+    return rows[0]?.value ?? ''
+  }
+
+  it('keeps a named adult who has no account, alongside the signer', async () => {
+    const f = await seedFixture()
+    const id = await docWithOccupantField(f, 'John Sheptock')
+    const value = await occupantValue(id)
+    // The form asks who lives here. The answer is everybody.
+    expect(value).toMatch(/Nancy Sheptock/)
+    expect(value).toMatch(/John Sheptock/)
+  })
+
+  it('does not print the same person twice', async () => {
+    const f = await seedFixture()
+    // A household sheet naming somebody who is already a signer, in other case.
+    const id = await docWithOccupantField(f, 'nancy sheptock, John Sheptock')
+    const value = (await occupantValue(id)).toLowerCase()
+    expect((value.match(/nancy sheptock/g) || []).length).toBe(1)
+    expect(value).toMatch(/john sheptock/)
+  })
+
+  it('still names the roster when the caller says nothing', async () => {
+    const f = await seedFixture()
+    const id = await docWithOccupantField(f)
+    expect(await occupantValue(id)).toMatch(/Nancy Sheptock/)
   })
 })
