@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { db, query, queryOne } from '../db'
+import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
@@ -1552,6 +1552,13 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       source:      z.string().nullish(),
       requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      // S652 (Nic): pin this stay to this exact site, or let the nightly
+      // compression move it to an equivalent one. Movable is the default — the
+      // lock is for when the counter promised somebody that particular space.
+      lockedToUnit: z.boolean().nullish(),
+      // S652: email the guest a deposit link and hold the site for them until
+      // they pay. See the deposit block below for what "hold" means here.
+      sendDepositLink: z.boolean().nullish(),
     }).parse(req.body)
 
     const checkInD  = new Date(body.checkIn)
@@ -1583,9 +1590,31 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       throw new AppError(400, `Lease type '${body.leaseType}' not allowed for ${unit.unit_type} units`)
     }
 
+    // S652 — AN UNPAID RESERVATION HOLDS ITS SITE, WITH NO CLOCK ON IT.
+    //
+    // Nic, asked how long the counter's hold should last: "there's no timer for
+    // deposit link but if it's not paid and someone else pays it boots them as
+    // unconfirmed when there's no other spaces."
+    //
+    // So: no `hold_expires_at`. Nobody's reservation quietly evaporates because
+    // they read their email on Monday instead of Friday. What an unpaid hold
+    // does NOT do is outrank somebody who actually paid — if the park fills and
+    // there is nowhere else to put them, the unpaid one yields. That rule lives
+    // in services/holdDisplacement so the counter, the booking site and the
+    // register all apply the same one.
+    const wantsDeposit = body.sendDepositLink === true && !!body.guestEmail
+
     // Conflicts (bookings + active leases): the shared predicate in
     // services/unitAvailability — same rule GET /units/available filters by.
-    const conflict = await findStayConflict(unit.id, { checkIn: body.checkIn, checkOut: body.checkOut })
+    //
+    // S652: a reservation being PAID for right now may take a site that an
+    // unpaid hold is sitting on, and the hold gets moved or told below. One
+    // that is itself only a hold may not — two unpaid holds on one site is just
+    // a double booking with extra steps.
+    const takingMoney = !wantsDeposit
+    const conflict = await findStayConflict(unit.id, {
+      checkIn: body.checkIn, checkOut: body.checkOut, ignoreUnpaidHolds: takingMoney,
+    })
     if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
 
     const nights = dayDiff(body.checkIn, body.checkOut)
@@ -1613,15 +1642,44 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // $2/occupied-unit monthly fee (services/platformFee.ts), not a booking cut.
     const platformFee = 0
 
-    const booking = await queryOne<any>(`INSERT INTO unit_bookings
-      (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
-       lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
-       total_amount, platform_fee, notes, source, required_site_layout, required_amp_service)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
-      [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
-       body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
-       body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
-       total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none'])
+    const bookingStatus = wantsDeposit ? 'tentative' : 'confirmed'
+
+    // S652: clearing the site and taking it are one act. Either this guest has
+    // the site and the holder has been moved or told, or neither happened —
+    // a half-applied version leaves a site with two claims on it.
+    let booking: any
+    let displaced: import('../services/holdDisplacement').DisplacementOutcome[] = []
+    const bookingClient = await getClient()
+    try {
+      await bookingClient.query('BEGIN')
+      if (takingMoney) {
+        const { clearUnpaidHolds } = await import('../services/holdDisplacement')
+        displaced = await clearUnpaidHolds(bookingClient, unit.id, body.checkIn, body.checkOut)
+      }
+      booking = (await bookingClient.query<any>(`INSERT INTO unit_bookings
+        (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
+         lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
+         total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
+         locked_to_unit, status, hold_expires_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL) RETURNING *`,
+        [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
+         body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
+         body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
+         total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
+         body.lockedToUnit === true, bookingStatus])).rows[0]
+      await bookingClient.query('COMMIT')
+    } catch (e) {
+      await bookingClient.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { bookingClient.release() }
+
+    // Somebody lost the site they were holding. A moved guest may never need to
+    // know; a displaced one is a phone call, and neither belongs only in a log.
+    if (displaced.length) {
+      import('../services/holdDisplacement')
+        .then((m) => m.notifyDisplacedHolds(unit.landlord_id, unit.property_id, displaced))
+        .catch((err: unknown) => logger.error({ err, bookingId: booking.id }, '[booking] displacement notice failed'))
+    }
 
     // S517: change-history (Master Schedule). Best-effort — never fail the booking.
     recordBookingEvent({
@@ -1647,7 +1705,29 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       }).catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] guest access email failed'))
     }
 
-    res.status(201).json({ success: true, data: booking })
+    // S652: the deposit link, sent to the guest who is not standing here. The
+    // deposit is the one the booking site would have quoted for these nights on
+    // this site — a guest who phones and a guest who books online are buying
+    // the same thing and are told the same number.
+    let depositLink: { id: string; url: string } | null = null
+    if (wantsDeposit) {
+      try {
+        const { quoteStayDeposit } = await import('../services/propertyBooking')
+        const depositAmount = await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
+        const { createBookingDepositLink } = await import('./posPayLinks')
+        depositLink = await createBookingDepositLink({
+          bookingId: booking.id, landlordId: unit.landlord_id, propertyId: unit.property_id,
+          amount: depositAmount, guestName: booking.guest_name, guestEmail: booking.guest_email,
+        })
+      } catch (err) {
+        // The reservation is real and on the board; only the link failed. Say
+        // so on the response rather than rolling back a site the counter has
+        // already told somebody they have.
+        logger.error({ err, bookingId: booking.id }, '[booking] deposit link failed')
+      }
+    }
+
+    res.status(201).json({ success: true, data: { ...booking, depositLink } })
   } catch (e) { next(e) }
 })
 

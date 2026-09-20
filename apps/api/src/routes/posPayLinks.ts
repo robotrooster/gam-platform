@@ -169,6 +169,71 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
 }
 
 /**
+ * S652 — the deposit on a reservation taken at the counter.
+ *
+ * Nic's counter script ends here: dates, then what is available, then the space,
+ * then a name and an email, "→ emailed a deposit pay link". The guest is not
+ * standing at a card reader — they rang, or they walked off — so the deposit is
+ * a link rather than a charge, and the site is held unpaid until it is paid.
+ *
+ * Deliberately the SAME deposit the booking site would have quoted for the same
+ * stay (services/propertyBooking quoteStay), because a guest who phones and a
+ * guest who books online are buying the identical nights on the identical site.
+ *
+ * Idempotent per booking: the row is claimed on `deposit_amount IS NULL`, so a
+ * double-click never sends two links or bills two deposits.
+ */
+export async function createBookingDepositLink(opts: {
+  bookingId: string; landlordId: string; propertyId: string
+  amount: number; guestName: string | null; guestEmail: string
+}): Promise<{ id: string; url: string } | null> {
+  if (!(opts.amount > 0)) return null
+  if (!(await connectIdFor(opts.landlordId))) throw new AppError(409, 'No payout account to pay the landlord')
+  const client = await getClient()
+  let link: any
+  let propName = ''
+  try {
+    await client.query('BEGIN')
+    const claimed = await client.query(
+      `UPDATE unit_bookings SET deposit_amount = $2, updated_at = NOW()
+        WHERE id = $1 AND deposit_amount IS NULL RETURNING id`, [opts.bookingId, opts.amount])
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return null }
+    const prop = (await client.query<{ name: string; booking_card_fee_payer: CardFeePayer }>(
+      `SELECT name, booking_card_fee_payer FROM properties WHERE id = $1`, [opts.propertyId])).rows[0]
+    propName = prop.name
+    const owner = (await client.query<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [opts.landlordId])).rows[0]
+    const items = [{ id: null, name: 'Reservation deposit', qty: 1, price: opts.amount, tax: 0 }]
+    const token = crypto.randomBytes(24).toString('hex')
+    link = (await client.query(
+      `INSERT INTO pos_pay_links
+         (token, landlord_id, property_id, created_by, kind, label, items,
+          subtotal, tax_amount, discount_amount, total,
+          customer_name, customer_email, booking_id, card_fee_on_top)
+       VALUES ($1,$2,$3,$4,'one_time',$5,$6::jsonb,$7,0,0,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [token, opts.landlordId, opts.propertyId, owner.user_id,
+       'Reservation deposit', JSON.stringify(items), opts.amount, opts.guestName,
+       opts.guestEmail.toLowerCase(), opts.bookingId, prop.booking_card_fee_payer === 'customer'])).rows[0]
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+
+  // No expiry on the LINK either. A deposit link that dies on its own leaves a
+  // held site and a guest holding a dead URL, and somebody has to notice.
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { emailPayLink } = await import('../services/email')
+  await emailPayLink({
+    to: link.customer_email, name: link.customer_name, propertyName: propName,
+    label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
+    ctx: { landlordId: opts.landlordId, payLinkId: link.id },
+  }).catch((e: unknown) => logger.error({ err: e, payLinkId: link.id }, '[deposit-link] email failed'))
+  return { id: link.id, url: payLinkUrl(link.token) }
+}
+
+/**
  * S649 — the balance of a short stay, billed on arrival day (services/stayBalance).
  * A one-time link tied to the booking; the card fee follows the property's
  * booking-site setting. Idempotent per booking: the booking row is claimed

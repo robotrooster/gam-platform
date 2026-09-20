@@ -331,6 +331,30 @@ export async function emailGuestStayLink(guestEmail: string, guestName: string |
   )
 }
 
+/**
+ * S652 — the site on a reservation changed, and the guest hears it from us
+ * before they arrive and find somebody else parked there.
+ *
+ * Only ever sent for a MOVE. A guest whose reservation was displaced entirely
+ * gets a phone call, not an email — see services/holdDisplacement.
+ */
+export async function emailBookingSiteChanged(
+  guestEmail: string, guestName: string | null, propertyName: string,
+  fromSite: string, toSite: string, ctx?: { landlordId?: string },
+) {
+  await send(guestEmail, `Your site at ${propertyName} is now ${toSite}`,
+    base(h('Your site has changed') +
+      p(`Hi ${guestName || 'there'},`) +
+      p(`We have moved your reservation at <strong style="color:#eef1f8">${propertyName}</strong> `
+        + `from site <strong style="color:#eef1f8">${fromSite}</strong> to site `
+        + `<strong style="color:#eef1f8">${toSite}</strong>.`) +
+      p('Your dates have not changed and nothing else about your reservation is different.') +
+      p('If that site does not suit you, just reply to this email or give us a ring and we will sort it out.')
+    ),
+    { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null }
+  )
+}
+
 // S547 (Nic): landlord-INITIATED screening request for a long-stay guest.
 // Sent only when the landlord explicitly chooses to screen — the system
 // never auto-sends a background check to a prospect.

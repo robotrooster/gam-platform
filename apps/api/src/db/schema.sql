@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3SbMpfRE3IBidCJTyo2WJti7QoniJBrPh7kTpASBXYMbtIVy81R4m1kmaxSNAIk
+\restrict wugqamU8SuLWUObVlgeQsauaTFhSy6f3nlzuqh5fIafXGgXsxb09Ndyn0iJuaF6
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9999,6 +9999,9 @@ CREATE TABLE public.unit_bookings (
     balance_billed_at timestamp with time zone,
     balance_paid_at timestamp with time zone,
     pos_transaction_id uuid,
+    displaced_at timestamp with time zone,
+    displaced_reason text,
+    displaced_from_unit uuid,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -10018,6 +10021,13 @@ COMMENT ON COLUMN public.unit_bookings.acknowledgment_signed_at IS 'Stamped via 
 --
 
 COMMENT ON COLUMN public.unit_bookings.pos_transaction_id IS 'S651: the register sale this stay was rung up on, when it came from the counter. NULL for every other source (storefront, reservation form, waitlist).';
+
+
+--
+-- Name: COLUMN unit_bookings.displaced_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.displaced_at IS 'S652: when an unpaid hold yielded its site to a paid booking. Set on both outcomes — moved elsewhere, or left with no site at all.';
 
 
 --
@@ -19295,6 +19305,13 @@ CREATE INDEX unit_bookings_pos_transaction_idx ON public.unit_bookings USING btr
 
 
 --
+-- Name: unit_bookings_unpaid_hold_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX unit_bookings_unpaid_hold_idx ON public.unit_bookings USING btree (unit_id, check_in, check_out) WHERE ((status = 'tentative'::text) AND (deposit_paid_at IS NULL));
+
+
+--
 -- Name: units_property_building_number_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26579,6 +26596,14 @@ ALTER TABLE ONLY public.unit_bookings
 
 
 --
+-- Name: unit_bookings unit_bookings_displaced_from_unit_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_displaced_from_unit_fkey FOREIGN KEY (displaced_from_unit) REFERENCES public.units(id);
+
+
+--
 -- Name: unit_bookings unit_bookings_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27310,5 +27335,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3SbMpfRE3IBidCJTyo2WJti7QoniJBrPh7kTpASBXYMbtIVy81R4m1kmaxSNAIk
+\unrestrict wugqamU8SuLWUObVlgeQsauaTFhSy6f3nlzuqh5fIafXGgXsxb09Ndyn0iJuaF6
 

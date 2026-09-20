@@ -19,6 +19,17 @@ export interface StayWindow {
   checkIn: string            // YYYY-MM-DD
   checkOut?: string | null   // YYYY-MM-DD; null/undefined = open-ended
   excludeBookingId?: string | null
+  /**
+   * S652: treat an UNPAID hold as not-a-conflict.
+   *
+   * An unpaid reservation holds its site with no clock on it, but it does not
+   * outrank somebody who paid (Nic: "if it's not paid and someone else pays it
+   * boots them as unconfirmed when there's no other spaces"). Callers that are
+   * about to take money pass this and then call clearUnpaidHolds in the same
+   * transaction — the hold is moved to an equivalent site, or the holder is
+   * told. Nothing that has taken a deposit is ever ignored.
+   */
+  ignoreUnpaidHolds?: boolean
 }
 
 export type StayConflict = 'booking' | 'lease' | 'pending_tenant' | 'out_of_order' | null
@@ -29,8 +40,12 @@ export async function findStayConflict(unitId: string, w: StayWindow): Promise<S
     WHERE unit_id = $1 AND status NOT IN ('cancelled')
       AND ($2::uuid IS NULL OR id != $2)
       AND ($3::date IS NULL OR check_in < $3)
-      AND check_out > $4`,
-    [unitId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn])
+      AND check_out > $4
+      -- S652: an unpaid hold steps aside for money. deposit_paid_at, not the
+      -- status, decides — a booking somebody has paid for is never ignored
+      -- however its status reads.
+      AND NOT ($5::boolean AND status = 'tentative' AND deposit_paid_at IS NULL)`,
+    [unitId, w.excludeBookingId ?? null, w.checkOut ?? null, w.checkIn, w.ignoreUnpaidHolds === true])
   if (booking) return 'booking'
   const lease = await queryOne<any>(`
     SELECT id FROM leases

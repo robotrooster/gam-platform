@@ -148,14 +148,68 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   // schedule sum so it always matches what will actually be invoiced.
   if (price.tier === 'monthly' && monthlyRate != null) {
     const sched = computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate)
-    // Flat deposit for monthly stays — the % never applies here. Hard cap at
-    // one month's rent regardless of the property's flat setting.
-    const flat = prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
-    const deposit = Math.round(Math.min(flat, monthlyRate) * 100) / 100
+    const deposit = depositForStay(prop, { tier: 'monthly', total: sched.total, monthlyRate })
     return { nights, base: sched.total, tax: 0, total: sched.total, deposit, tier: 'monthly' }
   }
-  const deposit = Math.round(price.total * (Number(prop.booking_deposit_pct) / 100) * 100) / 100
+  const deposit = depositForStay(prop, { tier: price.tier, total: price.total, monthlyRate })
   return { nights, base: price.base, tax: price.tax, total: price.total, deposit, tier: price.tier }
+}
+
+/**
+ * The deposit on a stay, from the property's own two settings.
+ *
+ * A flat amount for monthly-tier stays — the percentage never applies there —
+ * hard-capped at one month's rent regardless of what the flat setting says.
+ * Everything shorter is a percentage of the taxed total.
+ *
+ * S652: pulled out of quoteStay so a reservation taken at the COUNTER quotes
+ * the same deposit the booking site would have. A guest who phones and a guest
+ * who books online are buying the same nights on the same site and must not be
+ * told two different numbers. (memory: gam-register-price-is-its-own-thing)
+ */
+export function depositForStay(
+  prop: { booking_deposit_pct: string | number; booking_monthly_deposit: string | number | null },
+  stay: { tier: 'nightly' | 'weekly' | 'monthly'; total: number; monthlyRate: number | null },
+): number {
+  if (stay.tier === 'monthly' && stay.monthlyRate != null) {
+    const flat = prop.booking_monthly_deposit != null
+      ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
+    return Math.round(Math.min(flat, stay.monthlyRate) * 100) / 100
+  }
+  return Math.round(stay.total * (Number(prop.booking_deposit_pct) / 100) * 100) / 100
+}
+
+/**
+ * What deposit to ask for on a reservation the counter just took.
+ *
+ * Deliberately NOT quoteStay: that one also enforces the booking site's gates
+ * (minimum stay, maximum stay, no past check-in), and a staff reservation is
+ * allowed to break all three — somebody standing at the desk can book one night
+ * where the website requires two. Only the money is shared.
+ */
+export async function quoteStayDeposit(
+  unitId: string, checkIn: string, checkOut: string,
+): Promise<number> {
+  const row = await queryOne<any>(
+    `SELECT u.nightly_rate, u.weekly_rate, u.monthly_rate,
+            p.nightly_rate AS p_nightly, p.weekly_rate AS p_weekly, p.monthly_rate AS p_monthly,
+            p.short_term_tax_rate, p.booking_deposit_pct, p.booking_monthly_deposit
+       FROM units u JOIN properties p ON p.id = u.property_id
+      WHERE u.id = $1`, [unitId])
+  if (!row) throw new AppError(404, 'Unit not found')
+  const num = (x: any) => x != null ? Number(x) : null
+  const monthlyRate = num(row.monthly_rate) ?? num(row.p_monthly)
+  const nights = Math.round(
+    DateTime.fromISO(checkOut).startOf('day').diff(DateTime.fromISO(checkIn).startOf('day'), 'days').days)
+  const price = computeStayPrice(
+    { nightly: num(row.nightly_rate) ?? num(row.p_nightly),
+      weekly:  num(row.weekly_rate)  ?? num(row.p_weekly),
+      monthly: monthlyRate },
+    Number(row.short_term_tax_rate || 0), nights)
+  const total = price.tier === 'monthly' && monthlyRate != null
+    ? computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate).total
+    : price.total
+  return depositForStay(row, { tier: price.tier, total, monthlyRate })
 }
 
 /** Landlord's Connect account for destination charges; null if not onboarded. */

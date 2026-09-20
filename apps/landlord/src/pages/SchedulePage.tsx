@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
@@ -310,6 +310,12 @@ export function SchedulePage() {
   // pull-through) + electrical service (30/50 amp). When set, mismatched units
   // are flagged (warn, not blocked).
   const [resvLayout, setResvLayout] = useState<string>('none')
+  // S652: the counter's flow is a conversation, so the screen only reveals the
+  // next thing once the previous one is settled — availability after dates,
+  // names after a site. None of it is persisted; backing out drops all three.
+  const [showAvail, setShowAvail] = useState(false)
+  const [pickedUnit, setPickedUnit] = useState<any | null>(null)
+  const [lockSite, setLockSite] = useState(false)
   const [resvAmp, setResvAmp] = useState<string>('none')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
@@ -656,8 +662,14 @@ export function SchedulePage() {
     resvNights,
   )
   const resvGuestName = `${resvFirst.trim()} ${resvLast.trim()}`.trim()
+  // S652 (Nic): "When I back out and it's not a completed reservation, it just
+  // abandons everything... It doesn't save all that stuff as a drafted state.
+  // It's more like a browser than anything else." Nothing was written to the
+  // database on the way here, so there is nothing to unwind — only screen state
+  // to drop, and all of it goes.
   const closeNewResv = () => {
     setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none')
+    setShowAvail(false); setPickedUnit(null); setLockSite(false)
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
@@ -683,6 +695,10 @@ export function SchedulePage() {
       totalAmount:stayPriceForUnit(u).total, source:'direct',
       requiredSiteLayout: resvLayout,
       requiredAmpService: resvAmp,
+      // S652: movable unless the counter promised them that exact space, and
+      // the deposit goes out as a link because the guest is not standing here.
+      lockedToUnit: lockSite,
+      sendDepositLink: true,
     }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeNewResv() },
@@ -1021,11 +1037,29 @@ export function SchedulePage() {
   // don't appear — enable a unit via its ⚙ Configure.
   const ci = newBooking.checkIn, co = newBooking.checkOut
   const datesValid = !!ci && !!co && co > ci
-  const availableUnits = !datesValid ? [] : units.filter((u: any) => {
+  // S652 (Nic): "there's no timer for deposit link but if it's not paid and
+  // someone else pays it boots them as unconfirmed when there's no other
+  // spaces." So a site somebody is holding WITHOUT a deposit is not free — but
+  // it is not off the table either. It is offered last, and only when the park
+  // has nothing else, which is exactly what "when there's no other spaces"
+  // says. Taking one moves the holder to an equivalent site, or, if the park
+  // really is full, costs them the reservation and earns somebody a phone call.
+  const overlapsStay = (b: any) => dayOnly(b.checkIn) < co && dayOnly(b.checkOut) > ci
+  const bookableFor = (u: any) => {
     if (!u.isBookable) return false
-    const bookingConflict = bookings.some((b: any) => b.unitId === u.id && b.status !== 'cancelled' && dayOnly(b.checkIn) < co && dayOnly(b.checkOut) > ci)
     const leaseConflict = leases.some((l: any) => l.unitId === u.id && dayOnly(l.startDate) < co && (!l.endDate || dayOnly(l.endDate) > ci))
-    return !bookingConflict && !leaseConflict && !oooOverlaps(u.id, ci, co)
+    return !leaseConflict && !oooOverlaps(u.id, ci, co)
+  }
+  const blockingBookings = (u: any) => bookings.filter((b: any) =>
+    b.unitId === u.id && b.status !== 'cancelled' && overlapsStay(b))
+  const freeUnits = !datesValid ? [] : units.filter((u: any) =>
+    bookableFor(u) && blockingBookings(u).length === 0)
+  // Blocked ONLY by holds nobody has paid for.
+  const heldUnpaidUnits = !datesValid ? [] : units.filter((u: any) => {
+    if (!bookableFor(u)) return false
+    const blockers = blockingBookings(u)
+    return blockers.length > 0
+      && blockers.every((b: any) => b.status === 'tentative' && !b.depositPaidAt)
   })
 
   // Reservation search — match guest/tenant name, unit number, guest email or
@@ -2367,13 +2401,31 @@ export function SchedulePage() {
           onClose={()=>{ if (!checkInBusy) setCheckInPrompt(null) }} />
       )}
 
-      {/* ── NEW RESERVATION MODAL — dates → contact → pick available unit ── */}
+      {/* ── NEW RESERVATION — dates → what's available → the space → who ──
+          S652 (Nic), the flow in his words: "pick arrival AND end date → 'Show
+          available' filters out anything not free for the whole stay → the
+          counter tells the customer what IS available (30 amp, back-in,
+          pull-through) → the customer chooses from what exists → THEN the
+          counter picks the space → THEN name, phone, email → emailed a deposit
+          pay link. Names come last, after the negotiation, not first."
+
+          The old order asked for a name, an email and a phone number BEFORE it
+          would show a single site — so the counter had to take a stranger's
+          details to answer "have you got anything the first week of March".
+          Nobody works that way, and the person on the phone has not agreed to
+          anything yet.
+
+          Nothing is saved until the last button. "When I back out and it's not
+          a completed reservation, it just abandons everything... It's more like
+          a browser than anything else." No draft, no held site, no row. */}
       {newResvOpen && (() => {
         const validEmail = /.+@.+\..+/.test(newBooking.guestEmail.trim())
         const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail && !!newBooking.guestPhone.trim()
+        const offered = freeUnits.length ? freeUnits : heldUnpaidUnits
+        const lastResort = freeUnits.length === 0 && heldUnpaidUnits.length > 0
         return (
         <div className="modal-overlay" onClick={closeNewResv}>
-          <div className="modal" style={{maxWidth:540}} onClick={e=>e.stopPropagation()}>
+          <div className="modal" style={{maxWidth:560}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">New Reservation</span>
               <button className="btn btn-ghost btn-sm" onClick={closeNewResv}>✕</button>
@@ -2384,94 +2436,141 @@ export function SchedulePage() {
               <div>
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>1 · Dates</div>
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
+                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Arriving</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>{setShowAvail(false); setPickedUnit(null); setNewBooking(s=>({...s,checkIn:e.target.value}))}} /></div>
+                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Leaving</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>{setShowAvail(false); setPickedUnit(null); setNewBooking(s=>({...s,checkOut:e.target.value}))}} /></div>
                 </div>
                 {datesValid && <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>{resvNights} night{resvNights===1?'':'s'} · billed {resvType==='month_to_month'?'monthly':resvType}</div>}
+
+                {/* Optional: what the customer says they need, before the list
+                    is drawn, so the counter is not reading out sites that will
+                    not take their rig. */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}}>
+                  <div>
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Needs (optional)</div>
+                    <select className="form-select" style={{width:'100%'}} value={resvLayout} onChange={e=>setResvLayout(e.target.value)}>
+                      {RV_SITE_LAYOUTS.map(l=><option key={l} value={l}>{l==='none'?'Any layout':RV_SITE_LAYOUT_LABEL[l]}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>&nbsp;</div>
+                    <select className="form-select" style={{width:'100%'}} value={resvAmp} onChange={e=>setResvAmp(e.target.value)}>
+                      {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'Any service':RV_AMP_SERVICE_LABEL[a]}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                <button className="btn btn-primary" style={{width:'100%',marginTop:12}}
+                        disabled={!datesValid}
+                        onClick={()=>{ setPickedUnit(null); setResvError(''); setShowAvail(true) }}>
+                  Show available
+                </button>
               </div>
 
-              {/* 2 · Contact */}
-              <div style={{opacity:datesValid?1:.5,pointerEvents:datesValid?'auto':'none'}}>
-                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>2 · Guest contact</div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>First name</div><input className="form-input" style={{width:'100%'}} value={resvFirst} onChange={e=>setResvFirst(e.target.value)} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Last name</div><input className="form-input" style={{width:'100%'}} value={resvLast} onChange={e=>setResvLast(e.target.value)} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
-                  <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
-                </div>
-              </div>
-
-              {/* Optional RV requirements: site layout + electrical service. */}
-              <div style={{opacity:datesValid?1:.5,pointerEvents:datesValid?'auto':'none',display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                <div>
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Required site layout (optional)</div>
-                  <select className="form-select" style={{width:'100%'}} value={resvLayout} onChange={e=>setResvLayout(e.target.value)}>
-                    {RV_SITE_LAYOUTS.map(l=><option key={l} value={l}>{l==='none'?'No preference':RV_SITE_LAYOUT_LABEL[l]}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Required amp service (optional)</div>
-                  <select className="form-select" style={{width:'100%'}} value={resvAmp} onChange={e=>setResvAmp(e.target.value)}>
-                    {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'No preference':RV_AMP_SERVICE_LABEL[a]}</option>)}
-                  </select>
-                </div>
-              </div>
-
-              {/* 3 · Pick an available unit → completes the reservation */}
-              <div style={{opacity:(datesValid&&hasContact)?1:.5,pointerEvents:(datesValid&&hasContact)?'auto':'none'}}>
+              {/* 2 · What is available — read out loud to the customer. */}
+              {showAvail && datesValid && (
+              <div>
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
-                  3 · Pick a unit {datesValid&&hasContact && `· ${availableUnits.length} available`}
+                  2 · What is available · {offered.length} for {newBooking.checkIn} → {newBooking.checkOut}
                 </div>
-                {!datesValid ? (
-                  <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'12px',background:'var(--bg-3)',borderRadius:8}}>Choose dates first.</div>
-                ) : !hasContact ? (
-                  <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'12px',background:'var(--bg-3)',borderRadius:8}}>Fill in the guest's first &amp; last name, a valid email, and phone to see available units.</div>
-                ) : availableUnits.length === 0 ? (
+                {lastResort && (
+                  <div style={{fontSize:'.74rem',color:'var(--amber)',marginBottom:8,lineHeight:1.5}}>
+                    Everything else is taken. These are held by reservations that have not paid a deposit —
+                    taking one moves that guest to another site, or cancels them if there is nothing left.
+                  </div>
+                )}
+                {offered.length === 0 ? (
                   <div style={{padding:'12px',background:'var(--bg-3)',borderRadius:8}}>
-                    <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>All units are booked for those dates.</div>
-                    <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Add {resvGuestName||'this guest'} to the waitlist — they'll get a 1-hour claim link the moment a unit frees up.</div>
-                    {!/.+@.+\..+/.test(newBooking.guestEmail.trim())
-                      ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>Enter the guest's email above to add them to the waitlist (it's where the claim link is sent).</div>
+                    <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>Nothing is free for those dates.</div>
+                    <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Take their details and put them on the waitlist — they get a 1-hour claim link the moment something opens.</div>
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                      <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
+                      <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
+                      <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
+                      <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                    </div>
+                    {!validEmail
+                      ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>An email address is where the claim link goes.</div>
                       : <button className="btn btn-primary btn-sm" onClick={()=>{ setResvError(''); waitlistMut.mutate() }} disabled={waitlistMut.isLoading}>
                           {waitlistMut.isLoading?'Adding…':'Add to waitlist'}
                         </button>}
                   </div>
                 ) : (
-                  <div style={{display:'grid',gap:8,maxHeight:260,overflowY:'auto'}}>
-                    {availableUnits.map((u:any)=>{
+                  <div style={{display:'grid',gap:8,maxHeight:280,overflowY:'auto'}}>
+                    {offered.map((u:any)=>{
                       const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
                       const mismatch = reasons.length > 0
-                      const pickUnit = async () => {
-                        if (createResvMut.isLoading) return
-                        if (mismatch && !(await appConfirm(`Unit ${u.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
-                        setResvError(''); createResvMut.mutate(u)
-                      }
-                      const rvTags = u.unitType==='rv_spot'
-                        ? [u.rvSiteLayout, u.rvAmpService].filter((x:string)=>x && x!=='none')
-                            .map((x:string)=>(RV_SITE_LAYOUT_LABEL as any)[x] || (RV_AMP_SERVICE_LABEL as any)[x]).join(' · ')
-                        : ''
+                      const facts = u.unitType==='rv_spot' ? rvSiteFactsLabel(u) : ''
+                      const price = stayPriceForUnit(u)
+                      const isPicked = pickedUnit?.id === u.id
                       return (
                         <div key={u.id}
-                          onClick={pickUnit}
-                          style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,padding:'11px 14px',background:'var(--bg-2)',border:`1px solid ${mismatch?'var(--amber)':'var(--border-1)'}`,borderRadius:10,cursor:'pointer'}}
-                          onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')}
-                          onMouseLeave={e=>(e.currentTarget.style.borderColor=mismatch?'var(--amber)':'var(--border-1)')}>
+                          onClick={()=>{ setResvError(''); setPickedUnit(u) }}
+                          style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,padding:'11px 14px',background:isPicked?'var(--bg-3)':'var(--bg-2)',border:`1px solid ${isPicked?'var(--gold)':mismatch?'var(--amber)':'var(--border-1)'}`,borderRadius:10,cursor:'pointer'}}>
                           <div>
-                            <div style={{fontWeight:700,fontSize:'.9rem'}}>Unit {u.unitNumber}</div>
-                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unitType]||humanize(u.unitType)} · {u.propertyName}{rvTags ? ` · ${rvTags}` : ''}</div>
+                            <div style={{fontWeight:700,fontSize:'.9rem'}}>
+                              {u.unitNumber}{facts ? ` · ${facts}` : ''}
+                            </div>
+                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>
+                              {UNIT_TYPE_LABELS[u.unitType]||humanize(u.unitType)} · {u.propertyName}
+                              {lastResort ? ' · held, unpaid' : ''}
+                            </div>
                             {mismatch && <div style={{fontSize:'.68rem',color:'var(--amber)',marginTop:2}}>⚠ {reasons.join('; ')}</div>}
                           </div>
-                          {/* S526 (Nic): no pricing here — nobody pays on this
-                              screen; the backend prices from the unit's rates. */}
-                          <span className="btn btn-primary btn-sm" style={{pointerEvents:'none'}}>Reserve →</span>
+                          {/* S652 (Nic): the price IS shown here now. The counter
+                              is quoting a stay out loud, and "what does it cost"
+                              is the second thing anyone asks. It is the site's
+                              own rate — the same number the booking site would
+                              quote for these nights.
+                              (memory: gam-register-price-is-its-own-thing) */}
+                          <div style={{textAlign:'right'}}>
+                            <div style={{fontWeight:700,fontSize:'.9rem',color:'var(--gold)'}}>{fmt(price.total)}</div>
+                            <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>{resvNights} night{resvNights===1?'':'s'}</div>
+                          </div>
                         </div>
                       )
                     })}
                   </div>
                 )}
-                {createResvMut.isLoading && <div style={{fontSize:'.78rem',color:'var(--text-3)',marginTop:8}}>Creating reservation…</div>}
-                {resvError && <div style={{fontSize:'.78rem',color:'var(--red,#ff6b81)',marginTop:8}}>{resvError}</div>}
-              </div>
+              </div>)}
+
+              {/* 3 · Who it is for — LAST, once there is something to agree to. */}
+              {pickedUnit && (
+              <div>
+                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
+                  3 · Who is it for · {pickedUnit.unitNumber}
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                  <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
+                  <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
+                  <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
+                  <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                </div>
+
+                {/* S652 (Nic): movable by default. The nightly compression can
+                    shuffle this stay onto an equivalent site to close gaps —
+                    unless the counter promised them that exact space. */}
+                <label style={{display:'flex',alignItems:'center',gap:8,marginTop:12,fontSize:'.78rem',color:'var(--text-2)',cursor:'pointer'}}>
+                  <input type="checkbox" checked={lockSite} onChange={e=>setLockSite(e.target.checked)} />
+                  Keep them on {pickedUnit.unitNumber} — do not let the schedule move them
+                </label>
+
+                <button className="btn btn-primary" style={{width:'100%',marginTop:14}}
+                        disabled={!hasContact || createResvMut.isLoading}
+                        onClick={async ()=>{
+                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
+                          if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
+                          setResvError(''); createResvMut.mutate(pickedUnit)
+                        }}>
+                  {createResvMut.isLoading ? 'Sending…' : 'Reserve and email the deposit link'}
+                </button>
+                {!hasContact && <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6,lineHeight:1.5}}>
+                  The site is held for them with no deadline. If it is still unpaid when the park fills up,
+                  they get moved to another site — or told, if there is nothing else.
+                </div>
+              </div>)}
+
+              {resvError && <div style={{fontSize:'.78rem',color:'var(--red,#ff6b81)'}}>{resvError}</div>}
             </div>
           </div>
         </div>
