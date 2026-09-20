@@ -2762,34 +2762,49 @@ export type NoLeaseDocumentType = typeof NO_LEASE_DOCUMENT_TYPES[number]
 export const DISCLOSURE_TYPES = [
   // Ranked by how many states' acts mention the topic — see the note above on
   // why that is NOT a count of states that require it.
-  'death_on_premises',        // 48
-  'foreclosure_status',       // 46
-  'owner_agent_identity',     // 45
-  'property_condition',       // 33
-  'septic_system',            // 27
-  'rent_control',             // 27
-  'well_water',               // 26
-  'flood_zone',               // 22
-  'radon',                    // 22
-  'mold',                     // 22
-  'pest_control',             // 22
-  'sex_offender_registry',    // 18
-  'energy_efficiency',        // 18
-  'asbestos',                 // 17
-  'meth_contamination',       // 17
-  'park_change_of_use',       // 17
-  'park_statement_of_policy', // 15
-  'lead_based_paint',         // 15
-  'smoke_co_detector',        // 15
-  'zoning_designation',       // 15
-  'insurance_requirement',    // 13
-  'bed_bugs',                 // 9
-  'defective_drywall',        // 4
-  'utility_billing_method',   // 4
-  'military_ordnance',        // 3
-  'condemnation_orders',      // 3
-  'shared_utilities',         // 2
-  'fire_damage',              // 2
+  'death_on_premises',         // 48
+  'foreclosure_status',        // 46
+  'owner_agent_identity',      // 45
+  'security_deposit_terms',    // 41
+  'park_rules',                // 38
+  'property_condition',        // 33
+  'lease_copy_delivery',       // 29
+  'septic_system',             // 27
+  'rent_control',              // 27
+  'late_fee_policy',           // 27
+  'well_water',                // 26
+  'rent_increase_notice',      // 26
+  'entry_notice_policy',       // 24
+  'utility_shutoff_rights',    // 24
+  'domestic_violence_rights',  // 23
+  'flood_zone',                // 22
+  'radon',                     // 22
+  'mold',                      // 22
+  'pest_control',              // 22
+  'home_sale_on_lot',          // 21
+  'recycling_garbage',         // 20
+  'sex_offender_registry',     // 18
+  'energy_efficiency',         // 18
+  'asbestos',                  // 17
+  'meth_contamination',        // 17
+  'park_change_of_use',        // 17
+  'park_statement_of_policy',  // 15
+  'lead_based_paint',          // 15
+  'smoke_co_detector',         // 15
+  'zoning_designation',        // 15
+  'insurance_requirement',     // 13
+  'assistance_animal',         // 13
+  'bed_bugs',                  // 9
+  'certificate_of_occupancy',  // 8
+  'screening_criteria',        // 5
+  'defective_drywall',         // 4
+  'utility_billing_method',    // 4
+  'smoking_policy',            // 4
+  'move_in_condition',         // 4
+  'military_ordnance',         // 3
+  'condemnation_orders',       // 3
+  'shared_utilities',          // 2
+  'fire_damage',               // 2
   // S652 — NOT A DISCLOSURE, WHICH IS WHY IT NEEDED ITS OWN SLOT.
   //
   // Nic, reading the acknowledgement block on Blu's lease: "is that
@@ -2840,6 +2855,21 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   pest_control:             'Periodic pest control',
   rent_control:             'Rent control / just cause',
   energy_efficiency:        'Energy efficiency',
+  security_deposit_terms:   'Security deposit terms (where held, interest)',
+  park_rules:               'Park or community rules and regulations',
+  lease_copy_delivery:      'Copy of the signed lease',
+  late_fee_policy:          'Late fee policy',
+  rent_increase_notice:     'Rent increase notice policy',
+  entry_notice_policy:      'Notice before entering',
+  utility_shutoff_rights:   'Utility shut-off and service interruption',
+  domestic_violence_rights: 'Domestic violence: right to terminate',
+  home_sale_on_lot:         'Selling a home on a rented lot',
+  recycling_garbage:        'Rubbish and recycling service',
+  assistance_animal:        'Assistance and service animals',
+  certificate_of_occupancy: 'Certificate of occupancy',
+  screening_criteria:       'Screening criteria and fees',
+  smoking_policy:           'Smoking policy',
+  move_in_condition:        'Move-in condition checklist',
   statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
   other:                    'Other disclosure',
 }

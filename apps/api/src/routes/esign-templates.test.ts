@@ -383,7 +383,9 @@ describe('S652: disclosure categories', () => {
       .get('/api/esign/disclosures')
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.length).toBeGreaterThanOrEqual(15)
+    // S652: 45 and growing. A landlord may fill as many as they like; the count
+    // only has to be big enough that the list is the vocabulary, not a sample.
+    expect(res.body.data.length).toBeGreaterThanOrEqual(40)
 
     const blob = JSON.stringify(res.body.data).toLowerCase()
     // The words that would turn a checklist into a compliance claim.
