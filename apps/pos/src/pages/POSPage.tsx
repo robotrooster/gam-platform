@@ -90,7 +90,7 @@ export function POSPage() {
   // id is pre-mapped so the queue resolves it immediately.
   const [clientSessionId, setClientSessionId] = useState<string|null>(null)
   const [openTabBanner, setOpenTabBanner] = useState<{ id:string; total:number; openedAt:string; itemCount:number }|null>(null)
-  const [method, setMethod] = useState<'cash'|'card'|'charge'>('cash')
+  const [method, setMethod] = useState<'cash'|'card'|'card_on_file'|'charge'>('cash')
   const [tenantId, setTenantId] = useState('')
   // S254/S538: FlexCharge account holder can come from either backing
   // list (resident account or POS customer account). The register shows
@@ -188,7 +188,14 @@ export function POSPage() {
     ? (allProperties as any[]).filter((p: any) => user!.propertyIds!.includes(p.id))
     : allProperties
   // S254: pos_customers roster for FlexCharge non-tenant picker
-  const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge' })
+  const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge'||method==='card_on_file' })
+  // S652: whose card, and which one. The counter is about to take money with
+  // nobody handing anything over, so the screen says it out loud first.
+  const cardOnFile = useQuery<any>(
+    ['pos-card-on-file', tenantId, posCustomerId],
+    () => apiGet(`/pos/card-on-file?${tenantId?`tenantId=${tenantId}`:`posCustomerId=${posCustomerId}`}`),
+    { enabled: method==='card_on_file' && !!(tenantId||posCustomerId), retry: false },
+  )
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
   const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty], () => apiGet(`/pos/transactions${propQ}`), { enabled: tab==='history' })
@@ -461,7 +468,7 @@ export function POSPage() {
   // decides the real figure (cart-quote / transactions); this shows it first.
   const absorbsCardFee = (allProperties as any[]).find(p => p.id === registerProperty)?.registerCardFeePayer === 'landlord'
   const surcharge = method==='charge' ? discountedSubtotal*0.01
-    : method==='card' && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
+    : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
     : 0
   const total = discountedSubtotal + taxAmount + surcharge
   const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
@@ -483,7 +490,9 @@ export function POSPage() {
       paymentMethod:method,
       // S254: charge mode posts customer + property scoping for FlexCharge
       tenantId: tenantId||null,
-      posCustomerId: method==='charge' ? (posCustomerId||null) : null,
+      // S652: a card on file belongs to a PERSON, so the sale has to say which
+      // one — the same tenant-or-customer pair a charge sale sends.
+      posCustomerId: (method==='charge'||method==='card_on_file') ? (posCustomerId||null) : null,
       // Always send the register's property (not just for FlexCharge) so every
       // sale is tied to a property — required for cashier property-lock scoping.
       propertyId: registerProperty || null,
@@ -918,7 +927,7 @@ export function POSPage() {
               {taxAmount>0&&(Math.abs(namedTaxTotal-taxAmount)<0.01 && cartTaxLines.length
                 ? cartTaxLines.map(l=><div key={l.name} style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{l.name}</span><span>{fmt(l.amount)}</span></div>)
                 : <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(taxAmount)}</span></div>)}
-              {surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{method==='card' ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(surcharge)}</span></div>}
+              {surcharge>0&&<div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>{(method==='card'||method==='card_on_file') ? 'Card processing fee' : 'Charge account fee (1%)'}</span><span>{fmt(surcharge)}</span></div>}
               <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',borderTop:'1px solid var(--border-1)',paddingTop:6,marginTop:2}}>
                 <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(total)}</span>
               </div>
@@ -926,14 +935,20 @@ export function POSPage() {
             <div style={{marginBottom:10}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:5}}>Payment method</div>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
-                {(['cash','card','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} onClick={()=>setMethod(m)} style={{padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)',textTransform:'capitalize'}}>{m==='charge'?'charge':m}</button>))}
+                {/* S652 (Nic): "if they save a payment method on file as a
+                    point of sale customer, we can just auto charge them on
+                    delivery and we don't even have to take the reader with us."
+                    Same card, same fee — nobody is holding the plastic. */}
+                {(['cash','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} onClick={()=>setMethod(m)} style={{padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':'Card'}</button>))}
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
               <input className="form-input" type="number" {...nonNeg} placeholder="Cash given" value={cashGiven} onChange={e=>setCashGiven(e.target.value)} style={{width:'100%'}} />
               {cashGiven&&Number(cashGiven)>=total&&<div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>Change: {fmt(changeDue)}</div>}
             </div>)}
-            {method==='charge'&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
+            {/* S652: the picker serves BOTH tenders that need to know who the
+                customer is — a charge account and a card on file. */}
+            {(method==='charge'||method==='card_on_file')&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
               {/* S254: FlexCharge property selector — accounts are
                   per-property. Auto-picks for single-property landlords. */}
               {(properties as any[]).length>1&&(
@@ -952,7 +967,20 @@ export function POSPage() {
                   ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
                 ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
               </select>
-              {chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
+              {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
+              {method==='card_on_file'&&(
+                cardOnFile.isFetching
+                  ? <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Checking for a card…</div>
+                  : !(tenantId||posCustomerId)
+                    ? <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Pick who this is for.</div>
+                    : cardOnFile.data
+                      ? <div style={{fontSize:'.75rem',color:'var(--gold)',fontWeight:600}}>
+                          Charging {cardOnFile.data.brand ?? 'card'} ••••{cardOnFile.data.last4 ?? '????'}
+                        </div>
+                      : <div style={{fontSize:'.72rem',color:'var(--amber)',lineHeight:1.5}}>
+                          No card on file. Run it on the reader — that saves the card at the same time,
+                          so next time this button works.
+                        </div>)}
             </div>)}
             {/* S243: card-method property + reader controls. Auto-hidden
                 for single-property landlords (auto-picked on load); only
@@ -990,6 +1018,9 @@ export function POSPage() {
               || terminalStatus==='capturing'
               || (method==='charge' && (chargeBlocked || !registerProperty || (!tenantId && !posCustomerId)))
               || (method==='card' && !registerProperty)
+              // S652: no customer, no card — and a customer with no card saved
+              // has to go on the reader, which saves it for next time.
+              || (method==='card_on_file' && (!registerProperty || (!tenantId && !posCustomerId) || !cardOnFile.data))
             } onClick={()=>{
               if (stayInCart && !stay) { setStayModal(true); return }
               method==='card'?chargeWithReader():checkoutMut.mutate(undefined)

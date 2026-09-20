@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict wugqamU8SuLWUObVlgeQsauaTFhSy6f3nlzuqh5fIafXGgXsxb09Ndyn0iJuaF6
+\restrict OTK7AuUmhqYuN8Re3VripcQvNnNQHE9ZT5AjnwTZxVvODVYL3gsQsQtu0hR7aQn
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5058,6 +5058,10 @@ CREATE TABLE public.landlords (
     gam_debit_bank_last4 text,
     gam_debit_bank_name text,
     gam_debit_revoked_at timestamp with time zone,
+    platform_locked_at timestamp with time zone,
+    platform_locked_reason text,
+    platform_locked_by uuid,
+    uncollectable_notice_at timestamp with time zone,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
@@ -5177,6 +5181,13 @@ COMMENT ON COLUMN public.landlords.gam_debit_payment_method_id IS 'S651: the us_
 --
 
 COMMENT ON COLUMN public.landlords.gam_debit_revoked_at IS 'S651: DEAD. A landlord cannot revoke fee collection. Kept only so an existing row is not lost; nothing reads it.';
+
+
+--
+-- Name: COLUMN landlords.platform_locked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.platform_locked_at IS 'S652: portal access suspended — owes GAM with no bank to collect from. Set by a person at GAM, never by a job. Tenants are unaffected.';
 
 
 --
@@ -7451,7 +7462,7 @@ CREATE TABLE public.pos_transactions (
     discount_reason text,
     pay_link_id uuid,
     tax_breakdown jsonb,
-    CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
+    CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'card_on_file'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
 
@@ -18969,6 +18980,13 @@ CREATE UNIQUE INDEX landlord_pfo_one_active_per_landlord ON public.landlord_plat
 
 
 --
+-- Name: landlords_platform_locked_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlords_platform_locked_idx ON public.landlords USING btree (platform_locked_at) WHERE (platform_locked_at IS NOT NULL);
+
+
+--
 -- Name: landlords_portfolio_manager_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -23468,6 +23486,14 @@ ALTER TABLE ONLY public.landlords
 
 
 --
+-- Name: landlords landlords_platform_locked_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlords
+    ADD CONSTRAINT landlords_platform_locked_by_fkey FOREIGN KEY (platform_locked_by) REFERENCES public.users(id);
+
+
+--
 -- Name: landlords landlords_portfolio_manager_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27335,5 +27361,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict wugqamU8SuLWUObVlgeQsauaTFhSy6f3nlzuqh5fIafXGgXsxb09Ndyn0iJuaF6
+\unrestrict OTK7AuUmhqYuN8Re3VripcQvNnNQHE9ZT5AjnwTZxVvODVYL3gsQsQtu0hR7aQn
 

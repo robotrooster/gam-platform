@@ -365,3 +365,64 @@ export async function runGamDebitSweep(): Promise<{ considered: number; debited:
   }
   return { considered: rows.length, debited, skipped }
 }
+
+/**
+ * S652 — landlords GAM is owed money by and has no way to collect from.
+ *
+ * The end of every collection route is a bank: netting from a payout, or an ACH
+ * debit against a linked account. A landlord with neither has, without ever
+ * saying so, opted out of all of them — and until this existed the only trace
+ * was an error line in a log nobody reads.
+ *
+ * SURFACES, DOES NOT ACT. Nic asked for a lock as "a safety precaution" for the
+ * case where somebody "refuse[s] to put a bank account in there" — and an
+ * automatic lockout is one bug away from taking a paying customer's whole
+ * operation offline on a Saturday. A person at GAM reads this list and decides.
+ */
+export interface UncollectableLandlord {
+  landlordId: string
+  businessName: string | null
+  owed: number
+  threshold: number
+  hasBankLink: boolean
+  noticeSentAt: string | null
+  lockedAt: string | null
+  oldestChargeAt: string | null
+}
+
+export async function uncollectableLandlords(): Promise<UncollectableLandlord[]> {
+  const rows = await query<any>(
+    `SELECT l.id, l.business_name, l.platform_locked_at, l.uncollectable_notice_at,
+            l.gam_debit_payment_method_id,
+            COALESCE(SUM(c.amount - c.collected_amount), 0)::float AS owed,
+            MIN(c.created_at) AS oldest_charge_at,
+            EXISTS (SELECT 1 FROM bank_connections bc
+                     WHERE bc.landlord_id = l.id AND bc.status = 'active') AS has_bank_link
+       FROM landlords l
+       JOIN landlord_gam_charges c ON c.landlord_id = l.id AND c.collected_amount < c.amount
+      WHERE l.is_demo = FALSE
+      GROUP BY l.id
+      ORDER BY owed DESC`)
+
+  const out: UncollectableLandlord[] = []
+  for (const r of rows) {
+    const threshold = await debitThresholdForLandlord(r.id)
+    // Under the threshold the debt is simply waiting, which is the design —
+    // carrying $20 to next month is cheaper than the $6 transfer to collect it.
+    if (Number(r.owed) < threshold) continue
+    // A bank GAM can actually pull from means this is a timing question, not a
+    // collection failure. The sweep will take it.
+    if (r.gam_debit_payment_method_id) continue
+    out.push({
+      landlordId: r.id,
+      businessName: r.business_name,
+      owed: Math.round(Number(r.owed) * 100) / 100,
+      threshold,
+      hasBankLink: r.has_bank_link === true,
+      noticeSentAt: r.uncollectable_notice_at,
+      lockedAt: r.platform_locked_at,
+      oldestChargeAt: r.oldest_charge_at,
+    })
+  }
+  return out
+}

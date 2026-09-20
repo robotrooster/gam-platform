@@ -100,11 +100,71 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       try {
         req.user = { ...payload, landlordIds: await currentLandlordIds(payload) }
       } catch { /* the token's own list still stands */ }
+      // S652: a landlord GAM cannot collect from loses the portal until they
+      // sort it out. Checked here so it covers every endpoint at once rather
+      // than being remembered at a few hundred call sites.
+      const locked = await lockedLandlordFor(req.user!)
+      if (locked && !isLockEscapeRoute(req.method, req.originalUrl)) {
+        return res.status(402).json({
+          success: false,
+          error: 'Your account is on hold. Please contact GAM support to restore access.',
+          code: 'ACCOUNT_LOCKED',
+          lockedReason: locked.reason,
+        })
+      }
     }
     next()
   } catch {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' })
   }
+}
+
+/**
+ * S652 — the handful of things a locked-out landlord may still do.
+ *
+ * A lock whose only remedy sits BEHIND the lock is a deadlock, and the fastest
+ * way to turn a collections problem into a support ticket. So the routes that
+ * FIX it stay open: linking a bank, reading who you are, and signing out. Their
+ * own data — tenants, rent, reports, settings, the register — does not.
+ *
+ * Deliberately a short, explicit list rather than a pattern. Every addition to
+ * it is somebody deciding that a locked account may do one more thing.
+ */
+const LOCK_ESCAPE_ROUTES: Array<{ method: string; test: RegExp }> = [
+  // Who am I, and am I locked — the portal needs this to draw the lock screen.
+  { method: 'GET',  test: /^\/api\/auth\/me\b/ },
+  { method: 'POST', test: /^\/api\/auth\/logout\b/ },
+  { method: 'POST', test: /^\/api\/auth\/refresh\b/ },
+  // The remedy: connect a bank GAM can actually collect from.
+  { method: 'GET',  test: /^\/api\/bank-feed\b/ },
+  { method: 'POST', test: /^\/api\/bank-feed\b/ },
+  // What they owe, so the number on the lock screen is not a mystery.
+  { method: 'GET',  test: /^\/api\/landlords\/me\/gam-charges\b/ },
+]
+
+export function isLockEscapeRoute(method: string, url: string): boolean {
+  const path = (url || '').split('?')[0]
+  return LOCK_ESCAPE_ROUTES.some((r) => r.method === method.toUpperCase() && r.test.test(path))
+}
+
+/**
+ * Is every company this session can act for locked?
+ *
+ * ALL, not any: an account with two parks, one of them settled, is not locked
+ * out of the settled one. The scope checks downstream already keep them out of
+ * the locked company's data.
+ */
+export async function lockedLandlordFor(
+  user: AuthPayload,
+): Promise<{ reason: string | null } | null> {
+  const ids = (user.landlordIds ?? []).filter(Boolean)
+  if (!ids.length) return null
+  const rows = await query<{ platform_locked_at: string | null; platform_locked_reason: string | null }>(
+    `SELECT platform_locked_at, platform_locked_reason FROM landlords WHERE id = ANY($1::uuid[])`,
+    [ids])
+  if (!rows.length) return null
+  if (!rows.every((r) => r.platform_locked_at)) return null
+  return { reason: rows[0].platform_locked_reason ?? null }
 }
 
 export function requireRole(...roles: UserRole[]) {

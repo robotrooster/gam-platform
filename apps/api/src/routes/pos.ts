@@ -603,7 +603,10 @@ async function serverCartTotals(landlordId: string, items: any[], paymentMethod:
   // S648 (Nic): GAM's card fee is on every card sale; the property decides
   // whether the customer pays it on top or the landlord absorbs it.
   let cardFee = 0
-  if (paymentMethod === 'card') {
+  // S652: a card on file is a card. Same 3.5% + $0.55, same rule about who
+  // pays it — the only difference is that nobody is holding the plastic.
+  // (memory: gam-card-fee-every-card-payment)
+  if (paymentMethod === 'card' || paymentMethod === 'card_on_file') {
     const prop = propertyId ? await queryOne<{ register_card_fee_payer: CardFeePayer }>(
       `SELECT register_card_fee_payer FROM properties WHERE id = $1 AND landlord_id = $2`,
       [propertyId, landlordId]) : null
@@ -725,6 +728,25 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
   } catch (e) { next(e) }
 })
 
+// GET /api/pos/card-on-file — which card the "On file" button will charge.
+//
+// S652. The cashier is about to take money without anybody handing over a card,
+// so the screen has to say whose card and which one. "No card on file" is a
+// useful answer too: it tells the counter to run it on the reader, which saves
+// the card in the same motion and makes the next sale one of these.
+posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const tenantId = req.query.tenantId ? String(req.query.tenantId) : null
+    const posCustomerId = req.query.posCustomerId ? String(req.query.posCustomerId) : null
+    if (!tenantId && !posCustomerId) return res.json({ success: true, data: null })
+    const { savedCardFor } = await import('../services/posCardOnFile')
+    const card = await savedCardFor({ tenantId, posCustomerId, landlordId: posLandlordId(req) })
+    res.json({ success: true, data: card
+      ? { brand: card.brand, last4: card.last4, holderName: card.holderName }
+      : null })
+  } catch (e) { next(e) }
+})
+
 posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
     const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason,
@@ -838,7 +860,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
 
     // FlexCharge platform fee is 1% of what the customer is actually charged
     // (net of discount). A card sale's card fee is GAM's whoever paid it.
-    const platformFee = paymentMethod === 'card' ? cardFee : paymentMethod === 'charge' ? surchargeAmt : 0
+    const platformFee = (paymentMethod === 'card' || paymentMethod === 'card_on_file') ? cardFee
+      : paymentMethod === 'charge' ? surchargeAmt : 0
 
     // S242: terminal-captured card sales pass a stripePaymentIntentId
     // (capture path from /terminal/payment-intents/:id/capture). Verify
@@ -853,6 +876,39 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     let captureOnCommit: string | null = null
     if (paymentMethod === 'card' && !stripePaymentIntentId) {
       throw new AppError(400, 'Card sales go through the card reader')
+    }
+
+    // S652 — CHARGE THE CARD THEY ALREADY GAVE US.
+    //
+    // Nic: "maybe if they save a payment method on file as a point of sale
+    // customer, we can just auto charge them on delivery and we don't even have
+    // to take the reader with us." The card is already there — GAM has never
+    // spent a separate authorization to store one, because rent's own charge
+    // carries setup_future_usage (S603) — so this spends nothing new either.
+    //
+    // Charged BEFORE the sale is written, and the sale only happens if the
+    // money did: the opposite order would record a sale for a decline.
+    let cardOnFileIntentId: string | null = null
+    let cardOnFileLabel: string | null = null
+    if (paymentMethod === 'card_on_file') {
+      const { savedCardFor, chargeSavedCard } = await import('../services/posCardOnFile')
+      const card = await savedCardFor({
+        tenantId: tenantId ?? null, posCustomerId: posCustomerId ?? null,
+        landlordId: posLandlordId(req),
+      })
+      if (!card) {
+        throw new AppError(409,
+          'They have no card on file. Run it on the reader — that saves the card at the same time.')
+      }
+      const charged = await chargeSavedCard({
+        card,
+        amountCents: Math.round(total * 100),
+        landlordId: posLandlordId(req),
+        propertyId: propertyId || null,
+        description: `${card.holderName ?? 'Register sale'} - Gold Asset Management`,
+      })
+      cardOnFileIntentId = charged.paymentIntentId
+      cardOnFileLabel = [card.brand, card.last4].filter(Boolean).join(' ••••') || null
     }
     if (paymentMethod === 'card' && stripePaymentIntentId) {
       const intent = await retrieveTerminalPaymentIntent({ paymentIntentId: stripePaymentIntentId })
@@ -898,8 +954,10 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         const sale = await insertPosSale(client, {
           landlordId: posLandlordId(req), propertyId: propertyId || null, cashierId: req.user!.userId,
           paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
-          changeGiven, platformFee, stripePaymentIntentId, discountAmount: discountAmt, discountReason,
-          ...(paymentMethod === 'card' ? { payoutOwed: round2(total - cardFee) } : {}),
+          changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
+          discountAmount: discountAmt, discountReason,
+          ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
+            ? { payoutOwed: round2(total - cardFee) } : {}),
           items: pricedItems, taxBreakdown,
         })
         tx = sale.tx

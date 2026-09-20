@@ -7,6 +7,7 @@ import { Router, type Request } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL, isPlatformOwner } from '../middleware/auth'
+import { logger } from '../lib/logger'
 import { latencyP95, sampleSize, MIN_SAMPLES } from '../lib/apiMetrics'
 import { SUPPORT_TEMPLATES } from '../services/supportTemplates'
 import { AppError } from '../middleware/errorHandler'
@@ -3886,5 +3887,62 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       await client.query('ROLLBACK').catch(() => {})
       throw e
     } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+/**
+ * S652 — GAM's own collections desk.
+ *
+ * GET  /api/admin/uncollectable        — who owes GAM with no way to collect
+ * POST /api/admin/landlords/:id/lock   — suspend their portal
+ * POST /api/admin/landlords/:id/unlock — give it back
+ *
+ * Nic: "In the off chance they refuse to put a bank account in there, we can
+ * just lock down all the data and say, please, when they log in, maybe the only
+ * thing they can see is 'please contact GAM support to restore your account
+ * access.'"
+ *
+ * The lock is flipped BY A PERSON, on purpose. A sweep that locks accounts on
+ * its own is one bug away from taking a paying customer's whole operation
+ * offline, and nobody would find out until they rang.
+ */
+adminRouter.get('/uncollectable', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { uncollectableLandlords } = await import('../services/landlordGamDebit')
+    res.json({ success: true, data: await uncollectableLandlords() })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/landlords/:id/lock', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const { reason } = z.object({ reason: z.string().min(1).max(500) }).parse(req.body)
+    const l = await queryOne<any>(
+      `SELECT id, business_name, platform_locked_at FROM landlords WHERE id = $1`, [req.params.id])
+    if (!l) throw new AppError(404, 'No such company')
+    if (l.platform_locked_at) throw new AppError(409, 'That company is already locked.')
+    await query(
+      `UPDATE landlords
+          SET platform_locked_at = NOW(), platform_locked_reason = $2,
+              platform_locked_by = $3, updated_at = NOW()
+        WHERE id = $1`,
+      [l.id, reason, req.user.userId])
+    logger.warn({ landlordId: l.id, by: req.user.userId, reason },
+      '[admin] a landlord portal was locked')
+    res.json({ success: true, data: { locked: true } })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/landlords/:id/unlock', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const l = await queryOne<any>(
+      `SELECT id, platform_locked_at FROM landlords WHERE id = $1`, [req.params.id])
+    if (!l) throw new AppError(404, 'No such company')
+    if (!l.platform_locked_at) return res.json({ success: true, data: { locked: false } })
+    // The reason is kept, not blanked: the history of a lock is the answer to
+    // "has this happened before", and GAM does not erase records.
+    await query(
+      `UPDATE landlords SET platform_locked_at = NULL, updated_at = NOW() WHERE id = $1`, [l.id])
+    logger.warn({ landlordId: l.id, by: req.user.userId }, '[admin] a landlord portal was unlocked')
+    res.json({ success: true, data: { locked: false } })
   } catch (e) { next(e) }
 })
