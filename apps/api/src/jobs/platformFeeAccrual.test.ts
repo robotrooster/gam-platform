@@ -901,18 +901,19 @@ describe('the $2 swaps between landlords and is never lost (S616)', () => {
         [agreementId, bLeaseId])
     } finally { c2.release() }
 
-    // A fresh cycle, so both properties accrue again. In arrears the 1 July
-    // run is the one that bills June — RUN_DATE above already billed May.
+    // A fresh cycle, so both properties accrue again. S650: the lease side is
+    // billed for the month the run is IN, so the 1 July run bills July —
+    // RUN_DATE above already billed June.
     await processPlatformFeeAccrual(new Date('2026-07-01T08:00:00Z'))
 
     const { rows: aAfter } = await db.query<any>(
       `SELECT utility_service_unit_count, total_billable
          FROM platform_fee_accruals
-        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [A.propertyId])
+        WHERE property_id = $1 AND accrual_month = '2026-07-01'`, [A.propertyId])
     const { rows: bAfter } = await db.query<any>(
       `SELECT long_term_unit_count, total_billable
          FROM platform_fee_accruals
-        WHERE property_id = $1 AND accrual_month = '2026-06-01'`, [B.propertyId])
+        WHERE property_id = $1 AND accrual_month = '2026-07-01'`, [B.propertyId])
 
     // It left A…
     if (aAfter.length > 0) expect(aAfter[0].utility_service_unit_count).toBe(0)

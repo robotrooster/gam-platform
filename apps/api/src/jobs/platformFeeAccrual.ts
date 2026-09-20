@@ -74,6 +74,14 @@ interface AccrualResult {
 }
 
 export async function processPlatformFeeAccrual(now: Date = new Date()): Promise<AccrualResult> {
+  // ── S637 (SUPERSEDED IN PART BY S650) — SEE BELOW ───────────────────
+  // S650 (Nic): only the short-stay side is arrears now. "We only bill in
+  // arrears for things that have to be billed in arrears. Everything that can
+  // be charged up front, we do charge up front." Leases are known on the 1st,
+  // so they are billed for the month starting; nights ride along for the month
+  // just ended. The S637 reasoning below still explains WHY nights cannot be
+  // billed in advance.
+  //
   // ── S637: THE PLATFORM FEE IS BILLED IN ARREARS ─────────────────────
   //
   // Nic (DIRECTIVE): "The platform needs to bill in arrears for occupied units
@@ -550,7 +558,10 @@ async function accrueOneProperty(
          AND b.status NOT IN ('cancelled', 'no_show')
          AND b.check_in  <  $2::date + INTERVAL '1 month'
          AND b.check_out >  $2::date
-    `, [propertyId, monthIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
+      -- S650: nights are billed IN ARREARS — you cannot count them before the
+      -- month is over — so this query reads the month just ended while the
+      -- lease side above bills the month starting.
+    `, [propertyId, arrearsIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
     const shortStayNights = ssRes.rows[0].nights ?? 0
     const shortStayEquivalent = Math.ceil(shortStayNights / 30)
 
@@ -579,7 +590,7 @@ async function accrueOneProperty(
          AND b.status NOT IN ('cancelled', 'no_show')
          AND b.check_in  <  $2::date + INTERVAL '1 month'
          AND b.check_out >  $2::date
-    `, [propertyId, monthIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
+    `, [propertyId, arrearsIso  /* S650: arrears, like the nights above */, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
     const strRevenue = round2(parseFloat(strRes.rows[0].revenue ?? '0'))
 
     // ── S645: IS THIS PROPERTY RUN BY A MANAGER? ───────────────────
