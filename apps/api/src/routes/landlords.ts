@@ -6859,11 +6859,19 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
                 COALESCE(e.last_event_at, e.created_at) AS decided_at
            FROM email_send_log e
            JOIN mine m ON m.em = lower(e.to_email)
-          -- only messages that actually have a verdict
+          -- only messages that actually have a verdict. 'undeliverable'
+          -- (S651) is one: it means GAM refused to send because the provider
+          -- had already given up on the address.
           WHERE e.last_event IS NOT NULL OR e.status <> 'sent'
           ORDER BY lower(e.to_email), COALESCE(e.last_event_at, e.created_at) DESC
        )
-       SELECT v.em AS email, v.outcome, v.subject, v.category, v.decided_at,
+       SELECT v.em AS email,
+              -- A provider suppression outranks whatever the last message did.
+              -- It is the stronger fact: a bounce says one message failed, a
+              -- suppression says every future one will be discarded in silence.
+              CASE WHEN sup.email IS NOT NULL THEN 'suppressed' ELSE v.outcome END AS outcome,
+              sup.origin AS suppression_origin,
+              v.subject, v.category, v.decided_at,
               u.first_name, u.last_name,
               -- who this is, if GAM knows: a tenant on one of their units, or
               -- somebody still sitting on an unaccepted invite
@@ -6885,7 +6893,9 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
          FROM verdict v
          LEFT JOIN users u   ON lower(u.email) = v.em
          LEFT JOIN tenants t ON t.user_id = u.id
-        WHERE v.outcome IN ('bounced', 'complained', 'failed')
+         LEFT JOIN email_suppressions sup ON sup.email = v.em
+        WHERE v.outcome IN ('bounced', 'complained', 'failed', 'undeliverable')
+           OR sup.email IS NOT NULL
         ORDER BY v.decided_at DESC
         LIMIT 100`,
       [landlordIds])

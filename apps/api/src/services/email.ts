@@ -3,6 +3,8 @@ import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/sha
 import { query } from '../db'
 import { logger } from '../lib/logger'
 import { buildDemoBookingIcs } from './demoCalendar'
+// S651: read before every send — see the comment at the send decision below.
+import { suppressionFor } from './emailSuppressions'
 
 // S630: no key, no sender. The Resend constructor throws on a missing key, at
 // IMPORT time, which took the whole API down rather than degrading — and the
@@ -142,10 +144,30 @@ async function send(
   const isTestAddress = TEST_DOMAINS.some((d) => toLower.endsWith(d))
     || RESERVED_TLDS.some((t) => toLower.endsWith(t))
   const willSend = (nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1') && !isTestAddress
-  let status: 'sent' | 'failed' | 'suppressed' = 'sent'
+  let status: 'sent' | 'failed' | 'suppressed' | 'undeliverable' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
-  if (willSend) {
+
+  // S651 — DO NOT PRETEND TO SEND TO AN ADDRESS THE PROVIDER HAS GIVEN UP ON.
+  //
+  // Once Resend suppresses an address, every send to it is accepted, assigned a
+  // message id, and thrown away. No delivered event, no bounced event, nothing.
+  // Thirteen emails to Rashawn Bump disappeared that way over three weeks —
+  // invitations, reminders and two lease signing requests — every one of them
+  // written here as 'sent'. From the landlord's side a tenant was ignoring him.
+  //
+  // The point is not saving an API call. It is that this row is the answer to
+  // "did they get it?", and a row that says 'sent' about a message the provider
+  // will discard is worse than no row, because somebody believes it.
+  const suppressed = willSend ? await suppressionFor(to) : null
+  if (suppressed) {
+    status = 'undeliverable'
+    errorMessage = `Address is on the mail provider suppression list (${suppressed.origin}`
+      + `${suppressed.suppressedAt ? ` since ${suppressed.suppressedAt.slice(0, 10)}` : ''})`
+      + ' — nothing sent. Correct the address; resending to this one cannot work.'
+    logger.warn({ to, subject, origin: suppressed.origin },
+      '[EMAIL UNDELIVERABLE] provider suppresses this address — not sent')
+  } else if (willSend) {
     try {
       // S322: optional attachments via Resend's documented attachments[]
       // field. Unset for the existing callers — only the new

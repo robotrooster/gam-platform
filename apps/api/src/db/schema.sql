@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict jqP3Cu1n5xLPoCNtxdIuJN3LZ3CkDXiKS9DTgKpf5ZofHIG8mIlMCVbtUnCaN2m
+\restrict PhpsMy20d44tFactDFZrFcBIQjHszp1RfcpqyKfMn4PgEZ3Uq4GwjVTsN9q8TKU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3687,7 +3687,7 @@ CREATE TABLE public.email_send_log (
     last_event text,
     last_event_at timestamp with time zone,
     body_text text,
-    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text])))
+    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text, 'undeliverable'::text])))
 );
 
 
@@ -3695,7 +3695,7 @@ CREATE TABLE public.email_send_log (
 -- Name: COLUMN email_send_log.status; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.email_send_log.status IS 'sent = handed to the provider. failed = the provider refused it. suppressed = this environment has no mail configured and nothing left the machine (S641).';
+COMMENT ON COLUMN public.email_send_log.status IS 'sent = handed to the provider. failed = the provider refused it. suppressed = this environment does not send mail (dev/demo). undeliverable = S651, the address is on the provider suppression list and we did not try.';
 
 
 --
@@ -3739,6 +3739,27 @@ CREATE TABLE public.email_send_log_archive (
     body_text text,
     CONSTRAINT email_send_log_archive_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text, 'suppressed'::text])))
 );
+
+
+--
+-- Name: email_suppressions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.email_suppressions (
+    email text NOT NULL,
+    origin text NOT NULL,
+    provider_id text,
+    suppressed_at timestamp with time zone,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_synced_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE email_suppressions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.email_suppressions IS 'S651: addresses the mail provider will not deliver to, mirrored locally. A suppressed address produces NO delivery event of any kind, so without this a send to one is indistinguishable from a successful send. Synced nightly; read before every send.';
 
 
 --
@@ -12119,6 +12140,14 @@ ALTER TABLE ONLY public.email_send_log
 
 
 --
+-- Name: email_suppressions email_suppressions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_suppressions
+    ADD CONSTRAINT email_suppressions_pkey PRIMARY KEY (email);
+
+
+--
 -- Name: emergency_contacts emergency_contacts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14731,6 +14760,13 @@ CREATE INDEX common_areas_landlord_idx ON public.common_areas USING btree (landl
 --
 
 CREATE INDEX common_areas_property_idx ON public.common_areas USING btree (property_id) WHERE active;
+
+
+--
+-- Name: email_suppressions_synced_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX email_suppressions_synced_idx ON public.email_suppressions USING btree (last_synced_at DESC);
 
 
 --
@@ -27242,5 +27278,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict jqP3Cu1n5xLPoCNtxdIuJN3LZ3CkDXiKS9DTgKpf5ZofHIG8mIlMCVbtUnCaN2m
+\unrestrict PhpsMy20d44tFactDFZrFcBIQjHszp1RfcpqyKfMn4PgEZ3Uq4GwjVTsN9q8TKU
 

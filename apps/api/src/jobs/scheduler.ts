@@ -1762,6 +1762,20 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S651: mirror the mail provider's suppression list. An address it has given
+  // up on produces no event of any kind, so without this a send to a dead
+  // address is indistinguishable from a delivered one — thirteen emails to one
+  // tenant vanished that way before anyone noticed.
+  cron.schedule('35 4 * * *', async () => {
+    try {
+      const { syncEmailSuppressions } = await import('../services/emailSuppressions')
+      const r = await syncEmailSuppressions()
+      if (r.added || r.removed) logger.warn(r, '[email-suppressions] list changed')
+    } catch (e) {
+      logger.error({ err: e }, '[email-suppressions] sync failed')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S651: a park with no coordinates is invisible to every renter searching
   // nearby, and creation only ever tries to geocode once. Retry the stragglers
   // nightly, and shout about any that keep refusing to resolve.

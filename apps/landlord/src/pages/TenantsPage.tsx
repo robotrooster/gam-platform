@@ -35,9 +35,9 @@ function UndeliveredEmailNotice() {
         </b>
       </div>
       <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
-        Their mail server rejected the last message GAM sent, so invitations, reminders and
-        signing requests to these addresses are going nowhere. Check the spelling with them and
-        update it — resending to the same address will bounce again.
+        Mail to these addresses is not arriving, so invitations, reminders and signing requests
+        are going nowhere. Check the spelling with them and update it here — resending to the
+        same address cannot work.
       </div>
       {data.map((r: any) => (
         <div key={r.email} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
@@ -54,9 +54,16 @@ function UndeliveredEmailNotice() {
             )}
             <div style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{r.email}</div>
           </span>
-          <span style={{ color: 'var(--text-3)', fontSize: '.72rem', whiteSpace: 'nowrap' }}>
-            {r.outcome === 'complained' ? 'marked as spam' : 'rejected'}
-            {' '}{new Date(r.decidedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+          <span style={{ color: 'var(--text-3)', fontSize: '.72rem', whiteSpace: 'nowrap', textAlign: 'right' }}>
+            {/* 'suppressed' is the worst of these and reads as the mildest, so
+                it gets the plainest words: nothing is being attempted at all. */}
+            {r.outcome === 'suppressed'
+              ? (r.suppressionOrigin === 'complaint' ? 'marked GAM as spam — nothing is being sent'
+                                                     : 'nothing is being sent any more')
+              : r.outcome === 'complained' ? 'marked as spam'
+              : r.outcome === 'undeliverable' ? 'not sent — address is dead'
+              : 'rejected'}
+            <div>{new Date(r.decidedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>
           </span>
         </div>
       ))}
