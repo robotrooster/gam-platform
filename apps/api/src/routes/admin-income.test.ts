@@ -167,3 +167,109 @@ describe('GET /api/admin/onboarding/landlord/:id — detail + checklist', () => 
     expect(res.body.data.counts.unit_count).toBe(1)
   })
 })
+
+/**
+ * S652 — every number on the admin money page comes from one book.
+ *
+ * Nic, reading the page: "all the KPI cards are not linked up to each other...
+ * the pie charts at the bottom are showing all-time money $172.72 versus the
+ * KPI card up near the top that says GAM's own money... $218.87 all time, which
+ * is about a $50 difference... just reconcile all the different KPI cards where
+ * they're getting their numbers from the same source."
+ *
+ * He reproduced it to the cent. Three books were being added together: accruals
+ * plus a live run-rate for platform fees, a COUNT of background checks times a
+ * constant, and a ledger that also held adjustments nothing else knew about.
+ */
+describe('S652: the money page agrees with itself', () => {
+  let superToken = ''
+  beforeEach(async () => { superToken = (await seedAFixture()).superAdminToken })
+
+  async function ledger(rows: Array<{ type: string; amount: number; monthsAgo?: number }>) {
+    for (const r of rows) {
+      await db.query(
+        // balance_after is the running balance the real helper maintains; these
+        // fixtures only care about `amount`, so it carries the same value.
+        `INSERT INTO platform_revenue_ledger (type, amount, balance_after, notes, created_at)
+         VALUES ($1, $2, $2, 'test', NOW() - ($3 || ' months')::interval)`,
+        [r.type, r.amount, r.monthsAgo ?? 0])
+    }
+  }
+
+  it('the pie sums to exactly what the balance card calls all-time revenue', async () => {
+    await ledger([
+      { type: 'platform_fee_subscription', amount: 130 },
+      { type: 'banking_spread',            amount: 47.72 },
+      { type: 'screening_margin',          amount: 5 },
+      { type: 'adjustment',                amount: -13.85 },
+    ])
+    const comp = await request(buildApp())
+      .get('/api/admin/income/composition?window=all')
+      .set('Authorization', `Bearer ${superToken}`)
+    const [row] = await db.query<any>(`SELECT COALESCE(SUM(amount),0)::float AS amt FROM platform_revenue_ledger`)
+      .then((r: any) => r.rows)
+    expect(comp.status).toBe(200)
+    expect(comp.body.data.gross).toBeCloseTo(Number(row.amt), 2)
+  })
+
+  it('shows adjustments, which used to exist in the ledger and in no pie', async () => {
+    await ledger([
+      { type: 'platform_fee_subscription', amount: 130 },
+      { type: 'adjustment',                amount: -13.85 },
+    ])
+    const comp = await request(buildApp())
+      .get('/api/admin/income/composition?window=all')
+      .set('Authorization', `Bearer ${superToken}`)
+    const adj = comp.body.data.sources.find((s: any) => s.key === 'adjustments')
+    expect(adj.amount).toBeCloseTo(-13.85, 2)
+    expect(comp.body.data.gross).toBeCloseTo(116.15, 2)
+  })
+
+  it('never folds a forward run-rate into a historical total', async () => {
+    // The original defect: an "all time" figure that was part history and part
+    // forecast, and whose forecast disagreed with the bill that went out.
+    await ledger([{ type: 'platform_fee_subscription', amount: 130 }])
+    const comp = await request(buildApp())
+      .get('/api/admin/income/composition?window=all')
+      .set('Authorization', `Bearer ${superToken}`)
+    expect(comp.body.data.gross).toBeCloseTo(130, 2)
+    expect(comp.body.data).toHaveProperty('runRate')   // returned, and kept apart
+  })
+
+  it('reports recurring revenue as the bill that actually went out', async () => {
+    // Nic: "The recurring revenue is showing only $120 per month off of the
+    // subscription fees." September billed $130.
+    await ledger([
+      { type: 'platform_fee_subscription', amount: 10,  monthsAgo: 1 },
+      { type: 'platform_fee_subscription', amount: 130, monthsAgo: 0 },
+    ])
+    const all = await request(buildApp())
+      .get('/api/admin/income/composition/all')
+      .set('Authorization', `Bearer ${superToken}`)
+    expect(all.body.data.recurringMonthly).toBeCloseTo(130, 2)
+    expect(all.body.data.recurringAnnual).toBeCloseTo(1560, 2)
+  })
+
+  it('does not read an unbilled current month as a collapse in revenue', async () => {
+    // On the 2nd, before the accrual runs, there is no current-month row yet.
+    await ledger([{ type: 'platform_fee_subscription', amount: 130, monthsAgo: 1 }])
+    const all = await request(buildApp())
+      .get('/api/admin/income/composition/all')
+      .set('Authorization', `Bearer ${superToken}`)
+    expect(all.body.data.recurringMonthly).toBeCloseTo(130, 2)
+  })
+
+  it('a slice opens onto the rows that make it up', async () => {
+    await ledger([
+      { type: 'banking_spread', amount: 2.5 },
+      { type: 'banking_spread', amount: 3.5 },
+    ])
+    const bd = await request(buildApp())
+      .get('/api/admin/income/breakdown?window=all')
+      .set('Authorization', `Bearer ${superToken}`)
+    const proc = bd.body.data.sources.find((s: any) => s.key === 'processing')
+    expect(proc.count).toBe(2)
+    expect(proc.amount).toBeCloseTo(6, 2)
+    expect(bd.body.data.gross).toBeCloseTo(6, 2)
+  })
+})

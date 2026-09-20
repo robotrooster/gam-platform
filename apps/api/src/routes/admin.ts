@@ -1709,67 +1709,75 @@ async function currentPlatformRunRate(): Promise<number> {
   return propRows.reduce((s, r) => s + launchPlatformFeeForProperty(+r.occ), 0)
 }
 
-async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
-  const [pfa] = await query<any>(`
-    SELECT COALESCE(SUM(pfa.total_amount), 0)::float AS amt
-      FROM platform_fee_accruals pfa JOIN landlords l ON l.id = pfa.landlord_id
-     WHERE l.is_system IS NOT TRUE
-       AND pfa.accrual_month >= ${startSql}
-       AND pfa.accrual_month <  date_trunc('month', CURRENT_DATE)
-  `).catch(() => [{ amt: 0 }])
-  const platform = +((pfa?.amt || 0) + platformRunRate).toFixed(2)
-  const [fp] = await query<any>(`
-    SELECT COALESCE(SUM(tenant_fee_amount), 0)::float AS amt
-      FROM flexpay_advances WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
-  const flexpay = +(fp?.amt || 0).toFixed(2)
-  const [bg] = await query<any>(`
-    SELECT COUNT(*)::int AS n FROM background_checks WHERE created_at >= ${startSql}
-  `).catch(() => [{ n: 0 }])
-  const bgRevenue = +((bg?.n || 0) * PLATFORM_FEES.BG_CHECK_NET).toFixed(2)
-  // Processing spread + instant-withdrawal + placement income — all live on the
-  // platform_revenue_ledger, keyed by type. (platform_fee_subscription is NOT
-  // pulled here — the platform fee is already counted above via run-rate +
-  // accruals; pulling it again would double-count.)
-  const [led] = await query<any>(`
-    SELECT
-      COALESCE(SUM(amount) FILTER (WHERE type='banking_spread'),       0)::float AS processing,
-      COALESCE(SUM(amount) FILTER (WHERE type='manual_withdrawal_fee'),0)::float AS withdrawals,
-      COALESCE(SUM(amount) FILTER (WHERE type='placement_fee_share'),  0)::float AS placement
-    FROM platform_revenue_ledger WHERE created_at >= ${startSql}
-  `).catch(() => [{ processing: 0, withdrawals: 0, placement: 0 }])
-  // Business/POS platform fees (month is 'YYYY-MM' text — lexicographic compare).
-  const [bpos] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM business_platform_fee_accruals
-     WHERE month >= to_char((${startSql})::timestamptz, 'YYYY-MM')
-  `).catch(() => [{ amt: 0 }])
-  // FlexDeposit custody fee ($3/mo per FLEX_DEPOSIT_CUSTODY_FEE) while GAM holds
-  // a tenant's deposit in custody. Recurring GAM revenue.
-  const [fd] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flex_deposit_custody_charges
-     WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
-  // FlexCredit ($5/mo rent-reporting subscription). Wired but invisible until
-  // launch — $0 until the first enrollment. GROSS $5 shown here (the ~$1.50
-  // Esusu provider cost is COGS, tracked separately, not yet wired).
-  const [fc] = await query<any>(`
-    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flexcredit_charges
-     WHERE created_at >= ${startSql}
-  `).catch(() => [{ amt: 0 }])
+/**
+ * S652 — WHAT GAM ACTUALLY EARNED, FROM ONE BOOK.
+ *
+ * Nic: "all the KPI cards are not linked up to each other... the pie charts at
+ * the bottom are showing all-time money $172.72 versus the KPI card up near the
+ * top that says GAM's own money... $218.87 all time, which is about a $50
+ * difference... just reconcile all the different KPI cards where they're getting
+ * their numbers from the same source. That way, everything balances out."
+ *
+ * He reproduced the discrepancy to the cent, and the cause was that these pies
+ * and that card were reading three different books:
+ *
+ *  1. PLATFORM FEES came from `platform_fee_accruals` for past months PLUS a
+ *     live run-rate for the current one. A run-rate is a forecast of a month
+ *     that has not been billed yet, so an "all time" total containing one is
+ *     part history and part guess — and the guess said $120 while September was
+ *     actually billed $130 ($48 Oak Park + $82 Mountain View).
+ *  2. BACKGROUND CHECKS were a COUNT times a constant, not the margin actually
+ *     recorded. One check at an assumed net, rather than the $5 on the books.
+ *  3. ADJUSTMENTS (−$13.85 of them) existed only in the ledger and appeared in
+ *     no pie at all, so the two could not have matched even in principle.
+ *
+ * Now every slice is `platform_revenue_ledger`, which is what that table was
+ * built to be (S650: "one helper, so anything that earns GAM money records it
+ * the same way and the running balance stays a real running balance"). The pie
+ * sums to the card because they are the same rows.
+ *
+ * The run-rate did not disappear — a forward number is genuinely useful. It is
+ * returned beside the actuals as `runRate`, labelled as what it is, and it is
+ * never added to a historical total.
+ */
+const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recurring: boolean }> = [
+  { key: 'platform_unit',      label: 'Platform Fees',       types: ['platform_fee_subscription'], recurring: true },
+  { key: 'processing',         label: 'Processing / ACH',    types: ['banking_spread'],            recurring: true },
+  { key: 'background_checks',  label: 'Background Checks',   types: ['screening_margin'],          recurring: false },
+  { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
+  { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },
+  { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
+]
 
-  const sources = [
-    { key: 'platform_unit',       label: 'Platform Fees',        amount: platform,                        recurring: true },
-    { key: 'processing',          label: 'Processing / ACH',     amount: +(led?.processing || 0).toFixed(2), recurring: true },
-    { key: 'flexpay',             label: 'FlexPay',              amount: flexpay,                         recurring: true },
-    { key: 'flex_deposit',        label: 'FlexDeposit Custody',  amount: +(fd?.amt || 0).toFixed(2),      recurring: true },
-    { key: 'flex_credit',         label: 'FlexCredit',           amount: +(fc?.amt || 0).toFixed(2),      recurring: true },
-    { key: 'business_pos',        label: 'Business Fees' ,         amount: +(bpos?.amt || 0).toFixed(2),    recurring: true },
-    { key: 'placement',           label: 'Placement Fees',       amount: +(led?.placement || 0).toFixed(2),   recurring: false },
-    { key: 'instant_withdrawal',  label: 'Instant Withdrawals',  amount: +(led?.withdrawals || 0).toFixed(2), recurring: false },
-    { key: 'background_checks',   label: 'Background Checks',    amount: bgRevenue,                       recurring: false },
-  ]
+async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
+  const rows = await query<{ type: string; amt: number }>(`
+    SELECT type, COALESCE(SUM(amount), 0)::float AS amt
+      FROM platform_revenue_ledger
+     WHERE created_at >= ${startSql}
+     GROUP BY type`)
+  const byType = new Map(rows.map(r => [r.type, Number(r.amt)]))
+
+  const sources = REVENUE_SLICES.map(sl => ({
+    key: sl.key,
+    label: sl.label,
+    amount: +sl.types.reduce((sum, t) => sum + (byType.get(t) ?? 0), 0).toFixed(2),
+    recurring: sl.recurring,
+  }))
+
+  // Anything earning money under a type nobody has named yet still has to show
+  // up, or the pie quietly stops equalling the card the first time a new
+  // revenue type is added and nobody remembers this list.
+  const named = new Set(REVENUE_SLICES.flatMap(sl => sl.types))
+  const otherAmt = +rows.filter(r => !named.has(r.type))
+    .reduce((sum, r) => sum + Number(r.amt), 0).toFixed(2)
+  if (otherAmt !== 0) sources.push({ key: 'other', label: 'Other', amount: otherAmt, recurring: false })
+
   const gross = +sources.reduce((s, x) => s + x.amount, 0).toFixed(2)
-  return { window: key, label, gross, sources }
+  return {
+    window: key, label, gross, sources,
+    // Forward-looking, and kept apart from the history on purpose.
+    runRate: +platformRunRate.toFixed(2),
+  }
 }
 
 // GET /api/admin/income/composition?window=month|quarter|ytd|rolling12|all
@@ -1784,14 +1792,56 @@ adminRouter.get('/income/composition', requireSuperAdmin, async (req, res, next)
 
 // GET /api/admin/income/composition/all — every window at once (the "wall of
 // clocks": one pie per period, all on the page together).
+/**
+ * S652 — recurring revenue is the LAST BILL, not a re-derivation of it.
+ *
+ * Nic: "The recurring revenue is showing only $120 per month off of the
+ * subscription fees." September was billed $130 — $48 at Oak Park for 24
+ * billable units and $82 at Mountain View for 41. The $120 came from re-deriving
+ * the fee out of units that are `active` right now, which is not the same set as
+ * the units that were billable when the bill was raised: owner-occupied spaces
+ * are excluded, properties inside their onboarding grace are excluded, and
+ * occupancy moves between the two moments anyway.
+ *
+ * Two ways to compute one number is one way too many. The bill that actually
+ * went out is the answer — it is a fact, and it is the number a landlord would
+ * quote back at us.
+ */
+async function recurringMonthlyFromLedger(): Promise<{ amount: number; month: string | null }> {
+  const recurringTypes = REVENUE_SLICES.filter(sl => sl.recurring).flatMap(sl => sl.types)
+  const rows = await query<{ month: string; amt: number }>(`
+    SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+           COALESCE(SUM(amount), 0)::float AS amt
+      FROM platform_revenue_ledger
+     WHERE type = ANY($1::text[])
+     GROUP BY 1
+     -- The most recent month that actually billed something. An empty current
+     -- month (the 2nd, before the accrual runs) must not read as a collapse in
+     -- recurring revenue.
+     HAVING COALESCE(SUM(amount), 0) > 0
+     ORDER BY 1 DESC
+     LIMIT 1`, [recurringTypes])
+  const r = rows[0]
+  return { amount: r ? Math.round(Number(r.amt) * 100) / 100 : 0, month: r?.month ?? null }
+}
+
 adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rr = await currentPlatformRunRate()
     const keys = ['month', 'quarter', 'ytd', 'rolling12', 'all']
-    const periods = await Promise.all(
-      keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))
-    )
-    res.json({ success: true, data: { periods } })
+    const [periods, recurring] = await Promise.all([
+      Promise.all(keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))),
+      recurringMonthlyFromLedger(),
+    ])
+    res.json({ success: true, data: {
+      periods,
+      // Same book as the pies above it, so the page cannot contradict itself.
+      recurringMonthly: recurring.amount,
+      recurringMonth:   recurring.month,
+      recurringAnnual:  Math.round(recurring.amount * 12 * 100) / 100,
+      // The forward number, kept separate and named as what it is.
+      platformRunRate:  +rr.toFixed(2),
+    } })
   } catch (e) { next(e) }
 })
 
@@ -1803,58 +1853,45 @@ adminRouter.get('/income/breakdown', requireSuperAdmin, async (req, res, next) =
   try {
     const key = String(req.query.window || 'month')
     const win = INCOME_WINDOWS[key] || INCOME_WINDOWS.month
-    const S = win.start
-    const runRate = await currentPlatformRunRate()
-    const q = (sql: string) => query<any>(sql).catch(() => [] as any[])
 
-    const [platform, processing, flexpay, bpos, placement, withdrawals, bgc, fdc, fcc] = await Promise.all([
-      q(`SELECT to_char(pfa.accrual_month,'Mon YYYY') AS date, p.name AS label, pfa.total_amount::float AS amount
-           FROM platform_fee_accruals pfa JOIN landlords l ON l.id=pfa.landlord_id JOIN properties p ON p.id=pfa.property_id
-          WHERE l.is_system IS NOT TRUE AND pfa.accrual_month >= ${S} AND pfa.accrual_month < date_trunc('month',CURRENT_DATE)
-          ORDER BY pfa.accrual_month DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Processing spread') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='banking_spread' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexPay fee' AS label, tenant_fee_amount::float AS amount
-           FROM flexpay_advances WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT bpfa.month AS date, 'Business POS fee' AS label, bpfa.amount::float AS amount
-           FROM business_platform_fee_accruals bpfa WHERE bpfa.month >= to_char((${S})::timestamptz,'YYYY-MM') ORDER BY bpfa.month DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Placement fee') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='placement_fee_share' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Instant withdrawal') AS label, amount::float AS amount
-           FROM platform_revenue_ledger WHERE type='manual_withdrawal_fee' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS label
-           FROM background_checks WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexDeposit custody' AS label, amount::float AS amount
-           FROM flex_deposit_custody_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexCredit reporting' AS label, amount::float AS amount
-           FROM flexcredit_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
-    ])
+    // S652: the same rows the pie is drawn from, listed. This used to read
+    // accruals, a synthetic run-rate line and a count of background checks
+    // times a constant — so a slice worth $5 could open onto items worth
+    // something else, and nobody could tell which number was the real one.
+    const rows = await query<any>(`
+      SELECT type,
+             to_char(created_at, 'Mon DD') AS date,
+             COALESCE(NULLIF(notes, ''), reference_type, type) AS label,
+             amount::float AS amount,
+             created_at
+        FROM platform_revenue_ledger
+       WHERE created_at >= ${win.start}
+       ORDER BY created_at DESC
+       LIMIT 2000`)
 
-    // Current-month platform fee accrues on the 1st — surface the in-progress
-    // run-rate as a synthetic "accruing" line so the total matches the pie.
-    const platItems = [
-      ...(runRate > 0 ? [{ date: 'This month', label: 'Current run-rate (accruing)', amount: runRate }] : []),
-      ...platform,
-    ]
-    const bgItems = bgc.map((r: any) => ({ date: r.date, label: r.label || 'Screening', amount: PLATFORM_FEES.BG_CHECK_NET }))
-
+    const named = new Set(REVENUE_SLICES.flatMap(sl => sl.types))
     const sources = [
-      { key: 'platform_unit',      label: 'Platform Fees',       items: platItems },
-      { key: 'processing',         label: 'Processing / ACH',    items: processing },
-      { key: 'flexpay',            label: 'FlexPay',             items: flexpay },
-      { key: 'flex_deposit',       label: 'FlexDeposit Custody', items: fdc },
-      { key: 'flex_credit',        label: 'FlexCredit',          items: fcc },
-      { key: 'business_pos',       label: 'Business Fees' ,        items: bpos },
-      { key: 'placement',          label: 'Placement Fees',      items: placement },
-      { key: 'instant_withdrawal', label: 'Instant Withdrawals', items: withdrawals },
-      { key: 'background_checks',  label: 'Background Checks',    items: bgItems },
-    ].map(s => ({
-      ...s,
-      count: s.items.length,
-      amount: +s.items.reduce((a: number, x: any) => a + (x.amount || 0), 0).toFixed(2),
-    }))
-    const gross = +sources.reduce((a, s) => a + s.amount, 0).toFixed(2)
+      ...REVENUE_SLICES.map(sl => ({
+        key: sl.key,
+        label: sl.label,
+        items: rows.filter((r: any) => sl.types.includes(r.type))
+          .map((r: any) => ({ date: r.date, label: r.label, amount: r.amount })),
+      })),
+      {
+        key: 'other',
+        label: 'Other',
+        items: rows.filter((r: any) => !named.has(r.type))
+          .map((r: any) => ({ date: r.date, label: r.label, amount: r.amount })),
+      },
+    ]
+      .map(s => ({
+        ...s,
+        count: s.items.length,
+        amount: +s.items.reduce((a: number, x: any) => a + (x.amount || 0), 0).toFixed(2),
+      }))
+      .filter(s => s.count > 0)
 
+    const gross = +sources.reduce((a, s) => a + s.amount, 0).toFixed(2)
     res.json({ success: true, data: { window: key, label: win.label, gross, sources } })
   } catch (e) { next(e) }
 })

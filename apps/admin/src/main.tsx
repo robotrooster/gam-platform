@@ -1013,7 +1013,13 @@ function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
   const isSuperAdmin=user?.role==='super_admin'
-  const{data:income}=useQuery('income-projection',()=>get<any>('/admin/income/projection'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  // S652: the income PROJECTION is no longer fetched here. It is a forecast —
+  // occupancy-derived run-rates and counts times constants — and having it on
+  // the same screen as the ledger is what let this page disagree with itself:
+  // "$172.72 versus the KPI card up near the top... $218.87 all time." Every
+  // number on this page now comes from platform_revenue_ledger. The endpoint
+  // still exists for forecasting work; it just does not feed a card that reads
+  // as fact.
   const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
   const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
   const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
@@ -1221,18 +1227,25 @@ function Overview(){
       {/* ── Platform Revenue: recurring ARR + full income composition ── */}
       {(()=>{
         const colorOf=incomeColorOf
-        const SRC=[
-          {key:'platform_unit',label:'Platform Fees',recurring:true},
-          {key:'processing',label:'Processing / ACH',recurring:true},
-          {key:'flexpay',label:'FlexPay',recurring:true},
-          {key:'flex_deposit',label:'FlexDeposit Custody',recurring:true},
-          {key:'flex_credit',label:'FlexCredit',recurring:true},
-          {key:'business_pos',label:'Business Fees',recurring:true},
-          {key:'placement',label:'Placement Fees',recurring:false},
-          {key:'instant_withdrawal',label:'Instant Withdrawals',recurring:false},
-          {key:'background_checks',label:'Background Checks',recurring:false},
-        ]
-        const recurringMonthly=income?.monthly?.total||0
+        // S652: the legend is built from what the SERVER actually returned, not
+        // from a list kept in parallel here. A hand-maintained copy is how a
+        // slice ends up on the chart with no name beside it, or a name with no
+        // slice — and the whole point of this pass is that the page agrees with
+        // itself.
+        const SRC=Array.from(new Map(
+          ((compositionAll?.periods||[]) as any[])
+            .flatMap((p:any)=>p.sources||[])
+            .filter((s:any)=>s.amount!==0)
+            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
+        ).values())
+        // S652 (Nic): "just reconcile all the different KPI cards where they're
+        // getting their numbers from the same source. That way, everything
+        // balances out." This used to read a re-derived run-rate ($120) while
+        // the bill that actually went out was $130. It now comes from the same
+        // ledger the pies below are drawn from.
+        const recurringMonthly=compositionAll?.recurringMonthly??0
+        const recurringMonth=compositionAll?.recurringMonth as string|undefined
+        const recurringAnnual=compositionAll?.recurringAnnual??0
         const periods:any[]=compositionAll?.periods||[]
         // Small-donut geometry (stroke-dasharray technique).
         const R=40,SW=12,C=2*Math.PI*R
@@ -1243,11 +1256,13 @@ function Overview(){
               <div>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
-                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>per month · recurring only</div>
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>
+                  {recurringMonth?`billed ${recurringMonth} · recurring only`:'per month · recurring only'}
+                </div>
               </div>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(income?.annual||0)}</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(recurringAnnual)}</div>
                 <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · recurring × 12</div>
               </div>
             </div>
