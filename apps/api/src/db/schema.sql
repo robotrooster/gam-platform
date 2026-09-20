@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict OTK7AuUmhqYuN8Re3VripcQvNnNQHE9ZT5AjnwTZxVvODVYL3gsQsQtu0hR7aQn
+\restrict Bmm9amd6e9KC6jbBdcnjVBbMk9jZ1T4XRKhQmRmHSaC4WsoxdqpdLKZ04k4JUit
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7153,6 +7153,38 @@ COMMENT ON COLUMN public.pos_items.stay_unit IS 'S651: non-NULL marks this item 
 
 
 --
+-- Name: pos_open_tickets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_open_tickets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    created_by uuid NOT NULL,
+    tenant_id uuid,
+    pos_customer_id uuid,
+    items jsonb NOT NULL,
+    note text,
+    status text DEFAULT 'open'::text NOT NULL,
+    settled_transaction_id uuid,
+    settled_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    void_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_open_tickets_one_customer CHECK (((((tenant_id IS NOT NULL))::integer + ((pos_customer_id IS NOT NULL))::integer) = 1)),
+    CONSTRAINT pos_open_tickets_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'voided'::text])))
+);
+
+
+--
+-- Name: TABLE pos_open_tickets; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_open_tickets IS 'S652: a sale written up where the goods are measured and settled where the customer is. Holds no money — the total is computed at settlement by the same path every register sale uses.';
+
+
+--
 -- Name: pos_pay_links; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7462,6 +7494,7 @@ CREATE TABLE public.pos_transactions (
     discount_reason text,
     pay_link_id uuid,
     tax_breakdown jsonb,
+    open_ticket_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'card_on_file'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -13394,6 +13427,14 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_open_tickets pos_open_tickets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: pos_pay_links pos_pay_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19138,6 +19179,13 @@ CREATE UNIQUE INDEX pos_customers_email_landlord_uniq ON public.pos_customers US
 --
 
 CREATE UNIQUE INDEX pos_discounts_code_uniq ON public.pos_discounts USING btree (landlord_id, code) WHERE (code IS NOT NULL);
+
+
+--
+-- Name: pos_open_tickets_open_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_open_tickets_open_idx ON public.pos_open_tickets USING btree (property_id, created_at) WHERE (status = 'open'::text);
 
 
 --
@@ -25014,6 +25062,54 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_open_tickets pos_open_tickets_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: pos_open_tickets pos_open_tickets_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_open_tickets pos_open_tickets_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
+-- Name: pos_open_tickets pos_open_tickets_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_open_tickets pos_open_tickets_settled_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_settled_transaction_id_fkey FOREIGN KEY (settled_transaction_id) REFERENCES public.pos_transactions(id);
+
+
+--
+-- Name: pos_open_tickets pos_open_tickets_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
 -- Name: pos_pay_links pos_pay_links_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25267,6 +25363,14 @@ ALTER TABLE ONLY public.pos_transactions
 
 ALTER TABLE ONLY public.pos_transactions
     ADD CONSTRAINT pos_transactions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_transactions pos_transactions_open_ticket_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_open_ticket_id_fkey FOREIGN KEY (open_ticket_id) REFERENCES public.pos_open_tickets(id);
 
 
 --
@@ -27361,5 +27465,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict OTK7AuUmhqYuN8Re3VripcQvNnNQHE9ZT5AjnwTZxVvODVYL3gsQsQtu0hR7aQn
+\unrestrict Bmm9amd6e9KC6jbBdcnjVBbMk9jZ1T4XRKhQmRmHSaC4WsoxdqpdLKZ04k4JUit
 

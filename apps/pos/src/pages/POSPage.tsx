@@ -96,6 +96,12 @@ export function POSPage() {
   // list (resident account or POS customer account). The register shows
   // ONE neutral "customer" picker; the ids stay mutually exclusive.
   const [posCustomerId, setPosCustomerId] = useState('')
+  // S652 (Nic): propane is pumped in the office — that is where the meter is,
+  // and it has to be zeroed before the next tank — and paid for at the door.
+  // A ticket is the cart in between. Carries no total: the price is decided
+  // when it is rung, by the same server path as every other sale.
+  const [ticketsOpen, setTicketsOpen] = useState(false)
+  const [openTicketId, setOpenTicketId] = useState<string | null>(null)
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
   const [receipt, setReceipt] = useState<any>(null)
@@ -191,6 +197,27 @@ export function POSPage() {
   const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge'||method==='card_on_file' })
   // S652: whose card, and which one. The counter is about to take money with
   // nobody handing anything over, so the screen says it out loud first.
+  const tickets = useQuery<any[]>(
+    ['pos-tickets', registerProperty],
+    () => apiGet(`/pos/tickets?propertyId=${registerProperty}`),
+    { enabled: !!registerProperty, retry: false },
+  )
+  const writeTicketMut = useMutation(
+    () => apiPost('/pos/tickets', {
+      propertyId: registerProperty,
+      tenantId: tenantId || null,
+      posCustomerId: posCustomerId || null,
+      items: cart.map(i => ({ id: i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+    }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('pos-tickets')
+        setCart([]); setTenantId(''); setPosCustomerId('')
+        toast('Held for delivery')
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not hold that for delivery'),
+    },
+  )
   const cardOnFile = useQuery<any>(
     ['pos-card-on-file', tenantId, posCustomerId],
     () => apiGet(`/pos/card-on-file?${tenantId?`tenantId=${tenantId}`:`posCustomerId=${posCustomerId}`}`),
@@ -499,6 +526,9 @@ export function POSPage() {
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
       stripePaymentIntentId: stripePaymentIntentId || null,
+      // S652: the ticket this sale settles, claimed inside the sale's own
+      // transaction so two drivers cannot both charge the same tank.
+      openTicketId,
       // S651: present only when a stay is in the cart. The server derives the
       // dates from the item and its quantity; this is the part only the
       // cashier knows.
@@ -521,6 +551,7 @@ export function POSPage() {
       }
       setClientSessionId(null)
       setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
+      setOpenTicketId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
     }}
@@ -932,6 +963,15 @@ export function POSPage() {
                 <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(total)}</span>
               </div>
             </div>
+            {/* S652: what is still out for delivery. The driver opens one and it
+                fills the cart — same cart, same tenders, same server path. */}
+            {(tickets.data?.length || openTicketId) && (
+              <button className="btn btn-ghost btn-sm" style={{width:'100%',marginBottom:8,textAlign:'left'}}
+                      onClick={()=>setTicketsOpen(true)}>
+                {openTicketId
+                  ? 'Settling a ticket · tap to change'
+                  : `${tickets.data?.length} ticket${tickets.data?.length === 1 ? '' : 's'} out for delivery`}
+              </button>)}
             <div style={{marginBottom:10}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:5}}>Payment method</div>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
@@ -1036,6 +1076,21 @@ export function POSPage() {
               onClick={()=>setPayLinkOpen(true)}>
               Email a pay link
             </button>
+            {/* S652 (Nic): the propane is pumped here, where the meter is and
+                where it has to be zeroed before the next tank — and paid for at
+                the customer's door. Nic, on why this is not a pay link: "That's
+                product actually out and payment needs to be rendered right then
+                instead of chasing somebody down later." */}
+            <button className="btn btn-ghost" style={{width:'100%',marginTop:8}}
+              disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId
+                        || writeTicketMut.isLoading}
+              onClick={()=>writeTicketMut.mutate()}>
+              {writeTicketMut.isLoading ? 'Writing it up…' : 'Hold for delivery'}
+            </button>
+            {cart.length>0 && !openTicketId && !tenantId && !posCustomerId &&
+              <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                Pick who it is for to hold it for delivery.
+              </div>}
             {payLinkOpen && (
               <SendPayLinkModal
                 propertyId={registerProperty}
@@ -1751,6 +1806,43 @@ export function POSPage() {
           when they arrive, which site, and who it is for. The length comes from
           the item and the quantity already rung — Nic: "You add two of those,
           it's two days or two weeks or two months." */}
+      {ticketsOpen&&(<div className="modal-overlay" onClick={()=>setTicketsOpen(false)}>
+        <div className="modal" style={{maxWidth:460}} onClick={e=>e.stopPropagation()}>
+          <div className="modal-header">
+            <span className="modal-title">Out for delivery</span>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setTicketsOpen(false)}>✕</button>
+          </div>
+          <div style={{padding:'4px 24px 24px',display:'grid',gap:8}}>
+            {!tickets.data?.length && <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Nothing is out.</div>}
+            {(tickets.data ?? []).map((t:any)=>(
+              <div key={t.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,
+                                      padding:'11px 14px',background:'var(--bg-2)',
+                                      border:`1px solid ${openTicketId===t.id?'var(--gold)':'var(--border-1)'}`,
+                                      borderRadius:10}}>
+                <div>
+                  <div style={{fontWeight:700,fontSize:'.88rem'}}>{t.customerName || 'Customer'}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+                    {(t.items||[]).map((i:any)=>`${i.qty} × ${i.name||'item'}`).join(', ')}
+                  </div>
+                  {t.note && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:2}}>{t.note}</div>}
+                </div>
+                <button className="btn btn-primary btn-sm" onClick={()=>{
+                  // Load the ticket into the cart exactly as if it had been
+                  // rung here: same items, same customer, priced by the server
+                  // at the moment it is charged.
+                  setCart((t.items||[]).map((i:any)=>({
+                    id:i.id, name:i.name||'Item', price:Number(i.price)||0, qty:Number(i.qty)||1,
+                    tax:Number(i.tax)||0, cat:'', icon:'📦', chargeEligible:true, stayUnit:null,
+                  })) as any)
+                  if (t.tenantId) { setTenantId(t.tenantId); setPosCustomerId('') }
+                  else { setPosCustomerId(t.posCustomerId); setTenantId('') }
+                  setOpenTicketId(t.id); setTicketsOpen(false)
+                }}>Settle</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>)}
       {stayModal&&stayLine&&(<div className="modal-overlay" onClick={()=>setStayModal(false)}>
         <div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
           <StayDetailsModal

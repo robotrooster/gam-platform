@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import { insertPosSale } from '../services/posSale'
 import { cardFeeSplit, type CardFeePayer } from '@gam/shared'
 
@@ -728,6 +729,112 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
   } catch (e) { next(e) }
 })
 
+// ── S652: open tickets — written up at the pump, settled at the door ────────
+//
+// Nic: "we would need to somehow create the tickets in the office because
+// that's where the dispenser is pumping propane and you have to reset the
+// propane counter before you can pump the next person. So we need a list of who
+// the tank belongs to and how many gallons went into it."
+//
+// A ticket is a cart and a customer. It carries no total on purpose — see the
+// migration: freezing a price at write-up time would be a second pricing
+// authority, and a whole session went into deleting one of those.
+
+const ticketSchema = z.object({
+  propertyId:    z.string().uuid(),
+  tenantId:      z.string().uuid().nullish(),
+  posCustomerId: z.string().uuid().nullish(),
+  items: z.array(z.object({
+    id:    z.string().uuid(),
+    name:  z.string().max(160).optional(),
+    qty:   z.number().positive(),
+    price: z.number().min(0).optional(),
+    tax:   z.number().min(0).optional(),
+  })).min(1),
+  note: z.string().max(500).nullish(),
+})
+
+posRouter.post('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const body = ticketSchema.parse(req.body)
+    if (!!body.tenantId === !!body.posCustomerId) {
+      throw new AppError(400, 'A ticket is for one person — pick a tenant or a customer, not both.')
+    }
+    await assertPropertyInScope(req.user, body.propertyId)
+    const landlordId = posLandlordId(req)
+    await assertPropertyIsLandlords(landlordId, body.propertyId)
+    // Every line has to be a real item of this landlord's — the same rule the
+    // register enforces on a sale ("Items are set prices. There's no custom
+    // item thing"), applied at write-up so a bad ticket is refused in the
+    // office rather than at somebody's door.
+    const ids = [...new Set(body.items.map((i) => i.id))]
+    const known = await query<{ id: string }>(
+      `SELECT id FROM pos_items WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND is_active = TRUE`,
+      [ids, landlordId])
+    if (known.length !== ids.length) throw new AppError(400, 'One of those items is not on your register.')
+    // A stay is a booking with dates and a site; it cannot sit on a ticket.
+    const stays = await query<{ name: string }>(
+      `SELECT name FROM pos_items WHERE id = ANY($1::uuid[]) AND stay_unit IS NOT NULL`, [ids])
+    if (stays.length) throw new AppError(400, `"${stays[0].name}" is a stay — ring it at the register with a site and dates.`)
+
+    if (body.posCustomerId) {
+      const c = await queryOne<{ id: string }>(
+        `SELECT id FROM pos_customers WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
+        [body.posCustomerId, landlordId])
+      if (!c) throw new AppError(404, 'No such customer')
+    }
+
+    const row = await queryOne<any>(
+      `INSERT INTO pos_open_tickets
+         (landlord_id, property_id, created_by, tenant_id, pos_customer_id, items, note)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) RETURNING *`,
+      [landlordId, body.propertyId, req.user.userId, body.tenantId ?? null,
+       body.posCustomerId ?? null, JSON.stringify(body.items), body.note ?? null])
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pos/tickets?propertyId= — what is still out. The driver's list.
+posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = String(req.query.propertyId ?? '')
+    if (!propertyId) throw new AppError(400, 'A property must be selected')
+    await assertPropertyInScope(req.user, propertyId)
+    const rows = await query<any>(
+      `SELECT t.*,
+              COALESCE(
+                (SELECT u.first_name || ' ' || u.last_name
+                   FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = t.tenant_id),
+                (SELECT c.first_name || ' ' || c.last_name
+                   FROM pos_customers c WHERE c.id = t.pos_customer_id)
+              ) AS customer_name
+         FROM pos_open_tickets t
+        WHERE t.property_id = $1 AND t.landlord_id = $2 AND t.status = 'open'
+        ORDER BY t.created_at`,
+      [propertyId, posLandlordId(req)])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/pos/tickets/:id/void — the tank came back, or it was written wrong.
+// Kept, not deleted: GAM does not erase records, and an abandoned ticket is
+// part of the story of a day's deliveries.
+posRouter.post('/tickets/:id/void', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const reason = String(req.body?.reason ?? '').slice(0, 500) || null
+    const t = await queryOne<any>(
+      `SELECT id, property_id, status FROM pos_open_tickets WHERE id = $1 AND landlord_id = $2`,
+      [req.params.id, posLandlordId(req)])
+    if (!t) throw new AppError(404, 'No such ticket')
+    await assertPropertyInScope(req.user, t.property_id)
+    if (t.status !== 'open') throw new AppError(409, `That ticket is already ${t.status}.`)
+    await query(
+      `UPDATE pos_open_tickets SET status='voided', voided_at=NOW(), void_reason=$2, updated_at=NOW()
+        WHERE id=$1`, [t.id, reason])
+    res.json({ success: true, data: { voided: true } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/pos/card-on-file — which card the "On file" button will charge.
 //
 // S652. The cashier is about to take money without anybody handing over a card,
@@ -749,7 +856,7 @@ posRouter.get('/card-on-file', requirePerm('pos.ring_sale'), async (req: any, re
 
 posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason,
+    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason, openTicketId,
             // S651: present only when the cart contains a stay — the site, the
             // arrival date and who it is for. Everything else about the stay is
             // derived from the item and its quantity.
@@ -947,6 +1054,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       await client.query('BEGIN')
       txnOpen = true
 
+      // S652: a ticket is CLAIMED inside the sale's own transaction, and only
+      // if it is still open. Two drivers opening the same ticket on two phones
+      // is the ordinary case, not the exotic one, and the second one has to
+      // lose rather than charge somebody twice for the same tank.
+      if (openTicketId) {
+        const claimed = await client.query(
+          `UPDATE pos_open_tickets SET status='settled', settled_at=NOW(), updated_at=NOW()
+            WHERE id=$1 AND landlord_id=$2 AND status='open' RETURNING id`,
+          [openTicketId, posLandlordId(req)])
+        if (!claimed.rows.length) {
+          throw new AppError(409, 'That ticket has already been settled or voided.')
+        }
+      }
+
       let tx: any
       try {
         // S648: the writes live in services/posSale so a paid pay link records
@@ -962,6 +1083,14 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         })
         tx = sale.tx
         inventoryNeedsPO.push(...sale.needsPO)
+        // S652: point both ways. A till count can then tell a delivered ticket
+        // from a walk-up without guessing.
+        if (openTicketId) {
+          await client.query(
+            `UPDATE pos_transactions SET open_ticket_id = $2 WHERE id = $1`, [tx.id, openTicketId])
+          await client.query(
+            `UPDATE pos_open_tickets SET settled_transaction_id = $2 WHERE id = $1`, [openTicketId, tx.id])
+        }
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
         // recorded a transaction. Retry-safe: ROLLBACK the (empty) txn,

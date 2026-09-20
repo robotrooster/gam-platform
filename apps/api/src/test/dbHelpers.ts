@@ -335,7 +335,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // S343: pos_sessions FKs pos_transactions via completed_transaction_id;
   // session_items cascade on parent session delete.
   await db.query(`DELETE FROM pos_sessions`)
+  // S652: open tickets and transactions point AT EACH OTHER — a ticket names
+  // the sale that settled it, and that sale names the ticket. Neither can be
+  // deleted first, so the link is broken before either goes.
+  await db.query(`UPDATE pos_open_tickets SET settled_transaction_id = NULL`)
   await db.query(`DELETE FROM pos_transactions`)
+  await db.query(`DELETE FROM pos_open_tickets`)
   // S648: register pay links FK properties, landlords, bookings and the sale.
   await db.query(`DELETE FROM pos_pay_links`)
   await db.query(`DELETE FROM pos_purchase_orders`)
