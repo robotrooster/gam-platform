@@ -3894,41 +3894,28 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
  * S652 — GAM's own collections desk.
  *
  * GET  /api/admin/uncollectable        — who owes GAM with no way to collect
- * POST /api/admin/landlords/:id/lock   — suspend their portal
- * POST /api/admin/landlords/:id/unlock — give it back
+ * POST /api/admin/landlords/:id/unlock — restore access by hand
  *
- * Nic: "In the off chance they refuse to put a bank account in there, we can
- * just lock down all the data and say, please, when they log in, maybe the only
- * thing they can see is 'please contact GAM support to restore your account
- * access.'"
+ * THERE IS NO MANUAL LOCK, AND THAT IS THE POINT. I built one, on the reasoning
+ * that a sweep which suspends accounts by itself is one bug from taking a paying
+ * customer offline. Nic threw it out: "I don't want it flipped by a person. Like,
+ * that means somebody manually had to go in there and do that and make a choice.
+ * And choice creates the opportunity for discrimination. We need to have a
+ * standing company rule and a sweep that happens when that threshold is reached."
  *
- * The lock is flipped BY A PERSON, on purpose. A sweep that locks accounts on
- * its own is one bug away from taking a paying customer's whole operation
- * offline, and nobody would find out until they rang.
+ * He is right and the reasoning is not really about bugs. A lock a human chooses
+ * to apply is a lock a human can choose NOT to apply, and every instance of
+ * either is a decision somebody could be asked to justify. A rule that runs
+ * itself is the same for the 3-lot duplex and the 41-space park.
+ *
+ * The rule lives in services/portalLockSweep. Unlocking stays available by hand
+ * because restoring access is not the decision anybody would abuse, and it also
+ * happens automatically the moment the balance is settled.
  */
 adminRouter.get('/uncollectable', requireSuperAdmin, async (_req, res, next) => {
   try {
     const { uncollectableLandlords } = await import('../services/landlordGamDebit')
     res.json({ success: true, data: await uncollectableLandlords() })
-  } catch (e) { next(e) }
-})
-
-adminRouter.post('/landlords/:id/lock', requireSuperAdmin, async (req: any, res, next) => {
-  try {
-    const { reason } = z.object({ reason: z.string().min(1).max(500) }).parse(req.body)
-    const l = await queryOne<any>(
-      `SELECT id, business_name, platform_locked_at FROM landlords WHERE id = $1`, [req.params.id])
-    if (!l) throw new AppError(404, 'No such company')
-    if (l.platform_locked_at) throw new AppError(409, 'That company is already locked.')
-    await query(
-      `UPDATE landlords
-          SET platform_locked_at = NOW(), platform_locked_reason = $2,
-              platform_locked_by = $3, updated_at = NOW()
-        WHERE id = $1`,
-      [l.id, reason, req.user.userId])
-    logger.warn({ landlordId: l.id, by: req.user.userId, reason },
-      '[admin] a landlord portal was locked')
-    res.json({ success: true, data: { locked: true } })
   } catch (e) { next(e) }
 })
 

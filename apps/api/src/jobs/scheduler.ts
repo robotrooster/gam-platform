@@ -1789,6 +1789,23 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S652 (Nic): the standing rule that suspends a portal, run by nobody.
+  // "I don't want it flipped by a person... choice creates the opportunity for
+  // discrimination. We need to have a standing company rule and a sweep."
+  //
+  // Runs AFTER the 08:30 debit sweep on purpose: anybody who linked a bank
+  // overnight has already been collected from by the time this looks, so the
+  // rule can never suspend somebody GAM could have charged that morning.
+  cron.schedule('0 9 * * *', async () => {
+    try {
+      const { runPortalLockSweep } = await import('../services/portalLockSweep')
+      const r = await runPortalLockSweep()
+      if (r.locked || r.warned || r.released) logger.warn(r, '[portal-lock] sweep')
+    } catch (e) {
+      logger.error({ err: e }, '[portal-lock] sweep failed')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S652 (Nic): "immediately reach out to people when there's a problem."
   // A landlord GAM cannot collect from is a silent problem — the fee accrues,
   // the sweep finds no bank, and nothing reaches the one person who can fix it.
