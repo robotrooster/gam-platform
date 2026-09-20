@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict psA2fQ5grSMBJKwAn9cODPSpBullgVSoQXqvezXxYVfRojTYzDqh1MtcAZuc18i
+\restrict IIJZSZAV2aeg7Kenw0sqiOxSNff0rVoJ7s8SOAcZ16fgTQR3UJX8euxV4grIxTh
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -474,6 +474,24 @@ BEGIN
       (item_id, old_price, new_price, old_cost, new_cost, changed_by)
     VALUES
       (NEW.id, OLD.sell_price, NEW.sell_price, OLD.cost_price, NEW.cost_price, actor_id);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: fn_unit_bookings_stamp_cancelled_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_unit_bookings_stamp_cancelled_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.status = 'cancelled' AND NEW.cancelled_at IS NULL THEN
+    NEW.cancelled_at := NOW();
+  ELSIF NEW.status <> 'cancelled' THEN
+    NEW.cancelled_at := NULL;
   END IF;
   RETURN NEW;
 END;
@@ -10054,6 +10072,7 @@ CREATE TABLE public.unit_bookings (
     displaced_at timestamp with time zone,
     displaced_reason text,
     displaced_from_unit uuid,
+    cancelled_at timestamp with time zone,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -10080,6 +10099,13 @@ COMMENT ON COLUMN public.unit_bookings.pos_transaction_id IS 'S651: the register
 --
 
 COMMENT ON COLUMN public.unit_bookings.displaced_at IS 'S652: when an unpaid hold yielded its site to a paid booking. Set on both outcomes — moved elsewhere, or left with no site at all.';
+
+
+--
+-- Name: COLUMN unit_bookings.cancelled_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.cancelled_at IS 'S652: when the cancellation happened. Nights are exempt from the platform fee only when this is strictly before check_in — a stay cancelled on or after arrival was a stay.';
 
 
 --
@@ -20975,6 +21001,13 @@ CREATE TRIGGER trg_tenants_updated_at BEFORE UPDATE ON public.tenants FOR EACH R
 
 
 --
+-- Name: unit_bookings trg_unit_bookings_stamp_cancelled_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_bookings_stamp_cancelled_at BEFORE INSERT OR UPDATE OF status ON public.unit_bookings FOR EACH ROW EXECUTE FUNCTION public.fn_unit_bookings_stamp_cancelled_at();
+
+
+--
 -- Name: unit_inspection_videos trg_unit_inspection_videos_no_delete; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -27488,5 +27521,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict psA2fQ5grSMBJKwAn9cODPSpBullgVSoQXqvezXxYVfRojTYzDqh1MtcAZuc18i
+\unrestrict IIJZSZAV2aeg7Kenw0sqiOxSNff0rVoJ7s8SOAcZ16fgTQR3UJX8euxV4grIxTh
 

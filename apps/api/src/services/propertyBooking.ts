@@ -541,7 +541,8 @@ export async function claimWaitlistSpot(token: string, _stayType?: 'nightly' | '
  */
 export async function sweepBookingHoldsAndClaims(): Promise<{ holdsExpired: number; claimsExpired: number; promoted: number }> {
   const expiredHolds = await query<{ id: string; unit_id: string }>(
-    `UPDATE unit_bookings SET status='cancelled', updated_at=now()
+    `UPDATE unit_bookings SET status='cancelled',
+            cancelled_at = COALESCE(cancelled_at, now()), updated_at=now()
       WHERE status='tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now()
       RETURNING id, unit_id`)
   // S640: a cancelled reservation takes its unsigned draft lease with it. That

@@ -2055,6 +2055,14 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           required_site_layout=COALESCE($13,required_site_layout),
           required_amp_service=COALESCE($14,required_amp_service),
           locked_to_unit=COALESCE($15,locked_to_unit),
+          -- S652: stamp WHEN it was cancelled, once. Nights are exempt from
+          -- GAM's fee only when this lands before arrival, so the moment has to
+          -- be recorded at the moment — updated_at moves for every later edit
+          -- and could not answer the question afterwards.
+          cancelled_at = CASE
+            WHEN $1 = 'cancelled' AND cancelled_at IS NULL THEN NOW()
+            WHEN $1 IS NOT NULL AND $1 <> 'cancelled' THEN NULL
+            ELSE cancelled_at END,
           updated_at=NOW()
       WHERE id=$7 RETURNING *`,
       [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,

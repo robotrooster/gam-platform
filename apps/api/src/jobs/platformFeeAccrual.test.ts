@@ -412,11 +412,15 @@ describe('processPlatformFeeAccrual', () => {
       )
       unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
       await client.query(
+        // S652: cancelled BEFORE arrival, which is what this test has always
+        // meant by "cancelled" — the guest never came. A cancellation stamped
+        // after check-in is a different animal and bills (see the S652 block
+        // at the end of this file).
         `INSERT INTO unit_bookings
            (unit_id, landlord_id, lease_type, status,
-            check_in, check_out, nights)
+            check_in, check_out, nights, cancelled_at)
          VALUES ($1, $2, 'nightly', 'cancelled',
-                 '2026-05-05', '2026-05-15', 10)`,
+                 '2026-05-05', '2026-05-15', 10, '2026-05-01T12:00:00Z')`,
         [unitId, landlordId]
       )
     } finally {
@@ -1064,5 +1068,70 @@ describe('S652: an owner-occupied space is billed', () => {
       `SELECT total_billable FROM platform_fee_accruals WHERE property_id=$1`,
       [stack.propertyId])
     expect(rows[0].total_billable).toBe(1)
+  })
+})
+
+/**
+ * S652 — a stay cancelled after arrival is a stay.
+ *
+ * Nights bill in arrears and the accrual runs on the 1st, so excluding any
+ * booking whose status said 'cancelled' — with no check on WHEN — was a free
+ * month for the asking: let them stay, take the money, cancel on the 30th.
+ *
+ * Nic's rule: "If somebody cancels that stay prior to the date of the
+ * reservation, then those nights don't get counted for the aggregate... if the
+ * reservation was never cancelled, we have no way to know." Cutoff, after he
+ * thought about it aloud: "before check-in day, the day before check-in."
+ *
+ * And no-show is out of billing entirely — "if they just don't show up, that's
+ * not really GAM's problem." The site was held either way.
+ */
+describe('S652: when a booking was cancelled decides whether its nights bill', () => {
+  async function rvStay(stack: any, opts: { status?: string; cancelledAt?: string | null }) {
+    const unit = await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type, nightly_rate)
+       VALUES ($1,$2,$3,'vacant',0,'rv_spot',40) RETURNING id`,
+      [stack.propertyId, stack.landlordId, `RV-${Math.random().toString(36).slice(2, 7)}`])
+    await db.query(
+      `INSERT INTO unit_bookings
+         (unit_id, landlord_id, guest_name, lease_type, check_in, check_out, nights,
+          total_amount, status, cancelled_at)
+       VALUES ($1,$2,'Dale Carter','nightly','2026-05-10','2026-05-20',10,400,$3,$4)`,
+      [unit.rows[0].id, stack.landlordId, opts.status ?? 'confirmed', opts.cancelledAt ?? null])
+  }
+
+  const nightsBilled = async (propertyId: string) => {
+    const { rows } = await db.query<{ n: number }>(
+      `SELECT short_stay_nights AS n FROM platform_fee_accruals WHERE property_id=$1`, [propertyId])
+    return rows[0]?.n ?? 0
+  }
+
+  it('bills nights for a stay cancelled the day it started', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-10T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
+  })
+
+  it('bills nights for a stay cancelled after it ended', async () => {
+    // The whole exploit: let them stay, then cancel before the 1st.
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-30T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
+  })
+
+  it('does NOT bill a stay cancelled the day before arrival', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'cancelled', cancelledAt: '2026-05-09T09:00:00Z' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(0)
+  })
+
+  it('bills a no-show, because the site was held either way', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await rvStay(stack, { status: 'no_show' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    expect(await nightsBilled(stack.propertyId)).toBe(10)
   })
 })

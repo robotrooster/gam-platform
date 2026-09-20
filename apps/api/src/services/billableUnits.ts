@@ -176,7 +176,23 @@ export async function billableUnitsForProperty(
      WHERE u.property_id = $1
        AND u.unit_type = ANY($3::text[])
        AND b.lease_type IN ('nightly', 'weekly')
-       AND b.status NOT IN ('cancelled', 'no_show')
+       -- S652 (Nic): "If somebody cancels that stay prior to the date of the
+       -- reservation, then those nights don't get counted for the aggregate...
+       -- if the reservation was never cancelled, we have no way to know" — so
+       -- a stay cancelled ON or AFTER arrival is a stay. The site was held, it
+       -- could not be sold to anybody else, and the schedule carried it the
+       -- whole way, which is the thing GAM is paid for. Nights billed in
+       -- arrears against a status anybody could flip on the 30th was a free
+       -- month for the asking.
+       --
+       -- NO-SHOW IS NOT A BILLING STATE. Nic: "I don't want to have a no-show
+       -- thing. If they just don't show up, that's not really GAM's problem."
+       -- A NULL cancelled_at is read GENEROUSLY — as cancelled in time. It
+       -- cannot occur (a trigger stamps every cancellation, and the existing
+       -- rows were backfilled), and if it somehow did, billing a landlord for a
+       -- stay that never happened is a worse failure than missing $2.
+       AND NOT (b.status = 'cancelled'
+                AND (b.cancelled_at IS NULL OR b.cancelled_at::date < b.check_in))
        AND b.check_in  <  $2::date + INTERVAL '1 month'
        AND b.check_out >  $2::date
     -- S650: nights are billed IN ARREARS — you cannot count them before the
