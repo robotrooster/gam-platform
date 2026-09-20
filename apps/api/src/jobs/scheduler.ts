@@ -1789,6 +1789,21 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S652 (Nic): "immediately reach out to people when there's a problem."
+  // A landlord GAM cannot collect from is a silent problem — the fee accrues,
+  // the sweep finds no bank, and nothing reaches the one person who can fix it.
+  // Runs BEFORE the debit sweep so somebody who links a bank that morning is
+  // collected from the same day rather than chased first.
+  cron.schedule('0 8 * * *', async () => {
+    try {
+      const { noticeUncollectableLandlords } = await import('../services/gamCollections')
+      const r = await noticeUncollectableLandlords()
+      if (r.notified) logger.warn(r, '[gam-collections] uncollectable notices sent')
+    } catch (e) {
+      logger.error({ err: e }, '[gam-collections] notice sweep failed')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S651: the last-resort bank pull, deliberately scheduled 30 minutes AFTER
   // the passthrough recovery above. Netting gets every chance first — that is
   // the whole order of preference Nic set out — so by the time this runs,

@@ -14,6 +14,7 @@ import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { AccountLockScreen } from './components/AccountLockScreen'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
@@ -229,6 +230,8 @@ function App() {
           <TelemetryPing />
           <VersionWatch />
           <ScrollUnlock />
+          {/* S652: draws itself only when the API says the account is on hold. */}
+          <AccountLockScreen />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />

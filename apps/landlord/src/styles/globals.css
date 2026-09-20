@@ -827,3 +827,38 @@ fieldset:disabled { opacity: 1; }
   .auth-center{ align-items:flex-start; padding-top:18px; padding-bottom:28px; }
   .auth-center > *{ margin-top:0; }
 }
+
+/* S652 — the account-on-hold screen.
+   Sits above everything (modals included) because nothing behind it is usable,
+   and the landlord should not be able to click past it into a half-loaded
+   portal. Deliberately quiet rather than alarming: this is a billing matter, so
+   it should read like a notice from a company, not like an error. */
+.lock-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+  padding: 20px;
+  backdrop-filter: blur(6px);
+}
+.lock-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-xl);
+  padding: 28px;
+  width: 100%;
+  max-width: 460px;
+  text-align: left;
+}
+.lock-title  { font-size: 1.15rem; font-weight: 700; color: var(--gold); margin-bottom: 12px; }
+.lock-body   { font-size: .86rem; color: var(--text-2); line-height: 1.6; margin: 0 0 12px; }
+.lock-reason {
+  font-size: .82rem; color: var(--text-3); line-height: 1.6;
+  margin: 0 0 12px; padding: 10px 12px;
+  background: var(--bg-3); border-radius: var(--r-md);
+}
+.lock-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0 14px; }
+.lock-foot   { font-size: .74rem; color: var(--text-3); line-height: 1.55; margin: 0; }

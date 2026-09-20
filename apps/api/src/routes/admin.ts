@@ -3946,3 +3946,18 @@ adminRouter.post('/landlords/:id/unlock', requireSuperAdmin, async (req: any, re
     res.json({ success: true, data: { locked: false } })
   } catch (e) { next(e) }
 })
+
+/**
+ * GET /api/admin/collections — S652: what GAM was owed against what arrived.
+ *
+ * Nic: "we need a log on the admin side that money that we are actually
+ * expected to take in is taken in. We need to operate bookkeeping on our own
+ * stats." Distinct from /earnings, which books a fee when it is EARNED and is
+ * silent on whether it was ever received.
+ */
+adminRouter.get('/collections', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { collectionsBook } = await import('../services/gamCollections')
+    res.json({ success: true, data: await collectionsBook() })
+  } catch (e) { next(e) }
+})
