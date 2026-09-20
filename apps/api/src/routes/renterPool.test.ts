@@ -55,9 +55,16 @@ beforeEach(async () => {
 
 const sign = (claims: any) => jwt.sign(claims, process.env.JWT_SECRET!, { expiresIn: '1h' })
 
-/** A real park at real coordinates, under a real (non-system) company. */
+/**
+ * A real property at real coordinates, under a real (non-system) company.
+ *
+ * `leaseTypes` is what decides whether it belongs in the pool at all — not the
+ * property's type and not its unit types. An apartment building and an RV park
+ * are the same thing here; a nightly/weekly-only operator is not.
+ */
 async function seedPlaceToLive(
   name: string, city: string, state: string, lat: number, lon: number, vacantUnits = 2,
+  leaseTypes: string[] = ['month_to_month', 'long_term'],
 ) {
   const c = await db.connect()
   try {
@@ -70,9 +77,10 @@ async function seedPlaceToLive(
       [landlordId, name, city, state, lat, lon, userId])
     for (let i = 0; i < vacantUnits; i++) {
       await c.query(
-        `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount)
-         VALUES ($1,$2,$3,'vacant',500)`,
-        [p.rows[0].id, landlordId, `U${i + 1}`])
+        `INSERT INTO units (property_id, landlord_id, unit_number, status,
+                            rent_amount, lease_types_allowed)
+         VALUES ($1,$2,$3,'vacant',500,$4)`,
+        [p.rows[0].id, landlordId, `U${i + 1}`, leaseTypes])
     }
     await c.query('COMMIT')
     return p.rows[0].id
@@ -108,7 +116,7 @@ const get = (userId: string, qs = '') =>
     .set('Authorization', `Bearer ${sign({ userId, role: 'tenant', email: 'r@t.dev', permissions: {} })}`)
 
 describe('what a renter in the pool sees near them', () => {
-  it('shows the park down the road, measured from THEIR address', async () => {
+  it('shows the place down the road, measured from THEIR address', async () => {
     // Amado AZ, and a renter in Tucson — about 40 miles up I-19.
     await seedPlaceToLive('Mountain View RV Ranch', 'Amado', 'AZ', 31.705296, -111.064567)
     const userId = await seedRenterAt('Tucson', 'AZ', 32.2226, -110.9747)
@@ -147,6 +155,57 @@ describe('what a renter in the pool sees near them', () => {
     const wide = await get(userId, '?radiusMiles=1000')
     expect(wide.body.data.properties).toHaveLength(1)
     expect(wide.body.data.properties[0].city).toBe('Mattoon')
+  })
+
+  it('is not scoped to parks — an apartment building counts the same', async () => {
+    // Nic: "we don't want to filter it to parks... any applicable property that
+    // allows long-term stays." Nothing here reads the property's type or its
+    // unit types; the unit's own lease types are the whole test.
+    await seedPlaceToLive('Riverside Apartments', 'Tucson', 'AZ', 32.2226, -110.9747)
+    const userId = await seedRenterAt('Tucson', 'AZ', 32.2226, -110.9747)
+    const res = await get(userId)
+    expect(res.body.data.properties.map((p: any) => p.name)).toEqual(['Riverside Apartments'])
+  })
+
+  it('leaves out an operator who only rents by the night or the week', async () => {
+    // Somebody running an Airbnb-shaped business has nothing to offer a person
+    // looking for a home, and their units say so by carrying no long-term type.
+    await seedPlaceToLive('Nightly Cabins', 'Tucson', 'AZ', 32.2226, -110.9747, 4,
+      ['nightly', 'weekly'])
+    await seedPlaceToLive('Long Stay Court', 'Tucson', 'AZ', 32.2226, -110.9747, 1)
+    const userId = await seedRenterAt('Tucson', 'AZ', 32.2226, -110.9747)
+    const res = await get(userId)
+    expect(res.body.data.properties.map((p: any) => p.name)).toEqual(['Long Stay Court'])
+  })
+
+  it('counts only the long-term openings at a property that does both', async () => {
+    // Oak Park's shape: a motel with nightly rooms AND long-term residents. It
+    // belongs in the pool, but its nightly rooms are not somewhere to live.
+    const c = await db.connect()
+    let propertyId = '', landlordId = '', userId2 = ''
+    try {
+      await c.query('BEGIN')
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId; userId2 = l.userId
+      const p = await c.query<{ id: string }>(
+        `INSERT INTO properties (landlord_id, name, street1, city, state, zip,
+                                 latitude, longitude, owner_user_id, managed_by_user_id)
+         VALUES ($1,'Mixed Motel','1 Main St','Tucson','AZ','00000',32.2226,-110.9747,$2,$2)
+         RETURNING id`, [landlordId, userId2])
+      propertyId = p.rows[0].id
+      for (const [n, types] of [['N1', ['nightly']], ['N2', ['nightly']], ['L1', ['long_term']]] as any[]) {
+        await c.query(
+          `INSERT INTO units (property_id, landlord_id, unit_number, status,
+                              rent_amount, lease_types_allowed)
+           VALUES ($1,$2,$3,'vacant',500,$4)`, [propertyId, landlordId, n, types])
+      }
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const userId = await seedRenterAt('Tucson', 'AZ', 32.2226, -110.9747)
+    const res = await get(userId)
+    expect(res.body.data.properties).toHaveLength(1)
+    expect(Number(res.body.data.properties[0].openUnits)).toBe(1)   // not 3
   })
 
   it('never offers the GAM Renter Pool shell as a place to live', async () => {

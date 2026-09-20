@@ -1,6 +1,10 @@
 /**
  * S651 — what somebody in the renter pool is actually here for.
  *
+ * Anywhere a person could take a lease — an apartment, a house, a mobile-home
+ * space, a long-term motel room, an RV site. Not scoped to parks, and not
+ * showing operators who only rent by the night.
+ *
  * Nic: "The person signs up for a, looking for a place to live, and that's it.
  * Based on their address from their ID, it shows nearby properties in a radius
  * that are onboarded on the platform. If there's nothing in the area — if
@@ -50,8 +54,8 @@ export function FindAPlacePage() {
           <h1 className="pt">Find a place</h1>
           <p className="ps">
             {data?.from?.city
-              ? `Places on GAM near ${data.from.city}, ${data.from.state}`
-              : 'Places on GAM near you'}
+              ? `Places to live near ${data.from.city}, ${data.from.state}`
+              : 'Places to live near you'}
           </p>
         </div>
       </div>
