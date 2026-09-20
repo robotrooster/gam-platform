@@ -84,7 +84,7 @@ function GamChargesSection() {
   if (!charges.length && !debits.length) return null
 
   const outstanding = Number(data?.outstanding ?? 0)
-  const missingBank = banks.filter((b: any) => !b.has_bank_link)
+  const missingBank = banks.filter((b: any) => !b.hasBankLink)
 
   return (
     <div className="card" style={{ marginBottom: 16 }}>
@@ -97,7 +97,7 @@ function GamChargesSection() {
         which is why a payout can land smaller than the rent collected. The difference is itemised
         below. If a property takes only cash there’s no payout to take them from, and once the
         balance passes {fmt(banks[0]?.threshold ?? 100)} they’re transferred from your linked bank
-        instead{banks[0]?.gam_debit_bank_last4 ? ` (ending ${banks[0].gam_debit_bank_last4})` : ''},
+        instead{banks[0]?.gamDebitBankLast4 ? ` (ending ${banks[0].gamDebitBankLast4})` : ''},
         plus {fmt(data?.bankTransferCost ?? 6)} for the transfer, shown as its own line so you can
         check both numbers.
       </div>
@@ -107,7 +107,7 @@ function GamChargesSection() {
         // plainly and early, because the alternative is a landlord finding out
         // when collection fails.
         <div style={{ fontSize: '.78rem', color: 'var(--amber)', lineHeight: 1.55, marginBottom: 10 }}>
-          {missingBank.map((b: any) => b.business_name || 'Your company').join(', ')} has no bank
+          {missingBank.map((b: any) => b.businessName || 'Your company').join(', ')} has no bank
           linked. These charges still stand — link a bank so they can be settled without anyone
           chasing it. <Link to="/bank">Link a bank</Link>
         </div>
@@ -116,20 +116,20 @@ function GamChargesSection() {
       <div style={{ maxHeight: 260, overflowY: 'auto', marginBottom: debits.length ? 12 : 0 }}>
         {charges.map((c: any) => {
           const amount = Number(c.amount)
-          const collected = Number(c.collected_amount)
+          const collected = Number(c.collectedAmount)
           const paid = collected >= amount
           return (
             <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
                                      padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
               <span style={{ color: 'var(--text-2)' }}>
                 {GAM_CHARGE_LABEL[c.kind] ?? humanize(c.kind)}
-                {c.property_name ? ` · ${c.property_name}` : ''}
+                {c.propertyName ? ` · ${c.propertyName}` : ''}
                 {c.notes ? <span style={{ color: 'var(--text-3)' }}> — {c.notes}</span> : null}
               </span>
               <span style={{ display: 'flex', gap: 12, alignItems: 'baseline', whiteSpace: 'nowrap' }}>
                 <span style={{ fontSize: '.72rem', color: paid ? 'var(--text-3)' : 'var(--amber)' }}>
                   {paid
-                    ? `taken from your payout ${new Date(c.collected_at ?? c.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+                    ? `taken from your payout ${new Date(c.collectedAt ?? c.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
                     : collected > 0 ? `${fmt(collected)} of it taken so far` : 'comes out of your next payout'}
                 </span>
                 <span className="mono">{fmt(amount)}</span>
@@ -146,11 +146,11 @@ function GamChargesSection() {
             <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
                                      padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
               <span style={{ color: 'var(--text-2)' }}>
-                {new Date(d.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                {' · '}charges {fmt(d.charges_amount)} + bank transfer cost {fmt(d.bank_cost_amount)}
-                {d.status === 'failed' && d.failure_reason ? ` — your bank declined it: ${d.failure_reason}` : ''}
+                {new Date(d.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                {' · '}charges {fmt(d.chargesAmount)} + bank transfer cost {fmt(d.bankCostAmount)}
+                {d.status === 'failed' && d.failureReason ? ` — your bank declined it: ${d.failureReason}` : ''}
               </span>
-              <span className="mono">{fmt(d.total_amount)}</span>
+              <span className="mono">{fmt(d.totalAmount)}</span>
             </div>
           ))}
         </div>
