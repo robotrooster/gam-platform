@@ -515,6 +515,22 @@ tenantsRouter.get('/me', async (req, res, next) => {
         --
         -- They are inside a tenancy, not applying for one. This says so, and
         -- carries what they are waiting on so the portal can tell them.
+        -- ── S651: IN THE RENTER POOL, NOT IN A TENANCY ─────────────────────
+        --
+        -- Someone who took a background check without a landlord behind it is
+        -- looking for somewhere to live. They have no unit, no lease, no
+        -- invite and no utility agreement — but they ARE screening-approved,
+        -- which made every gate above treat them as a fully housed tenant and
+        -- hand them the whole portal: Payments with nothing to pay,
+        -- Maintenance with nothing to fix, a Lease tab with no lease.
+        --
+        -- Nic: they get "a real tenant-portal login in a suspended state — no
+        -- lease, nothing to do — until they connect with a landlord", and what
+        -- they CAN do is browse places near them. This is the signal that says
+        -- which of those two people is logged in.
+        (SELECT ap.id FROM application_pool ap
+          WHERE ap.user_id = t.user_id AND ap.status = 'available'
+          ORDER BY ap.created_at DESC LIMIT 1) AS renter_pool_entry_id,
         ob.unit_number       AS onboarding_unit_number,
         ob.property_name     AS onboarding_property_name,
         ob.household_pending AS onboarding_household_pending,

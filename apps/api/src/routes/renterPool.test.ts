@@ -22,10 +22,27 @@ import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
 import { renterPoolRouter } from './renterPool'
 import { errorHandler } from '../middleware/errorHandler'
+import { camelCaseKeys } from '../lib/caseConversion'
 
+/**
+ * The camelCase middleware is mounted here on purpose.
+ *
+ * index.ts camelizes every response on the way out, so production serves
+ * `distanceMiles` and `openUnits` while a bare router in a test serves
+ * `distance_miles` and `open_units`. A test that asserts the snake_case keys
+ * passes forever and proves nothing about what the portal actually receives —
+ * the page would read undefined everywhere and render blank rows with no error.
+ * Including the middleware makes this test check the real wire contract.
+ * (memory: gam-camelize-wire-contract-test-gap)
+ */
 function buildApp() {
   const app = express()
   app.use(express.json())
+  app.use((_req, res, next) => {
+    const originalJson = res.json.bind(res)
+    res.json = (body: any) => originalJson(camelCaseKeys(body))
+    next()
+  })
   app.use('/api/renter-pool', renterPoolRouter)
   app.use(errorHandler)
   return app
@@ -101,8 +118,8 @@ describe('what a renter in the pool sees near them', () => {
     expect(res.body.data.properties).toHaveLength(1)
     const [park] = res.body.data.properties
     expect(park.name).toBe('Mountain View RV Ranch')
-    expect(parseFloat(park.distance_miles)).toBeLessThan(50)
-    expect(Number(park.open_units)).toBe(2)
+    expect(parseFloat(park.distanceMiles)).toBeLessThan(50)
+    expect(Number(park.openUnits)).toBe(2)
     expect(res.body.data.from).toEqual({ city: 'Tucson', state: 'AZ' })
   })
 

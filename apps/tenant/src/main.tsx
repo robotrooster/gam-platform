@@ -29,9 +29,22 @@ function DefaultPage() {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
     }).then(r=>r.json()).then(r=>r.data)
   )
+  // S651: a renter in the pool passed their screening, so the check above sends
+  // them to /home — a page built entirely around a lease they do not have. Home
+  // is not in their nav either, so this was the one way to reach it. They came
+  // here to look for somewhere to live; land them there.
+  const { data: me } = useQuery<any>('tenant-me-default', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data).catch(() => null)
+  )
   if (!status) return null
   if (status.status === 'denied') return <BackgroundCheckPage />
   if (status.status === 'not_started' || status.status === 'submitted') return <BackgroundCheckPage />
+  if (me && me.renterPoolEntryId && !me.unitId && !me.pendingLeaseDocumentId
+      && !me.onboardingUnitNumber && !me.utilityServiceAgreementId) {
+    return <Navigate to="/find-a-place" replace />
+  }
   return <Navigate to="/home" replace />
 }
 import { SignPage } from './pages/SignPage'
@@ -42,6 +55,8 @@ import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
 import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
+// S651: the renter pool's only screen — places near the address on their ID.
+import { FindAPlacePage } from './pages/FindAPlacePage'
 import React, { useContext, useState, useEffect, useCallback, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
@@ -52,6 +67,7 @@ import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
+  UserSearch,
 } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
@@ -578,6 +594,23 @@ function Layout() {
   // reserve and no deposit — a nav full of doors that open onto nothing is its
   // own kind of broken. Home + Payments + Profile is the whole surface.
   const serviceOnly = isUtilityServicePayer && !isExistingTenant
+  // ── S651: IN THE RENTER POOL, LOOKING FOR SOMEWHERE TO LIVE ──────────────
+  //
+  // Somebody who took a background check with no landlord behind it is
+  // screening-approved and nothing else: no unit, no lease, no invite, no
+  // utility agreement. bgApproved alone therefore opened the ENTIRE portal to
+  // them — Payments with nothing to pay, Communication with no landlord to
+  // communicate with, a Lease tab with no lease. Every door opens onto nothing.
+  //
+  // Nic: they get "a real tenant-portal login in a suspended state — no lease,
+  // nothing to do — until they connect with a landlord", and what they can do
+  // is browse places near them. So the nav is Find a place + Profile, the same
+  // shape as serviceOnly above and for the same reason.
+  //
+  // The moment a landlord signs them, unitId or an invite appears and every
+  // check below stops firing on its own — there is no state to clean up.
+  const isRenterPoolOnly = !!(tenantMe as any)?.renterPoolEntryId
+    && !isExistingTenant && !isMidSigning && !isOnboarding && !isUtilityServicePayer
   const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -641,7 +674,11 @@ function Layout() {
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Billing</NavLink>
             <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
           </>}
-          {showFullNav && !serviceOnly && <>
+          {isRenterPoolOnly && !serviceOnly && <>
+            <NavLink to="/find-a-place" className={({isActive})=>`ni${isActive?' active':''}`}><UserSearch size={16}/>Find a place</NavLink>
+            <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>
+          </>}
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
             {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}><Star size={16}/>Flex Advantage</NavLink>}
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Payments</NavLink>
@@ -659,13 +696,13 @@ function Layout() {
           </>}
           {/* S570 (Nic): Preferences + Security folded into Profile (which already
               has Notification-prefs + Security tabs). Notifications feed → Home. */}
-          {showFullNav && !serviceOnly && tenantMe?.stripeConnectAccountId && (
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && tenantMe?.stripeConnectAccountId && (
             <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={16}/>Payouts</NavLink>
           )}
-          {showFullNav && !serviceOnly && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
+          {showFullNav && !serviceOnly && !isRenterPoolOnly && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
           {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
               via ?sso= so the tenant lands signed-in without re-auth. */}
-          {!LAUNCH_HIDE_FITNESS && !serviceOnly && (
+          {!LAUNCH_HIDE_FITNESS && !serviceOnly && !isRenterPoolOnly && (
           <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}><Dumbbell size={16}/>Fitness</a>
           )}
         </nav>
@@ -686,8 +723,8 @@ function Layout() {
         <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
         <DialogHost />
       </div>
-      {showFullNav && !serviceOnly && <FlexsuiteReAcceptanceGate />}
-      {showFullNav && !serviceOnly && <LeaseNoticeGate />}
+      {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
+      {showFullNav && !serviceOnly && !isRenterPoolOnly && <LeaseNoticeGate />}
       <AgentChatWidget />
     </div>
   )
@@ -4794,6 +4831,7 @@ function App() {
           <Route index element={<DefaultPage />} />
           <Route path="notifications"    element={<TenantNotificationsPage />} />
           <Route path="home"             element={<HomePage />} />
+          <Route path="find-a-place"     element={<FindAPlacePage />} />
           <Route path="payments"         element={<PaymentsPage />} />
           <Route path="communication"   element={<CommunicationPage />} />
           <Route path="maintenance"      element={<MaintenancePage />} />
