@@ -1082,6 +1082,19 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
 // Auth: requirePerm('take_payment') (owner roles auto-pass; staff need the
 // take_payment sub-permission). canManageLandlordResource confirms scope.
 const recordManualSchema = z.object({
+  // S651 — CARD IS NOT AND WILL NOT BE ON THIS LIST.
+  //
+  // Nic, asked directly: "record payment never does card. card is through
+  // pos/paylink for non tenants. invoices for tenants are through portal if
+  // electronic. no reason for them to come in to swipe the same card they can
+  // do from their house."
+  //
+  // record-manual exists to write down money that moved somewhere GAM was not.
+  // A card is money moving THROUGH GAM, which is a different act with a fee, a
+  // settlement and a dispute window attached — it does not belong behind a
+  // button whose whole meaning is "this already happened elsewhere". The
+  // electronic paths a tenant already has are the portal and a pay link, and
+  // both work from their kitchen table.
   method:    z.enum(MANUAL_PAYMENT_METHODS),   // 'cash' | 'check' | 'money_order'
   reference: z.string().max(120).optional(),   // check # / money-order # for the audit trail
   // S637 (Nic): what was actually handed over, and what happened to the extra.

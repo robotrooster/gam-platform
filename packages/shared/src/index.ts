@@ -4827,6 +4827,11 @@ export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 // cash). Each manual payment carries a flat fee EXCEPT the tenant's first rent
 // payment on the lease (waived to give them time to onboard ACH). The fee is
 // GAM revenue (a tenant-owed type='fee' row, entry_description 'MANUALPAY').
+// S651: card is deliberately absent. These are the ways money arrives WITHOUT
+// GAM — a card is money moving through GAM, with a fee and a settlement and a
+// dispute window, and belongs on the register or a pay link rather than behind
+// a button meaning "this already happened somewhere else". Nic: "no reason for
+// them to come in to swipe the same card they can do from their house."
 export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
 export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
 export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {

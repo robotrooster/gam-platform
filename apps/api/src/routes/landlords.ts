@@ -6797,3 +6797,69 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
 //
 // So the portal DISCLOSES this rather than asking about it. The section above
 // is the disclosure: what is owed, what has been taken, and out of where.
+
+// ── S651: mail that never arrived ─────────────────────────────────────────
+//
+// Nic invited Arnoldo Arvizu to RV 39 at Mountain View three times. All three
+// bounced. A lease signing request to RV 08 bounced. Nobody told him, because
+// bounce events only ever raised a GAM-side admin notification — the landlord,
+// who is the one person who can fix the address, saw nothing and could only
+// conclude the tenant was ignoring them.
+//
+// This is the same shape as the S650 Ellen Gregory failure: a person who cannot
+// get in, and an operator with no way to see why.
+//
+// PICKING THE LATEST **RESOLVED** EMAIL, NOT THE LATEST EMAIL. A message sent
+// ten minutes ago has no delivery event yet, and treating "no verdict" as good
+// news would let every fresh reminder paper over the bounce it is about to
+// repeat. Equally, an address that bounced once and has delivered since is
+// fine and must not be flagged — landscapebygutierrez@icloud.com bounced on the
+// 13th and delivered on the 14th, 15th and 16th, and nagging about it would
+// teach everyone to ignore this.
+landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), async (req: any, res, next) => {
+  try {
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+
+    const rows = await query<any>(
+      `WITH mine AS (
+         -- every address this account has mailed, from its own send log
+         SELECT DISTINCT lower(to_email) AS em
+           FROM email_send_log WHERE landlord_id = ANY($1::uuid[])
+       ),
+       verdict AS (
+         SELECT DISTINCT ON (lower(e.to_email))
+                lower(e.to_email) AS em,
+                COALESCE(e.last_event, e.status) AS outcome,
+                e.subject, e.category, e.created_at,
+                COALESCE(e.last_event_at, e.created_at) AS decided_at
+           FROM email_send_log e
+           JOIN mine m ON m.em = lower(e.to_email)
+          -- only messages that actually have a verdict
+          WHERE e.last_event IS NOT NULL OR e.status <> 'sent'
+          ORDER BY lower(e.to_email), COALESCE(e.last_event_at, e.created_at) DESC
+       )
+       SELECT v.em AS email, v.outcome, v.subject, v.category, v.decided_at,
+              u.first_name, u.last_name,
+              -- who this is, if GAM knows: a tenant on one of their units, or
+              -- somebody still sitting on an unaccepted invite
+              (SELECT un.unit_number FROM lease_tenants lt
+                 JOIN leases l  ON l.id = lt.lease_id
+                 JOIN units  un ON un.id = l.unit_id
+                WHERE lt.tenant_id = t.id AND lt.status = 'active'
+                ORDER BY l.created_at DESC LIMIT 1) AS unit_number,
+              (SELECT i.scope_payload->>'unitNumber' FROM invitations i
+                WHERE lower(i.email) = v.em AND i.landlord_id = ANY($1::uuid[])
+                  AND i.status = 'pending'
+                ORDER BY i.created_at DESC LIMIT 1) AS invited_unit_number
+         FROM verdict v
+         LEFT JOIN users u   ON lower(u.email) = v.em
+         LEFT JOIN tenants t ON t.user_id = u.id
+        WHERE v.outcome IN ('bounced', 'complained', 'failed')
+        ORDER BY v.decided_at DESC
+        LIMIT 100`,
+      [landlordIds])
+
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})

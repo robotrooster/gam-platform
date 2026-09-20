@@ -2,10 +2,67 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
-import { Plus, UserPlus } from 'lucide-react'
+import { Plus, UserPlus, MailWarning } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
+
+
+/**
+ * S651 — mail that never arrived.
+ *
+ * Nic invited Arnoldo Arvizu to RV 39 three times and all three bounced. A
+ * lease signing request to RV 08 bounced. Bounce events only ever raised a
+ * GAM-side admin notification, so the landlord — the one person who can fix the
+ * address — saw nothing, and could only conclude the tenant was ignoring them.
+ * Five people at Mountain View are in that state right now.
+ *
+ * It sits above the tenant list because that is where the address gets fixed.
+ * It renders nothing at all when nothing has bounced: an empty "all mail
+ * delivered" card is noise that trains people to stop reading this spot.
+ */
+function UndeliveredEmailNotice() {
+  const { data = [] } = useQuery<any[]>('undelivered-email',
+    () => apiGet('/landlords/me/undelivered-email'), { retry: false })
+  if (!data.length) return null
+
+  return (
+    <div className="card" style={{ marginBottom: 16, borderLeft: '3px solid var(--amber)' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+        <MailWarning size={16} style={{ color: 'var(--amber)' }} />
+        <b style={{ fontSize: '.92rem' }}>
+          {data.length === 1 ? 'An email never reached someone' : `${data.length} people aren’t getting your email`}
+        </b>
+      </div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
+        Their mail server rejected the last message GAM sent, so invitations, reminders and
+        signing requests to these addresses are going nowhere. Check the spelling with them and
+        update it — resending to the same address will bounce again.
+      </div>
+      {data.map((r: any) => (
+        <div key={r.email} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
+                                    padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
+          <span>
+            <span style={{ color: 'var(--text-0)', fontWeight: 600 }}>
+              {[r.firstName, r.lastName].filter(Boolean).join(' ') || r.email}
+            </span>
+            {(r.unitNumber || r.invitedUnitNumber) && (
+              <span style={{ color: 'var(--text-3)' }}>
+                {' · '}Unit {r.unitNumber || r.invitedUnitNumber}
+                {!r.unitNumber && r.invitedUnitNumber ? ' (invited)' : ''}
+              </span>
+            )}
+            <div style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{r.email}</div>
+          </span>
+          <span style={{ color: 'var(--text-3)', fontSize: '.72rem', whiteSpace: 'nowrap' }}>
+            {r.outcome === 'complained' ? 'marked as spam' : 'rejected'}
+            {' '}{new Date(r.decidedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 export function TenantsPage() {
   const [showInvite, setShowInvite] = useState(false)
@@ -45,6 +102,8 @@ export function TenantsPage() {
           )}
         </div>
       </div>
+      <UndeliveredEmailNotice />
+
       <div className="filter-bar">
         <SearchBox value={search} onChange={setSearch} placeholder="Search tenants, units, properties…" />
         <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
