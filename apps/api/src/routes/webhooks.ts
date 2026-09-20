@@ -8,6 +8,9 @@ import {
   firePmTransfersForReference, fireManagerTransfersForReference,
 } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
+// S651: a bounce must reach the landlord, not just GAM — they are the only one
+// who can ask the tenant how their address is spelled.
+import { createNotification } from '../services/notifications'
 import { confirmBookingDeposit } from '../services/propertyBooking'
 
 // S648: charges GAM takes for someone other than a tenant paying rent.
@@ -1571,6 +1574,60 @@ webhooksRouter.post('/resend', async (req, res) => {
           : `${updated[0].to_email} marked GAM mail as spam. Stop emailing this address.`,
         context: { toEmail: updated[0].to_email, landlordId: updated[0].landlord_id, messageId, kind },
       }).catch(() => {})
+
+      // ── S651: AND TELL THE LANDLORD ────────────────────────────────────
+      //
+      // Until now this raised a GAM-side alert and stopped. Nic: "the admin
+      // portal is not going to babysit that every day for every person. It
+      // needs to flag on the landlord side."
+      //
+      // He is right, and it is not only about workload. GAM cannot fix a
+      // bounced address — only the person who can phone the tenant and ask how
+      // it is actually spelled can, and that is the landlord. An alert that
+      // lands where nobody can act on it is a rumour.
+      //
+      // Pushed rather than left on a page, because a banner only works if
+      // somebody happens to open the right screen. Nic went three weeks without
+      // knowing a tenant was unreachable.
+      if (updated[0].landlord_id) {
+        try {
+          const owner = await queryOne<{ user_id: string; business_name: string | null }>(
+            `SELECT user_id, business_name FROM landlords WHERE id = $1`, [updated[0].landlord_id])
+          // Who this address belongs to, so the notice names a person rather
+          // than an address the landlord has to go and look up.
+          const who = await queryOne<{ first_name: string; last_name: string; unit_number: string | null }>(
+            `SELECT u.first_name, u.last_name,
+                    (SELECT un.unit_number FROM lease_tenants lt
+                       JOIN leases l ON l.id = lt.lease_id
+                       JOIN units un ON un.id = l.unit_id
+                      WHERE lt.tenant_id = t.id AND lt.status = 'active'
+                      ORDER BY l.created_at DESC LIMIT 1) AS unit_number
+               FROM users u LEFT JOIN tenants t ON t.user_id = u.id
+              WHERE lower(u.email) = lower($1)`, [updated[0].to_email])
+          const name = who ? [who.first_name, who.last_name].filter(Boolean).join(' ') : ''
+          const label = [name || updated[0].to_email, who?.unit_number ? `Unit ${who.unit_number}` : null]
+            .filter(Boolean).join(' · ')
+
+          if (owner?.user_id) {
+            await createNotification({
+              userId: owner.user_id,
+              landlordId: updated[0].landlord_id,
+              type: 'email_undeliverable',
+              title: kind === 'bounced'
+                ? `Your email to ${label} isn’t arriving`
+                : `${label} marked your email as spam`,
+              body: kind === 'bounced'
+                ? `${updated[0].to_email} rejected the message, and anything else sent there — invitations, reminders, lease signing requests — will go nowhere too. Check the spelling with them and update it on their tenant record.`
+                : `${updated[0].to_email} reported GAM mail as spam, so nothing more will be delivered there. Reach them another way before sending again.`,
+              actionUrl: '/tenants',
+            })
+          }
+        } catch (e) {
+          // Never fail the webhook over a notification — Svix would retry the
+          // whole event and the delivery record is the part that must not be lost.
+          logger.warn({ err: e, to: updated[0].to_email }, '[resend-webhook] could not notify the landlord')
+        }
+      }
     }
   } catch (err) {
     logger.error({ err, messageId }, '[resend-webhook] failed to record event')

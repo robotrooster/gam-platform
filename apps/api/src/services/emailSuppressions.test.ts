@@ -123,3 +123,71 @@ describe('sending to an address the provider has given up on', () => {
     expect(log.error_message).toMatch(/correct the address/i)
   })
 })
+
+/**
+ * Nic: "the admin portal is not going to babysit that every day for every
+ * person. It needs to flag on the landlord side."
+ *
+ * GAM cannot fix a dead address. Only the person who can phone the tenant and
+ * ask how it is spelled can, and that is the landlord — an alert that lands
+ * where nobody can act on it is a rumour.
+ */
+describe('telling the landlord, not just GAM', () => {
+  it('notifies the landlord when an address they mail goes dead', async () => {
+    const { db } = await import('../db')
+    const c = await db.connect()
+    let landlordUserId = '', landlordId = ''
+    try {
+      const { seedLandlord } = await import('../test/dbHelpers')
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId; landlordUserId = l.userId
+    } finally { c.release() }
+
+    await query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('dead-tenant@icloud.com','x','tenant','Gone','Quiet')`)
+    await query(
+      `INSERT INTO email_send_log (to_email, subject, category, status, landlord_id)
+       VALUES ('dead-tenant@icloud.com','Please sign','tenant_invite','sent',$1)`, [landlordId])
+
+    await syncEmailSuppressions(fakeResend([[row('dead-tenant@icloud.com')]]))
+
+    const [n] = await query<any>(
+      `SELECT title, body, type, action_url FROM notifications
+        WHERE user_id = $1 AND type = 'email_undeliverable'`, [landlordUserId])
+    expect(n).toBeTruthy()
+    expect(n.title).toContain('Gone Quiet')
+    // Says what to DO, not just that something is wrong.
+    expect(n.body).toMatch(/check the spelling/i)
+    expect(n.action_url).toBe('/tenants')
+  })
+
+  it('does not nag again on the next night’s sync', async () => {
+    // The sync runs nightly. A notice per night for the same dead address is
+    // how a landlord learns to dismiss these without reading them.
+    const { db } = await import('../db')
+    const c = await db.connect()
+    let landlordUserId = '', landlordId = ''
+    try {
+      const { seedLandlord } = await import('../test/dbHelpers')
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId; landlordUserId = l.userId
+    } finally { c.release() }
+
+    await query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ('repeat@icloud.com','x','tenant','Same','Person')`)
+    await query(
+      `INSERT INTO email_send_log (to_email, subject, category, status, landlord_id)
+       VALUES ('repeat@icloud.com','Please sign','tenant_invite','sent',$1)`, [landlordId])
+
+    await syncEmailSuppressions(fakeResend([[row('repeat@icloud.com')]]))
+    await query('DELETE FROM email_suppressions')          // force a fresh "added"
+    await syncEmailSuppressions(fakeResend([[row('repeat@icloud.com')]]))
+
+    const notices = await query<any>(
+      `SELECT id FROM notifications WHERE user_id = $1 AND type = 'email_undeliverable'`,
+      [landlordUserId])
+    expect(notices).toHaveLength(1)
+  })
+})
