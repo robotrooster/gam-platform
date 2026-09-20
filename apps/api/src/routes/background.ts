@@ -1490,13 +1490,19 @@ backgroundRouter.post('/pool/withdraw', requireAuth, async (req, res, next) => {
 // the proximity_rank CASE can be swapped for a haversine ORDER BY.
 backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
-    // S639: a read spans the account's companies.
+    // S639: a read spans the account's companies — and S651, it now actually
+    // does. The line here took landlordIds[0] and passed one id, so an account
+    // holding two LLCs had every applicant ranked against whichever company
+    // happened to come back first, and `already_contacted` came back FALSE for
+    // anyone the OTHER company had already paid to unlock. A landlord with a
+    // park in Yarnell and one in Amado saw the Amado renters sorted as though
+    // they were miles from anything, and could pay the dollar twice for the
+    // same person. (memory: gam-account-is-not-an-entity)
     const landlordIds = landlordScopeIds(req.user!)
-    const landlordId = landlordIds[0] ?? null
     const pool = await query<any>(`
       WITH props AS (
         SELECT DISTINCT zip, lower(city) AS city, state
-          FROM properties WHERE landlord_id = $1
+          FROM properties WHERE landlord_id = ANY($1::uuid[])
       )
       SELECT ap.id, ap.employment_status, ap.monthly_income, ap.city, ap.state, ap.zip,
              ap.risk_level, ap.risk_score, ap.created_at,
@@ -1509,10 +1515,11 @@ backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_backg
              END AS proximity_rank,
              CASE WHEN mr.id IS NOT NULL THEN TRUE ELSE FALSE END as already_contacted
         FROM application_pool ap
-        LEFT JOIN pool_match_requests mr ON mr.pool_entry_id = ap.id AND mr.landlord_id = $1
+        LEFT JOIN pool_match_requests mr ON mr.pool_entry_id = ap.id
+                                        AND mr.landlord_id = ANY($1::uuid[])
        WHERE ap.status = 'available'
        ORDER BY proximity_rank ASC, ap.risk_score ASC NULLS LAST, ap.created_at DESC
-       LIMIT 50`, [landlordId])
+       LIMIT 50`, [landlordIds])
     res.json({ success: true, data: pool })
   } catch (e) { next(e) }
 })
