@@ -528,15 +528,22 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
   const ids = [...new Set(lines.map((l) => l.itemId).filter((x): x is string =>
     typeof x === 'string' && /^[0-9a-f-]{36}$/i.test(x)))]
   if (!ids.length) return
-  const rows = await query<{ id: string; prices: string[] }>(
-    `SELECT i.id, ARRAY[i.sell_price::text] || COALESCE(
+  const rows = await query<{ id: string; prices: string[]; stay_unit: string | null }>(
+    `SELECT i.id, i.stay_unit, ARRAY[i.sell_price::text] || COALESCE(
               (SELECT array_agg(v.sell_price::text) FROM pos_item_variants v
                 WHERE v.item_id = i.id AND v.is_active = TRUE), '{}') AS prices
        FROM pos_items i WHERE i.id = ANY($1::uuid[]) AND i.landlord_id = $2`,
     [ids, posLandlordId(req)])
   const allowed = new Map(rows.map((r) => [r.id, r.prices.map(Number)]))
+  // S652: a stay is not priced from the catalog — the site's rate card decides,
+  // and the server sets it. Holding a cashier to the item's sell_price here
+  // would refuse every stay, since the two are not the same number and are not
+  // meant to be. Nothing is loosened: the price the browser sent for a stay is
+  // discarded and replaced before anything is totalled.
+  const stayItems = new Set(rows.filter((r) => r.stay_unit).map((r) => r.id))
   for (const l of lines) {
     if (!l.itemId || !allowed.has(l.itemId)) continue
+    if (stayItems.has(l.itemId)) continue
     const price = Number(l.price)
     if (!allowed.get(l.itemId)!.some((p) => Math.abs(p - price) < 0.005)) {
       throw new AppError(403, 'That price differs from the item\'s price. Changing a price needs the "Apply discounts" permission.')
@@ -551,10 +558,12 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
  * that calls its item "Nightly RV" or "Cabin - wk" must work the same as one
  * that calls it "RV site — daily", and a name is not a contract.
  *
- * lineTotal is what the counter is charging for those nights — the register's
- * own price, carried through to the booking untouched.
+ * S652 (Nic): lineTotal comes from the SITE, never from the catalog and never
+ * from the browser. "There's no variation allowed in terms of charging one
+ * price in the booking flow and one price if they come in and get it on the
+ * POS." The item says what one of quantity buys; the unit says what it costs.
  */
-async function resolveStayLines(landlordId: string, items: any[]): Promise<any[]> {
+async function resolveStayLines(landlordId: string, items: any[], unitId?: string | null): Promise<any[]> {
   const ids = [...new Set((items || []).map((it: any) => it.id).filter(Boolean))]
   if (!ids.length) return []
   const rows = await query<{ id: string; name: string; stay_unit: string | null }>(
@@ -563,17 +572,23 @@ async function resolveStayLines(landlordId: string, items: any[]): Promise<any[]
     [ids, landlordId])
   if (!rows.length) return []
   const byId = new Map(rows.map((r) => [r.id, r]))
-  return (items || [])
-    .filter((it: any) => it.id && byId.has(it.id))
-    .map((it: any) => {
-      const row = byId.get(it.id)!
-      const qty = Number(it.qty) || 0
-      return {
-        itemId: it.id, qty, stayUnit: row.stay_unit as 'night' | 'week' | 'month',
-        name: row.name,
-        lineTotal: Math.round((Number(it.price) || 0) * qty * 100) / 100,
-      }
+  const { priceStayFromUnit } = await import('../services/registerStay')
+  const out: any[] = []
+  for (const it of (items || [])) {
+    if (!it.id || !byId.has(it.id)) continue
+    const row = byId.get(it.id)!
+    const qty = Number(it.qty) || 0
+    const stayUnit = row.stay_unit as 'night' | 'week' | 'month'
+    // No site yet means no price yet — the caller refuses the sale a few lines
+    // later for the same reason, so this only has to not invent a number.
+    if (!unitId) { out.push({ itemId: it.id, qty, stayUnit, name: row.name, lineTotal: 0, rate: null }); continue }
+    const priced = await priceStayFromUnit(query, unitId, landlordId, stayUnit, qty)
+    out.push({
+      itemId: it.id, qty, stayUnit, name: row.name,
+      rate: priced.rate, lineTotal: priced.lineTotal,
     })
+  }
+  return out
 }
 
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
@@ -667,9 +682,16 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
     const { checkOutFor, nightsBetween } = await import('../services/registerStay')
     const checkOut = checkOutFor(checkIn, stayUnit, qty)
 
+    const { STAY_RATE_COLUMN } = await import('../services/registerStay')
+    const rateCol = STAY_RATE_COLUMN[stayUnit]
     const units = await query<any>(
-      `SELECT u.id, u.unit_number, u.unit_type, u.rv_site_layout, u.rv_amp_service
+      `SELECT u.id, u.unit_number, u.unit_type, u.rv_site_layout, u.rv_amp_service,
+              -- The site's own rate, else the property's: the same two places
+              -- and the same order the booking site quotes from, so the counter
+              -- and the booking site cannot price a site differently.
+              COALESCE(u.${rateCol}, pr.${rateCol})::float AS rate
          FROM units u
+         JOIN properties pr ON pr.id = u.property_id
         WHERE u.property_id = $1
           AND u.landlord_id = $2
           AND u.retired_at IS NULL
@@ -687,8 +709,18 @@ posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any,
         ORDER BY u.unit_number`,
       [propertyId, posLandlordId(req), checkIn, checkOut])
 
+    // S652 (Nic): the price is the site's, so it travels with the site. A site
+    // with no rate for this length is still LISTED — dropping it would read as
+    // "occupied", which is a lie about a site that is standing empty — but it
+    // cannot be picked until somebody sets the rate.
     res.json({ success: true, data: {
-      checkIn, checkOut, nights: nightsBetween(checkIn, checkOut), units,
+      checkIn, checkOut, nights: nightsBetween(checkIn, checkOut),
+      stayUnit,
+      units: units.map((u: any) => ({
+        ...u,
+        rate: u.rate ?? null,
+        lineTotal: u.rate != null ? Math.round(u.rate * qty * 100) / 100 : null,
+      })),
     } })
   } catch (e) { next(e) }
 })
@@ -776,7 +808,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // Read from the ITEM, never from its name: pos_items.stay_unit says what
     // one of these buys. An item with it set cannot be sold without a site and
     // a date, because the whole point is that the schedule hears about it.
-    const stayLines = await resolveStayLines(posLandlordId(req), items)
+    const stayLines = await resolveStayLines(posLandlordId(req), items, stay?.unitId ?? null)
     if (stayLines.length && !stay) {
       throw new AppError(400,
         'A stay needs a site and an arrival date before it can be rung up.')
@@ -785,13 +817,24 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       throw new AppError(400, 'Nothing in this sale is a stay.')
     }
 
+    // S652 (Nic): the site's rate IS the price, so the cart the server totals
+    // is not quite the cart the browser sent — a stay line is repriced from the
+    // unit before anything is added up. Done here, above serverCartTotals, so
+    // tax, the card fee and the amount checked against the card reader's
+    // authorization all come out of the same number the booking records.
+    const pricedItems = (items || []).map((it: any) => {
+      const line = stayLines.find((sl: any) => sl.itemId === it.id)
+      if (!line || line.rate == null) return it
+      return { ...it, price: line.rate }
+    })
+
     // S554: ONE shared cart-total calc — calculateCartTax (S241 server tax,
     // falling back to item.tax_rate) + the pure aggregateCartTotals that the
     // POST /pos/cart-quote endpoint ALSO runs, so the terminal PI the client
     // minted (against the quote) always equals this recomputed total.
     // S648: the fee is the server's (serverCartTotals), whatever the client sent.
     const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total, cardFee, taxBreakdown } =
-      await serverCartTotals(posLandlordId(req), items, paymentMethod ?? 'cash', discountAmount, undefined, propertyId)
+      await serverCartTotals(posLandlordId(req), pricedItems, paymentMethod ?? 'cash', discountAmount, undefined, propertyId)
 
     // FlexCharge platform fee is 1% of what the customer is actually charged
     // (net of discount). A card sale's card fee is GAM's whoever paid it.
@@ -857,7 +900,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           paymentMethod, tenantId, posCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId, discountAmount: discountAmt, discountReason,
           ...(paymentMethod === 'card' ? { payoutOwed: round2(total - cardFee) } : {}),
-          items, taxBreakdown,
+          items: pricedItems, taxBreakdown,
         })
         tx = sale.tx
         inventoryNeedsPO.push(...sale.needsPO)

@@ -10,7 +10,7 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { humanize, processingFeeFor } from '@gam/shared'
+import { humanize, processingFeeFor, rvSiteFactsLabel } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { SendPayLinkModal, PayLinksTab } from './POSPayLinks'
@@ -392,7 +392,10 @@ export function POSPage() {
       // pre-check above can read a stale cart; the updater always sees
       // the latest state and is the hard guarantee.
       if (ex) return c.map(x => x.id===item.id ? {...x,qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
-      return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, stayUnit:item.stayUnit ?? null, _sessionItemId: clientItemId } as any]
+      // S652 (Nic): a stay's price is the SITE's, not the catalog's, and no
+      // site has been picked yet. Starts at zero and fills in when one is,
+      // so nothing on screen ever shows a number the guest will not be charged.
+      return [...c, { id:item.id, name:item.name, price:item.stayUnit?0:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, stayUnit:item.stayUnit ?? null, _sessionItemId: clientItemId } as any]
     })
   }
   // S536 (Nic): absolute-quantity setter — the register quantity is
@@ -850,7 +853,12 @@ export function POSPage() {
               {visibleItems.filter((i:any)=>i.isActive).map((item:any) => (
                 <button key={item.id} onClick={()=>addToCart(item)} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:'var(--r-lg)',padding:16,cursor:'pointer',textAlign:'left'}} onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')} onMouseLeave={e=>(e.currentTarget.style.borderColor='var(--border-1)')}>
                   <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--text-0)',marginBottom:2}}>{item.name}</div>
-                  <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>{fmt(item.sellPrice)}</div>
+                  {/* S652 (Nic): a stay has no single price — site 5 is $40 a
+                      night and site 6 is $42 — so the button cannot show one.
+                      The price appears when the site does. */}
+                  <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>
+                    {item.stayUnit ? <span style={{fontSize:'.72rem',color:'var(--text-3)',fontWeight:600}}>price by site</span> : fmt(item.sellPrice)}
+                  </div>
                   <div style={{display:'flex',gap:4,marginTop:4,flexWrap:'wrap'}}>
                     {item.chargeEligible&&<span style={{fontSize:'.65rem',background:'var(--gold-bg)',color:'var(--gold)',padding:'1px 4px',borderRadius:3}}>charge</span>}
                     {item.stockQty<999&&<span style={{fontSize:'.65rem',color:item.stockQty<=item.stockMin?'var(--amber)':'var(--text-3)'}}>{item.stockQty} left</span>}
@@ -1719,7 +1727,13 @@ export function POSPage() {
             propertyId={registerProperty}
             initial={stay}
             onCancel={()=>setStayModal(false)}
-            onDone={(d:any)=>{ setStay(d); setStayModal(false) }}
+            onDone={(d:any)=>{
+              setStay(d); setStayModal(false)
+              // The site carries the rate. Writing it onto the cart line is what
+              // makes the total, the tax, the card authorization and the booking
+              // all one number instead of four.
+              if (d.rate != null) setCart(c=>c.map(i=>i.id===stayLine.id?{...i,price:Number(d.rate)}:i))
+            }}
           />
         </div>
       </div>)}
@@ -1763,7 +1777,8 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
     : line.stayUnit === 'week' ? `${line.qty} week${line.qty === 1 ? '' : 's'}`
     : `${line.qty} month${line.qty === 1 ? '' : 's'}`
 
-  const ready = !!unitId && !!checkIn && !!guestName.trim()
+  const picked = units.find((u: any) => u.id === unitId)
+  const ready = !!unitId && picked?.rate != null && !!checkIn && !!guestName.trim()
 
   return (
     <>
@@ -1784,13 +1799,29 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
         : isFetching && !units.length
           ? <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:12}}>Checking what is free…</div>
           : units.length
-            ? <select className="input" style={{width:'100%',marginBottom:12}}
-                      value={unitId} onChange={e=>setUnitId(e.target.value)}>
-                <option value="">Pick a site…</option>
-                {units.map((u:any)=>(
-                  <option key={u.id} value={u.id}>{u.unitNumber}</option>
-                ))}
-              </select>
+            ? <>
+                {/* S652 (Nic): the counter tells the customer what IS available
+                    — back-in or pull-through, what amp service, and the price —
+                    and the customer chooses from what exists. A bare list of
+                    site numbers makes the person behind the counter recite all
+                    of that from memory. The price is the site's rate card, the
+                    same number the booking site quotes. */}
+                <select className="input" style={{width:'100%',marginBottom:12}}
+                        value={unitId} onChange={e=>setUnitId(e.target.value)}>
+                  <option value="">Pick a site…</option>
+                  {units.map((u:any)=>(
+                    <option key={u.id} value={u.id} disabled={u.rate == null}>
+                      {[u.unitNumber, rvSiteFactsLabel(u),
+                        u.rate == null ? 'no rate set' : fmt(u.lineTotal ?? u.rate)]
+                        .filter(Boolean).join(' · ')}
+                    </option>
+                  ))}
+                </select>
+                {units.some((u:any)=>u.rate == null) && (
+                  <div style={{fontSize:'.72rem',color:'var(--amber)',marginBottom:12}}>
+                    A site with no rate for this length cannot be sold until one is set on the site.
+                  </div>)}
+              </>
             : <div style={{fontSize:'.78rem',color:'var(--amber)',marginBottom:12}}>
                 Nothing is free for those dates. Try a different arrival date.
               </div>}
@@ -1807,6 +1838,7 @@ function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
           unitId, checkIn, guestName: guestName.trim(), guestPhone: guestPhone.trim() || null,
           checkOut: data?.checkOut,
           siteLabel: units.find((u:any)=>u.id===unitId)?.unitNumber ?? 'Site',
+          rate: units.find((u:any)=>u.id===unitId)?.rate ?? null,
         })}>Use this site</button>
       </div>
     </>

@@ -2477,14 +2477,34 @@ export interface PropertyUnitSubtype {
   unitCount?: number
 }
 
+/**
+ * What an RV site IS, in the words the counter uses out loud: "Pull-through ·
+ * 50 amp". S652 (Nic): when somebody walks up asking what is available, the
+ * answer is the shape and the hookup, not a site number — so the register's
+ * site list, the reservation flow and the booking site all say it from here
+ * rather than each writing the same two ternaries slightly differently.
+ */
+export function rvSiteFactsLabel(
+  s: { rvSiteLayout?: string | null; rvAmpService?: string | null } | null | undefined,
+): string {
+  const parts: string[] = []
+  if (s?.rvSiteLayout && s.rvSiteLayout !== 'none') {
+    parts.push(RV_SITE_LAYOUT_LABEL[s.rvSiteLayout as RvSiteLayout] ?? s.rvSiteLayout)
+  }
+  if (s?.rvAmpService && s.rvAmpService !== 'none') {
+    parts.push(RV_AMP_SERVICE_LABEL[s.rvAmpService as RvAmpService] ?? s.rvAmpService)
+  }
+  return parts.join(' · ')
+}
+
 // Human summary of a subtype's facts for chips/rows, e.g.
 // "Pull-through · 50 amp", "2 bed · 1 bath", "10x10". Empty when no facts.
 export function unitSubtypeFactsLabel(s: PropertyUnitSubtype): string {
   const parts: string[] = []
   if (s.bedrooms != null) parts.push(s.bedrooms === 0 ? 'Studio' : `${s.bedrooms} bed`)
   if (s.bathrooms != null && s.bathrooms !== '') parts.push(`${s.bathrooms} bath`)
-  if (s.rvSiteLayout && s.rvSiteLayout !== 'none') parts.push(s.rvSiteLayout === 'pull_through' ? 'Pull-through' : 'Back-in')
-  if (s.rvAmpService && s.rvAmpService !== 'none') parts.push(s.rvAmpService === 'both' ? '30/50 amp' : `${s.rvAmpService} amp`)
+  const rv = rvSiteFactsLabel(s)
+  if (rv) parts.push(rv)
   if (s.storageSize?.trim()) parts.push(s.storageSize.trim())
   return parts.join(' · ')
 }

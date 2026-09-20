@@ -107,6 +107,27 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   if (body.kind === 'one_time' && !body.customer?.email) {
     throw new AppError(400, 'An email address is needed to send the link.')
   }
+  // S652 — A STAY CANNOT BE SOLD DOWN THIS ROUTE.
+  //
+  // A stay is priced by the site it is on and has to land on the Master
+  // Schedule; a pay link carries neither a site nor dates. Letting one through
+  // would take the money and put nothing on the schedule, which is the exact
+  // failure register stays were built to end — rebuilt through a second door.
+  // Billing an EXISTING stay's balance is a different thing and stays allowed:
+  // it goes out with no catalog item behind it (see stay-balance links below).
+  const itemIds = (body.items as any[]).map((i) => i.id).filter(Boolean)
+  if (itemIds.length) {
+    const stayish = await query<{ name: string }>(
+      `SELECT name FROM pos_items
+        WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
+      [itemIds, prop.landlord_id])
+    if (stayish.length) {
+      throw new AppError(400,
+        `"${stayish[0].name}" is a stay — it needs a site and an arrival date, so it has to be rung up at the register. `
+        + 'Send a link for the balance afterwards if they are paying later.')
+    }
+  }
+
   const totals = await computeCartTotals(prop.landlord_id, body.items as any[], {
     surcharge: 0, discountAmount: body.discountAmount ?? 0,
   })

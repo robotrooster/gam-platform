@@ -8,12 +8,22 @@
  *
  * Nic: "register stays → booking on the schedule."
  *
- * THE PRICE IS THE REGISTER'S. POS is per property and the catalog price is
- * authoritative here exactly as it is for propane. Nothing in this file reads a
- * unit's rate card or re-quotes anything — the booking records what was
- * actually charged at the counter. (I proposed pricing from the unit instead;
- * Nic: "why are you making prices falsely contradict. register price should be
- * its own thing.")
+ * THE PRICE IS THE UNIT'S, AND THERE IS ONLY ONE OF THEM.
+ *
+ * Nic, S652, after this file had it backwards: "There's no variation allowed in
+ * terms of charging one price in the booking flow and one price if they come in
+ * and get it on the POS and one price if they do whatever. It's all the same.
+ * It's based on the unit." The property's rates live on its units — site 5 is a
+ * back-in at $40 a night, site 6 a pull-through at $42 — and the register and
+ * the booking site both read them. A signed lease is the only thing that
+ * supersedes a unit's rate, and only for that unit.
+ *
+ * The catalog price on a stay item is therefore NOT what a stay costs. The item
+ * is the button and it says what one of quantity buys; the site says what it
+ * costs. Which is why an earlier draft's story — that a catalog price and a
+ * rate card were two legitimately different numbers — did not survive contact
+ * with the data: Mountain View's units said $269 a week while its register item
+ * said $250, and nobody could have told you which one a guest owed.
  *
  * WHAT THE CASHIER SUPPLIES is a site, a check-in date, and a name. Everything
  * else is derived: the item says what one unit of quantity buys (a night, a
@@ -67,6 +77,91 @@ export function nightsBetween(checkIn: string, checkOut: string): number {
   return Math.round(
     DateTime.fromISO(checkOut).startOf('day')
       .diff(DateTime.fromISO(checkIn).startOf('day'), 'days').days)
+}
+
+/**
+ * The column on `units` that holds the rate for one of these.
+ *
+ * One map, exported, so that every surface that prices a stay — the register,
+ * the booking site, the counter's availability list — is reading the same
+ * three columns rather than each deciding for itself which one applies.
+ */
+export const STAY_RATE_COLUMN = {
+  night: 'nightly_rate',
+  week:  'weekly_rate',
+  month: 'monthly_rate',
+} as const
+
+export type StayUnit = keyof typeof STAY_RATE_COLUMN
+
+/** What one night/week/month on this site costs, or null when nobody set it. */
+export function rateForStay(
+  unit: { nightly_rate?: any; weekly_rate?: any; monthly_rate?: any } | null | undefined,
+  stayUnit: StayUnit,
+): number | null {
+  if (!unit) return null
+  const raw = (unit as any)[STAY_RATE_COLUMN[stayUnit]]
+  if (raw === null || raw === undefined || raw === '') return null
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null
+}
+
+/** "a weekly rate" — for saying which one is missing, in words a person uses. */
+export function stayRateLabel(stayUnit: StayUnit): string {
+  return stayUnit === 'night' ? 'a nightly rate'
+       : stayUnit === 'week'  ? 'a weekly rate'
+       :                        'a monthly rate'
+}
+
+/**
+ * Price a stay from the site it is on.
+ *
+ * THE SITE FIRST, THEN THE PROPERTY — the same order, and the same two places,
+ * the booking site already quotes from (services/propertyBookingQuote: `rep
+ * .nightly_rate ?? prop.nightly_rate`). A site may be worth more or less than
+ * its neighbours and carries its own number; the property's rate is what the
+ * rest of the sites cost. If the register consulted only the unit, a property
+ * that prices at the property level would sell on the booking site and be
+ * refused at the counter — the identical split this whole change exists to
+ * close, rebuilt one layer down.
+ *
+ * Throws rather than falling back to the catalog price. No rate in either place
+ * is a setup mistake somebody has to fix, and quietly charging a different
+ * number instead is how the prices got out of step in the first place.
+ */
+export async function priceStayFromUnit(
+  /** A rows-returning query — `db.query`, or a PoolClient wrapped to match. */
+  q: (sql: string, params: any[]) => Promise<any[]>,
+  unitId: string,
+  landlordId: string,
+  stayUnit: StayUnit,
+  qty: number,
+): Promise<{ rate: number; lineTotal: number; unitNumber: string; from: 'site' | 'property' }> {
+  const rows = await q(
+    `SELECT u.unit_number, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+            p.nightly_rate AS p_nightly_rate, p.weekly_rate AS p_weekly_rate,
+            p.monthly_rate AS p_monthly_rate
+       FROM units u JOIN properties p ON p.id = u.property_id
+      WHERE u.id = $1 AND u.landlord_id = $2`,
+    [unitId, landlordId])
+  const u = rows[0]
+  if (!u) throw new AppError(404, 'That site is not one of yours')
+  const own = rateForStay(u, stayUnit)
+  const fallback = rateForStay({
+    nightly_rate: u.p_nightly_rate, weekly_rate: u.p_weekly_rate, monthly_rate: u.p_monthly_rate,
+  }, stayUnit)
+  const rate = own ?? fallback
+  if (rate === null) {
+    throw new AppError(409,
+      `Site ${u.unit_number} has no ${stayRateLabel(stayUnit).replace(/^a /, '')} set, and neither does the property. `
+      + 'Set it and it will be the price everywhere — the counter, the booking site, both.')
+  }
+  return {
+    rate,
+    lineTotal: Math.round(rate * qty * 100) / 100,
+    unitNumber: u.unit_number,
+    from: own !== null ? 'site' : 'property',
+  }
 }
 
 /**
