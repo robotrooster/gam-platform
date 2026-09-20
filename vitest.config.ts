@@ -27,6 +27,20 @@ import { defineConfig } from 'vitest/config'
 // someone eventually runs without.
 export default defineConfig({
   test: {
+    // 3. CONNECTION STARVATION (S652).
+    //    The pool defaults to 20 connections PER PROCESS and Postgres allows
+    //    100, and every test file gets its own pool that lingers for the 30s
+    //    idle timeout after the file finishes. Six files' worth of draining
+    //    pools is the whole server, and the suite starts failing with "sorry,
+    //    too many clients already" — on whichever files happen to be running,
+    //    which reads exactly like a real bug in code that is fine. It cost a
+    //    deploy: eight failures across three unrelated files, all of them
+    //    passing alone.
+    //
+    //    The suite runs files sequentially (see 1 above) and tests within a
+    //    file sequentially too, so a file has no use for twenty connections.
+    //    Five is generous and leaves room for a dozen draining pools.
+    env: { DB_POOL_MAX: '5' },
     fileParallelism: false,
     exclude: [
       '**/node_modules/**',
