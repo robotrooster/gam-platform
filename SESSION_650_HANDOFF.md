@@ -111,6 +111,17 @@ It is not the $1-per-Connect-account fee — Financial Connections is a separate
 
 Already fixed in S642: the balance refresh runs **once a day, banking days only** (`services/bankFeed.ts`; the scheduler skips weekends and federal holidays). Expect roughly **$1.60–$2.00/month per linked account** from here, not $9.30. Mountain View was connected in September, so September will show two accounts at the new cadence.
 
+## Idea to design next session — on-demand balance refresh button (Nic, end of S650)
+The daily refresh is already 75%+ cheaper than August's four-a-day, but most of those daily calls still ask a question nobody asked. Nic's idea: **stop refreshing on a timer at all past a point — refresh when the number is actually stale**, with a "your balance is out of sync — refresh now" button on the screen when GAM detects a discrepancy (cached balance vs. what the transactions imply).
+
+**Nic's own worry, and the answer: yes, an unthrottled button burns money.** Each press is a billable Stripe call (~7½¢). The button can't be trusted to the browser — a bored user or a stuck page could ring it hundreds of times. It has to be **capped on the server**, per linked account, with the button showing a plain "already refreshed a few minutes ago" state instead of failing. What's there today: `refreshBalance(conn)` in `services/bankFeed.ts` does one account, and nothing exposes it on demand — there's no route and no cooldown, so both get built together or not at all.
+
+**Open design questions for Nic:**
+1. Does the button *replace* the daily refresh, or sit on top of it? (Nic leaned toward keeping daily-minus-weekends-and-holidays as the floor — "a good starting point".)
+2. What's the cooldown — one on-demand refresh per account per hour? Per day on top of the scheduled one?
+3. Who eats it? It's GAM's cost today. If it stays GAM's, the cap is the whole cost control.
+4. What counts as "out of sync"? Cheapest honest signal is cached balance vs. balance implied by transactions since the last refresh — costs nothing to compute.
+
 ## Idea to design next session — renter pool outside property
 Today the pool lives under a "GAM Renter Pool" landlord and property, which also makes the proximity search wrong: it looks for units near *that property's* address instead of near the applicant. Nic's shape:
 - The pool sits **outside any property**. It only got scoped to one because a tenant portal needed a property.
