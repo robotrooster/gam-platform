@@ -19,6 +19,17 @@
 - Disbursements: "give it your best shot" — built, Nic reviews.
 - Mattoon water meters: Nic sends details later.
 - Agents: priority one. Primary goal = narrow a vague question, confirm, then resolve.
+- Agent pacing is deliberate: back-end speed is fair game, the customer-facing reply stays human-paced (reading delay + typing). Do not speed that up.
+- Ellen Gregory's two emails are two different people (her and her daughter), not duplicates.
+- Lisa Scheeler rings sales and takes payments; only the administrative register functions (tax rates, discounts, inventory counts, item setup) stay restricted.
+- Nothing in the register is freely typable except a quantity. "+ Open Item" removed — a one-off goes on a lease or a pay link.
+- FlexCharge is not a launch item and must not be visible or named anywhere.
+- Email gets verified by the invite → signup → lease-signing flow, not by a separate email.
+- **Bill up front everything that can be billed up front.** Arrears is only for things that can't be counted in advance (short-stay nights).
+- **A hibernating spot still carries the platform fee.** Landlord→tenant billing pauses; the spot is still occupied and can't be re-let, so GAM still bills the landlord.
+- **Never ACH-debit a landlord by default** — take it out of the money flowing through. When the debit is built for all-cash properties, **the bank cost is its own line item** so the landlord doesn't dispute the charge.
+- August must read $0 of real revenue. The $50 platform fee there was fabricated; the only August money was Nic's own test charges.
+- Renter pool must not be pinned to a property (design below).
 
 ## Done (committed; see deploy status at the bottom)
 ### Agents (David/Ava/all) — speed and crashes
@@ -57,13 +68,80 @@
 - **admin-ops is not in deploy.sh** — its login change (sends portal: 'admin_ops') isn't live; harmless (old client just skips the staff gate).
 - Model server runs ops/mlx_server.py (20 GB prompt-cache cap) since 09:04.
 
-## Open — ask Nic
-1. **Lisa Scheeler can't ring sales at all.** Her staff permissions have the Register tab, take-payment, balances and schedule, but not "Ring sales" (every sale and pay link returns 403). Switch it on?
-2. **"+ Open Item" on the register** lets any cashier ring a made-up item at any price. Keep it for the front counter, or require the discount permission?
-3. Reservation form follow-ups; screening-availability design; Mattoon meters (all waiting on Nic).
-4. Still open from S649: Stripe rep question, card reader order.
+## The evening's work (everything after Nic got back)
 
-## Still to build
+### Money failing to move — the #1 item
+**What was wrong:** the Tuesday batch claimed the full $4,154.89 of tenant rent from GAM's platform balance and handed Stripe a transfer for the whole amount. Stripe refused it: `balance_insufficient`. The money WAS GAM's — it just wasn't *available* yet. An ACH rent payment shows as "settled" on GAM's books the moment Stripe accepts it, but the funds don't become withdrawable for several business days. The batch was spending money that hadn't landed. Nic's read was right: GAM never advances anything, so a shortfall can only ever be a timing problem, never a funding one.
+
+**The fix** (`services/landlordPassthrough.ts`):
+- RESERVE now asks Stripe for the real available balance and claims only up to it, oldest payment first. What doesn't fit stays claimed-but-unsent and goes out on the next daily run — nothing is dropped, nothing is double-sent.
+- The recovery pass runs every morning at 08:00 and retries anything still pending.
+- Anything pending more than 24 hours raises a critical alert instead of sitting silent. That silence is why this went unnoticed.
+
+**Result:** the retry fired Saturday and went through — transfer `tr_1UHXhVDNEru9AEpKpLggYn5G`, $4,154.89 to Mountain View. Weekend transfer, so it shows in the bank Monday.
+
+### Ellen Gregory couldn't log in
+Two separate faults, both fixed:
+1. Her account was never email-verified (she never clicked an invite — the lease got signed in person), and the login refused unverified accounts.
+2. The tenant portal ran **two** 401 interceptors. One had the `/auth/` carve-out, the other didn't; the second one caught the refusal first and reloaded the page, so she got a blank screen with no message. The same duplicate/missing carve-out existed in **pos, admin and property-intel** — all four fixed.
+
+Going forward, signing a lease marks the signer's email verified (`routes/esign.ts`), and so does completing a password reset. A tenant who signs is verified by the act of signing.
+
+### Register
+- **"+ Open Item" is gone** from both registers. Every line has to be an item somebody set up; the server refuses a sale line that isn't in the catalog, at any price other than the catalog's, unless the cashier holds "Apply discounts".
+- Lisa's "Ring sales" permission is on. Nic to eyeball the rest of her permissions logged in as her.
+
+### GAM's own money — this took the rest of the night
+Nic's question: *"where is our profit pooling, and why don't any of the numbers match?"*
+
+**What was wrong:**
+- **August showed $55.97 of revenue on zero payments.** A $50 "platform fee" row had been written by hand at some point with nothing behind it, and a $5.97 card spread was booked against payments that don't exist. Both reversed. The only real August money was Nic's own test charges ($2 card + $2 ACH + the $6 ACH fee against a fake landlord) — swept into the platform account at his direction, $10.33. August now reads **$9.01** (that $10.33 minus Stripe's real $1.32 of costs).
+- **September's platform fee was never billed.** The accrual wrote a revenue row and stopped — nothing ever asked the landlord for the money. It now also writes a charge that nets out of the next payout (`landlord_gam_charges`): **Mountain View $82 (41 spots), Oak Park $48 (24 spots) = $130**.
+- **The unit counts disagreed** (65 / 56 / 63) because hibernating spots were excluded from the fee. Per Nic's directive they're included now: 65 billable.
+- **The $5 from the first background check was never recorded anywhere** — it sat in the Stripe balance and in no ledger. A screening now books both the $5 and the card spread on it (~49¢ on a $44.99 check). Backfilled.
+- **The per-payment spread is an estimate and runs low.** Stripe is on unbundled pricing: it attributes no cost to an individual charge and bills the real cost as daily aggregates, so the spread booked on the day uses a conservative cost assumption. September's estimate was $41.75 against a real margin of $74.86. A **daily true-up** (06:00, current + previous month) now posts one adjustment so the ledger equals what actually happened, and keeps correcting as more payments land.
+- **The bank feed was being counted as a cost of taking rent.** Financial Connections is billed monthly whether or not anyone pays; counting it made August read as a $10.92 loss on zero payments. It's split out and shown beside the margin now.
+
+**The books as they stand:** August $9.01 · September $209.86 · **total $218.87.** Admin → Platform Balance now splits Stripe's balance into GAM's own money, money owed to landlords, and deposits held in trust.
+
+### The Financial Connections $9.60 (Nic's last question)
+Two Stripe charges posted 2026-09-01 for the 2026-08-01→08-31 period: *Connections Transaction Subscription* $0.30 and *Connections Balance Refresh* **$9.30**.
+
+It is not the $1-per-Connect-account fee — Financial Connections is a separate product, and the balance refresh is billed **per call**, not per account. In August the transaction sync ran four times a day and refreshed the balance every time: ~124 refreshes × ~7.5¢ ≈ $9.30, for **one** linked account (Oak Park). The transaction data — the part that's actually the point — cost 30¢.
+
+Already fixed in S642: the balance refresh runs **once a day, banking days only** (`services/bankFeed.ts`; the scheduler skips weekends and federal holidays). Expect roughly **$1.60–$2.00/month per linked account** from here, not $9.30. Mountain View was connected in September, so September will show two accounts at the new cadence.
+
+## Idea to design next session — renter pool outside property
+Today the pool lives under a "GAM Renter Pool" landlord and property, which also makes the proximity search wrong: it looks for units near *that property's* address instead of near the applicant. Nic's shape:
+- The pool sits **outside any property**. It only got scoped to one because a tenant portal needed a property.
+- After the background check the renter has a real tenant-portal login in a **suspended state** — no lease, nothing to do — until they connect with a landlord.
+- What they can do in that state: **browse available units near them**, near the address that was verified on their ID.
+- Landlords still pay $1 for contact; GAM stays a conduit, not a CRA.
+
+## Production data changes (evening; backups ~/gam-backups/s650-*)
+- Phantom August revenue reversed ($50 + $5.97); Nic's test money swept in ($10.33).
+- Screening margin + card spread backfilled ($5.49).
+- September platform fee billed: Mountain View $82, Oak Park $48 — netting from their next payouts.
+- September margin trued up to Stripe's real numbers (+$33.11).
+- Ellen Gregory's account marked email-verified; Lisa Scheeler granted "Ring sales".
+- Stuck passthrough transfer re-fired: $4,154.89 to Mountain View.
+
+## Deploy status
+Everything through commit `6e59722` is built, deployed and verified (API, landlord, tenant, admin, pos, marketing). **admin-ops is still not in deploy.sh** — harmless, but it means its login change isn't live.
+
+## Open — ask Nic
+1. Reservation form follow-ups (Nic expects questions before the build).
+2. Screening: check availability before the paid background check — design with Nic.
+3. Still open from S649: Stripe rep question, card reader order.
+4. Nic to eyeball Lisa's permissions logged in as her.
+
+## Next session
+**Mattoon / Country Acres onboarding, from Nic's spreadsheet.** Owner wants billing ready for October rent through the portal; "build fast and break stuff", he'll fix details later.
+
+Then, in rough priority:
+- **ACH debit for all-cash properties** — with the bank cost as its own line item.
+- **Agents to ~99%**, or a clean referral when they can't be accurate. Queue turns when the model is busy and show "he's helping another customer right now".
+- **Renter pool** redesign above.
+- **Audit that FlexCharge is named nowhere** (flagged, not yet swept).
 - Register stays → booking on the schedule; card option on front-desk Record Payment; signing queue / "something's wrong" / undelivered-email flag; native apps; property settings questionnaire; work-trade redesign.
-- Agents, remaining eval failures: "tell me more about the apt 204 one" repeats the expirations answer instead of pulling 204's lease; FlexPay/FlexDeposit follow-ups ("sign me up", "yes, cancel it") don't reach the action; pay-rent quote→charge; demo-data drift in 3 landlord cases (spot 7 / spot 12 / Chen's balance). Run: `DB_NAME=gam_demo AGENT_CONV_JSON=/tmp/x.json npx tsx src/services/agents/agentConversations.ts` (~60 min, migrate gam_demo first).
-- Register screens (Taxes tab, item tax checkboxes, disbursement flow) were typechecked and API-verified on demo but not eyeballed in a browser (logging in needs a password).
+- Agent eval failures listed in the previous section still stand.
