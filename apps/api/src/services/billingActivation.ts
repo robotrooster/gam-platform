@@ -71,14 +71,26 @@ export async function activateBillingForOccupancy(
     `UPDATE landlords l
         SET billing_starts_at = $1::date, updated_at = now()
       WHERE l.billing_starts_at IS NULL
-        AND EXISTS (
-          SELECT 1
-            FROM leases le
-            JOIN units u ON u.id = le.unit_id
-           WHERE u.landlord_id = l.id
-             AND le.status = 'active'
-             AND le.start_date <= ($1::date + INTERVAL '1 month' - INTERVAL '1 day')
-             AND (le.end_date IS NULL OR le.end_date >= $1::date))`,
+        AND (
+          EXISTS (
+            SELECT 1
+              FROM leases le
+              JOIN units u ON u.id = le.unit_id
+             WHERE u.landlord_id = l.id
+               AND le.status = 'active'
+               AND le.start_date <= ($1::date + INTERVAL '1 month' - INTERVAL '1 day')
+               AND (le.end_date IS NULL OR le.end_date >= $1::date))
+          -- S652 (Nic): "We charge for anything occupied, no matter the status."
+          -- An owner_use space has no lease by design — that is the anti-cheat,
+          -- so a landlord cannot park a relative in a spot and call it rented.
+          -- But a landlord whose only occupancy was owner-use would have sat in
+          -- grace forever: no lease to find, so never activated, so never
+          -- billed, however many spaces were full.
+          OR EXISTS (
+            SELECT 1 FROM units u
+             WHERE u.landlord_id = l.id AND u.status = 'owner_use'
+               AND u.retired_at IS NULL)
+        )`,
     [monthIso],
   )
   return res.rowCount ?? 0

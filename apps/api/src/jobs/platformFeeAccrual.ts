@@ -484,7 +484,31 @@ async function accrueOneProperty(
          AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
          AND (l.end_date IS NULL OR l.end_date >= $2::date)
     `, [propertyId, monthIso])
-    const longTermUnitCount = ltRes.rows[0].c
+
+    // ── S652: OWNER-OCCUPIED SPACES ARE OCCUPIED ─────────────────────────
+    //
+    // Nic: "we absolutely charge the landlords for owner occupied units. We
+    // don't charge for vacant units. We charge for anything occupied, no matter
+    // the status."
+    //
+    // This count is lease-driven, and an owner_use space deliberately has no
+    // lease — that is the anti-cheat, so a landlord cannot park a relative in a
+    // space and call it rented. But "no lease" was quietly doing a second job it
+    // was never meant to do: making the space free to run. The space is full,
+    // the landlord cannot rent it to anybody else, and GAM is carrying it in
+    // every report and every screen exactly like a tenanted one.
+    //
+    // Counted separately and added, rather than folded into the lease query: an
+    // owner_use unit has nothing to join to, and a LEFT JOIN that tried would
+    // put the anti-cheat and the billing rule in one expression where the next
+    // person to touch either would break the other.
+    const ownerRes = await client.query<{ c: number }>(`
+      SELECT COUNT(*)::int AS c FROM units
+       WHERE property_id = $1 AND status = 'owner_use' AND retired_at IS NULL`,
+      [propertyId])
+    const ownerOccupiedCount = ownerRes.rows[0].c
+
+    const longTermUnitCount = ltRes.rows[0].c + ownerOccupiedCount
 
     // ── Utility-service spaces (S615) ────────────────────────────────────
     // Nic: "It is technically a unit, so it needs to be billed at two dollars."

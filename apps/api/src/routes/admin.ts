@@ -1696,15 +1696,35 @@ const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
   all:       { start: `'1970-01-01'::timestamptz`,             label: 'All time' },
 }
 
+/**
+ * S652 — OCCUPIED MEANS NOT VACANT. It does not mean 'active'.
+ *
+ * Nic: "we absolutely charge the landlords for owner occupied units. We don't
+ * charge for vacant units. We charge for anything occupied, no matter the
+ * status."
+ *
+ * This counted `status='active'` and handed the result to a function whose
+ * parameter is literally named `occupiedUnits`. Ten delinquent spaces —
+ * one at Mountain View, nine at Oak Park — were silently dropped: somebody
+ * lives in every one of them and owes rent, which is the opposite of vacant.
+ * That is the whole of the $120-versus-$130 gap Nic spotted, and both of my
+ * explanations for it (owner-occupancy, onboarding grace) were wrong. The
+ * arithmetic: 40 + 15 active plus Springville's $10 floor = $120; add the ten
+ * delinquent spaces at $2 and it is the $130 that was actually billed.
+ *
+ * The accrual itself was always right — it counts units with an ACTIVE LEASE,
+ * and a delinquent tenant still has one. This estimate was the thing that
+ * disagreed with it.
+ */
 async function currentPlatformRunRate(): Promise<number> {
   const propRows = await query<{ occ: string }>(`
-    SELECT COUNT(*) FILTER (WHERE u.status='active')::int AS occ
+    SELECT COUNT(*) FILTER (WHERE u.status <> 'vacant')::int AS occ
       FROM properties p
       JOIN landlords l ON l.id = p.landlord_id
-      LEFT JOIN units u ON u.property_id = p.id
+      LEFT JOIN units u ON u.property_id = p.id AND u.retired_at IS NULL
      WHERE l.is_system IS NOT TRUE
      GROUP BY p.id
-    HAVING COUNT(*) FILTER (WHERE u.status='active') > 0
+    HAVING COUNT(*) FILTER (WHERE u.status <> 'vacant') > 0
   `)
   return propRows.reduce((s, r) => s + launchPlatformFeeForProperty(+r.occ), 0)
 }

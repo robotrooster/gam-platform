@@ -1019,3 +1019,50 @@ describe('a property under a property manager', () => {
     expect(row.rows[0].rate).toBe(2)
   })
 })
+
+/**
+ * S652 — owner-occupied spaces are occupied.
+ *
+ * Nic, correcting me: "we absolutely charge the landlords for owner occupied
+ * units. We don't charge for vacant units. We charge for anything occupied, no
+ * matter the status."
+ *
+ * The count is lease-driven and an owner_use space deliberately has no lease —
+ * that is the anti-cheat, so nobody can park a relative in a spot and call it
+ * rented. "No lease" was quietly doing a second job it was never meant to do:
+ * making the space free to run.
+ */
+describe('S652: an owner-occupied space is billed', () => {
+  it('bills a space the landlord lives in, which has no lease by design', async () => {
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    // A second space, owner-occupied: no lease, not vacant.
+    await db.query(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type)
+       VALUES ($1, $2, 'OWNER 1', 'owner_use', 0, 'mobile_home')`,
+      [stack.propertyId, stack.landlordId])
+
+    const result = await processPlatformFeeAccrual(RUN_DATE)
+    expect(result.errors).toHaveLength(0)
+
+    const { rows } = await db.query<{ total_billable: number }>(
+      `SELECT total_billable FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    // The leased one plus the owner-occupied one.
+    expect(rows[0].total_billable).toBe(2)
+  })
+
+  it('still charges nothing for a vacant space', async () => {
+    // The only free space is an empty one.
+    const stack = await buildPlatformStack({ unitCount: 1, platformFeePayer: 'landlord' })
+    await db.query(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type)
+       VALUES ($1, $2, 'EMPTY 1', 'vacant', 0, 'mobile_home')`,
+      [stack.propertyId, stack.landlordId])
+
+    await processPlatformFeeAccrual(RUN_DATE)
+    const { rows } = await db.query<{ total_billable: number }>(
+      `SELECT total_billable FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(rows[0].total_billable).toBe(1)
+  })
+})

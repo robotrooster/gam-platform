@@ -15,6 +15,16 @@ the pattern matters more than the individual mistakes.
 
 ## Corrections Nic made, and what they changed
 
+**"I don't want it flipped by a person."** On the portal lock I built, where GAM
+reviewed candidates and acted. *"Choice creates the opportunity for
+discrimination."* The manual endpoint is gone and the rule runs itself.
+
+**"That seems like a broken workflow."** On the register's pay-link path for a
+stay, and on my refusing it rather than making it consume inventory.
+
+**"Where is your method coming from?"** On a bug description too vague to argue
+with. "A stay went out on a pay link" hid which of three doors was at fault.
+
 **"One price, and it is the unit's."** Counted by him as the eighth time he had
 said it: *"There's no variation allowed in terms of charging one price in the
 booking flow and one price if they come in and get it on the POS and one price
@@ -99,14 +109,43 @@ is two out of three or two out of two hundred. Writing it found a bug by hand:
 the netting check queried `status = 'succeeded'`, which is not a status that
 exists, so it matched nothing and would have called every landlord uncollectable.
 
-**Reaching out, then the lock.** A landlord GAM cannot collect from is now told
-once, before anything else happens, with the fix and the reassurance that their
-tenants are unaffected. If it comes to it, the portal can be suspended — 402 with
-`ACCOUNT_LOCKED`, never 401, because a 401 bounces a correctly signed-in landlord
-to a login page to retype a working password. The bank-linking route stays open,
-since a lock whose only remedy sits behind the lock is a deadlock. **Flipped by a
-person at GAM, never by a sweep** — the job surfaces candidates. Tenants are
-never touched.
+**Reaching out, then the lock — which no human applies.** A landlord GAM cannot
+collect from is told once, early, with the fix and the reassurance that their
+tenants are unaffected. If it comes to it the portal is suspended, by a standing
+rule running at 09:00: two uncollected billing cycles plus 48 hours, and only
+when there is genuinely no way to collect — no rent moving to net against, no
+bank linked to debit.
+
+I first built this as a list a person at GAM reviewed and acted on. Nic threw it
+out: *"I don't want it flipped by a person... choice creates the opportunity for
+discrimination."* He threw out a dollar trigger with it — a flat $500 is four
+years of patience for a duplex on the $10 minimum and a fortnight for a 300-unit
+portfolio. Two cycles scales itself. It returns 402 with `ACCOUNT_LOCKED`, never
+401, the bank-linking route stays reachable, access is restored automatically
+the moment the balance settles, and tenants are never touched.
+
+**Stays are inventory, at every door.** A cashier could tap a stay item into the
+register cart and press "Email a pay link" — that route had no notion of a site
+or a date to ask for, so it took money and the schedule never heard. My first
+fix refused it; Nic pointed out that refusing is wrong, because *"when I send a
+pay link, it should use up inventory according to what spot was booked and for
+how long."* It now carries the site and takes it off the board when the link is
+SENT, held and unpaid, displaceable by anybody who actually pays.
+
+**The walk-in.** Somebody shows up wanting two nights. The reservation flow had
+one exit — email a deposit link — which is absurd for a man at the counter. It
+has two now, and both commit the inventory at the moment the site is chosen.
+Sending it to the till writes a ticket carrying that booking; ringing it confirms
+THAT booking rather than writing a second one for a site already committed.
+
+**Every number on the admin money page comes from one book.** Nic reproduced the
+discrepancy to the cent — $172.72 in the pies against $218.87 on the card. Three
+books were being added: accruals plus a live run-rate for platform fees, a count
+of background checks times a constant, and adjustments that existed only in the
+ledger. Everything now reads `platform_revenue_ledger`. Recurring revenue is the
+bill that actually went out ($130) rather than a re-derivation from current
+occupancy ($120) — "active now" is not the set that was billable when the bill
+was raised.
 
 **One packet, two signatures, on a brand-new tenancy.** Nic: *"I don't understand
 why it's any different for a brand new tenancy or onboarding."* It isn't. Two
@@ -178,7 +217,8 @@ either way.
 
 ### Design items Nic holds
 11. **Screening: check availability BEFORE the paid background check** — unit
-    type, RV size, has-RV. Untouched.
+    type, RV size, has-RV. Untouched. This is now the oldest untouched item on
+    the list.
 12. **On-demand bank balance refresh button** — four open questions from S650.
 13. **Property settings questionnaire** — S648 idea, deferred.
 14. **Work-trade redesign.**
@@ -205,3 +245,6 @@ either way.
 - **Oak Park's register Stays items.** Its prices were always on its units; the
   three buttons now exist.
 - **Tenants as POS customers.** Already true — the picker has always unioned them.
+  The register can now charge their saved card, which is what was actually missing.
+- **Whether a pay link for a stay should be refused.** It should not; it consumes
+  inventory like every other door.
