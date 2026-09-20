@@ -43,7 +43,10 @@ const LAUNCH_HIDE_CHARGE = true
 // case now shows an empty dropdown until /pos/categories resolves;
 // landlord can't submit an item without a real category id anyway.
 
-interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean }
+// S651: stayUnit is set only on a STAY item (a night, a week or a month per
+// unit of quantity). Its presence is what makes the register ask for a site and
+// an arrival date before it will take the money — see StayDetailsModal.
+interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null }
 
 
 // POS money/quantity fields are never negative. Spread {...nonNeg} into every
@@ -63,6 +66,16 @@ export function POSPage() {
   const [tab, setTab] = useState<'register'|'history'|'paylinks'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
 
   const [cart, setCart] = useState<CartItem[]>([])
+  // S651: the site + dates + guest for a stay in the cart. Held here rather
+  // than inside the modal so the details survive the modal closing, and so
+  // checkout can refuse to run without them.
+  const [stay, setStay] = useState<any | null>(null)
+  const [stayModal, setStayModal] = useState(false)
+  // The stay line in the cart, if there is one. Only ONE kind of stay can be
+  // sold at a time — two different lengths on one sale have no single set of
+  // dates, and the server refuses it too.
+  const stayLine = cart.find(i => !!i.stayUnit) || null
+  const stayInCart = !!stayLine
   // S536: browser-neutral — no native alert(); transient in-app notice.
   const [stockNotice, setStockNotice] = useState<string | null>(null)
   const showStockNotice = (msg: string) => {
@@ -379,7 +392,7 @@ export function POSPage() {
       // pre-check above can read a stale cart; the updater always sees
       // the latest state and is the hard guarantee.
       if (ex) return c.map(x => x.id===item.id ? {...x,qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
-      return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, _sessionItemId: clientItemId } as any]
+      return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, stayUnit:item.stayUnit ?? null, _sessionItemId: clientItemId } as any]
     })
   }
   // S536 (Nic): absolute-quantity setter — the register quantity is
@@ -474,6 +487,10 @@ export function POSPage() {
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
       stripePaymentIntentId: stripePaymentIntentId || null,
+      // S651: present only when a stay is in the cart. The server derives the
+      // dates from the item and its quantity; this is the part only the
+      // cashier knows.
+      stay: stay || null,
     }),
     { onSuccess: async (res:any) => {
       setReceipt({ ...res.data, cartItems:cart, subtotal, discountAmt, taxAmount, surcharge, total, changeDue, method })
@@ -491,7 +508,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null)
+      setCart([]); setCashGiven(''); setTenantId(''); setPosCustomerId(''); setAppliedDiscount(null); setStay(null)
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
     }}
@@ -949,6 +966,15 @@ export function POSPage() {
               {terminalStatus==='capturing'&&<div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Capturing payment…</div>}
               {terminalStatus==='error'&&terminalError&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>{terminalError}</div>}
             </div>)}
+            {/* S651: a stay cannot be rung without a site and an arrival date,
+                so the button says what it needs instead of failing on submit.
+                Once set, the site and dates show above it. */}
+            {stayInCart && (stay
+              ? <button className="btn btn-ghost btn-sm" style={{width:'100%',marginBottom:6,textAlign:'left'}}
+                        onClick={()=>setStayModal(true)}>
+                  {stay.siteLabel} · {stay.checkIn} → {stay.checkOut} · {stay.guestName}
+                </button>
+              : null)}
             <button className="btn btn-primary" style={{width:'100%'}} disabled={
               cart.length===0
               || checkoutMut.isLoading
@@ -956,8 +982,13 @@ export function POSPage() {
               || terminalStatus==='capturing'
               || (method==='charge' && (chargeBlocked || !registerProperty || (!tenantId && !posCustomerId)))
               || (method==='card' && !registerProperty)
-            } onClick={()=>method==='card'?chargeWithReader():checkoutMut.mutate(undefined)}>
-              {checkoutMut.isLoading?'Processing...':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…':'Charge '+fmt(total)}
+            } onClick={()=>{
+              if (stayInCart && !stay) { setStayModal(true); return }
+              method==='card'?chargeWithReader():checkoutMut.mutate(undefined)
+            }}>
+              {checkoutMut.isLoading?'Processing...':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…'
+               :stayInCart&&!stay?'Pick a site and dates'
+               :'Charge '+fmt(total)}
             </button>
             {/* S648 (Nic): "generate an item, a charge and send it to a link so
                 they can pay by email." The same cart, paid later by card. */}
@@ -1672,6 +1703,112 @@ export function POSPage() {
           <button className="btn btn-primary" onClick={()=>refundMut.mutate()} disabled={refundMut.isLoading}>Process Refund</button>
         </div>
       </div></div>)}
+      {/* ── S651: the stay's site, dates and guest ────────────────────────
+          The register could already sell "RV site — daily" and take the money
+          without recording a site or a date, so the schedule never heard about
+          it and somebody sat on a spot the software thought was empty.
+
+          Only three things are asked, because only three cannot be derived:
+          when they arrive, which site, and who it is for. The length comes from
+          the item and the quantity already rung — Nic: "You add two of those,
+          it's two days or two weeks or two months." */}
+      {stayModal&&stayLine&&(<div className="modal-overlay" onClick={()=>setStayModal(false)}>
+        <div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
+          <StayDetailsModal
+            line={stayLine}
+            propertyId={registerProperty}
+            initial={stay}
+            onCancel={()=>setStayModal(false)}
+            onDone={(d:any)=>{ setStay(d); setStayModal(false) }}
+          />
+        </div>
+      </div>)}
     </div>
+  )
+}
+
+
+/**
+ * S651 — what the cashier fills in for a stay.
+ *
+ * The site list is what is ACTUALLY FREE for those dates, from the server,
+ * using the same three-way test the booking site uses: another booking, a
+ * lease, or an out-of-order window. Showing every site and letting the sale
+ * fail afterwards would put the error in front of a customer standing at the
+ * counter instead of in front of the cashier choosing.
+ */
+function StayDetailsModal({ line, propertyId, initial, onCancel, onDone }: {
+  line: any; propertyId: string; initial: any
+  onCancel: () => void; onDone: (d: any) => void
+}) {
+  const today = new Date().toISOString().slice(0, 10)
+  const [checkIn, setCheckIn] = useState<string>(initial?.checkIn || today)
+  const [unitId, setUnitId] = useState<string>(initial?.unitId || '')
+  const [guestName, setGuestName] = useState<string>(initial?.guestName || '')
+  const [guestPhone, setGuestPhone] = useState<string>(initial?.guestPhone || '')
+
+  const { data, isFetching, error } = useQuery<any>(
+    ['stay-availability', propertyId, checkIn, line.stayUnit, line.qty],
+    () => apiGet(`/pos/stays/available?propertyId=${propertyId}&checkIn=${checkIn}&stayUnit=${line.stayUnit}&qty=${line.qty}`),
+    { enabled: !!propertyId && !!checkIn, retry: false, keepPreviousData: true },
+  )
+  const units: any[] = data?.units ?? []
+  // A site chosen for one set of dates may not be free for another, so the
+  // pick clears whenever the dates move it out of the list.
+  useEffect(() => {
+    if (unitId && units.length && !units.some((u: any) => u.id === unitId)) setUnitId('')
+  }, [units, unitId])
+
+  const lengthLabel = line.stayUnit === 'night' ? `${line.qty} night${line.qty === 1 ? '' : 's'}`
+    : line.stayUnit === 'week' ? `${line.qty} week${line.qty === 1 ? '' : 's'}`
+    : `${line.qty} month${line.qty === 1 ? '' : 's'}`
+
+  const ready = !!unitId && !!checkIn && !!guestName.trim()
+
+  return (
+    <>
+      <div className="modal-title" style={{marginBottom:4}}>{line.name}</div>
+      <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:14}}>
+        {lengthLabel}{data?.checkOut ? ` · ${checkIn} → ${data.checkOut}` : ''}
+      </div>
+
+      <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Arriving</label>
+      <input type="date" className="input" style={{width:'100%',marginBottom:12}}
+             value={checkIn} min={today} onChange={e=>setCheckIn(e.target.value)} />
+
+      <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Site</label>
+      {error
+        ? <div style={{fontSize:'.78rem',color:'var(--red)',marginBottom:12}}>
+            {(error as any)?.response?.data?.error || 'Could not check what is free.'}
+          </div>
+        : isFetching && !units.length
+          ? <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:12}}>Checking what is free…</div>
+          : units.length
+            ? <select className="input" style={{width:'100%',marginBottom:12}}
+                      value={unitId} onChange={e=>setUnitId(e.target.value)}>
+                <option value="">Pick a site…</option>
+                {units.map((u:any)=>(
+                  <option key={u.id} value={u.id}>{u.unitNumber}</option>
+                ))}
+              </select>
+            : <div style={{fontSize:'.78rem',color:'var(--amber)',marginBottom:12}}>
+                Nothing is free for those dates. Try a different arrival date.
+              </div>}
+
+      <label style={{fontSize:'.78rem',color:'var(--text-2)'}}>Who is it for</label>
+      <input className="input" style={{width:'100%',marginBottom:12}} placeholder="Name"
+             value={guestName} onChange={e=>setGuestName(e.target.value)} />
+      <input className="input" style={{width:'100%',marginBottom:16}} placeholder="Phone (optional)"
+             value={guestPhone} onChange={e=>setGuestPhone(e.target.value)} />
+
+      <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+        <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" disabled={!ready} onClick={()=>onDone({
+          unitId, checkIn, guestName: guestName.trim(), guestPhone: guestPhone.trim() || null,
+          checkOut: data?.checkOut,
+          siteLabel: units.find((u:any)=>u.id===unitId)?.unitNumber ?? 'Site',
+        })}>Use this site</button>
+      </div>
+    </>
   )
 }

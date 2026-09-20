@@ -544,6 +544,38 @@ async function assertCashierPricing(req: any, lines: { itemId?: string | null; p
   }
 }
 
+/**
+ * S651 — which of these cart lines are stays, and what does one of each buy?
+ *
+ * Read from pos_items.stay_unit, never inferred from the item's name. A park
+ * that calls its item "Nightly RV" or "Cabin - wk" must work the same as one
+ * that calls it "RV site — daily", and a name is not a contract.
+ *
+ * lineTotal is what the counter is charging for those nights — the register's
+ * own price, carried through to the booking untouched.
+ */
+async function resolveStayLines(landlordId: string, items: any[]): Promise<any[]> {
+  const ids = [...new Set((items || []).map((it: any) => it.id).filter(Boolean))]
+  if (!ids.length) return []
+  const rows = await query<{ id: string; name: string; stay_unit: string | null }>(
+    `SELECT id, name, stay_unit FROM pos_items
+      WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
+    [ids, landlordId])
+  if (!rows.length) return []
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  return (items || [])
+    .filter((it: any) => it.id && byId.has(it.id))
+    .map((it: any) => {
+      const row = byId.get(it.id)!
+      const qty = Number(it.qty) || 0
+      return {
+        itemId: it.id, qty, stayUnit: row.stay_unit as 'night' | 'week' | 'month',
+        name: row.name,
+        lineTotal: Math.round((Number(it.price) || 0) * qty * 100) / 100,
+      }
+    })
+}
+
 async function serverCartTotals(landlordId: string, items: any[], paymentMethod: string | undefined,
                                 discountAmount: number | undefined, clientSurcharge?: number,
                                 propertyId?: string | null) {
@@ -615,9 +647,59 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
   } catch (e) { next(e) }
 })
 
+// GET /api/pos/stays/available — which sites can actually take this stay.
+//
+// S651. The cashier picks from what is FREE, not from a list of every site with
+// a cross through the taken ones after the fact. Same three-way test the
+// storefront uses — another booking, a lease, or an out-of-order window — so
+// the counter and the booking site can never disagree about a site.
+// (memory: gam-out-of-order-sites)
+posRouter.get('/stays/available', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = String(req.query.propertyId ?? '')
+    const checkIn = String(req.query.checkIn ?? '')
+    const stayUnit = String(req.query.stayUnit ?? 'night') as 'night' | 'week' | 'month'
+    const qty = Number(req.query.qty ?? 1)
+    if (!propertyId) throw new AppError(400, 'A property must be selected')
+    if (!['night', 'week', 'month'].includes(stayUnit)) throw new AppError(400, 'Unknown stay length')
+    await assertPropertyInScope(req.user, propertyId)
+
+    const { checkOutFor, nightsBetween } = await import('../services/registerStay')
+    const checkOut = checkOutFor(checkIn, stayUnit, qty)
+
+    const units = await query<any>(
+      `SELECT u.id, u.unit_number, u.unit_type, u.rv_site_layout, u.rv_amp_service
+         FROM units u
+        WHERE u.property_id = $1
+          AND u.landlord_id = $2
+          AND u.retired_at IS NULL
+          AND u.status = 'vacant'
+          AND NOT EXISTS (
+            SELECT 1 FROM unit_bookings b
+             WHERE b.unit_id = u.id AND b.status <> 'cancelled'
+               AND NOT (b.status = 'tentative' AND b.hold_expires_at IS NOT NULL AND b.hold_expires_at < now())
+               AND b.check_in < $4::date AND b.check_out > $3::date)
+          AND NOT EXISTS (
+            SELECT 1 FROM leases l
+             WHERE l.unit_id = u.id AND l.status IN ('active','pending')
+               AND l.start_date < $4::date AND (l.end_date IS NULL OR l.end_date > $3::date))
+          AND NOT unit_out_of_order_overlaps(u.id, $3::date, $4::date)
+        ORDER BY u.unit_number`,
+      [propertyId, posLandlordId(req), checkIn, checkOut])
+
+    res.json({ success: true, data: {
+      checkIn, checkOut, nights: nightsBetween(checkIn, checkOut), units,
+    } })
+  } catch (e) { next(e) }
+})
+
 posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason } = req.body
+    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason,
+            // S651: present only when the cart contains a stay — the site, the
+            // arrival date and who it is for. Everything else about the stay is
+            // derived from the item and its quantity.
+            stay } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError(400, 'items array required')
     }
@@ -687,6 +769,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         throw new AppError(403, 'FlexCharge account belongs to a different landlord')
       }
       flexChargeAccountId = account.id
+    }
+
+    // ── S651: is this sale a stay? ──────────────────────────────────────
+    //
+    // Read from the ITEM, never from its name: pos_items.stay_unit says what
+    // one of these buys. An item with it set cannot be sold without a site and
+    // a date, because the whole point is that the schedule hears about it.
+    const stayLines = await resolveStayLines(posLandlordId(req), items)
+    if (stayLines.length && !stay) {
+      throw new AppError(400,
+        'A stay needs a site and an arrival date before it can be rung up.')
+    }
+    if (!stayLines.length && stay) {
+      throw new AppError(400, 'Nothing in this sale is a stay.')
     }
 
     // S554: ONE shared cart-total calc — calculateCartTax (S241 server tax,
@@ -782,6 +878,21 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         throw e
       }
 
+      // S651: the booking goes in on the SAME transaction as the sale. A site
+      // that turns out to be taken rolls the money back rather than leaving a
+      // paid stay nobody can actually have.
+      let stayBooking: { bookingId: string; checkIn: string; checkOut: string; nights: number } | null = null
+      if (stayLines.length) {
+        const { createStayBooking } = await import('../services/registerStay')
+        stayBooking = await createStayBooking(client, {
+          landlordId: posLandlordId(req),
+          propertyId,
+          posTransactionId: tx.id,
+          lines: stayLines,
+          details: stay,
+        })
+      }
+
       // S254: post the FlexCharge transaction record. Has its own row-lock
       // + credit-limit + landlord-disqualification gate. S341: now runs on
       // the same client so it's part of this transaction — a balance/limit
@@ -816,7 +927,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         catch (e) { logger.error({ err: e, itemId: item.id }, '[POS] Post-commit auto-PO error:') }
       }
 
-      res.status(201).json({ success: true, data: tx })
+      // S651: hand the booking back so the register can print it on the
+      // receipt and show the cashier which site and dates they just sold.
+      res.status(201).json({ success: true, data: { ...tx, stayBooking } })
     } catch (e) {
       if (txnOpen) await client.query('ROLLBACK').catch(() => {})
       throw e
