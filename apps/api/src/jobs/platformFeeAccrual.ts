@@ -100,8 +100,25 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   //
   // So the run bills the month that just ENDED. Money still moves once: the
   // fee comes out of rent that is being disbursed to the landlord anyway.
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
-  const monthIso   = monthStart.toISOString().slice(0, 10)
+  // ── S650 (Nic): CHARGE UP FRONT WHAT CAN BE CHARGED UP FRONT ────────────
+  //
+  //   "We only bill in arrears for things that have to be billed in arrears.
+  //    Everything that can be charged up front, we do charge up front... the
+  //    leases are billed at that time. So October 1st we're going to bill
+  //    arrears for aggregate for September, and October's platform
+  //    subscription."
+  //
+  // A lease is known on the 1st: you know who is there and which spots are
+  // taken, so that part is billed for the month STARTING. Short-stay nights
+  // cannot be known in advance — a spot might turn over five times — so those
+  // stay in arrears for the month just ended, and land on the same bill.
+  //
+  // S637's all-arrears behaviour is why September's fee had to be run by hand:
+  // the run on the 1st was still billing the month before it.
+  const monthStart   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  const monthIso     = monthStart.toISOString().slice(0, 10)
+  const arrearsStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1))
+  const arrearsIso   = arrearsStart.toISOString().slice(0, 10)
 
   const result: AccrualResult = {
     monthScanned: monthIso,
@@ -142,7 +159,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
 
   for (const prop of properties) {
     try {
-      const outcome = await accrueOneProperty(prop.id, prop.landlord_id, monthIso)
+      const outcome = await accrueOneProperty(prop.id, prop.landlord_id, monthIso, arrearsIso)
       if      (outcome === 'accrued')         result.feesAccrued++
       else if (outcome === 'zero')            result.skippedZero++
       else if (outcome === 'already_accrued') result.skippedAlreadyAccrued++
@@ -397,7 +414,9 @@ type AccrualOutcome = 'accrued' | 'zero' | 'already_accrued' | 'pre_billing'
 async function accrueOneProperty(
   propertyId: string,
   landlordId: string,
-  monthIso: string
+  monthIso: string,
+  /** S650: the month whose short-stay nights ride along on this bill. */
+  arrearsIso: string,
 ): Promise<AccrualOutcome> {
   const client = await getClient()
   try {

@@ -1730,15 +1730,16 @@ export function schedulerInit() {
     }
   })
 
-  // S650 (Nic): "I want those numbers to match up." On the 5th, once Stripe's
-  // invoices for last month have landed, true the revenue ledger up to what
-  // actually happened — and do the month before as well, in case an invoice
-  // arrived late.
-  cron.schedule('0 6 5 * *', async () => {
+  // S650 (Nic): "I want it synced up with the margin so far, the real numbers
+  // that have actually happened... we can still true up as more payments are
+  // made." So it runs EVERY day over the current month and the one before it,
+  // recomputing rather than stacking — the books track reality as it lands
+  // instead of waiting for the month to close.
+  cron.schedule('0 6 * * *', async () => {
     try {
       const { trueUpProcessingMargin } = await import('../services/platformRevenue')
       const now = new Date()
-      for (const back of [1, 2]) {
+      for (const back of [0, 1]) {
         const m = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1))
         const r = await trueUpProcessingMargin(m.toISOString().slice(0, 10))
         if (r.adjustment !== 0) logger.info(r, '[processing-margin-true-up]')

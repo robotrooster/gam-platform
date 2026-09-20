@@ -158,9 +158,15 @@ export async function trueUpProcessingMargin(monthIso: string): Promise<{
          WHERE type = 'banking_spread' AND reference_type <> 'payment'
            AND to_char(date_trunc('month', created_at), 'YYYY-MM') = $1)::text AS other`,
     [month])
+  // PROCESSING costs only. S650: 'bank_linking' is the Financial Connections
+  // subscription — the bank-feed product, billed monthly whether or not a
+  // single tenant pays. Counting it here made August's processing margin look
+  // like a $10.92 loss on $0 of payments. It is an operating cost, not a cost
+  // of taking somebody's rent.
   const [costs] = await query<{ amt: string }>(
     `SELECT COALESCE(SUM(amount), 0)::text AS amt FROM stripe_processing_costs
-      WHERE to_char(date_trunc('month', COALESCE(period_start, posted_at::date)), 'YYYY-MM') = $1`,
+      WHERE to_char(date_trunc('month', COALESCE(period_start, posted_at::date)), 'YYYY-MM') = $1
+        AND category <> 'bank_linking'`,
     [month])
   // Its own previous true-up for the month is REPLACED, not added to — so the
   // figure is recomputed from scratch every time and running it twice cannot
@@ -169,10 +175,15 @@ export async function trueUpProcessingMargin(monthIso: string): Promise<{
     `DELETE FROM platform_revenue_ledger
       WHERE type = 'adjustment' AND reference_type = 'processing_margin_true_up'
         AND to_char(date_trunc('month', created_at), 'YYYY-MM') = $1`, [month])
+  // What the books already say this month's PROCESSING margin is: the per-payment
+  // spreads, plus any correction posted against one of them (a spread reversed
+  // because it was booked against a payment that does not exist). Platform fees
+  // and screening margin are separate earnings and are not part of this figure.
   const [recorded] = await query<{ amt: string }>(
     `SELECT COALESCE(SUM(amount), 0)::text AS amt FROM platform_revenue_ledger
       WHERE to_char(date_trunc('month', created_at), 'YYYY-MM') = $1
-        AND type = 'banking_spread'`,
+        AND (type = 'banking_spread'
+             OR (type = 'adjustment' AND reference_type IN ('payment', 'background_check')))`,
     [month])
   const feesCharged = round2(parseFloat(fees.rent) + parseFloat(fees.other))
   const stripeCost = round2(parseFloat(costs.amt))

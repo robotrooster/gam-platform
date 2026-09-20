@@ -1174,6 +1174,9 @@ function Overview(){
             <div>
               <div className="kl">Stripe took</div>
               <div className="kv r" style={{fontSize:'1.5rem'}}>−{formatCurrency(m.stripeCost)}</div>
+              {/* S650: the bank-feed subscription is billed monthly whether or not
+                  anybody pays rent, so it sits beside the margin, not inside it. */}
+              {m.bankFeedCost>0&&<div className="ks">plus {formatCurrency(m.bankFeedCost)} bank feed (not processing)</div>}
             </div>
             <div>
               <div className="kl">We keep</div>

@@ -153,7 +153,9 @@ export async function syncStripeCosts(opts: { lookbackDays?: number } = {}): Pro
 export interface MarginRow {
   month: string
   feeRevenue: number      // what tenants were charged
-  stripeCost: number      // what Stripe charged GAM, posted that month
+  stripeCost: number      // what Stripe charged GAM to PROCESS payments that month
+  /** S650: the bank-feed subscription — an operating cost, not processing. */
+  bankFeedCost: number
   margin: number
   marginPct: number | null
   byCategory: Array<{ category: CostCategory; label: string; amount: number }>
@@ -194,10 +196,19 @@ export async function marginByMonth(months = 6): Promise<MarginRow[]> {
   return [...monthsSet].sort().reverse().map(month => {
     const feeRevenue = Math.round(parseFloat(revenue.find(r => r.month === month)?.fee ?? '0') * 100) / 100
     const cats = costs.filter(c => c.month === month)
-    const stripeCost = Math.round(cats.reduce((s, c) => s + parseFloat(c.amount), 0) * 100) / 100
+    // S650 (Nic): the bank-feed subscription (Financial Connections) is billed
+    // monthly whether or not a single tenant pays, so it is an operating cost,
+    // not the cost of taking somebody's rent. Counting it here made August read
+    // as a $10.92 loss on zero payments, and put this card at odds with the
+    // revenue ledger. Shown on its own instead.
+    const isProcessing = (c: { category: string }) => c.category !== 'bank_linking'
+    const stripeCost = Math.round(cats.filter(isProcessing)
+      .reduce((s, c) => s + parseFloat(c.amount), 0) * 100) / 100
+    const bankFeedCost = Math.round(cats.filter(c => !isProcessing(c))
+      .reduce((s, c) => s + parseFloat(c.amount), 0) * 100) / 100
     const margin = Math.round((feeRevenue - stripeCost) * 100) / 100
     return {
-      month, feeRevenue, stripeCost, margin,
+      month, feeRevenue, stripeCost, margin, bankFeedCost,
       marginPct: feeRevenue > 0 ? Math.round((margin / feeRevenue) * 1000) / 10 : null,
       byCategory: COST_CATEGORIES
         .map(category => ({
