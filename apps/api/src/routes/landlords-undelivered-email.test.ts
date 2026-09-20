@@ -54,6 +54,13 @@ async function logEmail(landlordId: string, to: string, opts: {
      opts.event ?? null, opts.at])
 }
 
+/** Somebody who actually holds the address — otherwise it is nobody's problem. */
+async function seedUser(email: string) {
+  await query(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name)
+     VALUES ($1,'x','tenant','Test','Person')`, [email])
+}
+
 async function ask(userId: string, landlordId: string) {
   return request(buildApp())
     .get('/api/landlords/me/undelivered-email')
@@ -70,6 +77,7 @@ describe('GET /api/landlords/me/undelivered-email', () => {
     try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }
     finally { c.release() }
 
+    await seedUser('arnoldo@icloud.com')
     await logEmail(landlordId, 'arnoldo@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
     const res = await ask(userId, landlordId)
     expect(res.status).toBe(200)
@@ -102,10 +110,48 @@ describe('GET /api/landlords/me/undelivered-email', () => {
     try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }
     finally { c.release() }
 
+    await seedUser('pending@icloud.com')
     await logEmail(landlordId, 'pending@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
     await logEmail(landlordId, 'pending@icloud.com', { event: null,      at: '2026-09-19T12:00:00Z' })
     const res = await ask(userId, landlordId)
     expect(res.body.data.map((r: any) => r.email)).toEqual(['pending@icloud.com'])
+  })
+
+  it('forgets an address nobody holds any more', async () => {
+    // Nic, on the first version of this: four of the five it flagged were typos
+    // caught at onboarding and already superseded — "the person actually has
+    // their account now". An address with no account and no live invitation
+    // behind it cannot make anybody unreachable, and listing it forever is the
+    // crying-wolf failure this endpoint exists to avoid.
+    const c = await db.connect()
+    let landlordId = '', userId = ''
+    try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }
+    finally { c.release() }
+
+    await logEmail(landlordId, 'typo-at-onboarding@icloud.com', { event: 'bounced', at: '2026-09-01T12:00:00Z' })
+    expect((await ask(userId, landlordId)).body.data).toEqual([])
+  })
+
+  it('still flags a tenant who was invited and never got the email', async () => {
+    // The most important person on this list: someone with no lease and no
+    // logins BECAUSE the invite bounced. A tenant invite creates the user row
+    // and hangs a token off it (users.tenant_invite_token) — `invitations` is
+    // team roles only and its CHECK refuses 'tenant' — so the users test above
+    // is what keeps them visible. Rashawn Bump's exact shape.
+    const c = await db.connect()
+    let landlordId = '', userId = ''
+    try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }
+    finally { c.release() }
+
+    await query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          email_verified, tenant_invite_token, tenant_invite_expires_at)
+       VALUES ($1,'x','tenant','Never','Arrived', FALSE, 'tok', NOW() + INTERVAL '7 days')`,
+      ['never-arrived@icloud.com'])
+    await logEmail(landlordId, 'never-arrived@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
+
+    const res = await ask(userId, landlordId)
+    expect(res.body.data.map((r: any) => r.email)).toEqual(['never-arrived@icloud.com'])
   })
 
   it('never shows another company’s bounces', async () => {
@@ -116,6 +162,7 @@ describe('GET /api/landlords/me/undelivered-email', () => {
       const b = await seedLandlord(c); theirs = b.landlordId
     } finally { c.release() }
 
+    await seedUser('somebody-elses-tenant@icloud.com')
     await logEmail(theirs, 'somebody-elses-tenant@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
     const res = await ask(myUser, mine)
     expect(res.body.data).toEqual([])

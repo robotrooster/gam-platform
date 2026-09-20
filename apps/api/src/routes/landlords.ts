@@ -6823,9 +6823,33 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
 
     const rows = await query<any>(
       `WITH mine AS (
-         -- every address this account has mailed, from its own send log
-         SELECT DISTINCT lower(to_email) AS em
-           FROM email_send_log WHERE landlord_id = ANY($1::uuid[])
+         -- Addresses that are STILL SOMEBODY'S ADDRESS — a user account, or an
+         -- invitation still waiting to be accepted.
+         --
+         -- S651, after Nic read the first version: four of the five it flagged
+         -- were typos caught at onboarding and already superseded. "Those were
+         -- also bounced because of typo at onboarding... the person actually
+         -- has their account now." Keying on the address alone meant every
+         -- address ever mistyped stayed on this list for good, describing a
+         -- problem that had been fixed weeks earlier — which is precisely the
+         -- crying-wolf failure the rest of this endpoint is built to avoid.
+         --
+         -- The question is not "did an address ever bounce" but "is somebody
+         -- unreachable right now", and an address nobody holds any more cannot
+         -- make anybody unreachable. A dead address drops off the moment the
+         -- person is moved to a working one, which is exactly when the landlord
+         -- has finished dealing with it.
+         SELECT DISTINCT lower(e.to_email) AS em
+           FROM email_send_log e
+          WHERE e.landlord_id = ANY($1::uuid[])
+            AND (
+              EXISTS (SELECT 1 FROM users u2 WHERE lower(u2.email) = lower(e.to_email))
+              OR EXISTS (SELECT 1 FROM invitations i2
+                          WHERE lower(i2.email) = lower(e.to_email)
+                            AND i2.landlord_id = ANY($1::uuid[])
+                            AND i2.status = 'pending'
+                            AND i2.revoked_at IS NULL)
+            )
        ),
        verdict AS (
          SELECT DISTINCT ON (lower(e.to_email))
@@ -6848,10 +6872,16 @@ landlordsRouter.get('/me/undelivered-email', requirePerm('tenants.create'), asyn
                  JOIN units  un ON un.id = l.unit_id
                 WHERE lt.tenant_id = t.id AND lt.status = 'active'
                 ORDER BY l.created_at DESC LIMIT 1) AS unit_number,
-              (SELECT i.scope_payload->>'unitNumber' FROM invitations i
-                WHERE lower(i.email) = v.em AND i.landlord_id = ANY($1::uuid[])
-                  AND i.status = 'pending'
-                ORDER BY i.created_at DESC LIMIT 1) AS invited_unit_number
+              -- A tenant invite does not live in the invitations table (that
+              -- one is team roles only; its CHECK refuses 'tenant'). The
+              -- invite creates the USER and hangs a token off it, and the unit
+              -- they were invited to is on the open onboarding intent.
+              (SELECT un.unit_number
+                 FROM pending_tenant_intents pti
+                 JOIN units un ON un.id = pti.unit_id
+                WHERE pti.tenant_id = t.id
+                  AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
+                ORDER BY pti.created_at DESC LIMIT 1) AS invited_unit_number
          FROM verdict v
          LEFT JOIN users u   ON lower(u.email) = v.em
          LEFT JOIN tenants t ON t.user_id = u.id
