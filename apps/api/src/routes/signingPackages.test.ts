@@ -456,3 +456,73 @@ describe('S652: a household lease uses the roles its template binds to', () => {
     }
   })
 })
+
+/**
+ * S652 — the right lead-paint disclosure in front of the right household.
+ *
+ * Nic: "the goal was to have the package set up so you needed to detect who was
+ * on rent to own or already tenant owned homes and apply that to the thing, and
+ * have the leases that are just not on rent to own as the leased lead based
+ * paint disclosure. The whole reason we built the packages process was for this
+ * property."
+ *
+ * Blu uploaded two — "Mattoon LBP - Lease" and "Mattoon LBP - Sale" — because
+ * the federal disclosure differs between selling a home and renting one. What
+ * decides which is the TRANSACTION, and the database already knows it: a live
+ * home-sale contract means a sale, a tenant-owned dwelling means the landlord is
+ * renting land, and everything else is renting a home out.
+ */
+describe('S652: the packet picks the disclosure that matches the transaction', () => {
+  let transactionKindForUnit: any
+  beforeEach(async () => {
+    ({ transactionKindForUnit } = await import('../services/signingPackages'))
+  })
+
+  it('a home being bought on installments is a sale', async () => {
+    const f = await seedSignableUnit()
+    await db.query(
+      `INSERT INTO home_sale_contracts
+         (unit_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1,$2,$3,24000,0,24000,0,55,400,'2026-11-01','pending_signature',55)`,
+      [f.unitA, f.tenantId, f.a.landlordId])
+    expect(await transactionKindForUnit(f.unitA)).toBe('sale')
+  })
+
+  it('a household that already owns its home is renting the lot', async () => {
+    const f = await seedSignableUnit()
+    await db.query(`UPDATE units SET dwelling_ownership='tenant' WHERE id=$1`, [f.unitA])
+    expect(await transactionKindForUnit(f.unitA)).toBe('lot')
+  })
+
+  it('a park-owned home with no sale is a rental', async () => {
+    const f = await seedSignableUnit()
+    await db.query(`UPDATE units SET dwelling_ownership='landlord' WHERE id=$1`, [f.unitA])
+    expect(await transactionKindForUnit(f.unitA)).toBe('rental')
+  })
+
+  it('a sale in flight beats the ownership flag, because ownership flips at payoff', async () => {
+    // The home is still the park's on paper all the way through the contract;
+    // what is being papered today is the sale.
+    const f = await seedSignableUnit()
+    await db.query(`UPDATE units SET dwelling_ownership='landlord' WHERE id=$1`, [f.unitA])
+    await db.query(
+      `INSERT INTO home_sale_contracts
+         (unit_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1,$2,$3,24000,0,24000,0,55,400,'2026-11-01','active',55)`,
+      [f.unitA, f.tenantId, f.a.landlordId])
+    expect(await transactionKindForUnit(f.unitA)).toBe('sale')
+  })
+
+  it('a cancelled sale does not keep the unit looking like one', async () => {
+    const f = await seedSignableUnit()
+    await db.query(
+      `INSERT INTO home_sale_contracts
+         (unit_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
+          annual_interest_rate, term_months, monthly_payment, start_month, status, installments_total)
+       VALUES ($1,$2,$3,24000,0,24000,0,55,400,'2026-11-01','cancelled',55)`,
+      [f.unitA, f.tenantId, f.a.landlordId])
+    expect(await transactionKindForUnit(f.unitA)).toBe('rental')
+  })
+})

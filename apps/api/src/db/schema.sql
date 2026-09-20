@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict IIJZSZAV2aeg7Kenw0sqiOxSNff0rVoJ7s8SOAcZ16fgTQR3UJX8euxV4grIxTh
+\restrict UjaPYFfeA2czXCdHDyKXGVc2r8BJceHtjtdXxTQ4gsEfg9Z3B7zyGefbCoLV93o
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5587,11 +5587,20 @@ CREATE TABLE public.lease_templates (
     purpose text DEFAULT 'lease'::text NOT NULL,
     late_fee_terms jsonb,
     version integer DEFAULT 1 NOT NULL,
+    applies_to text DEFAULT 'any'::text NOT NULL,
+    CONSTRAINT lease_templates_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'sale'::text, 'rental'::text]))),
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
     CONSTRAINT lease_templates_purpose_check CHECK ((purpose = ANY (ARRAY['lease'::text, 'work_trade_addendum'::text, 'installment_sale'::text, 'park_rules'::text, 'state_disclosure'::text, 'addendum'::text, 'other'::text]))),
     CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))))
 );
+
+
+--
+-- Name: COLUMN lease_templates.applies_to; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_templates.applies_to IS 'S652: sale = the dwelling is being bought (rent-to-own); rental = the landlord is renting out a dwelling; any = both. Drives which disclosure the packet suggests.';
 
 
 --
@@ -27521,5 +27530,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IIJZSZAV2aeg7Kenw0sqiOxSNff0rVoJ7s8SOAcZ16fgTQR3UJX8euxV4grIxTh
+\unrestrict UjaPYFfeA2czXCdHDyKXGVc2r8BJceHtjtdXxTQ4gsEfg9Z3B7zyGefbCoLV93o
 

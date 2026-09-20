@@ -70,6 +70,43 @@ export async function setTemplateProperties(templateId: string, propertyIds: str
  * landlord can tick it anyway — the platform does not decide what belongs in
  * somebody's lease.
  */
+/**
+ * S652 — what KIND of transaction this household is having.
+ *
+ * Nic: "you needed to detect who was on rent to own or already tenant owned
+ * homes and apply that to the thing, and have the leases that are just not on
+ * rent to own as the leased lead based paint disclosure."
+ *
+ * Three cases at Country Acres, and the database already knows which is which
+ * without anybody keeping a list:
+ *
+ *   'sale'   — the park owns the home and the household is buying it on
+ *              installments. A sale is happening, so sale-side disclosures
+ *              apply on top of the lease for the lot.
+ *   'rental' — the park owns the home and is renting it out. The landlord is
+ *              providing the dwelling, so rental disclosures apply.
+ *   'lot'    — the household already owns their home outright. The landlord is
+ *              renting LAND, not housing, so a disclosure about the condition
+ *              of a dwelling he does not own and does not provide is not his to
+ *              make. Suggested off, never blocked: GAM accommodates, it does
+ *              not rule on what a landlord must sign. (memory:
+ *              gam-never-gate-on-legality)
+ */
+export type TransactionKind = 'sale' | 'rental' | 'lot'
+
+export async function transactionKindForUnit(unitId: string): Promise<TransactionKind> {
+  const unit = await queryOne<{ dwelling_ownership: string | null }>(
+    `SELECT dwelling_ownership FROM units WHERE id = $1`, [unitId])
+  // A sale in flight beats everything: the home is still the park's on paper
+  // (ownership flips at payoff), but a sale is what is being papered today.
+  const sale = await queryOne<{ id: string }>(
+    `SELECT id FROM home_sale_contracts
+      WHERE unit_id = $1 AND status IN ('pending_signature', 'active') LIMIT 1`, [unitId])
+  if (sale) return 'sale'
+  if (unit?.dwelling_ownership === 'tenant') return 'lot'
+  return 'rental'
+}
+
 export async function resolvePackageForUnit(params: {
   landlordId: string
   unitId: string
@@ -94,9 +131,15 @@ export async function resolvePackageForUnit(params: {
         [params.landlordId, unit.unit_type])
   if (!pkg) return null
 
+  // S652: which disclosures belong in front of THIS household.
+  const kind = await transactionKindForUnit(params.unitId)
+  // A lot lease matches neither side — the landlord is renting land, and a
+  // disclosure about a dwelling he does not provide is not his to make.
+  const wantedAppliesTo = kind === 'sale' ? 'sale' : kind === 'rental' ? 'rental' : null
+
   const rows = await query<any>(
     `SELECT i.id AS item_id, i.template_id, i.sort_order, i.renewal_behavior, i.required,
-            t.name AS template_name, t.purpose, t.version,
+            t.name AS template_name, t.purpose, t.version, t.applies_to,
             (SELECT COUNT(*) FROM lease_template_properties tp
               WHERE tp.template_id = t.id)::int AS pin_count,
             EXISTS (SELECT 1 FROM lease_template_properties tp
@@ -118,6 +161,16 @@ export async function resolvePackageForUnit(params: {
     } else if (r.template_unit_type && unit.unit_type && r.template_unit_type !== unit.unit_type) {
       suggested = false
       reason = `Written for ${String(r.template_unit_type).replace(/_/g, ' ')}`
+    } else if (r.applies_to && r.applies_to !== 'any' && r.applies_to !== wantedAppliesTo) {
+      // S652: the sale disclosure on a rental, or the rental one on a sale.
+      // Suggested OFF and said out loud — a landlord who wants it anyway ticks
+      // it, because GAM does not rule on what somebody must sign.
+      suggested = false
+      reason = kind === 'lot'
+        ? 'The household owns their home — this lease is for the lot'
+        : r.applies_to === 'sale'
+          ? 'For a home being sold, and this is a rental'
+          : 'For a home being rented, and this one is being sold'
     } else if (r.required) {
       reason = 'Always included'
     }
