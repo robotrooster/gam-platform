@@ -239,8 +239,34 @@ either way.
 10. **Everything built today is unexercised by a real person** — the reservation
     flow, the card on file, the tickets, the packet.
 
+**What GAM bills for, written down once.** The billable test is now evidence of
+use, in one function both the bill and the admin estimate call: an active lease
+(delinquent and hibernating included), an owner-use space, a utility-service
+space, and short stays as nights ÷ 30. A unit's *status* is not an input and
+must not become one — Nic reads `active` as "available", the landlord at
+Springville set it by hand with no tenant, and it produced a phantom $10.
+
+**A stay cancelled after arrival is a stay.** Nights bill in arrears and the
+accrual runs on the 1st, so excluding anything flagged `cancelled` — with no
+check on when — was a free month for the asking: let them stay, take the money,
+cancel on the 30th. Now exempt only if cancelled before the check-in date, with
+a database trigger stamping the moment so no call site can forget it. No-show is
+out of billing entirely, per Nic: the site was held either way.
+
 ### Waiting on a decision from Nic
-- **Should the portal let a landlord set a unit `active` with no lease?** That is
+- **The rent-free charitable tenancy.** Nic's real scale worry: a large operator
+  housing three or four families rent-free across many properties. Owner-use is
+  now billed so that door is shut, but a landlord who simply never writes a lease
+  (because there is no rent to collect) is invisible. A **$0-rent lease is fully
+  supported and there are zero of them** — nobody knows it is an option. Offering
+  "housed rent-free" as a tenancy type in onboarding probably recovers most of
+  this without any enforcement. If detection is ever wanted: a charitable tenancy
+  leaves no money trail at all, so the bank feed is useless — but utility
+  consumption on a unit the schedule calls empty is close to un-fakeable, and
+  GAM already holds the readings.
+- **Should the portal let a landlord set a unit `active` with no lease?** Nic's
+  answer: yes — "active just means available", and blocking it would stop
+  somebody taking an RV reservation. Settled; billing simply ignores the column. That is
   what happened at Springville, and it fed a wrong number onto GAM's own
   dashboard. The status asserts a tenancy that does not exist. Billing no longer
   reads it, so nothing is at stake financially — but it is a claim the product
