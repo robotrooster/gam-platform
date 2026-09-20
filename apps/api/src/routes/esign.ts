@@ -30,6 +30,7 @@ import {
   leaseDueDay,
   dueDayLabel,
   parseDueDay,
+  GENERIC_SIGNER_ROLES,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -391,6 +392,31 @@ export async function createDocumentRecord(client: any, opts: {
   // Copy template fields — match by signer_role, prune unused role slots
   if (opts.templateId) {
     const filledRoles = new Set(opts.signers.map(s => s.role))
+
+    // S652 — A ROLE THAT BINDS TO NOTHING IS A BUG, NOT AN EMPTY SLOT.
+    //
+    // Pruning unused role slots is correct and deliberate: a one-tenant lease
+    // should not carry co_tenant_3's signature box. But the same silence hid a
+    // real defect for thirteen Country Acres leases. draftHouseholdLease
+    // labelled every resident 'tenant' while templates bind to 'primary' and
+    // 'co_tenant_N', so NOT ONE tenant field matched — no name, no initials, no
+    // signature date — and the documents went out looking finished. 70 of 125
+    // fields vanished without a word.
+    //
+    // An ABSENT role is fine. An UNKNOWN one never is: it can only mean the
+    // caller and the templates disagree about the vocabulary, and every field
+    // for the real role is about to be dropped. Fail where it is cheap.
+    const KNOWN_SIGNER_ROLES = new Set([
+      'landlord', 'primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3',
+      ...GENERIC_SIGNER_ROLES,
+    ])
+    const unknown = [...filledRoles].filter(r => r && !KNOWN_SIGNER_ROLES.has(r))
+    if (unknown.length) {
+      throw new AppError(500,
+        `Cannot build this document: signer role${unknown.length > 1 ? 's' : ''} `
+        + `"${unknown.join('", "')}" match no field on any template. `
+        + 'Tenants are primary / co_tenant_1..3.')
+    }
     const tmplFields = await client.query(
       'SELECT * FROM lease_template_fields WHERE template_id=$1',
       [opts.templateId]).then((r: any) => r.rows)

@@ -109,8 +109,26 @@ export async function draftHouseholdLease(args: {
         { userId: signer.userId, role: 'landlord', name: signer.name,
           email: signer.email, phone: signer.phone, orderIndex: 1 },
         // Residents sign after, in household order — primary first.
+        //
+        // S652 — THE ROLE IS THE BINDING, AND 'tenant' BINDS TO NOTHING.
+        //
+        // This said `role: 'tenant'` for every resident while the comment
+        // beside it said "primary first". Lease templates place their fields
+        // against 'primary' and 'co_tenant_1..3' — that vocabulary is what the
+        // roster fill, the initials and the signature dates all look up — so a
+        // signer called 'tenant' matched no field, and every tenant field was
+        // dropped from the document without a word.
+        //
+        // Blu read thirteen Country Acres leases and reported it from the other
+        // end: "Tenant name(s) on page 1 didn't auto populate... page 5 didn't
+        // auto populate... page 7 didn't auto populate... Area for a date on
+        // page 7 didn't auto-populate or give the option to manually enter
+        // anything." 70 of the template's 125 fields never reached the document.
+        // Nobody could have signed those leases correctly.
         ...residents.map((r, i) => ({
-          userId: r.userId, role: 'tenant', name: r.name, email: r.email,
+          userId: r.userId,
+          role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          name: r.name, email: r.email,
           phone: r.phone ?? null, orderIndex: i + 2,
         })),
       ],

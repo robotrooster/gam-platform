@@ -377,3 +377,82 @@ describe('drafting a package as one bundle', () => {
     expect(rows[0].package_group_id).toBeNull()
   })
 })
+
+/**
+ * S652 — the tenant fields that never reached thirteen leases.
+ *
+ * Blu Haws read the Country Acres leases and reported it from the far end:
+ * "Tenant name(s) on page 1 didn't auto populate... page 5 didn't auto
+ * populate... page 7 didn't auto populate... Area for a date on page 7 didn't
+ * auto-populate or give the option to manually enter anything."
+ *
+ * draftHouseholdLease labelled every resident 'tenant'; lease templates bind
+ * their fields to 'primary' and 'co_tenant_1..3'. Nothing matched, so every
+ * tenant field was pruned as an unused role slot — 70 of 125 on those
+ * documents — and they went out looking finished.
+ *
+ * The POST /documents route had always required exactly one 'primary'. The
+ * household draft calls createDocumentRecord DIRECTLY and never met that check,
+ * which is the whole reason this could happen at all.
+ */
+describe('S652: a household lease uses the roles its template binds to', () => {
+  it('drafts residents as primary and co_tenant, and the tenant fields land', async () => {
+    const f = await seedSignableUnit()
+    // A default template for this unit type, with a tenant-bound field on it.
+    await db.query(
+      `UPDATE lease_templates SET base_pdf_url = '/x.pdf' WHERE id = $1`, [f.tplA])
+    await db.query(
+      `INSERT INTO lease_template_fields
+         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+       VALUES ($1,'text','primary','Tenant name','tenant_name',1,10,10,100,20,FALSE,1)`,
+      [f.tplA])
+    // Make it THE default for this unit type, which is how the draft finds it.
+    const { rows: unitRows } = await db.query<any>(
+      `SELECT unit_type FROM units WHERE id = $1`, [f.unitA])
+    await db.query(
+      `UPDATE lease_templates
+          SET unit_type = $2, is_unit_type_default = TRUE, is_active = TRUE, property_id = NULL
+        WHERE id = $1`, [f.tplA, unitRows[0].unit_type])
+
+    const { draftHouseholdLease } = await import('../services/householdLeaseDraft')
+    const res: any = await draftHouseholdLease({
+      landlordId: f.a.landlordId, unitId: f.unitA,
+      residents: [{ userId: f.tenantUserId, name: 'Test Tenant', email: 't@test.dev', phone: null }],
+    })
+    // No escape hatch: if this cannot draft, the test has stopped testing the
+    // thing it is named after and must say so.
+    expect(res.drafted, `did not draft: ${(res as any).reason}`).toBe(true)
+    const { rows: signers } = await db.query<any>(
+      `SELECT role FROM lease_document_signers WHERE document_id = $1 ORDER BY role`, [res.documentId])
+    expect(signers.map((r: any) => r.role)).toContain('primary')
+    expect(signers.map((r: any) => r.role)).not.toContain('tenant')
+
+    const { rows: fields } = await db.query<any>(
+      `SELECT lease_column FROM lease_document_fields
+        WHERE document_id = $1 AND lease_column = 'tenant_name'`, [res.documentId])
+    expect(fields.length).toBeGreaterThan(0)   // the field Blu could not see
+  })
+
+  it('refuses outright to build a document for a role no template knows', async () => {
+    // The guard lives in createDocumentRecord, where the household draft enters
+    // — not on the route, which was always protected and never the way in.
+    const f = await seedSignableUnit()
+    const { createDocumentRecord } = await import('./esign')
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await expect(createDocumentRecord(client as any, {
+        landlordId: f.a.landlordId, templateId: f.tplA, unitId: f.unitA,
+        title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'tenant', name: 'Test Tenant', email: 't@test.dev', orderIndex: 2 },
+        ],
+      } as any)).rejects.toThrow(/primary \/ co_tenant/i)
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
+  })
+})
