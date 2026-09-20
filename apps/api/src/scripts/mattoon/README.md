@@ -19,6 +19,23 @@ inspection — every one skips what already exists — but they were written to 
 once and are kept as the record of what was loaded, not as a tool to re-run
 casually.
 
+## The other adults in a household
+
+Six adults share a household mailbox, so only the mailbox-holder has an account
+and signs: John Sheptock (Lot 1), Rachel Middleton (17), Brandon Meiring and
+Cary Case (21), Rebecca Street (22), Sklyer Blankenship (28).
+
+They are named in the lease's `occupant_names` box — named residents, no
+account, no email, not financially liable, which is what Blu's sheet records
+them as. `load6_occupants.ts` does this.
+
+This was a decision I made silently and should have raised. The reasoning for
+not creating accounts was right (an account needs a real address and GAM never
+invents one), but the conclusion I skipped is that **not having an email does
+not mean you are not on the lease** — they ended up named nowhere at all until
+Nic caught it. A signing co-tenant needs their own address and can be added by
+addendum once it is known.
+
 ## What was deliberately NOT done
 
 **No tenant was emailed, and none can be yet.** Nic: "don't let anything go to
