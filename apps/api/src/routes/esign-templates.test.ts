@@ -388,8 +388,11 @@ describe('S652: disclosure categories', () => {
     const blob = JSON.stringify(res.body.data).toLowerCase()
     // The words that would turn a checklist into a compliance claim.
     expect(blob).not.toMatch(/required|must|mandatory|violation|complian/)
-    // And no state ever appears — GAM holds the acts, it does not rule on them.
-    expect(res.body.data[0]).not.toHaveProperty('states')
+    // `states` IS present, and means one thing only: the states this landlord
+    // has filed a specific form for. It is never a list of states that require
+    // the disclosure — GAM holds the acts, it does not rule on them. Empty here
+    // because this fixture has filed nothing.
+    expect(res.body.data[0].states).toEqual([])
   })
 
   it('shows a landlord what they hold, per category and per transaction', async () => {
@@ -433,5 +436,47 @@ describe('S652: disclosure categories', () => {
     expect(res.status).toBe(201)
     expect(res.body.data.disclosure_type ?? res.body.data.disclosureType).toBeFalsy()
     expect(res.body.data.applies_to ?? res.body.data.appliesTo).toBe('any')
+  })
+})
+
+/**
+ * S652 — many forms per category, because many of these are a state's own words.
+ *
+ * Nic: "are any of these forms state specific or could I use one asbestos
+ * disclosure for all seventeen states... when the form is specific we need to be
+ * able to assign multiple per category."
+ *
+ * Both cases are real. Lead-based paint is federal — one form, fifty states.
+ * Washington legislates the FORMAT of its disclosure statement and Minnesota,
+ * Michigan, Ohio and Nebraska each prescribe their own, so one form does not
+ * travel. NULL state means it travels; a state code means it does not.
+ */
+describe('S652: a disclosure can be written for one state', () => {
+  const mk = (f: any, body: any) =>
+    request(buildApp()).post('/api/esign/templates')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: null, ...body })
+
+  it('holds several forms in one category and says which state each is for', async () => {
+    const f = await seed()
+    expect((await mk(f, { name: 'Asbestos — WA', disclosureType: 'asbestos', stateCode: 'WA' })).status).toBe(201)
+    expect((await mk(f, { name: 'Asbestos — IL', disclosureType: 'asbestos', stateCode: 'il' })).status).toBe(201)
+    expect((await mk(f, { name: 'Lead paint (federal)', disclosureType: 'lead_based_paint' })).status).toBe(201)
+
+    const res = await request(buildApp())
+      .get('/api/esign/disclosures').set('Authorization', `Bearer ${f.tokenA}`)
+    const asb = res.body.data.find((d: any) => d.type === 'asbestos')
+    expect(asb.documents).toHaveLength(2)
+    expect(asb.states.sort()).toEqual(['IL', 'WA'])   // lowercase input normalised
+
+    const lbp = res.body.data.find((d: any) => d.type === 'lead_based_paint')
+    expect(lbp.documents[0].stateCode).toBeNull()     // federal: it travels
+    expect(lbp.states).toEqual([])
+  })
+
+  it('refuses something that is not a state', async () => {
+    const f = await seed()
+    const res = await mk(f, { name: 'Nope', disclosureType: 'mold', stateCode: 'Illinois' })
+    expect(res.status).toBe(400)
   })
 })

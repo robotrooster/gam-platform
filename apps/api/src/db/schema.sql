@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict clrGROcSWgptccoCF9IufgjX8rZ0z4Z3HosGWozINr4b4v1yveKoFgkM3a9RwBB
+\restrict mkUxX3niKkMq9xHnwb78STIpiKLQIZUHU4KyVVLY8qxK6WbRl9iDvFlueLjYjXU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5589,6 +5589,7 @@ CREATE TABLE public.lease_templates (
     version integer DEFAULT 1 NOT NULL,
     applies_to text DEFAULT 'any'::text NOT NULL,
     disclosure_type text,
+    state_code text,
     CONSTRAINT lease_templates_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'sale'::text, 'rental'::text]))),
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
@@ -5609,6 +5610,13 @@ COMMENT ON COLUMN public.lease_templates.applies_to IS 'S652: sale = the dwellin
 --
 
 COMMENT ON COLUMN public.lease_templates.disclosure_type IS 'S652: which disclosure this document IS (lead_based_paint, bed_bugs, ...). NULL = not a disclosure. Carries no requirement claim — see DISCLOSURE_TYPES in @gam/shared.';
+
+
+--
+-- Name: COLUMN lease_templates.state_code; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_templates.state_code IS 'S652: the state this form was written for. NULL = any state (federal forms like lead-based paint, and landlord-written notices). Most-specific-wins when a packet picks between them.';
 
 
 --
@@ -19114,6 +19122,13 @@ CREATE INDEX lease_templates_disclosure_idx ON public.lease_templates USING btre
 
 
 --
+-- Name: lease_templates_disclosure_state_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_templates_disclosure_state_idx ON public.lease_templates USING btree (landlord_id, disclosure_type, state_code) WHERE (disclosure_type IS NOT NULL);
+
+
+--
 -- Name: lease_templates_unit_type_default_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -27545,5 +27560,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict clrGROcSWgptccoCF9IufgjX8rZ0z4Z3HosGWozINr4b4v1yveKoFgkM3a9RwBB
+\unrestrict mkUxX3niKkMq9xHnwb78STIpiKLQIZUHU4KyVVLY8qxK6WbRl9iDvFlueLjYjXU
 

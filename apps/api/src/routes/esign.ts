@@ -2040,8 +2040,8 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
  */
 esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async (req: any, res, next) => {
   try {
-    const held = await query<{ disclosure_type: string; applies_to: string; id: string; name: string }>(
-      `SELECT disclosure_type, applies_to, id, name
+    const held = await query<{ disclosure_type: string; applies_to: string; id: string; name: string; state_code: string | null }>(
+      `SELECT disclosure_type, applies_to, id, name, state_code
          FROM lease_templates
         WHERE landlord_id = ANY($1::uuid[]) AND is_active = TRUE AND disclosure_type IS NOT NULL
         ORDER BY name`,
@@ -2051,7 +2051,15 @@ esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async
       return {
         type,
         label: DISCLOSURE_TYPE_LABEL[type],
-        documents: docs.map(d => ({ id: d.id, name: d.name, appliesTo: d.applies_to })),
+        documents: docs.map(d => ({
+          id: d.id, name: d.name, appliesTo: d.applies_to,
+          // null = the form travels: federal, or the landlord's own wording.
+          stateCode: d.state_code,
+        })),
+        // Which states this landlord holds a specific form for, so somebody
+        // operating in three states can see where the gaps in their own filing
+        // are. Still says nothing about where one is needed.
+        states: [...new Set(docs.map(d => d.state_code).filter(Boolean))],
         // A disclosure that reads differently for a sale than for a rental
         // needs both to be complete. Stated as a fact about what they hold,
         // never as something they are missing.
@@ -2065,7 +2073,7 @@ esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose,
-            disclosureType, appliesTo } = req.body
+            disclosureType, appliesTo, stateCode } = req.body
     if (!name) throw new AppError(400, 'Template name required')
     // S576 (B-8): 'lease' (default) or 'work_trade_addendum' — the landlord's
     // own work-trade addendum form, auto-attached to a renewal on lease expiry.
@@ -2087,6 +2095,12 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     const applies = appliesTo == null || appliesTo === '' ? 'any' : String(appliesTo)
     if (!(TEMPLATE_APPLIES_TO as readonly string[]).includes(applies)) {
       throw new AppError(400, `appliesTo must be one of ${TEMPLATE_APPLIES_TO.join(', ')}`)
+    }
+    // S652: the state a form was WRITTEN for. Null means it travels — a federal
+    // form like lead-based paint, or a notice the landlord wrote themselves.
+    const stCode = stateCode == null || stateCode === '' ? null : String(stateCode).toUpperCase()
+    if (stCode != null && !/^[A-Z]{2}$/.test(stCode)) {
+      throw new AppError(400, 'stateCode must be a two-letter state code, or null for any state')
     }
 
     // S558: the deposit multiplier ("N months' rent") is a lease term on the
@@ -2120,10 +2134,10 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       : resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
     const t = await queryOne<any>(`
       INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose,
-                                   disclosure_type, applies_to)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+                                   disclosure_type, applies_to, state_code)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [templateLandlordId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose,
-       disclosure, applies])
+       disclosure, applies, stCode])
 
     // S629 (Nic): "when you add a template for a unit type and there is no
     // default, it should automatically become the default."

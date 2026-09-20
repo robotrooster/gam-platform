@@ -112,8 +112,10 @@ export async function resolvePackageForUnit(params: {
   unitId: string
   packageId?: string | null
 }): Promise<ResolvedPackage | null> {
-  const unit = await queryOne<{ property_id: string; unit_type: string | null }>(
-    `SELECT property_id, unit_type FROM units WHERE id = $1`, [params.unitId])
+  const unit = await queryOne<{ property_id: string; unit_type: string | null; state: string | null }>(
+    `SELECT u.property_id, u.unit_type, p.state
+       FROM units u JOIN properties p ON p.id = u.property_id
+      WHERE u.id = $1`, [params.unitId])
   if (!unit) return null
 
   const pkg = params.packageId
@@ -140,6 +142,7 @@ export async function resolvePackageForUnit(params: {
   const rows = await query<any>(
     `SELECT i.id AS item_id, i.template_id, i.sort_order, i.renewal_behavior, i.required,
             t.name AS template_name, t.purpose, t.version, t.applies_to,
+            t.disclosure_type, t.state_code,
             (SELECT COUNT(*) FROM lease_template_properties tp
               WHERE tp.template_id = t.id)::int AS pin_count,
             EXISTS (SELECT 1 FROM lease_template_properties tp
@@ -151,6 +154,12 @@ export async function resolvePackageForUnit(params: {
       ORDER BY i.sort_order, t.name`,
     [pkg.id, unit.property_id])
 
+  // S652: which categories this landlord has a state-specific form for. A
+  // general form in the same category is then the fallback, not a duplicate.
+  const supersededByStateForm = new Set(
+    rows.filter((r: any) => r.disclosure_type && r.state_code && r.state_code === unit.state)
+        .map((r: any) => r.disclosure_type as string))
+
   const items: PackageItem[] = rows.map(r => {
     let suggested = true
     let reason = 'Applies to this unit'
@@ -161,6 +170,18 @@ export async function resolvePackageForUnit(params: {
     } else if (r.template_unit_type && unit.unit_type && r.template_unit_type !== unit.unit_type) {
       suggested = false
       reason = `Written for ${String(r.template_unit_type).replace(/_/g, ' ')}`
+    } else if (r.state_code && unit.state && r.state_code !== unit.state) {
+      // S652: a form written for another state. Kept in the list — a landlord
+      // who wants it says so — but never suggested at a property it was not
+      // written for.
+      suggested = false
+      reason = `Written for ${r.state_code}, and this property is in ${unit.state}`
+    } else if (r.disclosure_type && supersededByStateForm.has(r.disclosure_type) && !r.state_code) {
+      // The landlord holds a form for THIS state in this same category, so the
+      // general one steps aside. Most-specific-wins, said out loud rather than
+      // silently dropping one of two documents with the same name.
+      suggested = false
+      reason = `Superseded by the ${unit.state} version`
     } else if (r.applies_to && r.applies_to !== 'any' && r.applies_to !== wantedAppliesTo) {
       // S652: the sale disclosure on a rental, or the rental one on a sale.
       // Suggested OFF and said out loud — a landlord who wants it anyway ticks
