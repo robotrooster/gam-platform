@@ -1762,6 +1762,25 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S651: the last-resort bank pull, deliberately scheduled 30 minutes AFTER
+  // the passthrough recovery above. Netting gets every chance first — that is
+  // the whole order of preference Nic set out — so by the time this runs,
+  // anything collectable from money already moving has been collected, and
+  // what is left is a landlord whose tenants all pay cash.
+  //
+  // Does nothing on a normal night: it only looks at landlords who explicitly
+  // authorized a debit, and then only if they are over their threshold.
+  cron.schedule('30 8 * * *', async () => {
+    try {
+      const { runGamDebitSweep } = await import('../services/landlordGamDebit')
+      const r = await runGamDebitSweep()
+      if (r.debited) logger.warn(r, '[gam-debit-sweep] pulled fees from a bank')
+      else if (r.considered) logger.info(r, '[gam-debit-sweep]')
+    } catch (e) {
+      logger.error({ err: e }, '[gam-debit-sweep] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S650 (Nic): held utilities nobody claimed by the time a property's
   // onboarding window closes are presumed settled off-platform.
   cron.schedule('40 3 * * *', async () => {

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict qdbrYzcoM4eVPCJYKFS9i5v4oA24YrqDYG8I2R3oYfSBggHONSEkJX7d7a2KTnc
+\restrict VZiJr1R5JapOQq71GAjnwDoqw8B4h3orbhABdSeSTYPfTwjoNTYKVoo68FrDIvg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4734,8 +4734,48 @@ CREATE TABLE public.landlord_gam_charges (
     CONSTRAINT collected_never_exceeds_amount CHECK ((collected_amount <= amount)),
     CONSTRAINT landlord_gam_charges_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT landlord_gam_charges_collected_amount_check CHECK ((collected_amount >= (0)::numeric)),
-    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text])))
+    CONSTRAINT landlord_gam_charges_kind_check CHECK ((kind = ANY (ARRAY['subscription'::text, 'manual_payment_fee'::text, 'bank_debit_cost'::text])))
 );
+
+
+--
+-- Name: COLUMN landlord_gam_charges.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_gam_charges.kind IS 'subscription = the monthly platform fee. manual_payment_fee = a fee on a payment taken outside the platform. bank_debit_cost = S651, what the ACH pull itself cost, kept as its own line so a landlord can see what each number is rather than disputing one lump sum.';
+
+
+--
+-- Name: landlord_gam_debits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_gam_debits (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    charges_amount numeric(12,2) NOT NULL,
+    bank_cost_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(12,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    stripe_payment_intent_id text,
+    payment_method_id text,
+    failure_reason text,
+    charge_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    threshold_at_debit numeric(12,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT landlord_gam_debits_bank_cost_amount_check CHECK ((bank_cost_amount >= (0)::numeric)),
+    CONSTRAINT landlord_gam_debits_charges_amount_check CHECK ((charges_amount > (0)::numeric)),
+    CONSTRAINT landlord_gam_debits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'succeeded'::text, 'failed'::text, 'canceled'::text]))),
+    CONSTRAINT landlord_gam_debits_total_amount_check CHECK ((total_amount > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE landlord_gam_debits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.landlord_gam_debits IS 'S651: every time GAM pulled from a landlord''s bank because there was no payout to net against. One row per attempt, failures kept. charges_amount and bank_cost_amount are separate columns for the same reason they are separate line items — see the migration header.';
 
 
 --
@@ -4990,6 +5030,13 @@ CREATE TABLE public.landlords (
     books_start_date date,
     migration_window_ends_at timestamp with time zone,
     first_billing_cycle date,
+    gam_debit_authorized_at timestamp with time zone,
+    gam_debit_authorized_by_user_id uuid,
+    gam_debit_authorized_ip text,
+    gam_debit_payment_method_id text,
+    gam_debit_bank_last4 text,
+    gam_debit_bank_name text,
+    gam_debit_revoked_at timestamp with time zone,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
@@ -5088,6 +5135,13 @@ COMMENT ON COLUMN public.landlords.books_start_date IS 'S605: bank transactions 
 --
 
 COMMENT ON COLUMN public.landlords.first_billing_cycle IS 'S632 SUPERSEDED by properties.first_billing_cycle — onboarding is per property. Retained only as the record of what was set before the move; nothing reads it.';
+
+
+--
+-- Name: COLUMN landlords.gam_debit_authorized_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.gam_debit_authorized_at IS 'S651: when this landlord authorized GAM to ACH-debit them for GAM charges that could not be netted out of a payout. NULL = never authorized or since revoked; debitLandlordForCharges() refuses. Linking a bank for the transaction feed does NOT set this.';
 
 
 --
@@ -12451,6 +12505,14 @@ ALTER TABLE ONLY public.landlord_gam_charges
 
 
 --
+-- Name: landlord_gam_debits landlord_gam_debits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_debits
+    ADD CONSTRAINT landlord_gam_debits_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: landlord_instant_margins landlord_instant_margins_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -18774,6 +18836,27 @@ CREATE UNIQUE INDEX landlord_gam_charges_source_uniq ON public.landlord_gam_char
 
 
 --
+-- Name: landlord_gam_debits_landlord_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_gam_debits_landlord_idx ON public.landlord_gam_debits USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: landlord_gam_debits_one_in_flight; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlord_gam_debits_one_in_flight ON public.landlord_gam_debits USING btree (landlord_id) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: landlord_gam_debits_pi_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlord_gam_debits_pi_idx ON public.landlord_gam_debits USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
+
+
+--
 -- Name: landlord_member_history_by_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -23118,6 +23201,14 @@ ALTER TABLE ONLY public.landlord_gam_charges
 
 
 --
+-- Name: landlord_gam_debits landlord_gam_debits_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_gam_debits
+    ADD CONSTRAINT landlord_gam_debits_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
 -- Name: landlord_instant_margins landlord_instant_margins_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23275,6 +23366,14 @@ ALTER TABLE ONLY public.landlord_platform_fee_overrides
 
 ALTER TABLE ONLY public.landlords
     ADD CONSTRAINT landlords_default_pm_company_id_fkey FOREIGN KEY (default_pm_company_id) REFERENCES public.pm_companies(id) ON DELETE SET NULL;
+
+
+--
+-- Name: landlords landlords_gam_debit_authorized_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlords
+    ADD CONSTRAINT landlords_gam_debit_authorized_by_user_id_fkey FOREIGN KEY (gam_debit_authorized_by_user_id) REFERENCES public.users(id);
 
 
 --
@@ -27129,5 +27228,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict qdbrYzcoM4eVPCJYKFS9i5v4oA24YrqDYG8I2R3oYfSBggHONSEkJX7d7a2KTnc
+\unrestrict VZiJr1R5JapOQq71GAjnwDoqw8B4h3orbhABdSeSTYPfTwjoNTYKVoo68FrDIvg
 

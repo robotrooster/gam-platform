@@ -36,6 +36,9 @@ import {
   rejectPropertyInvitation, revokePropertyInvitation,
 } from '../services/pm'
 import { logger } from '../lib/logger'
+// S651: what an ACH pull of GAM's fees costs, shown to the landlord before they
+// authorize one — see services/landlordGamDebit.ts.
+import { bankCostFor } from '../services/landlordGamDebit'
 import { portalLink } from '../lib/portalUrls'
 import { randomUUID } from 'crypto'
 import { unitNumberNeedsPrefix } from '@gam/shared'
@@ -6693,3 +6696,144 @@ landlordsRouter.post('/me/tenants/:tenantId/balance-reminder',
       } })
     } catch (e) { next(e) }
   })
+
+// ── S651: what the landlord owes GAM, and how GAM gets it ─────────────────
+//
+// Until now this ledger was invisible. GAM netted $130 of platform fees out of
+// Mountain View's next payout and the landlord saw a deposit short by $130 with
+// nothing anywhere explaining it. That is the dispute Nic was describing, and
+// it starts one step before the bank debit: a number you cannot see is a number
+// you can only argue with.
+//
+// So the statement comes first, then the authorization sits under it. Each
+// charge says what it was for and how it was collected — netted out of a
+// payout, or pulled from the bank — and the bank pull's own cost is its own
+// line rather than a rounding difference in somebody's total.
+
+landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (req: any, res, next) => {
+  try {
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
+
+    const charges = await query<any>(
+      `SELECT c.id, c.kind, c.amount::text AS amount,
+              c.collected_amount::text AS collected_amount,
+              c.collected_at, c.notes, c.created_at,
+              p.name AS property_name,
+              l.business_name AS entity_name
+         FROM landlord_gam_charges c
+         LEFT JOIN properties p ON p.id = c.property_id
+         LEFT JOIN landlords  l ON l.id = c.landlord_id
+        WHERE c.landlord_id = ANY($1::uuid[])
+        ORDER BY c.created_at DESC
+        LIMIT 200`,
+      [landlordIds])
+
+    const debits = await query<any>(
+      `SELECT id, charges_amount::text AS charges_amount,
+              bank_cost_amount::text AS bank_cost_amount,
+              total_amount::text AS total_amount,
+              status, failure_reason, created_at, settled_at
+         FROM landlord_gam_debits
+        WHERE landlord_id = ANY($1::uuid[])
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [landlordIds])
+
+    // The authorization is per company, and a read spans every company the
+    // account owns — so say which of them have authorized rather than
+    // flattening it into one yes/no that would be wrong for the other.
+    const auth = await query<any>(
+      `SELECT l.id AS landlord_id, l.business_name,
+              l.gam_debit_authorized_at, l.gam_debit_revoked_at,
+              l.gam_debit_bank_last4, l.gam_debit_bank_name,
+              (l.gam_debit_payment_method_id IS NOT NULL) AS has_payment_method,
+              EXISTS (SELECT 1 FROM bank_connections bc
+                       WHERE bc.landlord_id = l.id AND bc.status = 'active') AS has_bank_link
+         FROM landlords l WHERE l.id = ANY($1::uuid[])
+        ORDER BY l.business_name NULLS LAST`,
+      [landlordIds])
+
+    const outstanding = charges.reduce(
+      (n: number, c: any) => n + (parseFloat(c.amount) - parseFloat(c.collected_amount)), 0)
+
+    res.json({
+      success: true,
+      data: {
+        outstanding: Math.round(outstanding * 100) / 100,
+        charges,
+        debits,
+        authorizations: auth,
+        // What a pull would cost today, so the landlord can see that letting
+        // money run through the platform is the cheaper of the two routes
+        // before they decide anything.
+        bankCostIfDebitedToday: bankCostFor(Math.round(outstanding * 100) / 100),
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+const gamDebitAuthSchema = z.object({
+  landlordId: z.string().uuid().optional(),
+  bankConnectionId: z.string().uuid().optional(),
+  /** must be literally true — an unchecked box is not consent */
+  agree: z.literal(true),
+})
+
+// POST /api/landlords/me/gam-debit-authorization
+//
+// requireLandlord + ownsLandlord, not a permission: authorizing somebody to
+// take money out of the company's bank account is an owner's act. An onsite
+// manager with payments.view_all can read the statement above and cannot do
+// this.
+landlordsRouter.post('/me/gam-debit-authorization', requireLandlord, async (req: any, res, next) => {
+  try {
+    const body = gamDebitAuthSchema.parse(req.body)
+    const landlordId = resolveLandlordTarget(req.user!, body.landlordId, 'company')
+    if (!ownsLandlord(req.user!, landlordId)) throw new AppError(403, 'Not your company')
+
+    const { createDebitPaymentMethod } = await import('../services/bankFeed')
+    const pm = await createDebitPaymentMethod(landlordId, body.bankConnectionId)
+    if (!pm) {
+      // Deliberately specific. "Something went wrong" here would have the
+      // landlord calling their bank about a permission GAM never asked for.
+      throw new AppError(400,
+        'Your bank is linked for reading transactions only. Re-link it once and you’ll be asked ' +
+        'to allow payments from that account — then you can turn this on.')
+    }
+
+    await query(
+      `UPDATE landlords
+          SET gam_debit_authorized_at = NOW(),
+              gam_debit_authorized_by_user_id = $2,
+              gam_debit_authorized_ip = $3,
+              gam_debit_payment_method_id = $4,
+              gam_debit_bank_last4 = $5,
+              gam_debit_bank_name = $6,
+              gam_debit_revoked_at = NULL,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [landlordId, req.user!.userId, (req.ip ?? '').slice(0, 64),
+       pm.paymentMethodId, pm.last4, pm.bankName])
+
+    logger.warn({ landlordId, userId: req.user!.userId, last4: pm.last4 },
+      '[gam-debit] landlord authorized GAM to debit for uncollectable charges')
+    res.json({ success: true, data: { bankLast4: pm.last4, bankName: pm.bankName } })
+  } catch (e) { next(e) }
+})
+
+// DELETE — revoking is one click and takes effect immediately. A debit already
+// submitted to the bank keeps settling; it was authorized when it was made.
+landlordsRouter.delete('/me/gam-debit-authorization', requireLandlord, async (req: any, res, next) => {
+  try {
+    const landlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
+    if (!ownsLandlord(req.user!, landlordId)) throw new AppError(403, 'Not your company')
+    await query(
+      `UPDATE landlords
+          SET gam_debit_revoked_at = NOW(), gam_debit_authorized_at = NULL,
+              gam_debit_payment_method_id = NULL, updated_at = NOW()
+        WHERE id = $1`, [landlordId])
+    logger.warn({ landlordId, userId: req.user!.userId }, '[gam-debit] authorization revoked')
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})

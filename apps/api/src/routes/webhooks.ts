@@ -84,6 +84,16 @@ webhooksRouter.post('/stripe', async (req, res) => {
         break
       }
 
+      // S651: GAM pulling its own fees out of a landlord's bank. This is not a
+      // tenant payment and has no `payments` row, so it must branch out before
+      // the rent allocation path below. The charges are only marked collected
+      // HERE — an ACH pull can still bounce days after it was submitted.
+      if (pi.metadata?.gam_debit_id) {
+        const { settleGamDebit } = await import('../services/landlordGamDebit')
+        await settleGamDebit(pi.id, true)
+        break
+      }
+
       const charge = await resolveCharge(stripe, pi)
       const paymentMethod = extractPaymentMethod(charge)
       // S113-Phase2.5: snapshot the underlying charge id so post-commit
@@ -663,6 +673,17 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // card, or abandon the sale. No ledger row, no NACHA retry logic,
       // no notification. Skip.
       if (HELD_PURPOSES.has(pi.metadata?.gam_purpose ?? '')) break
+
+      // S651: a bounced GAM fee pull. No NACHA retry pipeline — the charges
+      // simply stay owed and the nightly sweep will consider the landlord
+      // again once nothing is in flight. Auto-retrying a bank that just said
+      // no is how a landlord collects three NSF fees from their own bank.
+      if (pi.metadata?.gam_debit_id) {
+        const { settleGamDebit } = await import('../services/landlordGamDebit')
+        await settleGamDebit(pi.id, false,
+          pi.last_payment_error?.message ?? 'the bank refused the transfer')
+        break
+      }
 
       // S537: a failed FIFO remittance is closed out; its covered rows
       // revert / retry through the standard by-PI NACHA logic below, and

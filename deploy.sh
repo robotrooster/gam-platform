@@ -54,6 +54,13 @@ FRONTENDS=(
   # (pos-parity.test.ts) and was never shipped by this script, so it silently
   # fell behind every register change.
   "pos:pos.goldassetmanagement.com"
+  # S651: both of these were live on their own domains and shipped by NOBODY.
+  # admin-ops has been stale since S650 (its staff-only login change never went
+  # out); books since it was built. Same failure the storefront note below
+  # describes: a surface this script does not know about is a surface that
+  # silently keeps serving last month's code.
+  "admin-ops:ops.goldassetmanagement.com"
+  "books:books.goldassetmanagement.com"
 )
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'

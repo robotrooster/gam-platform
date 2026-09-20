@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useQuery } from 'react-query'
+import { useQuery, useQueryClient } from 'react-query'
 import { Link } from 'react-router-dom'
 import { humanize } from '@gam/shared'
-import { apiGet } from '../lib/api'
+import { apiGet, apiPost, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
 import { PropertySelect } from '../components/ListControls'
@@ -55,6 +55,153 @@ function AbsorbedManualFeesSection() {
   )
 }
 
+
+// ── S651: what you pay GAM ────────────────────────────────────────────────
+//
+// This sat in the database and on no screen. GAM netted $130 of platform fees
+// out of Mountain View's next payout and the landlord saw a deposit short by
+// $130 with nothing, anywhere, saying why. Nic's worry about landlords
+// disputing a charge starts here, one step before any bank debit: a number you
+// cannot see is a number you can only argue with.
+//
+// It lives on Disbursements rather than its own page because this is the screen
+// somebody opens when a payout looks wrong — the explanation belongs where the
+// question gets asked.
+
+const GAM_CHARGE_LABEL: Record<string, string> = {
+  subscription:       'Platform fee',
+  manual_payment_fee: 'Fee on a payment taken outside GAM',
+  // S651: shown as its own line on purpose — see services/landlordGamDebit.ts.
+  bank_debit_cost:    'Bank transfer cost',
+}
+
+function GamChargesSection() {
+  const qc = useQueryClient()
+  const { data } = useQuery<any>('gam-charges', () => apiGet('/landlords/me/gam-charges'))
+  const [confirming, setConfirming] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const charges: any[] = data?.charges ?? []
+  const debits: any[] = data?.debits ?? []
+  const auths: any[] = data?.authorizations ?? []
+  if (!charges.length && !debits.length) return null
+
+  const outstanding = Number(data?.outstanding ?? 0)
+
+  const setAuth = async (landlordId: string, on: boolean) => {
+    setBusy(true); setErr(null)
+    try {
+      if (on) await apiPost('/landlords/me/gam-debit-authorization', { landlordId, agree: true })
+      else    await apiDelete('/landlords/me/gam-debit-authorization')
+      await qc.invalidateQueries('gam-charges')
+      setConfirming(null)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || e?.response?.data?.message || 'That didn’t go through.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+        <h3 style={{ margin: 0, fontSize: '1rem' }}>What you pay GAM</h3>
+        <span style={{ fontWeight: 700 }}>{outstanding > 0 ? fmt(outstanding) : 'Nothing owed'}</span>
+      </div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
+        GAM takes what you owe out of money already on its way to you, so it costs you no extra
+        transfer. That’s why a payout can land smaller than the rent collected — the difference
+        is itemised below.
+      </div>
+
+      <div style={{ maxHeight: 260, overflowY: 'auto', marginBottom: 12 }}>
+        {charges.map((c: any) => {
+          const amount = Number(c.amount)
+          const collected = Number(c.collected_amount)
+          const paid = collected >= amount
+          return (
+            <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
+                                     padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
+              <span style={{ color: 'var(--text-2)' }}>
+                {GAM_CHARGE_LABEL[c.kind] ?? humanize(c.kind)}
+                {c.property_name ? ` · ${c.property_name}` : ''}
+                {c.notes ? <span style={{ color: 'var(--text-3)' }}> — {c.notes}</span> : null}
+              </span>
+              <span style={{ display: 'flex', gap: 12, alignItems: 'baseline', whiteSpace: 'nowrap' }}>
+                <span style={{ fontSize: '.72rem', color: paid ? 'var(--text-3)' : 'var(--amber)' }}>
+                  {paid
+                    ? `taken from your payout ${new Date(c.collected_at ?? c.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+                    : collected > 0 ? `${fmt(collected)} of it taken so far` : 'comes out of your next payout'}
+                </span>
+                <span className="mono">{fmt(amount)}</span>
+              </span>
+            </div>
+          )
+        })}
+      </div>
+
+      {debits.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4 }}>Taken straight from your bank</div>
+          {debits.map((d: any) => (
+            <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10,
+                                     padding: '6px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem' }}>
+              <span style={{ color: 'var(--text-2)' }}>
+                {new Date(d.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                {' · '}charges {fmt(d.charges_amount)} + bank transfer cost {fmt(d.bank_cost_amount)}
+                {d.status === 'failed' && d.failure_reason ? ` — your bank declined it: ${d.failure_reason}` : ''}
+              </span>
+              <span className="mono">{fmt(d.total_amount)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* The authorization. Off unless the landlord turns it on — Nic: "never
+          ACH-debit a landlord by default." */}
+      {auths.map((a: any) => {
+        const on = !!a.gam_debit_authorized_at
+        return (
+          <div key={a.landlord_id} style={{ borderTop: '1px solid var(--border-0)', paddingTop: 10, marginTop: 4 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
+              <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55 }}>
+                <b>{a.business_name || 'Your company'}</b>{' — '}
+                {on
+                  ? <>if there’s ever no payout to take these out of, GAM may transfer them from your
+                      bank ending {a.gam_debit_bank_last4 ?? '—'}. The transfer’s own cost is charged
+                      as its own line, so you can see both numbers.</>
+                  : <>if every tenant at a property pays cash, there’s no payout to take these out of
+                      and the balance just sits. You can let GAM transfer it from your linked bank
+                      instead. It only ever happens when netting can’t —{' '}
+                      today that would be {fmt(data?.bankCostIfDebitedToday)} of bank transfer cost
+                      on top, charged as its own line.</>}
+              </div>
+              {on ? (
+                <button className="btn btn-ghost btn-sm" disabled={busy}
+                        onClick={() => setAuth(a.landlord_id, false)}>Turn off</button>
+              ) : confirming === a.landlord_id ? (
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="btn btn-primary btn-sm" disabled={busy}
+                          onClick={() => setAuth(a.landlord_id, true)}>
+                    {busy ? 'Saving…' : 'Yes, allow it'}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" disabled={busy}
+                          onClick={() => { setConfirming(null); setErr(null) }}>Cancel</button>
+                </div>
+              ) : (
+                <button className="btn btn-primary btn-sm"
+                        onClick={() => setConfirming(a.landlord_id)}>Allow bank transfers</button>
+              )}
+            </div>
+            {err && confirming === a.landlord_id && (
+              <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
 
@@ -92,6 +239,8 @@ export function DisbursementsPage() {
       {can('disbursements.pm_impact_view') && <PmImpactSection />}
 
       <AbsorbedManualFeesSection />
+
+      <GamChargesSection />
 
       <div className="kpi-grid" style={{ marginBottom: 24 }}>
         <div className="kpi-card">

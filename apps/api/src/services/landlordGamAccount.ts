@@ -36,7 +36,14 @@ export const DEFAULT_DEBIT_THRESHOLD = 100
 export interface GamCharge {
   landlordId: string
   propertyId?: string | null
-  kind: 'subscription' | 'manual_payment_fee'
+  /**
+   * subscription       — the monthly platform fee
+   * manual_payment_fee — a fee on a payment taken outside the platform
+   * bank_debit_cost    — S651: what an ACH pull cost, kept as its own line so
+   *                      the landlord sees two numbers they can each check
+   *                      rather than one lump they can only dispute
+   */
+  kind: 'subscription' | 'manual_payment_fee' | 'bank_debit_cost'
   amount: number
   /** what produced this, so a retry cannot bill twice */
   sourceType: string

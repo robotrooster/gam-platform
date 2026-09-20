@@ -95,7 +95,23 @@ export async function createLinkSession(landlordId: string): Promise<{ clientSec
       // new application. Links made BEFORE this change hold transactions-only
       // consent and must be re-linked once to grant it; nothing breaks in the
       // meantime, the balance just reads as unknown.
-      permissions: ['transactions', 'balances'],
+      // S651: `payment_method` joins the list so ONE bank link can serve both
+      // jobs — reading the feed, and being the account GAM pulls its fees from
+      // when a property is all-cash and there is no payout to net against.
+      // Asking twice for the same bank is the kind of friction that makes a
+      // landlord skip the feed entirely.
+      //
+      // Unlike `transactions`, this permission needs no Stripe approval (see
+      // the catch below), so adding it cannot break linking.
+      //
+      // IT IS NOT AUTHORIZATION TO DEBIT. Stripe's modal grants the technical
+      // capability; GAM still refuses to pull a cent until the landlord
+      // separately authorizes it in the portal (landlords.gam_debit_authorized_at,
+      // services/landlordGamDebit.ts). Nic: "never ACH-debit a landlord by
+      // default." Links made before this change carry no payment_method consent
+      // and must be re-linked once before a debit is even possible — which is
+      // the safe direction for that to fail in.
+      permissions: ['transactions', 'balances', 'payment_method'],
       prefetch: ['transactions', 'balances'],
     })
   } catch (err: any) {
@@ -764,4 +780,47 @@ export async function setBooksStartDate(
       RETURNING id`, [landlordId, date])
 
   return { ignored: ignored.length, restored: restored.length }
+}
+
+/**
+ * Mint the us_bank_account PaymentMethod GAM would debit, from a bank the
+ * landlord already linked for the feed.
+ *
+ * Separate from linking on purpose. Linking is "you may read this account";
+ * this is called only at the moment a landlord authorizes a debit, so the
+ * payment method does not exist on any account that never said yes.
+ *
+ * Returns null when the link predates the payment_method permission — the
+ * caller turns that into "re-link your bank", not into a silent failure.
+ */
+export async function createDebitPaymentMethod(
+  landlordId: string,
+  bankConnectionId?: string,
+): Promise<{ paymentMethodId: string; last4: string | null; bankName: string | null } | null> {
+  const conn = await queryOne<any>(
+    bankConnectionId
+      ? `SELECT * FROM bank_connections WHERE id = $2 AND landlord_id = $1 AND status = 'active'`
+      : `SELECT * FROM bank_connections WHERE landlord_id = $1 AND status = 'active'
+          ORDER BY created_at DESC LIMIT 1`,
+    bankConnectionId ? [landlordId, bankConnectionId] : [landlordId])
+  if (!conn?.stripe_fc_account_id) return null
+
+  const stripe = getStripe()
+  const customer = await getOrCreateFcCustomer(landlordId)
+  try {
+    const pm = await stripe.paymentMethods.create({
+      type: 'us_bank_account',
+      us_bank_account: { financial_connections_account: conn.stripe_fc_account_id },
+    } as any)
+    await stripe.paymentMethods.attach(pm.id, { customer })
+    return {
+      paymentMethodId: pm.id,
+      last4: (pm as any).us_bank_account?.last4 ?? conn.account_last4 ?? null,
+      bankName: (pm as any).us_bank_account?.bank_name ?? conn.institution_name ?? null,
+    }
+  } catch (e: any) {
+    // The common case by far: a link made before payment_method was requested.
+    if (/permission|financial_connections/i.test(e?.message ?? '')) return null
+    throw e
+  }
 }
