@@ -105,7 +105,9 @@ interface LandlordDebitRow {
 }
 
 /**
- * Pull what this landlord owes GAM out of the bank they authorized.
+ * Pull what this landlord owes GAM out of the bank they linked. Linked, not
+ * authorized for this: the bank feed is where the link came from, which is
+ * why a link made before the payment_method permission cannot be debited.
  *
  * Returns without doing anything — and says why — when any gate is shut. The
  * caller is a nightly job, so "skipped" is the normal, healthy answer and

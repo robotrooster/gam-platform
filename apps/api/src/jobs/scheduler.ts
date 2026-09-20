@@ -1795,8 +1795,10 @@ export function schedulerInit() {
   // anything collectable from money already moving has been collected, and
   // what is left is a landlord whose tenants all pay cash.
   //
-  // Does nothing on a normal night: it only looks at landlords who explicitly
-  // authorized a debit, and then only if they are over their threshold.
+  // Does nothing on a normal night: it looks at every landlord who owes GAM
+  // anything, and pulls only from the ones over their threshold. There is no
+  // opt-in — a landlord does not get to decline paying for the park GAM runs,
+  // and a switch here would make an all-cash park free.
   cron.schedule('30 8 * * *', async () => {
     try {
       const { runGamDebitSweep } = await import('../services/landlordGamDebit')
