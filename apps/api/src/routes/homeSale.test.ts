@@ -131,6 +131,104 @@ describe('POST /api/home-sales', () => {
   })
 })
 
+/**
+ * S651 — A HOME SALE IS NOT A TENANCY.
+ *
+ * leaseId used to be required, as "the billing anchor". Nic: "we can't do the
+ * contract sales tied to a lease... I know a guy that owns over a hundred homes
+ * throughout various parks without actually owning any parks. He's not going to
+ * have a lease. The ownership of the trailer has nothing to do with who's
+ * actually living in the trailer." One tenant can sell their home to another,
+ * who subleases it on; the sale outlives and ignores every tenancy around it.
+ *
+ * What still has to hold is the guard the lease check was doing by accident:
+ * tenantId becomes the billed obligor on every installment, so it can never be
+ * an arbitrary id from the request body.
+ */
+describe('a home sale without a lease', () => {
+  /** A buyer the landlord knows, who rents nothing. */
+  async function seedBuyerWithNoLease() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId: llUser, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
+      const unitId = await seedUnit(c, { propertyId, landlordId, unitType: 'mobile_home' })
+      await c.query(`UPDATE units SET dwelling_ownership = 'landlord' WHERE id = $1`, [unitId])
+      const tenantId = await seedTenant(c)
+      // No lease anywhere — the only tie is an open invite from the seller.
+      await c.query(
+        `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, property_id)
+         VALUES ($1,$2,$3)`, [landlordId, tenantId, propertyId])
+      await c.query('COMMIT')
+      const token = jwt.sign(
+        { userId: llUser, role: 'landlord', email: 'll@t.dev', profileId: landlordId, permissions: {} },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { landlordId, tenantId, unitId, token }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('sells a home to somebody who rents nothing', async () => {
+    const f = await seedBuyerWithNoLease()
+    const res = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, tenantId: f.tenantId,
+              planType: 'flat', monthlyAmount: 200, numberOfPayments: 55, startMonth: '2026-10-01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.contract.lease_id).toBeNull()
+    expect(res.body.data.schedule).toHaveLength(55)
+    expect(Number(res.body.data.contract.financed_amount)).toBe(11000)   // 200 × 55
+  })
+
+  it('still refuses a buyer this landlord has no record of', async () => {
+    // The protection the lease check was providing: tenantId becomes the billed
+    // obligor, so a stranger's id must not be accepted from the body.
+    const f = await seedBuyerWithNoLease()
+    const stranger = await (async () => {
+      const c = await db.connect()
+      try { return await seedTenant(c) } finally { c.release() }
+    })()
+    const res = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, tenantId: stranger,
+              planType: 'flat', monthlyAmount: 200, numberOfPayments: 12, startMonth: '2026-10-01' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no record with you/i)
+  })
+
+  it('bills an installment with no lease behind it', async () => {
+    // home_payment has its own settlement path and is excluded from rent
+    // allocation, so a null lease was never actually needed to bill.
+    const f = await seedBuyerWithNoLease()
+    const created = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, tenantId: f.tenantId,
+              planType: 'flat', monthlyAmount: 200, numberOfPayments: 3, startMonth: '2026-10-01' })
+    expect(created.status).toBe(200)
+
+    const { billDueHomeSaleInstallments } = await import('../services/homeSale')
+    await billDueHomeSaleInstallments(new Date('2026-10-15'))
+
+    const [p] = await query<any>(
+      `SELECT amount::text, type, lease_id, tenant_id FROM payments
+        WHERE unit_id = $1 AND type = 'home_payment'`, [f.unitId])
+    expect(p).toBeTruthy()
+    expect(Number(p.amount)).toBe(200)
+    expect(p.lease_id).toBeNull()
+    expect(p.tenant_id).toBe(f.tenantId)
+  })
+
+  it('records the lease when there is one, without needing it', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
+              planType: 'flat', monthlyAmount: 200, numberOfPayments: 12, startMonth: '2026-10-01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.contract.lease_id).toBe(f.leaseId)
+  })
+})
+
 describe('GET /api/home-sales/unit/:unitId — tenant scoping', () => {
   it('never leaks another buyer\'s cancelled contract to an unrelated tenant', async () => {
     const f = await seed()

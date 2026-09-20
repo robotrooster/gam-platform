@@ -26,6 +26,18 @@ const EXTRA_EMAILS: Record<string, string[]> = {
   '30': ['Jeffbowman1971sr@gmail.com'],   // Kim + Jeff Bowman
 }
 
+/**
+ * Whose mailbox it actually is, where the sheet's name order does not say.
+ *
+ * Lot 1 reads "John Sheptock / Nancy Sheptock" against one address. The account
+ * created in error during setup was NANCY's, which is the evidence for whose
+ * mailbox the5ways2005@ is — so she holds the account and signs, and John is
+ * the occupant. (Nic: "Nancy needs to be on the lot one lease.")
+ */
+const PRIMARY_NAME: Record<string, string> = {
+  '1': 'Nancy Sheptock',
+}
+
 function splitNames(s: string): string[] {
   return s.split(/\n|\//).map((x) => x.trim()).filter(Boolean)
 }
@@ -58,10 +70,13 @@ async function main() {
       .flatMap((e: string | null) => (e ?? '').split(/\n/))
       .map((e) => e.trim().toLowerCase()).filter(Boolean))]
     // Names that get an account, in household order, paired with a mailbox.
+    const ordered = PRIMARY_NAME[r.lot]
+      ? [PRIMARY_NAME[r.lot], ...names.filter((n) => n !== PRIMARY_NAME[r.lot])]
+      : names
     const accounts = emails.map((email, i) => ({
-      email, name: names[i] ?? names[0], phone: phones[i] ?? phones[0] ?? null,
+      email, name: ordered[i] ?? ordered[0], phone: phones[i] ?? phones[0] ?? null,
     }))
-    const occupants = names.slice(accounts.length)
+    const occupants = ordered.slice(accounts.length)
     plan.push({ lot: r.lot, unitNumber: `Lot ${r.lot}`, accounts, occupants, raw: r })
   }
 

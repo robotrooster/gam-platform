@@ -20,7 +20,27 @@ export interface CreateHomeSaleInput {
   /** S629: hold the terms unsigned — no schedule, nothing billed, until the agreement completes. */
   pendingSignature?: boolean
   unitId: string
-  leaseId: string          // the tenant's space-rent lease — the billing anchor
+  /**
+   * S651 — OPTIONAL, and that is the point.
+   *
+   * This used to be required as "the billing anchor". Nic: "we can't do the
+   * contract sales tied to a lease... I know a guy that owns over a hundred
+   * homes throughout various parks without actually owning any parks. He's not
+   * going to have a lease. The ownership of the trailer has nothing to do with
+   * who's actually living in the trailer."
+   *
+   * He is right, and the coupling was wrong in both directions: a buyer may
+   * own a home they do not live in, and a tenant may live in a home somebody
+   * else is buying. One tenant can sell their home to another, who then
+   * subleases it on. So a sale stands on its own, and a lease — when there is
+   * one — is recorded for context, not required for the sale to exist.
+   *
+   * `home_sale_contracts.lease_id` and `payments.lease_id` were both already
+   * nullable; only this type and the route insisted. A home-sale installment
+   * bills as a standalone `home_payment`, which has its own settlement path and
+   * is excluded from rent allocation, so it never needed a lease to bill.
+   */
+  leaseId?: string | null
   tenantId: string
   landlordId: string
   salePrice: number
@@ -64,7 +84,7 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
         status)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      RETURNING *`,
-    [input.unitId, input.leaseId, input.tenantId, input.landlordId, input.salePrice.toFixed(2),
+    [input.unitId, input.leaseId ?? null, input.tenantId, input.landlordId, input.salePrice.toFixed(2),
      input.downPayment.toFixed(2), financed.toFixed(2), input.annualInterestRate, input.termMonths,
      monthlyPayment.toFixed(2), input.startMonth, schedule.length, input.planType ?? 'amortized',
      status])).rows[0]

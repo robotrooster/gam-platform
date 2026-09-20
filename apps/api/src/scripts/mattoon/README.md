@@ -30,11 +30,14 @@ tenant is reachable until Blu has signed.
 installment contract ($11,000 over 55 months), never the original sale price or
 the down payment, so those fields are blank for Blu to fill from the originals.
 
-**Curtis Clabough is deliberately NOT on a work-trade agreement.** Nic, after
-seeing the sheet had no hours: "let's just leave him not on a work trade
-agreement for now... I think the guy is only going to get a partial coverage of
-the rent for some work. So Blu can just apply a credit as needed." Lot 6 carries
-a note saying so; it moves to a real agreement when Blu decides the hours.
+**Curtis Clabough is on a work-trade agreement from 1 October** — hours tracked
+monthly, three months of carry-forward, covering rent. Nic: "he is going to be
+on work trade with hours billed monthly... I don't know the exact hour terms
+yet, but let's do a three month cycle of carry forward while they figure out how
+many hours." The carry-forward is the point: some months are busier than others
+at this park. **The 20 hrs/mo target is a placeholder** — the schema requires a
+positive number and this one was not on the sheet. Nothing settles until Blu
+signs the lease, so it is safe to correct, but it must be corrected.
 
 **The installment contracts were drafted and then voided.** They are the reason
 to read the next section.
@@ -58,10 +61,20 @@ The order that works, which `POST /home-sale` already does in one step:
                   →  purchase agreement drafted against that contract
                   →  agreement signed  →  installments written and billed
 
-**This constrains the signing bundle.** Nic's intent is one packet — lease and
-installment contract out together, two separate documents and two separate
-signatures. That works for a tenant who already has a lease. It cannot work on a
-brand-new tenancy, because the contract has nothing to anchor to until the lease
-exists. Worth a decision: either the bundle sends in two passes for new
-tenancies, or `home_sale_contracts.lease_id` (already nullable in the database,
-though not in the TypeScript input) gets filled in when the lease completes.
+**Fixed, rather than worked around.** The lease requirement was the bug. Nic:
+"we can't do the contract sales tied to a lease... I know a guy that owns over a
+hundred homes throughout various parks without actually owning any parks. He's
+not going to have a lease. The ownership of the trailer has nothing to do with
+who's actually living in the trailer." One tenant can sell their home to
+another, who subleases it on.
+
+`leaseId` is optional now, on the service and the route. The guard the lease
+check was doing by accident — tenantId becomes the billed obligor, so it can
+never be an arbitrary id from the body — is kept explicitly: the buyer must have
+a lease of any status, an open invite, or a utility agreement with this
+landlord. A buyer who rents nowhere still reaches GAM through the seller's
+invite; a stranger's id does not.
+
+The bundle binds nothing. `package_group_id` groups documents for SENDING, so
+one packet goes out and both get signed in one sitting. It is a workflow
+convenience and no part of the back end treats the two as one thing.
