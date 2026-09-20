@@ -225,6 +225,47 @@ describe('processPlatformFeeAccrual', () => {
     })
   })
 
+  // S650 (Nic): the fee was recognised as revenue and never charged to anybody
+  // — the payout nets what the landlord OWES, and nothing wrote that down.
+  it('charges the landlord for the fee, so a payout can net it out', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await processPlatformFeeAccrual(RUN_DATE)
+
+    const charge = await db.query<{ kind: string; amount: string; collected_amount: string }>(
+      `SELECT kind, amount::text, collected_amount::text FROM landlord_gam_charges
+        WHERE landlord_id = $1`, [stack.landlordId])
+    expect(charge.rows).toHaveLength(1)
+    expect(charge.rows[0]).toMatchObject({ kind: 'subscription', amount: '12.00', collected_amount: '0.00' })
+  })
+
+  it('re-running the month does not charge the landlord twice', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await processPlatformFeeAccrual(RUN_DATE)
+    await processPlatformFeeAccrual(RUN_DATE)
+    const charge = await db.query(`SELECT id FROM landlord_gam_charges WHERE landlord_id = $1`, [stack.landlordId])
+    expect(charge.rows).toHaveLength(1)
+  })
+
+  // ── S650 (Nic), REPLACING S576 ──────────────────────────────────────────
+  // "The hibernating leases don't get billed anything from the landlord to the
+  // tenant, but we bill from the platform to the landlord. Those are still an
+  // active spot... I cannot put another lease in that spot while there's the
+  // hibernated spot."
+  it('a hibernating lease still carries the platform fee — the spot is occupied', async () => {
+    const stack = await buildPlatformStack({ unitCount: 6, platformFeePayer: 'landlord' })
+    await db.query(
+      `UPDATE leases SET is_hibernating = TRUE, hibernated_at = NOW() - interval '90 days'
+        WHERE unit_id IN (SELECT id FROM units WHERE property_id = $1 LIMIT 2)`,
+      [stack.propertyId])
+
+    const result = await processPlatformFeeAccrual(RUN_DATE)
+    expect(result.feesAccrued).toBe(1)
+    const accrual = await db.query<{ total_billable: number; total_amount: string }>(
+      `SELECT total_billable, total_amount::text FROM platform_fee_accruals WHERE property_id=$1`,
+      [stack.propertyId])
+    expect(accrual.rows[0]).toMatchObject({ total_billable: 6, total_amount: '12.00' })
+  })
+
   // S607 (Nic, DIRECTIVE): the tenant-payer branch is GONE — not by deleting the
   // code path, but by making the state unreachable. "The landlord cannot toggle
   // the platform fee because when we change for volume discounts or things like

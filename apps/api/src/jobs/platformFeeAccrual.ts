@@ -54,6 +54,7 @@
  */
 
 import { getClient, query } from '../db'
+import { chargeLandlord } from '../services/landlordGamAccount'
 import { activateBillingForOccupancy } from '../services/billingActivation'
 import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
@@ -442,10 +443,17 @@ async function accrueOneProperty(
         JOIN units u ON u.id = l.unit_id
        WHERE u.property_id = $1
          AND l.status = 'active'
-         -- S576 Snowbird: a hibernating (seasonally-paused) lease doesn't accrue
-         -- the per-occupied-unit fee — the tenant is gone and the spot earns
-         -- off-season reservation revenue (zero platform fee) instead.
-         AND l.is_hibernating = false
+         -- ── S650 (Nic), REPLACING S576 ────────────────────────────────────
+         -- A hibernating lease DOES carry the platform fee. Nic: "The
+         -- hibernating leases don't get billed anything from the landlord to
+         -- the tenant, but we bill from the platform to the landlord. Those
+         -- are still an active spot... I cannot put another lease in that spot
+         -- while there's the hibernated spot."
+         --
+         -- Hibernation suspends the landlord's billing of the TENANT (no rent,
+         -- no utilities). It does not free the space, so GAM still charges the
+         -- landlord for it. The old rule dropped two Mountain View spots that
+         -- are occupied and unavailable.
          AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
          AND (l.end_date IS NULL OR l.end_date >= $2::date)
     `, [propertyId, monthIso])
@@ -689,6 +697,28 @@ async function accrueOneProperty(
         `UPDATE platform_fee_accruals SET platform_revenue_ledger_id=$1, updated_at=NOW() WHERE id=$2`,
         [ledgerRes.rows[0].id, accrualId]
       )
+
+      // ── S650 (Nic): AND ACTUALLY CHARGE FOR IT ────────────────────────────
+      //
+      // This posted GAM's revenue and stopped. The header's "the landlord's
+      // payouts net out this amount via Stripe Connect destination charge math"
+      // described the PRE-S561 money model; under platform-holds a payout nets
+      // what the landlord OWES (landlord_gam_charges) and nothing else. No
+      // charge was ever written, so the platform fee has been recognised as
+      // revenue and never collected from anybody — GAM has been running the
+      // parks for free while the books said otherwise.
+      //
+      // Idempotent on (source_type, source_id): a re-run accrual cannot bill
+      // the same month twice.
+      await chargeLandlord(client, {
+        landlordId,
+        propertyId,
+        kind: 'subscription',
+        amount: totalAmount,
+        sourceType: 'platform_fee_accrual',
+        sourceId: accrualId,
+        notes: `Platform fee for ${monthIso} (${totalBillable} billable units)`,
+      })
     }
 
     await client.query('COMMIT')
