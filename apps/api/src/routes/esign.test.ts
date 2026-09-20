@@ -593,6 +593,63 @@ describe('template unit-type default (S558)', () => {
 // ─── POST /documents/:id/send ──────────────────────────────────
 
 describe('POST /documents/:id/send', () => {
+  // ─── S651: sending a lease leaves a record of who sent it ────────────
+  //
+  // It left none. A legal document went to a real person and nothing recorded
+  // who caused it. Found the hard way: I signed in as a landlord to send his
+  // own leases and then could not prove from the system what I had touched.
+  //
+  // Nic, on why it matters past that one incident: "when I authorize you to do
+  // something like this on behalf of a landlord down the road — I had
+  // permission from him because we're friends. Another landlord may not grant
+  // me that permission... And I want a record of when that happened, so we can
+  // corroborate emails or phone calls to the time that something actually
+  // happened."
+  describe('S651 audit trail', () => {
+    it('records who sent it, to whom, and when', async () => {
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(200)
+
+      const rows = await db.query<any>(
+        `SELECT user_id, action, entity_type, entity_id, new_value
+           FROM audit_log WHERE entity_id = $1 AND action = 'document.sent_for_signature'`,
+        [documentId])
+      expect(rows.rows).toHaveLength(1)
+      const a = rows.rows[0]
+      expect(a.entity_type).toBe('lease_document')
+      expect(a.user_id).toBe(f.landlordUserId)
+      // Enough to line up against a phone log or an email thread months later:
+      // the acting account, and who the thing actually went to.
+      expect(a.new_value.sentTo).toBeTruthy()
+      expect(a.new_value.sentToRole).toBe('landlord')
+      expect(a.new_value.actingRole).toBe('landlord')
+    })
+
+    it('writes nothing when the send is refused', async () => {
+      // A blocked send is not a send. An audit row for one would make the log
+      // lie in the direction that matters most.
+      const f = await seedFixture()
+      const { documentId } = await seedDoc(f)
+      await db.query(
+        `UPDATE lease_documents SET status='voided', voided_at=NOW() WHERE id=$1`, [documentId])
+
+      const res = await request(buildApp())
+        .post(`/api/esign/documents/${documentId}/send`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(res.status).toBe(400)
+
+      const rows = await db.query<any>(
+        `SELECT 1 FROM audit_log WHERE entity_id = $1 AND action = 'document.sent_for_signature'`,
+        [documentId])
+      expect(rows.rows).toHaveLength(0)
+    })
+  })
+
   // ─── S622 screening gate (Business Terms §9.2) ───────────────────────
   //
   // Nic: "after the onboarding window is closed, all applicants must complete

@@ -207,7 +207,7 @@ describe('a home sale without a lease', () => {
     expect(created.status).toBe(200)
 
     const { billDueHomeSaleInstallments } = await import('../services/homeSale')
-    await billDueHomeSaleInstallments(new Date('2026-10-15'))
+    await billDueHomeSaleInstallments('2026-10-15')
 
     const [p] = await query<any>(
       `SELECT amount::text, type, lease_id, tenant_id FROM payments

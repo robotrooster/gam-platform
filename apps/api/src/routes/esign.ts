@@ -4165,6 +4165,42 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     await query("UPDATE lease_documents SET status='sent', sent_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
     await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1", [firstSigner.id])
 
+    // ── S651: WHO SENT THIS LEASE OUT, AND WHEN ─────────────────────────────
+    //
+    // Sending a lease for signature wrote no audit row at all. A legal document
+    // went to a real person and nothing recorded who caused it — which means
+    // the only account of it is whoever happens to remember.
+    //
+    // Found because I did exactly that: signed in as a landlord to send his own
+    // leases, and then could not prove from the system what I had touched.
+    //
+    // Nic, on why it matters beyond that: "when I authorize you to do something
+    // like this on behalf of a landlord down the road — I had permission from
+    // him because we're friends. Another landlord may not grant me that
+    // permission, or I may need to talk to them first. And I want a record of
+    // when that happened, so we can corroborate emails or phone calls to the
+    // time that something actually happened."
+    //
+    // So this records the acting account, the document, who it went to and the
+    // IP — enough to line up against a phone log or an email thread months
+    // later. Best-effort: a failed audit write must never stop a lease going
+    // out, and the send has already happened by this line.
+    await query(
+      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, new_value, ip_address)
+       VALUES ($1, 'document.sent_for_signature', 'lease_document', $2, $3::jsonb, $4)`,
+      [req.user!.userId, doc.id,
+       JSON.stringify({
+         title: doc.title,
+         landlordId: doc.landlord_id,
+         documentType: doc.document_type,
+         sentTo: firstSigner.email,
+         sentToRole: firstSigner.role,
+         sentToName: firstSigner.name,
+         actingRole: req.user!.role,
+         actingEmail: req.user!.email ?? null,
+       }),
+       (req.ip ?? '').slice(0, 64) || null]).catch(() => {})
+
     res.json({ success: true, data: { sentTo: firstSigner.email } })
   } catch (e) { next(e) }
 })
