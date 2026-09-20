@@ -83,6 +83,17 @@ const createSchema = z.object({
   tenantId: z.string().uuid().optional(),
   posCustomerId: z.string().uuid().optional(),
   bookingId: z.string().uuid().optional(),
+  // S652 (Nic): a stay sold down this route takes the site off the board.
+  // "Think of the stays like almost inventory where I've only got so many sites
+  // on January 12th... when I send a pay link, it should use up inventory
+  // according to what spot was booked and for how long."
+  stay: z.object({
+    unitId:     z.string().uuid(),
+    checkIn:    z.string(),
+    guestName:  z.string().max(120),
+    guestPhone: z.string().max(40).nullish(),
+    guestEmail: z.string().email().nullish(),
+  }).optional(),
 })
 
 async function propertyFor(req: any, propertyId: string) {
@@ -107,28 +118,63 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
   if (body.kind === 'one_time' && !body.customer?.email) {
     throw new AppError(400, 'An email address is needed to send the link.')
   }
-  // S652 — A STAY CANNOT BE SOLD DOWN THIS ROUTE.
+  // S652 — A STAY SOLD DOWN THIS ROUTE USES UP INVENTORY.
   //
-  // A stay is priced by the site it is on and has to land on the Master
-  // Schedule; a pay link carries neither a site nor dates. Letting one through
-  // would take the money and put nothing on the schedule, which is the exact
-  // failure register stays were built to end — rebuilt through a second door.
-  // Billing an EXISTING stay's balance is a different thing and stays allowed:
-  // it goes out with no catalog item behind it (see stay-balance links below).
+  // Nic: "Think of the stays like almost inventory where I've only got so many
+  // sites on January 12th. The inventory replenishes January 13th because it's
+  // a new day and new nights can be paid for. So when I send a pay link, it
+  // should use up inventory according to what spot was booked and for how long."
+  //
+  // The failure this replaces was narrow and real: a cashier could tap a stay
+  // item into the cart and press "Email a pay link" instead of taking payment.
+  // That path accepted any list of items, totalled them and emailed a link —
+  // it had no notion of a site or a date to ask for. Paid, it wrote a sale and
+  // the Master Schedule never heard about it, which is the same failure
+  // register stays were built to end, through a different door. (The booking
+  // site and the counter's reservation flow were always fine; both write a
+  // unit_bookings row.)
+  //
+  // So the link now carries the stay, and the site comes off the board when the
+  // link is SENT, not when it is paid. An unpaid hold has no clock on it and
+  // yields to somebody who pays — the same rank every other hold obeys
+  // (services/holdDisplacement).
   const itemIds = (body.items as any[]).map((i) => i.id).filter(Boolean)
+  let stayLine: { itemId: string; name: string; stayUnit: 'night' | 'week' | 'month'; qty: number } | null = null
   if (itemIds.length) {
-    const stayish = await query<{ name: string }>(
-      `SELECT name FROM pos_items
+    const stayItems = await query<{ id: string; name: string; stay_unit: string }>(
+      `SELECT id, name, stay_unit FROM pos_items
         WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND stay_unit IS NOT NULL`,
       [itemIds, prop.landlord_id])
-    if (stayish.length) {
-      throw new AppError(400,
-        `"${stayish[0].name}" is a stay — it needs a site and an arrival date, so it has to be rung up at the register. `
-        + 'Send a link for the balance afterwards if they are paying later.')
+    if (stayItems.length > 1) {
+      throw new AppError(400, 'One stay to a link — a second site needs its own.')
+    }
+    if (stayItems.length === 1) {
+      const cartLine = (body.items as any[]).find((i) => i.id === stayItems[0].id)!
+      stayLine = {
+        itemId: stayItems[0].id, name: stayItems[0].name,
+        stayUnit: stayItems[0].stay_unit as 'night' | 'week' | 'month',
+        qty: Number(cartLine.qty) || 0,
+      }
+      if (!body.stay) {
+        throw new AppError(400,
+          `"${stayLine.name}" needs a site and an arrival date before a link can go out — `
+          + 'the site is held for them from the moment it is sent.')
+      }
     }
   }
+  if (body.stay && !stayLine) throw new AppError(400, 'Nothing on this link is a stay.')
 
-  const totals = await computeCartTotals(prop.landlord_id, body.items as any[], {
+  // The site's own rate, exactly as the counter and the booking site quote it.
+  // (memory: gam-register-price-is-its-own-thing)
+  let payItems = body.items as any[]
+  if (stayLine && body.stay) {
+    const { priceStayFromUnit } = await import('../services/registerStay')
+    const priced = await priceStayFromUnit(query, body.stay.unitId, prop.landlord_id,
+      stayLine.stayUnit, stayLine.qty)
+    payItems = payItems.map((i) => i.id === stayLine!.itemId ? { ...i, price: priced.rate } : i)
+  }
+
+  const totals = await computeCartTotals(prop.landlord_id, payItems, {
     surcharge: 0, discountAmount: body.discountAmount ?? 0,
   })
   if (!(Number(totals.total) > 0)) throw new AppError(400, 'Nothing to charge — the total is $0.')
@@ -138,6 +184,51 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
         WHERE b.id = $1 AND u.property_id = $2`, [body.bookingId, prop.id])
     if (!b) throw new AppError(404, 'That stay is not at this property.')
   }
+  // The site comes off the board NOW. A link sitting unpaid in somebody's inbox
+  // while the counter sells the same site to a walk-in is the double-booking
+  // this whole mechanism exists to prevent — so the booking is written when the
+  // link is sent, tentative and unpaid, and it is displaceable exactly like any
+  // other unpaid hold. Both writes share one transaction: a held site with no
+  // link, or a link with no site, are each worse than neither.
+  let stayBookingId: string | null = body.bookingId ?? null
+  const bookingClient = stayLine && body.stay ? await getClient() : null
+  if (bookingClient && body.stay && stayLine) {
+    try {
+      await bookingClient.query('BEGIN')
+      const { checkOutFor, siteIsFree, createStayBooking } = await import('../services/registerStay')
+      const checkOut = checkOutFor(body.stay.checkIn, stayLine.stayUnit, stayLine.qty)
+      await bookingClient.query(
+        `SELECT id FROM units WHERE id = $1 AND landlord_id = $2 FOR UPDATE`,
+        [body.stay.unitId, prop.landlord_id])
+      // A LINK IS NOT PAYMENT, so it displaces nobody. It may only take a site
+      // nothing else is holding — the rank is money, not intent. createStayBooking
+      // re-checks this under an advisory lock, which is what actually settles a
+      // race; the check here is so the refusal reads like a sentence.
+      if (!(await siteIsFree(bookingClient, body.stay.unitId, body.stay.checkIn, checkOut))) {
+        throw new AppError(409, 'That site is not free for those dates any more.')
+      }
+      const booking = await createStayBooking(bookingClient, {
+        landlordId: prop.landlord_id,
+        propertyId: prop.id,
+        posTransactionId: null,
+        status: 'tentative',
+        lines: [{ itemId: stayLine.itemId, qty: stayLine.qty, stayUnit: stayLine.stayUnit,
+                  name: stayLine.name, lineTotal: Number(totals.subtotal) }],
+        details: {
+          unitId: body.stay.unitId, checkIn: body.stay.checkIn,
+          guestName: body.stay.guestName,
+          guestPhone: body.stay.guestPhone ?? body.customer?.phone ?? null,
+          guestEmail: body.stay.guestEmail ?? body.customer?.email ?? null,
+        },
+      })
+      stayBookingId = booking.bookingId
+      await bookingClient.query('COMMIT')
+    } catch (e) {
+      await bookingClient.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { bookingClient.release() }
+  }
+
   const token = crypto.randomBytes(24).toString('hex')
   const label = body.label?.trim()
     || (body.items.length === 1 ? body.items[0].name : `${body.items.length} items`)
@@ -151,9 +242,9 @@ export async function createPayLink(req: any, body: z.infer<typeof createSchema>
              CASE WHEN $5 = 'one_time' THEN NOW() + INTERVAL '14 days' ELSE NULL END)
      RETURNING *`,
     [token, prop.landlord_id, prop.id, req.user.userId, body.kind, label.slice(0, 120),
-     JSON.stringify(body.items), totals.subtotal, totals.taxAmount, totals.discount, totals.total,
+     JSON.stringify(payItems), totals.subtotal, totals.taxAmount, totals.discount, totals.total,
      body.customer?.name ?? null, body.customer?.email?.toLowerCase() ?? null, body.customer?.phone ?? null,
-     body.tenantId ?? null, body.posCustomerId ?? null, body.bookingId ?? null,
+     body.tenantId ?? null, body.posCustomerId ?? null, stayBookingId,
      prop.register_card_fee_payer === 'customer'])
 
   const { customerFee, charged } = payLinkCharge(Number(link.total), payerOf(link))

@@ -208,9 +208,26 @@ export async function createStayBooking(
   opts: {
     landlordId: string
     propertyId: string
-    posTransactionId: string
+    /** Null when the money has not been taken yet — a pay link sent, not paid. */
+    posTransactionId: string | null
     lines: StayLine[]
     details: StayDetails
+    /**
+     * S652 — SOLD, or merely SPOKEN FOR.
+     *
+     * A sale at the counter is 'confirmed' and paid the instant it is rung,
+     * which is what this function has always written. A pay link is different:
+     * Nic, on stays as inventory — "when I send a pay link, it should use up
+     * inventory according to what spot was booked and for how long." The site
+     * comes off the board when the link is SENT, because a link sitting unpaid
+     * in an inbox while the counter sells the same site to a walk-in is the
+     * double booking this whole mechanism exists to prevent.
+     *
+     * Unpaid means displaceable: no `deposit_paid_at`, no timer, and it yields
+     * to anybody who actually pays (services/holdDisplacement).
+     */
+    status?: 'confirmed' | 'tentative'
+    source?: string
   },
 ): Promise<{ bookingId: string; checkIn: string; checkOut: string; nights: number }> {
   const { lines, details } = opts
@@ -248,8 +265,8 @@ export async function createStayBooking(
        (unit_id, landlord_id, guest_name, guest_email, guest_phone,
         check_in, check_out, nights, total_amount, status, lease_type,
         source, pos_transaction_id, deposit_paid_at, notes)
-     VALUES ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,'confirmed',$10,
-             'register',$11, NOW(), $12)
+     VALUES ($1,$2,$3,$4,$5,$6::date,$7::date,$8,$9,$13,$10,
+             $14,$11, CASE WHEN $13 = 'confirmed' THEN NOW() ELSE NULL END, $12)
      RETURNING id`,
     [details.unitId, opts.landlordId, details.guestName.trim(),
      details.guestEmail?.trim() || null, details.guestPhone?.trim() || null,
@@ -257,7 +274,8 @@ export async function createStayBooking(
      // The lease type the stay was SOLD as, so the schedule and the books agree
      // with the item that was rung rather than re-deriving a tier from nights.
      line.stayUnit === 'night' ? 'nightly' : line.stayUnit === 'week' ? 'weekly' : 'monthly',
-     opts.posTransactionId, details.notes?.trim() || null])
+     opts.posTransactionId, details.notes?.trim() || null,
+     opts.status ?? 'confirmed', opts.source ?? 'register'])
 
   return { bookingId: ins.rows[0].id, checkIn, checkOut, nights }
 }

@@ -74,6 +74,11 @@ async function seed() {
     const cust = await c.query(
       `INSERT INTO pos_customers (landlord_id, first_name, last_name, email)
        VALUES ($1,'Ray','Delgado','ray@t.dev') RETURNING id`, [landlordId])
+    // A pay link refuses to go out with nowhere to pay the landlord, and that
+    // check fires before anything these tests are about.
+    await c.query(
+      `UPDATE landlords SET stripe_connect_account_id = 'acct_652_' || replace($1::text,'-','')
+        WHERE id = $1`, [landlordId])
     await c.query('COMMIT')
     const token = jwt.sign(
       { userId, role: 'landlord', email: 'll@t.dev', profileId: landlordId, landlordIds: [landlordId], permissions: {} },
@@ -212,5 +217,101 @@ describe('settling it at the door', () => {
     expect(list.body.data).toHaveLength(1)
     expect(list.body.data[0].id).toBe(open.id)
     expect(list.body.data[0].customerName).toBe('Ray Delgado')
+  })
+})
+
+/**
+ * S652 — a stay sent as a pay link takes the site off the board.
+ *
+ * Nic: "Think of the stays like almost inventory where I've only got so many
+ * sites on January 12th. The inventory replenishes January 13th because it's a
+ * new day and new nights can be paid for. So when I send a pay link, it should
+ * use up inventory according to what spot was booked and for how long."
+ *
+ * The narrow failure this replaces: a cashier could tap a stay item into the
+ * cart and press "Email a pay link" instead of taking payment. That path had no
+ * notion of a site or a date to ask for, so it emailed a link, took money, and
+ * the Master Schedule never heard about it.
+ */
+describe('a stay on a pay link', () => {
+  let posPayLinksRouter: any
+  beforeEach(async () => { ({ posPayLinksRouter } = await import('./posPayLinks')) })
+
+  function linkApp() {
+    const app = express()
+    app.use(express.json())
+    app.use((_req, res, next) => {
+      const originalJson = res.json.bind(res)
+      res.json = (body: any) => originalJson(camelCaseKeys(body))
+      next()
+    })
+    app.use("/api/pos/pay-links", posPayLinksRouter)
+    app.use(errorHandler)
+    return app
+  }
+
+  async function seedSite(f: any) {
+    const u = await query<any>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, status, rent_amount, unit_type,
+                          nightly_rate, is_bookable)
+       VALUES ($1,$2,'RV 01','vacant',500,'rv_spot',40,TRUE) RETURNING id`,
+      [f.propertyId, f.landlordId])
+    return u[0].id
+  }
+
+  const send = (f: any, body: any = {}) =>
+    request(linkApp()).post('/api/pos/pay-links').set('Authorization', `Bearer ${f.token}`)
+      .send({
+        propertyId: f.propertyId, kind: 'one_time',
+        customer: { name: 'Dale Carter', email: 'dale@t.dev' },
+        items: [{ id: f.stayItemId, name: 'RV site — nightly', qty: 3, price: 49, tax: 0 }],
+        ...body,
+      })
+
+  it('refuses to send without a site and a date', async () => {
+    const f = await seed()
+    const res = await send(f)
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/site and an arrival date/i)
+  })
+
+  it('holds the site from the moment the link is sent, unpaid', async () => {
+    const f = await seed()
+    const unitId = await seedSite(f)
+    const res = await send(f, { stay: { unitId, checkIn: '2027-01-12', guestName: 'Dale Carter' } })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+
+    const [b] = await query<any>(
+      `SELECT status, deposit_paid_at, hold_expires_at, check_in::text AS ci, check_out::text AS co,
+              total_amount::text AS total
+         FROM unit_bookings`)
+    expect(b.status).toBe('tentative')       // spoken for, not sold
+    expect(b.deposit_paid_at).toBeNull()     // and therefore displaceable
+    expect(b.hold_expires_at).toBeNull()     // with no clock on it
+    expect(b.ci).toBe('2027-01-12')
+    expect(b.co).toBe('2027-01-15')          // three nights of inventory, not one
+    // Priced from the SITE ($40), not the catalog price the browser sent ($49).
+    expect(Number(b.total)).toBe(120)
+  })
+
+  it('will not sell the same nights twice', async () => {
+    const f = await seed()
+    const unitId = await seedSite(f)
+    const first = await send(f, { stay: { unitId, checkIn: '2027-01-12', guestName: 'Dale Carter' } })
+    expect(first.status).toBe(201)
+    const second = await send(f, { stay: { unitId, checkIn: '2027-01-13', guestName: 'Pat Ruiz' } })
+    expect(second.status).toBe(409)
+    expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(1)
+  })
+
+  it('frees the inventory again on the next day', async () => {
+    // "The inventory replenishes January 13th because it's a new day."
+    const f = await seed()
+    const unitId = await seedSite(f)
+    const first = await send(f, { stay: { unitId, checkIn: '2027-01-12', guestName: 'Dale Carter' } })
+    expect(first.status).toBe(201)
+    const later = await send(f, { stay: { unitId, checkIn: '2027-01-15', guestName: 'Pat Ruiz' } })
+    expect(later.status).toBe(201)
+    expect(await query('SELECT 1 FROM unit_bookings')).toHaveLength(2)
   })
 })
