@@ -2760,16 +2760,36 @@ export type NoLeaseDocumentType = typeof NO_LEASE_DOCUMENT_TYPES[number]
  * and the rental version in front of a renter.
  */
 export const DISCLOSURE_TYPES = [
-  // Ordered roughly by how widely the topic appears in the acts.
-  'owner_agent_identity', 'foreclosure_status', 'death_on_premises',
-  'septic_system', 'well_water', 'flood_zone', 'radon', 'mold',
-  'sex_offender_registry', 'asbestos', 'meth_contamination',
-  'park_change_of_use', 'park_statement_of_policy', 'lead_based_paint',
-  'smoke_co_detector', 'zoning_designation', 'insurance_requirement',
-  'bed_bugs', 'defective_drywall', 'utility_billing_method',
-  'military_ordnance', 'condemnation_orders', 'shared_utilities', 'fire_damage',
-  // Common on the sale side, where the seller describes the property itself.
-  'property_condition', 'pest_control', 'rent_control', 'energy_efficiency',
+  // Ranked by how many states' acts mention the topic — see the note above on
+  // why that is NOT a count of states that require it.
+  'death_on_premises',        // 48
+  'foreclosure_status',       // 46
+  'owner_agent_identity',     // 45
+  'property_condition',       // 33
+  'septic_system',            // 27
+  'rent_control',             // 27
+  'well_water',               // 26
+  'flood_zone',               // 22
+  'radon',                    // 22
+  'mold',                     // 22
+  'pest_control',             // 22
+  'sex_offender_registry',    // 18
+  'energy_efficiency',        // 18
+  'asbestos',                 // 17
+  'meth_contamination',       // 17
+  'park_change_of_use',       // 17
+  'park_statement_of_policy', // 15
+  'lead_based_paint',         // 15
+  'smoke_co_detector',        // 15
+  'zoning_designation',       // 15
+  'insurance_requirement',    // 13
+  'bed_bugs',                 // 9
+  'defective_drywall',        // 4
+  'utility_billing_method',   // 4
+  'military_ordnance',        // 3
+  'condemnation_orders',      // 3
+  'shared_utilities',         // 2
+  'fire_damage',              // 2
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
