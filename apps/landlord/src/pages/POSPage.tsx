@@ -1820,7 +1820,9 @@ export function POSPage() {
                                       border:`1px solid ${openTicketId===t.id?'var(--gold)':'var(--border-1)'}`,
                                       borderRadius:10}}>
                 <div>
-                  <div style={{fontWeight:700,fontSize:'.88rem'}}>{t.customerName || 'Customer'}</div>
+                  <div style={{fontWeight:700,fontSize:'.88rem'}}>
+                    {t.customerName || (t.bookingId ? 'Reservation' : 'Customer')}
+                  </div>
                   <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
                     {(t.items||[]).map((i:any)=>`${i.qty} × ${i.name||'item'}`).join(', ')}
                   </div>
@@ -1834,8 +1836,11 @@ export function POSPage() {
                     id:i.id, name:i.name||'Item', price:Number(i.price)||0, qty:Number(i.qty)||1,
                     tax:Number(i.tax)||0, cat:'', icon:'📦', chargeEligible:true, stayUnit:null,
                   })) as any)
+                  // A walk-in reservation is neither a tenant nor a POS
+                  // customer; the booking carries their name.
                   if (t.tenantId) { setTenantId(t.tenantId); setPosCustomerId('') }
-                  else { setPosCustomerId(t.posCustomerId); setTenantId('') }
+                  else if (t.posCustomerId) { setPosCustomerId(t.posCustomerId); setTenantId('') }
+                  else { setPosCustomerId(''); setTenantId('') }
                   setOpenTicketId(t.id); setTicketsOpen(false)
                 }}>Settle</button>
               </div>

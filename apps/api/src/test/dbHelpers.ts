@@ -297,6 +297,12 @@ export async function cleanupAllSchema(): Promise<void> {
   // property_duplicate_flags all CASCADE via units / properties.
   await db.query(`DELETE FROM unit_applications`)
   // S350: unit_bookings FK units RESTRICT; clear before units.
+  // S652: a ticket may name the booking it is payment for. Nulling that column
+  // is not an option — a ticket has to say who it is for, and for a walk-in the
+  // booking IS the answer — so the tickets go first, after releasing the sale
+  // rows that point at them.
+  await db.query(`UPDATE pos_transactions SET open_ticket_id = NULL`)
+  await db.query(`DELETE FROM pos_open_tickets`)
   await db.query(`DELETE FROM unit_bookings`)
   // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
   // for work_trade_logs (CASCADE on agreement delete). Clear before units.

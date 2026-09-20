@@ -316,6 +316,7 @@ export function SchedulePage() {
   const [showAvail, setShowAvail] = useState(false)
   const [pickedUnit, setPickedUnit] = useState<any | null>(null)
   const [lockSite, setLockSite] = useState(false)
+  const [payMode, setPayMode] = useState<'link' | 'register'>('link')
   const [resvAmp, setResvAmp] = useState<string>('none')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
@@ -669,7 +670,7 @@ export function SchedulePage() {
   // to drop, and all of it goes.
   const closeNewResv = () => {
     setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none')
-    setShowAvail(false); setPickedUnit(null); setLockSite(false)
+    setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
@@ -695,10 +696,13 @@ export function SchedulePage() {
       totalAmount:stayPriceForUnit(u).total, source:'direct',
       requiredSiteLayout: resvLayout,
       requiredAmpService: resvAmp,
-      // S652: movable unless the counter promised them that exact space, and
-      // the deposit goes out as a link because the guest is not standing here.
+      // S652: movable unless the counter promised them that exact space.
       lockedToUnit: lockSite,
-      sendDepositLink: true,
+      // Nic's two exits. A deposit link is right for somebody who rang in
+      // February about March, and absurd for a man standing at the desk with
+      // his rig idling outside — he pays at the till, three feet away.
+      sendDepositLink: payMode === 'link',
+      payAtRegister:   payMode === 'register',
     }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeNewResv() },
@@ -2554,19 +2558,40 @@ export function SchedulePage() {
                   Keep them on {pickedUnit.unitNumber} — do not let the schedule move them
                 </label>
 
-                <button className="btn btn-primary" style={{width:'100%',marginTop:14}}
-                        disabled={!hasContact || createResvMut.isLoading}
+                {/* S652 (Nic): "it needs to generate either a pay link from the
+                    scheduling flow or send it to the point of sale for payment
+                    there in person." Either way the site comes off the calendar
+                    now — the sales inventory and the calendar inventory are the
+                    same inventory. */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginTop:14}}>
+                  {([['link','Email a deposit link'],['register','Paying at the counter']] as const).map(([m,label])=>(
+                    <button key={m} onClick={()=>setPayMode(m)}
+                      style={{padding:'8px 4px',border:'1px solid '+(payMode===m?'var(--gold)':'var(--border-1)'),
+                              background:payMode===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',
+                              cursor:'pointer',fontSize:'.74rem',fontWeight:payMode===m?700:400,
+                              color:payMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
+                  ))}
+                </div>
+
+                <button className="btn btn-primary" style={{width:'100%',marginTop:10}}
+                        disabled={(payMode==='link' && !hasContact) || !resvGuestName || createResvMut.isLoading}
                         onClick={async ()=>{
                           const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
                           if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
                           setResvError(''); createResvMut.mutate(pickedUnit)
                         }}>
-                  {createResvMut.isLoading ? 'Sending…' : 'Reserve and email the deposit link'}
+                  {createResvMut.isLoading ? 'Holding the site…'
+                   : payMode==='register' ? 'Hold it and send to the register'
+                   : 'Reserve and email the deposit link'}
                 </button>
-                {!hasContact && <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                {payMode==='link' && !hasContact &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                {payMode==='register' && !resvGuestName &&
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name is enough when they are paying here.</div>}
                 <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6,lineHeight:1.5}}>
-                  The site is held for them with no deadline. If it is still unpaid when the park fills up,
-                  they get moved to another site — or told, if there is nothing else.
+                  {payMode==='register'
+                    ? 'The site comes off the board now and a ticket appears on the register. Ringing it up confirms this same reservation.'
+                    : 'The site is held for them with no deadline. If it is still unpaid when the park fills up, they get moved to another site — or told, if there is nothing else.'}
                 </div>
               </div>)}
 

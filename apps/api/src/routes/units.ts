@@ -1559,6 +1559,13 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       // S652: email the guest a deposit link and hold the site for them until
       // they pay. See the deposit block below for what "hold" means here.
       sendDepositLink: z.boolean().nullish(),
+      // S652 (Nic): the walk-in. "If we find a spot for them in the system, it
+      // needs to generate either a pay link from the scheduling flow or send it
+      // to the point of sale for payment there in person." The site is held the
+      // moment it is chosen; the money happens three feet away.
+      payAtRegister: z.boolean().nullish(),
+      /** Which register item this stay is sold as — the button, not the price. */
+      stayItemId: z.string().uuid().nullish(),
     }).parse(req.body)
 
     const checkInD  = new Date(body.checkIn)
@@ -1603,6 +1610,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // in services/holdDisplacement so the counter, the booking site and the
     // register all apply the same one.
     const wantsDeposit = body.sendDepositLink === true && !!body.guestEmail
+    // Held, unpaid, waiting at the till. Same state as a deposit-link hold —
+    // no timer, displaceable by anybody who actually pays — because it is the
+    // same thing: a site committed on the calendar before the money moved.
+    const wantsRegister = body.payAtRegister === true
 
     // Conflicts (bookings + active leases): the shared predicate in
     // services/unitAvailability — same rule GET /units/available filters by.
@@ -1611,7 +1622,7 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // unpaid hold is sitting on, and the hold gets moved or told below. One
     // that is itself only a hold may not — two unpaid holds on one site is just
     // a double booking with extra steps.
-    const takingMoney = !wantsDeposit
+    const takingMoney = !wantsDeposit && !wantsRegister
     const conflict = await findStayConflict(unit.id, {
       checkIn: body.checkIn, checkOut: body.checkOut, ignoreUnpaidHolds: takingMoney,
     })
@@ -1642,7 +1653,7 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // $2/occupied-unit monthly fee (services/platformFee.ts), not a booking cut.
     const platformFee = 0
 
-    const bookingStatus = wantsDeposit ? 'tentative' : 'confirmed'
+    const bookingStatus = (wantsDeposit || wantsRegister) ? 'tentative' : 'confirmed'
 
     // S652: clearing the site and taking it are one act. Either this guest has
     // the site and the holder has been moved or told, or neither happened —
@@ -1727,7 +1738,53 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       }
     }
 
-    res.status(201).json({ success: true, data: { ...booking, depositLink } })
+    // S652: hand it to the till. The ticket carries the booking, so settling it
+    // confirms THAT reservation — the register cannot invent a second booking
+    // for a site the schedule has already committed.
+    let registerTicketId: string | null = null
+    if (wantsRegister) {
+      try {
+        const item = body.stayItemId
+          ? await queryOne<any>(
+              `SELECT id, name, stay_unit FROM pos_items
+                WHERE id = $1 AND landlord_id = $2 AND stay_unit IS NOT NULL AND is_active = TRUE`,
+              [body.stayItemId, unit.landlord_id])
+          : await queryOne<any>(
+              // No item named: take the property's own stay button for this
+              // length. A park with none has not set its register up, and the
+              // reservation still stands — it just cannot be rung yet.
+              `SELECT id, name, stay_unit FROM pos_items
+                WHERE property_id = $1 AND landlord_id = $2 AND is_active = TRUE
+                  AND stay_unit = $3 LIMIT 1`,
+              [unit.property_id, unit.landlord_id,
+               body.leaseType === 'nightly' ? 'night' : body.leaseType === 'weekly' ? 'week' : 'month'])
+        if (!item) {
+          throw new AppError(409,
+            'This property has no register button for that length of stay, so it cannot be rung up. '
+            + 'Add one under Register items, or email a deposit link instead.')
+        }
+        const qty = item.stay_unit === 'night' ? nights
+          : item.stay_unit === 'week' ? Math.max(1, Math.round(nights / 7))
+          : Math.max(1, Math.round(nights / 30))
+        const ticket = await queryOne<any>(
+          `INSERT INTO pos_open_tickets
+             (landlord_id, property_id, created_by, tenant_id, pos_customer_id, items, note, booking_id)
+           VALUES ($1,$2,$3,$4,NULL,$5::jsonb,$6,$7) RETURNING id`,
+          [unit.landlord_id, unit.property_id, req.user!.userId, body.tenantId ?? null,
+           JSON.stringify([{ id: item.id, name: item.name, qty, price: 0, tax: 0 }]),
+           `${booking.guest_name || 'Guest'} · site ${unit.unit_number} · ${body.checkIn} → ${body.checkOut}`,
+           booking.id])
+        registerTicketId = ticket.id
+      } catch (err) {
+        // The reservation is real and the site is held. Only the till handoff
+        // failed, and saying so beats rolling back a site somebody was just told
+        // they have.
+        if (err instanceof AppError && err.statusCode === 409) throw err
+        logger.error({ err, bookingId: booking.id }, '[booking] register handoff failed')
+      }
+    }
+
+    res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId } })
   } catch (e) { next(e) }
 })
 

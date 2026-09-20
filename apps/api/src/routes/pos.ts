@@ -937,13 +937,33 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // Read from the ITEM, never from its name: pos_items.stay_unit says what
     // one of these buys. An item with it set cannot be sold without a site and
     // a date, because the whole point is that the schedule hears about it.
-    const stayLines = await resolveStayLines(posLandlordId(req), items, stay?.unitId ?? null)
-    if (stayLines.length && !stay) {
+    // S652: when the ticket carries a reservation, the site and the dates were
+    // settled on the schedule and the cashier supplies neither.
+    let ticketBookingId: string | null = null
+    if (openTicketId) {
+      const t = await queryOne<{ booking_id: string | null; unit_id: string | null }>(
+        `SELECT t.booking_id, b.unit_id
+           FROM pos_open_tickets t
+           LEFT JOIN unit_bookings b ON b.id = t.booking_id
+          WHERE t.id = $1 AND t.landlord_id = $2`,
+        [openTicketId, posLandlordId(req)])
+      ticketBookingId = t?.booking_id ?? null
+    }
+
+    const stayLines = await resolveStayLines(posLandlordId(req), items,
+      stay?.unitId ?? (ticketBookingId
+        ? (await queryOne<{ unit_id: string }>(
+            `SELECT unit_id FROM unit_bookings WHERE id = $1`, [ticketBookingId]))?.unit_id ?? null
+        : null))
+    if (stayLines.length && !stay && !ticketBookingId) {
       throw new AppError(400,
         'A stay needs a site and an arrival date before it can be rung up.')
     }
     if (!stayLines.length && stay) {
       throw new AppError(400, 'Nothing in this sale is a stay.')
+    }
+    if (ticketBookingId && !stayLines.length) {
+      throw new AppError(400, 'That ticket is for a reservation, but nothing on it is a stay.')
     }
 
     // S652 (Nic): the site's rate IS the price, so the cart the server totals
@@ -1112,7 +1132,33 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       // that turns out to be taken rolls the money back rather than leaving a
       // paid stay nobody can actually have.
       let stayBooking: { bookingId: string; checkIn: string; checkOut: string; nights: number } | null = null
-      if (stayLines.length) {
+      // S652 — A TICKET THAT CARRIES A RESERVATION CONFIRMS IT; IT DOES NOT
+      // BOOK A SECOND ONE.
+      //
+      // Nic's walk-in: a spot found on the schedule, paid for at the counter.
+      // The site left the calendar when it was chosen, so by the time the
+      // cashier rings it there is already a booking — held and unpaid. Writing
+      // a new one here would sell the same site twice in the same breath: the
+      // guest's own hold would collide with the sale that is paying for it.
+      if (ticketBookingId) {
+        const confirmed = await client.query(
+          `UPDATE unit_bookings
+              SET status = 'confirmed', deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+                  hold_expires_at = NULL, pos_transaction_id = $2, updated_at = NOW()
+            WHERE id = $1 AND status = 'tentative'
+            RETURNING id, check_in::text AS check_in, check_out::text AS check_out, nights`,
+          [ticketBookingId, tx.id])
+        if (!confirmed.rows.length) {
+          throw new AppError(409,
+            'That reservation is no longer waiting to be paid — it may have been cancelled or already settled.')
+        }
+        stayBooking = {
+          bookingId: confirmed.rows[0].id,
+          checkIn: confirmed.rows[0].check_in,
+          checkOut: confirmed.rows[0].check_out,
+          nights: confirmed.rows[0].nights,
+        }
+      } else if (stayLines.length) {
         const { createStayBooking } = await import('../services/registerStay')
         stayBooking = await createStayBooking(client, {
           landlordId: posLandlordId(req),

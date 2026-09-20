@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Bmm9amd6e9KC6jbBdcnjVBbMk9jZ1T4XRKhQmRmHSaC4WsoxdqpdLKZ04k4JUit
+\restrict psA2fQ5grSMBJKwAn9cODPSpBullgVSoQXqvezXxYVfRojTYzDqh1MtcAZuc18i
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7172,7 +7172,8 @@ CREATE TABLE public.pos_open_tickets (
     void_reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT pos_open_tickets_one_customer CHECK (((((tenant_id IS NOT NULL))::integer + ((pos_customer_id IS NOT NULL))::integer) = 1)),
+    booking_id uuid,
+    CONSTRAINT pos_open_tickets_one_customer CHECK (((((((tenant_id IS NOT NULL))::integer + ((pos_customer_id IS NOT NULL))::integer) + ((booking_id IS NOT NULL))::integer) >= 1) AND ((((tenant_id IS NOT NULL))::integer + ((pos_customer_id IS NOT NULL))::integer) <= 1))),
     CONSTRAINT pos_open_tickets_status_check CHECK ((status = ANY (ARRAY['open'::text, 'settled'::text, 'voided'::text])))
 );
 
@@ -7182,6 +7183,13 @@ CREATE TABLE public.pos_open_tickets (
 --
 
 COMMENT ON TABLE public.pos_open_tickets IS 'S652: a sale written up where the goods are measured and settled where the customer is. Holds no money — the total is computed at settlement by the same path every register sale uses.';
+
+
+--
+-- Name: COLUMN pos_open_tickets.booking_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_open_tickets.booking_id IS 'S652: the held reservation this ticket is payment for. Settling the ticket confirms THAT booking rather than creating another — one row from the schedule to the till.';
 
 
 --
@@ -19182,6 +19190,13 @@ CREATE UNIQUE INDEX pos_discounts_code_uniq ON public.pos_discounts USING btree 
 
 
 --
+-- Name: pos_open_tickets_booking_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_open_tickets_booking_idx ON public.pos_open_tickets USING btree (booking_id) WHERE (booking_id IS NOT NULL);
+
+
+--
 -- Name: pos_open_tickets_open_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -25062,6 +25077,14 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_open_tickets pos_open_tickets_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_open_tickets
+    ADD CONSTRAINT pos_open_tickets_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id);
+
+
+--
 -- Name: pos_open_tickets pos_open_tickets_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27465,5 +27488,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Bmm9amd6e9KC6jbBdcnjVBbMk9jZ1T4XRKhQmRmHSaC4WsoxdqpdLKZ04k4JUit
+\unrestrict psA2fQ5grSMBJKwAn9cODPSpBullgVSoQXqvezXxYVfRojTYzDqh1MtcAZuc18i
 
