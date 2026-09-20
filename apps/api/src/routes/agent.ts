@@ -64,6 +64,11 @@ agentRouter.get('/visibility', async (req, res, next) => {
 const chatSchema = z.object({
   message: z.string().trim().min(1).max(4000),
   conversationId: z.string().uuid().optional(),
+  // S651: an id the CLIENT picks for this turn, so it can ask where it is in
+  // the queue while it waits. conversationId can't do that job — on a new
+  // thread the server mints it and the client only learns it once the turn has
+  // answered. Keys an in-memory array; looks nothing up.
+  turnId: z.string().uuid().optional(),
   // Prior turns only — the engine appends the current message. Only
   // user/assistant roles are accepted from the client.
   history: z
@@ -75,6 +80,36 @@ const chatSchema = z.object({
     )
     .max(40)
     .optional(),
+})
+
+// GET /api/agent/chat/waiting?turnId=… — am I actually in a queue?
+//
+// S651. The gate has queued conversations since S628 and has never once told
+// anybody they were queued. What the person sees is a typing indicator that has
+// been running for ninety seconds with no reply — which reads as a page that
+// broke, not as somebody who is busy, and the difference decides whether they
+// wait or close the tab.
+//
+// A poll rather than a push because a turn is one ordinary HTTP request that
+// cannot say anything until it answers. Cheap: an array index lookup, no model,
+// no database.
+//
+// The reply is deliberately in a person's words, never "queue position 3" or
+// anything else that gives away there is a machine behind it — the same rule
+// the rest of the conversation follows.
+agentRouter.get('/chat/waiting', async (req, res, next) => {
+  try {
+    const turnId = typeof req.query.turnId === 'string' ? req.query.turnId : ''
+    if (!turnId) { res.json({ success: true, data: { waiting: false } }); return }
+    const { queuePositionOf, queuePositionMessage } = await import('../services/agents/concurrencyGate')
+    const position = queuePositionOf(turnId)
+    res.json({
+      success: true,
+      data: position > 0
+        ? { waiting: true, message: queuePositionMessage(position) }
+        : { waiting: false },
+    })
+  } catch (e) { next(e) }
 })
 
 // POST /api/agent/chat — one conversational turn.
@@ -123,6 +158,7 @@ agentRouter.post('/chat', async (req, res, next) => {
       },
       message: body.message,
       conversationId,
+      gateKey: body.turnId,
       history,
     })
 

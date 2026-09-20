@@ -6,7 +6,7 @@
  * wait, not take the machine down and lose every conversation in flight.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
-import { withConcurrencySlot, gateStats, queuePositionMessage, __resetGate } from './concurrencyGate'
+import { withConcurrencySlot, gateStats, queuePositionMessage, queuePositionOf, __resetGate } from './concurrencyGate'
 
 const defer = () => {
   let release!: () => void
@@ -93,5 +93,68 @@ describe('the concurrency gate', () => {
     expect(queuePositionMessage(5)).toMatch(/ahead of you/i)
     // Never a number the person would have to interpret.
     expect(queuePositionMessage(5)).not.toMatch(/\bposition\b|\bqueue\b|#\d/)
+  })
+})
+
+/**
+ * S651 — the queue can now say where somebody is, which is the whole point of
+ * having queued them rather than dropped them. Until this, the copy for it
+ * existed and was shown to nobody.
+ */
+describe('telling somebody where they are', () => {
+  it('reports a real position, and only for the one who is waiting', async () => {
+    const a = defer(), b = defer()
+    void withConcurrencySlot(async () => { await a.p }, undefined, 'turn-a')
+    void withConcurrencySlot(async () => { await b.p }, undefined, 'turn-b')
+    // both running at limit 2 — neither is queued
+    void withConcurrencySlot(async () => {}, undefined, 'turn-c')
+    void withConcurrencySlot(async () => {}, undefined, 'turn-d')
+    await new Promise((r) => setImmediate(r))
+
+    expect(queuePositionOf('turn-a')).toBe(0)   // running, not waiting
+    expect(queuePositionOf('turn-c')).toBe(1)
+    expect(queuePositionOf('turn-d')).toBe(2)
+    expect(queuePositionOf('nobody')).toBe(0)
+
+    a.release(); b.release()
+    await new Promise((r) => setImmediate(r))
+  })
+
+  it('moves people up as those ahead finish', async () => {
+    // A position that went stale would be worse than saying nothing — "a
+    // couple of people are ahead of you" held for two minutes after they left
+    // is how a truthful message becomes a lie.
+    // The waiters hold once they start, or releasing one runner would drain
+    // the whole queue in a single tick and there would be no move-up to see.
+    const a = defer(), b = defer(), w1 = defer(), w2 = defer()
+    void withConcurrencySlot(async () => { await a.p }, undefined, 'run-1')
+    void withConcurrencySlot(async () => { await b.p }, undefined, 'run-2')
+    void withConcurrencySlot(async () => { await w1.p }, undefined, 'wait-1')
+    void withConcurrencySlot(async () => { await w2.p }, undefined, 'wait-2')
+    await new Promise((r) => setImmediate(r))
+    expect(queuePositionOf('wait-2')).toBe(2)
+
+    a.release()
+    await new Promise((r) => setImmediate(r))
+    expect(queuePositionOf('wait-2')).toBe(1)
+
+    b.release()
+    await new Promise((r) => setImmediate(r))
+    expect(queuePositionOf('wait-2')).toBe(0)   // their turn came
+
+    w1.release(); w2.release()
+    await new Promise((r) => setImmediate(r))
+  })
+
+  it('says it in a person’s words, never a number', () => {
+    // The rest of the conversation never leaks that a machine is behind it;
+    // a wait notice must not be the one place that does.
+    const one = queuePositionMessage(1)!
+    const many = queuePositionMessage(5)!
+    for (const m of [one, many]) {
+      expect(m).not.toMatch(/\d/)
+      expect(m.toLowerCase()).not.toMatch(/queue|capacity|position|server|model/)
+    }
+    expect(queuePositionMessage(0)).toBeNull()
   })
 })
