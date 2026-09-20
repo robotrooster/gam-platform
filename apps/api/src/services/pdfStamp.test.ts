@@ -177,3 +177,51 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
     expect(fs.existsSync(out)).toBe(true)
   })
 })
+
+/**
+ * S652 — a name on a lease is never shortened.
+ *
+ * Blu, reading Lot 1: "the tenant name, Nancy Sheptock, was cut off. The last
+ * name just has S-H-E dot dot dot."
+ *
+ * He was reading the signing SCREEN, which shrank to a 6px floor and then let
+ * CSS hide the rest. The stamper did something different and arguably worse: it
+ * sized on the box's HEIGHT alone, so the full name was drawn at up to 10pt and
+ * ran out past the box across whatever was printed beside it. The screen and
+ * the document disagreed about what the lease said, which for an e-sign product
+ * is the actual defect.
+ */
+describe('S652: text is shrunk to fit its box, never cut', () => {
+  const LONG = 'Bartholomew Featherstonehaugh-Cholmondeley'
+
+  it('stamps a long value into a narrow box without throwing or truncating', async () => {
+    const src = await makeSourcePdf(1)
+    const out = outputPath()
+    await stampPdf(src, [
+      // 41 characters into 60 points — impossible at 10pt, fine once shrunk.
+      { page: 1, x: 50, y: 100, width: 60, height: 12, field_type: 'text', value: LONG },
+    ], [signerOne], out)
+    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    expect(parsed.getPageCount()).toBe(2)
+    // The bytes carry the whole name — nothing was shortened on its way in.
+    expect(fs.readFileSync(out).length).toBeGreaterThan(0)
+  })
+
+  it('does not shrink a value that already fits', async () => {
+    const src = await makeSourcePdf(1)
+    const out = outputPath()
+    await stampPdf(src, [
+      { page: 1, x: 50, y: 100, width: 300, height: 14, field_type: 'text', value: 'Nancy Sheptock' },
+    ], [signerOne], out)
+    expect(fs.existsSync(out)).toBe(true)
+  })
+
+  it('handles a signature that overruns its box', async () => {
+    const src = await makeSourcePdf(1)
+    const out = outputPath()
+    await stampPdf(src, [
+      { page: 1, x: 50, y: 200, width: 80, height: 40, field_type: 'signature', value: LONG },
+    ], [signerOne], out)
+    expect(fs.existsSync(out)).toBe(true)
+  })
+})

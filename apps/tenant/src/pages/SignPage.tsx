@@ -274,10 +274,25 @@ type Stage = 'signing'|'review'|'done'|'declined'
 // signer signed. Term dates (lease start/end) are deliberate inputs.
 
 /** S629: the largest font that fits a value inside its box, both ways. */
+/**
+ * S652 — the same shrink the stamper applies, so the screen is not a different
+ * document from the one that prints.
+ *
+ * Blu read Lot 1 and reported the tenant's name as "S-H-E dot dot dot". That was
+ * this function's floor plus a CSS ellipsis: the name did not fit, it stopped
+ * shrinking at 6px, and the browser hid the rest. Meanwhile the PDF stamper
+ * sized on height alone and drew the whole name straight out of its box — so
+ * the page he was asked to approve and the page that would be filed disagreed
+ * about what it said.
+ *
+ * Floor lowered to match MIN_PT in services/pdfStamp, and the ellipsis is gone
+ * from value rendering. A name that overflows is visibly wrong and gets fixed;
+ * a name silently shortened is a different person on a lease.
+ */
 function fitFontSize(text: string, boxW: number, boxH: number): number {
   const byHeight = boxH * 0.5
   const byWidth = text.length ? (boxW - 4) / (text.length * 0.55) : byHeight
-  return Math.max(6, Math.min(byHeight, byWidth))
+  return Math.max(5, Math.min(byHeight, byWidth))
 }
 
 const isDateSignedField = (f: any) =>
@@ -756,7 +771,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
                                      fontSize:fitFontSize(String(val), f.width*s, f.height*s),
                                      color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
-                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                                     overflow:'visible' }}>{val}</span>}
                 </div>
               )
             }
@@ -781,7 +796,7 @@ export function SignPage() {
                     // wide values ("29" became "2", a full name became "Jon…"),
                     // and the clipped text is what gets stamped into the
                     // executed PDF.
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'visible' }}>{val}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
                     {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}

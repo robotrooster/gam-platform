@@ -2790,6 +2790,23 @@ export const DISCLOSURE_TYPES = [
   'condemnation_orders',      // 3
   'shared_utilities',         // 2
   'fire_damage',              // 2
+  // S652 — NOT A DISCLOSURE, WHICH IS WHY IT NEEDED ITS OWN SLOT.
+  //
+  // Nic, reading the acknowledgement block on Blu's lease: "is that
+  // acknowledgement a legal requirement? And is that also in your disclosure
+  // list... because that didn't seem to fit into a category on your table."
+  //
+  // It did not, and he was right to notice. Every other entry here says
+  // something about the PROPERTY — lead in the paint, water in the basement. An
+  // acknowledgement says something about the LANDLORD: that he did the things
+  // the statute told him to do, evidenced by the tenant's initials beside each.
+  //
+  // Blu's four are real Illinois law, and specific: the tenant was offered the
+  // Department of Public Health pamphlet on tenant and park operator rights
+  // (765 ILCS 745/14-1), was shown a copy of the lease before signing, and was
+  // offered a written lease of not less than 24 months on a date BEFORE signing
+  // (745/6 and 6(a), almost word for word), and received the park rules.
+  'statutory_acknowledgement',
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
@@ -2823,6 +2840,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   pest_control:             'Periodic pest control',
   rent_control:             'Rent control / just cause',
   energy_efficiency:        'Energy efficiency',
+  statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
   other:                    'Other disclosure',
 }
 

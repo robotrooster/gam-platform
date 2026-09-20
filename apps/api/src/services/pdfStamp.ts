@@ -22,6 +22,39 @@ interface SignerInfo {
   signed_at: string
 }
 
+/**
+ * S652 — a value has to FIT ITS BOX, and nothing on a lease may be shortened.
+ *
+ * Blu, reading Lot 1: "the tenant name, Nancy Sheptock, was cut off. The last
+ * name just has S-H-E dot dot dot. The box in the template should have been big
+ * enough for that whole name to fit."
+ *
+ * He was looking at the signing screen, which shrinks text to fit and then
+ * CSS-ellipsises whatever still does not. This stamper did something different
+ * and arguably worse: it sized text by the box's HEIGHT alone and never its
+ * width, so a long name was drawn in full at up to 10pt and simply ran out past
+ * the box and across whatever was printed next to it.
+ *
+ * Two wrongs that disagreed with each other, which for an e-sign product is the
+ * real defect: what somebody reads before signing has to be what gets stamped.
+ * Both now shrink on width as well as height.
+ *
+ * NOTHING IS EVER TRUNCATED HERE. A name shortened on a lease is a different
+ * person, and a document that quietly drops half of one is worse than an ugly
+ * one. Below MIN_PT the text is drawn at MIN_PT and allowed to overflow, because
+ * a landlord seeing a name spill past its box will fix the template; a landlord
+ * seeing "She..." has no idea anything is wrong.
+ */
+const MIN_PT = 5
+function fitSize(font: any, text: string, boxW: number, boxH: number, maxPt: number): number {
+  const byHeight = Math.min(boxH * 0.55, maxPt)
+  if (!text) return byHeight
+  const w = font.widthOfTextAtSize(text, byHeight)
+  const usable = Math.max(boxW - 4, 1)
+  if (w <= usable) return byHeight
+  return Math.max(MIN_PT, byHeight * (usable / w))
+}
+
 export async function stampPdf(
   sourcePath: string,
   fields: FieldStamp[],
@@ -89,15 +122,20 @@ export async function stampPdf(
             : await pdfDoc.embedJpg(imgBytes)
           page.drawImage(img, { x:field.x, y:pdfY, width:field.width, height:field.height })
         } catch(e) {
-          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.5) })
+          page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.25,
+            size:fitSize(signatureFontFor(field.font_css), field.value, field.width, field.height, 20),
+            font:signatureFontFor(field.font_css), color:rgb(0,0,0.5) })
         }
       } else {
         // S637: the signer's own style, not the body font.
-        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.6,20), font:signatureFontFor(field.font_css), color:rgb(0,0,0.4) })
+        page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+          size:fitSize(signatureFontFor(field.font_css), field.value, field.width, field.height, 20),
+          font:signatureFontFor(field.font_css), color:rgb(0,0,0.4) })
       }
       page.drawLine({ start:{x:field.x,y:pdfY}, end:{x:field.x+field.width,y:pdfY}, thickness:0.5, color:rgb(0.4,0.4,0.4) })
     } else if (field.field_type === 'date') {
-      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
+      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+        size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })
     } else if (field.field_type === 'checkbox' && field.value === 'checked') {
       const useCheck = field.checkbox_mark === 'check'
       page.drawText(useCheck ? '3' : 'X', {
@@ -108,7 +146,8 @@ export async function stampPdf(
         color: rgb(0, 0.4, 0),
       })
     } else if (field.value) {
-      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2, size:Math.min(field.height*0.55,10), font:helvetica, color:rgb(0,0,0) })
+      page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
+        size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })
     }
   }
 
