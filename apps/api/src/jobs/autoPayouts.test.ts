@@ -289,3 +289,53 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
     expect(res.payoutsFired).toBe(1)
   })
 })
+
+describe('processAutoPayouts — a transfer that landed late (S652)', () => {
+  // Mountain View's Sep 16 batch could not transfer that week; the retry landed
+  // it Sep 19 and it sat in the Stripe balance waiting a whole extra week.
+  async function lateTransfer(userId: string, landedHoursAfter: number) {
+    const ll = await db.query(`SELECT id FROM landlords WHERE user_id=$1`, [userId])
+    await db.query(
+      `INSERT INTO platform_transfer_intents
+         (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, status,
+          stripe_transfer_id, created_at, transferred_at)
+       VALUES ($1,$2,'acct_x',4154.89,4154.89,'transferred','tr_late', NOW() - interval '3 days',
+               NOW() - interval '3 days' + ($3 || ' hours')::interval)`,
+      [ll.rows[0].id, userId, String(landedHoursAfter)])
+  }
+
+  it('pays it out on the next weekday run, even off the weekly day', async () => {
+    const userId = await seedConnectReadyLandlord('acct_late')
+    await lateTransfer(userId, 60)                       // landed 2½ days after its batch
+    const res = await processAutoPayouts(WEDNESDAY)      // not a payout day
+    expect(res.payoutsFired).toBe(1)
+    const d = await db.query(`SELECT trigger_type FROM disbursements WHERE user_id=$1`, [userId])
+    expect(d.rows).toEqual([{ trigger_type: 'catch_up' }])
+  })
+
+  it('does not then skip the regular weekly payout that follows', async () => {
+    const userId = await seedConnectReadyLandlord('acct_late2')
+    await lateTransfer(userId, 60)
+    await processAutoPayouts(WEDNESDAY)                  // catch-up
+    const res = await processAutoPayouts(THURSDAY)       // the weekly day, a day later
+    expect(res.skippedAlreadyPaidThisWeek).toBe(0)
+    expect(res.payoutsFired).toBe(1)
+  })
+
+  it('pays out only once — the catch-up does not repeat', async () => {
+    const userId = await seedConnectReadyLandlord('acct_late3')
+    await lateTransfer(userId, 60)
+    await processAutoPayouts(WEDNESDAY)
+    firePayoutMock.mockClear()
+    const again = await processAutoPayouts(WEDNESDAY)
+    expect(again.candidatesScanned).toBe(0)
+    expect(firePayoutMock).not.toHaveBeenCalled()
+  })
+
+  it('an on-time transfer (same run as its batch) is left for the weekly day', async () => {
+    const userId = await seedConnectReadyLandlord('acct_ontime')
+    await lateTransfer(userId, 0)
+    const res = await processAutoPayouts(WEDNESDAY)
+    expect(res.candidatesScanned).toBe(0)
+  })
+})

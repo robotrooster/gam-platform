@@ -370,6 +370,32 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     logger.error({ err: e }, '[auto_payouts] passthrough recovery failed')
   }
 
+  // ── S652: A TRANSFER THAT LANDED LATE IS PAID OUT THE NEXT WEEKDAY ──────
+  //
+  // Mountain View's Sep 16 batch ($4,154.89) could not transfer that week — its
+  // newest payments were not yet available at Stripe. The retry landed it on
+  // Sep 19, into Mountain View's Stripe balance, and there it sat: the bank
+  // payout only fires on the weekly day, so the week it missed became two.
+  // Nic: "where did that four thousand dollars go?"
+  //
+  // A transfer is "late" when it landed well after its batch was built (a
+  // same-run transfer lands in seconds) and nothing has been paid out to that
+  // landlord's bank since. Those landlords are paid on today's run whatever day
+  // it is. Once paid, a disbursement exists after the transfer and they drop
+  // out — this never repeats.
+  const catchUp = new Set<string>((await query<{ user_id: string }>(
+    `SELECT DISTINCT i.landlord_user_id AS user_id
+       FROM platform_transfer_intents i
+      WHERE i.status = 'transferred' AND i.landlord_user_id IS NOT NULL
+        AND i.transferred_at > i.created_at + interval '1 hour'
+        AND i.transferred_at > NOW() - interval '21 days'
+        AND i.transferred_at > COALESCE(
+              (SELECT max(d.created_at) FROM disbursements d WHERE d.user_id = i.landlord_user_id), 'epoch')`
+  )).map(r => r.user_id))
+  if (catchUp.size && !isPayoutDay) {
+    logger.info({ users: [...catchUp] }, '[auto_payouts] paying out late-landed transfers on a non-payout day')
+  }
+
   // Build the candidate list: every Connect-ready landlord/user + pm_company.
   // Cached readiness flags (S159+) are webhook-fed; gating here matches
   // the same gate used at withdrawal time so a manual withdrawal and an
@@ -464,7 +490,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
     // Every Connect-ready landlord, every weekly run. The trigger machinery
     // below still measures the roll — that reporting is worth keeping — but it
     // no longer decides who gets paid.
-    ...(isPayoutDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r })) : []),
+    ...(isPayoutDay ? userRows.map((r): UserCandidate => ({ kind: 'user', ...r }))
+                    : userRows.filter(r => catchUp.has(r.entity_id)).map((r): UserCandidate => ({ kind: 'user', ...r }))),
     ...(weeklyDay ? pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })) : []),
     ...(weeklyDay ? bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })) : []),
   ]
@@ -472,7 +499,8 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 
   for (const cand of candidates) {
     try {
-      const fired = await processOneCandidate(cand, today, sweepDay)
+      const isCatchUp = !isPayoutDay && cand.kind === 'user' && catchUp.has(cand.entity_id)
+      const fired = await processOneCandidate(cand, today, sweepDay, isCatchUp)
       if (fired === 'fired')                      result.payoutsFired++
       else if (fired === 'zero_balance')          result.skippedZeroBalance++
       else if (fired === 'below_minimum')         result.skippedBelowMinimum++
@@ -497,7 +525,7 @@ type OneCandidateOutcome =
   'fired' | 'zero_balance' | 'already_paid_this_week' | 'below_minimum' | 'failed'
 
 async function processOneCandidate(
-  cand: Candidate, today: string, monthEndSweep = false,
+  cand: Candidate, today: string, monthEndSweep = false, catchUpRun = false,
 ): Promise<OneCandidateOutcome> {
   // 1. Pre-skip: already paid TODAY? Stripe's idempotency_key is the
   //    authoritative guard; this avoids a wasted balance.retrieve round-trip.
@@ -522,8 +550,10 @@ async function processOneCandidate(
   let daysSinceLastPayout: number | null = null
   if (cand.kind === 'user') {
     const last = await query<{ days: string | null }>(
+      // S652: a catch-up payout does not count against the spacing — it paid a
+      // week that was missed, and must not push back the week that follows.
       `SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 86400 AS days
-         FROM disbursements WHERE user_id = $1`,
+         FROM disbursements WHERE user_id = $1 AND trigger_type IS DISTINCT FROM 'catch_up'`,
       [cand.entity_id]
     )
     daysSinceLastPayout = last[0]?.days == null ? null : Number(last[0].days)
@@ -636,8 +666,8 @@ async function processOneCandidate(
     await query(
       `INSERT INTO disbursements
          (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
-       VALUES ($1, 'auto_friday', $2, 'processing', $3, NOW(), 0)`,
-      [cand.entity_id, available, stripePayoutId]
+       VALUES ($1, $4, $2, 'processing', $3, NOW(), 0)`,
+      [cand.entity_id, available, stripePayoutId, catchUpRun ? 'catch_up' : 'auto_friday']
     )
   }
 
