@@ -183,6 +183,48 @@ created, scoped to this unit and the people actually on this lease.
 The home-sale guards moved into the service so the packet runs the identical
 ones: mobile homes only (S613), park-owned only, buyer must have standing.
 
+**Country Acres had two sets of lots.** Nic, on the unit count: *"He had
+previously added 11, but never onboarded the right way. And I'm thinking you just
+added a bunch more and ignored his existing 11... I can see he has 47 units which
+doesn't make sense."* He was right. The load script wrote 36 lots with raw SQL,
+bypassing `canonicalUnitNumber`, so Blu's own eleven `MH NN` units sat beside 36
+new `Lot N` ones and nothing joined them — the property's own water meters were
+already named `MH 01`, so the park had been disagreeing with itself. The eleven
+empty duplicates are deleted and the 35 renamed; Country Acres reads 36 units.
+
+**The back-end name and the printed name are different jobs.** Nic: *"They can
+call it lot one on the lease, but it needs to be mobile home one in the system so
+that we are accurately treating like unit types the same consistency platform
+wide... if it was technically an RV spot and they called it lot one, then it would
+be compatible on the scheduler to move around with other short-term stay sites,
+versus a mobile home. You cannot put an RV in there, which is why the distinction
+on the back end matters. I don't give a shit what's on the actual lease."*
+
+`units.display_label` carries the park's own word for the space; `unit_number`
+stays canonical and is what every schedule, availability check, meter and packet
+reads. One helper, `printedUnitNumber` in the shared package, decides what a
+lease prints: display label first, then the canonical name, with the leading word
+stripped because the form already prints "Lot #" beside the box (S632). Both
+prefill paths call it — the S556 unit prefill, which was the one actually filling
+the box and was reading `unit_number` raw, and the S629 identity block behind it.
+Country Acres is backfilled: MH 00–MH 34 in the system, "Lot 0"–"Lot 34" on the
+page. The label never decides what a space IS; an RV spot called "Lot 1" is still
+short-stay inventory.
+
+**The acknowledgements are their own document now.** Nic, on Blu's lease: *"is
+that acknowledgement a legal requirement? And is that also in your disclosure
+list?"* — then *"can you get those acknowledgements, a copy of those into the
+system?"* It is, and it was, but only as four initial lines on page 4 of one
+park's form, which cannot be sent to a tenant who signed on paper years ago and
+cannot be reused by the next Illinois park. It is now a one-page form tagged
+`statutory_acknowledgement` / IL / rental, with the four lines fielded: the IDPH
+pamphlet, the lease exhibited before signing, the written 24-month offer on a
+date preceding signature, and the park rules.
+`apps/api/src/scripts/mattoon/load9_il_acknowledgements.ts` built it; template
+`c5ad6ff1-d085-4053-91cd-aba3b0774fc9`. **Deliberately NOT added to Blu's
+packet** — his lease already carries these lines, and asking one household to
+initial them twice is worse than once.
+
 ---
 
 ## Verified against code, not taken on trust
@@ -190,7 +232,8 @@ ones: mobile homes only (S613), park-owned only, buyer must have standing.
 These S651 claims held up: the 08:30 fee-debit sweep with no consent gate, ACH
 at $6 flat from the shared schedule, the suppression check on the single send
 path, the 04:35 mail sync and 03:50 geocode retry, the renter pool, register
-stays, and Country Acres' 47 lots / 13 sent leases / 11 voided contracts.
+stays, and Country Acres' 13 sent leases / 11 voided contracts. The 47-lot
+count was real and was the bug — see "Country Acres had two sets of lots" below.
 
 Two contradictions found and fixed: the scheduler still described the sweep as
 "only landlords who explicitly authorized a debit" (it considers everyone who
@@ -218,15 +261,30 @@ either way.
    (check whether it is the Ethernet one), the $5 test card is a **platform-side**
    purchase for proving the flow once, the case only matters once the reader
    travels — which it now will, for propane.
-4. **Blu signs the 13 leases.** Invoicing backfills 30 days, so a signature any
-   time through about **30 October** still bills October in full. After that,
-   October has to be billed by hand.
+4. **Blu signs Lot 1 — the test packet.** The 13 originally-sent leases were
+   deleted, not voided: they were drafted before the co-tenant roles were fixed,
+   so 70 of 125 template fields never landed, nobody had signed them and nothing
+   referenced them. Nic: something *"that was never a real issue, of real
+   substance or value to the system... needs to just kind of be pruned
+   completely."* Lot 1 went back out as the real three-document packet (lot
+   lease + installment contract + lead-based-paint SALE form) with John Sheptock
+   as signer and Nancy as authorised occupant. The other twelve wait on Blu
+   blessing this one. Invoicing backfills 30 days, so a signature any time
+   through about **30 October** still bills October in full; after that, October
+   has to be billed by hand.
 5. **Country Acres onboarding window expired 9/11** — left alone deliberately.
+6. **What the Office lot actually is.** It is loaded as `commercial` with no
+   display label. Nic: *"the office building is I think it's a single wide
+   trailer that's on its own lot that they may be trying to sell off so that
+   might actually be considered a mobile home too"* — he is unsure and wants
+   Blu's answer. It matters because the type, not the label, is what decides
+   whether a space can ever be scheduled as short-stay inventory. One field
+   change once Blu says.
 
 ### Still to do at Mattoon
-6. **The 11 installment contracts**, after the leases are signed. The packet now
+7. **The 11 installment contracts**, after the leases are signed. The packet now
    works either way, so they can go out with a lease or on their own.
-7. **Six adults are occupants, not signers.** If any should be liable co-tenants,
+8. **Six adults are occupants, not signers.** If any should be liable co-tenants,
    Blu collects their addresses and they go on by addendum.
 
 ### Built but never exercised

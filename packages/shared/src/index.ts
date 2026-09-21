@@ -534,6 +534,31 @@ export function canonicalUnitNumber(unitType: UnitType, raw: string): string {
   return id ? `${prefix} ${id}`.trim() : prefix
 }
 
+// S652 — THE BACK-END NAME AND THE PRINTED NAME ARE DIFFERENT JOBS.
+//
+// Nic: "They can call it lot one on the lease, but it needs to be mobile home
+// one in the system so that we are accurately treating like unit types the same
+// consistency platform wide... if it was technically an RV spot and they called
+// it lot one, then it would be compatible on the scheduler to move around with
+// other short-term stay sites, versus a mobile home. You cannot put an RV in
+// there, which is why the distinction on the back end matters. I don't give a
+// shit what's on the actual lease."
+//
+// So `unit_number` stays the platform's canonical name (MH 01, RV 03) — every
+// schedule, availability check, meter and packet reads it — and `display_label`
+// carries whatever the sign on the space says. This is the one place the park's
+// word wins: the page a resident reads.
+//
+// The leading word is then stripped, because a lease form prints the kind of
+// space in its own text ("Lot #___", "RV Space #___") and stamping the label
+// after it prints the type twice — on a tight box, on top of itself (S632).
+// The box gets the identifier.
+export function printedUnitNumber(displayLabel: unknown, unitNumber: unknown): string {
+  const source = String(displayLabel ?? '').trim() || String(unitNumber ?? '').trim()
+  const stripped = source.replace(/^[A-Za-z]+[\s#]*/, '').trim()
+  return stripped || source
+}
+
 export const UNIT_NUMBER_PREFIX_ERROR =
   'Unit numbers need a label in front of the number — "RV 37", "MH 4", "Apt 101", "Site 12". ' +
   'A bare number is too easy to mistype into the wrong space, and it collides when two unit ' +

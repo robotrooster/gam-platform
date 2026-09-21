@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict mkUxX3niKkMq9xHnwb78STIpiKLQIZUHU4KyVVLY8qxK6WbRl9iDvFlueLjYjXU
+\restrict bFjuscR4YAJrMabEFi3dsaFNI1Rj1egdOE4ddAxbNQi1nGgMURffZgXHeFlONLg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10404,6 +10404,7 @@ CREATE TABLE public.units (
     owner_household_size integer DEFAULT 1 NOT NULL,
     has_propane_tank boolean DEFAULT false NOT NULL,
     building text,
+    display_label text,
     CONSTRAINT units_building_not_blank CHECK (((building IS NULL) OR (btrim(building) <> ''::text))),
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
@@ -10485,6 +10486,13 @@ COMMENT ON COLUMN public.units.has_propane_tank IS 'S613: this space has a propa
 --
 
 COMMENT ON COLUMN public.units.building IS 'S641: the building within the property. NULL for properties that have none — most parks. Part of the uniqueness key, so Apt 101 can exist in Building 1 and Building 2.';
+
+
+--
+-- Name: COLUMN units.display_label; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.display_label IS 'S652: what the park calls this space — "Lot 1", "Space 7". Printed on leases and shown to residents; NULL prints unit_number. NEVER used to decide what a space is or what may be put on it — unit_type does that.';
 
 
 --
@@ -27560,5 +27568,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict mkUxX3niKkMq9xHnwb78STIpiKLQIZUHU4KyVVLY8qxK6WbRl9iDvFlueLjYjXU
+\unrestrict bFjuscR4YAJrMabEFi3dsaFNI1Rj1egdOE4ddAxbNQi1nGgMURffZgXHeFlONLg
 

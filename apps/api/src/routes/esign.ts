@@ -34,6 +34,7 @@ import {
   DISCLOSURE_TYPES,
   DISCLOSURE_TYPE_LABEL,
   TEMPLATE_APPLIES_TO,
+  printedUnitNumber,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -443,7 +444,8 @@ export async function createDocumentRecord(client: any, opts: {
     // caller passed explicitly — a renewal or a send form still wins.
     if (opts.unitId) {
       const ctx = await client.query(
-        `SELECT u.unit_number, u.rent_amount, u.security_deposit, p.name AS property_name,
+        `SELECT u.unit_number, u.display_label,
+                u.rent_amount, u.security_deposit, p.name AS property_name,
                 CONCAT_WS(', ', p.street1, NULLIF(p.street2,''), p.city, p.state, p.zip) AS property_address,
                 -- S641: the printed name under a landlord signature is whoever
                 -- signs, which is the property's named on-site signer when it
@@ -476,9 +478,19 @@ export async function createDocumentRecord(client: any, opts: {
         // He is right that the type is never in doubt: templates are bound to a
         // unit type (S535 refuses a mismatched pairing outright) and the form's
         // own text names the space. So the box gets the number and nothing else.
-        const shortNumber = String(ctx.unit_number || '').replace(/^[A-Za-z]+\s*/, '')
+        // S652 (Nic): the printed name is the park's own word, not the
+        // platform's. "They can call it lot one on the lease, but it needs to be
+        // mobile home one in the system so that we are accurately treating like
+        // unit types the same consistency platform wide... I don't give a shit
+        // what's on the actual lease, as long as the tenant knows what they're
+        // paying for."
+        //
+        // So the query above reads display_label first. MH 01 in every schedule,
+        // every availability check and every packet; "Lot 1" on the page, which
+        // is what the sign on the space says. Stripping the word still applies —
+        // the form already prints "Lot #" beside the box (S632).
         const identity: Record<string, string | null> = {
-          unit_number: shortNumber || ctx.unit_number,
+          unit_number: printedUnitNumber(ctx.display_label, ctx.unit_number),
           property_name: ctx.property_name,
           property_address: ctx.property_address,
           landlord_name: ctx.landlord_name,

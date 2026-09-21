@@ -3996,3 +3996,74 @@ describe('S652: the occupant box names the whole household', () => {
     expect(await occupantValue(id)).toMatch(/Nancy Sheptock/)
   })
 })
+
+/**
+ * S652 — the back end name and the printed name are different jobs.
+ *
+ * Nic: "We need the system to distinguish unit type. Whatever they print on the
+ * lease can be whatever. They can call it lot one on the lease, but it needs to
+ * be mobile home one in the system so that we are accurately treating like unit
+ * types the same consistency platform wide... if it was technically an RV spot
+ * and they called it lot one, then it would be compatible on the scheduler to
+ * move around with other short-term stay sites, versus a mobile home. You
+ * cannot put an RV in there, which is why the distinction on the back end
+ * matters."
+ */
+describe('S652: a lease prints what the park calls the space', () => {
+  async function docFor(f: SeedFixture) {
+    const tpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, is_active)
+       VALUES ($1, 'Unit label ' || gen_random_uuid(), 'lease', TRUE) RETURNING id`,
+      [f.landlordId])
+    await db.query(
+      `INSERT INTO lease_template_fields
+         (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+       VALUES ($1,'text',NULL,'Lot #','unit_number',1,10,10,80,20,FALSE,1)`,
+      [tpl.rows[0].id])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const doc = await createDocumentRecord(client as any, {
+        landlordId: f.landlordId, templateId: tpl.rows[0].id, unitId: f.unitId, leaseId: null,
+        title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [
+          { userId: f.landlordUserId, role: 'landlord', name: 'Owner', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'T T', email: f.tenantEmail, orderIndex: 2 },
+        ],
+      } as any)
+      await client.query('COMMIT')
+      const { rows } = await db.query<{ value: string }>(
+        `SELECT value FROM lease_document_fields WHERE document_id=$1 AND lease_column='unit_number'`,
+        [doc.id])
+      return rows[0]?.value
+    } finally { client.release() }
+  }
+
+  it('prints the word the park uses, when the unit carries one', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_number='MH 07', display_label='Lot 7' WHERE id=$1`, [f.unitId])
+    // S632: the box gets the number — the form already prints "Lot #" beside it.
+    expect(await docFor(f)).toBe('7')
+  })
+
+  it('falls back to the system name when the park has no other word', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_number='MH 07', display_label=NULL WHERE id=$1`, [f.unitId])
+    expect(await docFor(f)).toBe('07')
+  })
+
+  it('the label never decides what the space IS', async () => {
+    // A space called "Lot 1" that is genuinely an RV spot stays an RV spot, and
+    // the scheduler keeps treating it as short-stay inventory.
+    const f = await seedFixture()
+    await db.query(
+      `UPDATE units SET unit_type='rv_spot', unit_number='RV 01', display_label='Lot 1' WHERE id=$1`,
+      [f.unitId])
+    const { rows } = await db.query<{ unit_type: string }>(
+      `SELECT unit_type FROM units WHERE id=$1`, [f.unitId])
+    expect(rows[0].unit_type).toBe('rv_spot')
+  })
+})

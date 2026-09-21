@@ -11,13 +11,16 @@
  *                      multiplier is a LEASE term on the template, not a
  *                      property setting; only filled when a templateId is given
  *                      AND that template states deposit_months)
- *   unit_number      ← unit
+ *   unit_number      ← what the park calls the space (display_label), else the
+ *                      platform's canonical name — stripped to the identifier,
+ *                      since the form already prints "Lot #" beside the box (S652)
  *   property_name    ← property
  *   property_address ← property street/city/state/zip
  */
 import { query } from '../db'
 import { resolveDepositMonths, computeDeposit } from './depositPolicy'
 import { computeLeaseStart, computeLeaseEnd } from './leaseDates'
+import { printedUnitNumber } from '@gam/shared'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> } | null
 
@@ -26,7 +29,7 @@ export async function suggestUnitPrefill(
   exec: Exec = null,
   templateId: string | null = null,
 ): Promise<Record<string, string>> {
-  const sql = `SELECT u.rent_amount, u.unit_number, u.unit_type, u.property_id, u.available_date,
+  const sql = `SELECT u.rent_amount, u.unit_number, u.display_label, u.unit_type, u.property_id, u.available_date,
                       p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip
                  FROM units u JOIN properties p ON p.id = u.property_id
                 WHERE u.id = $1`
@@ -45,7 +48,10 @@ export async function suggestUnitPrefill(
     const months = await resolveDepositMonths(templateId, exec)
     if (months != null) out.security_deposit = computeDeposit(rent, months).toFixed(2)
   }
-  if (u.unit_number) out.unit_number = u.unit_number
+  // S652: the printed page carries the park's own word for the space; every
+  // other surface keeps the canonical MH 01 / RV 03. See printedUnitNumber.
+  const printed = printedUnitNumber(u.display_label, u.unit_number)
+  if (printed) out.unit_number = printed
   if (u.property_name) out.property_name = u.property_name
   const addr = [u.street1, u.street2, u.city, u.state, u.zip].filter(Boolean).join(', ')
   if (addr) out.property_address = addr
