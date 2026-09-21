@@ -355,6 +355,103 @@ exactly lease + installment contract + EPA Sales form + lead pamphlet + IDPH
 guide — once he has marked his park rules and owner disclosure as "Already in"
 his lease.
 
+**Sleeves, second pass (Nic's corrections the same day).**
+- **Auto-detection replaced "Already in…".** `services/sleeveDetection.ts` reads
+  every landlord document on upload and on PDF replace. It goes by section
+  headings, plus a few body signals: the owner name-and-address block, utility
+  billing, "acknowledges receipt of", and — added late S652 — a hazard the
+  document keeps discussing (bed bugs, mold, radon, asbestos: 3+ mentions). The
+  last came from Nic: his Oak Park apartment lease has a bed-bug clause and
+  EPA's flyer attached, both in Title Case, so no heading matched.
+  - Every re-read replaces that document's automatic ticks, so a section dropped
+    from next year's draft un-ticks itself. Ticks the landlord set by hand are
+    never touched.
+  - "It's in another document" is a checklist, shown on documents only (never on
+    leases, sale contracts or notices).
+  - `scripts/disclosures/redetectAll.ts` re-reads everything after a detector
+    change.
+- **Duplicates.** Blu is an owner-member of Oak Park, so his view spans two
+  companies. The library now dedupes to one copy per viewer.
+- **Cards are wide and short**, nothing is truncated, and every group starts
+  collapsed.
+- **Locked late-fee boxes** can be moved and resized; only the value is locked.
+- **Free government versions.** A state's own version of a document fills the
+  matching sleeve and also lists under Government forms. A state model lease
+  would fill the lease sleeve.
+- **Read only.** A government PDF that is locked against editing (IEMA's sales
+  radon pamphlet) can be viewed and handed out but never stamped. `/upload`
+  refuses encrypted PDFs.
+
+**Government library — the rule is Nic's: "If the government provides a
+document, we are adding it to the library. That's it."** Claude sources every
+document; Nic does not download anything. `stockLibrary.ts` is the one source
+for each document's file, title, boxes, source file URL, and (new) the agency
+PAGE to check for the next edition (`source_page_url`). A newer edition names
+the file it `replaces`; shelving it retires the old one and moves every
+landlord copy over (`resyncAdoptions`). Signed documents keep the edition that
+was signed. Every file lives in `apps/api/uploads/leases/library-*.pdf` on the
+Mac Studio (nightly backup).
+- **Federal (4):**
+  - EPA 9600-041 (rentals) and 9600-040 (sales)
+  - *Protect Your Family From Lead in Your Home* (January 2026)
+  - *Renovate Right* (September 2011, still EPA's current edition). Its sleeve
+    fills every housing state's lead slot; in a package it is for renovation
+    work, not move-in.
+- **Illinois (7):**
+  - IDHR Safe Homes summary, **December 2025 (V.2025-12.3)**, which replaced the
+    October edition. It has signature rows on all 4 pages; the rights take
+    effect 1/1/2026.
+  - IEMA radon: the tenant disclosure, the tenant guide, and the sales
+    guidelines (read only)
+  - AG landlord-tenant fact sheet
+  - IDPH *Living in a Manufactured Home Community* (the pamphlet 765 ILCS 745/14-1
+    has parks offer every tenant)
+  - IDPH printing of the MH act
+  - **Illinois lead:** 77 IAC 845.25(b) only asks for a brochure "consistent
+    with" 40 CFR 745, so the federal pamphlet covers it. There is no separate
+    Illinois brochure.
+- **Arizona (5 active):**
+  - Residential act (May 2023) and MH parks act (2024), both through
+    web.archive.org
+  - UA bed-bug bulletin (2012)
+  - ADHS bed-bug toolkit (2019)
+  - Phoenix guide (2014)
+  - The Spanish act is retired (English only, Nic).
+- **Arizona gaps:** the Nov 2025 MH act and the MH act **summary**. ARS
+  33-1432.01 has landlords give MH tenants the summary. Both exist only on
+  housing.az.gov, which refuses scripted downloads (403). The archive has no
+  copies, and the in-app browser was refused the site. Files:
+  `housing.az.gov/sites/default/files/2025-11/AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act-Nov_2025.pdf`
+  and `.../2024-10/LTA-Summary-REV-Oct_2024.pdf` (check the resource page for a
+  2025 summary).
+
+**Tenant portal — "Landlord-Tenant Act".** New sidebar page (`/laws`, API
+`GET /tenants/me/laws`). One section per leased home: the state's act for that
+kind of space, then the state's guides, each showing its publisher and edition.
+It updates automatically when a new edition is shelved.
+
+**Mountain View leases never mention Oak Park.** The RV and MH lease PDFs were
+corrected in place:
+- LLC: "Mountain View RV Park Ranch LLC"
+- Manager: Nicholas Rhoades
+- Rules titles: Mountain View
+
+Both templates now point at the corrected PDFs with every box kept. The 37
+completed leases keep their signed text. **4 in progress (3 MH, 1 RV) are still
+on the old file** — Nic's call whether to void and reissue.
+
+**Voided documents that were never signed** are hidden from the documents list
+(kept, never deleted).
+
+**Mountain View payout ($4,154.89).** The money reached the Connect account
+Saturday, after that week's payout run, and the manual payout schedule left it
+sitting there. Nic paid it out by hand at 12:18 (arrives ~9/21–22). The balance
+is $0, so the evening run cannot double-pay.
+- `jobs/autoPayouts.ts` now has a **catch-up**: a transfer that lands more than
+  an hour after its intent and after the landlord's last payout is paid out
+  the next day. `disbursements.trigger_type='catch_up'`.
+- Claude does not create payouts or move money itself; that stays with Nic.
+
 ---
 
 ## Verified against code, not taken on trust
