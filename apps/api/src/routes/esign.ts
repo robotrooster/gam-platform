@@ -2722,6 +2722,14 @@ esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (
       LEFT JOIN properties p ON p.id = u.property_id
       LEFT JOIN lease_document_signers s ON s.document_id = d.id
       WHERE d.landlord_id = ANY($1::uuid[])
+        -- S652 (Blu, via Nic): "All the voided ones that are showing in his
+        -- history, he wants those deleted... we only want to keep expired ones
+        -- for history of tenancy. We don't want to keep voided ones that never
+        -- were fully executed. It's just clutter." A voided document never
+        -- became an agreement (a completed one cannot be voided), so it has no
+        -- place in the landlord's list. The row itself is kept — GAM never
+        -- erases — it just is not shown.
+        AND d.status <> 'voided'
       GROUP BY d.id, u.unit_number, p.name
       ORDER BY d.created_at DESC`, [landlordScopeIds(req.user!)])
     res.json({ success: true, data: docs })

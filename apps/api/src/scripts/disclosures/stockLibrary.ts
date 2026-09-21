@@ -79,34 +79,45 @@ const sigRow = (role: string, who: string, page: number, sigX: number, dateX: nu
     page, x: dateX, y: labelTop - 17, w: 64, h: 16, required: true },
 ]
 
-// Receipt on a pamphlet with no blanks: initials on the cover, initials and
-// date on the last page.
+// S652 (Nic): "by default, it's primary tenants or up to four tenants' initials
+// that they received each separate document that doesn't need a signature."
+// One box per tenant slot. Co-tenant boxes on a lease with fewer tenants are
+// dropped when the document is drafted (a role nobody holds never reaches the
+// page), so a one-tenant lease shows one box.
+const TENANT_ROLES = ['primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3']
+const INIT_W = 38, INIT_H = 16, INIT_GAP = 4
+const initialsRow = (page: number, x: number, y: number, label: string, cols = 4): Field[] =>
+  TENANT_ROLES.map((role, i) => ({
+    type: 'initials' as const, role, label: `${label} — ${role === 'primary' ? 'tenant' : `co-tenant ${i}`}`,
+    column: 'tenant_initial', page,
+    x: x + (i % cols) * (INIT_W + INIT_GAP), y: y + Math.floor(i / cols) * (INIT_H + INIT_GAP),
+    w: INIT_W, h: INIT_H, required: role === 'primary',
+  }))
+const rowWidth = (cols = 4) => cols * INIT_W + (cols - 1) * INIT_GAP
+
+// Receipt on a pamphlet with no blanks: every tenant initials the first page
+// and the last page; the tenant dates the last page, after the initials.
 const receipt = (lastPage: number, first: { x: number; y: number }, last: { x: number; y: number }): Field[] => [
-  { type: 'initials', role: 'primary', label: 'Received this — initials, first page', column: 'tenant_initial',
-    page: 1, x: first.x, y: first.y, w: 56, h: 18, required: true },
-  { type: 'initials', role: 'primary', label: 'Received this — initials, last page', column: 'tenant_initial',
-    page: lastPage, x: last.x, y: last.y, w: 56, h: 18, required: true },
+  ...initialsRow(1, first.x, first.y, 'Received this, first page'),
+  ...initialsRow(lastPage, last.x, last.y, 'Received this, last page'),
   { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed',
-    page: lastPage, x: last.x + 70, y: last.y, w: 90, h: 18, required: true },
+    page: lastPage, x: last.x + rowWidth() + 8, y: last.y, w: 80, h: INIT_H, required: true },
+]
+
+// The same, where the clear space is not side by side: each row placed by hand
+// after looking at the rendered page, `cols` wide (2 = a 2×2 block).
+const receiptAt = (lastPage: number, first: { x: number; y: number; cols?: number },
+                   lastInitials: { x: number; y: number; cols?: number }, lastDate: { x: number; y: number }): Field[] => [
+  ...initialsRow(1, first.x, first.y, 'Received this, first page', first.cols),
+  ...initialsRow(lastPage, lastInitials.x, lastInitials.y, 'Received this, last page', lastInitials.cols),
+  { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed',
+    page: lastPage, x: lastDate.x, y: lastDate.y, w: 80, h: INIT_H, required: true },
 ]
 
 // The federal lead rule covers HOUSING built before 1978 — a place someone lives,
 // not an RV site, a storage unit or a shop. Scoped here so an RV park's shelf and
 // its packages never carry lead paperwork that does not apply to it.
 const DWELLINGS = ['apartment', 'single_family', 'mobile_home', 'hotel_room']
-
-// Receipt where the clear space is somewhere else on each page — initials on
-// the first page, initials and date on the last, each placed by hand after
-// looking at the rendered page.
-const receiptAt = (lastPage: number, first: { x: number; y: number },
-                   lastInitials: { x: number; y: number }, lastDate: { x: number; y: number }): Field[] => [
-  { type: 'initials', role: 'primary', label: 'Received this — initials, first page', column: 'tenant_initial',
-    page: 1, x: first.x, y: first.y, w: 56, h: 16, required: true },
-  { type: 'initials', role: 'primary', label: 'Received this — initials, last page', column: 'tenant_initial',
-    page: lastPage, x: lastInitials.x, y: lastInitials.y, w: 56, h: 16, required: true },
-  { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed',
-    page: lastPage, x: lastDate.x, y: lastDate.y, w: 90, h: 16, required: true },
-]
 
 // A form's own "Printed Name / Signature / Date" row, one per tenant.
 const signRow = (page: number, top: number, role: string, nameColumn: string): Field[] => [
@@ -180,7 +191,7 @@ const DOCS: Doc[] = [
     sourceUrl: 'https://www.epa.gov/system/files/documents/2026-02/protectyourfamily_pamphlet_2026_3.pdf',
     publicationRef: 'Protect Your Family From Lead in Your Home, January 2026 (English)',
     effectiveFrom: '2026-01-12',
-    fields: receipt(20, { x: 300, y: 567 }, { x: 40, y: 540 }),
+    fields: receipt(20, { x: 40, y: 566 }, { x: 40, y: 540 }),
   },
   {
     file: 'library-il-idph-living-in-mh-community.pdf',
@@ -191,7 +202,7 @@ const DOCS: Doc[] = [
     sourceUrl: 'https://dph.illinois.gov/content/dam/soi/en/web/idph/files/publications/publicationsohp2018-living-manufacturedhome-community.pdf',
     publicationRef: 'IDPH, Living in a Manufactured Home Community, 2018',
     effectiveFrom: '2018-01-01',
-    fields: receipt(27, { x: 440, y: 735 }, { x: 72, y: 300 }),
+    fields: receipt(27, { x: 400, y: 735 }, { x: 72, y: 300 }),
   },
   {
     file: 'library-il-idph-mh-landlord-tenant-act.pdf',
@@ -202,7 +213,7 @@ const DOCS: Doc[] = [
     sourceUrl: 'https://dph.illinois.gov/content/dam/soi/en/web/idph/files/publications/mobile-home-landlord-and-tenant-rights-act-printable-5-31-18.pdf',
     publicationRef: '765 ILCS 745, IDPH printing of May 31, 2018',
     effectiveFrom: '2018-05-31',
-    fields: receipt(20, { x: 450, y: 742 }, { x: 72, y: 722 }),
+    fields: receipt(20, { x: 400, y: 742 }, { x: 72, y: 722 }),
   },
   // ── Arizona ───────────────────────────────────────────────────────────
   // ARS 33-1319 has landlords give "bedbug educational materials" and names
@@ -220,7 +231,7 @@ const DOCS: Doc[] = [
     sourceName: 'University of Arizona Cooperative Extension',
     sourceUrl: 'https://acis.cals.arizona.edu/docs/default-source/community-ipm-documents/public-health-ipm/bed-bugs/az1563.pdf',
     publicationRef: 'AZ1563, May 2012', effectiveFrom: '2012-05-01',
-    fields: receiptAt(6, { x: 522, y: 4 }, { x: 460, y: 4 }, { x: 520, y: 4 }),
+    fields: receiptAt(6, { x: 420, y: 4 }, { x: 300, y: 4 }, { x: 476, y: 4 }),
   },
   // ── Illinois ──────────────────────────────────────────────────────────
   {
@@ -269,7 +280,7 @@ const DOCS: Doc[] = [
     sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
     sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/radonguidefortenants.pdf',
     publicationRef: 'Radon Guide for Tenants', effectiveFrom: '2026-09-21',
-    fields: receiptAt(8, { x: 170, y: 548 }, { x: 40, y: 540 }, { x: 40, y: 562 }),
+    fields: receiptAt(8, { x: 170, y: 548 }, { x: 40, y: 300, cols: 2 }, { x: 40, y: 345 }),
   },
   // NOT stocked: IEMA's "Radon Testing Guidelines for Real Estate Transactions".
   // The agency's PDF is encrypted against editing, so no signature box can be
@@ -283,7 +294,7 @@ const DOCS: Doc[] = [
     sourceName: 'Illinois Attorney General',
     sourceUrl: 'https://illinoisattorneygeneral.gov/Page-Attachments/LandlordAndTenantRightsLaws.pdf',
     publicationRef: 'Fact sheet, 01/24', effectiveFrom: '2024-01-01',
-    fields: receiptAt(3, { x: 520, y: 24 }, { x: 72, y: 752 }, { x: 142, y: 752 }),
+    fields: receiptAt(3, { x: 420, y: 24 }, { x: 72, y: 752 }, { x: 248, y: 752 }),
   },
 ]
 
@@ -328,6 +339,43 @@ async function stock() {
       console.log(renamed.length || copies.length
         ? `renamed: ${d.name} (and ${copies.length} landlord cop${copies.length === 1 ? 'y' : 'ies'})`
         : `already shelved: ${d.name}`)
+
+      // The default BOXES are this script's too. When they change, the shelf
+      // gets the new ones — and so does every landlord copy whose boxes are
+      // still exactly the old defaults. A copy the landlord has moved or added
+      // boxes on is theirs (Nic: boxes "able to be altered if necessary") and
+      // is left alone, and said so.
+      const sig = (rows: any[]) => rows.map(r =>
+        [r.field_type, r.signer_role, r.page, Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)].join('|')).sort().join(';')
+      const libFields = await query<any>(`SELECT * FROM disclosure_library_fields WHERE document_id=$1`, [held[0].id])
+      const wanted = sig(d.fields.map(f => ({ field_type: f.type, signer_role: f.role, page: f.page, x: f.x, y: f.y, width: f.w, height: f.h })))
+      const oldSig = sig(libFields)
+      if (oldSig !== wanted) {
+        await query(`DELETE FROM disclosure_library_fields WHERE document_id=$1`, [held[0].id])
+        let n = 0
+        for (const f of d.fields) {
+          await query(
+            `INSERT INTO disclosure_library_fields
+               (document_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            [held[0].id, f.type, f.role, f.label, f.column ?? null, f.page, f.x, f.y, f.w, f.h, f.required, ++n])
+        }
+        const adopted = await query<{ id: string; name: string }>(
+          `SELECT t.id, u.email AS name FROM lease_templates t JOIN landlords l ON l.id=t.landlord_id
+             JOIN users u ON u.id=l.user_id WHERE t.library_document_id=$1 AND t.is_active`, [held[0].id])
+        for (const t of adopted) {
+          const own = await query<any>(`SELECT * FROM lease_template_fields WHERE template_id=$1`, [t.id])
+          if (sig(own) !== oldSig) { console.log(`    left alone (boxes customised): ${t.name}`); continue }
+          await query(`DELETE FROM lease_template_fields WHERE template_id=$1`, [t.id])
+          await query(
+            `INSERT INTO lease_template_fields
+               (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, options, default_value, checkbox_mark)
+             SELECT $2, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, options, default_value, checkbox_mark
+               FROM disclosure_library_fields WHERE document_id=$1`, [held[0].id, t.id])
+          console.log(`    new default boxes → ${t.name}`)
+        }
+        console.log(`  boxes updated: ${d.name} (${d.fields.length})`)
+      }
       continue
     }
 

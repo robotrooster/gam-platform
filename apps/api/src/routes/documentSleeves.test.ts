@@ -250,3 +250,18 @@ describe('uploading a PDF', () => {
     expect(r.status).toBe(400)
   })
 })
+
+describe('the landlord\'s document list', () => {
+  it('leaves out voided documents — they never became agreements', async () => {
+    // Blu: voided documents that were never executed are clutter in his history.
+    for (const [title, status] of [['Sent one', 'sent'], ['Voided one', 'voided'], ['Signed one', 'completed']]) {
+      await query(`INSERT INTO lease_documents (landlord_id, title, document_type, status) VALUES ($1,$2,'general_contract',$3)`,
+        [il.landlordId, title, status])
+    }
+    const r = await request(app()).get('/api/esign/documents').set('Authorization', `Bearer ${token(il)}`).expect(200)
+    const titles = (r.body.data ?? r.body).map((d: any) => d.title).sort()
+    expect(titles).toEqual(['Sent one', 'Signed one'])
+    // the row itself is kept
+    expect((await query<any>(`SELECT count(*)::int c FROM lease_documents WHERE status='voided'`))[0].c).toBe(1)
+  })
+})
