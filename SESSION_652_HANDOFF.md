@@ -316,6 +316,45 @@ the steps, so the fix is a trigger (`trg_cancel_unsigned_sale_on_void`), not a
 fifth copy. The button's steps also moved into `lib/voidDocument` so scripts run
 the same ones. Zero sales were stranded in production before this.
 
+**Templates are sleeves now.** Nic: *"right now, all of my templates are just
+sitting there in a pool instead of in a designated card slot... if I upload my
+Arizona property and twelve documents are anticipated, that shows twelve
+blanks... They're not required to use the blank spots. But that hint of hey,
+there's more things to upload is there."* The sleeve is the slot; the card is the
+document in it.
+
+- **Catalog** — `document_sleeves`, 811 rows, from the statute corpus by
+  `scripts/disclosures/buildSleeves.ts`: a lease per unit type per state (561),
+  a mobile home sale contract per state (51), and 199 document sleeves across 43
+  states wherever a state's act has the landlord hand or tell the tenant
+  something, scoped to the spaces that act governs. `REPORT=IL,AZ` prints the
+  statute sentence behind every one. Took four matching passes; every IL and AZ
+  hit was read against the statute, TX/CA/FL spot-checked. Errs toward leaving
+  one out.
+- **Corpus mislabels found:** IL `rv_park` is a 45/45 copy of the mobile home
+  act; IL `commercial` is eviction + residential. Routed around here; the fix is
+  a separate task (chip raised) — along with `state_landlord_tenant_acts`, which
+  the agents use to find the governing act and which holds ONE state.
+- **The page** — one section per state the landlord holds property in, the
+  sleeves for the unit types they run there, numbered so gaps read as gaps.
+  Government forms sit in theirs already. Nothing says required. Upload into a
+  sleeve and it takes the sleeve's type, unit type and state. Unfileable
+  templates show under Other documents. All seven existing templates filed.
+- **"Already in…"** — Blu's lease carries his park rules and owner disclosure as
+  exhibits; a sleeve can be covered by a document he already has
+  (`sleeve_coverings`) instead of reading as missing.
+- **Library is relevant-only** again — Federal plus their states, for the spaces
+  they run. The federal lead forms are scoped to housing.
+- **Packages** keep a state; **Fill from my documents** adds every filled sleeve
+  for that state and unit type (default lease if two; Sales or Rentals lead form,
+  never both; nothing covered).
+
+For Blu's Lot 1 packet the order is unchanged, but step 3 is now one click: a
+package for Illinois / mobile home with "Includes a home sale" ticked fills with
+exactly lease + installment contract + EPA Sales form + lead pamphlet + IDPH
+guide — once he has marked his park rules and owner disclosure as "Already in"
+his lease.
+
 ---
 
 ## Verified against code, not taken on trust
