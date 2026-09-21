@@ -291,16 +291,36 @@ const DOCS: Doc[] = [
   },
   // Spanish edition: shelved and then retired the same day. Nic: "Yeah, let's do
   // English only for now. Let's keep it simple."
+  // September 2026 edition, saved by Nic from the agency page 2026-09-21 (the
+  // site blocks scripted downloads). Its cover still reads "laws in effect as of
+  // September 14, 2024", but the text is new: relocation-fund payouts rose to
+  // $22,500 single-section / $30,000 multisection, anywhere in the state.
   {
-    file: 'library-az-adoh-mh-parks-lta-2024.pdf',
-    name: 'Arizona: Mobile Home Parks Residential Landlord and Tenant Act (Department of Housing, 2024)',
-    description: 'The Arizona Mobile Home Parks Residential Landlord and Tenant Act as printed by the Arizona Department of Housing, revised with laws in effect as of September 14, 2024.',
+    file: 'library-az-adoh-mh-parks-lta-2026-09.pdf',
+    replaces: 'library-az-adoh-mh-parks-lta-2024.pdf',
+    name: 'Arizona: Mobile Home Parks Residential Landlord and Tenant Act (Department of Housing, September 2026)',
+    description: 'The Arizona Mobile Home Parks Residential Landlord and Tenant Act as printed by the Arizona Department of Housing, September 2026 edition.',
     disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Arizona Department of Housing',
-    sourceUrl: 'https://housing.az.gov/sites/default/files/2024-10/AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act-Oct_2024.pdf',
+    sourceUrl: 'https://housing.az.gov/resources/mobile-home-residential-landlord-and-tenant-act',
     sourcePage: 'https://housing.az.gov/resources/mobile-home-residential-landlord-and-tenant-act',
-    publicationRef: 'Revised with laws in effect as of September 14, 2024 (via web.archive.org, 2025-02-19)', effectiveFrom: '2024-09-14',
+    publicationRef: 'AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act- Sep_2026.pdf', effectiveFrom: '2026-09-01',
     fields: coverReceipt(180, 670),
+  },
+  // A.R.S. 33-1432(G)/(H): a park hands every prospective mobile home tenant
+  // the Director-approved summary before the rental agreement, and makes it
+  // available to all tenants each year by November 1. Saved by Nic from the
+  // agency page 2026-09-21 ("Updated 9/10/26").
+  {
+    file: 'library-az-adoh-mh-parks-lta-summary-2026-09.pdf',
+    name: 'Arizona: Summary of the Mobile Home Parks Residential Landlord and Tenant Act (Department of Housing, September 2026)',
+    description: "The Arizona Department of Housing's Director-approved summary of the Mobile Home Parks Residential Landlord and Tenant Act, updated September 10, 2026.",
+    disclosureType: 'tenant_rights_guide', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['mobile_home'],
+    sourceName: 'Arizona Department of Housing',
+    sourceUrl: 'https://housing.az.gov/resources/summary-mobile-home-parks-residential-landlord-and-tenant-act-0',
+    sourcePage: 'https://housing.az.gov/resources/summary-mobile-home-parks-residential-landlord-and-tenant-act-0',
+    publicationRef: 'LTA-Summary-REV-Sep_2026.pdf (Updated 9/10/26)', effectiveFrom: '2026-09-10',
+    fields: receipt(6, { x: 58, y: 736 }, { x: 72, y: 450 }),
   },
   // ── Illinois ──────────────────────────────────────────────────────────
   {
