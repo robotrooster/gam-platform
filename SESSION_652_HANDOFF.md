@@ -423,7 +423,8 @@ Mac Studio (nightly backup).
   (replaces 2024: new relocation-fund amounts under an unchanged cover date)
   and the **Director-approved summary** (updated 9/10/26), which A.R.S.
   33-1432(G)/(H) has parks give before the rental agreement and every
-  November 1.
+  November 1. The Residential act's current edition is still May 2023
+  (checked on the agency page 9/21).
 
 **Tenant portal — "Landlord-Tenant Act".** New sidebar page (`/laws`, API
 `GET /tenants/me/laws`). One section per leased home: the state's act for that
