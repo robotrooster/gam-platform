@@ -2109,6 +2109,100 @@ esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async
   } catch (e) { next(e) }
 })
 
+/**
+ * S652 — A GOVERNMENT FORM STAYS THE GOVERNMENT'S.
+ *
+ * Nic: "the library should only be government published documents that
+ * something we're not altering at all." A template carrying library_document_id
+ * is GAM's copy of somebody else's document sitting on this landlord's shelf.
+ * Its words, its layout and its boxes are all fixed — a form cannot be both
+ * "unaltered" and one every landlord re-types.
+ *
+ * Note what is NOT blocked: taking it off the shelf, and picking it in a packet.
+ * Those are the landlord's choices about their own operation. Only the contents
+ * are out of reach, and the message says where to go instead, because a landlord
+ * who wants different wording is not doing anything wrong — they just need their
+ * own form, which they can upload exactly like their own lease.
+ */
+function assertTemplateIsEditable(t: { library_document_id?: string | null; name?: string }) {
+  if (!t?.library_document_id) return
+  throw new AppError(409,
+    `"${t.name || 'This form'}" is published by a government agency and GAM keeps it exactly as issued. ` +
+    `To use different wording or different boxes, upload your own version as a template.`)
+}
+
+// GET /api/esign/library — the shelf, narrowed to where this landlord operates.
+// Says what exists and who published it. Says nothing about what is required.
+esignRouter.get('/library', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const { libraryForLandlord } = await import('../services/disclosureLibrary')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    const rows = await libraryForLandlord(exec, landlordScopeIds(req.user!))
+    res.json({
+      documents: rows.map((d: any) => ({
+        id: d.id,
+        name: d.name,
+        description: d.description,
+        disclosureType: d.disclosure_type,
+        disclosureLabel: DISCLOSURE_TYPE_LABEL[d.disclosure_type as keyof typeof DISCLOSURE_TYPE_LABEL] ?? d.disclosure_type,
+        jurisdiction: d.jurisdiction,
+        appliesTo: d.applies_to,
+        unitTypes: d.unit_types,
+        publishedBy: d.source_name,
+        sourceUrl: d.source_url,
+        publicationRef: d.publication_ref,
+        version: d.version,
+        adoptedTemplateId: d.adopted_template_id,
+      })),
+    })
+  } catch (e) { next(e) }
+})
+
+// POST /api/esign/library/adopt — put a published form on the shelf.
+//
+// Takes `documentId` from the screen, or `formName` the way somebody says it
+// out loud. The second one is why this is one route and not two: an action whose
+// only handle is a uuid "from a lookup" is an action nobody can actually reach
+// by talking, which is how the existing template actions ended up unreachable.
+// Resolution refuses to guess — no match and two matches both name what IS on
+// the shelf rather than picking one.
+esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const scope = landlordScopeIds(req.user!)
+    const landlordId = scope[0]
+    if (!landlordId) throw new AppError(403, 'Forbidden')
+    const { adoptLibraryDocument, libraryForLandlord } = await import('../services/disclosureLibrary')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+
+    let documentId: string | undefined = req.body?.documentId
+    if (!documentId) {
+      const spoken = String(req.body?.formName ?? '').trim()
+      if (!spoken) throw new AppError(400, 'Name the form, or pass documentId')
+      const shelf = await libraryForLandlord(exec, scope)
+      const needle = spoken.toLowerCase()
+      const hits = shelf.filter((d: any) => String(d.name).toLowerCase().includes(needle))
+      if (hits.length === 0) {
+        throw new AppError(404,
+          `No form called "${spoken}". On the shelf: ${shelf.map((d: any) => d.name).join('; ') || 'nothing yet'}.`)
+      }
+      if (hits.length > 1) {
+        throw new AppError(409,
+          `"${spoken}" matches more than one: ${hits.map((d: any) => d.name).join('; ')}. Which one?`)
+      }
+      documentId = hits[0].id
+    }
+
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const out = await adoptLibraryDocument(client as any, landlordId, documentId!)
+      await client.query('COMMIT')
+      res.json({ success: true, ...out })
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose,
@@ -2224,6 +2318,7 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_man
     const { name, description, basePdfUrl, pageCount, isActive, unitType, depositMonths, defaultTermMonths } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!t) throw new AppError(404, 'Template not found')
+    assertTemplateIsEditable(t)
     if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
       throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
     }
@@ -2318,6 +2413,7 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     const { fields } = req.body
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
+    assertTemplateIsEditable(template)
 
     for (const f of (fields || [])) {
       if (f.leaseColumn && !(f.leaseColumn in LEASE_COLUMN_CATEGORY)) {
@@ -2422,6 +2518,7 @@ esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.t
   try {
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
+    assertTemplateIsEditable(template)
     if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
     const filename = extractUploadFilename(template.base_pdf_url)
     if (!filename) throw new AppError(400, 'Template PDF path is not a local upload')
@@ -2476,10 +2573,11 @@ esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('e
     // field — the SQL only required (fieldId, templateId) match.
     // Same class as the S390 variants cross-tenant fix on
     // pos_item_variants.
-    const template = await queryOne<{ id: string }>(
-      'SELECT id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+    const template = await queryOne<{ id: string; name: string; library_document_id: string | null }>(
+      'SELECT id, name, library_document_id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
       [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
+    assertTemplateIsEditable(template)
     await query('DELETE FROM lease_template_fields WHERE id=$1 AND template_id=$2', [req.params.fieldId, req.params.id])
     res.json({ success: true })
   } catch (e) { next(e) }

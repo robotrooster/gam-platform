@@ -2744,6 +2744,27 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'adopt_published_form',
+    audience: 'landlord', method: 'POST', path: '/api/esign/library/adopt',
+    description:
+      'Put a form a government agency publishes onto their shelf, so it can go out in a packet and ' +
+      'be initialled like anything else. Use for "add the federal lead paint disclosure" or ' +
+      '"I need the Illinois park pamphlet".\n' +
+      'Named, not looked up — say the form the way they said it and the system finds it, or names ' +
+      'what IS on the shelf if there is no match. The shelf already only shows forms published for ' +
+      'the states they operate in and the kinds of space they run.\n' +
+      'GAM keeps these EXACTLY as the agency issued them, so nothing about one can be reworded or ' +
+      'rearranged afterwards. A landlord who needs different wording uploads their own form instead ' +
+      '— say that rather than promising an edit.\n' +
+      'Never say a landlord is required to send any of these. Whether a form applies to them is ' +
+      'their call with their own attorney; this only puts it within reach.',
+    params: {
+      formName: { type: 'string', description: 'The form, named the way the landlord said it.' },
+    },
+    required: ['formName'],
+    confirmFirst: true,
+  },
+  {
     id: 'delete_lease_template',
     audience: 'landlord', method: 'DELETE', path: '/api/esign/templates/:templateId',
     pathParams: ['templateId'],

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict bFjuscR4YAJrMabEFi3dsaFNI1Rj1egdOE4ddAxbNQi1nGgMURffZgXHeFlONLg
+\restrict uBts5oftv6ZTls0UcwRVR5ORE0Zda2k1wlt13FcwpY4vHibIG4xEzwpQx8aIUle
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3562,6 +3562,59 @@ CREATE TABLE public.disbursements (
 
 
 --
+-- Name: disclosure_library_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.disclosure_library_documents (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    disclosure_type text NOT NULL,
+    jurisdiction text NOT NULL,
+    applies_to text DEFAULT 'any'::text NOT NULL,
+    unit_types text[],
+    name text NOT NULL,
+    description text,
+    source_name text NOT NULL,
+    source_url text NOT NULL,
+    publication_ref text,
+    base_pdf_url text NOT NULL,
+    page_count integer DEFAULT 1 NOT NULL,
+    version integer DEFAULT 1 NOT NULL,
+    effective_from date DEFAULT CURRENT_DATE NOT NULL,
+    superseded_by_id uuid,
+    retired_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT disclosure_library_documents_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'rental'::text, 'sale'::text])))
+);
+
+
+--
+-- Name: disclosure_library_fields; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.disclosure_library_fields (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    document_id uuid NOT NULL,
+    field_type text NOT NULL,
+    signer_role text,
+    label text,
+    lease_column text,
+    page integer DEFAULT 1 NOT NULL,
+    x double precision,
+    y double precision,
+    width double precision DEFAULT 200 NOT NULL,
+    height double precision DEFAULT 50 NOT NULL,
+    required boolean DEFAULT true NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    options text,
+    default_value text,
+    checkbox_mark text DEFAULT 'x'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT disclosure_library_fields_checkbox_mark_check CHECK ((checkbox_mark = ANY (ARRAY['x'::text, 'check'::text])))
+);
+
+
+--
 -- Name: document_batches; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5590,6 +5643,7 @@ CREATE TABLE public.lease_templates (
     applies_to text DEFAULT 'any'::text NOT NULL,
     disclosure_type text,
     state_code text,
+    library_document_id uuid,
     CONSTRAINT lease_templates_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'sale'::text, 'rental'::text]))),
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
@@ -12214,6 +12268,22 @@ ALTER TABLE ONLY public.disbursements
 
 
 --
+-- Name: disclosure_library_documents disclosure_library_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disclosure_library_documents
+    ADD CONSTRAINT disclosure_library_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: disclosure_library_fields disclosure_library_fields_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disclosure_library_fields
+    ADD CONSTRAINT disclosure_library_fields_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: document_batches document_batches_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14906,6 +14976,20 @@ CREATE INDEX common_areas_landlord_idx ON public.common_areas USING btree (landl
 --
 
 CREATE INDEX common_areas_property_idx ON public.common_areas USING btree (property_id) WHERE active;
+
+
+--
+-- Name: disclosure_library_fields_doc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX disclosure_library_fields_doc ON public.disclosure_library_fields USING btree (document_id);
+
+
+--
+-- Name: disclosure_library_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX disclosure_library_lookup ON public.disclosure_library_documents USING btree (jurisdiction, disclosure_type) WHERE ((retired_at IS NULL) AND (superseded_by_id IS NULL));
 
 
 --
@@ -19137,6 +19221,20 @@ CREATE INDEX lease_templates_disclosure_state_idx ON public.lease_templates USIN
 
 
 --
+-- Name: lease_templates_library_doc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_templates_library_doc ON public.lease_templates USING btree (library_document_id) WHERE (library_document_id IS NOT NULL);
+
+
+--
+-- Name: lease_templates_one_adoption_per_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX lease_templates_one_adoption_per_landlord ON public.lease_templates USING btree (landlord_id, library_document_id) WHERE (library_document_id IS NOT NULL);
+
+
+--
 -- Name: lease_templates_unit_type_default_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -22653,6 +22751,22 @@ ALTER TABLE ONLY public.disbursements
 
 
 --
+-- Name: disclosure_library_documents disclosure_library_documents_superseded_by_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disclosure_library_documents
+    ADD CONSTRAINT disclosure_library_documents_superseded_by_id_fkey FOREIGN KEY (superseded_by_id) REFERENCES public.disclosure_library_documents(id);
+
+
+--
+-- Name: disclosure_library_fields disclosure_library_fields_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disclosure_library_fields
+    ADD CONSTRAINT disclosure_library_fields_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.disclosure_library_documents(id) ON DELETE CASCADE;
+
+
+--
 -- Name: document_batches document_batches_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23962,6 +24076,14 @@ ALTER TABLE ONLY public.lease_template_properties
 
 ALTER TABLE ONLY public.lease_templates
     ADD CONSTRAINT lease_templates_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_templates lease_templates_library_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_templates
+    ADD CONSTRAINT lease_templates_library_document_id_fkey FOREIGN KEY (library_document_id) REFERENCES public.disclosure_library_documents(id);
 
 
 --
@@ -27568,5 +27690,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict bFjuscR4YAJrMabEFi3dsaFNI1Rj1egdOE4ddAxbNQi1nGgMURffZgXHeFlONLg
+\unrestrict uBts5oftv6ZTls0UcwRVR5ORE0Zda2k1wlt13FcwpY4vHibIG4xEzwpQx8aIUle
 
