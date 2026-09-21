@@ -196,7 +196,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
     const fits = (u: string[] | null) => !unitType || !u || u.includes(unitType)
     const wanted: Array<{ templateId?: string; lib?: string }> = []
     for (const s of [...(st?.sleeves ?? []), ...sleeves.federal] as any[]) {
-      if (!fits(s.unitTypes) || s.coveredBy) continue
+      if (!fits(s.unitTypes) || s.coveredBy?.length) continue
       if (s.kind === 'sale_contract' && !sale) continue
       if (s.kind === 'government') {
         if (s.appliesTo === 'sale' && !sale) continue

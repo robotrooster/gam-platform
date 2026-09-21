@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { apiGet, apiPut } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { jurisdictionLabel, UNIT_TYPE_LABEL } from '@gam/shared'
 import { ensureLibraryCopy } from './TemplateLibrarySection'
@@ -31,7 +31,8 @@ export type Sleeve = {
   id: string; kind: 'lease' | 'sale_contract' | 'disclosure' | 'government'
   title: string; number: number; filled: boolean; unitTypes: string[] | null
   cards: SleeveCard[]; libraryDocumentId?: string; publishedBy?: string; pdfUrl?: string
-  coveredBy?: { templateId: string; name: string } | null
+  coveredBy?: Array<{ templateId: string; name: string }>
+  group?: string
 }
 type StateGroup = { state: string; unitTypes: string[]; sleeves: Sleeve[]; filled: number; total: number }
 export type SleevesData = { states: StateGroup[]; federal: Sleeve[]; other: SleeveCard[] }
@@ -46,8 +47,22 @@ async function openPdf(url: string) {
   window.open(URL.createObjectURL(await res.blob()), '_blank', 'noopener')
 }
 
-// Inside a state's section the state is already said once, in the header.
-const shortTitle = (title: string) => title.replace(/^[A-Z][A-Za-z .]+:\s+/, '')
+// Inside a state's section the state is said once, in the header, and the
+// kind of space in the group heading — so neither is repeated on each card.
+const shortTitle = (title: string) =>
+  title.replace(/^[A-Z][A-Za-z .]+:\s+/, '').replace(/\s+\((?:Mobile Home Lots|RV & Camp Sites|Storage|Commercial)\)$/, '')
+
+// Nic: "maybe we break it down... some of them say RV or mobile home or
+// campsites... it needs more organization."
+const GROUP_LABEL: Record<string, string> = {
+  contracts: 'Leases & contracts',
+  government: 'Government forms',
+  all_rentals: 'For every rental',
+  mobile_home_lots: 'Mobile home lots',
+  rv_sites: 'RV & camp sites',
+  storage: 'Storage',
+}
+const GROUP_ORDER = Object.keys(GROUP_LABEL)
 
 const cardStyle = (filled: boolean): React.CSSProperties => ({
   padding: '10px 12px', borderRadius: 10, minHeight: 92, display: 'flex', flexDirection: 'column', gap: 6,
@@ -66,6 +81,7 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
   const { data, isLoading } = useSleeves()
   const [closed, setClosed] = useState<Record<string, boolean>>({})
   const [busy, setBusy] = useState<string | null>(null)
+  const [covering, setCovering] = useState<{ sleeveId: string; ids: string[] } | null>(null)
 
   if (isLoading) return <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>
   if (!data) return null
@@ -77,13 +93,14 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
     ...data.other,
   ].filter((c, i, a) => a.findIndex(x => x.templateId === c.templateId) === i)
 
-  const cover = async (sleeveId: string, templateId: string) => {
-    try { await apiPost(`/esign/sleeves/${sleeveId}/cover`, { templateId }); qc.invalidateQueries('esign-sleeves') }
-    catch (e: any) { toast.error(e?.message || 'Could not do that') }
-  }
-  const uncover = async (sleeveId: string) => {
-    try { await apiDelete(`/esign/sleeves/${sleeveId}/cover`); qc.invalidateQueries('esign-sleeves') }
-    catch (e: any) { toast.error(e?.message || 'Could not do that') }
+  // "It's in another document": the landlord ticks which of their own documents
+  // already contain this one. Nothing is detected — they say so, and can tick
+  // more than one (two properties, one attorney's lease).
+  const saveCoverings = async (sleeveId: string, ids: string[]) => {
+    try {
+      await apiPut(`/esign/sleeves/${sleeveId}/cover`, { templateIds: ids })
+      qc.invalidateQueries('esign-sleeves'); setCovering(null)
+    } catch (e: any) { toast.error(e?.message || 'Could not save that') }
   }
 
   const editGovernment = async (s: Sleeve) => {
@@ -118,26 +135,45 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
               </button>
             )}
           </div>
-        ) : s.coveredBy ? (
-          <div style={{ marginTop: 'auto', display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: '.7rem', color: 'var(--text-2)', flex: '1 1 110px' }}>
-              In <strong style={{ color: 'var(--text-1)' }}>{s.coveredBy.name}</strong>
-            </span>
+        ) : covering?.sleeveId === s.id ? (
+          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-2)' }}>Which of your documents already include this?</div>
+            {ownDocs.map(d => (
+              <label key={d.templateId} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.72rem', color: 'var(--text-1)' }}>
+                <input type="checkbox" checked={covering.ids.includes(d.templateId)}
+                  onChange={e => setCovering({ sleeveId: s.id, ids: e.target.checked
+                    ? [...covering.ids, d.templateId] : covering.ids.filter(x => x !== d.templateId) })} />
+                {d.name}
+              </label>
+            ))}
+            <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+              <button className="btn btn-primary btn-sm" onClick={() => saveCoverings(s.id, covering.ids)}>Save</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setCovering(null)}>Cancel</button>
+            </div>
+          </div>
+        ) : s.coveredBy && s.coveredBy.length > 0 ? (
+          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>Included in</span>
+            {s.coveredBy.map(c => (
+              <span key={c.templateId} style={{ fontSize: '.72rem', color: 'var(--text-1)' }}>{c.name}</span>
+            ))}
             {canEdit && (
-              <button className="btn btn-ghost btn-sm" style={{ fontSize: '.64rem', padding: '0 4px' }} onClick={() => uncover(s.id)}>Undo</button>
+              <button className="btn btn-primary btn-sm" style={{ alignSelf: 'flex-start', marginTop: 3 }}
+                      onClick={() => setCovering({ sleeveId: s.id, ids: s.coveredBy!.map(c => c.templateId) })}>
+                Change
+              </button>
             )}
           </div>
         ) : s.cards.length === 0 ? (
           canEdit && (
-            <div style={{ marginTop: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <div style={{ marginTop: 'auto', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               <button className="btn btn-primary btn-sm" onClick={() => onUpload(s, state)}><Plus size={11} /> Upload</button>
-              {ownDocs.length > 0 && (
-                <select className="input input-sm" value="" style={{ width: 'auto', maxWidth: 120, fontSize: '.66rem', padding: '2px 4px' }}
-                  title="This is already part of another document of yours"
-                  onChange={e => { if (e.target.value) cover(s.id, e.target.value) }}>
-                  <option value="">Already in…</option>
-                  {ownDocs.map(d => <option key={d.templateId} value={d.templateId}>{d.name}</option>)}
-                </select>
+              {/* Only a document can live inside another one — a lease or a sale
+                  contract is its own document. */}
+              {s.kind === 'disclosure' && ownDocs.length > 0 && (
+                <button className="btn btn-primary btn-sm" onClick={() => setCovering({ sleeveId: s.id, ids: [] })}>
+                  It's in another document
+                </button>
               )}
             </div>
           )
@@ -189,8 +225,20 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
           <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>{sub}</span>
         </button>
         {!isClosed && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 10, padding: '0 14px 14px' }}>
-            {sleeves.map(s => renderSleeve(s, state))}
+          <div style={{ padding: '0 14px 14px' }}>
+            {GROUP_ORDER.map(g => {
+              const inGroup = sleeves.filter(x => (x.group ?? (x.kind === 'government' ? 'government' : 'all_rentals')) === g)
+              if (!inGroup.length) return null
+              return (
+                <div key={g} style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: '.68rem', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase',
+                                color: 'var(--text-3)', margin: '4px 0 8px' }}>{GROUP_LABEL[g]}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 10 }}>
+                    {inGroup.map(x => renderSleeve(x, state))}
+                  </div>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>

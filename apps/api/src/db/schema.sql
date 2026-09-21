@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ch3iL5tRFqzM5G74UahA1kBZz8QYBSKy7ZHTmpcCnnjcFQ9PfVas7CIg2bonsOh
+\restrict GPwKrIeKSkj0crIqMC8rhjyNgSMdqBEoJY2fScPo6G8mEUHrVGk2tdNuZQwdu9X
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -14217,11 +14217,11 @@ ALTER TABLE ONLY public.shifts
 
 
 --
--- Name: sleeve_coverings sleeve_coverings_landlord_id_sleeve_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: sleeve_coverings sleeve_coverings_one_per_document; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.sleeve_coverings
-    ADD CONSTRAINT sleeve_coverings_landlord_id_sleeve_id_key UNIQUE (landlord_id, sleeve_id);
+    ADD CONSTRAINT sleeve_coverings_one_per_document UNIQUE (landlord_id, sleeve_id, template_id);
 
 
 --
@@ -27836,5 +27836,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ch3iL5tRFqzM5G74UahA1kBZz8QYBSKy7ZHTmpcCnnjcFQ9PfVas7CIg2bonsOh
+\unrestrict GPwKrIeKSkj0crIqMC8rhjyNgSMdqBEoJY2fScPo6G8mEUHrVGk2tdNuZQwdu9X
 

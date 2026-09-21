@@ -139,29 +139,51 @@ describe('filing templates', () => {
   })
 })
 
-describe('"already in my lease"', () => {
-  let leaseId: string
+describe('"it\'s in another document"', () => {
+  // Nothing is detected: the landlord says which of their documents already
+  // contain this one, and can name more than one — Nic: "my lease for both
+  // properties is identical... you need to be able to select both."
+  let leaseA: string, leaseB: string
   beforeEach(async () => {
-    const r = await request(app()).post('/api/esign/templates').set('Authorization', `Bearer ${token(il)}`)
-      .send({ name: 'Mattoon Lease', sleeveId: s.ilMhLease }).expect(201)
-    leaseId = r.body.data.id
+    leaseA = (await request(app()).post('/api/esign/templates').set('Authorization', `Bearer ${token(il)}`)
+      .send({ name: 'Park A Lease', sleeveId: s.ilMhLease }).expect(201)).body.data.id
+    leaseB = (await request(app()).post('/api/esign/templates').set('Authorization', `Bearer ${token(il)}`)
+      .send({ name: 'Park B Lease', sleeveId: s.ilMhLease }).expect(201)).body.data.id
+  })
+  const cover = (w: typeof il, sleeveId: string, ids: string[]) =>
+    request(app()).put(`/api/esign/sleeves/${sleeveId}/cover`).set('Authorization', `Bearer ${token(w)}`).send({ templateIds: ids })
+  const rulesSleeve = async () => (await sleevesOf(il)).states[0].sleeves.find((x: any) => x.id === s.ilRules)
+
+  it('can name every document it is in, and counts as filled', async () => {
+    await cover(il, s.ilRules, [leaseA, leaseB]).expect(200)
+    const r = await rulesSleeve()
+    expect(r.filled).toBe(true)
+    expect(r.coveredBy.map((c: any) => c.name).sort()).toEqual(['Park A Lease', 'Park B Lease'])
   })
 
-  it('a covered sleeve counts as filled and says what covers it', async () => {
-    await request(app()).post(`/api/esign/sleeves/${s.ilRules}/cover`).set('Authorization', `Bearer ${token(il)}`)
-      .send({ templateId: leaseId }).expect(200)
-    const rules = (await sleevesOf(il)).states[0].sleeves.find((x: any) => x.id === s.ilRules)
-    expect(rules.filled).toBe(true)
-    expect(rules.coveredBy.name).toBe('Mattoon Lease')
-    await request(app()).delete(`/api/esign/sleeves/${s.ilRules}/cover`).set('Authorization', `Bearer ${token(il)}`).expect(200)
-    expect((await sleevesOf(il)).states[0].sleeves.find((x: any) => x.id === s.ilRules).filled).toBe(false)
+  it('an empty list clears it', async () => {
+    await cover(il, s.ilRules, [leaseA]).expect(200)
+    await cover(il, s.ilRules, []).expect(200)
+    const r = await rulesSleeve()
+    expect([r.filled, r.coveredBy]).toEqual([false, []])
   })
 
-  it('cannot be covered with somebody else\'s document, or in a state they don\'t operate in', async () => {
-    await request(app()).post(`/api/esign/sleeves/${s.ilRules}/cover`).set('Authorization', `Bearer ${token(az)}`)
-      .send({ templateId: leaseId }).expect(404)
-    await request(app()).post(`/api/esign/sleeves/${s.azRvLease}/cover`).set('Authorization', `Bearer ${token(il)}`)
-      .send({ templateId: leaseId }).expect(404)
+  it('a lease or sale contract cannot be "in" another document — it is its own', async () => {
+    await cover(il, s.ilSale, [leaseA]).expect(400)
+  })
+
+  it('refuses somebody else\'s document, and a state they don\'t operate in', async () => {
+    await cover(az, s.ilRules, [leaseA]).expect(404)
+    await cover(il, s.azRvLease, [leaseA]).expect(404)
+  })
+})
+
+describe('grouping', () => {
+  it('each sleeve says which heading it sits under', async () => {
+    const byTitle = Object.fromEntries((await sleevesOf(il)).states[0].sleeves.map((x: any) => [x.title, x.group]))
+    expect(byTitle['Illinois: Mobile Home Lease']).toBe('contracts')
+    expect(byTitle['Illinois: Mobile Home Sale Contract']).toBe('contracts')
+    expect(byTitle['Illinois: Park Rules (Mobile Home Lots)']).toBe('mobile_home_lots')
   })
 })
 

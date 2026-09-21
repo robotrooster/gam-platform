@@ -18,6 +18,23 @@ import { AppError } from '../middleware/errorHandler'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
 
+/**
+ * Which heading a sleeve sits under on the Templates page. Nic: "maybe we break
+ * it down... some of them say RV or mobile home or campsites... it needs more
+ * organization." So a state's sleeves are grouped by what they are for:
+ * the leases and contracts, then the documents for every rental, then those for
+ * mobile home lots, RV and camp sites, and storage — the kind of space the act
+ * that put the sleeve there governs.
+ */
+export const SLEEVE_GROUPS = ['contracts', 'government', 'all_rentals', 'mobile_home_lots', 'rv_sites', 'storage'] as const
+export function groupOf(kind: string, unitTypes: string[]): typeof SLEEVE_GROUPS[number] {
+  if (kind === 'lease' || kind === 'sale_contract') return 'contracts'
+  if (unitTypes.length === 1 && unitTypes[0] === 'mobile_home') return 'mobile_home_lots'
+  if (unitTypes.includes('rv_spot') || unitTypes.includes('campsite')) return 'rv_sites'
+  if (unitTypes.length === 1 && unitTypes[0] === 'storage') return 'storage'
+  return 'all_rentals'
+}
+
 /** Where a landlord operates: state → the unit types they run there. */
 export async function operatingFootprint(q: Exec, landlordIds: string[]) {
   const rows = await q.query(
@@ -123,8 +140,13 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
     `SELECT c.sleeve_id, t.id AS template_id, t.name
        FROM sleeve_coverings c JOIN lease_templates t ON t.id = c.template_id AND t.is_active
       WHERE c.landlord_id = ANY($1::uuid[])`, [landlordIds]).then(r => r.rows)
-  const coveredBy = new Map<string, { templateId: string; name: string }>(
-    coverings.map((c: any) => [c.sleeve_id, { templateId: c.template_id, name: c.name }]))
+  // Several documents can cover one sleeve — Nic's two properties each have a
+  // lease, and the owner disclosure is inside both.
+  const coveredBy = new Map<string, Array<{ templateId: string; name: string }>>()
+  for (const c of coverings as any[]) {
+    const list = coveredBy.get(c.sleeve_id) ?? []
+    list.push({ templateId: c.template_id, name: c.name }); coveredBy.set(c.sleeve_id, list)
+  }
 
   const library = await q.query(
     `SELECT d.*, t.id AS adopted_template_id,
@@ -138,7 +160,7 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
       ORDER BY lower(d.name)`, [landlordIds, states, allUnits]).then(r => r.rows)
 
   const govSleeve = (d: any) => ({
-    id: `library:${d.id}`, kind: 'government', title: d.name, appliesTo: d.applies_to,
+    id: `library:${d.id}`, kind: 'government', group: 'government', title: d.name, appliesTo: d.applies_to,
     unitTypes: d.unit_types, libraryDocumentId: d.id, publishedBy: d.source_name, pdfUrl: d.base_pdf_url,
     cards: d.adopted_template_id
       ? [{ templateId: d.adopted_template_id, name: d.name, fieldCount: d.adopted_field_count, pageCount: d.page_count }]
@@ -160,8 +182,9 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
           fieldCount: x.field_count, pageCount: x.page_count, isUnitTypeDefault: x.is_unit_type_default,
           purpose: x.purpose, unitType: x.unit_type,
         })),
-        coveredBy: c.length ? null : (coveredBy.get(s.id) ?? null),
+        coveredBy: c.length ? [] : (coveredBy.get(s.id) ?? []),
         filled: c.length > 0 || coveredBy.has(s.id),
+        group: groupOf(s.kind, s.unit_types),
       }
     })
     // Leases first, then a sale contract, then the government's forms, then
@@ -170,7 +193,9 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
     const sales = rows.filter((r: any) => r.kind === 'sale_contract')
     const docs = rows.filter((r: any) => r.kind === 'disclosure')
     const gov = library.filter((d: any) => d.jurisdiction === st).map(govSleeve)
-    const ordered = [...leases, ...sales, ...gov, ...docs].map((r, i) => ({ ...r, number: i + 1 }))
+    const groupRank = (g: string) => SLEEVE_GROUPS.indexOf(g as any)
+    const docsByGroup = [...docs].sort((a: any, b: any) => groupRank(a.group) - groupRank(b.group))
+    const ordered = [...leases, ...sales, ...gov, ...docsByGroup].map((r, i) => ({ ...r, number: i + 1 }))
     return { state: st, unitTypes: units, sleeves: ordered,
              filled: ordered.filter(r => r.filled).length, total: ordered.length }
   })
@@ -185,27 +210,30 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
 }
 
 /**
- * Mark a sleeve as covered by a document the landlord already has — Blu's park
- * rules live inside his lease as Exhibit B. Refuses a template that is not
- * theirs, and a sleeve for a state they do not operate in.
+ * Say which of the landlord's own documents already contain this sleeve's
+ * document — Blu's park rules are Exhibit B of his lease; Nic's owner disclosure
+ * is inside both of his mobile home leases. Replaces the whole set; an empty set
+ * uncovers it. Only a DOCUMENT sleeve can be covered: a lease or a sale contract
+ * is its own document and nothing else stands in for it. Refuses documents that
+ * are not theirs and sleeves outside the states they operate in.
  */
-export async function coverSleeve(q: Exec, landlordIds: string[], sleeveId: string, templateId: string) {
-  const t = await q.query(
-    `SELECT id, landlord_id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[]) AND is_active`,
-    [templateId, landlordIds]).then(r => r.rows[0])
-  if (!t) throw new AppError(404, 'That document is not one of yours')
+export async function setSleeveCoverings(q: Exec, landlordIds: string[], sleeveId: string, templateIds: string[]) {
   const s = await q.query(
-    `SELECT s.id FROM document_sleeves s
+    `SELECT s.id, s.kind FROM document_sleeves s
       WHERE s.id=$1 AND s.retired_at IS NULL
         AND s.state_code IN (SELECT state FROM properties WHERE landlord_id = ANY($2::uuid[]) AND state IS NOT NULL)`,
     [sleeveId, landlordIds]).then(r => r.rows[0])
   if (!s) throw new AppError(404, 'That document slot is not one of yours')
-  await q.query(
-    `INSERT INTO sleeve_coverings (landlord_id, sleeve_id, template_id) VALUES ($1,$2,$3)
-     ON CONFLICT (landlord_id, sleeve_id) DO UPDATE SET template_id = EXCLUDED.template_id, created_at = now()`,
-    [t.landlord_id, sleeveId, templateId])
-}
-
-export async function uncoverSleeve(q: Exec, landlordIds: string[], sleeveId: string) {
+  if (s.kind !== 'disclosure') throw new AppError(400, 'A lease or sale contract is its own document — upload it into its slot')
+  const ids = [...new Set(templateIds)]
+  const owned = ids.length ? await q.query(
+    `SELECT id, landlord_id FROM lease_templates WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[]) AND is_active`,
+    [ids, landlordIds]).then(r => r.rows) : []
+  if (owned.length !== ids.length) throw new AppError(404, 'One of those documents is not one of yours')
   await q.query(`DELETE FROM sleeve_coverings WHERE sleeve_id=$1 AND landlord_id = ANY($2::uuid[])`, [sleeveId, landlordIds])
+  for (const t of owned) {
+    await q.query(
+      `INSERT INTO sleeve_coverings (landlord_id, sleeve_id, template_id) VALUES ($1,$2,$3)
+       ON CONFLICT (landlord_id, sleeve_id, template_id) DO NOTHING`, [t.landlord_id, sleeveId, t.id])
+  }
 }

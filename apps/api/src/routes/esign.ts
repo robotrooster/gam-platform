@@ -2156,22 +2156,16 @@ esignRouter.get('/sleeves', requireAuth, requirePerm('leases.create'), async (re
   } catch (e) { next(e) }
 })
 
-// POST /api/esign/sleeves/:id/cover { templateId } — "this is already in my
-// lease". DELETE undoes it. See the sleeve_coverings migration.
-esignRouter.post('/sleeves/:id/cover', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+// PUT /api/esign/sleeves/:id/cover { templateIds } — which of the landlord's own
+// documents already contain this one ("it's in my lease"). Replaces the set;
+// [] uncovers. See services/documentSleeves.setSleeveCoverings.
+esignRouter.put('/sleeves/:id/cover', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { coverSleeve } = await import('../services/documentSleeves')
+    const { setSleeveCoverings } = await import('../services/documentSleeves')
     const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
-    if (!req.body?.templateId) throw new AppError(400, 'Which document covers it?')
-    await coverSleeve(exec, landlordScopeIds(req.user!), req.params.id, String(req.body.templateId))
-    res.json({ success: true })
-  } catch (e) { next(e) }
-})
-esignRouter.delete('/sleeves/:id/cover', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
-  try {
-    const { uncoverSleeve } = await import('../services/documentSleeves')
-    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
-    await uncoverSleeve(exec, landlordScopeIds(req.user!), req.params.id)
+    const ids = Array.isArray(req.body?.templateIds) ? req.body.templateIds.map(String) : null
+    if (!ids) throw new AppError(400, 'templateIds must be a list (empty to clear)')
+    await setSleeveCoverings(exec, landlordScopeIds(req.user!), req.params.id, ids)
     res.json({ success: true })
   } catch (e) { next(e) }
 })
