@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict gAxsEiIpX96FnvNyYEbyMrPIU1H8yXBaoxNp7DaYZeWhgJAQpjNg8Q5yEK0gH4a
+\restrict gEZybDIAXvybYUhAtPjDgkBEIlSY5qqums4CiDAToRLFRhFU7ffm2yQe20Wo1JI
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -11422,6 +11422,9 @@ CREATE TABLE public.work_trade_agreements (
     banked_hours numeric(8,2) DEFAULT 0 NOT NULL,
     carry_forward_months integer DEFAULT 1 NOT NULL,
     tracks_hours boolean DEFAULT true NOT NULL,
+    trusted boolean DEFAULT false NOT NULL,
+    skills text[] DEFAULT '{}'::text[] NOT NULL,
+    CONSTRAINT work_trade_agreements_skills_check CHECK ((skills <@ ARRAY['plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text])),
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
     CONSTRAINT work_trade_banked_hours_nonneg CHECK ((banked_hours >= (0)::numeric)),
@@ -27928,5 +27931,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict gAxsEiIpX96FnvNyYEbyMrPIU1H8yXBaoxNp7DaYZeWhgJAQpjNg8Q5yEK0gH4a
+\unrestrict gEZybDIAXvybYUhAtPjDgkBEIlSY5qqums4CiDAToRLFRhFU7ffm2yQe20Wo1JI
 

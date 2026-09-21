@@ -1,7 +1,9 @@
 import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { Link } from 'react-router-dom'
+import { WorkTradePanel } from '../../../../packages/shared-ui/WorkTradePanel'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
+const panelApi = { get: apiGet, post: apiPost, patch: apiPatch }
 import { ChevronDown, Plus, X } from 'lucide-react'
 import { toast } from '../components/dialogs'
 import { WORK_TRADE_COVERABLE, WORK_TRADE_COVERABLE_LABEL } from '@gam/shared'
@@ -42,12 +44,14 @@ function PropertyTargetRow({ propertyId, name }: { propertyId: string; name: str
 
 export function WorkTradePage() {
   const [showNew, setShowNew] = useState(false)
+  // S652 (Nic): clicking a person opens THEIR work-trade window here, on this
+  // page — never the lease editor, never a trip to another tab.
+  const [openId, setOpenId] = useState<string | null>(null)
   const { data: agreements = [], isLoading } = useQuery<any[]>('work-trade', () => apiGet('/work-trade'))
   // S576 (B-8): the landlord's own work-trade addendum forms (Form Type =
   // Work-Trade Addendum). Fetched once, passed to each row's addendum cell.
   const { data: addendumTemplates = [] } = useQuery<any[]>('wt-addendum-templates', () => apiGet('/esign/templates?purpose=work_trade_addendum'))
 
-  const navigate = useNavigate()
   // Distinct properties for the new-agreement DEFAULT editor. a.target is
   // now the per-agreement value, so fetch nothing extra — the default
   // editor reads its own value lazily per property row.
@@ -65,6 +69,15 @@ export function WorkTradePage() {
       </div>
 
       {showNew && <NewAgreementModal onClose={() => setShowNew(false)} />}
+      {openId && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.5)', zIndex:1000, display:'flex', justifyContent:'center', alignItems:'flex-start', padding:'4vh 16px', overflowY:'auto' }}
+          onClick={() => setOpenId(null)}>
+          <div style={{ width:'100%', maxWidth:760 }} onClick={e => e.stopPropagation()}>
+            <WorkTradePanel agreementId={openId} side="landlord" api={panelApi} onClose={() => setOpenId(null)}
+              notify={(m, kind) => kind === 'error' ? toast.error(m) : toast(m)} />
+          </div>
+        </div>
+      )}
 
       {properties.length > 0 && (
         <div className="card" style={{ marginBottom: 16, padding: 16 }}>
@@ -81,15 +94,12 @@ export function WorkTradePage() {
       <div className="card" style={{ padding: 0 }}>
         {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
           <table className="data-table">
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Grace</th><th>Covers</th><th>Pending</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>This Month</th><th>Target</th><th>Grace</th><th>Covers</th><th>Logged</th><th>Start</th><th>Status</th><th>Addendum</th></tr></thead>
             <tbody>
               {agreements.length ? agreements.map((a: any) => (
-                // W-56: the row pulls up the tenant's LEASE; the target cell
-                // edits inline without triggering the row click.
-                <tr key={a.id} style={{ cursor: a.leaseId ? 'pointer' : undefined }}
-                  onClick={() => a.leaseId && navigate(`/leases?open=${a.leaseId}`)}
-                  title={a.leaseId ? 'Open lease' : undefined}>
-                  <td style={{ fontWeight: 500, color: a.leaseId ? 'var(--gold)' : undefined }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
+                // S652: the row opens this person's work-trade window in place.
+                <tr key={a.id} style={{ cursor: 'pointer' }} onClick={() => setOpenId(a.id)} title="Open their work trade">
+                  <td style={{ fontWeight: 500, color: 'var(--gold)' }}>{[a.tenantFirst, a.tenantLast].filter(Boolean).join(' ') || '—'}</td>
                   <td className="mono">{a.unitNumber || '—'}</td>
                   <td>{a.propertyName || '—'}</td>
                   <td className="mono">{a.tracksHours === false

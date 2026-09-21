@@ -7,6 +7,8 @@ import { landlordScopeIds, landlordIdForUnit, ownsLandlord } from '../lib/landlo
 import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
+import { DateTime } from 'luxon'
+import { lastBusinessDay, WORK_TRADE_SKILLS } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough Landlord #29 — work-trade routes, percent model.
@@ -254,10 +256,13 @@ workTradeRouter.get('/:id', async (req, res, next) => {
   try {
     const agreement = await queryOne<any>(`
       SELECT wta.*, wta.monthly_hours_target AS target,
-        un.unit_number, p.name as property_name
+        un.unit_number, p.name as property_name,
+        tu.first_name AS tenant_first, tu.last_name AS tenant_last
       FROM work_trade_agreements wta
       JOIN units un ON un.id = wta.unit_id
       JOIN properties p ON p.id = un.property_id
+      LEFT JOIN tenants tt ON tt.id = wta.tenant_id
+      LEFT JOIN users tu ON tu.id = tt.user_id
       WHERE wta.id=$1`, [req.params.id])
     if (!agreement) throw new AppError(404, 'Not found')
     // S397: validate caller scope (owner landlord / team / own tenant / admin).
@@ -296,6 +301,34 @@ workTradeRouter.get('/:id', async (req, res, next) => {
     const pendingLogs = logs.filter(l => l.status === 'pending')
     const fraction = workTradeFraction(hoursApprovedThisMonth, target)
 
+    // S652 (Nic): "keep track of how many total sets of hours they turn in and
+    // percentage of denied versus approved... hey, you don't do the right thing
+    // half the time." Counted by submissions AND by hours — a denied 10-hour
+    // day and a denied half hour are not the same thing.
+    const decided = logs.filter((l: any) => l.status === 'approved' || l.status === 'rejected')
+    const sumH = (xs: any[]) => xs.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
+    const approvedAll = logs.filter((l: any) => l.status === 'approved')
+    const deniedAll = logs.filter((l: any) => l.status === 'rejected')
+    const pct = (n: number, d: number) => d > 0 ? Math.round((n / d) * 1000) / 10 : null
+    const record = {
+      submitted: logs.length,
+      approved: approvedAll.length,
+      denied: deniedAll.length,
+      logged: pendingLogs.length,
+      approvedPct: pct(approvedAll.length, decided.length),
+      deniedPct: pct(deniedAll.length, decided.length),
+      hoursApproved: sumH(approvedAll),
+      hoursDenied: sumH(deniedAll),
+      hoursDeniedPct: pct(sumH(deniedAll), sumH(decided)),
+    }
+    // Hours are reviewed by the last business day of the month — the same day
+    // meters are read. Anything still logged then counts as not worked.
+    const tz = (await queryOne<{ timezone: string | null }>(
+      `SELECT p.timezone FROM units un JOIN properties p ON p.id=un.property_id WHERE un.id=$1`,
+      [agreement.unit_id]))?.timezone || 'America/Phoenix'
+    const nowTz = DateTime.now().setZone(tz)
+    const reviewBy = lastBusinessDay(nowTz.year, nowTz.month, tz).toISODate()
+
     res.json({
       success: true,
       data: {
@@ -307,7 +340,9 @@ workTradeRouter.get('/:id', async (req, res, next) => {
           pendingCount: pendingLogs.length,
           creditFraction: fraction,
           creditPct: Math.round(fraction * 1000) / 10,   // e.g. 62.5
-        }
+          reviewBy,
+        },
+        record,
       }
     })
   } catch (e) { next(e) }
@@ -339,10 +374,17 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
       throw new AppError(403, 'Forbidden')
     }
 
+    // S652: a TRUSTED person's hours count the moment they log them (Nic:
+    // "some people can be trusted to do their own hours"); hours the landlord's
+    // side logs are the reviewer's own word. Everyone else's stay "logged"
+    // until approved or denied.
+    const approvedNow = (isOwnTenant && agreement.trusted === true) || isOwnerLandlord || isTeam || isAdmin
     const log = await queryOne<any>(`
-      INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description)
-      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [agreement.id, agreement.tenant_id, req.user!.userId, body.workDate, body.hours, body.description]
+      INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description,
+                                   status, reviewed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [agreement.id, agreement.tenant_id, req.user!.userId, body.workDate, body.hours, body.description,
+       approvedNow ? 'approved' : 'pending', approvedNow ? new Date() : null]
     )
 
     res.json({ success: true, data: log })
@@ -455,7 +497,12 @@ workTradeRouter.get('/:id/standing', async (req, res, next) => {
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths } = z.object({
+    const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths,
+            trusted, skills, duties } = z.object({
+      // S652: trusted or monitored, what they can fix, and the duties in words.
+      trusted: z.boolean().optional(),
+      skills: z.array(z.enum(WORK_TRADE_SKILLS as unknown as [string, ...string[]])).optional(),
+      duties: z.string().max(5000).nullable().optional(),
       coveredCharges: z.array(z.enum(
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
       status:  z.enum(['active','paused','ended']).optional(),
@@ -484,10 +531,14 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         covered_charges=COALESCE($5::text[], covered_charges),
         carry_forward_months=COALESCE($6,carry_forward_months),
         tracks_hours=COALESCE($7,tracks_hours),
+        trusted=COALESCE($8,trusted),
+        skills=COALESCE($9::text[],skills),
+        duties=CASE WHEN $10::boolean THEN $11 ELSE duties END,
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
-       coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null]
+       coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null,
+       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null]
     )
 
     // S624 (Nic): "when the landlord marks the work trade agreement as over, any

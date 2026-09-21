@@ -6441,6 +6441,27 @@ export const WORK_TRADE_COVERABLE_LABEL: Record<WorkTradeCoverable, string> = {
   gas: 'Natural gas', trash: 'Trash', propane: 'Propane', fees: 'Fees',
 }
 
+// S652 — which skilled maintenance a work trader may see and take. Mirrors the
+// skilled half of the maintenance categories; the migration's CHECK lists the
+// same values. General, landscaping, cleaning and pest work needs no skill:
+// every work trader at the property sees it (WORK_TRADE_OPEN_CATEGORIES).
+export const WORK_TRADE_SKILLS = [
+  'plumbing', 'electrical', 'hvac', 'appliance', 'roofing', 'structural', 'pool', 'locksmith',
+] as const
+export type WorkTradeSkill = typeof WORK_TRADE_SKILLS[number]
+export const WORK_TRADE_SKILL_LABEL: Record<WorkTradeSkill, string> = {
+  plumbing: 'Plumbing', electrical: 'Electrical', hvac: 'Heating & cooling', appliance: 'Appliances',
+  roofing: 'Roofing', structural: 'Structural', pool: 'Pool', locksmith: 'Locks',
+}
+export const WORK_TRADE_OPEN_CATEGORIES = ['general', 'landscape', 'cleaning', 'pest'] as const
+
+// S652 (Nic): the words a work trader sees on their hours. "Pending" read as if
+// the hours were already in trouble — "Logged" is hours turned in and not yet
+// reviewed; Approved and Denied are the only final states.
+export const WORK_TRADE_LOG_STATUS_LABEL: Record<string, string> = {
+  pending: 'Logged', approved: 'Approved', rejected: 'Denied',
+}
+
 // What rate a SUBMETERED unit on a RUBS master's line is billed at (S607).
 //   property_rate — the rate the landlord published (default). A predictable
 //                   figure the tenant can check, unchanged from how a submeter

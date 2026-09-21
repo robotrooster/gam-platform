@@ -23,6 +23,10 @@ applyCamelizeInterceptor(api)
 api.interceptors.response.use(
   r => r,
   err => {
+    // S652: say WHY — the server's sentence, not "Request failed with status
+    // code 400" (same fix as the landlord portal).
+    const serverSays = err.response?.data?.error ?? err.response?.data?.message
+    if (typeof serverSays === 'string' && serverSays.trim()) err.message = serverSays
     if (err.response?.status === 401 && !String(err.config?.url || '').includes('/auth/')) {
       localStorage.removeItem('gam_tenant_token')
       window.location.href = '/login'

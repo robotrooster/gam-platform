@@ -476,3 +476,62 @@ describe('PATCH /:id  (status update)', () => {
     expect(res.body.data.status).toBe('paused')
   })
 })
+
+// ───────────────────────────────────────────────────────────────────
+// S652 — trusted or monitored, the record, and the landlord's edits
+// ───────────────────────────────────────────────────────────────────
+describe('S652 — trusted, monitored, and the record', () => {
+  it('a monitored person\'s hours stay Logged; a trusted person\'s count when logged', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    const monitored = await request(buildApp()).post(`/api/work-trade/${agId}/logs`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`).send({ workDate: '2026-06-01', hours: 3, description: 'raked leaves' })
+    expect(monitored.body.data.status).toBe('pending')
+
+    await request(buildApp()).patch(`/api/work-trade/${agId}`).set('Authorization', `Bearer ${f.tokenA}`).send({ trusted: true }).expect(200)
+    const trusted = await request(buildApp()).post(`/api/work-trade/${agId}/logs`)
+      .set('Authorization', `Bearer ${f.tenantAToken}`).send({ workDate: '2026-06-02', hours: 2, description: 'cleaned laundry room' })
+    expect(trusted.body.data.status).toBe('approved')
+  })
+
+  it('a tenant cannot make themselves trusted', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    const r = await request(buildApp()).patch(`/api/work-trade/${agId}`).set('Authorization', `Bearer ${f.tenantAToken}`).send({ trusted: true })
+    expect(r.status).toBeGreaterThanOrEqual(403)
+    const row = (await db.query(`SELECT trusted FROM work_trade_agreements WHERE id=$1`, [agId])).rows[0]
+    expect(row.trusted).toBe(false)
+  })
+
+  it('the landlord sets skills and duties; an unknown skill is refused', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    await request(buildApp()).patch(`/api/work-trade/${agId}`).set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ skills: ['plumbing', 'electrical'], duties: 'Grounds and the laundry room' }).expect(200)
+    const row = (await db.query(`SELECT skills, duties FROM work_trade_agreements WHERE id=$1`, [agId])).rows[0]
+    expect(row.skills).toEqual(['plumbing', 'electrical'])
+    expect(row.duties).toBe('Grounds and the laundry room')
+    const bad = await request(buildApp()).patch(`/api/work-trade/${agId}`).set('Authorization', `Bearer ${f.tokenA}`).send({ skills: ['juggling'] })
+    expect(bad.status).toBe(400)
+  })
+
+  it('the record counts turned-in sets and the approved / denied split, and names the review day', async () => {
+    const f = await seed()
+    const agId = await seedAgreement(f)
+    for (const [hours, status] of [[4, 'approved'], [2, 'approved'], [3, 'rejected'], [1, 'pending']] as const) {
+      await db.query(`INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description, status)
+                      VALUES ($1,$2,$3,'2026-06-01',$4,'x',$5)`, [agId, f.tenantAId, f.tenantAUserId, hours, status])
+    }
+    const r = await request(buildApp()).get(`/api/work-trade/${agId}`).set('Authorization', `Bearer ${f.tenantAToken}`)
+    expect(r.status).toBe(200)
+    const rec = r.body.data.record
+    expect(rec.submitted).toBe(4)
+    expect(rec.approved).toBe(2)
+    expect(rec.denied).toBe(1)
+    expect(rec.logged).toBe(1)
+    expect(rec.deniedPct).toBe(33.3)
+    expect(rec.hoursDeniedPct).toBe(33.3)
+    expect(r.body.data.stats.reviewBy).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect(r.body.data.agreement.tenant_first).toBeTruthy()
+  })
+})
