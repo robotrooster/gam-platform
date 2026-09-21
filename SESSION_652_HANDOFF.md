@@ -437,8 +437,9 @@ corrected in place:
 - Rules titles: Mountain View
 
 Both templates now point at the corrected PDFs with every box kept. The 37
-completed leases keep their signed text. **4 in progress (3 MH, 1 RV) are still
-on the old file** — Nic's call whether to void and reissue.
+completed leases keep their signed text. **4 in progress (3 MH, 1 RV) stay on the old
+file** — Nic decided: do not void; they are signed as sent, the corrected text is
+for every lease from here on.
 
 **Voided documents that were never signed** are hidden from the documents list
 (kept, never deleted).
