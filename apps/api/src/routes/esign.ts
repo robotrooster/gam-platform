@@ -58,7 +58,7 @@ import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType }
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, landlordOperatingIn } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, fileUnderCompany } from '../lib/landlordScope'
 
 export const esignRouter = Router()
 
@@ -2249,9 +2249,15 @@ esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_mana
     const wantState = docRow && docRow.jurisdiction !== 'US'
       ? docRow.jurisdiction
       : (typeof req.body?.stateCode === 'string' ? req.body.stateCode.toUpperCase() : null)
-    const landlordId = req.body?.landlordId
-      ? resolveLandlordTarget(req.user!, req.body.landlordId, 'form')
-      : (await landlordOperatingIn(req.user!, wantState, query)) ?? scope[0]
+    // Already on the account's shelf under any company? That copy IS the
+    // account's copy — never make a second.
+    const heldAnywhere = await queryOne<{ id: string }>(
+      `SELECT id FROM lease_templates WHERE library_document_id=$1 AND landlord_id = ANY($2::uuid[]) AND is_active
+        ORDER BY created_at LIMIT 1`, [documentId, scope])
+    if (heldAnywhere && !req.body?.landlordId) {
+      return res.json({ success: true, data: { templateId: heldAnywhere.id, alreadyHeld: true } })
+    }
+    const landlordId = await fileUnderCompany(req.user!, { explicit: req.body?.landlordId, state: wantState }, query)
 
     const client = await getClient()
     try {
@@ -2337,10 +2343,9 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     // (silently, if it owns only one). A template filed under the wrong company
     // is invisible to the properties that need it.
     // S652: uploaded into a state's slot → that state's company.
-    const templateLandlordId = propertyId
-      ? await landlordIdForProperty(req.user!, String(propertyId), query)
-      : (!req.body?.landlordId && sleeve ? await landlordOperatingIn(req.user!, sleeve.stateCode, query) : null)
-        ?? resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
+    const templateLandlordId = await fileUnderCompany(req.user!, {
+      explicit: req.body?.landlordId, propertyId: propertyId ? String(propertyId) : null,
+      state: sleeve?.stateCode ?? stCode }, query)
     const t = await queryOne<any>(`
       INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose,
                                    disclosure_type, applies_to, state_code)
@@ -3159,8 +3164,14 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
       })).min(1).max(10),
     }).parse(req.body)
 
-    // S633: the document is created under a NAMED company.
-    const landlordId = resolveLandlordTarget(req.user as any, (req.body as any)?.landlordId, 'document')
+    // S652: filed under the template's company when there is one, else
+    // wherever fits — never a "which company" refusal (Nic).
+    const tmplCo = body.templateId ? await queryOne<{ landlord_id: string }>(
+      'SELECT landlord_id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [body.templateId, landlordScopeIds(req.user as any)]) : null
+    if (body.templateId && !tmplCo) throw new AppError(404, 'Template not found')
+    const landlordId = tmplCo?.landlord_id
+      ?? await fileUnderCompany(req.user as any, { explicit: (req.body as any)?.landlordId }, query)
 
     for (const s of body.signers) {
       if (!isValidSignerRole(s.role)) throw new AppError(400, `Invalid signer role: ${s.role}`)
@@ -3171,8 +3182,7 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
 
     // If a template is supplied it must belong to this landlord.
     if (body.templateId) {
-      const tmpl = await queryOne<any>('SELECT id FROM lease_templates WHERE id=$1 AND landlord_id=$2', [body.templateId, landlordId])
-      if (!tmpl) throw new AppError(404, 'Template not found')
+      // (checked against the whole account above)
     }
 
     await client.query('BEGIN')
@@ -3295,7 +3305,7 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     if (openDraft) throw new AppError(409, 'A renewal draft already exists for this lease — void it first or send it')
 
     const tmpl = await queryOne<any>(
-      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, lease.landlord_id])
+      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))', [templateId, lease.landlord_id])
     if (!tmpl) throw new AppError(404, 'Template not found')
     if (!tmpl.base_pdf_url) throw new AppError(400, 'Template has no base PDF')
     // S535: templates are per unit type — refuse an incompatible pairing
@@ -3583,7 +3593,7 @@ esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.cre
     // Resolve PDF
     let pdfUrl = basePdfUrl
     if (templateId) {
-      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
+      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))',
         [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
@@ -3736,7 +3746,7 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requirePerm('leases.
     // Resolve PDF
     let pdfUrl = basePdfUrl
     if (templateId) {
-      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
+      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))',
         [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
@@ -3799,8 +3809,8 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requirePerm('le
 
     // 2. Template ownership
     const tmpl = await queryOne<any>(
-      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
-      [templateId, landlordId])
+      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+      [templateId, landlordScopeIds(req.user!)])
     if (!tmpl) throw new AppError(404, 'Template not found')
 
     // 3. Landlord user record for signer construction
@@ -4077,7 +4087,7 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
     // Resolve PDF
     let pdfUrl = basePdfUrl
     if (templateId) {
-      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2',
+      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))',
         [templateId, lease.landlord_id])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
@@ -4204,7 +4214,7 @@ esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('lea
       ORDER BY l.start_date DESC LIMIT 1`, [agr.unit_id, agr.tenant_id])
     if (!lease) throw new AppError(409, 'No active lease for this tenant on this unit — renew the lease first')
 
-    const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, landlordId])
+    const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id IN (SELECT account_companies($2))', [templateId, landlordId])
     if (!tmpl) throw new AppError(404, 'Template not found')
     if (tmpl.purpose !== 'work_trade_addendum') throw new AppError(400, 'Pick a Work-Trade Addendum form (set Form Type = Work-Trade Addendum on the template)')
     if (!tmpl.base_pdf_url) throw new AppError(400, 'That addendum form has no PDF — add one in the template editor')

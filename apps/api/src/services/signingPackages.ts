@@ -108,7 +108,8 @@ export async function transactionKindForUnit(unitId: string): Promise<Transactio
 }
 
 export async function resolvePackageForUnit(params: {
-  landlordId: string
+  // S652: every company in the account — a package is the account's.
+  landlordIds: string[]
   unitId: string
   packageId?: string | null
 }): Promise<ResolvedPackage | null> {
@@ -121,16 +122,18 @@ export async function resolvePackageForUnit(params: {
   const pkg = params.packageId
     ? await queryOne<any>(
         `SELECT id, name FROM document_packages
-          WHERE id = $1 AND landlord_id = $2 AND archived_at IS NULL`,
-        [params.packageId, params.landlordId])
-    // The default for this unit type, else a landlord-wide default.
+          WHERE id = $1 AND landlord_id = ANY($2::uuid[]) AND archived_at IS NULL`,
+        [params.packageId, params.landlordIds])
+    // The default for this unit type in this state, else any state, else a
+    // package for every unit type.
     : await queryOne<any>(
         `SELECT id, name FROM document_packages
-          WHERE landlord_id = $1 AND archived_at IS NULL AND is_default
+          WHERE landlord_id = ANY($1::uuid[]) AND archived_at IS NULL AND is_default
             AND (unit_type = $2 OR unit_type IS NULL)
-          ORDER BY (unit_type IS NOT NULL) DESC
+            AND (state_code = $3 OR state_code IS NULL)
+          ORDER BY (unit_type IS NOT NULL) DESC, (state_code IS NOT NULL) DESC
           LIMIT 1`,
-        [params.landlordId, unit.unit_type])
+        [params.landlordIds, unit.unit_type, unit.state])
   if (!pkg) return null
 
   // S652: which disclosures belong in front of THIS household.

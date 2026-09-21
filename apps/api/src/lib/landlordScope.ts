@@ -200,6 +200,31 @@ export async function landlordOperatingIn(
   return rows.length === 1 ? rows[0].landlord_id : null
 }
 
+/**
+ * S652 — where to FILE a document, template or package. Never asks.
+ *
+ * Nic: "Doesn't matter what company it's for... The landlord portal is linked
+ * to everything that's under their purview." These things belong to the
+ * account; landlord_id only records a filing place, and every use checks the
+ * account (landlordScopeIds / account_companies()), never an exact match. So
+ * unlike resolveLandlordTarget — right for a PROPERTY, which really belongs to
+ * one LLC — this picks sensibly and moves on: a named company, else the
+ * property's, else the one running that state, else the account's first.
+ */
+export async function fileUnderCompany(
+  user: AuthPayload,
+  hint: { explicit?: string | null; propertyId?: string | null; state?: string | null },
+  q: <T>(sql: string, params: unknown[]) => Promise<T[]>,
+): Promise<string> {
+  if (hint.explicit) return resolveLandlordTarget(user, hint.explicit)
+  if (hint.propertyId) return landlordIdForProperty(user, hint.propertyId, q)
+  const byState = await landlordOperatingIn(user, hint.state, q)
+  if (byState) return byState
+  const scope = landlordScopeIds(user)
+  if (!scope.length) throw new AppError(400, 'No landlord scope on this user')
+  return scope[0]
+}
+
 export async function landlordIdForProperty(
   user: AuthPayload,
   propertyId: string,

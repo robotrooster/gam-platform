@@ -14,10 +14,10 @@
  */
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne, getClient } from '../db'
+import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { landlordOperatingIn, landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { fileUnderCompany, landlordScopeIds } from '../lib/landlordScope'
 import { RENEWAL_BEHAVIORS, UNIT_TYPES } from '@gam/shared'
 import {
   resolvePackageForUnit, setTemplateProperties, templatePropertyIds,
@@ -77,10 +77,9 @@ signingPackagesRouter.post('/', requirePerm('esign.template_manage'), async (req
     // Oak Park in Arizona) was refused with "choose which company" and no way
     // to choose. The package's state already says which: only one of them runs
     // property there.
-    const landlordId = body.landlordId
-      ? resolveLandlordTarget(req.user!, body.landlordId, 'signing package')
-      : (await landlordOperatingIn(req.user!, body.stateCode, query))
-        ?? resolveLandlordTarget(req.user!, null, 'signing package')
+    // S652: a package is the ACCOUNT's (Nic: "doesn't matter what company it's
+    // for"). landlord_id only records where it is filed.
+    const landlordId = await fileUnderCompany(req.user!, { explicit: body.landlordId, state: body.stateCode }, query)
 
     const pkg = await queryOne<{ id: string }>(
       `INSERT INTO document_packages (landlord_id, name, description, unit_type, is_default, state_code)
@@ -142,7 +141,7 @@ signingPackagesRouter.get('/for-unit/:unitId', requirePerm('leases.create'), asy
     if (!unit) throw new AppError(404, 'Unit not found')
 
     const resolved = await resolvePackageForUnit({
-      landlordId: unit.landlord_id,
+      landlordIds: landlordScopeIds(req.user!),
       unitId: req.params.unitId,
       packageId: typeof req.query.packageId === 'string' ? req.query.packageId : null,
     })
@@ -201,39 +200,17 @@ async function assertTemplateInScope(templateId: string, user: any): Promise<voi
  */
 async function replaceItems(
   packageId: string,
-  landlordId: string,
+  _landlordId: string,
   items: Array<z.infer<typeof itemSchema>>,
   user: Parameters<typeof landlordScopeIds>[0],
 ): Promise<void> {
   if (items.length) {
+    // Any document within this account — whichever company it is filed under.
     const ids = [...new Set(items.map(i => i.templateId))]
-    const rows = await query<{ id: string; landlord_id: string; library_document_id: string | null }>(
-      `SELECT id, landlord_id, library_document_id FROM lease_templates WHERE id = ANY($1::uuid[])`, [ids])
-    const scope = landlordScopeIds(user)
-    // A GOVERNMENT form is the same document whichever company holds the copy.
-    // The Templates page shows one copy per form (the dedupe), which can be a
-    // sibling company's — so swap it for this company's own copy, making one
-    // if needed. A landlord's OWN document from another company stays refused:
-    // that one really does belong to someone else.
-    const swap = new Map<string, string>()
-    for (const r of rows) {
-      if (r.landlord_id === landlordId) continue
-      if (r.library_document_id && scope.includes(r.landlord_id)) {
-        const { adoptLibraryDocument } = await import('../services/disclosureLibrary')
-        const client = await getClient()
-        try {
-          await client.query('BEGIN')
-          const out = await adoptLibraryDocument(client as any, landlordId, r.library_document_id)
-          await client.query('COMMIT')
-          swap.set(r.id, out.templateId)
-        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
-        finally { client.release() }
-        continue
-      }
-      throw new AppError(403, 'One of those documents belongs to another company')
-    }
-    if (rows.length !== ids.length) throw new AppError(403, 'One of those templates is not yours')
-    items = items.map(i => swap.has(i.templateId) ? { ...i, templateId: swap.get(i.templateId)! } : i)
+    const owned = await query<{ id: string }>(
+      `SELECT id FROM lease_templates WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[])`,
+      [ids, landlordScopeIds(user)])
+    if (owned.length !== ids.length) throw new AppError(403, 'One of those documents is not yours')
   }
 
   await query(`DELETE FROM document_package_items WHERE package_id = $1`, [packageId])

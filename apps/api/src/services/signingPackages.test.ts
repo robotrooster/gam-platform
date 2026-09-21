@@ -81,7 +81,7 @@ async function world(): Promise<World> {
 describe('resolving a package for a unit', () => {
   it('picks the default for the unit type and returns items in order', async () => {
     const w = await world()
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.mhUnit })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.mhUnit })
     expect(r!.name).toBe('AZ Park-Owned Homes')
     expect(r!.items.map(i => i.templateName)).toEqual([
       'Mobile Home Lease', 'Installment Sale', 'AZ Statement of Policy',
@@ -91,7 +91,7 @@ describe('resolving a package for a unit', () => {
 
   it('suggests everything unpinned — a disclosure is reusable anywhere', async () => {
     const w = await world()
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.mhUnit })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.mhUnit })
     const policy = r!.items.find(i => i.templateName === 'AZ Statement of Policy')!
     expect(policy.suggested).toBe(true)
   })
@@ -101,7 +101,7 @@ describe('resolving a package for a unit', () => {
   it('a template pinned to other properties is not suggested here', async () => {
     const w = await world()
     await setTemplateProperties(w.tpl.parking, [w.parkB, w.parkC])
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.mhUnit })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.mhUnit })
     const parking = r!.items.find(i => i.templateName === 'Assigned Parking Rules')!
     expect(parking.suggested).toBe(false)
     expect(parking.reason).toBe('Not used at this property')
@@ -113,7 +113,7 @@ describe('resolving a package for a unit', () => {
     expect((await templatePropertyIds(w.tpl.parking)).sort())
       .toEqual([w.parkA, w.parkB].sort())
 
-    const here = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.mhUnit })
+    const here = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.mhUnit })
     expect(here!.items.find(i => i.templateName === 'Assigned Parking Rules')!.suggested).toBe(true)
   })
 
@@ -126,14 +126,14 @@ describe('resolving a package for a unit', () => {
       `INSERT INTO document_package_items (package_id, template_id, sort_order, renewal_behavior)
        VALUES ($1,$2,0,'once_per_tenancy')`, [second.rows[0].id, w.tpl.policy])
 
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.rvUnit, packageId: second.rows[0].id })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.rvUnit, packageId: second.rows[0].id })
     expect(r!.items.map(i => i.templateName)).toEqual(['AZ Statement of Policy'])
   })
 
   it('a required item stays ticked even where inference would drop it', async () => {
     const w = await world()
     await setTemplateProperties(w.tpl.lease, [w.parkB])  // pinned away from this park
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.mhUnit })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.mhUnit })
     const lease = r!.items.find(i => i.templateName === 'Mobile Home Lease')!
     expect(lease.required).toBe(true)
     expect(lease.suggested).toBe(true)
@@ -141,7 +141,7 @@ describe('resolving a package for a unit', () => {
 
   it('a template written for another unit type is offered, not blocked', async () => {
     const w = await world()
-    const r = await resolvePackageForUnit({ landlordId: w.landlordId, unitId: w.rvUnit, packageId: w.packageId })
+    const r = await resolvePackageForUnit({ landlordIds: [w.landlordId], unitId: w.rvUnit, packageId: w.packageId })
     const lease = r!.items.find(i => i.templateName === 'Mobile Home Lease')!
     // still present — the landlord decides, the platform does not gate
     expect(lease).toBeTruthy()

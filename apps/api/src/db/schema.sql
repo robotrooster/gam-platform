@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict YzYj6orheE5A3IguxuApsn0zotn7SlejpeaohfBdLwlNxpg6Id6e5zsMo7oYKUl
+\restrict gAxsEiIpX96FnvNyYEbyMrPIU1H8yXBaoxNp7DaYZeWhgJAQpjNg8Q5yEK0gH4a
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -84,6 +84,26 @@ CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 --
 
 COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+--
+-- Name: account_companies(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.account_companies(company uuid) RETURNS SETOF uuid
+    LANGUAGE sql STABLE
+    AS $$
+  WITH people AS (
+    SELECT user_id FROM landlord_members WHERE landlord_id = company
+    UNION
+    SELECT user_id FROM landlords WHERE id = company AND user_id IS NOT NULL
+  )
+  SELECT landlord_id FROM landlord_members WHERE user_id IN (SELECT user_id FROM people)
+  UNION
+  SELECT id FROM landlords WHERE user_id IN (SELECT user_id FROM people)
+  UNION
+  SELECT company
+$$;
 
 
 --
@@ -27908,5 +27928,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict YzYj6orheE5A3IguxuApsn0zotn7SlejpeaohfBdLwlNxpg6Id6e5zsMo7oYKUl
+\unrestrict gAxsEiIpX96FnvNyYEbyMrPIU1H8yXBaoxNp7DaYZeWhgJAQpjNg8Q5yEK0gH4a
 

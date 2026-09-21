@@ -545,34 +545,46 @@ describe('an account that runs two companies (Blu: Country Acres in IL, Oak Park
     return { ...f, doc, azCopy, both }
   }
 
-  it('an Illinois package saves under the Illinois company, with no company question', async () => {
+  it('a package takes any document in the account, whichever company it is filed under — no company question', async () => {
     const f = await twoCompanies()
+    // tplB is Oak Park's own lease; azCopy is Oak Park's copy of a federal form.
     const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
-      .send({ name: 'IL home sale', stateCode: 'IL', items: [{ templateId: f.tplA }, { templateId: f.azCopy }] })
+      .send({ name: 'IL home sale', stateCode: 'IL', items: [{ templateId: f.tplA }, { templateId: f.tplB }, { templateId: f.azCopy }] })
     expect(r.status).toBe(201)
-    const pkg = (await db.query(`SELECT landlord_id FROM document_packages WHERE id=$1`, [r.body.data.id])).rows[0]
-    expect(pkg.landlord_id).toBe(f.a.landlordId)
-    // The federal form in it is the Illinois company's own copy, not Oak Park's.
-    const items = (await db.query(
-      `SELECT t.landlord_id, t.library_document_id FROM document_package_items i JOIN lease_templates t ON t.id=i.template_id WHERE i.package_id=$1`,
-      [r.body.data.id])).rows
-    expect(items).toHaveLength(2)
-    expect(items.every((x: any) => x.landlord_id === f.a.landlordId)).toBe(true)
-    expect(items.some((x: any) => x.library_document_id === f.doc)).toBe(true)
+    const items = (await db.query(`SELECT template_id FROM document_package_items WHERE package_id=$1`, [r.body.data.id])).rows
+    expect(items.map((x: any) => x.template_id).sort()).toEqual([f.tplA, f.tplB, f.azCopy].sort())
   })
 
-  it('another company\'s OWN document is still refused', async () => {
-    const f = await twoCompanies()
-    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
-      .send({ name: 'IL', stateCode: 'IL', items: [{ templateId: f.tplB }] })
-    expect(r.status).toBe(403)
-  })
-
-  it('with no state to go on, it says why in words', async () => {
+  it('with no state given it still saves — the company is never asked for', async () => {
     const f = await twoCompanies()
     const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
       .send({ name: 'No state', items: [] })
-    expect(r.status).toBe(400)
-    expect(r.body.error).toMatch(/more than one company/)
+    expect(r.status).toBe(201)
+  })
+
+  it('a package filed under one company is used for a unit of the other', async () => {
+    const f = await twoCompanies()
+    const c = await db.connect()
+    let unitB: string
+    try { unitB = await seedUnit(c, { propertyId: f.propB, landlordId: f.b.landlordId }) } finally { c.release() }
+    await db.query(`UPDATE units SET unit_type='mobile_home' WHERE id=$1`, [unitB!])
+    // Nic's case: a second park in the SAME state, run by a different company.
+    await db.query(`UPDATE properties SET state='IL' WHERE id=$1`, [f.propB])
+    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
+      .send({ name: 'Every MH park', unitType: 'mobile_home', isDefault: true, stateCode: 'IL', items: [{ templateId: f.tplA }] })
+    expect(r.status).toBe(201)
+    const got = await request(buildApp()).get(`/api/signing-packages/for-unit/${unitB!}`).set('Authorization', `Bearer ${f.both}`)
+    expect(got.status).toBe(200)
+    expect(got.body.data?.name).toBe('Every MH park')
+  })
+
+  it('a stranger\'s document is still refused', async () => {
+    const f = await twoCompanies()
+    const c = await db.connect(); let stranger: any
+    try { await c.query('BEGIN'); stranger = await seedLandlord(c); await c.query('COMMIT') } finally { c.release() }
+    const t = (await db.query<{ id: string }>(`INSERT INTO lease_templates (landlord_id, name, purpose) VALUES ($1,'Theirs','lease') RETURNING id`, [stranger.landlordId])).rows[0].id
+    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
+      .send({ name: 'IL', stateCode: 'IL', items: [{ templateId: t }] })
+    expect(r.status).toBe(403)
   })
 })
