@@ -58,7 +58,7 @@ import { draftHouseholdLease, resolveHouseholdByEmail, draftPendingForUnitType }
 import { activateHomeSaleContract } from '../services/homeSale'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { landlordSigningContact } from '../services/landlordSigningContact'
-import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord } from '../lib/landlordScope'
+import { landlordScopeIds, resolveLandlordTarget, landlordIdForProperty, landlordIdForUnit, ownsLandlord, landlordOperatingIn } from '../lib/landlordScope'
 
 export const esignRouter = Router()
 
@@ -2217,8 +2217,7 @@ esignRouter.get('/library', requireAuth, requirePerm('leases.create'), async (re
 esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const scope = landlordScopeIds(req.user!)
-    const landlordId = scope[0]
-    if (!landlordId) throw new AppError(403, 'Forbidden')
+    if (!scope.length) throw new AppError(403, 'Forbidden')
     const { adoptLibraryDocument, libraryForLandlord } = await import('../services/disclosureLibrary')
     const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
 
@@ -2239,6 +2238,20 @@ esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_mana
       }
       documentId = hits[0].id
     }
+
+    // S652: WHICH company takes the copy. A state form goes to the company that
+    // runs property in that state; a federal one to the company running the
+    // state the screen is working in (the package or slot's state). Before
+    // this it was always the first company listed — Blu's Illinois package
+    // could be handed an Oak Park copy and then refused it as "not yours".
+    const docRow = await queryOne<{ jurisdiction: string }>(
+      `SELECT jurisdiction FROM disclosure_library_documents WHERE id=$1`, [documentId])
+    const wantState = docRow && docRow.jurisdiction !== 'US'
+      ? docRow.jurisdiction
+      : (typeof req.body?.stateCode === 'string' ? req.body.stateCode.toUpperCase() : null)
+    const landlordId = req.body?.landlordId
+      ? resolveLandlordTarget(req.user!, req.body.landlordId, 'form')
+      : (await landlordOperatingIn(req.user!, wantState, query)) ?? scope[0]
 
     const client = await getClient()
     try {
@@ -2323,9 +2336,11 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     // that property's company IS the answer; otherwise the account names one
     // (silently, if it owns only one). A template filed under the wrong company
     // is invisible to the properties that need it.
+    // S652: uploaded into a state's slot → that state's company.
     const templateLandlordId = propertyId
       ? await landlordIdForProperty(req.user!, String(propertyId), query)
-      : resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
+      : (!req.body?.landlordId && sleeve ? await landlordOperatingIn(req.user!, sleeve.stateCode, query) : null)
+        ?? resolveLandlordTarget(req.user!, req.body?.landlordId, 'template')
     const t = await queryOne<any>(`
       INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose,
                                    disclosure_type, applies_to, state_code)

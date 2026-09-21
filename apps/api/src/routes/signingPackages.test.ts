@@ -526,3 +526,53 @@ describe('S652: the packet picks the disclosure that matches the transaction', (
     expect(await transactionKindForUnit(f.unitA)).toBe('rental')
   })
 })
+
+describe('an account that runs two companies (Blu: Country Acres in IL, Oak Park in AZ)', () => {
+  async function twoCompanies() {
+    const f = await seed()
+    await db.query(`UPDATE properties SET state='IL' WHERE landlord_id=$1`, [f.a.landlordId])
+    await db.query(`UPDATE properties SET state='AZ' WHERE landlord_id=$1`, [f.b.landlordId])
+    const doc = (await db.query<{ id: string }>(
+      `INSERT INTO disclosure_library_documents (disclosure_type, jurisdiction, applies_to, unit_types, name, source_name, source_url, base_pdf_url)
+       VALUES ('lead_based_paint','US','sale',NULL,'Federal: Lead — Sales','EPA','https://epa.gov/x','/api/esign/files/x.pdf') RETURNING id`)).rows[0].id
+    // The Templates page shows one copy per form, and here it is Oak Park's.
+    const azCopy = (await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, library_document_id) VALUES ($1,'Federal: Lead — Sales','state_disclosure',$2) RETURNING id`,
+      [f.b.landlordId, doc])).rows[0].id
+    const both = jwt.sign(
+      { userId: f.a.userId, role: 'landlord', email: 'blu@t.dev', profileId: f.a.landlordId, landlordIds: [f.a.landlordId, f.b.landlordId], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    return { ...f, doc, azCopy, both }
+  }
+
+  it('an Illinois package saves under the Illinois company, with no company question', async () => {
+    const f = await twoCompanies()
+    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
+      .send({ name: 'IL home sale', stateCode: 'IL', items: [{ templateId: f.tplA }, { templateId: f.azCopy }] })
+    expect(r.status).toBe(201)
+    const pkg = (await db.query(`SELECT landlord_id FROM document_packages WHERE id=$1`, [r.body.data.id])).rows[0]
+    expect(pkg.landlord_id).toBe(f.a.landlordId)
+    // The federal form in it is the Illinois company's own copy, not Oak Park's.
+    const items = (await db.query(
+      `SELECT t.landlord_id, t.library_document_id FROM document_package_items i JOIN lease_templates t ON t.id=i.template_id WHERE i.package_id=$1`,
+      [r.body.data.id])).rows
+    expect(items).toHaveLength(2)
+    expect(items.every((x: any) => x.landlord_id === f.a.landlordId)).toBe(true)
+    expect(items.some((x: any) => x.library_document_id === f.doc)).toBe(true)
+  })
+
+  it('another company\'s OWN document is still refused', async () => {
+    const f = await twoCompanies()
+    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
+      .send({ name: 'IL', stateCode: 'IL', items: [{ templateId: f.tplB }] })
+    expect(r.status).toBe(403)
+  })
+
+  it('with no state to go on, it says why in words', async () => {
+    const f = await twoCompanies()
+    const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
+      .send({ name: 'No state', items: [] })
+    expect(r.status).toBe(400)
+    expect(r.body.error).toMatch(/more than one company/)
+  })
+})

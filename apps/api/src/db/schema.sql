@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Mp4Caagc5B9OCbjfsY6Jzv2qRdSFtwA7d74V97IDJCn2vDEwU1iPeu2BXIQz0ea
+\restrict YzYj6orheE5A3IguxuApsn0zotn7SlejpeaohfBdLwlNxpg6Id6e5zsMo7oYKUl
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5969,6 +5969,33 @@ CREATE TABLE public.liability_insurance_policies (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: library_coverage_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.library_coverage_items (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    state_code text NOT NULL,
+    item_key text NOT NULL,
+    source text NOT NULL,
+    what text NOT NULL,
+    unit_types text[],
+    basis text,
+    sleeve_id uuid,
+    status text DEFAULT 'to_search'::text NOT NULL,
+    library_document_id uuid,
+    reason text,
+    where_searched text,
+    searched_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT library_coverage_items_check CHECK (((status <> ALL (ARRAY['none_published'::text, 'blocked'::text, 'not_applicable'::text])) OR ((reason IS NOT NULL) AND (length(TRIM(BOTH FROM reason)) > 0)))),
+    CONSTRAINT library_coverage_items_check1 CHECK (((status <> 'found'::text) OR (library_document_id IS NOT NULL))),
+    CONSTRAINT library_coverage_items_source_check CHECK ((source = ANY (ARRAY['statute'::text, 'standard'::text, 'corpus_gap'::text]))),
+    CONSTRAINT library_coverage_items_status_check CHECK ((status = ANY (ARRAY['to_search'::text, 'found'::text, 'none_published'::text, 'blocked'::text, 'not_applicable'::text])))
 );
 
 
@@ -13135,6 +13162,22 @@ ALTER TABLE ONLY public.liability_insurance_policies
 
 
 --
+-- Name: library_coverage_items library_coverage_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.library_coverage_items
+    ADD CONSTRAINT library_coverage_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: library_coverage_items library_coverage_items_state_code_item_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.library_coverage_items
+    ADD CONSTRAINT library_coverage_items_state_code_item_key_key UNIQUE (state_code, item_key);
+
+
+--
 -- Name: login_email_otps login_email_otps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19397,6 +19440,13 @@ CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id
 
 
 --
+-- Name: library_coverage_items_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX library_coverage_items_status_idx ON public.library_coverage_items USING btree (status, state_code);
+
+
+--
 -- Name: payments_work_trade_suspended_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24431,6 +24481,22 @@ ALTER TABLE ONLY public.liability_insurance_policies
 
 
 --
+-- Name: library_coverage_items library_coverage_items_library_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.library_coverage_items
+    ADD CONSTRAINT library_coverage_items_library_document_id_fkey FOREIGN KEY (library_document_id) REFERENCES public.disclosure_library_documents(id);
+
+
+--
+-- Name: library_coverage_items library_coverage_items_sleeve_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.library_coverage_items
+    ADD CONSTRAINT library_coverage_items_sleeve_id_fkey FOREIGN KEY (sleeve_id) REFERENCES public.document_sleeves(id);
+
+
+--
 -- Name: login_email_otps login_email_otps_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27842,5 +27908,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Mp4Caagc5B9OCbjfsY6Jzv2qRdSFtwA7d74V97IDJCn2vDEwU1iPeu2BXIQz0ea
+\unrestrict YzYj6orheE5A3IguxuApsn0zotn7SlejpeaohfBdLwlNxpg6Id6e5zsMo7oYKUl
 

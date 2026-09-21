@@ -14,10 +14,10 @@
  */
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { landlordOperatingIn, landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { RENEWAL_BEHAVIORS, UNIT_TYPES } from '@gam/shared'
 import {
   resolvePackageForUnit, setTemplateProperties, templatePropertyIds,
@@ -73,14 +73,21 @@ signingPackagesRouter.get('/', requirePerm('leases.create'), async (req, res, ne
 signingPackagesRouter.post('/', requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const body = packageSchema.parse(req.body)
-    const landlordId = await resolveLandlordTarget(req.user!, body.landlordId, 'signing package')
+    // S652: an account that runs two companies (Blu: Country Acres in Illinois,
+    // Oak Park in Arizona) was refused with "choose which company" and no way
+    // to choose. The package's state already says which: only one of them runs
+    // property there.
+    const landlordId = body.landlordId
+      ? resolveLandlordTarget(req.user!, body.landlordId, 'signing package')
+      : (await landlordOperatingIn(req.user!, body.stateCode, query))
+        ?? resolveLandlordTarget(req.user!, null, 'signing package')
 
     const pkg = await queryOne<{ id: string }>(
       `INSERT INTO document_packages (landlord_id, name, description, unit_type, is_default, state_code)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
       [landlordId, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false, body.stateCode ?? null])
 
-    await replaceItems(pkg!.id, landlordId, body.items ?? [])
+    await replaceItems(pkg!.id, landlordId, body.items ?? [], req.user!)
     res.status(201).json({ success: true, data: { id: pkg!.id } })
   } catch (e) { next(e) }
 })
@@ -100,7 +107,7 @@ signingPackagesRouter.put('/:id', requirePerm('esign.template_manage'), async (r
         WHERE id=$1`,
       [existing.id, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false, body.stateCode ?? null])
 
-    if (body.items) await replaceItems(existing.id, existing.landlord_id, body.items)
+    if (body.items) await replaceItems(existing.id, existing.landlord_id, body.items, req.user!)
     res.json({ success: true, data: { id: existing.id } })
   } catch (e) { next(e) }
 })
@@ -196,13 +203,37 @@ async function replaceItems(
   packageId: string,
   landlordId: string,
   items: Array<z.infer<typeof itemSchema>>,
+  user: Parameters<typeof landlordScopeIds>[0],
 ): Promise<void> {
   if (items.length) {
     const ids = [...new Set(items.map(i => i.templateId))]
-    const owned = await query<{ id: string }>(
-      `SELECT id FROM lease_templates WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
-      [ids, landlordId])
-    if (owned.length !== ids.length) throw new AppError(403, 'One of those templates is not yours')
+    const rows = await query<{ id: string; landlord_id: string; library_document_id: string | null }>(
+      `SELECT id, landlord_id, library_document_id FROM lease_templates WHERE id = ANY($1::uuid[])`, [ids])
+    const scope = landlordScopeIds(user)
+    // A GOVERNMENT form is the same document whichever company holds the copy.
+    // The Templates page shows one copy per form (the dedupe), which can be a
+    // sibling company's — so swap it for this company's own copy, making one
+    // if needed. A landlord's OWN document from another company stays refused:
+    // that one really does belong to someone else.
+    const swap = new Map<string, string>()
+    for (const r of rows) {
+      if (r.landlord_id === landlordId) continue
+      if (r.library_document_id && scope.includes(r.landlord_id)) {
+        const { adoptLibraryDocument } = await import('../services/disclosureLibrary')
+        const client = await getClient()
+        try {
+          await client.query('BEGIN')
+          const out = await adoptLibraryDocument(client as any, landlordId, r.library_document_id)
+          await client.query('COMMIT')
+          swap.set(r.id, out.templateId)
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
+        finally { client.release() }
+        continue
+      }
+      throw new AppError(403, 'One of those documents belongs to another company')
+    }
+    if (rows.length !== ids.length) throw new AppError(403, 'One of those templates is not yours')
+    items = items.map(i => swap.has(i.templateId) ? { ...i, templateId: swap.get(i.templateId)! } : i)
   }
 
   await query(`DELETE FROM document_package_items WHERE package_id = $1`, [packageId])

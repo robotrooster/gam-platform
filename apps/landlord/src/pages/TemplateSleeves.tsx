@@ -104,10 +104,10 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
     } catch (e: any) { toast.error(e?.message || 'Could not save that') }
   }
 
-  const editGovernment = async (s: Sleeve) => {
+  const editGovernment = async (s: Sleeve, state?: string) => {
     setBusy(s.id)
     try {
-      const id = s.cards[0]?.templateId ?? await ensureLibraryCopy(s.libraryDocumentId!)
+      const id = s.cards[0]?.templateId ?? await ensureLibraryCopy(s.libraryDocumentId!, state && state.length === 2 ? state : null)
       qc.invalidateQueries('esign-sleeves')
       onEdit(id)
     } catch (e: any) { toast.error(e?.message || 'Could not open that form') }
@@ -149,7 +149,7 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
               <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(s.pdfUrl!)}><Eye size={11} /></button>
               {canEdit && s.signable !== false && (
                 <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes" disabled={busy === s.id}
-                        onClick={() => editGovernment(s)}><Settings size={11} /></button>
+                        onClick={() => editGovernment(s, state)}><Settings size={11} /></button>
               )}
             </span>
           )}
@@ -196,7 +196,7 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
               <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(free.pdfUrl)}><Eye size={11} /></button>
               {canEdit && free.signable !== false && (
                 <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes"
-                  onClick={() => editGovernment({ ...s, cards: free.templateId ? [{ templateId: free.templateId } as any] : [], libraryDocumentId: free.libraryDocumentId })}>
+                  onClick={() => editGovernment({ ...s, cards: free.templateId ? [{ templateId: free.templateId } as any] : [], libraryDocumentId: free.libraryDocumentId }, state)}>
                   <Settings size={11} />
                 </button>
               )}

@@ -50,8 +50,10 @@ export const useLibrary = () =>
  * The landlord's own copy of a library form, made the first time it is needed.
  * Safe to call repeatedly — the server returns the existing copy.
  */
-export async function ensureLibraryCopy(documentId: string): Promise<string> {
-  const r = await apiPost<{ templateId: string }>('/esign/library/adopt', { documentId })
+// stateCode: the state the screen is working in, so a federal form lands with
+// the company that runs property there (accounts that run two companies).
+export async function ensureLibraryCopy(documentId: string, stateCode?: string | null): Promise<string> {
+  const r = await apiPost<{ templateId: string }>('/esign/library/adopt', { documentId, stateCode: stateCode || undefined })
   return (r as any).data.templateId
 }
 

@@ -48,6 +48,13 @@ export const ACCOUNT_LOCKED_EVENT = 'gam:account-locked'
 api.interceptors.response.use(
   (res) => res,
   (err) => {
+    // S652: say WHY. Axios' own message is "Request failed with status code
+    // 400", and 61 screens fall back to e.message — so Blu, saving a package,
+    // saw a status code instead of the server's plain sentence. Every caller
+    // that reads e.message now gets the reason; callers reading
+    // response.data.error are unchanged.
+    const serverSays = err.response?.data?.error ?? err.response?.data?.message
+    if (typeof serverSays === 'string' && serverSays.trim()) err.message = serverSays
     const url = String(err.config?.url || '')
     if (err.response?.status === 401 && !url.includes('/auth/')) {
       localStorage.removeItem('gam_token')

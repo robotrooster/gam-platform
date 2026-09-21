@@ -218,7 +218,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
     try {
       const next = [...items]
       for (const w of wanted) {
-        const templateId = w.templateId ?? await ensureLibraryCopy(w.lib!)
+        const templateId = w.templateId ?? await ensureLibraryCopy(w.lib!, pickState)
         if (!next.some(i => i.templateId === templateId)) {
           next.push({ templateId, sortOrder: next.length, renewalBehavior: 'with_lease' })
         }

@@ -180,6 +180,26 @@ export function resolveLandlordTarget(
  * distinction is deliberate. A 404 tells a landlord their own property does not
  * exist, which is what sent Nic looking for a banner that could not render.
  */
+/**
+ * S652 — the one company, of those this account acts for, that runs property in
+ * `state`. Blu owns Country Acres (Illinois) and is an owner-member of Oak Park
+ * (Arizona): an Illinois package, an Illinois form, an upload into an Illinois
+ * slot can only be Country Acres', so nobody should be asked. Null when no
+ * company or more than one runs property there — the caller falls back.
+ */
+export async function landlordOperatingIn(
+  user: AuthPayload,
+  state: string | null | undefined,
+  q: <T>(sql: string, params: unknown[]) => Promise<T[]>,
+): Promise<string | null> {
+  const scope = landlordScopeIds(user)
+  if (!state || !/^[A-Z]{2}$/.test(state) || scope.length === 0) return null
+  const rows = await q<{ landlord_id: string }>(
+    `SELECT DISTINCT landlord_id FROM properties WHERE landlord_id = ANY($1::uuid[]) AND state = $2`,
+    [scope, state])
+  return rows.length === 1 ? rows[0].landlord_id : null
+}
+
 export async function landlordIdForProperty(
   user: AuthPayload,
   propertyId: string,
