@@ -49,6 +49,7 @@ function DefaultPage() {
 }
 import { SignPage } from './pages/SignPage'
 import { LeasePage } from './pages/LeasePage'
+import { LawsPage } from './pages/LawsPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
@@ -693,6 +694,9 @@ function Layout() {
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
             <LeaseNavLink/>
+            {/* S652 (Nic): the landlord-tenant act for their home, from the
+                government library, by state and unit type — automatic. */}
+            <NavLink to="/laws" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>Landlord-Tenant Act</NavLink>
           </>}
           {/* S570 (Nic): Preferences + Security folded into Profile (which already
               has Notification-prefs + Security tabs). Notifications feed → Home. */}
@@ -4836,6 +4840,7 @@ function App() {
           <Route path="communication"   element={<CommunicationPage />} />
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
+          <Route path="laws"             element={<LawsPage />} />
           <Route path="sign/:documentId" element={<SignPage />} />
           <Route path="services"         element={<ServicesPage />} />
           {/* S571: Documents folded into the Communication dashboard (it's

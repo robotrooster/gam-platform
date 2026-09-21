@@ -259,17 +259,8 @@ const DOCS: Doc[] = [
     publicationRef: 'Updated May 2023 (via web.archive.org, 2024-12-12)', effectiveFrom: '2023-05-01',
     fields: coverReceipt(180, 515),
   },
-  {
-    file: 'library-az-adoh-residential-lta-2023-es.pdf',
-    name: 'Arizona: Ley para Propietarios e Inquilinos Residenciales (Spanish, May 2023)',
-    description: "The Arizona Department of Housing's Spanish edition of the Residential Landlord and Tenant Act, updated May 2023.",
-    disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'rental',
-    unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'land_lot'],
-    sourceName: 'Arizona Department of Housing',
-    sourceUrl: 'https://housing.az.gov/sites/default/files/2024-07/SPANISH-Landlord-Tenant-Act_May-2023.pdf',
-    publicationRef: 'Actualizado en mayo de 2023 (via web.archive.org, 2024-12-12)', effectiveFrom: '2023-05-01',
-    fields: coverReceipt(180, 530),
-  },
+  // Spanish edition: shelved and then retired the same day. Nic: "Yeah, let's do
+  // English only for now. Let's keep it simple."
   {
     file: 'library-az-adoh-mh-parks-lta-2024.pdf',
     name: 'Arizona: Mobile Home Parks Residential Landlord and Tenant Act (Department of Housing, 2024)',

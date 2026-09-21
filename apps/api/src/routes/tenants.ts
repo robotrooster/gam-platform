@@ -855,6 +855,59 @@ tenantsRouter.get('/me/move-in-gate', async (req, res, next) => {
 // Returns empty rate / accruals when the deposit's state has no
 // hardcoded statutory rate (tenant in NV, AZ, etc.) — UI shows the
 // principal but no interest line.
+/**
+ * S652 — THE LAW FOR YOUR HOME.
+ *
+ * Nic: "upload each Landlord Tenant Act... where relevant to that unit type and
+ * to that state, the applicable Landlord Tenant Act shows up in the tenant's
+ * portal as a side menu option... show the version so that it can be updated
+ * when we update it. That should be accessible automatically to all tenants
+ * based on how the unit type is set up. As long as the landlord sets the unit
+ * type the right way, the tenant will automatically get the correct thing, with
+ * us providing it on the landlord's behalf."
+ *
+ * For each home the tenant has a lease on: the state's landlord-tenant act for
+ * that kind of space, as the agency prints it, and the state's plain-language
+ * guides. Straight from the government library — so a new edition shelved there
+ * is what every tenant sees next time, with its edition shown.
+ */
+tenantsRouter.get('/me/laws', async (req, res, next) => {
+  try {
+    const tenantId = req.user!.profileId!
+    const homes = await query<{ lease_id: string; state: string; unit_type: string; property_name: string; unit_number: string }>(
+      `SELECT DISTINCT l.id AS lease_id, p.state, u.unit_type, p.name AS property_name,
+              COALESCE(NULLIF(u.display_label, ''), u.unit_number) AS unit_number
+         FROM lease_tenants lt
+         JOIN leases l ON l.id = lt.lease_id
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE lt.tenant_id = $1 AND l.status IN ('active','pending') AND p.state IS NOT NULL`,
+      [tenantId])
+    const out = []
+    for (const h of homes) {
+      const docs = await query<any>(
+        `SELECT id, name, description, disclosure_type, source_name, publication_ref, effective_from, base_pdf_url, page_count
+           FROM disclosure_library_documents
+          WHERE jurisdiction = $1
+            AND disclosure_type IN ('landlord_tenant_act', 'tenant_rights_guide')
+            AND retired_at IS NULL AND superseded_by_id IS NULL
+            AND (unit_types IS NULL OR $2 = ANY(unit_types))
+          ORDER BY (disclosure_type = 'landlord_tenant_act') DESC, lower(name)`,
+        [h.state, h.unit_type])
+      out.push({
+        leaseId: h.lease_id, state: h.state, propertyName: h.property_name, unitNumber: h.unit_number,
+        documents: docs.map(d => ({
+          id: d.id, name: d.name, description: d.description,
+          kind: d.disclosure_type === 'landlord_tenant_act' ? 'act' : 'guide',
+          publishedBy: d.source_name, edition: d.publication_ref, effectiveFrom: d.effective_from,
+          pdfUrl: d.base_pdf_url, pageCount: d.page_count,
+        })),
+      })
+    }
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
   try {
     const tenantId = req.user!.profileId!

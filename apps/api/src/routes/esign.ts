@@ -6014,12 +6014,13 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
       SELECT 1 FROM lease_templates t
        WHERE t.base_pdf_url = $1 AND COALESCE(array_length($2::uuid[], 1), 0) > 0 AND t.landlord_id = ANY($2::uuid[])
       UNION ALL
-      -- S652: a form on the government shelf is readable by any landlord, so
-      -- they can look at it BEFORE putting it on their own shelf. It is a
-      -- public agency document; the login is still required (nothing public
-      -- without one), but no ownership is, because nobody owns it.
+      -- S652: a form on the government shelf is readable by any signed-in user
+      -- — a landlord looking at it before putting it on their shelf, and a
+      -- tenant reading the landlord-tenant act for their home from the portal.
+      -- It is a public agency document; the login is still required (nothing
+      -- public without one), but no ownership is, because nobody owns it.
       SELECT 1 FROM disclosure_library_documents g
-       WHERE g.base_pdf_url = $1 AND COALESCE(array_length($2::uuid[], 1), 0) > 0
+       WHERE g.base_pdf_url = $1
       LIMIT 1`, [urlSuffix, scopeLandlordIds, userId])
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 
