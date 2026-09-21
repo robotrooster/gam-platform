@@ -110,14 +110,27 @@ describe('GET /api/esign/library — what is on the shelf', () => {
     }
   })
 
-  it('shows the WHOLE library, every state — and says where the landlord operates', async () => {
-    // Nic: "the whole library should be in the templates." A landlord opening
-    // in a new state needs its forms before they own a unit there.
+  it('shows only what is relevant to where they operate — and says where that is', async () => {
+    // Nic: "The library should only show relevant stuff to properties they've
+    // uploaded. They'll all be there on the back end. As soon as somebody
+    // uploads a property in Texas, boom, the Texas documents show up."
     await shelve({ jurisdiction: 'IL', name: 'Illinois Thing' })
-    const r = (await get(az).expect(200)).body.data
-    expect(r.documents.map((d: any) => d.name)).toContain('Illinois Thing')
-    expect(r.operatingStates).toEqual(['AZ'])
-    expect((await get(il).expect(200)).body.data.operatingStates).toEqual(['IL'])
+    const azView = (await get(az).expect(200)).body.data
+    expect(azView.documents.map((d: any) => d.name)).not.toContain('Illinois Thing')
+    expect(azView.operatingStates).toEqual(['AZ'])
+    expect((await get(il).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Illinois Thing')
+  })
+
+  it('a new property in a new state reveals that state\'s forms', async () => {
+    await shelve({ jurisdiction: 'IL', name: 'Illinois Thing' })
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const p = await seedProperty(c, { landlordId: az.landlordId, ownerUserId: az.userId, managedByUserId: az.userId, state: 'IL' })
+      await seedUnit(c, { propertyId: p, landlordId: az.landlordId, unitType: 'apartment' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    expect((await get(az).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Illinois Thing')
   })
 
   it('the AGENT\'s view stays narrowed — "the lead form" means the one for where they are', async () => {

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict QhSpNpMpdr0YeNyUZARWLlp96YiqGo3fbrbRhNYmKCkaGJ91CAEyT8Goeh30l5l
+\restrict ch3iL5tRFqzM5G74UahA1kBZz8QYBSKy7ZHTmpcCnnjcFQ9PfVas7CIg2bonsOh
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3683,6 +3683,8 @@ CREATE TABLE public.document_packages (
     archived_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    state_code text,
+    CONSTRAINT document_packages_state_code_check CHECK (((state_code IS NULL) OR ((state_code = upper(state_code)) AND (length(state_code) = 2)))),
     CONSTRAINT document_packages_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))))
 );
 
@@ -3695,6 +3697,32 @@ CREATE TABLE public.document_properties (
     document_id uuid NOT NULL,
     property_id uuid NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: document_sleeves; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_sleeves (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    sleeve_key text NOT NULL,
+    state_code text NOT NULL,
+    kind text NOT NULL,
+    purpose text NOT NULL,
+    disclosure_type text,
+    unit_types text[] NOT NULL,
+    applies_to text DEFAULT 'any'::text NOT NULL,
+    title text NOT NULL,
+    sort_order integer NOT NULL,
+    basis_citation text,
+    basis_section_ids uuid[],
+    retired_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT document_sleeves_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'rental'::text, 'sale'::text]))),
+    CONSTRAINT document_sleeves_kind_check CHECK ((kind = ANY (ARRAY['lease'::text, 'sale_contract'::text, 'disclosure'::text]))),
+    CONSTRAINT document_sleeves_state_code_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2)))
 );
 
 
@@ -5663,6 +5691,7 @@ CREATE TABLE public.lease_templates (
     disclosure_type text,
     state_code text,
     library_document_id uuid,
+    sleeve_id uuid,
     CONSTRAINT lease_templates_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'sale'::text, 'rental'::text]))),
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
@@ -8992,6 +9021,19 @@ CREATE TABLE public.shifts (
     clocked_in_at timestamp with time zone DEFAULT now() NOT NULL,
     clocked_out_at timestamp with time zone,
     notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: sleeve_coverings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sleeve_coverings (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    sleeve_id uuid NOT NULL,
+    template_id uuid NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -12343,6 +12385,22 @@ ALTER TABLE ONLY public.document_properties
 
 
 --
+-- Name: document_sleeves document_sleeves_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_sleeves
+    ADD CONSTRAINT document_sleeves_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: document_sleeves document_sleeves_sleeve_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_sleeves
+    ADD CONSTRAINT document_sleeves_sleeve_key_key UNIQUE (sleeve_key);
+
+
+--
 -- Name: documents documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14159,6 +14217,22 @@ ALTER TABLE ONLY public.shifts
 
 
 --
+-- Name: sleeve_coverings sleeve_coverings_landlord_id_sleeve_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sleeve_coverings
+    ADD CONSTRAINT sleeve_coverings_landlord_id_sleeve_id_key UNIQUE (landlord_id, sleeve_id);
+
+
+--
+-- Name: sleeve_coverings sleeve_coverings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sleeve_coverings
+    ADD CONSTRAINT sleeve_coverings_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: state_law_provisions slp_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15009,6 +15083,13 @@ CREATE INDEX disclosure_library_fields_doc ON public.disclosure_library_fields U
 --
 
 CREATE INDEX disclosure_library_lookup ON public.disclosure_library_documents USING btree (jurisdiction, disclosure_type) WHERE ((retired_at IS NULL) AND (superseded_by_id IS NULL));
+
+
+--
+-- Name: document_sleeves_state; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX document_sleeves_state ON public.document_sleeves USING btree (state_code) WHERE (retired_at IS NULL);
 
 
 --
@@ -19251,6 +19332,13 @@ CREATE INDEX lease_templates_library_doc ON public.lease_templates USING btree (
 --
 
 CREATE UNIQUE INDEX lease_templates_one_adoption_per_landlord ON public.lease_templates USING btree (landlord_id, library_document_id) WHERE (library_document_id IS NOT NULL);
+
+
+--
+-- Name: lease_templates_sleeve; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_templates_sleeve ON public.lease_templates USING btree (sleeve_id) WHERE (sleeve_id IS NOT NULL);
 
 
 --
@@ -24121,6 +24209,14 @@ ALTER TABLE ONLY public.lease_templates
 
 
 --
+-- Name: lease_templates lease_templates_sleeve_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_templates
+    ADD CONSTRAINT lease_templates_sleeve_id_fkey FOREIGN KEY (sleeve_id) REFERENCES public.document_sleeves(id);
+
+
+--
 -- Name: lease_tenants lease_tenants_add_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26385,6 +26481,30 @@ ALTER TABLE ONLY public.shifts
 
 
 --
+-- Name: sleeve_coverings sleeve_coverings_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sleeve_coverings
+    ADD CONSTRAINT sleeve_coverings_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: sleeve_coverings sleeve_coverings_sleeve_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sleeve_coverings
+    ADD CONSTRAINT sleeve_coverings_sleeve_id_fkey FOREIGN KEY (sleeve_id) REFERENCES public.document_sleeves(id);
+
+
+--
+-- Name: sleeve_coverings sleeve_coverings_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sleeve_coverings
+    ADD CONSTRAINT sleeve_coverings_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
+
+
+--
 -- Name: state_law_provisions slp_act_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27716,5 +27836,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict QhSpNpMpdr0YeNyUZARWLlp96YiqGo3fbrbRhNYmKCkaGJ91CAEyT8Goeh30l5l
+\unrestrict ch3iL5tRFqzM5G74UahA1kBZz8QYBSKy7ZHTmpcCnnjcFQ9PfVas7CIg2bonsOh
 

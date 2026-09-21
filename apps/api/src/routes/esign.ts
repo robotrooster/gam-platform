@@ -2144,6 +2144,38 @@ function assertLibraryDocumentUnchanged(t: { library_document_id?: string | null
     `You can add, move or remove signature and initial boxes on it. To use different wording, upload your own version as a template.`)
 }
 
+// GET /api/esign/sleeves — the Templates page: every state the landlord holds
+// property in, its sleeves for the unit types they run there (filled or empty),
+// the government's forms as sleeves that come filled, and anything that fits no
+// sleeve under `other`. See services/documentSleeves.
+esignRouter.get('/sleeves', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const { sleevesForLandlord } = await import('../services/documentSleeves')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    res.json({ success: true, data: await sleevesForLandlord(exec, landlordScopeIds(req.user!)) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/esign/sleeves/:id/cover { templateId } — "this is already in my
+// lease". DELETE undoes it. See the sleeve_coverings migration.
+esignRouter.post('/sleeves/:id/cover', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const { coverSleeve } = await import('../services/documentSleeves')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    if (!req.body?.templateId) throw new AppError(400, 'Which document covers it?')
+    await coverSleeve(exec, landlordScopeIds(req.user!), req.params.id, String(req.body.templateId))
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+esignRouter.delete('/sleeves/:id/cover', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const { uncoverSleeve } = await import('../services/documentSleeves')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    await uncoverSleeve(exec, landlordScopeIds(req.user!), req.params.id)
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // GET /api/esign/library — the WHOLE government library, for the Templates page.
 // Says what exists, where it is from and who published it. Says nothing about
 // what is required. operatingStates lets the page open the states they are in.
@@ -2226,9 +2258,22 @@ esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_mana
 
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose,
+    let { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose,
             disclosureType, appliesTo, stateCode } = req.body
     if (!name) throw new AppError(400, 'Template name required')
+    // S652: uploaded INTO a sleeve. The sleeve already says what this document
+    // is — "Arizona: RV Spot Lease" is an RV-spot lease for Arizona — so those
+    // facts come from it and the landlord is not asked to repeat them.
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    const { sleeveDefaults, placeTemplate } = await import('../services/documentSleeves')
+    const sleeve = req.body?.sleeveId ? await sleeveDefaults(exec, String(req.body.sleeveId)) : null
+    if (sleeve) {
+      purpose = sleeve.purpose
+      unitType = sleeve.unitType ?? unitType ?? null
+      stateCode = sleeve.stateCode
+      disclosureType = sleeve.disclosureType
+      appliesTo = sleeve.appliesTo
+    }
     // S576 (B-8): 'lease' (default) or 'work_trade_addendum' — the landlord's
     // own work-trade addendum form, auto-attached to a renewal on lease expiry.
     const tmplPurpose = purpose || 'lease'
@@ -2292,6 +2337,9 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [templateLandlordId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose,
        disclosure, applies, stCode])
+    // S652: into the sleeve it was uploaded to, or the one it plainly belongs in.
+    if (sleeve) await query(`UPDATE lease_templates SET sleeve_id=$2 WHERE id=$1`, [t.id, sleeve.sleeveId])
+    else await placeTemplate(exec, t.id)
 
     // S629 (Nic): "when you add a template for a unit type and there is no
     // default, it should automatically become the default."

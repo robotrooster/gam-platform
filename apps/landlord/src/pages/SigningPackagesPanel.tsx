@@ -4,9 +4,10 @@ import { apiGet, apiPost, apiPut, apiDelete } from '../lib/api'
 import { toast, appConfirm } from '../components/dialogs'
 import {
   LEASE_TEMPLATE_PURPOSE_LABEL, RENEWAL_BEHAVIORS, RENEWAL_BEHAVIOR_LABEL,
-  UNIT_TYPES, UNIT_TYPE_LABEL, US_STATE_NAME, jurisdictionLabel,
+  UNIT_TYPES, UNIT_TYPE_LABEL, jurisdictionLabel,
 } from '@gam/shared'
 import { useLibrary, ensureLibraryCopy } from './TemplateLibrarySection'
+import { useSleeves } from './TemplateSleeves'
 import { Plus, Trash2, GripVertical, Package } from 'lucide-react'
 
 /**
@@ -36,6 +37,7 @@ type Pkg = {
   name: string
   description: string | null
   unitType: string | null
+  stateCode?: string | null
   isDefault: boolean
   items: Item[]
 }
@@ -169,12 +171,59 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
 
   const qc = useQueryClient()
   const { data: library } = useLibrary()
-  const [pickState, setPickState] = useState<string>('')
+  const { data: sleeves } = useSleeves()
+  // S652: a package is "my Arizona RV package" — its state is saved with it,
+  // and is what the picker and Fill from my documents read.
+  const [pickState, setPickState] = useState<string>(pkg.stateCode || '')
   const [adding, setAdding] = useState(false)
-  // Open on the state they operate in; they can pick any other.
+  const [sale, setSale] = useState(false)
+  const myStates = sleeves?.states.map(s => s.state) ?? library?.operatingStates ?? []
   useEffect(() => {
-    if (!pickState && library) setPickState(library.operatingStates[0] || 'AZ')
-  }, [library, pickState])
+    if (!pickState && myStates.length) setPickState(myStates[0])
+  }, [myStates.join(','), pickState])
+
+  /**
+   * Nic: "based on the occupied sleeves that allows the package to help auto
+   * pick which things are relevant to their operation." Every filled sleeve for
+   * this state and unit type goes in, in the page's order: the default lease
+   * where there are two, the government's forms (the Sales lead form for a home
+   * sale, the Rentals one otherwise — never both), and nothing covered by
+   * another document, since that document is already in. Existing items stay.
+   */
+  const fillFromSleeves = async () => {
+    if (!sleeves) return
+    const st = sleeves.states.find(x => x.state === pickState)
+    const fits = (u: string[] | null) => !unitType || !u || u.includes(unitType)
+    const wanted: Array<{ templateId?: string; lib?: string }> = []
+    for (const s of [...(st?.sleeves ?? []), ...sleeves.federal] as any[]) {
+      if (!fits(s.unitTypes) || s.coveredBy) continue
+      if (s.kind === 'sale_contract' && !sale) continue
+      if (s.kind === 'government') {
+        if (s.appliesTo === 'sale' && !sale) continue
+        if (s.appliesTo === 'rental' && sale) continue
+        wanted.push(s.cards[0] ? { templateId: s.cards[0].templateId } : { lib: s.libraryDocumentId })
+      } else if (s.cards.length) {
+        const pick = s.kind === 'lease' ? (s.cards.find((c: any) => c.isUnitTypeDefault) ?? s.cards[0]) : s.cards[0]
+        wanted.push({ templateId: pick.templateId })
+      }
+    }
+    setAdding(true)
+    try {
+      const next = [...items]
+      for (const w of wanted) {
+        const templateId = w.templateId ?? await ensureLibraryCopy(w.lib!)
+        if (!next.some(i => i.templateId === templateId)) {
+          next.push({ templateId, sortOrder: next.length, renewalBehavior: 'with_lease' })
+        }
+      }
+      setItems(next)
+      qc.invalidateQueries('esign-templates-all'); qc.invalidateQueries('esign-sleeves')
+      const added = next.length - items.length
+      toast(added ? `Added ${added} document${added === 1 ? '' : 's'}` : 'Everything filled for this state and unit type is already in')
+    } catch (e: any) {
+      toast.error(e?.message || 'Could not fill the package')
+    } finally { setAdding(false) }
+  }
 
   const chosen = new Set(items.map(i => i.templateId))
   const ownAvailable = templates.filter(t => !t.libraryDocumentId && !chosen.has(t.id))
@@ -204,7 +253,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
           <button className="btn btn-primary" disabled={!name.trim() || saving}
             onClick={() => onSave({
               ...pkg, name: name.trim(),
-              unitType: unitType || null, isDefault,
+              unitType: unitType || null, stateCode: pickState || null, isDefault,
               items: items.map((r, i) => ({
                 templateId: r.templateId, sortOrder: i,
                 renewalBehavior: r.renewalBehavior || 'with_lease',
@@ -217,7 +266,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
       </div>
 
       <div className="card" style={{ padding:16, marginBottom:14 }}>
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+        <div style={{ display:'grid', gridTemplateColumns:'1.4fr 1fr 1fr', gap:12 }}>
           <label>
             <div className="form-label">Name</div>
             <input className="input" value={name} onChange={e => setName(e.target.value)}
@@ -232,6 +281,12 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
               ))}
             </select>
           </label>
+          <label>
+            <div className="form-label">State</div>
+            <select className="input" value={pickState} onChange={e => setPickState(e.target.value)}>
+              {myStates.map(code => <option key={code} value={code}>{jurisdictionLabel(code)}</option>)}
+            </select>
+          </label>
         </div>
         <label style={{ display:'flex', alignItems:'center', gap:8, marginTop:12, fontSize:'.82rem', color:'var(--text-2)' }}>
           <input type="checkbox" checked={isDefault} onChange={e => setIsDefault(e.target.checked)} />
@@ -240,7 +295,16 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
       </div>
 
       <div className="card" style={{ padding:16 }}>
-        <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:4 }}>What is in it</div>
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:4 }}>
+          <div style={{ fontWeight:700, color:'var(--text-0)', flex:1 }}>What is in it</div>
+          <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:'.76rem', color:'var(--text-2)' }}>
+            <input type="checkbox" checked={sale} onChange={e => setSale(e.target.checked)} />
+            Includes a home sale
+          </label>
+          <button className="btn btn-primary btn-sm" disabled={adding || !pickState} onClick={fillFromSleeves}>
+            {adding ? 'Filling…' : 'Fill from my documents'}
+          </button>
+        </div>
         <div style={{ fontSize:'.76rem', color:'var(--text-3)', marginBottom:12 }}>
           In signing order. The lease usually goes first, then whatever explains or qualifies it.
         </div>
@@ -304,9 +368,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
         <div style={{ marginTop:14, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
           <select className="input" value={pickState} style={{ width:'auto', minWidth:150 }}
             onChange={e => setPickState(e.target.value)} title="Show that state's government forms">
-            {Object.entries(US_STATE_NAME).sort((a, b) => a[1].localeCompare(b[1])).map(([code, name]) => (
-              <option key={code} value={code}>{name}</option>
-            ))}
+            {myStates.map(code => <option key={code} value={code}>{jurisdictionLabel(code)}</option>)}
           </select>
           <select className="input" value="" disabled={adding} style={{ maxWidth:420 }}
             onChange={async e => {

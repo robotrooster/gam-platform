@@ -85,13 +85,14 @@ export async function libraryForLandlord(q: Exec, landlordIds: string[]) {
 }
 
 /**
- * S652 — THE WHOLE LIBRARY, for the Templates page.
+ * S652 — THE LIBRARY A LANDLORD SEES: Federal, plus the states they hold
+ * property in, for the kinds of space they run there.
  *
- * Nic: "the whole library should be in the templates... all the government
- * forms are there by default, titled what they are." Not narrowed: a landlord
- * opening a park in a new state needs that state's forms before they own a unit
- * there. What IS returned alongside is where they operate today, so the page can
- * open those states and leave the rest folded.
+ * Nic, revising the first version (which showed all fifty states): "The library
+ * should only show relevant stuff to properties they've uploaded. They'll all be
+ * there on the back end. As soon as somebody uploads a property in Texas, boom,
+ * the Texas documents show up." The rest of the catalog is untouched; adding a
+ * property is what reveals it.
  *
  * libraryForLandlord (above) stays narrowed on purpose — it is what the agent
  * resolves a spoken name against, and "the lead form" should mean the one for
@@ -107,6 +108,11 @@ export async function libraryCatalog(q: Exec, landlordIds: string[]) {
              AND t.landlord_id = ANY($1::uuid[])
              AND t.is_active
       WHERE d.retired_at IS NULL AND d.superseded_by_id IS NULL
+        AND (d.jurisdiction = 'US' OR d.jurisdiction IN (
+              SELECT p.state FROM properties p WHERE p.landlord_id = ANY($1::uuid[]) AND p.state IS NOT NULL))
+        AND (d.unit_types IS NULL OR d.unit_types && ARRAY(
+              SELECT DISTINCT u.unit_type FROM units u
+               WHERE u.landlord_id = ANY($1::uuid[]) AND u.retired_at IS NULL AND u.unit_type IS NOT NULL))
       ORDER BY (d.jurisdiction = 'US') DESC, d.jurisdiction, lower(d.name)`,
     [landlordIds]).then(r => r.rows)
   const states = await q.query(

@@ -37,6 +37,9 @@ const packageSchema = z.object({
   name: z.string().min(1).max(120),
   description: z.string().max(1000).nullable().optional(),
   unitType: z.enum(UNIT_TYPES as unknown as [string, ...string[]]).nullable().optional(),
+  // S652: "my Arizona RV package" — the state is half of what lets a package
+  // fill itself from the landlord's filled document sleeves.
+  stateCode: z.string().regex(/^[A-Z]{2}$/).nullable().optional(),
   isDefault: z.boolean().optional(),
   items: z.array(itemSchema).max(40).optional(),
   landlordId: z.string().uuid().optional(),
@@ -73,9 +76,9 @@ signingPackagesRouter.post('/', requirePerm('esign.template_manage'), async (req
     const landlordId = await resolveLandlordTarget(req.user!, body.landlordId, 'signing package')
 
     const pkg = await queryOne<{ id: string }>(
-      `INSERT INTO document_packages (landlord_id, name, description, unit_type, is_default)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-      [landlordId, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false])
+      `INSERT INTO document_packages (landlord_id, name, description, unit_type, is_default, state_code)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [landlordId, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false, body.stateCode ?? null])
 
     await replaceItems(pkg!.id, landlordId, body.items ?? [])
     res.status(201).json({ success: true, data: { id: pkg!.id } })
@@ -93,9 +96,9 @@ signingPackagesRouter.put('/:id', requirePerm('esign.template_manage'), async (r
 
     await query(
       `UPDATE document_packages
-          SET name=$2, description=$3, unit_type=$4, is_default=$5, updated_at=now()
+          SET name=$2, description=$3, unit_type=$4, is_default=$5, state_code=$6, updated_at=now()
         WHERE id=$1`,
-      [existing.id, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false])
+      [existing.id, body.name, body.description ?? null, body.unitType ?? null, body.isDefault ?? false, body.stateCode ?? null])
 
     if (body.items) await replaceItems(existing.id, existing.landlord_id, body.items)
     res.json({ success: true, data: { id: existing.id } })

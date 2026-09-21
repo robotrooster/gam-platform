@@ -90,12 +90,17 @@ const receipt = (lastPage: number, first: { x: number; y: number }, last: { x: n
     page: lastPage, x: last.x + 70, y: last.y, w: 90, h: 18, required: true },
 ]
 
+// The federal lead rule covers HOUSING built before 1978 — a place someone lives,
+// not an RV site, a storage unit or a shop. Scoped here so an RV park's shelf and
+// its packages never carry lead paperwork that does not apply to it.
+const DWELLINGS = ['apartment', 'single_family', 'mobile_home', 'hotel_room']
+
 const DOCS: Doc[] = [
   {
     file: 'library-us-epa-lessor-lead-disclosure.pdf',
     name: 'Federal: Lead-Based Paint Disclosure — Rentals (EPA Form 9600-041)',
     description: "EPA's disclosure form for leasing housing built before 1978: the lead warning statement, the landlord's disclosure of known lead-based paint and records, and the tenant's acknowledgement of receiving them and the lead pamphlet.",
-    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: null,
+    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/lesr_eng.pdf',
     publicationRef: 'EPA Form 9600-041; 40 CFR 745.113(b)',
@@ -124,7 +129,7 @@ const DOCS: Doc[] = [
     file: 'library-us-epa-seller-lead-disclosure.pdf',
     name: 'Federal: Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)',
     description: "EPA's disclosure form for selling housing built before 1978: the lead warning statement, the seller's disclosure of known lead-based paint and records, and the purchaser's acknowledgement of receiving them, the lead pamphlet, and the 10-day inspection opportunity.",
-    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'sale', unitTypes: null,
+    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'sale', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/selr_eng.pdf',
     publicationRef: 'EPA Form 9600-040; 40 CFR 745.113(a)',
@@ -150,7 +155,7 @@ const DOCS: Doc[] = [
     file: 'library-us-epa-protect-your-family-2026.pdf',
     name: 'Federal: Protect Your Family From Lead in Your Home (January 2026)',
     description: 'The lead poisoning prevention pamphlet from EPA, the Consumer Product Safety Commission and HUD. The January 2026 edition reflects the dust-lead action levels effective January 12, 2026.',
-    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'any', unitTypes: null,
+    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'any', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency, Consumer Product Safety Commission, and Department of Housing and Urban Development',
     sourceUrl: 'https://www.epa.gov/system/files/documents/2026-02/protectyourfamily_pamphlet_2026_3.pdf',
     publicationRef: 'Protect Your Family From Lead in Your Home, January 2026 (English)',
@@ -212,9 +217,9 @@ async function stock() {
       // reaches the shelf AND every landlord's copy — their copy's name is not
       // theirs to change, so it is ours to keep right.
       const renamed = await query<{ id: string }>(
-        `UPDATE disclosure_library_documents SET name=$2, description=$3, updated_at=now()
-          WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,
-        [held[0].id, d.name, d.description])
+        `UPDATE disclosure_library_documents SET name=$2, description=$3, unit_types=$4, updated_at=now()
+          WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 OR unit_types IS DISTINCT FROM $4) RETURNING id`,
+        [held[0].id, d.name, d.description, d.unitTypes])
       const copies = await query<{ id: string }>(
         `UPDATE lease_templates SET name=$2, description=$3, updated_at=now()
           WHERE library_document_id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,

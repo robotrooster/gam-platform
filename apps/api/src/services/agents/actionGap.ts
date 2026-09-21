@@ -191,6 +191,11 @@ const DELIBERATE = new Map(Object.entries({
   'books DELETE /transactions/:id': 'GAM never erases — correct it with update_book_transaction',
   'properties POST /:id/transfer': 'moves ownership of a property to another account by email; owner-only, and too easy to aim at a mistyped address',
   'esign PUT /templates/:id/fields': 'field geometry on a PDF — placed visually, not described',
+  // S652: marking a document slot as "already in my lease" is bookkeeping for
+  // what the Templates page shows — done on the page, where the slots and the
+  // landlord's documents are side by side. Nothing is sent, signed or billed.
+  'esign POST /sleeves/:id/cover': 'marks a document slot on the Templates page as covered by one of their other documents — page bookkeeping, done where the slots are visible',
+  'esign DELETE /sleeves/:id/cover': 'undoes marking a document slot as covered — page bookkeeping, done where the slots are visible',
   'esign DELETE /templates/:id/fields/:fieldId': 'field geometry on a PDF — removed visually, not described',
   'esign POST /documents': 'takes a hand-assembled signer list; draft_household_lease is the safe path',
   'esign POST /standalone-documents': 'takes the same hand-assembled signer list as POST /documents',
