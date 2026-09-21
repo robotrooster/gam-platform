@@ -2885,6 +2885,11 @@ export const DISCLOSURE_TYPES = [
   // the government explaining the law to the tenant in plain words. Many states
   // publish one, so this slot fills up as the library does.
   'tenant_rights_guide',
+  // S652 — the landlord-tenant act ITSELF, as a state agency prints it (Arizona's
+  // Department of Housing booklets; IDPH's printing of 765 ILCS 745). Distinct
+  // from a guide ABOUT the law: this is what the tenant portal offers every
+  // tenant as "the law for your home".
+  'landlord_tenant_act',
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
@@ -2949,6 +2954,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   move_in_condition:        'Move-in condition checklist',
   statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
   tenant_rights_guide:      'Tenant rights guide from a government agency',
+  landlord_tenant_act:      'Landlord-tenant act (the law itself)',
   other:                    'Other disclosure',
 }
 

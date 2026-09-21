@@ -122,6 +122,13 @@ const receiptAt = (lastPage: number, first: { x: number; y: number; cols?: numbe
 // its packages never carry lead paperwork that does not apply to it.
 const DWELLINGS = ['apartment', 'single_family', 'mobile_home', 'hotel_room']
 
+// Receipt on the cover alone — one set of initials per document is the
+// requirement (Nic), and a booklet's cover is where there is room.
+const coverReceipt = (x: number, y: number): Field[] => [
+  ...initialsRow(1, x, y, 'Received this'),
+  { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed', page: 1, x: x + rowWidth() + 8, y, w: 80, h: INIT_H, required: true },
+]
+
 // A form's own "Printed Name / Signature / Date" row, one per tenant.
 const signRow = (page: number, top: number, role: string, nameColumn: string): Field[] => [
   { type: 'text', role, label: 'Printed name', column: nameColumn, page, x: 120, y: top - 1, w: 150, h: 15, required: false },
@@ -211,7 +218,7 @@ const DOCS: Doc[] = [
     file: 'library-il-idph-mh-landlord-tenant-act.pdf',
     name: 'Illinois: Mobile Home Landlord and Tenant Rights Act (765 ILCS 745)',
     description: 'The text of the Illinois Mobile Home Landlord and Tenant Rights Act, as printed by the Illinois Department of Public Health.',
-    disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
+    disclosureType: 'landlord_tenant_act', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Illinois Department of Public Health',
     sourceUrl: 'https://dph.illinois.gov/content/dam/soi/en/web/idph/files/publications/mobile-home-landlord-and-tenant-rights-act-printable-5-31-18.pdf',
     publicationRef: '765 ILCS 745, IDPH printing of May 31, 2018',
@@ -235,6 +242,43 @@ const DOCS: Doc[] = [
     sourceUrl: 'https://acis.cals.arizona.edu/docs/default-source/community-ipm-documents/public-health-ipm/bed-bugs/az1563.pdf',
     publicationRef: 'AZ1563, May 2012', effectiveFrom: '2012-05-01',
     fields: receiptAt(6, { x: 420, y: 4 }, { x: 300, y: 4 }, { x: 476, y: 4 }),
+  },
+  // The Department of Housing's own booklets. Its site shows a bot-verification
+  // challenge to anything automated, so these are the department's unaltered
+  // files as captured by the Internet Archive (web.archive.org), byte for byte.
+  // ARS 33-1322 has landlords tell residential tenants the act is free from the
+  // department; this puts it in their hands.
+  {
+    file: 'library-az-adoh-residential-lta-2023.pdf',
+    name: 'Arizona: Residential Landlord and Tenant Act (Department of Housing, May 2023)',
+    description: 'The Arizona Residential Landlord and Tenant Act as printed by the Arizona Department of Housing, updated May 2023.',
+    disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'rental',
+    unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'land_lot'],
+    sourceName: 'Arizona Department of Housing',
+    sourceUrl: 'https://housing.az.gov/sites/default/files/2024-07/Landlord_Tenant_Act_May-2023_1.pdf',
+    publicationRef: 'Updated May 2023 (via web.archive.org, 2024-12-12)', effectiveFrom: '2023-05-01',
+    fields: coverReceipt(180, 515),
+  },
+  {
+    file: 'library-az-adoh-residential-lta-2023-es.pdf',
+    name: 'Arizona: Ley para Propietarios e Inquilinos Residenciales (Spanish, May 2023)',
+    description: "The Arizona Department of Housing's Spanish edition of the Residential Landlord and Tenant Act, updated May 2023.",
+    disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'rental',
+    unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'land_lot'],
+    sourceName: 'Arizona Department of Housing',
+    sourceUrl: 'https://housing.az.gov/sites/default/files/2024-07/SPANISH-Landlord-Tenant-Act_May-2023.pdf',
+    publicationRef: 'Actualizado en mayo de 2023 (via web.archive.org, 2024-12-12)', effectiveFrom: '2023-05-01',
+    fields: coverReceipt(180, 530),
+  },
+  {
+    file: 'library-az-adoh-mh-parks-lta-2024.pdf',
+    name: 'Arizona: Mobile Home Parks Residential Landlord and Tenant Act (Department of Housing, 2024)',
+    description: 'The Arizona Mobile Home Parks Residential Landlord and Tenant Act as printed by the Arizona Department of Housing, revised with laws in effect as of September 14, 2024.',
+    disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['mobile_home'],
+    sourceName: 'Arizona Department of Housing',
+    sourceUrl: 'https://housing.az.gov/sites/default/files/2024-10/AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act-Oct_2024.pdf',
+    publicationRef: 'Revised with laws in effect as of September 14, 2024 (via web.archive.org, 2025-02-19)', effectiveFrom: '2024-09-14',
+    fields: coverReceipt(180, 670),
   },
   // ── Illinois ──────────────────────────────────────────────────────────
   {
@@ -368,9 +412,10 @@ async function stock() {
       // reaches the shelf AND every landlord's copy — their copy's name is not
       // theirs to change, so it is ours to keep right.
       const renamed = await query<{ id: string }>(
-        `UPDATE disclosure_library_documents SET name=$2, description=$3, unit_types=$4, updated_at=now()
-          WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 OR unit_types IS DISTINCT FROM $4) RETURNING id`,
-        [held[0].id, d.name, d.description, d.unitTypes])
+        `UPDATE disclosure_library_documents SET name=$2, description=$3, unit_types=$4, disclosure_type=$5, updated_at=now()
+          WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 OR unit_types IS DISTINCT FROM $4
+                           OR disclosure_type IS DISTINCT FROM $5) RETURNING id`,
+        [held[0].id, d.name, d.description, d.unitTypes, d.disclosureType])
       const copies = await query<{ id: string }>(
         `UPDATE lease_templates SET name=$2, description=$3, updated_at=now()
           WHERE library_document_id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,
