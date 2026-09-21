@@ -196,6 +196,38 @@ Everything here is meant to land BEFORE real tenants are on the platform. Nic:
 
 ---
 
+## 2e. Government forms library — stock the whole shelf (S652, 2026-09-21)
+
+Nic: *"need to download all the government pamphlets and issued forms for this
+library build. Not just... five. That's not the only ones the government puts
+out."* The shelf, the locking, the refresh and the landlord screen are built;
+the first five are on it (EPA lessor + seller lead disclosures, the January 2026
+lead pamphlet, IDPH's manufactured-home guide, and the Illinois Act). What is
+left is the inventory.
+
+- **Scope: government-published only, unaltered.** Nic: *"the library should
+  only be government published documents that something we're not altering at
+  all."* Nothing GAM or a landlord authored. Attorney-verified state forms are a
+  later, separate source once there are attorneys on retainer.
+- **Federal first, then every state.** Federal: HUD and EPA handouts beyond
+  lead (e.g. HUD's fair housing and "Know Your Rights" material, the Spanish and
+  other-language editions of the lead pamphlet — EPA publishes eight). States:
+  each state's own tenant/landlord handbook, manufactured-home guides, and any
+  agency-issued disclosure forms (bed bug, mold, radon, flood, sex-offender
+  registry notices where the STATE prints the form). Walk each state's housing,
+  health, and attorney-general sites.
+- **Every one gets:** a title-case name that says what it is (never the download
+  filename), the publishing agency, the source URL, the edition date, the right
+  disclosure category (add a category if none fits — `tenant_rights_guide` was
+  added this way), unit-type narrowing where the agency wrote it for one kind of
+  space, and default initial/signature boxes placed on its own blanks or, for a
+  pamphlet with none, initials on the first and last page.
+- **Annual refresh:** re-check every source URL each November with the deposit-
+  interest and state-tax-form refresh. A changed edition is a NEW library row;
+  `resyncAdoptions` moves every landlord holding the old one onto it.
+  NOTE: a refresh resets the landlord's boxes to the new edition's defaults,
+  because positions placed on the old layout can land on text in the new one.
+
 ## 2c. Open items raised S624 (2026-08-26)
 
 ### Documents tab has no way to UPLOAD a document — only "send" one

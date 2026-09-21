@@ -11,7 +11,9 @@
  * boxes are out of the landlord's reach, AND the form still signs like anything
  * else. Plus the one GAM must never do — say what anybody is required to send.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import fs from 'fs'
+import path from 'path'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
@@ -104,26 +106,26 @@ describe('GET /api/esign/library — what is on the shelf', () => {
     await shelve({ jurisdiction: 'US', name: 'Federal Thing' })
     for (const who of [il, az]) {
       const r = await get(who).expect(200)
-      expect(r.body.documents.map((d: any) => d.name)).toContain('Federal Thing')
+      expect(r.body.data.documents.map((d: any) => d.name)).toContain('Federal Thing')
     }
   })
 
   it('shows a state form only where the landlord actually operates', async () => {
     await shelve({ jurisdiction: 'IL', name: 'Illinois Thing' })
-    expect((await get(il).expect(200)).body.documents.map((d: any) => d.name)).toContain('Illinois Thing')
-    expect((await get(az).expect(200)).body.documents.map((d: any) => d.name)).not.toContain('Illinois Thing')
+    expect((await get(il).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Illinois Thing')
+    expect((await get(az).expect(200)).body.data.documents.map((d: any) => d.name)).not.toContain('Illinois Thing')
   })
 
   it('a form written for one kind of space stays off the others', async () => {
     // The IL landlord runs mobile homes, the AZ landlord RV spots.
     await shelve({ jurisdiction: 'US', name: 'Mobile Homes Only', unitTypes: ['mobile_home'] })
-    expect((await get(il).expect(200)).body.documents.map((d: any) => d.name)).toContain('Mobile Homes Only')
-    expect((await get(az).expect(200)).body.documents.map((d: any) => d.name)).not.toContain('Mobile Homes Only')
+    expect((await get(il).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Mobile Homes Only')
+    expect((await get(az).expect(200)).body.data.documents.map((d: any) => d.name)).not.toContain('Mobile Homes Only')
   })
 
   it('names the publisher, because that is the whole claim the shelf makes', async () => {
     await shelve({ jurisdiction: 'US' })
-    const d = (await get(il).expect(200)).body.documents[0]
+    const d = (await get(il).expect(200)).body.data.documents[0]
     expect(d.publishedBy).toBe('Example Agency')
     expect(d.sourceUrl).toBe('https://example.gov/form')
   })
@@ -142,7 +144,7 @@ describe('GET /api/esign/library — what is on the shelf', () => {
     const old = await shelve({ jurisdiction: 'US', name: 'Last Year' })
     const fresh = await shelve({ jurisdiction: 'US', name: 'This Year', version: 2 })
     await query(`UPDATE disclosure_library_documents SET superseded_by_id=$2 WHERE id=$1`, [old, fresh])
-    const names = (await get(il).expect(200)).body.documents.map((d: any) => d.name)
+    const names = (await get(il).expect(200)).body.data.documents.map((d: any) => d.name)
     expect(names).toContain('This Year')
     expect(names).not.toContain('Last Year')
   })
@@ -156,10 +158,10 @@ describe('POST /api/esign/library/:id/adopt', () => {
   it('puts it on the shelf as a template, with the fields the library wrote', async () => {
     const docId = await shelve({ jurisdiction: 'US', name: 'Federal Thing' })
     const r = await adopt(il, docId).expect(200)
-    const tpl = await query<any>(`SELECT * FROM lease_templates WHERE id=$1`, [r.body.templateId])
+    const tpl = await query<any>(`SELECT * FROM lease_templates WHERE id=$1`, [r.body.data.templateId])
     expect(tpl[0].library_document_id).toBe(docId)
     expect(tpl[0].base_pdf_url).toBe('/api/esign/files/v1.pdf')
-    const fields = await query<any>(`SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY sort_order`, [r.body.templateId])
+    const fields = await query<any>(`SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY sort_order`, [r.body.data.templateId])
     // The signing layer is the point: an unaltered page nobody can initial is
     // not a document anybody can send.
     expect(fields.map(f => f.field_type)).toEqual(['initials', 'signature'])
@@ -172,51 +174,74 @@ describe('POST /api/esign/library/:id/adopt', () => {
     const a = await adopt(il, fed).expect(200)
     const b = await adopt(il, state).expect(200)
     const rows = await query<any>(`SELECT id, state_code FROM lease_templates WHERE id = ANY($1::uuid[])`,
-      [[a.body.templateId, b.body.templateId]])
-    expect(rows.find(r => r.id === a.body.templateId)!.state_code).toBeNull()
-    expect(rows.find(r => r.id === b.body.templateId)!.state_code).toBe('IL')
+      [[a.body.data.templateId, b.body.data.templateId]])
+    expect(rows.find(r => r.id === a.body.data.templateId)!.state_code).toBeNull()
+    expect(rows.find(r => r.id === b.body.data.templateId)!.state_code).toBe('IL')
   })
 
   it('adopting twice is the same shelf, not a second copy', async () => {
     const docId = await shelve({ jurisdiction: 'US' })
     const first = await adopt(il, docId).expect(200)
     const second = await adopt(il, docId).expect(200)
-    expect(second.body.templateId).toBe(first.body.templateId)
-    expect(second.body.alreadyHeld).toBe(true)
+    expect(second.body.data.templateId).toBe(first.body.data.templateId)
+    expect(second.body.data.alreadyHeld).toBe(true)
     const n = await query<any>(`SELECT count(*)::int AS c FROM lease_templates WHERE library_document_id=$1`, [docId])
     expect(n[0].c).toBe(1)
   })
 })
 
-describe('an adopted form is the government\'s, not the landlord\'s', () => {
+describe('an adopted form: the words are fixed, the boxes are the landlord\'s', () => {
+  // Nic: "they can't edit the text of the document because it's a government
+  // published form. They can add the necessary initial boxes... just including
+  // it with the signature in the packet with no actual initial on the page itself
+  // is going to be argued that it was never received."
   let templateId: string
   let docId: string
   beforeEach(async () => {
     docId = await shelve({ jurisdiction: 'US', name: 'Federal Thing' })
     const r = await request(buildApp()).post('/api/esign/library/adopt')
       .set('Authorization', `Bearer ${token(il)}`).send({ documentId: docId }).expect(200)
-    templateId = r.body.templateId
+    templateId = r.body.data.templateId
   })
 
-  it('refuses a rename or any other content edit', async () => {
-    const r = await request(buildApp()).patch(`/api/esign/templates/${templateId}`)
-      .set('Authorization', `Bearer ${token(il)}`)
-      .send({ name: 'My Own Version' }).expect(409)
-    // The message has to send them somewhere, not just say no.
-    expect(String(r.body.error || r.body.message)).toMatch(/upload your own/i)
-    const after = await query<any>(`SELECT name FROM lease_templates WHERE id=$1`, [templateId])
+  it('refuses a new name, description or PDF — those say WHICH document it is', async () => {
+    for (const body of [{ name: 'My Own Version' }, { description: 'mine' },
+                        { basePdfUrl: '/api/esign/files/other.pdf' }, { pageCount: 9 }]) {
+      const r = await request(buildApp()).patch(`/api/esign/templates/${templateId}`)
+        .set('Authorization', `Bearer ${token(il)}`).send(body).expect(409)
+      // The refusal has to send them somewhere, not just say no.
+      expect(String(r.body.error || r.body.message)).toMatch(/upload your own/i)
+    }
+    const after = await query<any>(`SELECT name, base_pdf_url FROM lease_templates WHERE id=$1`, [templateId])
     expect(after[0].name).toBe('Federal Thing')
+    expect(after[0].base_pdf_url).toBe('/api/esign/files/v1.pdf')
   })
 
-  it('refuses moving, adding or deleting the boxes', async () => {
+  it('still takes the landlord\'s own settings — which kind of space it is for', async () => {
+    await request(buildApp()).patch(`/api/esign/templates/${templateId}`)
+      .set('Authorization', `Bearer ${token(il)}`).send({ unitType: 'mobile_home' }).expect(200)
+    const t = await query<any>(`SELECT unit_type FROM lease_templates WHERE id=$1`, [templateId])
+    expect(t[0].unit_type).toBe('mobile_home')
+  })
+
+  it('lets the landlord place boxes — an initial on the page is the proof of delivery', async () => {
     await request(buildApp()).put(`/api/esign/templates/${templateId}/fields`)
       .set('Authorization', `Bearer ${token(il)}`)
-      .send({ fields: [{ fieldType: 'text', page: 1, x: 1, y: 1, width: 10, height: 10 }] })
-      .expect(409)
+      .send({ fields: [
+        { fieldType: 'initials', signerRole: 'primary', label: 'Page 3 received', page: 1, x: 40, y: 40, width: 40, height: 16 },
+        { fieldType: 'checkbox', signerRole: 'primary', label: 'I received this pamphlet', page: 1, x: 40, y: 80, width: 14, height: 14 },
+      ] })
+      .expect(200)
+    const f = await query<any>(`SELECT field_type, label FROM lease_template_fields WHERE template_id=$1 ORDER BY y`, [templateId])
+    expect(f.map(x => x.field_type)).toEqual(['initials', 'checkbox'])
+  })
+
+  it('lets the landlord remove one of GAM\'s default boxes', async () => {
     const f = await query<any>(`SELECT id FROM lease_template_fields WHERE template_id=$1`, [templateId])
-    expect(f.length).toBe(2)
     await request(buildApp()).delete(`/api/esign/templates/${templateId}/fields/${f[0].id}`)
-      .set('Authorization', `Bearer ${token(il)}`).expect(409)
+      .set('Authorization', `Bearer ${token(il)}`).expect(200)
+    const after = await query<any>(`SELECT count(*)::int AS c FROM lease_template_fields WHERE template_id=$1`, [templateId])
+    expect(after[0].c).toBe(1)
   })
 
   it('still lets them read it and take it off their shelf', async () => {
@@ -230,7 +255,29 @@ describe('an adopted form is the government\'s, not the landlord\'s', () => {
 
   it('a stranger cannot reach it at all', async () => {
     await request(buildApp()).patch(`/api/esign/templates/${templateId}`)
-      .set('Authorization', `Bearer ${token(az)}`).send({ name: 'x' }).expect(404)
+      .set('Authorization', `Bearer ${token(az)}`).send({ unitType: 'rv_spot' }).expect(404)
+  })
+})
+
+describe('looking at a form before taking it', () => {
+  const file = `library-test-${Date.now()}.pdf`
+  const dest = path.join(process.cwd(), 'uploads', 'leases', file)
+  beforeEach(() => {
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.writeFileSync(dest, '%PDF-1.4\n%test\n')
+  })
+  afterEach(() => { try { fs.unlinkSync(dest) } catch { /* already gone */ } })
+
+  it('any landlord can open a shelf PDF they have not adopted', async () => {
+    await shelve({ jurisdiction: 'US', pdf: `/api/esign/files/${file}` })
+    await request(buildApp()).get(`/api/esign/files/${file}`)
+      .set('Authorization', `Bearer ${token(az)}`).expect(200)
+  })
+
+  it('but never without logging in', async () => {
+    await shelve({ jurisdiction: 'US', pdf: `/api/esign/files/${file}` })
+    const r = await request(buildApp()).get(`/api/esign/files/${file}`)
+    expect([401, 403]).toContain(r.status)
   })
 })
 
@@ -267,7 +314,7 @@ describe('the annual refresh', () => {
     const doc = await query<{ id: string }>(
       `INSERT INTO lease_documents (landlord_id, template_id, title, base_pdf_url, document_type, status)
        VALUES ($1,$2,'Sent copy','/api/esign/files/v1.pdf','general_contract','sent') RETURNING id`,
-      [il.landlordId, a.body.templateId])
+      [il.landlordId, a.body.data.templateId])
 
     const v2 = await shelve({ jurisdiction: 'US', name: 'Form v2', version: 2, pdf: '/api/esign/files/v2.pdf' })
     await query(`UPDATE disclosure_library_documents SET superseded_by_id=$2 WHERE id=$1`, [v1, v2])
@@ -289,7 +336,7 @@ describe('naming the form out loud', () => {
   it('finds it on a partial name', async () => {
     await shelve({ jurisdiction: 'US', name: 'Lead-Based Paint Disclosure — Rental' })
     const r = await adoptByName(il, 'lead-based paint').expect(200)
-    const t = await query<any>(`SELECT name FROM lease_templates WHERE id=$1`, [r.body.templateId])
+    const t = await query<any>(`SELECT name FROM lease_templates WHERE id=$1`, [r.body.data.templateId])
     expect(t[0].name).toBe('Lead-Based Paint Disclosure — Rental')
   })
 

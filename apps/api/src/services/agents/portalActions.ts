@@ -2753,9 +2753,10 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       'Named, not looked up — say the form the way they said it and the system finds it, or names ' +
       'what IS on the shelf if there is no match. The shelf already only shows forms published for ' +
       'the states they operate in and the kinds of space they run.\n' +
-      'GAM keeps these EXACTLY as the agency issued them, so nothing about one can be reworded or ' +
-      'rearranged afterwards. A landlord who needs different wording uploads their own form instead ' +
-      '— say that rather than promising an edit.\n' +
+      'GAM keeps the WORDING exactly as the agency issued it — that cannot change. The initial and ' +
+      'signature boxes on it are the landlord\u2019s to add, move or remove in the template editor, and ' +
+      'it arrives with sensible ones already placed. A landlord who needs different wording uploads ' +
+      'their own form instead — say that rather than promising an edit.\n' +
       'Never say a landlord is required to send any of these. Whether a form applies to them is ' +
       'their call with their own attorney; this only puts it within reach.',
     params: {

@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
 import SigningPackagesPanel from './SigningPackagesPanel'
+import GovernmentFormsPanel from './GovernmentFormsPanel'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -1605,7 +1606,7 @@ export function ESignPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { can } = usePerms()
-  const [tab, setTab]           = useState<'documents'|'templates'|'packages'>('documents')
+  const [tab, setTab]           = useState<'documents'|'templates'|'packages'|'government'>('documents')
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
   const [showStandalone, setShowStandalone] = useState(false)
@@ -1813,6 +1814,9 @@ export function ESignPage() {
     { id:'templates', label:'Templates', perm:'esign.tab.templates' },
     // S641: a package is a list of templates, so it is gated with them.
     { id:'packages',  label:'Packages',  perm:'esign.tab.templates' },
+    // S652: government-published forms become templates, so they are gated
+    // with templates too.
+    { id:'government', label:'Government Forms', perm:'esign.tab.templates' },
   ].filter(t => can(t.perm))
   const visibleTabIds = TABS.map(t => t.id).join(',')
   useEffect(() => {
@@ -1843,6 +1847,12 @@ export function ESignPage() {
       </div>
 
       {tab === 'packages' && <SigningPackagesPanel />}
+      {tab === 'government' && (
+        <GovernmentFormsPanel onEditBoxes={async (templateId) => {
+          const full = await apiGet<any>(`/esign/templates/${templateId}`)
+          setEditTemplate(full)
+        }} />
+      )}
 
       {/* Documents */}
       {tab === 'documents' && (documents as any[]).length > 0 && (

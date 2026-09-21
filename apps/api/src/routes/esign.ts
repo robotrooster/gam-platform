@@ -2110,25 +2110,36 @@ esignRouter.get('/disclosures', requireAuth, requirePerm('leases.create'), async
 })
 
 /**
- * S652 — A GOVERNMENT FORM STAYS THE GOVERNMENT'S.
+ * S652 — A GOVERNMENT FORM'S WORDS STAY THE GOVERNMENT'S. ITS BOXES ARE THE LANDLORD'S.
  *
  * Nic: "the library should only be government published documents that
  * something we're not altering at all." A template carrying library_document_id
- * is GAM's copy of somebody else's document sitting on this landlord's shelf.
- * Its words, its layout and its boxes are all fixed — a form cannot be both
- * "unaltered" and one every landlord re-types.
+ * is GAM's copy of somebody else's document on this landlord's shelf, and what
+ * is fixed is the DOCUMENT — the PDF, and the name and description that say
+ * which document it is.
  *
- * Note what is NOT blocked: taking it off the shelf, and picking it in a packet.
- * Those are the landlord's choices about their own operation. Only the contents
- * are out of reach, and the message says where to go instead, because a landlord
- * who wants different wording is not doing anything wrong — they just need their
- * own form, which they can upload exactly like their own lease.
+ * The boxes are NOT fixed, and the first version of this got that wrong by
+ * locking them too. Nic: "When I say they can't edit it on the documents, I mean
+ * they can't edit the text of the document because it's a government published
+ * form. They can add the necessary initial boxes or potentially an
+ * acknowledgement checkbox... just including it with the signature in the packet
+ * with no actual initial on the page itself is going to be argued that it was
+ * never received from somebody down the line." Placing an initial on the page is
+ * how a landlord proves delivery, so taking that away defeated the point. GAM
+ * ships default boxes; the landlord adds, moves or removes them freely.
+ *
+ * The message says where to go for the one thing that IS refused, because a
+ * landlord wanting different wording is not doing anything wrong — they just
+ * need their own form, uploaded like their own lease.
  */
-function assertTemplateIsEditable(t: { library_document_id?: string | null; name?: string }) {
+const LIBRARY_FIXED_FIELDS = ['name', 'description', 'basePdfUrl', 'pageCount'] as const
+function assertLibraryDocumentUnchanged(t: { library_document_id?: string | null; name?: string }, body: any) {
   if (!t?.library_document_id) return
+  const touched = LIBRARY_FIXED_FIELDS.filter(k => body?.[k] !== undefined)
+  if (!touched.length) return
   throw new AppError(409,
-    `"${t.name || 'This form'}" is published by a government agency and GAM keeps it exactly as issued. ` +
-    `To use different wording or different boxes, upload your own version as a template.`)
+    `"${t.name || 'This form'}" is published by a government agency and GAM keeps its text exactly as issued. ` +
+    `You can add, move or remove signature and initial boxes on it. To use different wording, upload your own version as a template.`)
 }
 
 // GET /api/esign/library — the shelf, narrowed to where this landlord operates.
@@ -2138,7 +2149,9 @@ esignRouter.get('/library', requireAuth, requirePerm('esign.template_manage'), a
     const { libraryForLandlord } = await import('../services/disclosureLibrary')
     const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
     const rows = await libraryForLandlord(exec, landlordScopeIds(req.user!))
-    res.json({
+    // The standard envelope. The portal's apiGet unwraps `.data`, so a bare
+    // { documents } read as undefined and rendered an empty shelf.
+    res.json({ success: true, data: {
       documents: rows.map((d: any) => ({
         id: d.id,
         name: d.name,
@@ -2151,10 +2164,13 @@ esignRouter.get('/library', requireAuth, requirePerm('esign.template_manage'), a
         publishedBy: d.source_name,
         sourceUrl: d.source_url,
         publicationRef: d.publication_ref,
+        pdfUrl: d.base_pdf_url,
+        pageCount: d.page_count,
+        effectiveFrom: d.effective_from,
         version: d.version,
         adoptedTemplateId: d.adopted_template_id,
       })),
-    })
+    } })
   } catch (e) { next(e) }
 })
 
@@ -2197,7 +2213,7 @@ esignRouter.post('/library/adopt', requireAuth, requirePerm('esign.template_mana
       await client.query('BEGIN')
       const out = await adoptLibraryDocument(client as any, landlordId, documentId!)
       await client.query('COMMIT')
-      res.json({ success: true, ...out })
+      res.json({ success: true, data: out })
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e }
     finally { client.release() }
   } catch (e) { next(e) }
@@ -2318,7 +2334,7 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_man
     const { name, description, basePdfUrl, pageCount, isActive, unitType, depositMonths, defaultTermMonths } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!t) throw new AppError(404, 'Template not found')
-    assertTemplateIsEditable(t)
+    assertLibraryDocumentUnchanged(t, req.body)
     if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
       throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
     }
@@ -2413,7 +2429,6 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     const { fields } = req.body
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
-    assertTemplateIsEditable(template)
 
     for (const f of (fields || [])) {
       if (f.leaseColumn && !(f.leaseColumn in LEASE_COLUMN_CATEGORY)) {
@@ -2518,7 +2533,6 @@ esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.t
   try {
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
-    assertTemplateIsEditable(template)
     if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
     const filename = extractUploadFilename(template.base_pdf_url)
     if (!filename) throw new AppError(400, 'Template PDF path is not a local upload')
@@ -2573,11 +2587,10 @@ esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('e
     // field — the SQL only required (fieldId, templateId) match.
     // Same class as the S390 variants cross-tenant fix on
     // pos_item_variants.
-    const template = await queryOne<{ id: string; name: string; library_document_id: string | null }>(
-      'SELECT id, name, library_document_id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
+    const template = await queryOne<{ id: string }>(
+      'SELECT id FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])',
       [req.params.id, landlordScopeIds(req.user!)])
     if (!template) throw new AppError(404, 'Template not found')
-    assertTemplateIsEditable(template)
     await query('DELETE FROM lease_template_fields WHERE id=$1 AND template_id=$2', [req.params.fieldId, req.params.id])
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -5911,6 +5924,8 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
       SELECT 1 FROM lease_documents WHERE base_pdf_url = $1 OR executed_pdf_url = $1
       UNION ALL
       SELECT 1 FROM lease_templates WHERE base_pdf_url = $1
+      UNION ALL
+      SELECT 1 FROM disclosure_library_documents WHERE base_pdf_url = $1
       LIMIT 1`, [urlSuffix])
     if (!exists) throw new AppError(404, 'File not found')
 
@@ -5923,6 +5938,13 @@ esignRouter.get('/files/:filename', authOrSignerTokenQuery, async (req: any, res
       UNION ALL
       SELECT 1 FROM lease_templates t
        WHERE t.base_pdf_url = $1 AND COALESCE(array_length($2::uuid[], 1), 0) > 0 AND t.landlord_id = ANY($2::uuid[])
+      UNION ALL
+      -- S652: a form on the government shelf is readable by any landlord, so
+      -- they can look at it BEFORE putting it on their own shelf. It is a
+      -- public agency document; the login is still required (nothing public
+      -- without one), but no ownership is, because nobody owns it.
+      SELECT 1 FROM disclosure_library_documents g
+       WHERE g.base_pdf_url = $1 AND COALESCE(array_length($2::uuid[], 1), 0) > 0
       LIMIT 1`, [urlSuffix, scopeLandlordIds, userId])
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 

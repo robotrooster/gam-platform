@@ -553,6 +553,24 @@ export function canonicalUnitNumber(unitType: UnitType, raw: string): string {
 // space in its own text ("Lot #___", "RV Space #___") and stamping the label
 // after it prints the type twice — on a tight box, on top of itself (S632).
 // The box gets the identifier.
+// S652 — two-letter code → the state's name, for anything a person reads.
+// Added for the government-forms shelf, which groups forms by the state that
+// published them; a landlord should read "Illinois", never "IL". One list,
+// here, so no screen keeps its own half-copy.
+export const US_STATE_NAME: Record<string, string> = {
+  AL: 'Alabama', AK: 'Alaska', AZ: 'Arizona', AR: 'Arkansas', CA: 'California',
+  CO: 'Colorado', CT: 'Connecticut', DE: 'Delaware', DC: 'District of Columbia',
+  FL: 'Florida', GA: 'Georgia', HI: 'Hawaii', ID: 'Idaho', IL: 'Illinois',
+  IN: 'Indiana', IA: 'Iowa', KS: 'Kansas', KY: 'Kentucky', LA: 'Louisiana',
+  ME: 'Maine', MD: 'Maryland', MA: 'Massachusetts', MI: 'Michigan', MN: 'Minnesota',
+  MS: 'Mississippi', MO: 'Missouri', MT: 'Montana', NE: 'Nebraska', NV: 'Nevada',
+  NH: 'New Hampshire', NJ: 'New Jersey', NM: 'New Mexico', NY: 'New York',
+  NC: 'North Carolina', ND: 'North Dakota', OH: 'Ohio', OK: 'Oklahoma', OR: 'Oregon',
+  PA: 'Pennsylvania', RI: 'Rhode Island', SC: 'South Carolina', SD: 'South Dakota',
+  TN: 'Tennessee', TX: 'Texas', UT: 'Utah', VT: 'Vermont', VA: 'Virginia',
+  WA: 'Washington', WV: 'West Virginia', WI: 'Wisconsin', WY: 'Wyoming',
+}
+
 export function printedUnitNumber(displayLabel: unknown, unitNumber: unknown): string {
   const source = String(displayLabel ?? '').trim() || String(unitNumber ?? '').trim()
   const stripped = source.replace(/^[A-Za-z]+[\s#]*/, '').trim()
@@ -2847,6 +2865,13 @@ export const DISCLOSURE_TYPES = [
   // offered a written lease of not less than 24 months on a date BEFORE signing
   // (745/6 and 6(a), almost word for word), and received the park rules.
   'statutory_acknowledgement',
+  // S652 — a state agency's own guide to tenant and landlord rights, handed to
+  // the resident. Found stocking the government library: IDPH's "Living in a
+  // Manufactured Home Community" fit no slot. Not an acknowledgement (that is
+  // the landlord's evidence he did something) and not a property fact — it is
+  // the government explaining the law to the tenant in plain words. Many states
+  // publish one, so this slot fills up as the library does.
+  'tenant_rights_guide',
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
@@ -2896,6 +2921,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   smoking_policy:           'Smoking policy',
   move_in_condition:        'Move-in condition checklist',
   statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
+  tenant_rights_guide:      'Tenant rights guide from a government agency',
   other:                    'Other disclosure',
 }
 

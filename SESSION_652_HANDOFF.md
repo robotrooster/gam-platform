@@ -225,6 +225,56 @@ date preceding signature, and the park rules.
 packet** — his lease already carries these lines, and asking one household to
 initial them twice is worse than once.
 
+**A shelf of forms GAM did not write.** Nic: *"the library should only be
+government published documents that something we're not altering at all...
+Anything that the landlord has to publish, they can do on their own. They can
+upload their own form the same way they upload their own lease."* And on why the
+statute text stays off the screen: *"a landlord may have properties in multiple
+states. We don't want to clutter all that screen."*
+
+The case was already in the data — Blu uploaded his own copies of the FEDERAL
+lead-based paint disclosures, identical for every landlord in the country, and
+every landlord after him would have uploaded them again.
+
+Adoption makes an ordinary `lease_templates` row linked back to the library, so
+packets, sending, signing and stamping work untouched; it is a template, only
+locked. That link is what makes the annual refresh reach people. It cannot reach
+backwards — `lease_documents` carries its own PDF and its own copied fields, so
+somebody who signed version 1 signed version 1. There is a test for that.
+
+The lock is both halves of what Nic asked for: *"they can't alter the document,
+but when they send it out for signature, it needs to have e-signature flow on it
+where the page can at least have the tenant's initials."* The library owns the
+PDF **and** the field map; the landlord edits neither, but can take it off the
+shelf and pick it in a packet. The refusal names the way out — upload your own.
+
+The action-parity guard caught the new endpoint. Rather than name it deliberate, the
+route resolves a SPOKEN name, because the existing lease-template actions all
+take an id "from a lookup" and no lookup returning template ids exists — they are
+unreachable by talking. This one is not, and it refuses to guess: no match and
+two matches both read back what is on the shelf.
+
+**THE SHELF IS EMPTY.** Stocking it means downloading agency PDFs, which needs
+Nic's go. The five identified, all verified to exist and be PDFs:
+
+| File | Agency | Size |
+|---|---|---|
+| `lesr_eng.pdf` — sample lessor (rental) disclosure | EPA | 902 KB |
+| `selr_eng.pdf` — sample seller (sales) disclosure | EPA | 263 KB |
+| `protectyourfamily_pamphlet_2026_3.pdf` — Jan 2026 edition | EPA | 1.3 MB |
+| `mobile-home-landlord-and-tenant-rights-act-printable-5-31-18.pdf` | IDPH | 169 KB |
+| `publicationsohp2018-living-manufacturedhome-community.pdf` | IDPH | 476 KB |
+
+The two Illinois ones cannot be told apart from outside; pull both, keep whichever
+is the statutory pamphlet Blu's acknowledgement refers to.
+
+**The first refresh case arrived before the mechanism did.** EPA reissued
+"Protect Your Family From Lead in Your Home" in **January 2026** for the new
+dust-lead action levels. Every copy downloaded before that is stale. Blu's
+lead-paint FORMS are fine — that wording is fixed federal regulation — but the
+PAMPHLET he hands over with them is the thing that changed, so the Sheptocks
+should get the January 2026 one.
+
 ---
 
 ## Verified against code, not taken on trust
