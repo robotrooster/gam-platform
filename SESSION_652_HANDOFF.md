@@ -417,13 +417,13 @@ Mac Studio (nightly backup).
   - ADHS bed-bug toolkit (2019)
   - Phoenix guide (2014)
   - The Spanish act is retired (English only, Nic).
-- **Arizona gaps:** the Nov 2025 MH act and the MH act **summary**. ARS
-  33-1432.01 has landlords give MH tenants the summary. Both exist only on
-  housing.az.gov, which refuses scripted downloads (403). The archive has no
-  copies, and the in-app browser was refused the site. Files:
-  `housing.az.gov/sites/default/files/2025-11/AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act-Nov_2025.pdf`
-  and `.../2024-10/LTA-Summary-REV-Oct_2024.pdf` (check the resource page for a
-  2025 summary).
+- **Arizona, closed 9/21:** housing.az.gov blocks scripts with a Cloudflare
+  check, so Nic ticks the box in his own browser and saves the PDF, and Claude
+  checks and shelves it. That brought in the **September 2026 MH parks act**
+  (replaces 2024: new relocation-fund amounts under an unchanged cover date)
+  and the **Director-approved summary** (updated 9/10/26), which A.R.S.
+  33-1432(G)/(H) has parks give before the rental agreement and every
+  November 1.
 
 **Tenant portal — "Landlord-Tenant Act".** New sidebar page (`/laws`, API
 `GET /tenants/me/laws`). One section per leased home: the state's act for that
