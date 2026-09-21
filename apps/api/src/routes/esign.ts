@@ -2200,6 +2200,7 @@ esignRouter.get('/library', requireAuth, requirePerm('leases.create'), async (re
         version: d.version,
         adoptedTemplateId: d.adopted_template_id,
         fieldCount: d.adopted_template_id ? d.adopted_field_count : null,
+        signable: d.signable !== false,
       })),
     } })
   } catch (e) { next(e) }

@@ -176,6 +176,7 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
 
   const govSleeve = (d: any) => ({
     id: `library:${d.id}`, kind: 'government', group: 'government', title: d.name, appliesTo: d.applies_to,
+    signable: d.signable !== false,
     unitTypes: d.unit_types, libraryDocumentId: d.id, publishedBy: d.source_name, pdfUrl: d.base_pdf_url,
     cards: d.adopted_template_id
       ? [{ templateId: d.adopted_template_id, name: d.name, fieldCount: d.adopted_field_count, pageCount: d.page_count }]
@@ -212,6 +213,7 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
         // own in it — Nic: "automatically have the government drafted ones."
         freeVersion: free ? {
           libraryDocumentId: free.id, title: free.name, publishedBy: free.source_name, pdfUrl: free.base_pdf_url,
+          signable: free.signable !== false,
           templateId: free.adopted_template_id ?? null,
         } : null,
         filled: c.length > 0 || coveredBy.has(s.id) || !!free,

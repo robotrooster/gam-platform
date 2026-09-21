@@ -31,9 +31,10 @@ export type Sleeve = {
   id: string; kind: 'lease' | 'sale_contract' | 'disclosure' | 'government'
   title: string; number: number; filled: boolean; unitTypes: string[] | null
   cards: SleeveCard[]; libraryDocumentId?: string; publishedBy?: string; pdfUrl?: string
+  signable?: boolean   // false: the publisher locked the PDF — view only
   coveredBy?: Array<{ templateId: string; name: string; source?: 'auto' | 'manual'; evidence?: string | null }>
   group?: string
-  freeVersion?: { libraryDocumentId: string; title: string; publishedBy: string; pdfUrl: string; templateId: string | null } | null
+  freeVersion?: { libraryDocumentId: string; title: string; publishedBy: string; pdfUrl: string; templateId: string | null; signable?: boolean } | null
 }
 type StateGroup = { state: string; unitTypes: string[]; sleeves: Sleeve[]; filled: number; total: number }
 export type SleevesData = { states: StateGroup[]; federal: Sleeve[]; other: SleeveCard[] }
@@ -138,11 +139,15 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
                          color: s.filled ? 'var(--text-0)' : 'var(--text-3)' }}>
             {shortTitle(s.title)}
             {gov && <span title={s.publishedBy}><Landmark size={11} style={{ color: 'var(--gold)', marginLeft: 5, verticalAlign: '-1px' }} /></span>}
+            {gov && s.signable === false && (
+              <span title="The publisher locked this PDF against editing, so it can be viewed and handed out but not signed"
+                    style={{ marginLeft: 5, fontSize: '.54rem', fontWeight: 700, color: 'var(--text-3)', border: '1px solid var(--border-1)', borderRadius: 3, padding: '0 3px' }}>READ ONLY</span>
+            )}
           </span>
           {gov && (
             <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
               <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(s.pdfUrl!)}><Eye size={11} /></button>
-              {canEdit && (
+              {canEdit && s.signable !== false && (
                 <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes" disabled={busy === s.id}
                         onClick={() => editGovernment(s)}><Settings size={11} /></button>
               )}
@@ -189,7 +194,7 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
             </span>
             <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
               <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(free.pdfUrl)}><Eye size={11} /></button>
-              {canEdit && (
+              {canEdit && free.signable !== false && (
                 <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes"
                   onClick={() => editGovernment({ ...s, cards: free.templateId ? [{ templateId: free.templateId } as any] : [], libraryDocumentId: free.libraryDocumentId })}>
                   <Settings size={11} />

@@ -62,6 +62,9 @@ type Doc = {
   publicationRef: string
   effectiveFrom: string
   fields: Field[]
+  // false: the agency's PDF is locked against editing, so it can be read and
+  // handed over but never stamped with a signature (see the migration).
+  signable?: boolean
 }
 
 // A box on one of EPA's printed blanks. `top` is the blank's word-box top as
@@ -282,10 +285,44 @@ const DOCS: Doc[] = [
     publicationRef: 'Radon Guide for Tenants', effectiveFrom: '2026-09-21',
     fields: receiptAt(8, { x: 170, y: 548 }, { x: 40, y: 300, cols: 2 }, { x: 40, y: 345 }),
   },
-  // NOT stocked: IEMA's "Radon Testing Guidelines for Real Estate Transactions".
-  // The agency's PDF is encrypted against editing, so no signature box can be
-  // stamped on it without removing their lock — which would be altering their
-  // document. Revisit if IEMA publishes an unlocked copy.
+  // Nic: "If the government provides a document, we are adding it to the
+  // library. That's it." IEMA's PDF is encrypted against editing, so it is on
+  // the shelf to READ — no boxes, never adopted or packaged.
+  {
+    file: 'library-il-iema-radon-guidelines-sales.pdf',
+    name: 'Illinois: Radon Testing Guidelines for Real Estate Transactions (read only)',
+    description: "IEMA's pamphlet on radon testing during the sale of a home, approved under the Illinois Radon Awareness Act. The agency's file is locked against editing, so it can be viewed and handed over but not signed through GAM.",
+    disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'sale', unitTypes: ['single_family'],
+    sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
+    sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/radontestguidelineforrealestatepamphlet.pdf',
+    publicationRef: 'IEMA, 2007', effectiveFrom: '2007-01-01',
+    signable: false, fields: [],
+  },
+  {
+    file: 'library-az-adhs-bed-bug-toolkit.pdf',
+    name: 'Arizona: Bed Bugs Toolkit (Department of Health Services, 2019)',
+    description: "The Arizona Department of Health Services' toolkit on bed bugs: general information, prevention and control, and resources. Written with workplaces in mind.",
+    disclosureType: 'bed_bugs', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['apartment', 'mobile_home', 'hotel_room'],
+    sourceName: 'Arizona Department of Health Services',
+    sourceUrl: 'https://www.azdhs.gov/documents/preparedness/epidemiology-disease-control/food-safety-environmental-services/resources/bed-bug-toolkit.pdf',
+    publicationRef: 'ADHS, October 2019', effectiveFrom: '2019-10-08',
+    // Pages 18 and 19 are full to the edges; the cover is mostly white. Receipt
+    // is one set of initials per document (Nic), so it all goes on the cover.
+    fields: [
+      ...initialsRow(1, 60, 120, 'Received this'),
+      { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed', page: 1, x: 60 + rowWidth() + 8, y: 120, w: 80, h: INIT_H, required: true },
+    ],
+  },
+  {
+    file: 'library-az-phoenix-guide-to-landlord-tenant-act-2014.pdf',
+    name: 'Arizona: Guide to the Arizona Residential Landlord and Tenant Act (City of Phoenix, January 2014)',
+    description: "The City of Phoenix Neighborhood Services Department's plain-language guide to the Arizona Residential Landlord and Tenant Act, January 2014 edition, as published on the Arizona Department of Health Services site.",
+    disclosureType: 'tenant_rights_guide', jurisdiction: 'AZ', appliesTo: 'rental', unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room'],
+    sourceName: 'City of Phoenix Neighborhood Services Department',
+    sourceUrl: 'https://www.azdhs.gov/documents/preparedness/epidemiology-disease-control/childrens-environmental-health/landlord-tenant-act.pdf',
+    publicationRef: 'Revised January 2014', effectiveFrom: '2014-01-01',
+    fields: receiptAt(12, { x: 110, y: 575 }, { x: 40, y: 540 }, { x: 212, y: 540 }),
+  },
   {
     file: 'library-il-ag-landlord-tenant-rights.pdf',
     name: 'Illinois: Landlord and Tenant Rights and Laws (Attorney General, 2024)',
@@ -301,6 +338,7 @@ const DOCS: Doc[] = [
 async function preview(outDir: string) {
   fs.mkdirSync(outDir, { recursive: true })
   for (const d of DOCS) {
+    if (d.signable === false) continue          // no boxes to draw on a locked file
     const pdf = await PDFDocument.load(fs.readFileSync(path.join(DIR, d.file)))
     for (const f of d.fields) {
       const page = pdf.getPage(f.page - 1)
@@ -320,7 +358,8 @@ async function stock() {
     const src = path.join(DIR, d.file)
     if (!fs.existsSync(src)) throw new Error(`missing ${src}`)
     const url = `/api/esign/files/${d.file}`
-    const pages = (await PDFDocument.load(fs.readFileSync(src))).getPageCount()
+    // a locked PDF can still be COUNTED (ignoreEncryption reads, never writes)
+    const pages = (await PDFDocument.load(fs.readFileSync(src), { ignoreEncryption: true })).getPageCount()
 
     const held = await query<{ id: string }>(
       `SELECT id FROM disclosure_library_documents WHERE base_pdf_url=$1`, [url])
@@ -382,10 +421,10 @@ async function stock() {
     const row = await query<{ id: string }>(
       `INSERT INTO disclosure_library_documents
          (disclosure_type, jurisdiction, applies_to, unit_types, name, description,
-          source_name, source_url, publication_ref, base_pdf_url, page_count, effective_from)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+          source_name, source_url, publication_ref, base_pdf_url, page_count, effective_from, signable)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [d.disclosureType, d.jurisdiction, d.appliesTo, d.unitTypes, d.name, d.description,
-       d.sourceName, d.sourceUrl, d.publicationRef, url, pages, d.effectiveFrom])
+       d.sourceName, d.sourceUrl, d.publicationRef, url, pages, d.effectiveFrom, d.signable !== false])
     let sort = 0
     for (const f of d.fields) {
       await query(

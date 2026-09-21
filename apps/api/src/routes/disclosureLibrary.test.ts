@@ -394,3 +394,16 @@ describe('naming the form out loud', () => {
     await adoptByName(az, 'Illinois Park Pamphlet').expect(404)
   })
 })
+
+describe('a form its publisher locked against editing', () => {
+  it('is on the shelf to read, but cannot be adopted or sent for signature', async () => {
+    const id = await shelve({ jurisdiction: 'US', name: 'Locked Pamphlet' })
+    await query(`UPDATE disclosure_library_documents SET signable=false WHERE id=$1`, [id])
+    const listed = (await request(buildApp()).get('/api/esign/library').set('Authorization', `Bearer ${token(il)}`).expect(200))
+      .body.data.documents.find((d: any) => d.id === id)
+    expect(listed.signable).toBe(false)
+    const r = await request(buildApp()).post('/api/esign/library/adopt').set('Authorization', `Bearer ${token(il)}`)
+      .send({ documentId: id }).expect(409)
+    expect(String(r.body.error || r.body.message)).toMatch(/locked/i)
+  })
+})

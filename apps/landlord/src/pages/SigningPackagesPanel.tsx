@@ -201,13 +201,14 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
       if (s.group === 'notices_later') continue
       if (s.kind === 'sale_contract' && !sale) continue
       if (s.kind === 'government') {
+        if (s.signable === false) continue       // read-only: the publisher locked it
         if (s.appliesTo === 'sale' && !sale) continue
         if (s.appliesTo === 'rental' && sale) continue
         wanted.push(s.cards[0] ? { templateId: s.cards[0].templateId } : { lib: s.libraryDocumentId })
       } else if (s.cards.length) {
         const pick = s.kind === 'lease' ? (s.cards.find((c: any) => c.isUnitTypeDefault) ?? s.cards[0]) : s.cards[0]
         wanted.push({ templateId: pick.templateId })
-      } else if (s.freeVersion) {
+      } else if (s.freeVersion && s.freeVersion.signable !== false) {
         // The state's own version, until the landlord uploads theirs.
         wanted.push(s.freeVersion.templateId ? { templateId: s.freeVersion.templateId } : { lib: s.freeVersion.libraryDocumentId })
       }
@@ -233,7 +234,8 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
   const chosen = new Set(items.map(i => i.templateId))
   const ownAvailable = templates.filter(t => !t.libraryDocumentId && !chosen.has(t.id))
   const libFor = (j: string) => (library?.documents ?? [])
-    .filter(d => d.jurisdiction === j && !(d.adoptedTemplateId && chosen.has(d.adoptedTemplateId)))
+    .filter(d => d.jurisdiction === j && (d as any).signable !== false
+                 && !(d.adoptedTemplateId && chosen.has(d.adoptedTemplateId)))
   // An already-copied form goes in by its template id; one never touched is
   // copied first (see the onChange above).
   const libValue = (d: { id: string; adoptedTemplateId: string | null }) =>

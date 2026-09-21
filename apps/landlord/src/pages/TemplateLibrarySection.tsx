@@ -39,6 +39,7 @@ export type LibraryDoc = {
   adoptedTemplateId: string | null
   fieldCount: number | null
   sourceUrl?: string
+  signable?: boolean
 }
 export type LibraryData = { documents: LibraryDoc[]; operatingStates: string[] }
 
@@ -171,7 +172,7 @@ export default function TemplateLibrarySection({ mode = 'templates', canEdit = f
                   <button className="btn btn-primary btn-sm" onClick={() => openPdf(d.pdfUrl)}>
                     <Eye size={12} /> View
                   </button>
-                  {!reference && canEdit && (
+                  {!reference && canEdit && d.signable !== false && (
                     <button className="btn btn-primary btn-sm" disabled={busy === d.id} onClick={() => editBoxes(d)}>
                       <Settings size={12} /> {busy === d.id ? 'Opening…' : 'Edit boxes'}
                     </button>

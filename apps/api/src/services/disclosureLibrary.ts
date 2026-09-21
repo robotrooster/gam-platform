@@ -153,6 +153,9 @@ export async function adoptLibraryDocument(
       WHERE id=$1 AND retired_at IS NULL AND superseded_by_id IS NULL`, [documentId])
     .then(r => r.rows[0] as LibraryDocument | undefined)
   if (!doc) throw new AppError(404, 'That form is not on the shelf')
+  // S652: the agency locked this PDF against editing, so nothing can be signed
+  // on it — it is on the shelf to read and hand over, not to send for signature.
+  if ((doc as any).signable === false) throw new AppError(409, 'This government form is locked against editing by its publisher, so it can be viewed and handed out but not sent for signature.')
 
   const held = await q.query(
     `SELECT id FROM lease_templates WHERE landlord_id=$1 AND library_document_id=$2`,
