@@ -788,6 +788,13 @@ export const UNIT_CLONE_COPIED = [
 export const UNIT_CLONE_RESET: Record<string, string> = {
   id:                      'new identity',
   unit_number:             'the whole point — the replacement takes the new number',
+  // S652: the park's own word for the space does NOT carry. Retire-and-replace
+  // is a RENUMBERING, and the sign on the space usually changed with it — so a
+  // copied label would print "Lot 7" on a lease for the space the system now
+  // calls MH 12. Blank degrades to the canonical name, which is always true;
+  // stale prints a wrong number on a signed document. The landlord re-enters it
+  // if the sign really did stay the same.
+  display_label:           'the printed name follows the sign, and a renumbered space usually gets a new one',
   created_at:              'the replacement is created now',
   updated_at:              'the replacement is created now',
   status:                  "starts 'vacant' — a fresh unit holds no lease",
