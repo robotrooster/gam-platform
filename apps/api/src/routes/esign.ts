@@ -4584,43 +4584,12 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
       [req.params.id, landlordScopeIds(req.user!)]
     ).then((r: any) => r.rows[0])
     if (!doc) throw new AppError(404, 'Document not found')
-    if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
-    if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
 
-    // S29 item 6 / S558: allow voiding through a landlord-only signature. The
-    // landlord always signs first (S28), and a lease is not an executed contract
-    // until the counterparty signs — a landlord's signature on a draft no tenant
-    // has signed binds no one, so it stays voidable (typo recall, roster changes
-    // before tenants commit). Lock voiding only once a TENANT signs; from there
-    // the legally clean path is a superseding document. (Blocking on the
-    // landlord's own signature would make void useless for every mid-roster fix,
-    // since the landlord-first flow means every fresh draft already carries it.)
-    // This also unblocks voiding execution_failed docs so landlords can clear
-    // them from their dashboard while admin investigates.
-    const tenantSigned = await queryOne<any>(
-      "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1",
-      [doc.id])
-    if (tenantSigned) throw new AppError(409, 'Cannot void after a tenant has signed — create a superseding document instead')
-
-    // Cascade lease_tenants state by document_type
-    await cascadeLeaseTenantsOnVoid(client.query.bind(client), doc)
-
-    // S647: a document the landlord signed has already issued a lease, an
-    // invoice and possibly a work-trade agreement. Voiding the paper alone left
-    // all three live. See lib/unwindIssuedLease.
-    const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
-    await unwindIssuedLease(client.query.bind(client), doc)
-
-    await client.query(
-      "UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
-      [reason || null, doc.id])
-
-    // S581: a voided addendum's pending money changes (scheduled rent / recurring
-    // fee) must NEVER reach billing — cancel them atomically with the void.
-    await client.query(
-      `UPDATE scheduled_lease_changes SET status='cancelled', updated_at=NOW()
-        WHERE source_document_id=$1 AND status IN ('draft','scheduled')`,
-      [doc.id])
+    // S29 item 6 / S558 / S581 / S647 / S652: every step of a void lives in
+    // lib/voidDocument, so a script clearing a packet runs the same ones. Read
+    // that file for why each exists — including the one that was missing.
+    const { voidDocument } = await import('../lib/voidDocument')
+    await voidDocument(client.query.bind(client), doc, reason || null)
 
     await client.query('COMMIT')
     res.json({ success: true })

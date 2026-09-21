@@ -254,19 +254,36 @@ take an id "from a lookup" and no lookup returning template ids exists — they 
 unreachable by talking. This one is not, and it refuses to guess: no match and
 two matches both read back what is on the shelf.
 
-**THE SHELF IS EMPTY.** Stocking it means downloading agency PDFs, which needs
-Nic's go. The five identified, all verified to exist and be PDFs:
+**Stocked, 2026-09-21.** Five forms, each the agency's own file byte for byte,
+each with a title-case name that says what it is:
 
-| File | Agency | Size |
-|---|---|---|
-| `lesr_eng.pdf` — sample lessor (rental) disclosure | EPA | 902 KB |
-| `selr_eng.pdf` — sample seller (sales) disclosure | EPA | 263 KB |
-| `protectyourfamily_pamphlet_2026_3.pdf` — Jan 2026 edition | EPA | 1.3 MB |
-| `mobile-home-landlord-and-tenant-rights-act-printable-5-31-18.pdf` | IDPH | 169 KB |
-| `publicationsohp2018-living-manufacturedhome-community.pdf` | IDPH | 476 KB |
+- Lead-Based Paint Disclosure — Rentals (EPA Form 9600-041)
+- Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)
+- Protect Your Family From Lead in Your Home (January 2026)
+- Living in a Manufactured Home Community (Illinois, 2018) — the statutory
+  pamphlet; its introduction cites Section 14-1, which Blu's acknowledgement
+  refers to
+- Illinois Mobile Home Landlord and Tenant Rights Act (765 ILCS 745)
 
-The two Illinois ones cannot be told apart from outside; pull both, keep whichever
-is the statutory pamphlet Blu's acknowledgement refers to.
+`apps/api/src/scripts/disclosures/stockLibrary.ts` loads them; `PREVIEW=<dir>`
+draws every default box onto a copy for checking. **Check the render** — it
+caught two boxes sitting over EPA's printed words on the first pass. The
+remaining inventory is LAUNCH.md §2e.
+
+**The lock, corrected.** The first version locked the boxes along with the text.
+Nic: *"they can't edit the text of the document because it's a government
+published form. They can add the necessary initial boxes... just including it
+with the signature in the packet with no actual initial on the page itself is
+going to be argued that it was never received."* Now only the PDF, page count,
+name and description are fixed; every box is the landlord's.
+
+**Two lead forms, never three.** Nic asked what the pamphlet is for. A pre-1978
+home needs ONE disclosure form — Rentals or Sales, whichever the deal is — plus
+the pamphlet, which line (d) of either form has the tenant initial as received.
+
+**The screen:** GoldSign → Government Forms. Verified in the LIVE bundle
+(`index-B8VX-UbS.js` contains the tab), not just the build log. Nobody has
+looked at it logged in — that needs Nic.
 
 **The first refresh case arrived before the mechanism did.** EPA reissued
 "Protect Your Family From Lead in Your Home" in **January 2026** for the new
@@ -274,6 +291,30 @@ dust-lead action levels. Every copy downloaded before that is stale. Blu's
 lead-paint FORMS are fine — that wording is fixed federal regulation — but the
 PAMPHLET he hands over with them is the thing that changed, so the Sheptocks
 should get the January 2026 one.
+
+**Lot 1 cleared for a redraft.** Nic: *"remove everything from lot one... get
+those forms in there for the package... he needs to edit whatever box is on his
+template first."* Nothing was signed. The three live documents are voided (not
+erased), zero signing requests remain open, and the pending sale is cancelled.
+On Blu's shelf: EPA's Sales form, the January 2026 pamphlet, and IDPH's
+community guide. Retired (one click restores any of them): his own two
+lead-paint uploads — tagged as LEASES, so the lease picker offered them — and the
+acknowledgements form I wrote on S652, which is GAM-authored and so falls
+outside the rule Nic set today. `load10_clear_lot1_stock_blu.ts` did it.
+
+**NOTHING HAS BEEN REDRAFTED OR SENT.** The order is Nic's: Blu fixes the box
+on his lease template (the Lot # box that sits off to the right) → Nic confirms
+→ draft Lot 1 as lease + installment contract + EPA Sales form + lead pamphlet +
+IDPH pamphlet → Blu blesses it → then the other twelve.
+
+**A void left the sale behind — fixed at the table.** Clearing Lot 1 found that
+voiding an unsigned installment agreement left its sale at `pending_signature`
+forever, and one live sale per unit meant Lot 1 could never have been redrafted.
+Documents are voided from FOUR places (the button, the 48-hour timeout, the
+renewal auto-void, the add-a-person redraft), each with its own partial copy of
+the steps, so the fix is a trigger (`trg_cancel_unsigned_sale_on_void`), not a
+fifth copy. The button's steps also moved into `lib/voidDocument` so scripts run
+the same ones. Zero sales were stranded in production before this.
 
 ---
 
@@ -311,7 +352,8 @@ either way.
    (check whether it is the Ethernet one), the $5 test card is a **platform-side**
    purchase for proving the flow once, the case only matters once the reader
    travels — which it now will, for propane.
-4. **Blu signs Lot 1 — the test packet.** The 13 originally-sent leases were
+4. **Lot 1 waits on Blu's template fix, then a redraft.** (See "Lot 1 cleared"
+   above — the earlier packet is voided.) History: The 13 originally-sent leases were
    deleted, not voided: they were drafted before the co-tenant roles were fixed,
    so 70 of 125 template fields never landed, nobody had signed them and nothing
    referenced them. Nic: something *"that was never a real issue, of real

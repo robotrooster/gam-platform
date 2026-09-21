@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict uBts5oftv6ZTls0UcwRVR5ORE0Zda2k1wlt13FcwpY4vHibIG4xEzwpQx8aIUle
+\restrict QhSpNpMpdr0YeNyUZARWLlp96YiqGo3fbrbRhNYmKCkaGJ91CAEyT8Goeh30l5l
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -137,6 +137,25 @@ BEGIN
     RETURN OLD;
   END IF;
   RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: cancel_unsigned_sale_on_void(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.cancel_unsigned_sale_on_void() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.status = 'voided' AND OLD.status IS DISTINCT FROM 'voided' THEN
+    UPDATE home_sale_contracts
+       SET status = 'cancelled', updated_at = now()
+     WHERE purchase_document_id = NEW.id
+       AND status = 'pending_signature';
+  END IF;
+  RETURN NEW;
 END;
 $$;
 
@@ -20810,6 +20829,13 @@ CREATE TRIGGER trg_businesses_updated_at BEFORE UPDATE ON public.businesses FOR 
 
 
 --
+-- Name: lease_documents trg_cancel_unsigned_sale_on_void; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_cancel_unsigned_sale_on_void AFTER UPDATE OF status ON public.lease_documents FOR EACH ROW EXECUTE FUNCTION public.cancel_unsigned_sale_on_void();
+
+
+--
 -- Name: security_deposits trg_deposits_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -27690,5 +27716,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict uBts5oftv6ZTls0UcwRVR5ORE0Zda2k1wlt13FcwpY4vHibIG4xEzwpQx8aIUle
+\unrestrict QhSpNpMpdr0YeNyUZARWLlp96YiqGo3fbrbRhNYmKCkaGJ91CAEyT8Goeh30l5l
 
