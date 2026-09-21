@@ -2387,6 +2387,17 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_man
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     if (!t) throw new AppError(404, 'Template not found')
     assertLibraryDocumentUnchanged(t, req.body)
+    // S652 — REPLACE THE PDF, KEEP THE BOXES. Boxes are stored by page and
+    // position, apart from the PDF, so a corrected or next-year version slots in
+    // underneath them. The one way that goes wrong is a box on a page the new
+    // file no longer has; refuse that rather than strand it.
+    if (basePdfUrl && basePdfUrl !== t.base_pdf_url && pageCount) {
+      const beyond = await queryOne<{ page: number }>(
+        `SELECT max(page)::int AS page FROM lease_template_fields WHERE template_id=$1`, [t.id])
+      if (beyond?.page && beyond.page > Number(pageCount)) {
+        throw new AppError(409, `The new PDF has ${pageCount} page${Number(pageCount) === 1 ? '' : 's'} but boxes sit on page ${beyond.page}. Use a version with the same pages, or move those boxes first.`)
+      }
+    }
     if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
       throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
     }
@@ -5883,6 +5894,23 @@ const upload = multer({
 esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.single('file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
+    // S652 — A PDF LOCKED AGAINST EDITING CAN NEVER BE SIGNED. Signing stamps
+    // names, initials and dates onto the page (services/pdfStamp, pdf-lib), and
+    // pdf-lib refuses an encrypted file — so a locked PDF uploaded as a template
+    // would be accepted here and fail the moment the last person signed. Found
+    // stocking the library: one of Illinois' radon pamphlets is locked. Say so
+    // now, while the landlord can still save an unlocked copy.
+    {
+      const { PDFDocument } = await import('pdf-lib')
+      try { await PDFDocument.load(fs.readFileSync(req.file.path)) }
+      catch (e: any) {
+        try { fs.unlinkSync(req.file.path) } catch { /* already gone */ }
+        if (/encrypt/i.test(String(e?.message))) {
+          throw new AppError(400, 'This PDF is locked against editing, so signatures can\'t be added to it. Open it and save or print it to a new PDF, then upload that copy.')
+        }
+        throw new AppError(400, 'That file could not be read as a PDF.')
+      }
+    }
     const fileUrl = '/api/esign/files/' + req.file.filename
     let pageCount = 1
     try {

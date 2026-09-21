@@ -1621,6 +1621,29 @@ export function ESignPage() {
   // S652: set when the landlord clicked Upload on a sleeve. The sleeve says what
   // the document is, so the dialog stops asking.
   const [newTmplSleeve, setNewTmplSleeve] = useState<Sleeve | null>(null)
+  // S652 — Replace PDF, keep the boxes. Nic: "if I change my draft next year..."
+  // and the Mountain View lease that still said Oak Park. The new file goes
+  // under the existing boxes, and the lease is re-read for what it contains.
+  const replaceInput = useRef<HTMLInputElement>(null)
+  const [replacing, setReplacing] = useState<{ templateId: string; name: string } | null>(null)
+  const replacePdf = async (file: File) => {
+    if (!replacing) return
+    try {
+      const form = new FormData(); form.append('file', file)
+      const up = await fetch(`${API_URL}/api/esign/upload`, {
+        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('gam_token')}` }, body: form,
+      }).then(r => r.json())
+      if (!up.success) throw new Error(up.error || 'Upload failed')
+      await apiPatch(`/esign/templates/${replacing.templateId}`, { basePdfUrl: up.data.url, pageCount: up.data.pageCount || 1 })
+      qc.invalidateQueries('esign-sleeves'); qc.invalidateQueries('esign-templates')
+      toast(`${replacing.name}: new PDF in place, every box kept. Re-read for what it contains.`)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || e?.message || 'Could not replace the PDF')
+    } finally {
+      setReplacing(null)
+      if (replaceInput.current) replaceInput.current.value = ''
+    }
+  }
   const [newTmplName, setNewTmplName] = useState('')
   // S576 (B-8): template purpose — 'lease' (default) or 'work_trade_addendum'
   // (the landlord's own work-trade addendum form).
@@ -2093,8 +2116,11 @@ export function ESignPage() {
               every document that state's law has a landlord hand over for the
               spaces they run, government forms already in theirs. See
               TemplateSleeves. */}
+          <input ref={replaceInput} type="file" accept="application/pdf" style={{ display:'none' }}
+                 onChange={e => { const f = e.target.files?.[0]; if (f) replacePdf(f) }} />
           <TemplateSleeves
             canEdit={can('esign.template_manage')}
+            onReplacePdf={(c) => { setReplacing({ templateId: c.templateId, name: c.name }); replaceInput.current?.click() }}
             onEdit={async (id) => setEditTemplate(await apiGet<any>(`/esign/templates/${id}`))}
             onMakeDefault={(id) => setDefaultTemplateMut.mutate(id)}
             onDelete={(c) => {

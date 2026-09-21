@@ -27,7 +27,8 @@ type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
  * mobile home lots, RV and camp sites, and storage — the kind of space the act
  * that put the sleeve there governs.
  */
-export const SLEEVE_GROUPS = ['contracts', 'government', 'all_rentals', 'mobile_home_lots', 'rv_sites', 'storage', 'notices_later'] as const
+// Nic: free government versions go "underneath all of that" — last.
+export const SLEEVE_GROUPS = ['contracts', 'all_rentals', 'mobile_home_lots', 'rv_sites', 'storage', 'notices_later', 'government'] as const
 export function groupOf(kind: string, unitTypes: string[], disclosureType?: string | null): typeof SLEEVE_GROUPS[number] {
   if (kind === 'lease' || kind === 'sale_contract') return 'contracts'
   // Sent when something happens, never handed over at signing — their own
@@ -186,8 +187,18 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
   const byState = states.map(st => {
     const units = footprint.get(st) ?? []
     const mine = sleeves.filter((s: any) => s.state_code === st && s.unit_types.some((u: string) => units.includes(u)))
+    // S652 — a state's own version of this document. Nic: "say a state
+    // specifically provided a generic lease for an apartment — that would be in
+    // the apartment lease [sleeve]." Same state, same kind of document, a space
+    // it was written for; a lease sleeve matches the state's model lease.
+    const freeFor = (s: any) => library.find((d: any) =>
+      d.jurisdiction === st
+      && (s.kind === 'lease' ? d.purpose === 'lease' : (d.purpose !== 'lease' && d.disclosure_type === s.disclosure_type))
+      && (!d.unit_types || d.unit_types.some((u: string) => s.unit_types.includes(u)))
+      && (s.applies_to === 'any' || d.applies_to === 'any' || d.applies_to === s.applies_to))
     const rows = mine.map((s: any) => {
       const c = cards.filter((x: any) => x.sleeve_id === s.id)
+      const free = freeFor(s)
       c.forEach((x: any) => placed.add(x.id))
       return {
         id: s.id, kind: s.kind, title: s.title, unitTypes: s.unit_types, appliesTo: s.applies_to,
@@ -197,7 +208,13 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
           purpose: x.purpose, unitType: x.unit_type,
         })),
         coveredBy: c.length ? [] : (coveredBy.get(s.id) ?? []),
-        filled: c.length > 0 || coveredBy.has(s.id),
+        // A government version fills the sleeve until the landlord puts their
+        // own in it — Nic: "automatically have the government drafted ones."
+        freeVersion: free ? {
+          libraryDocumentId: free.id, title: free.name, publishedBy: free.source_name, pdfUrl: free.base_pdf_url,
+          templateId: free.adopted_template_id ?? null,
+        } : null,
+        filled: c.length > 0 || coveredBy.has(s.id) || !!free,
         group: groupOf(s.kind, s.unit_types, s.disclosure_type),
       }
     })
@@ -209,7 +226,7 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
     const gov = library.filter((d: any) => d.jurisdiction === st).map(govSleeve)
     const groupRank = (g: string) => SLEEVE_GROUPS.indexOf(g as any)
     const docsByGroup = [...docs].sort((a: any, b: any) => groupRank(a.group) - groupRank(b.group))
-    const ordered = [...leases, ...sales, ...gov, ...docsByGroup].map((r, i) => ({ ...r, number: i + 1 }))
+    const ordered = [...leases, ...sales, ...docsByGroup, ...gov].map((r, i) => ({ ...r, number: i + 1 }))
     return { state: st, unitTypes: units, sleeves: ordered,
              filled: ordered.filter(r => r.filled).length, total: ordered.length }
   })

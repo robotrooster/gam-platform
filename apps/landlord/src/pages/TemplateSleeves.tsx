@@ -4,7 +4,7 @@ import { apiGet, apiPut } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { jurisdictionLabel, UNIT_TYPE_LABEL } from '@gam/shared'
 import { ensureLibraryCopy } from './TemplateLibrarySection'
-import { ChevronDown, ChevronRight, Eye, Landmark, Plus, Settings, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Eye, Landmark, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -33,6 +33,7 @@ export type Sleeve = {
   cards: SleeveCard[]; libraryDocumentId?: string; publishedBy?: string; pdfUrl?: string
   coveredBy?: Array<{ templateId: string; name: string; source?: 'auto' | 'manual'; evidence?: string | null }>
   group?: string
+  freeVersion?: { libraryDocumentId: string; title: string; publishedBy: string; pdfUrl: string; templateId: string | null } | null
 }
 type StateGroup = { state: string; unitTypes: string[]; sleeves: Sleeve[]; filled: number; total: number }
 export type SleevesData = { states: StateGroup[]; federal: Sleeve[]; other: SleeveCard[] }
@@ -56,25 +57,22 @@ const shortTitle = (title: string) =>
 // campsites... it needs more organization."
 const GROUP_LABEL: Record<string, string> = {
   contracts: 'Leases & contracts',
-  government: 'Government forms',
   all_rentals: 'For every rental',
   mobile_home_lots: 'Mobile home lots',
   rv_sites: 'RV & camp sites',
   storage: 'Storage',
   // Sent when something happens — never part of a signing packet.
   notices_later: 'Notices you send later',
+  // Nic: "a section underneath all of that that shows free-use versions."
+  government: 'Free government versions',
 }
 const GROUP_ORDER = Object.keys(GROUP_LABEL)
 
-const cardStyle = (filled: boolean): React.CSSProperties => ({
-  padding: '10px 12px', borderRadius: 10, minHeight: 92, display: 'flex', flexDirection: 'column', gap: 6,
-  background: filled ? 'var(--bg-2, var(--surface-2))' : 'transparent',
-  border: filled ? '1px solid var(--border-0)' : '1px dashed var(--border-1)',
-})
 
-export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefault, onDelete }: {
+export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefault, onDelete, onReplacePdf }: {
   canEdit: boolean
   onEdit: (templateId: string) => void
+  onReplacePdf: (card: SleeveCard) => void
   onUpload: (sleeve: Sleeve, state: string) => void
   onMakeDefault: (templateId: string) => void
   onDelete: (card: SleeveCard) => void
@@ -115,102 +113,127 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
     finally { setBusy(null) }
   }
 
+  // S652 — CARDS ARE WIDE AND SHORT. Nic: "make the cards more rectangular,
+  // squish them a little bit and stretch them out... everything for a state
+  // should fit easily into one page... the title for my lease template, Mountain
+  // View RV Spot Lease, dot, dot, dot — it's cut off." So: the actions sit on the
+  // title line as small buttons instead of a row of their own, nothing is
+  // truncated (names wrap), and the grid fills the width.
+  const iconBtn: React.CSSProperties = { padding: '2px 6px', lineHeight: 1, minHeight: 0 }
   const renderSleeve = (s: Sleeve, state: string) => {
     const gov = s.kind === 'government'
+    const covered = !gov && s.cards.length === 0 && (s.coveredBy?.length ?? 0) > 0
+    const free = !gov && s.cards.length === 0 && !covered ? s.freeVersion ?? null : null
+    const empty = !gov && s.cards.length === 0 && !covered
+    const editingCover = covering?.sleeveId === s.id
     return (
-      <div key={s.id} style={cardStyle(s.filled)}>
+      <div key={s.id} style={{
+        padding: '7px 10px', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 4,
+        background: s.filled ? 'var(--bg-2, var(--surface-2))' : 'transparent',
+        border: s.filled ? '1px solid var(--border-0)' : '1px dashed var(--border-1)',
+      }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-          <span style={{ fontSize: '.66rem', fontWeight: 700, color: 'var(--text-3)', minWidth: 16 }}>{s.number}</span>
-          <span style={{ flex: 1, fontSize: '.8rem', fontWeight: 600, lineHeight: 1.3,
+          <span style={{ fontSize: '.64rem', fontWeight: 700, color: 'var(--text-3)', minWidth: 14, paddingTop: 2 }}>{s.number}</span>
+          <span style={{ flex: 1, fontSize: '.78rem', fontWeight: 600, lineHeight: 1.3,
                          color: s.filled ? 'var(--text-0)' : 'var(--text-3)' }}>
             {shortTitle(s.title)}
+            {gov && <span title={s.publishedBy}><Landmark size={11} style={{ color: 'var(--gold)', marginLeft: 5, verticalAlign: '-1px' }} /></span>}
           </span>
-          {gov && <span title={s.publishedBy}><Landmark size={13} style={{ color: 'var(--gold)', flexShrink: 0 }} /></span>}
+          {gov && (
+            <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+              <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(s.pdfUrl!)}><Eye size={11} /></button>
+              {canEdit && (
+                <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes" disabled={busy === s.id}
+                        onClick={() => editGovernment(s)}><Settings size={11} /></button>
+              )}
+            </span>
+          )}
+          {empty && canEdit && !editingCover && (
+            <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+              <button className="btn btn-primary btn-sm" style={iconBtn} title="Upload" onClick={() => onUpload(s, state)}><Plus size={11} /></button>
+            </span>
+          )}
         </div>
 
-        {gov ? (
-          <div style={{ display: 'flex', gap: 6, marginTop: 'auto' }}>
-            <button className="btn btn-primary btn-sm" onClick={() => openPdf(s.pdfUrl!)}><Eye size={11} /> View</button>
+        {/* what fills it — every name, wrapping, never cut off */}
+        {!gov && s.cards.map(c => (
+          <div key={c.templateId} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, paddingLeft: 20 }}>
+            <span style={{ flex: 1, fontSize: '.72rem', color: 'var(--text-1)', lineHeight: 1.3 }}>
+              {c.name}
+              {c.isUnitTypeDefault && <span style={{ marginLeft: 5, fontSize: '.54rem', fontWeight: 700, color: 'var(--gold)', border: '1px solid var(--gold)', borderRadius: 3, padding: '0 3px' }}>DEFAULT</span>}
+              <span style={{ color: 'var(--text-3)', fontSize: '.64rem' }}> · {c.propertyName || 'any property'} · {c.fieldCount} boxes</span>
+            </span>
             {canEdit && (
-              <button className="btn btn-primary btn-sm" disabled={busy === s.id} onClick={() => editGovernment(s)}>
-                <Settings size={11} /> {busy === s.id ? 'Opening…' : 'Edit boxes'}
-              </button>
+              <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+                <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes" onClick={() => onEdit(c.templateId)}><Settings size={11} /></button>
+                <button className="btn btn-primary btn-sm" style={iconBtn} title="Replace the PDF — boxes stay where they are" onClick={() => onReplacePdf(c)}><RefreshCw size={11} /></button>
+                {s.kind === 'lease' && !c.isUnitTypeDefault && (
+                  <button className="btn btn-primary btn-sm" style={{ ...iconBtn, fontSize: '.6rem' }} title="Use this lease for new leases of this unit type" onClick={() => onMakeDefault(c.templateId)}>Default</button>
+                )}
+                <button className="btn btn-ghost btn-sm" style={{ ...iconBtn, color: 'var(--red)' }} title="Delete" onClick={() => onDelete(c)}><Trash2 size={11} /></button>
+              </span>
             )}
           </div>
-        ) : covering?.sleeveId === s.id ? (
-          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-2)' }}>Which of your documents already include this?</div>
-            {ownDocs.map(d => (
-              <label key={d.templateId} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.72rem', color: 'var(--text-1)' }}>
-                <input type="checkbox" checked={covering.ids.includes(d.templateId)}
-                  onChange={e => setCovering({ sleeveId: s.id, ids: e.target.checked
-                    ? [...covering.ids, d.templateId] : covering.ids.filter(x => x !== d.templateId) })} />
-                {d.name}
-              </label>
-            ))}
-            <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
-              <button className="btn btn-primary btn-sm" onClick={() => saveCoverings(s.id, covering.ids)}>Save</button>
-              <button className="btn btn-ghost btn-sm" onClick={() => setCovering(null)}>Cancel</button>
-            </div>
+        ))}
+        {!gov && s.cards.length > 0 && canEdit && (
+          <button className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start', fontSize: '.62rem', padding: '0 4px', marginLeft: 16 }}
+                  onClick={() => onUpload(s, state)}><Plus size={9} /> Add another</button>
+        )}
+
+        {free && (
+          <div style={{ paddingLeft: 20, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+            <span style={{ flex: 1, fontSize: '.7rem', lineHeight: 1.35 }} title={free.publishedBy}>
+              <span style={{ color: 'var(--text-3)' }}>Free version: </span>
+              <span style={{ color: 'var(--text-1)' }}>{shortTitle(free.title)}</span>
+              <Landmark size={10} style={{ color: 'var(--gold)', marginLeft: 4, verticalAlign: '-1px' }} />
+            </span>
+            <span style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+              <button className="btn btn-primary btn-sm" style={iconBtn} title="View" onClick={() => openPdf(free.pdfUrl)}><Eye size={11} /></button>
+              {canEdit && (
+                <button className="btn btn-primary btn-sm" style={iconBtn} title="Edit boxes"
+                  onClick={() => editGovernment({ ...s, cards: free.templateId ? [{ templateId: free.templateId } as any] : [], libraryDocumentId: free.libraryDocumentId })}>
+                  <Settings size={11} />
+                </button>
+              )}
+            </span>
           </div>
-        ) : s.coveredBy && s.coveredBy.length > 0 ? (
-          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
-            {s.coveredBy.map(c => (
-              <span key={c.templateId} style={{ fontSize: '.72rem', color: 'var(--text-1)' }}
-                    title={c.source === 'auto' && c.evidence ? `Read from the document: "${c.evidence}"` : undefined}>
-                <span style={{ color: 'var(--text-3)' }}>{c.source === 'auto' ? 'Found in ' : 'Included in '}</span>{c.name}
+        )}
+
+        {covered && !editingCover && (
+          <div style={{ paddingLeft: 20, fontSize: '.7rem', lineHeight: 1.45 }}>
+            {s.coveredBy!.map((c, i) => (
+              <span key={c.templateId} title={c.source === 'auto' && c.evidence ? `Read from the document: "${c.evidence}"` : undefined}>
+                {i === 0 && <span style={{ color: 'var(--text-3)' }}>{c.source === 'auto' ? 'Found in ' : 'Included in '}</span>}
+                <span style={{ color: 'var(--text-1)' }}>{c.name}</span>{i < s.coveredBy!.length - 1 ? ', ' : ''}
               </span>
             ))}
             {canEdit && (
-              <button className="btn btn-primary btn-sm" style={{ alignSelf: 'flex-start', marginTop: 3 }}
-                      onClick={() => setCovering({ sleeveId: s.id, ids: s.coveredBy!.map(c => c.templateId) })}>
-                Change
-              </button>
+              <button className="btn btn-ghost btn-sm" style={{ fontSize: '.6rem', padding: '0 4px', marginLeft: 4 }}
+                      onClick={() => setCovering({ sleeveId: s.id, ids: s.coveredBy!.map(c => c.templateId) })}>Change</button>
             )}
           </div>
-        ) : s.cards.length === 0 ? (
-          canEdit && (
-            <div style={{ marginTop: 'auto', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <button className="btn btn-primary btn-sm" onClick={() => onUpload(s, state)}><Plus size={11} /> Upload</button>
-              {/* Only a document can live inside another one — a lease or a sale
-                  contract is its own document. */}
-              {s.kind === 'disclosure' && s.group !== 'notices_later' && ownDocs.length > 0 && (
-                <button className="btn btn-primary btn-sm" onClick={() => setCovering({ sleeveId: s.id, ids: [] })}>
-                  It's in another document
-                </button>
-              )}
-            </div>
-          )
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 'auto' }}>
-            {s.cards.map(c => (
-              <div key={c.templateId} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <div style={{ flex: '1 1 110px', minWidth: 0 }}>
-                  <div style={{ fontSize: '.74rem', color: 'var(--text-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={c.name}>
-                    {c.name}
-                    {c.isUnitTypeDefault && <span style={{ marginLeft: 5, fontSize: '.56rem', fontWeight: 700, color: 'var(--gold)', border: '1px solid var(--gold)', borderRadius: 3, padding: '0 3px' }}>DEFAULT</span>}
-                  </div>
-                  <div style={{ fontSize: '.64rem', color: 'var(--text-3)' }}>
-                    {c.propertyName || 'any property'} · {c.fieldCount} boxes
-                  </div>
-                </div>
-                {canEdit && (
-                  <div style={{ display: 'flex', gap: 4 }}>
-                    <button className="btn btn-primary btn-sm" onClick={() => onEdit(c.templateId)} title="Edit boxes"><Settings size={11} /></button>
-                    {s.kind === 'lease' && !c.isUnitTypeDefault && (
-                      <button className="btn btn-primary btn-sm" onClick={() => onMakeDefault(c.templateId)} title="Use this lease for new leases of this unit type">Default</button>
-                    )}
-                    <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => onDelete(c)} title="Delete"><Trash2 size={11} /></button>
-                  </div>
-                )}
-              </div>
+        )}
+
+        {empty && canEdit && !editingCover && s.kind === 'disclosure' && s.group !== 'notices_later' && ownDocs.length > 0 && (
+          <button className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start', fontSize: '.62rem', padding: '0 4px', marginLeft: 16 }}
+                  onClick={() => setCovering({ sleeveId: s.id, ids: [] })}>It's in another document</button>
+        )}
+
+        {editingCover && (
+          <div style={{ paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <div style={{ fontSize: '.66rem', color: 'var(--text-2)' }}>Which of your documents already include this?</div>
+            {ownDocs.map(d => (
+              <label key={d.templateId} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '.7rem', color: 'var(--text-1)' }}>
+                <input type="checkbox" checked={covering!.ids.includes(d.templateId)}
+                  onChange={e => setCovering({ sleeveId: s.id, ids: e.target.checked
+                    ? [...covering!.ids, d.templateId] : covering!.ids.filter(x => x !== d.templateId) })} />
+                {d.name}
+              </label>
             ))}
-            {canEdit && (
-              <button className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start', fontSize: '.66rem', padding: '0 4px' }}
-                      onClick={() => onUpload(s, state)}>
-                <Plus size={10} /> Add another
-              </button>
-            )}
+            <div style={{ display: 'flex', gap: 6, marginTop: 3 }}>
+              <button className="btn btn-primary btn-sm" onClick={() => saveCoverings(s.id, covering!.ids)}>Save</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setCovering(null)}>Cancel</button>
+            </div>
           </div>
         )}
       </div>
@@ -236,10 +259,10 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
               const inGroup = sleeves.filter(x => (x.group ?? (x.kind === 'government' ? 'government' : 'all_rentals')) === g)
               if (!inGroup.length) return null
               return (
-                <div key={g} style={{ marginTop: 10 }}>
-                  <div style={{ fontSize: '.68rem', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase',
-                                color: 'var(--text-3)', margin: '4px 0 8px' }}>{GROUP_LABEL[g]}</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: 10 }}>
+                <div key={g} style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: '.64rem', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase',
+                                color: 'var(--text-3)', margin: '2px 0 5px' }}>{GROUP_LABEL[g]}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 6 }}>
                     {inGroup.map(x => renderSleeve(x, state))}
                   </div>
                 </div>

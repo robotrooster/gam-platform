@@ -95,6 +95,26 @@ const receipt = (lastPage: number, first: { x: number; y: number }, last: { x: n
 // its packages never carry lead paperwork that does not apply to it.
 const DWELLINGS = ['apartment', 'single_family', 'mobile_home', 'hotel_room']
 
+// Receipt where the clear space is somewhere else on each page — initials on
+// the first page, initials and date on the last, each placed by hand after
+// looking at the rendered page.
+const receiptAt = (lastPage: number, first: { x: number; y: number },
+                   lastInitials: { x: number; y: number }, lastDate: { x: number; y: number }): Field[] => [
+  { type: 'initials', role: 'primary', label: 'Received this — initials, first page', column: 'tenant_initial',
+    page: 1, x: first.x, y: first.y, w: 56, h: 16, required: true },
+  { type: 'initials', role: 'primary', label: 'Received this — initials, last page', column: 'tenant_initial',
+    page: lastPage, x: lastInitials.x, y: lastInitials.y, w: 56, h: 16, required: true },
+  { type: 'date', role: 'primary', label: 'Date received', column: 'date_signed',
+    page: lastPage, x: lastDate.x, y: lastDate.y, w: 90, h: 16, required: true },
+]
+
+// A form's own "Printed Name / Signature / Date" row, one per tenant.
+const signRow = (page: number, top: number, role: string, nameColumn: string): Field[] => [
+  { type: 'text', role, label: 'Printed name', column: nameColumn, page, x: 120, y: top - 1, w: 150, h: 15, required: false },
+  { type: 'signature', role, label: 'Signature', column: 'tenant_signature', page, x: 333, y: top - 3, w: 122, h: 17, required: true },
+  { type: 'date', role, label: 'Date', column: 'date_signed', page, x: 490, y: top - 1, w: 76, h: 15, required: true },
+]
+
 const DOCS: Doc[] = [
   {
     file: 'library-us-epa-lessor-lead-disclosure.pdf',
@@ -183,6 +203,87 @@ const DOCS: Doc[] = [
     publicationRef: '765 ILCS 745, IDPH printing of May 31, 2018',
     effectiveFrom: '2018-05-31',
     fields: receipt(20, { x: 450, y: 742 }, { x: 72, y: 722 }),
+  },
+  // ── Arizona ───────────────────────────────────────────────────────────
+  // ARS 33-1319 has landlords give "bedbug educational materials" and names
+  // state agencies and universities as sources. This is the one written for
+  // exactly that statute. The Department of Housing's own booklets (the
+  // residential act, the mobile home act and its annual summary) could not be
+  // fetched — its site blocks automated downloads — and are added by hand.
+  {
+    file: 'library-az-ua-bed-bug-landlords-tenants.pdf',
+    name: 'Arizona: Bed Bug Control — What Landlords and Tenants Need to Know (2012)',
+    description: 'University of Arizona Cooperative Extension guide to bed bugs in multi-family housing, written for the landlord and tenant duties in ARS 33-1319.',
+    disclosureType: 'bed_bugs', jurisdiction: 'AZ', appliesTo: 'any',
+    // The statute leaves out single-family homes.
+    unitTypes: ['apartment', 'mobile_home', 'hotel_room'],
+    sourceName: 'University of Arizona Cooperative Extension',
+    sourceUrl: 'https://acis.cals.arizona.edu/docs/default-source/community-ipm-documents/public-health-ipm/bed-bugs/az1563.pdf',
+    publicationRef: 'AZ1563, May 2012', effectiveFrom: '2012-05-01',
+    fields: receiptAt(6, { x: 522, y: 4 }, { x: 460, y: 4 }, { x: 520, y: 4 }),
+  },
+  // ── Illinois ──────────────────────────────────────────────────────────
+  {
+    file: 'library-il-idhr-safe-homes-summary-2025.pdf',
+    name: 'Illinois: Summary of Rights for Safer Homes (Safe Homes Act, October 2025)',
+    description: "The Illinois Department of Human Rights' summary of tenants' rights under the Safe Homes Act for survivors of domestic violence, dating violence, sexual assault and stalking. Each page carries its own tenant acknowledgement.",
+    disclosureType: 'domestic_violence_rights', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
+    sourceName: 'Illinois Department of Human Rights',
+    sourceUrl: 'https://dhr.illinois.gov/content/dam/soi/en/web/dhr/publications/documents/sfa/Summary%20of%20Rights%20for%20Safer%20Homes%20-%20Safe%20Homes%20Act%20Lease%20Document%20-%2010-2025.rev2.pdf',
+    publicationRef: 'IDHR, V.2025-1.2', effectiveFrom: '2025-10-01',
+    fields: [
+      ...signRow(1, 670.6, 'primary', 'tenant_name'), ...signRow(1, 699.9, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(2, 661.7, 'primary', 'tenant_name'), ...signRow(2, 691.0, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(3, 660.9, 'primary', 'tenant_name'), ...signRow(3, 690.2, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(4, 676.2, 'primary', 'tenant_name'), ...signRow(4, 705.5, 'co_tenant_1', 'tenant_2_name'),
+    ],
+  },
+  {
+    file: 'library-il-iema-radon-disclosure-lease.pdf',
+    name: 'Illinois: Disclosure of Information on Radon Hazards — Tenants',
+    description: "IEMA's radon disclosure for current and prospective tenants: the radon warning statement, the landlord's disclosure of known radon levels and records, and the tenant's acknowledgement of receiving them and the Radon Guide for Tenants.",
+    disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
+    sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
+    sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/disclosureradonhazards.pdf',
+    publicationRef: 'Illinois Radon Awareness Act, 420 ILCS 46', effectiveFrom: '2026-09-21',
+    fields: [
+      { type: 'text', role: null, label: 'Dwelling unit address', column: 'property_address', page: 1, x: 195, y: 280, w: 320, h: 14, required: false },
+      onBlank('landlord', '(a) No knowledge of elevated radon', 1, 88.3, 320.9, 33, false),
+      onBlank('landlord', '(b) Elevated radon known to be present', 1, 88.3, 352.2, 33, false),
+      onBlank('landlord', '(c) Records and reports provided', 1, 88.3, 383.5, 33, false),
+      onBlank('primary', '(d) Received the information listed above', 1, 88.3, 433.6, 33, true),
+      onBlank('primary', '(e) Received the pamphlet Radon Guide for Tenants', 1, 88.3, 452.2, 33, true),
+      { type: 'text', role: 'landlord', label: 'Lessor printed name', column: 'landlord_name', page: 1, x: 124, y: 561, w: 140, h: 13, required: false },
+      { type: 'signature', role: 'landlord', label: 'Lessor signature', column: 'landlord_signature', page: 1, x: 124, y: 591, w: 140, h: 15, required: true },
+      { type: 'date', role: 'landlord', label: 'Lessor date', column: 'date_signed', page: 1, x: 340, y: 592, w: 92, h: 13, required: true },
+      { type: 'text', role: 'primary', label: 'Tenant printed name', column: 'tenant_name', page: 1, x: 124, y: 624, w: 140, h: 13, required: false },
+      { type: 'signature', role: 'primary', label: 'Tenant signature', column: 'tenant_signature', page: 1, x: 124, y: 654, w: 140, h: 15, required: true },
+      { type: 'date', role: 'primary', label: 'Tenant date', column: 'date_signed', page: 1, x: 340, y: 655, w: 92, h: 13, required: true },
+    ],
+  },
+  {
+    file: 'library-il-iema-radon-guide-for-tenants.pdf',
+    name: 'Illinois: Radon Guide for Tenants',
+    description: "IEMA's pamphlet for renters: what radon is, how to find out whether a home has a radon problem, and what a tenant can do about it. Line (e) of the Illinois radon disclosure is the tenant's receipt of this guide.",
+    disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
+    sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
+    sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/radonguidefortenants.pdf',
+    publicationRef: 'Radon Guide for Tenants', effectiveFrom: '2026-09-21',
+    fields: receiptAt(8, { x: 170, y: 548 }, { x: 40, y: 540 }, { x: 40, y: 562 }),
+  },
+  // NOT stocked: IEMA's "Radon Testing Guidelines for Real Estate Transactions".
+  // The agency's PDF is encrypted against editing, so no signature box can be
+  // stamped on it without removing their lock — which would be altering their
+  // document. Revisit if IEMA publishes an unlocked copy.
+  {
+    file: 'library-il-ag-landlord-tenant-rights.pdf',
+    name: 'Illinois: Landlord and Tenant Rights and Laws (Attorney General, 2024)',
+    description: "The Illinois Attorney General's fact sheet on the rights and responsibilities of landlords and tenants: security deposits, repairs, evictions and where to get help.",
+    disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
+    sourceName: 'Illinois Attorney General',
+    sourceUrl: 'https://illinoisattorneygeneral.gov/Page-Attachments/LandlordAndTenantRightsLaws.pdf',
+    publicationRef: 'Fact sheet, 01/24', effectiveFrom: '2024-01-01',
+    fields: receiptAt(3, { x: 520, y: 24 }, { x: 72, y: 752 }, { x: 142, y: 752 }),
   },
 ]
 

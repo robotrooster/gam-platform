@@ -207,6 +207,9 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
       } else if (s.cards.length) {
         const pick = s.kind === 'lease' ? (s.cards.find((c: any) => c.isUnitTypeDefault) ?? s.cards[0]) : s.cards[0]
         wanted.push({ templateId: pick.templateId })
+      } else if (s.freeVersion) {
+        // The state's own version, until the landlord uploads theirs.
+        wanted.push(s.freeVersion.templateId ? { templateId: s.freeVersion.templateId } : { lib: s.freeVersion.libraryDocumentId })
       }
     }
     setAdding(true)

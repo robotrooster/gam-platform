@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 3ULgRBwDIJUvcRaaRCcf9eaiCkvCz3Kudrj1WQUFa8LouuVyvldwKgB2BC4PNgm
+\restrict e0KD4lu8a6Ox0WAzSA5XDwCk3qXlFzfpYRjGmS9dGTacF5jcQSgpj70BmG4kPdj
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3586,7 +3586,7 @@ CREATE TABLE public.disbursements (
 
 CREATE TABLE public.disclosure_library_documents (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    disclosure_type text NOT NULL,
+    disclosure_type text,
     jurisdiction text NOT NULL,
     applies_to text DEFAULT 'any'::text NOT NULL,
     unit_types text[],
@@ -3603,6 +3603,7 @@ CREATE TABLE public.disclosure_library_documents (
     retired_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    purpose text DEFAULT 'state_disclosure'::text NOT NULL,
     CONSTRAINT disclosure_library_documents_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'rental'::text, 'sale'::text])))
 );
 
@@ -27839,5 +27840,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 3ULgRBwDIJUvcRaaRCcf9eaiCkvCz3Kudrj1WQUFa8LouuVyvldwKgB2BC4PNgm
+\unrestrict e0KD4lu8a6Ox0WAzSA5XDwCk3qXlFzfpYRjGmS9dGTacF5jcQSgpj70BmG4kPdj
 

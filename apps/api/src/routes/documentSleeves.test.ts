@@ -195,3 +195,58 @@ describe('packages', () => {
     expect(p.state_code).toBe('IL')
   })
 })
+
+describe('replacing a template\'s PDF', () => {
+  // Boxes are kept by page and position, apart from the PDF — a replacement
+  // slides in underneath them unless it drops a page a box is on.
+  it('keeps the boxes, and refuses a PDF missing a page one sits on', async () => {
+    const id = (await request(app()).post('/api/esign/templates').set('Authorization', `Bearer ${token(il)}`)
+      .send({ name: 'Lot Lease', sleeveId: s.ilMhLease, basePdfUrl: '/api/esign/files/old.pdf', pageCount: 9 }).expect(201)).body.data.id
+    await query(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, page, x, y) VALUES ($1,'signature','primary',9,50,50)`, [id])
+
+    const r = await request(app()).patch(`/api/esign/templates/${id}`).set('Authorization', `Bearer ${token(il)}`)
+      .send({ basePdfUrl: '/api/esign/files/new.pdf', pageCount: 8 }).expect(409)
+    expect(String(r.body.error || r.body.message)).toMatch(/page 9/)
+
+    await request(app()).patch(`/api/esign/templates/${id}`).set('Authorization', `Bearer ${token(il)}`)
+      .send({ basePdfUrl: '/api/esign/files/new.pdf', pageCount: 9 }).expect(200)
+    const t = (await query<any>(`SELECT base_pdf_url FROM lease_templates WHERE id=$1`, [id]))[0]
+    expect(t.base_pdf_url).toBe('/api/esign/files/new.pdf')
+    expect((await query<any>(`SELECT count(*)::int c FROM lease_template_fields WHERE template_id=$1`, [id]))[0].c).toBe(1)
+  })
+})
+
+describe('free government versions', () => {
+  it('a state\'s own version fills its sleeve until the landlord uploads theirs, and sits in the section underneath', async () => {
+    await query(
+      `INSERT INTO disclosure_library_documents (disclosure_type, jurisdiction, applies_to, unit_types, name, source_name, source_url, base_pdf_url)
+       VALUES ('park_rules','IL','any',ARRAY['mobile_home'],'Illinois: Model Park Rules','IDPH','https://idph/x','/api/esign/files/m.pdf')`)
+    const st = (await sleevesOf(il)).states[0]
+    const rules = st.sleeves.find((x: any) => x.id === s.ilRules)
+    expect(rules.filled).toBe(true)
+    expect(rules.freeVersion.title).toBe('Illinois: Model Park Rules')
+    // and underneath, with the other government documents — last
+    expect(st.sleeves[st.sleeves.length - 1].group).toBe('government')
+
+    await request(app()).post('/api/esign/templates').set('Authorization', `Bearer ${token(il)}`)
+      .send({ name: 'Our Own Rules', sleeveId: s.ilRules }).expect(201)
+    const after = (await sleevesOf(il)).states[0].sleeves.find((x: any) => x.id === s.ilRules)
+    expect(after.cards.map((c: any) => c.name)).toEqual(['Our Own Rules'])
+  })
+
+  it('a state model lease lines up with that state\'s lease sleeve', async () => {
+    await query(
+      `INSERT INTO disclosure_library_documents (purpose, disclosure_type, jurisdiction, applies_to, unit_types, name, source_name, source_url, base_pdf_url)
+       VALUES ('lease',NULL,'IL','rental',ARRAY['mobile_home'],'Illinois: Model Lot Lease','State','https://x','/api/esign/files/l.pdf')`)
+    const lease = (await sleevesOf(il)).states[0].sleeves.find((x: any) => x.id === s.ilMhLease)
+    expect(lease.freeVersion.title).toBe('Illinois: Model Lot Lease')
+  })
+})
+
+describe('uploading a PDF', () => {
+  it('refuses one that is locked against editing — it could never be signed', async () => {
+    const r = await request(app()).post('/api/esign/upload').set('Authorization', `Bearer ${token(il)}`)
+      .attach('file', Buffer.from('%PDF-1.4\n1 0 obj<</Filter/Standard/V 1/R 2/O(x)/U(y)/P -4>>endobj\ntrailer<</Encrypt 1 0 R/Root 2 0 R>>\n%%EOF'), 'locked.pdf')
+    expect(r.status).toBe(400)
+  })
+})
