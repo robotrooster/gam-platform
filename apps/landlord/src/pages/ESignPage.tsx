@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { Fragment, useState, useRef, useCallback, useEffect } from 'react'
 import SigningPackagesPanel from './SigningPackagesPanel'
-import GovernmentFormsPanel from './GovernmentFormsPanel'
+import TemplateLibrarySection from './TemplateLibrarySection'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
@@ -10,6 +10,7 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLock
   AUTO_PLACE_ESTIMATE, autoPlaceTimeoutMs, LEASE_COLUMN_CATEGORY, FEE_TYPE_META,
   SCREENING_FEE_EXCLUSION_REASON,
   isAutoFilledLeaseColumn, matchesUnitQuery,
+  LEASE_TEMPLATE_PURPOSE_LABEL,
 } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
@@ -1814,8 +1815,8 @@ export function ESignPage() {
     { id:'templates', label:'Templates', perm:'esign.tab.templates' },
     // S641: a package is a list of templates, so it is gated with them.
     { id:'packages',  label:'Packages',  perm:'esign.tab.templates' },
-    // S652: government-published forms become templates, so they are gated
-    // with templates too.
+    // S652: read-only reference. The same forms are already in Templates,
+    // which is where their boxes are placed.
     { id:'government', label:'Government Forms', perm:'esign.tab.templates' },
   ].filter(t => can(t.perm))
   const visibleTabIds = TABS.map(t => t.id).join(',')
@@ -1847,12 +1848,8 @@ export function ESignPage() {
       </div>
 
       {tab === 'packages' && <SigningPackagesPanel />}
-      {tab === 'government' && (
-        <GovernmentFormsPanel onEditBoxes={async (templateId) => {
-          const full = await apiGet<any>(`/esign/templates/${templateId}`)
-          setEditTemplate(full)
-        }} />
-      )}
+      {tab === 'government' && <TemplateLibrarySection mode="reference" />}
+
 
       {/* Documents */}
       {tab === 'documents' && (documents as any[]).length > 0 && (
@@ -2094,64 +2091,79 @@ export function ESignPage() {
               </span>
             </div>
           )}
-          {tmplLoading ? <div style={{ padding:32, textAlign:'center', color:'var(--text-3)' }}>Loading…</div> :
-          (templates as any[]).length === 0 ? (
-            <div className="empty-state" style={{ padding:48 }}>
-              <FileText size={40} />
-              <h3>No templates yet</h3>
-              <p>Create a template to define reusable signature fields.</p>
-              {can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={14} /> New Template</button>}
-            </div>
-          ) : (
-            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))', gap:12 }}>
-              {(templates as any[]).map(t => (
-                <div key={t.id} className="card" style={{ padding:'16px' }}>
-                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
-                    <div>
-                      <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:2 }}>
-                        <span style={{ fontWeight:700, color:'var(--text-0)' }}>{t.name}</span>
-                        {t.purpose === 'work_trade_addendum' && (
-                          <span title="Attaches to a renewal when a work-trade tenant needs a fresh tenancy" style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--text-1)', border:'1px solid var(--border-1)', borderRadius:4, padding:'1px 5px' }}>Work-Trade Addendum</span>
-                        )}
-                        {t.isUnitTypeDefault && (
-                          <span title={`Default lease for ${t.unitType ? humanize(t.unitType) : 'this unit type'}`} style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--gold)', border:'1px solid var(--gold)', borderRadius:4, padding:'1px 5px' }}>Default</span>
+          {/* S652 — Nic: "have it where the landlord uploaded templates are pinned
+              in like a top row and all the library is... a clear section header
+              that says library... instead of having all these templates have
+              that big of a KPI card, maybe it's just a briefer view." One line
+              per template, alphabetical (the API sorts). A library form's
+              landlord copy is listed under Library, not here. */}
+          {(() => {
+            const own = (templates as any[]).filter(t => !t.libraryDocumentId)
+            const openEditor = async (id: string) => {
+              const full = await apiGet<any>(`/esign/templates/${id}`)
+              setEditTemplate(full)
+            }
+            return (
+              <>
+                <div style={{ fontSize:'.72rem', fontWeight:700, letterSpacing:'.06em', textTransform:'uppercase' as const,
+                              color:'var(--text-3)', marginBottom:8 }}>Your templates</div>
+                {tmplLoading ? <div style={{ padding:24, textAlign:'center', color:'var(--text-3)' }}>Loading…</div> :
+                own.length === 0 ? (
+                  <div className="card" style={{ padding:'18px 16px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' as const }}>
+                    <FileText size={18} style={{ color:'var(--text-3)' }} />
+                    <span style={{ fontSize:'.82rem', color:'var(--text-2)', flex:1 }}>
+                      No templates of your own yet. Upload a lease or any form you use, and place its signature boxes once.
+                    </span>
+                    {can('esign.template_manage') && <button className="btn btn-primary btn-sm" onClick={() => setShowNewTemplate(true)}><Plus size={13} /> New Template</button>}
+                  </div>
+                ) : (
+                  <div className="card" style={{ padding:0, overflow:'hidden' }}>
+                    {own.map((t, i) => (
+                      <div key={t.id} style={{ display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' as const,
+                                               padding:'10px 14px', borderTop: i ? '1px solid var(--border-0)' : 'none' }}>
+                        <div style={{ flex:'1 1 320px', minWidth:0 }}>
+                          <div style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' as const }}>
+                            <span style={{ fontWeight:600, color:'var(--text-0)', fontSize:'.88rem' }}>{t.name}</span>
+                            {t.purpose === 'work_trade_addendum' && (
+                              <span title="Attaches to a renewal when a work-trade tenant needs a fresh tenancy" style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--text-1)', border:'1px solid var(--border-1)', borderRadius:4, padding:'1px 5px' }}>Work-Trade Addendum</span>
+                            )}
+                            {t.isUnitTypeDefault && (
+                              <span title={`Default lease for ${t.unitType ? humanize(t.unitType) : 'this unit type'}`} style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--gold)', border:'1px solid var(--gold)', borderRadius:4, padding:'1px 5px' }}>Default</span>
+                            )}
+                          </div>
+                          <div style={{ fontSize:'.7rem', color:'var(--text-3)', marginTop:1 }}>
+                            {(LEASE_TEMPLATE_PURPOSE_LABEL as any)[t.purpose] || 'Lease'}
+                            {' · '}{t.unitType ? humanize(t.unitType) : 'any unit type'}
+                            {' · '}{t.propertyName || 'any property'}
+                            {' · '}{t.fieldCount} boxes · {t.pageCount} {t.pageCount === 1 ? 'page' : 'pages'}
+                            {t.purpose === 'lease' && <>{' · '}{t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'month-to-month'}</>}
+                          </div>
+                        </div>
+                        {can('esign.template_manage') && (
+                          <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                            <button className="btn btn-primary btn-sm" onClick={() => openEditor(t.id)}>
+                              <Settings size={12} /> Edit boxes
+                            </button>
+                            {t.purpose !== 'work_trade_addendum' && t.unitType && !t.isUnitTypeDefault && (
+                              <button className="btn btn-primary btn-sm" disabled={setDefaultTemplateMut.isLoading} onClick={() => setDefaultTemplateMut.mutate(t.id)}>
+                                Make default
+                              </button>
+                            )}
+                            <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} title="Delete template" onClick={() => {
+                              appConfirm('Delete template "' + t.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteTemplateMut.mutate(t.id) })
+                            }}>
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
                         )}
                       </div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? humanize(t.unitType) : 'any unit type'} · {t.propertyName || 'any property'}</div>
-                      {t.purpose !== 'work_trade_addendum' && (
-                        <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:2 }}>
-                          {t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'Month-to-month'}
-                          {t.depositMonths != null ? ` · deposit ${Number(t.depositMonths)}× rent` : ' · deposit set on lease'}
-                        </div>
-                      )}
-                    </div>
-                    <FileText size={18} style={{ color:'var(--text-3)' }} />
+                    ))}
                   </div>
-                  {t.description && <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:12 }}>{t.description}</div>}
-                  {can('esign.template_manage') && (
-                    <div style={{ display:'flex', gap:6, flexWrap:'wrap' as const }}>
-                      <button className="btn btn-ghost btn-sm" onClick={async () => {
-                        const full = await apiGet<any>(`/esign/templates/${t.id}`)
-                        setEditTemplate(full)
-                      }}>
-                        <Settings size={12} /> Edit Fields
-                      </button>
-                      {t.purpose !== 'work_trade_addendum' && t.unitType && !t.isUnitTypeDefault && (
-                        <button className="btn btn-ghost btn-sm" disabled={setDefaultTemplateMut.isLoading} onClick={() => setDefaultTemplateMut.mutate(t.id)}>
-                          Make default
-                        </button>
-                      )}
-                      <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
-                        appConfirm('Delete template "' + t.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteTemplateMut.mutate(t.id) })
-                      }}>
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+                )}
+                <TemplateLibrarySection canEdit={can('esign.template_manage')} onEditBoxes={openEditor} />
+              </>
+            )
+          })()}
         </div>
       )}
 

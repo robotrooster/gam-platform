@@ -2747,9 +2747,10 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     id: 'adopt_published_form',
     audience: 'landlord', method: 'POST', path: '/api/esign/library/adopt',
     description:
-      'Put a form a government agency publishes onto their shelf, so it can go out in a packet and ' +
-      'be initialled like anything else. Use for "add the federal lead paint disclosure" or ' +
-      '"I need the Illinois park pamphlet".\n' +
+      'Get a government-published form ready to go out in a packet — every one is already listed in ' +
+      'their Templates under Library; this makes their own copy of it so it can be sent and ' +
+      'initialled. Use for "add the federal lead paint disclosure" or "I need the Illinois park ' +
+      'pamphlet". Library forms cannot be deleted, only left out of a package.\n' +
       'Named, not looked up — say the form the way they said it and the system finds it, or names ' +
       'what IS on the shelf if there is no match. The shelf already only shows forms published for ' +
       'the states they operate in and the kinds of space they run.\n' +

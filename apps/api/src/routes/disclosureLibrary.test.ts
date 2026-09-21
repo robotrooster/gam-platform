@@ -110,17 +110,26 @@ describe('GET /api/esign/library — what is on the shelf', () => {
     }
   })
 
-  it('shows a state form only where the landlord actually operates', async () => {
+  it('shows the WHOLE library, every state — and says where the landlord operates', async () => {
+    // Nic: "the whole library should be in the templates." A landlord opening
+    // in a new state needs its forms before they own a unit there.
     await shelve({ jurisdiction: 'IL', name: 'Illinois Thing' })
-    expect((await get(il).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Illinois Thing')
-    expect((await get(az).expect(200)).body.data.documents.map((d: any) => d.name)).not.toContain('Illinois Thing')
+    const r = (await get(az).expect(200)).body.data
+    expect(r.documents.map((d: any) => d.name)).toContain('Illinois Thing')
+    expect(r.operatingStates).toEqual(['AZ'])
+    expect((await get(il).expect(200)).body.data.operatingStates).toEqual(['IL'])
   })
 
-  it('a form written for one kind of space stays off the others', async () => {
-    // The IL landlord runs mobile homes, the AZ landlord RV spots.
+  it('the AGENT\'s view stays narrowed — "the lead form" means the one for where they are', async () => {
+    const { libraryForLandlord } = await import('../services/disclosureLibrary')
+    await shelve({ jurisdiction: 'IL', name: 'Illinois Thing' })
     await shelve({ jurisdiction: 'US', name: 'Mobile Homes Only', unitTypes: ['mobile_home'] })
-    expect((await get(il).expect(200)).body.data.documents.map((d: any) => d.name)).toContain('Mobile Homes Only')
-    expect((await get(az).expect(200)).body.data.documents.map((d: any) => d.name)).not.toContain('Mobile Homes Only')
+    const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+    const forAz = (await libraryForLandlord(exec, [az.landlordId])).map((d: any) => d.name)
+    expect(forAz).not.toContain('Illinois Thing')
+    expect(forAz).not.toContain('Mobile Homes Only')     // AZ runs RV spots
+    const forIl = (await libraryForLandlord(exec, [il.landlordId])).map((d: any) => d.name)
+    expect(forIl).toEqual(expect.arrayContaining(['Illinois Thing', 'Mobile Homes Only']))
   })
 
   it('names the publisher, because that is the whole claim the shelf makes', async () => {
@@ -244,13 +253,22 @@ describe('an adopted form: the words are fixed, the boxes are the landlord\'s', 
     expect(after[0].c).toBe(1)
   })
 
-  it('still lets them read it and take it off their shelf', async () => {
+  it('can be read, but not deleted — it lives in their library', async () => {
+    // Nic: "They should be in the templates and not deletable from the templates."
     await request(buildApp()).get(`/api/esign/templates/${templateId}`)
       .set('Authorization', `Bearer ${token(il)}`).expect(200)
-    await request(buildApp()).delete(`/api/esign/templates/${templateId}`)
-      .set('Authorization', `Bearer ${token(il)}`).expect(200)
+    const r = await request(buildApp()).delete(`/api/esign/templates/${templateId}`)
+      .set('Authorization', `Bearer ${token(il)}`).expect(409)
+    expect(String(r.body.error || r.body.message)).toMatch(/stays there/i)
     const t = await query<any>(`SELECT is_active FROM lease_templates WHERE id=$1`, [templateId])
-    expect(t[0].is_active).toBe(false)
+    expect(t[0].is_active).toBe(true)
+  })
+
+  it('their OWN templates still delete', async () => {
+    const own = await query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name) VALUES ($1,'My Lease') RETURNING id`, [il.landlordId])
+    await request(buildApp()).delete(`/api/esign/templates/${own[0].id}`)
+      .set('Authorization', `Bearer ${token(il)}`).expect(200)
   })
 
   it('a stranger cannot reach it at all', async () => {

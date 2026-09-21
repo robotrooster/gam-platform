@@ -85,6 +85,38 @@ export async function libraryForLandlord(q: Exec, landlordIds: string[]) {
 }
 
 /**
+ * S652 — THE WHOLE LIBRARY, for the Templates page.
+ *
+ * Nic: "the whole library should be in the templates... all the government
+ * forms are there by default, titled what they are." Not narrowed: a landlord
+ * opening a park in a new state needs that state's forms before they own a unit
+ * there. What IS returned alongside is where they operate today, so the page can
+ * open those states and leave the rest folded.
+ *
+ * libraryForLandlord (above) stays narrowed on purpose — it is what the agent
+ * resolves a spoken name against, and "the lead form" should mean the one for
+ * where they are, not a guess across fifty states.
+ */
+export async function libraryCatalog(q: Exec, landlordIds: string[]) {
+  const docs = await q.query(
+    `SELECT d.*, t.id AS adopted_template_id,
+            (SELECT count(*) FROM lease_template_fields f WHERE f.template_id = t.id)::int AS adopted_field_count
+       FROM disclosure_library_documents d
+       LEFT JOIN lease_templates t
+              ON t.library_document_id = d.id
+             AND t.landlord_id = ANY($1::uuid[])
+             AND t.is_active
+      WHERE d.retired_at IS NULL AND d.superseded_by_id IS NULL
+      ORDER BY (d.jurisdiction = 'US') DESC, d.jurisdiction, lower(d.name)`,
+    [landlordIds]).then(r => r.rows)
+  const states = await q.query(
+    `SELECT DISTINCT p.state FROM properties p
+      WHERE p.landlord_id = ANY($1::uuid[]) AND p.state IS NOT NULL
+      ORDER BY p.state`, [landlordIds]).then(r => r.rows.map((x: any) => x.state as string))
+  return { docs, operatingStates: states }
+}
+
+/**
  * Put a library form on this landlord's shelf.
  *
  * The result is a normal lease_templates row carrying library_document_id, which

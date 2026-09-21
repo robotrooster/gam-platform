@@ -571,6 +571,18 @@ export const US_STATE_NAME: Record<string, string> = {
   WA: 'Washington', WV: 'West Virginia', WI: 'Wisconsin', WY: 'Wyoming',
 }
 
+/**
+ * S652 — where a form comes from, the way a landlord says it. 'US' (and a
+ * missing code) read as Federal; a state code reads as the state's name. Used
+ * everywhere a library form is labelled, so the Templates list, the package
+ * picker and the send screen can never disagree about whether a form is
+ * federal or Illinois-only.
+ */
+export function jurisdictionLabel(code: string | null | undefined): string {
+  if (!code || code === 'US') return 'Federal'
+  return US_STATE_NAME[code] ?? code
+}
+
 export function printedUnitNumber(displayLabel: unknown, unitNumber: unknown): string {
   const source = String(displayLabel ?? '').trim() || String(unitNumber ?? '').trim()
   const stripped = source.replace(/^[A-Za-z]+[\s#]*/, '').trim()
@@ -2945,7 +2957,10 @@ export const LEASE_TEMPLATE_PURPOSE_LABEL: Record<LeaseTemplatePurpose, string> 
   work_trade_addendum: 'Work-Trade Addendum',
   installment_sale:    'Installment Sale Contract',
   park_rules:          'Park Rules',
-  state_disclosure:    'State Disclosure',
+  // S652: 'Disclosure', not 'State Disclosure'. Nic: "the EPA is federal —
+  // people are going to get confused if that's linked to a specific state."
+  // Where a form comes from is jurisdictionLabel()'s job, not this word's.
+  state_disclosure:    'Disclosure',
   addendum:            'Addendum',
   other:               'Other Document',
 }

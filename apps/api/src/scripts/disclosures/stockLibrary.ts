@@ -1,6 +1,13 @@
 /**
  * S652 — STOCK THE SHELF: the first five government forms.
  *
+ * NAMING RULE: "<Federal|State name>: <what the form is> (<edition or form no.>)".
+ * Nic: "Is that a federal document? Is that statewide? Is that Illinois only?...
+ * if there's like some states that require a certain disclosure and they all
+ * have their own similar form... it needs to have that in the title." Fifteen
+ * states' bed-bug forms must read as fifteen different documents at a glance,
+ * in every list a title appears in — not only on a page that groups them.
+ *
  * Nic: "download those five forms first, maybe put it on our to-do list for the
  * actual all of the library." And: "we also need to label them correctly in the
  * system, not just have them be the file name that happens to be on the download
@@ -86,7 +93,7 @@ const receipt = (lastPage: number, first: { x: number; y: number }, last: { x: n
 const DOCS: Doc[] = [
   {
     file: 'library-us-epa-lessor-lead-disclosure.pdf',
-    name: 'Lead-Based Paint Disclosure — Rentals (EPA Form 9600-041)',
+    name: 'Federal: Lead-Based Paint Disclosure — Rentals (EPA Form 9600-041)',
     description: "EPA's disclosure form for leasing housing built before 1978: the lead warning statement, the landlord's disclosure of known lead-based paint and records, and the tenant's acknowledgement of receiving them and the lead pamphlet.",
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: null,
     sourceName: 'U.S. Environmental Protection Agency',
@@ -115,7 +122,7 @@ const DOCS: Doc[] = [
   },
   {
     file: 'library-us-epa-seller-lead-disclosure.pdf',
-    name: 'Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)',
+    name: 'Federal: Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)',
     description: "EPA's disclosure form for selling housing built before 1978: the lead warning statement, the seller's disclosure of known lead-based paint and records, and the purchaser's acknowledgement of receiving them, the lead pamphlet, and the 10-day inspection opportunity.",
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'sale', unitTypes: null,
     sourceName: 'U.S. Environmental Protection Agency',
@@ -141,7 +148,7 @@ const DOCS: Doc[] = [
   },
   {
     file: 'library-us-epa-protect-your-family-2026.pdf',
-    name: 'Protect Your Family From Lead in Your Home (January 2026)',
+    name: 'Federal: Protect Your Family From Lead in Your Home (January 2026)',
     description: 'The lead poisoning prevention pamphlet from EPA, the Consumer Product Safety Commission and HUD. The January 2026 edition reflects the dust-lead action levels effective January 12, 2026.',
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'any', unitTypes: null,
     sourceName: 'U.S. Environmental Protection Agency, Consumer Product Safety Commission, and Department of Housing and Urban Development',
@@ -152,7 +159,7 @@ const DOCS: Doc[] = [
   },
   {
     file: 'library-il-idph-living-in-mh-community.pdf',
-    name: 'Living in a Manufactured Home Community (Illinois, 2018)',
+    name: 'Illinois: Living in a Manufactured Home Community (2018)',
     description: "The Illinois Department of Public Health's guide for residents of manufactured home communities, including the full text of the Mobile Home Landlord and Tenant Rights Act.",
     disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Illinois Department of Public Health',
@@ -163,7 +170,7 @@ const DOCS: Doc[] = [
   },
   {
     file: 'library-il-idph-mh-landlord-tenant-act.pdf',
-    name: 'Illinois Mobile Home Landlord and Tenant Rights Act (765 ILCS 745)',
+    name: 'Illinois: Mobile Home Landlord and Tenant Rights Act (765 ILCS 745)',
     description: 'The text of the Illinois Mobile Home Landlord and Tenant Rights Act, as printed by the Illinois Department of Public Health.',
     disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Illinois Department of Public Health',
@@ -200,7 +207,23 @@ async function stock() {
 
     const held = await query<{ id: string }>(
       `SELECT id FROM disclosure_library_documents WHERE base_pdf_url=$1`, [url])
-    if (held.length) { console.log('already shelved:', d.name); continue }
+    if (held.length) {
+      // This script is the one source for a library form's title. A rename here
+      // reaches the shelf AND every landlord's copy — their copy's name is not
+      // theirs to change, so it is ours to keep right.
+      const renamed = await query<{ id: string }>(
+        `UPDATE disclosure_library_documents SET name=$2, description=$3, updated_at=now()
+          WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,
+        [held[0].id, d.name, d.description])
+      const copies = await query<{ id: string }>(
+        `UPDATE lease_templates SET name=$2, description=$3, updated_at=now()
+          WHERE library_document_id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,
+        [held[0].id, d.name, d.description])
+      console.log(renamed.length || copies.length
+        ? `renamed: ${d.name} (and ${copies.length} landlord cop${copies.length === 1 ? 'y' : 'ies'})`
+        : `already shelved: ${d.name}`)
+      continue
+    }
 
     const row = await query<{ id: string }>(
       `INSERT INTO disclosure_library_documents

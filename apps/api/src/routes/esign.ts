@@ -2045,7 +2045,9 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
         AND ($2::text IS NULL OR t.unit_type IS NULL OR t.unit_type = $2)
         AND ($3::uuid IS NULL OR t.property_id IS NULL OR t.property_id = $3)
         AND ($4::text IS NULL OR t.purpose = $4)
-      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [landlordScopeIds(req.user!), unitTypeFilter, propertyFilter, purposeFilter])
+      -- S652: alphabetical. It was newest-first, which Nic read as "mostly
+      -- alphabetical except the one I added last" — an order nobody chose.
+      GROUP BY t.id, p.name ORDER BY lower(t.name)`, [landlordScopeIds(req.user!), unitTypeFilter, propertyFilter, purposeFilter])
     // S622: the prose-stated conditional fees the landlord confirmed, so the
     // editor can show what is already tracked and not re-ask on every open.
     if (templates.length > 0) {
@@ -2142,17 +2144,19 @@ function assertLibraryDocumentUnchanged(t: { library_document_id?: string | null
     `You can add, move or remove signature and initial boxes on it. To use different wording, upload your own version as a template.`)
 }
 
-// GET /api/esign/library — the shelf, narrowed to where this landlord operates.
-// Says what exists and who published it. Says nothing about what is required.
-esignRouter.get('/library', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+// GET /api/esign/library — the WHOLE government library, for the Templates page.
+// Says what exists, where it is from and who published it. Says nothing about
+// what is required. operatingStates lets the page open the states they are in.
+esignRouter.get('/library', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
-    const { libraryForLandlord } = await import('../services/disclosureLibrary')
+    const { libraryCatalog } = await import('../services/disclosureLibrary')
     const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
-    const rows = await libraryForLandlord(exec, landlordScopeIds(req.user!))
+    const { docs, operatingStates } = await libraryCatalog(exec, landlordScopeIds(req.user!))
     // The standard envelope. The portal's apiGet unwraps `.data`, so a bare
-    // { documents } read as undefined and rendered an empty shelf.
+    // object read as undefined and rendered an empty library.
     res.json({ success: true, data: {
-      documents: rows.map((d: any) => ({
+      operatingStates,
+      documents: docs.map((d: any) => ({
         id: d.id,
         name: d.name,
         description: d.description,
@@ -2169,6 +2173,7 @@ esignRouter.get('/library', requireAuth, requirePerm('esign.template_manage'), a
         effectiveFrom: d.effective_from,
         version: d.version,
         adoptedTemplateId: d.adopted_template_id,
+        fieldCount: d.adopted_template_id ? d.adopted_field_count : null,
       })),
     } })
   } catch (e) { next(e) }
@@ -2419,6 +2424,14 @@ esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.t
 
 esignRouter.delete('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
+    // S652 — Nic: "They should be in the templates and not deletable from the
+    // templates." A government form is part of every landlord's library, the
+    // way a dictionary is part of a desk; removing it from one account would
+    // only mean it has to be found again. Their OWN templates delete as before.
+    const lib = await queryOne<any>(
+      'SELECT name FROM lease_templates WHERE id=$1 AND landlord_id = ANY($2::uuid[]) AND library_document_id IS NOT NULL',
+      [req.params.id, landlordScopeIds(req.user!)])
+    if (lib) throw new AppError(409, `"${lib.name}" is a government form in your library and stays there. Leave it out of a package if you don't use it.`)
     await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id = ANY($2::uuid[])', [req.params.id, landlordScopeIds(req.user!)])
     res.json({ success: true })
   } catch (e) { next(e) }

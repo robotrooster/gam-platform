@@ -1,11 +1,12 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPut, apiDelete } from '../lib/api'
 import { toast, appConfirm } from '../components/dialogs'
 import {
   LEASE_TEMPLATE_PURPOSE_LABEL, RENEWAL_BEHAVIORS, RENEWAL_BEHAVIOR_LABEL,
-  UNIT_TYPES, UNIT_TYPE_LABEL,
+  UNIT_TYPES, UNIT_TYPE_LABEL, US_STATE_NAME, jurisdictionLabel,
 } from '@gam/shared'
+import { useLibrary, ensureLibraryCopy } from './TemplateLibrarySection'
 import { Plus, Trash2, GripVertical, Package } from 'lucide-react'
 
 /**
@@ -38,7 +39,7 @@ type Pkg = {
   isDefault: boolean
   items: Item[]
 }
-type Template = { id: string; name: string; purpose: string; unitType: string | null }
+type Template = { id: string; name: string; purpose: string; unitType: string | null; libraryDocumentId?: string | null; stateCode?: string | null }
 
 export default function SigningPackagesPanel() {
   const qc = useQueryClient()
@@ -146,6 +147,14 @@ export default function SigningPackagesPanel() {
   )
 }
 
+/** What kind of document a package row is — and for a library form, WHERE it
+ *  is from, because "Disclosure" alone cannot tell an EPA form from Illinois'. */
+function docKind(t: Template | undefined, fallbackPurpose?: string) {
+  if (t?.libraryDocumentId) return jurisdictionLabel(t.stateCode)
+  const kind = (LEASE_TEMPLATE_PURPOSE_LABEL as any)[t?.purpose || fallbackPurpose || 'lease']
+  return t?.stateCode ? `${kind} · ${jurisdictionLabel(t.stateCode)}` : kind
+}
+
 function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
   pkg: Partial<Pkg>
   templates: Template[]
@@ -158,8 +167,23 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
   const [isDefault, setIsDefault] = useState(!!pkg.isDefault)
   const [items, setItems] = useState<Item[]>(pkg.items || [])
 
+  const qc = useQueryClient()
+  const { data: library } = useLibrary()
+  const [pickState, setPickState] = useState<string>('')
+  const [adding, setAdding] = useState(false)
+  // Open on the state they operate in; they can pick any other.
+  useEffect(() => {
+    if (!pickState && library) setPickState(library.operatingStates[0] || 'AZ')
+  }, [library, pickState])
+
   const chosen = new Set(items.map(i => i.templateId))
-  const available = templates.filter(t => !chosen.has(t.id))
+  const ownAvailable = templates.filter(t => !t.libraryDocumentId && !chosen.has(t.id))
+  const libFor = (j: string) => (library?.documents ?? [])
+    .filter(d => d.jurisdiction === j && !(d.adoptedTemplateId && chosen.has(d.adoptedTemplateId)))
+  // An already-copied form goes in by its template id; one never touched is
+  // copied first (see the onChange above).
+  const libValue = (d: { id: string; adoptedTemplateId: string | null }) =>
+    d.adoptedTemplateId ?? `lib:${d.id}`
 
   const move = (from: number, to: number) => {
     if (to < 0 || to >= items.length) return
@@ -245,7 +269,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
                     {t?.name || it.templateName}
                   </div>
                   <div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>
-                    {(LEASE_TEMPLATE_PURPOSE_LABEL as any)[t?.purpose || it.purpose || 'lease']}
+                    {docKind(t, it.purpose)}
                   </div>
                 </div>
                 <label style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
@@ -272,27 +296,59 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
           })}
         </div>
 
-        {available.length > 0 && (
-          <div style={{ marginTop:14, display:'flex', alignItems:'center', gap:8 }}>
-            <select className="input" defaultValue="" style={{ maxWidth:340 }}
-              onChange={e => {
-                const id = e.target.value
-                if (!id) return
-                setItems([...items, { templateId: id, sortOrder: items.length, renewalBehavior: 'with_lease' }])
-                e.target.value = ''
-              }}>
-              <option value="">Add a document…</option>
-              {available.map(t => (
-                <option key={t.id} value={t.id}>
-                  {t.name} · {(LEASE_TEMPLATE_PURPOSE_LABEL as any)[t.purpose] || t.purpose}
-                </option>
-              ))}
-            </select>
-            <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
-              A document can be in as many packages as you like.
-            </span>
-          </div>
-        )}
+        {/* S652 — Nic: "you click add a document, you select your state, and
+            then any relevant documents to that state show up." Three groups
+            so nobody mistakes an EPA form for an Illinois one: your own
+            templates, Federal, and the chosen state's. A library form picked
+            here gets the landlord's copy made on the spot. */}
+        <div style={{ marginTop:14, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          <select className="input" value={pickState} style={{ width:'auto', minWidth:150 }}
+            onChange={e => setPickState(e.target.value)} title="Show that state's government forms">
+            {Object.entries(US_STATE_NAME).sort((a, b) => a[1].localeCompare(b[1])).map(([code, name]) => (
+              <option key={code} value={code}>{name}</option>
+            ))}
+          </select>
+          <select className="input" value="" disabled={adding} style={{ maxWidth:420 }}
+            onChange={async e => {
+              const v = e.target.value
+              if (!v) return
+              let templateId = v
+              if (v.startsWith('lib:')) {
+                setAdding(true)
+                try {
+                  templateId = await ensureLibraryCopy(v.slice(4))
+                  qc.invalidateQueries('esign-templates-all')
+                  qc.invalidateQueries('esign-library')
+                } catch (err: any) {
+                  toast.error(err?.message || 'Could not add that form'); return
+                } finally { setAdding(false) }
+              }
+              if (items.some(i => i.templateId === templateId)) return
+              setItems([...items, { templateId, sortOrder: items.length, renewalBehavior: 'with_lease' }])
+            }}>
+            <option value="">{adding ? 'Adding…' : 'Add a document…'}</option>
+            {ownAvailable.length > 0 && (
+              <optgroup label="Your templates">
+                {ownAvailable.map(t => (
+                  <option key={t.id} value={t.id}>{t.name} · {(LEASE_TEMPLATE_PURPOSE_LABEL as any)[t.purpose] || t.purpose}</option>
+                ))}
+              </optgroup>
+            )}
+            {libFor('US').length > 0 && (
+              <optgroup label="Federal">
+                {libFor('US').map(d => <option key={d.id} value={libValue(d)}>{d.name}</option>)}
+              </optgroup>
+            )}
+            <optgroup label={jurisdictionLabel(pickState)}>
+              {libFor(pickState).length === 0
+                ? <option disabled value="-">No {jurisdictionLabel(pickState)} forms in the library yet</option>
+                : libFor(pickState).map(d => <option key={d.id} value={libValue(d)}>{d.name}</option>)}
+            </optgroup>
+          </select>
+          <span style={{ fontSize:'.72rem', color:'var(--text-3)' }}>
+            A document can be in as many packages as you like.
+          </span>
+        </div>
       </div>
     </div>
   )
