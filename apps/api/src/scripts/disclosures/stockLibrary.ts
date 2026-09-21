@@ -35,7 +35,8 @@
 import fs from 'fs'
 import path from 'path'
 import { PDFDocument, rgb } from 'pdf-lib'
-import { query } from '../../db'
+import { db, query } from '../../db'
+import { resyncAdoptions } from '../../services/disclosureLibrary'
 
 const DIR = path.resolve(__dirname, '../../../uploads/leases')
 
@@ -59,6 +60,12 @@ type Doc = {
   unitTypes: string[] | null
   sourceName: string
   sourceUrl: string
+  // The agency's PAGE that lists this document — where next year's check
+  // starts. sourceUrl is the file, and goes dead with the next edition.
+  sourcePage: string
+  // A newer edition: the file it replaces. Shelving it retires the old one and
+  // moves every landlord copy onto the new edition (resyncAdoptions).
+  replaces?: string
   publicationRef: string
   effectiveFrom: string
   fields: Field[]
@@ -144,6 +151,7 @@ const DOCS: Doc[] = [
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/lesr_eng.pdf',
+    sourcePage: 'https://www.epa.gov/lead/real-estate-disclosure',
     publicationRef: 'EPA Form 9600-041; 40 CFR 745.113(b)',
     effectiveFrom: '2026-09-21',
     fields: [
@@ -173,6 +181,7 @@ const DOCS: Doc[] = [
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'sale', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency',
     sourceUrl: 'https://www.epa.gov/sites/default/files/documents/selr_eng.pdf',
+    sourcePage: 'https://www.epa.gov/lead/real-estate-disclosure',
     publicationRef: 'EPA Form 9600-040; 40 CFR 745.113(a)',
     effectiveFrom: '2026-09-21',
     fields: [
@@ -199,9 +208,26 @@ const DOCS: Doc[] = [
     disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'any', unitTypes: DWELLINGS,
     sourceName: 'U.S. Environmental Protection Agency, Consumer Product Safety Commission, and Department of Housing and Urban Development',
     sourceUrl: 'https://www.epa.gov/system/files/documents/2026-02/protectyourfamily_pamphlet_2026_3.pdf',
+    sourcePage: 'https://www.epa.gov/lead/protect-your-family-lead-your-home-real-estate-disclosure',
     publicationRef: 'Protect Your Family From Lead in Your Home, January 2026 (English)',
     effectiveFrom: '2026-01-12',
     fields: receipt(20, { x: 40, y: 566 }, { x: 40, y: 540 }),
+  },
+  // 40 CFR 745.84: before renovation work in pre-1978 housing, whoever does the
+  // work — a landlord's own crew included — hands the occupants this pamphlet
+  // and gets their written acknowledgment. EPA's current edition is still the
+  // September 2011 revision (re-posted February 2026).
+  {
+    file: 'library-us-epa-renovate-right-2011.pdf',
+    name: 'Federal: The Lead-Safe Certified Guide to Renovate Right (September 2011)',
+    description: "EPA's pamphlet for occupants of pre-1978 housing before renovation, repair or painting work that disturbs painted surfaces.",
+    disclosureType: 'lead_based_paint', jurisdiction: 'US', appliesTo: 'rental', unitTypes: DWELLINGS,
+    sourceName: 'U.S. Environmental Protection Agency',
+    sourceUrl: 'https://www.epa.gov/system/files/documents/2026-02/renovateright_sept2011_color_portrait.pdf',
+    sourcePage: 'https://www.epa.gov/lead/renovate-right',
+    publicationRef: 'EPA-740-K-10-001, Revised September 2011',
+    effectiveFrom: '2011-09-01',
+    fields: receipt(20, { x: 20, y: 582 }, { x: 40, y: 120 }),
   },
   {
     file: 'library-il-idph-living-in-mh-community.pdf',
@@ -210,6 +236,7 @@ const DOCS: Doc[] = [
     disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Illinois Department of Public Health',
     sourceUrl: 'https://dph.illinois.gov/content/dam/soi/en/web/idph/files/publications/publicationsohp2018-living-manufacturedhome-community.pdf',
+    sourcePage: 'https://dph.illinois.gov/topics-services/environmental-health-protection/manufactured-modular-homes-mobile-structures.html',
     publicationRef: 'IDPH, Living in a Manufactured Home Community, 2018',
     effectiveFrom: '2018-01-01',
     fields: receipt(27, { x: 400, y: 735 }, { x: 72, y: 300 }),
@@ -221,6 +248,7 @@ const DOCS: Doc[] = [
     disclosureType: 'landlord_tenant_act', jurisdiction: 'IL', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Illinois Department of Public Health',
     sourceUrl: 'https://dph.illinois.gov/content/dam/soi/en/web/idph/files/publications/mobile-home-landlord-and-tenant-rights-act-printable-5-31-18.pdf',
+    sourcePage: 'https://dph.illinois.gov/topics-services/environmental-health-protection/manufactured-modular-homes-mobile-structures.html',
     publicationRef: '765 ILCS 745, IDPH printing of May 31, 2018',
     effectiveFrom: '2018-05-31',
     fields: receipt(20, { x: 400, y: 742 }, { x: 72, y: 722 }),
@@ -240,6 +268,7 @@ const DOCS: Doc[] = [
     unitTypes: ['apartment', 'mobile_home', 'hotel_room'],
     sourceName: 'University of Arizona Cooperative Extension',
     sourceUrl: 'https://acis.cals.arizona.edu/docs/default-source/community-ipm-documents/public-health-ipm/bed-bugs/az1563.pdf',
+    sourcePage: 'https://acis.cals.arizona.edu/community-ipm',
     publicationRef: 'AZ1563, May 2012', effectiveFrom: '2012-05-01',
     fields: receiptAt(6, { x: 420, y: 4 }, { x: 300, y: 4 }, { x: 476, y: 4 }),
   },
@@ -256,6 +285,7 @@ const DOCS: Doc[] = [
     unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'land_lot'],
     sourceName: 'Arizona Department of Housing',
     sourceUrl: 'https://housing.az.gov/sites/default/files/2024-07/Landlord_Tenant_Act_May-2023_1.pdf',
+    sourcePage: 'https://housing.az.gov/general-public/arizona-residential-landlord-and-tenant-act',
     publicationRef: 'Updated May 2023 (via web.archive.org, 2024-12-12)', effectiveFrom: '2023-05-01',
     fields: coverReceipt(180, 515),
   },
@@ -268,22 +298,27 @@ const DOCS: Doc[] = [
     disclosureType: 'landlord_tenant_act', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['mobile_home'],
     sourceName: 'Arizona Department of Housing',
     sourceUrl: 'https://housing.az.gov/sites/default/files/2024-10/AZ-Mobile-Home-Parks-Residential-Landlord-Tenant-Act-Oct_2024.pdf',
+    sourcePage: 'https://housing.az.gov/resources/mobile-home-residential-landlord-and-tenant-act',
     publicationRef: 'Revised with laws in effect as of September 14, 2024 (via web.archive.org, 2025-02-19)', effectiveFrom: '2024-09-14',
     fields: coverReceipt(180, 670),
   },
   // ── Illinois ──────────────────────────────────────────────────────────
   {
-    file: 'library-il-idhr-safe-homes-summary-2025.pdf',
-    name: 'Illinois: Summary of Rights for Safer Homes (Safe Homes Act, October 2025)',
+    // V.2025-12.3 replaced the October edition; the rights take effect
+    // January 1, 2026, and the summary is the lease's FIRST page.
+    file: 'library-il-idhr-safe-homes-summary-2025-12.pdf',
+    replaces: 'library-il-idhr-safe-homes-summary-2025.pdf',
+    name: 'Illinois: Summary of Rights for Safer Homes (Safe Homes Act, December 2025)',
     description: "The Illinois Department of Human Rights' summary of tenants' rights under the Safe Homes Act for survivors of domestic violence, dating violence, sexual assault and stalking. Each page carries its own tenant acknowledgement.",
     disclosureType: 'domestic_violence_rights', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Department of Human Rights',
-    sourceUrl: 'https://dhr.illinois.gov/content/dam/soi/en/web/dhr/publications/documents/sfa/Summary%20of%20Rights%20for%20Safer%20Homes%20-%20Safe%20Homes%20Act%20Lease%20Document%20-%2010-2025.rev2.pdf',
-    publicationRef: 'IDHR, V.2025-1.2', effectiveFrom: '2025-10-01',
+    sourceUrl: 'https://dhr.illinois.gov/content/dam/soi/en/web/dhr/publications/documents/sfa/Summary%20of%20Rights%20for%20Safer%20Homes%20-%20Safe%20Homes%20Act%20Lease%20Document%20-%2012-2025-R3.pdf',
+    sourcePage: 'https://dhr.illinois.gov/compliance/real-estate-and-housing/summary-of-rights-for-safer-homes-act.html',
+    publicationRef: 'IDHR, V.2025-12.3', effectiveFrom: '2026-01-01',
     fields: [
-      ...signRow(1, 670.6, 'primary', 'tenant_name'), ...signRow(1, 699.9, 'co_tenant_1', 'tenant_2_name'),
-      ...signRow(2, 661.7, 'primary', 'tenant_name'), ...signRow(2, 691.0, 'co_tenant_1', 'tenant_2_name'),
-      ...signRow(3, 660.9, 'primary', 'tenant_name'), ...signRow(3, 690.2, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(1, 678.4, 'primary', 'tenant_name'), ...signRow(1, 707.7, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(2, 672.2, 'primary', 'tenant_name'), ...signRow(2, 701.5, 'co_tenant_1', 'tenant_2_name'),
+      ...signRow(3, 642.5, 'primary', 'tenant_name'), ...signRow(3, 671.9, 'co_tenant_1', 'tenant_2_name'),
       ...signRow(4, 676.2, 'primary', 'tenant_name'), ...signRow(4, 705.5, 'co_tenant_1', 'tenant_2_name'),
     ],
   },
@@ -294,6 +329,7 @@ const DOCS: Doc[] = [
     disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
     sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/disclosureradonhazards.pdf',
+    sourcePage: 'https://iemaohs.illinois.gov/nrs/radon.html',
     publicationRef: 'Illinois Radon Awareness Act, 420 ILCS 46', effectiveFrom: '2026-09-21',
     fields: [
       { type: 'text', role: null, label: 'Dwelling unit address', column: 'property_address', page: 1, x: 195, y: 280, w: 320, h: 14, required: false },
@@ -317,6 +353,7 @@ const DOCS: Doc[] = [
     disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
     sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/radonguidefortenants.pdf',
+    sourcePage: 'https://iemaohs.illinois.gov/nrs/radon.html',
     publicationRef: 'Radon Guide for Tenants', effectiveFrom: '2026-09-21',
     fields: receiptAt(8, { x: 170, y: 548 }, { x: 40, y: 300, cols: 2 }, { x: 40, y: 345 }),
   },
@@ -330,6 +367,7 @@ const DOCS: Doc[] = [
     disclosureType: 'radon', jurisdiction: 'IL', appliesTo: 'sale', unitTypes: ['single_family'],
     sourceName: 'Illinois Emergency Management Agency and Office of Homeland Security',
     sourceUrl: 'https://iemaohs.illinois.gov/content/dam/soi/en/web/iemaohs/nrs/radon/documents/radontestguidelineforrealestatepamphlet.pdf',
+    sourcePage: 'https://iemaohs.illinois.gov/nrs/radon.html',
     publicationRef: 'IEMA, 2007', effectiveFrom: '2007-01-01',
     signable: false, fields: [],
   },
@@ -340,6 +378,7 @@ const DOCS: Doc[] = [
     disclosureType: 'bed_bugs', jurisdiction: 'AZ', appliesTo: 'any', unitTypes: ['apartment', 'mobile_home', 'hotel_room'],
     sourceName: 'Arizona Department of Health Services',
     sourceUrl: 'https://www.azdhs.gov/documents/preparedness/epidemiology-disease-control/food-safety-environmental-services/resources/bed-bug-toolkit.pdf',
+    sourcePage: 'https://www.azdhs.gov/preparedness/epidemiology-disease-control/food-safety-environmental-services/index.php',
     publicationRef: 'ADHS, October 2019', effectiveFrom: '2019-10-08',
     // Pages 18 and 19 are full to the edges; the cover is mostly white. Receipt
     // is one set of initials per document (Nic), so it all goes on the cover.
@@ -355,6 +394,7 @@ const DOCS: Doc[] = [
     disclosureType: 'tenant_rights_guide', jurisdiction: 'AZ', appliesTo: 'rental', unitTypes: ['apartment', 'single_family', 'mobile_home', 'hotel_room'],
     sourceName: 'City of Phoenix Neighborhood Services Department',
     sourceUrl: 'https://www.azdhs.gov/documents/preparedness/epidemiology-disease-control/childrens-environmental-health/landlord-tenant-act.pdf',
+    sourcePage: 'https://www.azdhs.gov/preparedness/epidemiology-disease-control/childrens-environmental-health/index.php',
     publicationRef: 'Revised January 2014', effectiveFrom: '2014-01-01',
     fields: receiptAt(12, { x: 110, y: 575 }, { x: 40, y: 540 }, { x: 212, y: 540 }),
   },
@@ -365,6 +405,7 @@ const DOCS: Doc[] = [
     disclosureType: 'tenant_rights_guide', jurisdiction: 'IL', appliesTo: 'rental', unitTypes: DWELLINGS,
     sourceName: 'Illinois Attorney General',
     sourceUrl: 'https://illinoisattorneygeneral.gov/Page-Attachments/LandlordAndTenantRightsLaws.pdf',
+    sourcePage: 'https://illinoisattorneygeneral.gov/Publications/',
     publicationRef: 'Fact sheet, 01/24', effectiveFrom: '2024-01-01',
     fields: receiptAt(3, { x: 420, y: 24 }, { x: 72, y: 752 }, { x: 248, y: 752 }),
   },
@@ -403,10 +444,11 @@ async function stock() {
       // reaches the shelf AND every landlord's copy — their copy's name is not
       // theirs to change, so it is ours to keep right.
       const renamed = await query<{ id: string }>(
-        `UPDATE disclosure_library_documents SET name=$2, description=$3, unit_types=$4, disclosure_type=$5, updated_at=now()
+        `UPDATE disclosure_library_documents SET name=$2, description=$3, unit_types=$4, disclosure_type=$5,
+                source_page_url=$6, updated_at=now()
           WHERE id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3 OR unit_types IS DISTINCT FROM $4
-                           OR disclosure_type IS DISTINCT FROM $5) RETURNING id`,
-        [held[0].id, d.name, d.description, d.unitTypes, d.disclosureType])
+                           OR disclosure_type IS DISTINCT FROM $5 OR source_page_url IS DISTINCT FROM $6) RETURNING id`,
+        [held[0].id, d.name, d.description, d.unitTypes, d.disclosureType, d.sourcePage])
       const copies = await query<{ id: string }>(
         `UPDATE lease_templates SET name=$2, description=$3, updated_at=now()
           WHERE library_document_id=$1 AND (name IS DISTINCT FROM $2 OR description IS DISTINCT FROM $3) RETURNING id`,
@@ -457,10 +499,10 @@ async function stock() {
     const row = await query<{ id: string }>(
       `INSERT INTO disclosure_library_documents
          (disclosure_type, jurisdiction, applies_to, unit_types, name, description,
-          source_name, source_url, publication_ref, base_pdf_url, page_count, effective_from, signable)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+          source_name, source_url, publication_ref, base_pdf_url, page_count, effective_from, signable, source_page_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
       [d.disclosureType, d.jurisdiction, d.appliesTo, d.unitTypes, d.name, d.description,
-       d.sourceName, d.sourceUrl, d.publicationRef, url, pages, d.effectiveFrom, d.signable !== false])
+       d.sourceName, d.sourceUrl, d.publicationRef, url, pages, d.effectiveFrom, d.signable !== false, d.sourcePage])
     let sort = 0
     for (const f of d.fields) {
       await query(
@@ -470,6 +512,17 @@ async function stock() {
         [row[0].id, f.type, f.role, f.label, f.column ?? null, f.page, f.x, f.y, f.w, f.h, f.required, ++sort])
     }
     console.log('shelved:', d.name, `— ${pages} pages, ${d.fields.length} boxes`)
+
+    if (d.replaces) {
+      const old = await query<{ id: string }>(
+        `UPDATE disclosure_library_documents SET superseded_by_id=$2, updated_at=now()
+          WHERE base_pdf_url=$1 AND superseded_by_id IS NULL RETURNING id`,
+        [`/api/esign/files/${d.replaces}`, row[0].id])
+      for (const o of old) {
+        const moved = await resyncAdoptions({ query: (sql, params) => db.query(sql, params) }, o.id, row[0].id)
+        console.log(`  replaces the older edition — ${moved} landlord cop${moved === 1 ? 'y' : 'ies'} moved to it`)
+      }
+    }
   }
 }
 

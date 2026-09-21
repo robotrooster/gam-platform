@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict F6E9jcFWi3yjY7sEh6OqguFQFoXHIOhjFObTLpwyey3oyHRI5r5RmO7QEKm7a2u
+\restrict Mp4Caagc5B9OCbjfsY6Jzv2qRdSFtwA7d74V97IDJCn2vDEwU1iPeu2BXIQz0ea
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3605,6 +3605,7 @@ CREATE TABLE public.disclosure_library_documents (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     purpose text DEFAULT 'state_disclosure'::text NOT NULL,
     signable boolean DEFAULT true NOT NULL,
+    source_page_url text,
     CONSTRAINT disclosure_library_documents_applies_to_check CHECK ((applies_to = ANY (ARRAY['any'::text, 'rental'::text, 'sale'::text])))
 );
 
@@ -27841,5 +27842,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict F6E9jcFWi3yjY7sEh6OqguFQFoXHIOhjFObTLpwyey3oyHRI5r5RmO7QEKm7a2u
+\unrestrict Mp4Caagc5B9OCbjfsY6Jzv2qRdSFtwA7d74V97IDJCn2vDEwU1iPeu2BXIQz0ea
 

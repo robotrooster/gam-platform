@@ -95,6 +95,22 @@ describe('reading a lease', () => {
       .map(f => f.disclosureType)
     expect(found).not.toContain('park_rules')
   })
+
+  it('a hazard the lease keeps discussing is covered with no heading — the Oak Park bed-bug clause and flyer', async () => {
+    const found = (await readDocument(path.join(DIR, await pdf([
+      'Tenant shall promptly notify Landlord upon discovery of Bed Bugs.',
+      'Tenant is advised that information about bed bugs is available online.',
+      'Bed Bugs Could be Anywhere!',
+      'Bed bugs are excellent hitchhikers, so be careful when traveling.',
+    ])))).map(f => f.disclosureType)
+    expect(found).toContain('bed_bugs')
+  })
+
+  it('one passing mention is not a section: "report pests or mold" covers nothing', async () => {
+    const found = (await readDocument(path.join(DIR, await pdf(['Tenant shall report pests, mold or leaks to Landlord.']))))
+      .map(f => f.disclosureType)
+    expect(found).not.toContain('mold')
+  })
 })
 
 describe('covering sleeves from it', () => {

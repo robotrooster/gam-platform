@@ -82,6 +82,19 @@ const BODY: Partial<Record<string, RegExp>> = {
   statutory_acknowledgement: /acknowledg\w*\s+(?:the\s+)?receipt\s+of/i,
 }
 
+// A hazard the document keeps coming back to IS a section on it, even when the
+// section is not laid out under a heading. Nic's Oak Park apartment lease has a
+// bed-bug clause in its body and EPA's bed-bug flyer stapled to the back — the
+// flyer's titles are Title Case, so no heading matched and the sleeve sat empty.
+// Three mentions: a one-line "tenant shall report pests, mold..." never reaches it.
+const REPEATED: Partial<Record<string, RegExp>> = {
+  bed_bugs: /bed ?bugs?/gi,
+  mold:     /\bmou?ld\b/gi,
+  radon:    /\bradon\b/gi,
+  asbestos: /\basbestos\b/gi,
+}
+const REPEATED_MIN = 3
+
 type Line = { text: string; page: number }
 
 /** A line reads as a heading: mostly capitals, or "N. Title:" / "EXHIBIT A — Title". */
@@ -132,6 +145,13 @@ export async function readDocument(pdfPath: string): Promise<Found[]> {
     if (found.has(cat) || !re) continue
     const m = body.match(re)
     if (m) found.set(cat, m[0].slice(0, 160))
+  }
+  for (const [cat, re] of Object.entries(REPEATED)) {
+    if (found.has(cat) || !re) continue
+    const hits = [...body.matchAll(re)]
+    if (hits.length < REPEATED_MIN) continue
+    const at = hits[0].index ?? 0
+    found.set(cat, `mentioned ${hits.length} times: …${body.slice(Math.max(0, at - 50), at + 90).trim()}…`)
   }
   for (const n of NOTICES_WHEN_IT_HAPPENS) found.delete(n)
   return [...found.entries()].map(([disclosureType, evidence]) => ({ disclosureType, evidence }))
