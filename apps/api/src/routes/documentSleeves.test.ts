@@ -113,6 +113,16 @@ describe('what a landlord sees', () => {
     expect(azView.federal).toEqual([])
     expect(JSON.stringify(azView)).not.toContain('Illinois: Guide')
   })
+
+  it('a form handed over before renovation work is marked as a when-it-happens notice, so packets skip it', async () => {
+    await query(
+      `INSERT INTO disclosure_library_documents (disclosure_type, jurisdiction, applies_to, unit_types, name, source_name, source_url, base_pdf_url)
+       VALUES ('renovation_notice','US','rental',ARRAY['mobile_home'],'Federal: Renovate Right','EPA','https://epa.gov/r','/api/esign/files/r.pdf'),
+              ('lead_based_paint','US','rental',ARRAY['mobile_home'],'Federal: Lead — Rentals','EPA','https://epa.gov/l','/api/esign/files/l.pdf')`)
+    const fed = (await sleevesOf(il)).federal
+    expect(fed.find((x: any) => x.title === 'Federal: Renovate Right')?.whenItHappens).toBe(true)
+    expect(fed.find((x: any) => x.title === 'Federal: Lead — Rentals')?.whenItHappens).toBe(false)
+  })
 })
 
 describe('filing templates', () => {

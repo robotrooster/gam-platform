@@ -2890,6 +2890,11 @@ export const DISCLOSURE_TYPES = [
   // from a guide ABOUT the law: this is what the tenant portal offers every
   // tenant as "the law for your home".
   'landlord_tenant_act',
+  // S652 — handed to the occupants BEFORE renovation work in pre-1978 housing
+  // (40 CFR 745.84, EPA's Renovate Right). Its own type because it is not a
+  // move-in document: filed under lead paint, "Fill from my documents" would
+  // have put it in every housing packet.
+  'renovation_notice',
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
@@ -2906,6 +2911,7 @@ export type DisclosureType = typeof DISCLOSURE_TYPES[number]
 export const NOTICES_WHEN_IT_HAPPENS: readonly DisclosureType[] = [
   'rent_increase_notice', 'foreclosure_status', 'park_change_of_use',
   'utility_shutoff_rights', 'condemnation_orders', 'entry_notice_policy',
+  'renovation_notice',
 ] as const
 
 export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
@@ -2955,6 +2961,7 @@ export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   statutory_acknowledgement: 'Statutory acknowledgements (pamphlet, lease offer, rules)',
   tenant_rights_guide:      'Tenant rights guide from a government agency',
   landlord_tenant_act:      'Landlord-tenant act (the law itself)',
+  renovation_notice:        'Renovation notice (lead-safe work)',
   other:                    'Other disclosure',
 }
 

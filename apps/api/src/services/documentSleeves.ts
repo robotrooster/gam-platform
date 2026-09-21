@@ -176,6 +176,9 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
 
   const govSleeve = (d: any) => ({
     id: `library:${d.id}`, kind: 'government', group: 'government', title: d.name, appliesTo: d.applies_to,
+    // Handed over when something happens (Renovate Right, before the work),
+    // never with the lease — packages leave it out.
+    whenItHappens: (NOTICES_WHEN_IT_HAPPENS as readonly string[]).includes(d.disclosure_type),
     signable: d.signable !== false,
     unitTypes: d.unit_types, libraryDocumentId: d.id, publishedBy: d.source_name, pdfUrl: d.base_pdf_url,
     cards: d.adopted_template_id

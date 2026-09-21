@@ -202,6 +202,7 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
       if (s.kind === 'sale_contract' && !sale) continue
       if (s.kind === 'government') {
         if (s.signable === false) continue       // read-only: the publisher locked it
+        if (s.whenItHappens) continue            // e.g. Renovate Right: before renovation work, not at move-in
         if (s.appliesTo === 'sale' && !sale) continue
         if (s.appliesTo === 'rental' && sale) continue
         wanted.push(s.cards[0] ? { templateId: s.cards[0].templateId } : { lib: s.libraryDocumentId })
