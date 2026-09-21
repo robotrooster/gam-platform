@@ -71,9 +71,17 @@ export async function libraryForLandlord(q: Exec, landlordIds: string[]) {
             t.id AS adopted_template_id,
             (SELECT array_agg(DISTINCT o.st) FROM operating o) AS landlord_states
        FROM disclosure_library_documents d
-       LEFT JOIN lease_templates t
-              ON t.library_document_id = d.id
-             AND t.landlord_id = ANY($1::uuid[])
+       LEFT JOIN LATERAL (
+         -- S652: ONE copy per form per viewer. An account can reach several
+         -- companies (Blu is an owner-member of Oak Park as well as his own), and
+         -- each company may hold its own copy; joining every copy listed the same
+         -- federal form twice. Prefer the copy of a company that operates in the
+         -- form's state, then the oldest.
+         SELECT t.id, t.landlord_id FROM lease_templates t
+          WHERE t.library_document_id = d.id AND t.landlord_id = ANY($1::uuid[]) AND t.is_active
+          ORDER BY EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = t.landlord_id AND p.state = d.jurisdiction) DESC,
+                   t.created_at
+          LIMIT 1) t ON true
       WHERE d.retired_at IS NULL
         AND d.superseded_by_id IS NULL
         AND (d.jurisdiction = 'US' OR d.jurisdiction IN (SELECT st FROM operating))
@@ -103,10 +111,17 @@ export async function libraryCatalog(q: Exec, landlordIds: string[]) {
     `SELECT d.*, t.id AS adopted_template_id,
             (SELECT count(*) FROM lease_template_fields f WHERE f.template_id = t.id)::int AS adopted_field_count
        FROM disclosure_library_documents d
-       LEFT JOIN lease_templates t
-              ON t.library_document_id = d.id
-             AND t.landlord_id = ANY($1::uuid[])
-             AND t.is_active
+       LEFT JOIN LATERAL (
+         -- S652: ONE copy per form per viewer. An account can reach several
+         -- companies (Blu is an owner-member of Oak Park as well as his own), and
+         -- each company may hold its own copy; joining every copy listed the same
+         -- federal form twice. Prefer the copy of a company that operates in the
+         -- form's state, then the oldest.
+         SELECT t.id, t.landlord_id FROM lease_templates t
+          WHERE t.library_document_id = d.id AND t.landlord_id = ANY($1::uuid[]) AND t.is_active
+          ORDER BY EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = t.landlord_id AND p.state = d.jurisdiction) DESC,
+                   t.created_at
+          LIMIT 1) t ON true
       WHERE d.retired_at IS NULL AND d.superseded_by_id IS NULL
         AND (d.jurisdiction = 'US' OR d.jurisdiction IN (
               SELECT p.state FROM properties p WHERE p.landlord_id = ANY($1::uuid[]) AND p.state IS NOT NULL))

@@ -197,6 +197,8 @@ function PackageEditor({ pkg, templates, onCancel, onSave, saving }: {
     const wanted: Array<{ templateId?: string; lib?: string }> = []
     for (const s of [...(st?.sleeves ?? []), ...sleeves.federal] as any[]) {
       if (!fits(s.unitTypes) || s.coveredBy?.length) continue
+      // A notice sent when something happens is never signed with the lease.
+      if (s.group === 'notices_later') continue
       if (s.kind === 'sale_contract' && !sale) continue
       if (s.kind === 'government') {
         if (s.appliesTo === 'sale' && !sale) continue

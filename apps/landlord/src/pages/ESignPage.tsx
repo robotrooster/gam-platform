@@ -101,10 +101,15 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   const systemFilled = isAutoFilledLeaseColumn(field.leaseColumn)
   const color = systemFilled ? '#64748b' : (ROLE_COLORS[field.signerRole] || '#888')
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
-  // S558 (Nic): late-fee boxes are policy-controlled — locked from move / resize
-  // / delete / edit so the landlord can't tamper with the stamped fee (anti-
-  // discrimination; the signed lease is the legal charge). S582: same lock covers
-  // rent_due_day (platform-locked to the 1st).
+  // S558 (Nic): late-fee boxes are policy-controlled — their VALUE is locked and
+  // they cannot be deleted, so the landlord can't tamper with the stamped fee
+  // (anti-discrimination; the signed lease is the legal charge).
+  //
+  // S652 (Nic): the box itself is NOT frozen. "When the box placement generator
+  // places it in the wrong spot, that needs to be selectable to be able to be
+  // moved on the page and resized... not to input the data that's in the actual
+  // box." Where auto-placement put a box is a guess about the PDF, not policy;
+  // what gets stamped in it still comes only from the property's Late Fees.
   const locked = isLockedLeaseColumn(field.leaseColumn)
 
   const onResizeMouseDown = (e: React.MouseEvent, handle: string) => {
@@ -130,7 +135,6 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
     e.stopPropagation()
     e.preventDefault()
     onSelect(field.id)
-    if (locked) return // locked late-fee box: select only, no drag
     const startX = e.clientX
     const startY = e.clientY
     let moved = false
@@ -203,7 +207,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
           background:'var(--bg-0)', padding:'0 3px', borderRadius:3, zIndex:30,
         }}>auto</div>
       )}
-      <div onMouseDown={onMouseDown} title={systemFilled ? 'Filled from the invite — nobody types this. If it is wrong, fix the invite.' : locked ? 'Late-fee field — set by the property Late Fees policy, locked' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
+      <div onMouseDown={onMouseDown} title={systemFilled ? 'Filled from the invite — nobody types this. If it is wrong, fix the invite.' : locked ? 'Late-fee field — its amount comes from the property Late Fees policy. Move or resize it to fit the form.' : isConditional ? `Shown only when ${parentLabel || 'the parent field'} = ${field.parentOption}` : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px ${isConditional ? 'dashed' : 'solid'} ${selected ? color : color + '99'}`,
         // Depth ring — drawn outside the box so it never eats the field's own
@@ -211,7 +215,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         boxShadow: depth > 0 ? `0 0 0 ${Math.max(1, Math.round(2 * scale))}px ${DEPTH_RING[Math.min(depth, 3)]}` : undefined,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
-        cursor: locked ? 'not-allowed' : 'move', userSelect:'none', boxSizing:'border-box' as const,
+        cursor: 'move', userSelect:'none', boxSizing:'border-box' as const,
         display:'flex', alignItems:'center', justifyContent:'center', gap:4,
         overflow:'visible',
       }}>
@@ -222,7 +226,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
             {field.label || ft.label}
           </span>
         )}
-        {selected && !locked && [
+        {selected && [
           { id:'e',  style:{ position:'absolute' as const, right:-5, top:'50%', transform:'translateY(-50%)', cursor:'ew-resize',   width:8, height:20, background:color, borderRadius:2, zIndex:20 } },
           { id:'s',  style:{ position:'absolute' as const, bottom:-5, left:'50%', transform:'translateX(-50%)', cursor:'ns-resize',  width:20, height:8, background:color, borderRadius:2, zIndex:20 } },
           { id:'se', style:{ position:'absolute' as const, right:-5, bottom:-5, cursor:'nwse-resize', width:10, height:10, background:color, borderRadius:2, zIndex:20 } },
@@ -852,9 +856,10 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   moved, or deleted; the landlord doesn&apos;t choose the due day.</>
                 ) : (
                   <> Late fees come from the property&apos;s <b>Late Fees</b> policy for this unit type. The amount is
-                  stamped into the lease at signing and can&apos;t be edited, moved, or deleted here — that keeps the
-                  charge identical for every tenant of the class and matching the signed document. To change late
-                  fees, update the property settings; changes apply to new leases at signing/renewal.</>
+                  stamped into the lease at signing and nobody types it or deletes the box — that keeps the charge
+                  identical for every tenant of the class and matching the signed document. <b>You can move and resize
+                  the box</b> so it lines up with the form. To change late fees, update the property settings; changes
+                  apply to new leases at signing/renewal.</>
                 )}
               </div>
             </div>

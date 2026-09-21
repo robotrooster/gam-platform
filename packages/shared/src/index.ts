@@ -737,8 +737,9 @@ export function isLockedLeaseColumn(col: string | null | undefined): boolean {
 // unit, the property, the landlord, the date it was signed. None of it is
 // anybody's to fill in.
 //
-// Distinct from isLockedLeaseColumn: a locked field also cannot be moved,
-// resized or deleted, because its VALUE is policy. An auto-filled field is
+// Distinct from isLockedLeaseColumn: a locked field's VALUE is policy and it
+// cannot be deleted. (S652: it CAN be moved and resized — the box's value is
+// locked, not where auto-placement happened to put it.) An auto-filled field is
 // ordinary furniture — the landlord places it, labels it, and deletes it if the
 // form has no such blank. They just never fill it.
 // S635 (Nic): "month to month printed raw on all the leases I just sent."
@@ -2887,6 +2888,20 @@ export const DISCLOSURE_TYPES = [
   'other',
 ] as const
 export type DisclosureType = typeof DISCLOSURE_TYPES[number]
+
+/**
+ * S652 — documents a landlord SENDS WHEN SOMETHING HAPPENS, not hands over at
+ * signing: the rent is going up, the park is changing use, the property is in
+ * foreclosure, the water will be off, someone needs to come in. Found reading a
+ * real lease: "Fill from my documents" would otherwise have put a Rent Increase
+ * Notice into a signing packet, and a lease can never "contain" a notice that
+ * has not happened yet. They get their own heading on the Templates page, and
+ * packages and lease-reading both leave them out.
+ */
+export const NOTICES_WHEN_IT_HAPPENS: readonly DisclosureType[] = [
+  'rent_increase_notice', 'foreclosure_status', 'park_change_of_use',
+  'utility_shutoff_rights', 'condemnation_orders', 'entry_notice_policy',
+] as const
 
 export const DISCLOSURE_TYPE_LABEL: Record<DisclosureType, string> = {
   owner_agent_identity:     'Owner / agent identity and address',

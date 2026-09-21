@@ -31,7 +31,7 @@ export type Sleeve = {
   id: string; kind: 'lease' | 'sale_contract' | 'disclosure' | 'government'
   title: string; number: number; filled: boolean; unitTypes: string[] | null
   cards: SleeveCard[]; libraryDocumentId?: string; publishedBy?: string; pdfUrl?: string
-  coveredBy?: Array<{ templateId: string; name: string }>
+  coveredBy?: Array<{ templateId: string; name: string; source?: 'auto' | 'manual'; evidence?: string | null }>
   group?: string
 }
 type StateGroup = { state: string; unitTypes: string[]; sleeves: Sleeve[]; filled: number; total: number }
@@ -61,6 +61,8 @@ const GROUP_LABEL: Record<string, string> = {
   mobile_home_lots: 'Mobile home lots',
   rv_sites: 'RV & camp sites',
   storage: 'Storage',
+  // Sent when something happens — never part of a signing packet.
+  notices_later: 'Notices you send later',
 }
 const GROUP_ORDER = Object.keys(GROUP_LABEL)
 
@@ -153,9 +155,11 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
           </div>
         ) : s.coveredBy && s.coveredBy.length > 0 ? (
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
-            <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>Included in</span>
             {s.coveredBy.map(c => (
-              <span key={c.templateId} style={{ fontSize: '.72rem', color: 'var(--text-1)' }}>{c.name}</span>
+              <span key={c.templateId} style={{ fontSize: '.72rem', color: 'var(--text-1)' }}
+                    title={c.source === 'auto' && c.evidence ? `Read from the document: "${c.evidence}"` : undefined}>
+                <span style={{ color: 'var(--text-3)' }}>{c.source === 'auto' ? 'Found in ' : 'Included in '}</span>{c.name}
+              </span>
             ))}
             {canEdit && (
               <button className="btn btn-primary btn-sm" style={{ alignSelf: 'flex-start', marginTop: 3 }}
@@ -170,7 +174,7 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
               <button className="btn btn-primary btn-sm" onClick={() => onUpload(s, state)}><Plus size={11} /> Upload</button>
               {/* Only a document can live inside another one — a lease or a sale
                   contract is its own document. */}
-              {s.kind === 'disclosure' && ownDocs.length > 0 && (
+              {s.kind === 'disclosure' && s.group !== 'notices_later' && ownDocs.length > 0 && (
                 <button className="btn btn-primary btn-sm" onClick={() => setCovering({ sleeveId: s.id, ids: [] })}>
                   It's in another document
                 </button>
@@ -214,7 +218,9 @@ export default function TemplateSleeves({ canEdit, onEdit, onUpload, onMakeDefau
   }
 
   const section = (key: string, label: string, sub: string, sleeves: Sleeve[], state: string) => {
-    const isClosed = closed[key] ?? false
+    // Nic: "have everything closed by default... you don't want to close
+    // freaking 10 states to get down to the state that you want."
+    const isClosed = closed[key] ?? true
     return (
       <div key={key} className="card" style={{ padding: 0, marginBottom: 12, overflow: 'hidden' }}>
         <button onClick={() => setClosed({ ...closed, [key]: !isClosed })}

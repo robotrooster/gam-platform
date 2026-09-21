@@ -102,7 +102,8 @@ export default function TemplateLibrarySection({ mode = 'templates', canEdit = f
   }, {})
   const order = Object.keys(groups).sort((a, b) =>
     a === 'US' ? -1 : b === 'US' ? 1 : jurisdictionLabel(a).localeCompare(jurisdictionLabel(b)))
-  const isOpen = (j: string) => open[j] ?? (j === 'US' || data.operatingStates.includes(j))
+  // Closed until opened — Nic: "have everything closed by default."
+  const isOpen = (j: string) => open[j] ?? false
 
   const editBoxes = async (d: LibraryDoc) => {
     setBusy(d.id)

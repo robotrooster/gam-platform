@@ -15,6 +15,7 @@
  * document is required; an empty sleeve is simply empty.
  */
 import { AppError } from '../middleware/errorHandler'
+import { NOTICES_WHEN_IT_HAPPENS } from '@gam/shared'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
 
@@ -26,9 +27,12 @@ type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
  * mobile home lots, RV and camp sites, and storage — the kind of space the act
  * that put the sleeve there governs.
  */
-export const SLEEVE_GROUPS = ['contracts', 'government', 'all_rentals', 'mobile_home_lots', 'rv_sites', 'storage'] as const
-export function groupOf(kind: string, unitTypes: string[]): typeof SLEEVE_GROUPS[number] {
+export const SLEEVE_GROUPS = ['contracts', 'government', 'all_rentals', 'mobile_home_lots', 'rv_sites', 'storage', 'notices_later'] as const
+export function groupOf(kind: string, unitTypes: string[], disclosureType?: string | null): typeof SLEEVE_GROUPS[number] {
   if (kind === 'lease' || kind === 'sale_contract') return 'contracts'
+  // Sent when something happens, never handed over at signing — their own
+  // heading, and packages leave them out.
+  if (disclosureType && (NOTICES_WHEN_IT_HAPPENS as readonly string[]).includes(disclosureType)) return 'notices_later'
   if (unitTypes.length === 1 && unitTypes[0] === 'mobile_home') return 'mobile_home_lots'
   if (unitTypes.includes('rv_spot') || unitTypes.includes('campsite')) return 'rv_sites'
   if (unitTypes.length === 1 && unitTypes[0] === 'storage') return 'storage'
@@ -137,23 +141,33 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
       ORDER BY lower(t.name)`, [landlordIds]).then(r => r.rows)
 
   const coverings = await q.query(
-    `SELECT c.sleeve_id, t.id AS template_id, t.name
+    `SELECT c.sleeve_id, t.id AS template_id, t.name, c.source, c.evidence
        FROM sleeve_coverings c JOIN lease_templates t ON t.id = c.template_id AND t.is_active
       WHERE c.landlord_id = ANY($1::uuid[])`, [landlordIds]).then(r => r.rows)
   // Several documents can cover one sleeve — Nic's two properties each have a
   // lease, and the owner disclosure is inside both.
-  const coveredBy = new Map<string, Array<{ templateId: string; name: string }>>()
+  const coveredBy = new Map<string, Array<{ templateId: string; name: string; source: string; evidence: string | null }>>()
   for (const c of coverings as any[]) {
     const list = coveredBy.get(c.sleeve_id) ?? []
-    list.push({ templateId: c.template_id, name: c.name }); coveredBy.set(c.sleeve_id, list)
+    list.push({ templateId: c.template_id, name: c.name, source: c.source, evidence: c.evidence })
+    coveredBy.set(c.sleeve_id, list)
   }
 
   const library = await q.query(
     `SELECT d.*, t.id AS adopted_template_id,
             (SELECT count(*) FROM lease_template_fields f WHERE f.template_id = t.id)::int AS adopted_field_count
        FROM disclosure_library_documents d
-       LEFT JOIN lease_templates t ON t.library_document_id = d.id
-             AND t.landlord_id = ANY($1::uuid[]) AND t.is_active
+       LEFT JOIN LATERAL (
+         -- S652: ONE copy per form per viewer. An account can reach several
+         -- companies (Blu is an owner-member of Oak Park as well as his own), and
+         -- each company may hold its own copy; joining every copy listed the same
+         -- federal form twice. Prefer the copy of a company that operates in the
+         -- form's state, then the oldest.
+         SELECT t.id, t.landlord_id FROM lease_templates t
+          WHERE t.library_document_id = d.id AND t.landlord_id = ANY($1::uuid[]) AND t.is_active
+          ORDER BY EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = t.landlord_id AND p.state = d.jurisdiction) DESC,
+                   t.created_at
+          LIMIT 1) t ON true
       WHERE d.retired_at IS NULL AND d.superseded_by_id IS NULL
         AND (d.jurisdiction = 'US' OR d.jurisdiction = ANY($2::text[]))
         AND (d.unit_types IS NULL OR d.unit_types && $3::text[])
@@ -184,7 +198,7 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
         })),
         coveredBy: c.length ? [] : (coveredBy.get(s.id) ?? []),
         filled: c.length > 0 || coveredBy.has(s.id),
-        group: groupOf(s.kind, s.unit_types),
+        group: groupOf(s.kind, s.unit_types, s.disclosure_type),
       }
     })
     // Leases first, then a sale contract, then the government's forms, then
@@ -219,21 +233,29 @@ export async function sleevesForLandlord(q: Exec, landlordIds: string[]) {
  */
 export async function setSleeveCoverings(q: Exec, landlordIds: string[], sleeveId: string, templateIds: string[]) {
   const s = await q.query(
-    `SELECT s.id, s.kind FROM document_sleeves s
+    `SELECT s.id, s.kind, s.disclosure_type FROM document_sleeves s
       WHERE s.id=$1 AND s.retired_at IS NULL
         AND s.state_code IN (SELECT state FROM properties WHERE landlord_id = ANY($2::uuid[]) AND state IS NOT NULL)`,
     [sleeveId, landlordIds]).then(r => r.rows[0])
   if (!s) throw new AppError(404, 'That document slot is not one of yours')
   if (s.kind !== 'disclosure') throw new AppError(400, 'A lease or sale contract is its own document — upload it into its slot')
+  if ((NOTICES_WHEN_IT_HAPPENS as readonly string[]).includes(s.disclosure_type)) {
+    throw new AppError(400, 'A notice sent when something happens cannot already be inside another document')
+  }
   const ids = [...new Set(templateIds)]
   const owned = ids.length ? await q.query(
     `SELECT id, landlord_id FROM lease_templates WHERE id = ANY($1::uuid[]) AND landlord_id = ANY($2::uuid[]) AND is_active`,
     [ids, landlordIds]).then(r => r.rows) : []
   if (owned.length !== ids.length) throw new AppError(404, 'One of those documents is not one of yours')
-  await q.query(`DELETE FROM sleeve_coverings WHERE sleeve_id=$1 AND landlord_id = ANY($2::uuid[])`, [sleeveId, landlordIds])
+  // Keep the ones already there as they were (an automatic one stays automatic,
+  // so next year's re-read can still un-tick it); drop what was un-ticked; add
+  // new ticks as the landlord's own.
+  await q.query(
+    `DELETE FROM sleeve_coverings WHERE sleeve_id=$1 AND landlord_id = ANY($2::uuid[])
+        AND NOT (template_id = ANY($3::uuid[]))`, [sleeveId, landlordIds, owned.map((t: any) => t.id)])
   for (const t of owned) {
     await q.query(
-      `INSERT INTO sleeve_coverings (landlord_id, sleeve_id, template_id) VALUES ($1,$2,$3)
+      `INSERT INTO sleeve_coverings (landlord_id, sleeve_id, template_id, source) VALUES ($1,$2,$3,'manual')
        ON CONFLICT (landlord_id, sleeve_id, template_id) DO NOTHING`, [t.landlord_id, sleeveId, t.id])
   }
 }

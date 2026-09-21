@@ -2334,6 +2334,11 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
     // S652: into the sleeve it was uploaded to, or the one it plainly belongs in.
     if (sleeve) await query(`UPDATE lease_templates SET sleeve_id=$2 WHERE id=$1`, [t.id, sleeve.sleeveId])
     else await placeTemplate(exec, t.id)
+    // S652: read it for the documents it already contains (services/sleeveDetection).
+    if (t.base_pdf_url) {
+      const { detectCoverings } = await import('../services/sleeveDetection')
+      await detectCoverings(exec, t.id)
+    }
 
     // S629 (Nic): "when you add a template for a unit type and there is no
     // default, it should automatically become the default."
@@ -2409,6 +2414,15 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_man
       WHERE id=$9 RETURNING *`,
       [name??t.name, description??t.description, basePdfUrl??t.base_pdf_url, pageCount??t.page_count, isActive??t.is_active,
        unitType===undefined ? t.unit_type : unitType, depMonths, termMonths, t.id])
+    // S652: a new PDF is a new document — re-read it, so a section dropped from
+    // next year's lease un-ticks the sleeve it used to fill (Nic: "it needs to
+    // reread that and deselect the options that are no longer applicable").
+    // Retiring the template drops its automatic coverings the same way.
+    if ((basePdfUrl && basePdfUrl !== t.base_pdf_url) || isActive === false) {
+      const { detectCoverings } = await import('../services/sleeveDetection')
+      const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+      await detectCoverings(exec, t.id)
+    }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

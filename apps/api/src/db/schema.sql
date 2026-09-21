@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict GPwKrIeKSkj0crIqMC8rhjyNgSMdqBEoJY2fScPo6G8mEUHrVGk2tdNuZQwdu9X
+\restrict 3ULgRBwDIJUvcRaaRCcf9eaiCkvCz3Kudrj1WQUFa8LouuVyvldwKgB2BC4PNgm
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -9034,7 +9034,10 @@ CREATE TABLE public.sleeve_coverings (
     landlord_id uuid NOT NULL,
     sleeve_id uuid NOT NULL,
     template_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    source text DEFAULT 'manual'::text NOT NULL,
+    evidence text,
+    CONSTRAINT sleeve_coverings_source_check CHECK ((source = ANY (ARRAY['auto'::text, 'manual'::text])))
 );
 
 
@@ -27836,5 +27839,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict GPwKrIeKSkj0crIqMC8rhjyNgSMdqBEoJY2fScPo6G8mEUHrVGk2tdNuZQwdu9X
+\unrestrict 3ULgRBwDIJUvcRaaRCcf9eaiCkvCz3Kudrj1WQUFa8LouuVyvldwKgB2BC4PNgm
 
