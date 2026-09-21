@@ -117,6 +117,10 @@ export default function TemplateLibrarySection({ mode = 'templates', canEdit = f
 
   return (
     <div style={{ marginTop: reference ? 0 : 28 }}>
+      {/* Nic: "landlord stuff's always at the top no matter the alphabet order
+          and... there's a page break below their uploads and then the library."
+          A real rule, not just spacing, so the two never read as one list. */}
+      {!reference && <hr style={{ border: 'none', borderTop: '1px solid var(--border-1)', margin: '0 0 20px' }} />}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <Landmark size={16} style={{ color: 'var(--gold)' }} />
         <h2 style={{ margin: 0, fontSize: '1rem', color: 'var(--text-0)' }}>{reference ? 'Government Forms' : 'Library'}</h2>
