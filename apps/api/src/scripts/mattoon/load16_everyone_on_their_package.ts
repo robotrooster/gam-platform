@@ -18,7 +18,6 @@
 import { query, queryOne, getClient } from '../../db'
 import { createDocumentRecord, signingUrlFor } from '../../routes/esign'
 import { emailSigningRequest } from '../../services/email'
-import { createHomeSaleContract } from '../../services/homeSale'
 import { resolvePackageForUnit } from '../../services/signingPackages'
 import crypto from 'crypto'
 import fs from 'fs'
@@ -91,21 +90,9 @@ async function main() {
       })),
     ]
 
-    // The sale first, on its own: the package judges the unit through the pool.
-    let sale: any = null
-    if (terms) {
-      const c = await getClient()
-      try {
-        await c.query('BEGIN')
-        sale = await createHomeSaleContract(c, {
-          unitId: unit.id, leaseId: null, tenantId: residents[0].tenant_id, landlordId: prop.landlord_id,
-          salePrice: terms.monthly * terms.payments, downPayment: 0, annualInterestRate: 0,
-          termMonths: terms.payments, startMonth: START_MONTH, planType: 'flat', pendingSignature: true,
-        })
-        await c.query(APPLY ? 'COMMIT' : 'ROLLBACK')
-      } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e } finally { c.release() }
-    }
-
+    // S652 (Nic): no sale record at draft — Blu types the terms on the contract
+    // and his signature makes the record. The sheet's numbers only prefill.
+    const sale: any = null
     const client = await getClient()
     let leaseDocId = ''
     try {
@@ -126,11 +113,10 @@ async function main() {
         const documentType = t.purpose === 'lease' ? 'original_lease' : t.purpose === 'installment_sale' ? 'purchase_agreement' : 'addendum_terms'
         const prefill = t.purpose === 'lease'
           ? (occupants.length ? { occupant_names: occupants.join(', ') } : {})
-          : t.purpose === 'installment_sale' && sale ? {
-              sale_price: (terms!.monthly * terms!.payments).toFixed(2), sale_down_payment: '0.00',
-              sale_financed_amount: Number(sale.financed_amount).toFixed(2),
-              sale_monthly_payment: Number(sale.monthly_payment).toFixed(2),
-              sale_term_months: String(terms!.payments), sale_interest_rate: '0', sale_first_payment_month: START_MONTH,
+          : t.purpose === 'installment_sale' && terms ? {
+              sale_price: (terms.monthly * terms.payments).toFixed(2), sale_down_payment: '0.00',
+              sale_monthly_payment: terms.monthly.toFixed(2),
+              sale_term_months: String(terms.payments), sale_interest_rate: '0', sale_first_payment_month: '10/1/2026',
             } : {}
         const doc = await createDocumentRecord(client, {
           landlordId: prop.landlord_id, templateId: t.id, unitId: unit.id, leaseId: null,
@@ -143,8 +129,7 @@ async function main() {
         if (documentType === 'purchase_agreement') saleDocId = doc.id
         if (documentType === 'original_lease') leaseDocId = doc.id
       }
-      if (sale && !saleDocId) throw new Error(`${label}: sale without an installment contract in the packet`)
-      if (sale && saleDocId) await client.query(`UPDATE home_sale_contracts SET purchase_document_id=$2, updated_at=NOW() WHERE id=$1`, [sale.id, saleDocId])
+      if (terms && !saleDocId) throw new Error(`${label}: sale without an installment contract in the packet`)
       if (!leaseDocId) throw new Error(`${label}: no lease in the packet`)
       await client.query('COMMIT')
       console.log(`  packet    ${groupId} — ${picked.length} documents`)

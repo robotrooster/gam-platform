@@ -2410,9 +2410,10 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
   try {
     // S652 (Nic): "are you adding a home to the sale?" — asked on the invite for
     // a park-owned home, carried on the intent so the packet drafts as a sale.
-    const homeSaleTerms = req.body?.homeSale
-      ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
-      : null
+    // S652 (Nic): the terms are typed on the contract at signing; the invite
+    // only says whether this household is buying the home. Numbers given here
+    // are kept as a prefill, nothing more.
+    const homeSaleTerms = req.body?.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null
     // S652: the packet as the landlord left it ticked on the invite.
     const packageTemplateIds: string[] | null = Array.isArray(req.body?.packageTemplateIds)
       ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && /^[0-9a-f-]{36}$/i.test(t)) : null
@@ -2753,9 +2754,10 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
   try {
     // S652 (Nic): "are you adding a home to the sale?" — asked on the invite for
     // a park-owned home, carried on the intent so the packet drafts as a sale.
-    const homeSaleTerms = req.body?.homeSale
-      ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
-      : null
+    // S652 (Nic): the terms are typed on the contract at signing; the invite
+    // only says whether this household is buying the home. Numbers given here
+    // are kept as a prefill, nothing more.
+    const homeSaleTerms = req.body?.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null
     // S652: the packet as the landlord left it ticked on the invite.
     const packageTemplateIds: string[] | null = Array.isArray(req.body?.packageTemplateIds)
       ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && /^[0-9a-f-]{36}$/i.test(t)) : null

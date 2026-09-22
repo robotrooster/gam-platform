@@ -765,3 +765,14 @@ Still held for Nic's go: tenant packet email bundling (tenant is emailed per doc
 
 ## Year field (Blu) — deploy 42
 `field_type='year'`: template palette "Year (pick from a list)"; on the signing page a scroll list (next year back a century) that stays open until Save; stamped as text. Blu's installment contract "Year of manufacture" box (page 4) switched to it on the template; documents already drafted keep their text box until re-drafted.
+
+## The paper is the record — installment contract terms (Nic, 2026-09-22) — deploy 43
+
+Nic: "If I want my payment to be $19 for one hundred payments I need to type those in ... have the data tag be the correct label where the invoice will go out correctly no matter what I type in that box at signing time." Nothing derives from the invite or a sheet.
+
+- Shared: sale columns (`sale_price`, `sale_down_payment`, `sale_monthly_payment`, `sale_term_months`, `sale_interest_rate`, `sale_first_payment_month`) are category **'sale'** — typed by the landlord, value-bearing (required on his pass), NOT locked. `sale_financed_amount` and the new `sale_final_payment_amount` / `sale_final_payment_month` are derived (identity). Migration `20260922050000_the_paper_is_the_record_final_payment_labels.sql` adds the two labels to both CHECKs.
+- `services/homeSale.ts`: `saleTermsFromFields` / `resolveTypedSaleTerms` read the boxes as typed ("$19", "100", "10/2026", "October 2026"); `applySaleTermsFromDocument(docId)` runs on the LANDLORD's signature of a purchase agreement — writes the sale record (pending the tenant's signature, which starts billing), cancels a stale pending record on the unit, stamps the derived boxes. Typed terms are validated BEFORE the signature commits, so a bad box is fixed on the spot. Tests: `homeSaleTyped.test.ts`, signingPackages "what the landlord types … becomes the sale record".
+- No record at draft anywhere now (packetDraft, the send flow, load16): a sale on the invite is a yes/no ("Selling them this home on installments"); any numbers given only prefill. The invite form lost its number boxes.
+- Blu's installment contract template re-tagged: Monthly payment amount → Monthly payment; Number of monthly installments → Number of payments; First payment date → First payment month; Final payment amount / Final payment due date → the two derived labels (not required). The $450 was the box being tagged with the LOT RENT label; the 55 was right per lot (each contract had its own) but the box lost its tag when the template was re-fielded.
+- Template editor: every box kind offers the data-label dropdown (signature → signature labels, initials → initial labels, year/choice/checkbox → text labels); "Fixed text" renamed **Template text**.
+- Still waiting on Nic/Blu: the Template-text wording for the lead-paint form's "List documents below", then the go for the full re-draft (load20 then load16 --only 1,6,11,17,18,21,22,24,28,29,30).

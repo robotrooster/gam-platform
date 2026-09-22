@@ -36,7 +36,7 @@ const FIELD_TYPES = [
   // S652 (Nic): "text I put in the template that is just there, as part of the
   // document on every lease" — printed, not a box; the landlord can change it
   // on one lease with a deliberate click.
-  { type:'fixed_text',label:'Fixed text', icon:'🔤', color:'#64748b', w:200, h:20 },
+  { type:'fixed_text',label:'Template text', icon:'🔤', color:'#64748b', w:200, h:20 },
   // S652 (Blu): the year of manufacture picked from a list, not typed — a
   // year only, no month or day.
   { type:'year',      label:'Year (pick from a list)', icon:'📆', color:'#0ea5e9', w:70, h:18 },
@@ -60,9 +60,17 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     .filter(c => LEASE_COLUMN_INPUT[c] === 'text' && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
   date: LEASE_COLUMNS
-    .filter(c => LEASE_COLUMN_INPUT[c] === 'date' && !PALETTE_EXCLUDED.has(c))
+    .filter(c => (LEASE_COLUMN_INPUT[c] === 'date' || c === 'date_signed') && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
+// S652 (Nic): "Everything should be uniform and selectable for data label."
+// Every kind of box offers the labels that fit it.
+DATA_LABELS.year = DATA_LABELS.text
+DATA_LABELS.checkbox = DATA_LABELS.text
+DATA_LABELS.choice = DATA_LABELS.text
+DATA_LABELS.radio_group = DATA_LABELS.text
+DATA_LABELS.signature = LEASE_COLUMNS.filter(c => /_signature$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
+DATA_LABELS.initials = LEASE_COLUMNS.filter(c => /_initial$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
 // S622 (Nic): the Data label dropdown is how a landlord RE-TAGS a box the
 // auto-placer got wrong — "can a landlord mark a box as a lease fee item".
 // They always could. What the form never said is that this tag is what makes
@@ -232,7 +240,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         {locked && <span style={{ position:'absolute', top:-8, left:-8, fontSize: Math.max(9, 11*scale), zIndex:998, pointerEvents:'none' }}>🔒</span>}
         {field.fieldType === 'fixed_text' ? (
           <span style={{ color:'#1a1a1a', whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, Math.min(field.height * scale * 0.6, 12 * scale)), pointerEvents:'none', padding:'0 2px' }}>
-            {field.defaultValue || 'Fixed text — type it in the panel'}
+            {field.defaultValue || 'Template text — type it in the panel'}
           </span>
         ) : (<>
         <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>
@@ -944,7 +952,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 <input className="input" value={sel.label||''} onChange={e => updateSelected('label', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }} />
               </div>
               <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginBottom:8 }}>Drag edges to resize field</div>
-              {(sel.fieldType === 'text' || sel.fieldType === 'date') && (
+              {sel.fieldType !== 'fixed_text' && (
                 <div style={{ marginBottom:8 }}>
                   <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Data label</label>
                   <select className="input" value={sel.leaseColumn||''} onChange={e => updateSelected('leaseColumn', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem' }}>

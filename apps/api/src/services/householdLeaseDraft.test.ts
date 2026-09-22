@@ -138,7 +138,10 @@ describe('draftHouseholdLease', () => {
 
   // S652 (Nic): the home sale is decided on the invite — the packet drafts as
   // a sale, the contract exists, and the two are linked.
-  it('with sale terms from the invite, drafts the installment contract too and writes the sale', async () => {
+  // S652 (Nic): "it's not gonna derive from anywhere." The invite's numbers only
+  // prefill the contract; the record is written when the landlord signs what he
+  // typed (services/homeSale.applySaleTermsFromDocument).
+  it('with a sale on the invite, drafts the installment contract too — prefilled, with no record yet', async () => {
     const c = await seedCtx('mobile_home')
     await db.query(`UPDATE units SET dwelling_ownership='landlord' WHERE id=$1`, [c.unitId])
     const tpl = await seedTemplate(c.landlordId, 'mobile_home')
@@ -155,11 +158,9 @@ describe('draftHouseholdLease', () => {
     const { rows: docs } = await db.query<any>(
       `SELECT id, document_type, package_group_id FROM lease_documents WHERE unit_id=$1 ORDER BY package_sort_order`, [c.unitId])
     expect(docs.map((d: any) => d.document_type)).toEqual(['original_lease', 'purchase_agreement'])
-    const { rows: [sale] } = await db.query<any>(`SELECT status, sale_price, monthly_payment, purchase_document_id FROM home_sale_contracts WHERE unit_id=$1`, [c.unitId])
-    expect(sale.status).toBe('pending_signature')
-    expect(Number(sale.sale_price)).toBe(11000)
-    expect(sale.purchase_document_id).toBe(docs[1].id)
-    // and the contract page carries the same numbers
+    const { rows: sales } = await db.query<any>(`SELECT 1 FROM home_sale_contracts WHERE unit_id=$1`, [c.unitId])
+    expect(sales).toHaveLength(0)   // nothing recorded until the landlord signs what he typed
+    // and the contract page carries the invite's numbers as a starting point
     const { rows: pre } = await db.query<any>(
       `SELECT value FROM lease_document_fields WHERE document_id=$1 AND lease_column='sale_monthly_payment'`, [docs[1].id])
     expect(pre.length === 0 || Number(pre[0].value) === 200).toBe(true)

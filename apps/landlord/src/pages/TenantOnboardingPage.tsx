@@ -288,13 +288,11 @@ export type HomeSaleForm = { planType: 'flat' | 'amortized'; monthlyAmount: stri
   salePrice: string; downPayment: string; annualInterestRate: string; termMonths: string; startMonth: string }
 export const emptyHomeSale = (): HomeSaleForm => ({ planType: 'flat', monthlyAmount: '', numberOfPayments: '',
   salePrice: '', downPayment: '0', annualInterestRate: '0', termMonths: '', startMonth: new Date().toISOString().slice(0, 7) + '-01' })
-export const homeSalePayload = (f: HomeSaleForm) => f.planType === 'flat'
-  ? { planType: 'flat', monthlyAmount: Number(f.monthlyAmount), numberOfPayments: Number(f.numberOfPayments), startMonth: f.startMonth }
-  : { planType: 'amortized', salePrice: Number(f.salePrice), downPayment: Number(f.downPayment || 0),
-      annualInterestRate: Number(f.annualInterestRate || 0), termMonths: Number(f.termMonths), startMonth: f.startMonth }
-export const homeSaleComplete = (f: HomeSaleForm | null) => !f ? true : f.planType === 'flat'
-  ? Number(f.monthlyAmount) > 0 && Number(f.numberOfPayments) > 0
-  : Number(f.salePrice) > 0 && Number(f.termMonths) > 0
+// S652 (Nic): "it's not gonna derive from anywhere." The invite only says the
+// household is buying the home; the landlord TYPES the terms on the installment
+// contract at signing and those become the sale record.
+export const homeSalePayload = (_f: HomeSaleForm) => ({ selling: true })
+export const homeSaleComplete = (_f: HomeSaleForm | null) => true
 
 /**
  * S652 (Nic): "it needs to show the packet at the invite." The unit's default
@@ -368,8 +366,6 @@ export const tickedIds = (t: Record<string, boolean> | null) => t ? Object.entri
 /** "Are you adding a home to the sale?" — the invite's one question beyond who lives there. */
 export function HomeSaleToggle({ sale, setSale }: { sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void }) {
   const f = sale
-  const set = (k: keyof HomeSaleForm, v: string) => f && setSale({ ...f, [k]: v })
-  const inp = { fontSize: '.8rem' } as React.CSSProperties
   return (
     <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
       <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer' }}>
@@ -377,42 +373,13 @@ export function HomeSaleToggle({ sale, setSale }: { sale: HomeSaleForm | null; s
         <div>
           <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Selling them this home on installments</div>
           <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
-            The packet drafts as a sale: the installment contract and the sale papers go in with the lot lease, pre-filled from these terms.
+            The packet drafts as a sale: the installment contract and the sale papers go in with the lot lease.
           </div>
         </div>
       </label>
       {f && (
-        <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
-          <div style={{ display: 'flex', gap: 6 }}>
-            {(['flat', 'amortized'] as const).map(pt => (
-              <button key={pt} type="button" className={`btn btn-sm ${f.planType === pt ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set('planType', pt)}>
-                {pt === 'flat' ? 'Same amount each month' : 'Price, rate and term'}</button>
-            ))}
-          </div>
-          {f.planType === 'flat' ? (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Each month ($)</label>
-                <input className="input" style={inp} type="number" min="1" value={f.monthlyAmount} onChange={e => set('monthlyAmount', e.target.value)} placeholder="200" /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Number of payments</label>
-                <input className="input" style={inp} type="number" min="1" value={f.numberOfPayments} onChange={e => set('numberOfPayments', e.target.value)} placeholder="55" /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>First payment month</label>
-                <input className="input" style={inp} type="month" value={f.startMonth.slice(0, 7)} onChange={e => set('startMonth', e.target.value + '-01')} /></div>
-            </div>
-          ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Price ($)</label>
-                <input className="input" style={inp} type="number" min="1" value={f.salePrice} onChange={e => set('salePrice', e.target.value)} /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Down payment ($)</label>
-                <input className="input" style={inp} type="number" min="0" value={f.downPayment} onChange={e => set('downPayment', e.target.value)} /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Interest (% / yr)</label>
-                <input className="input" style={inp} type="number" min="0" step="0.1" value={f.annualInterestRate} onChange={e => set('annualInterestRate', e.target.value)} /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Term (months)</label>
-                <input className="input" style={inp} type="number" min="1" value={f.termMonths} onChange={e => set('termMonths', e.target.value)} /></div>
-              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>First payment month</label>
-                <input className="input" style={inp} type="month" value={f.startMonth.slice(0, 7)} onChange={e => set('startMonth', e.target.value + '-01')} /></div>
-            </div>
-          )}
-          {!homeSaleComplete(f) && <div style={{ fontSize: '.7rem', color: 'var(--amber, #d97706)' }}>Fill in the terms, or untick the box.</div>}
+        <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+          You type the price, the monthly payment and the number of payments on the installment contract when you sign it — that is what bills, and it stops after the last payment.
         </div>
       )}
     </div>

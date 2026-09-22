@@ -3132,6 +3132,8 @@ export const LEASE_COLUMNS = [
   'sale_price', 'sale_down_payment', 'sale_financed_amount',
   'sale_monthly_payment', 'sale_term_months', 'sale_interest_rate',
   'sale_first_payment_month',
+  // S652: derived from what the landlord typed — the last instalment and its month
+  'sale_final_payment_amount', 'sale_final_payment_month',
   // signature — PDF display only
   'tenant_signature', 'landlord_signature',
   'tenant_initial', 'landlord_initial',
@@ -3173,7 +3175,7 @@ export const LEASE_COLUMNS = [
 ] as const
 export type LeaseColumn = typeof LEASE_COLUMNS[number]
 
-export type LeaseColumnCategory = 'writable' | 'identity' | 'signature' | 'fee_row' | 'utility_row'
+export type LeaseColumnCategory = 'writable' | 'identity' | 'signature' | 'fee_row' | 'utility_row' | 'sale'
 export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   // identity
   tenant_name:            'identity',
@@ -3189,14 +3191,19 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   tenant_3_name:            'identity',
   tenant_4_name:            'identity',
   occupant_names:           'identity',
-  // S629: home-sale terms — display-only, never written back to leases.
-  sale_price:               'identity',
-  sale_down_payment:        'identity',
+  // S652 (Nic): the home-sale terms are TYPED by the landlord on the
+  // installment contract at signing — "$19 for one hundred payments if that
+  // is what I type" — and what is signed becomes the sale record that bills.
+  // 'sale' = a box the landlord fills; the derived figures stay identity.
+  sale_price:               'sale',
+  sale_down_payment:        'sale',
   sale_financed_amount:     'identity',
-  sale_monthly_payment:     'identity',
-  sale_term_months:         'identity',
-  sale_interest_rate:       'identity',
-  sale_first_payment_month: 'identity',
+  sale_monthly_payment:     'sale',
+  sale_term_months:         'sale',
+  sale_interest_rate:       'sale',
+  sale_first_payment_month: 'sale',
+  sale_final_payment_amount: 'identity',
+  sale_final_payment_month:  'identity',
   // signature
   tenant_signature:       'signature',
   landlord_signature:     'signature',
@@ -3279,7 +3286,7 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
 // ============================================================================
 
 export const LEASE_COLUMN_VALUE_BEARING_CATEGORIES: readonly LeaseColumnCategory[] =
-  ['writable', 'fee_row', 'utility_row'] as const
+  ['writable', 'fee_row', 'utility_row', 'sale'] as const
 
 export interface LeaseDocumentFieldRow {
   lease_column: LeaseColumn | null
@@ -3334,6 +3341,8 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   sale_term_months:         'Number of payments',
   sale_interest_rate:       'Interest rate (%)',
   sale_first_payment_month: 'First payment month',
+  sale_final_payment_amount: 'Final payment amount',
+  sale_final_payment_month:  'Final payment month',
   tenant_name:            'Tenant name',
   tenant_email:           'Tenant email',
   landlord_name:          'Landlord name',
@@ -3420,6 +3429,8 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   sale_term_months:         'text',
   sale_interest_rate:       'text',
   sale_first_payment_month: 'text',
+  sale_final_payment_amount: 'text',
+  sale_final_payment_month:  'text',
   tenant_name:            'text',
   tenant_email:           'text',
   landlord_name:          'text',

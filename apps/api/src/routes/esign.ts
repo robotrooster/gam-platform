@@ -3072,52 +3072,26 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       let homeSaleContract: any = null
       let homeSalePrefill: Record<string, string> = {}
       if (installmentTemplate) {
-        const {
-          createHomeSaleContract, homeSaleTermsSchema, assertUnitIsSaleable, assertBuyerIsKnown,
-        } = await import('../services/homeSale')
-        if (!req.body?.homeSale) {
-          throw new AppError(400,
-            'That package includes an installment sale, so it needs the terms — price, down payment, '
-            + 'term and first billing month. Without them the agreement would be signed and bill nothing.')
-        }
+        const { homeSaleTermsSchema, assertUnitIsSaleable, assertBuyerIsKnown } = await import('../services/homeSale')
+        // S652 (Nic): terms are TYPED on the contract at signing and become the
+        // record then. Terms given here only prefill the boxes.
+        if (req.body?.homeSale && homeSaleTermsSchema.safeParse(req.body.homeSale).success) {
         const terms = homeSaleTermsSchema.parse(req.body.homeSale)
         const tenantIdForSale = terms.tenantId
-          ?? signers.find((sg: any) => sg.role === 'tenant')?.tenantId
+          ?? signers.find((sg: any) => sg.role === 'tenant' || sg.role === 'primary')?.tenantId
           ?? null
-        if (!tenantIdForSale) {
-          throw new AppError(400, 'A purchase agreement needs to say who is buying.')
-        }
         if (!finalUnitId) throw new AppError(400, 'An installment sale needs a unit.')
-        // The SAME guards POST /api/home-sales runs. A second door into a home
-        // sale must not be a way around the first door's rules.
         await assertUnitIsSaleable(client, finalUnitId)
-        await assertBuyerIsKnown(client, tenantIdForSale, docLandlordId)
-        homeSaleContract = await createHomeSaleContract(client, {
-          unitId: finalUnitId!,
-          // Null on a new tenancy — there is no lease until this packet is
-          // signed. The lease adopts the contract when it is created
-          // (buildLeaseFromDocument), so the billing anchor arrives on its own.
-          leaseId: docLeaseId ?? null,
-          tenantId: tenantIdForSale,
-          landlordId: docLandlordId,
-          salePrice: terms.salePrice,
-          downPayment: terms.downPayment,
-          annualInterestRate: terms.annualInterestRate,
-          termMonths: terms.termMonths,
-          startMonth: terms.startMonth,
-          planType: terms.planType,
-          pendingSignature: true,
-        })
-        // The document states the same numbers the billing will use. The
-        // contract is the source; the signed page is the proof.
+        if (tenantIdForSale) await assertBuyerIsKnown(client, tenantIdForSale, docLandlordId)
         homeSalePrefill = {
           sale_price:               Number(terms.salePrice).toFixed(2),
           sale_down_payment:        Number(terms.downPayment).toFixed(2),
-          sale_financed_amount:     Number(homeSaleContract.financed_amount).toFixed(2),
-          sale_monthly_payment:     Number(homeSaleContract.monthly_payment).toFixed(2),
           sale_term_months:         String(terms.termMonths),
           sale_interest_rate:       String(terms.annualInterestRate),
           sale_first_payment_month: String(terms.startMonth),
+          ...(terms.planType === 'flat' && req.body.homeSale.monthlyAmount != null
+            ? { sale_monthly_payment: Number(req.body.homeSale.monthlyAmount).toFixed(2) } : {}),
+        }
         }
       }
 
@@ -5297,6 +5271,15 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     if (missingRequired.length > 0) {
       throw new AppError(400, `Missing required fields: ${missingRequired.join(', ')}`)
     }
+    // S652 (Nic): the landlord TYPES the sale terms on the installment contract
+    // and they become the record. Read them now, while he can still fix a box,
+    // rather than after his signature is on the paper.
+    if (signer.role === 'landlord' && doc.document_type === 'purchase_agreement') {
+      const { saleTermsFromFields, resolveTypedSaleTerms } = await import('../services/homeSale')
+      resolveTypedSaleTerms(saleTermsFromFields(
+        allFields.filter((f: any) => f.lease_column && String(f.lease_column).startsWith('sale_'))
+                 .map((f: any) => ({ lease_column: f.lease_column, value: effVal(f) }))))
+    }
 
     const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress
     const ua = req.headers['user-agent']
@@ -5421,6 +5404,22 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // from exactly one place — buildLeaseFromDocument — and all that changed is
     // when that runs. A tenant finishing later hits the builder's own
     // finalized_at short-circuit and bills nobody twice.
+    // S652 (Nic): the installment contract's typed terms become the sale record
+    // on the landlord's signature; the tenant's signature then starts billing.
+    if (signer.role === 'landlord' && doc.document_type === 'purchase_agreement') {
+      try {
+        const { applySaleTermsFromDocument } = await import('../services/homeSale')
+        await applySaleTermsFromDocument(doc.id)
+      } catch (e: any) {
+        logger.error({ err: e, documentId: doc.id }, '[HomeSale] typed terms did not become a sale record')
+        await createAdminNotification({
+          severity: 'critical', category: 'home_sale_terms_failed',
+          title: `Installment contract signed but its terms did not record — document ${doc.id}`,
+          body: e.message, context: { document_id: doc.id },
+        }).catch(() => {})
+      }
+    }
+
     if (signer.role === 'landlord' && !isNoLeaseDoc) {
       try {
         const issued = await buildLeaseFromDocument(doc.id)

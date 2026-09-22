@@ -301,52 +301,66 @@ describe('drafting a package as one bundle', () => {
    * quietly: signed by everybody, billing nobody, silent about it. That is how
    * Country Acres ended up with eleven contracts that had to be voided.
    */
-  it('refuses an installment sale with no terms rather than billing nothing', async () => {
+  // S652 (Nic): "it's not gonna derive from anywhere." The contract drafts with
+  // empty boxes; the landlord types the terms at signing and they become the
+  // record. No terms at draft is not an error any more.
+  it('drafts an installment contract without terms — they are typed at signing', async () => {
     const f = await seedSignableUnit()
     const res = await request(buildEsignApp())
       .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
       .send({
         templateId: f.tplA, unitId: f.unitA, title: 'Lot Lease',
         packageTemplateIds: [f.inst],
-        signers: [
-          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
-          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
-        ],
-      })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/terms/i)
-    // Nothing half-made: no lease document either, since it is one transaction.
-    const { rows } = await db.query(`SELECT 1 FROM lease_documents`)
-    expect(rows).toHaveLength(0)
-  })
-
-  it('creates the contract the agreement will activate, bound to that document', async () => {
-    // Nic: one packet, two documents, two signatures — and it has to work on a
-    // brand-new tenancy, where there is no lease to anchor to yet.
-    const f = await seedSignableUnit()
-    const res = await request(buildEsignApp())
-      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
-      .send({
-        templateId: f.tplA, unitId: f.unitA, title: 'Lot Lease',
-        packageTemplateIds: [f.inst],
-        homeSale: { tenantId: f.tenantId, salePrice: 24000, downPayment: 2000,
-                    annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
+        homeSale: { selling: true },
         signers: [
           { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
           { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
         ],
       })
     expect(res.status, JSON.stringify(res.body)).toBe(201)
+    expect(res.body.package).toHaveLength(1)
+    const { rows } = await db.query(`SELECT 1 FROM home_sale_contracts`)
+    expect(rows).toHaveLength(0)   // nothing recorded until the landlord signs what he typed
+  })
+
+  it('what the landlord types on the contract becomes the sale record, bound to that document', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Lot Lease',
+        packageTemplateIds: [f.inst],
+        homeSale: { selling: true },
+        signers: [
+          { userId: f.tenantUserId, role: 'primary', name: 'Test Tenant', email: 't@test.dev' },
+          { userId: f.a.userId, role: 'landlord', name: 'Owner', email: 'l@t.dev' },
+        ],
+      })
+    expect(res.status, JSON.stringify(res.body)).toBe(201)
+    const saleDoc = (await db.query(`SELECT id FROM lease_documents WHERE document_type = 'purchase_agreement'`)).rows[0]
+    // The landlord's boxes, as he typed them: $400 a month, 55 payments, from November.
+    for (const [col, value] of [['sale_monthly_payment', '$400'], ['sale_term_months', '55'], ['sale_first_payment_month', '11/2026'], ['sale_final_payment_amount', ''], ['sale_final_payment_month', '']]) {
+      await db.query(`INSERT INTO lease_document_fields (document_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, value)
+                      VALUES ($1, 'text', 'landlord', $2, $2, 1, 10, 10, 100, 20, false, NULLIF($3, ''))`, [saleDoc.id, col, value])
+    }
+    const { applySaleTermsFromDocument } = await import('../services/homeSale')
+    await applySaleTermsFromDocument(saleDoc.id)
 
     const { rows } = await db.query(
-      `SELECT c.status, c.lease_id, c.financed_amount, c.purchase_document_id, d.document_type
-         FROM home_sale_contracts c
-         JOIN lease_documents d ON d.id = c.purchase_document_id`)
+      `SELECT c.status, c.lease_id, c.sale_price, c.financed_amount, c.monthly_payment, c.term_months, c.start_month::text, c.purchase_document_id
+         FROM home_sale_contracts c`)
     expect(rows).toHaveLength(1)
-    expect(rows[0].document_type).toBe('purchase_agreement')
-    expect(rows[0].status).toBe('pending_signature')   // nothing bills until it is signed
+    expect(rows[0].purchase_document_id).toBe(saleDoc.id)
+    expect(rows[0].status).toBe('pending_signature')   // the tenant's signature starts billing
+    expect(Number(rows[0].sale_price)).toBe(22000)
     expect(Number(rows[0].financed_amount)).toBe(22000)
-    expect(rows[0].lease_id).toBeNull()                // no lease yet — that is the point
+    expect(Number(rows[0].monthly_payment)).toBe(400)
+    expect(rows[0].term_months).toBe(55)
+    expect(rows[0].start_month.slice(0, 10)).toBe('2026-11-01')
+    expect(rows[0].lease_id).toBeNull()
+    // The derived boxes are printed from the record.
+    const derived = (await db.query(`SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1 AND lease_column LIKE 'sale_final%' ORDER BY 1`, [saleDoc.id])).rows
+    expect(derived).toEqual([{ lease_column: 'sale_final_payment_amount', value: '400.00' }, { lease_column: 'sale_final_payment_month', value: '5/1/2031' }])
   })
 
   it('refuses to finance an RV, whichever door you come through', async () => {

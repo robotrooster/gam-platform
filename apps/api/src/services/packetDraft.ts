@@ -17,7 +17,7 @@
  */
 import { AppError } from '../middleware/errorHandler'
 import { resolvePackageForUnit } from './signingPackages'
-import { createHomeSaleContract, homeSaleTermsSchema } from './homeSale'
+import { homeSaleTermsSchema } from './homeSale'
 import crypto from 'crypto'
 
 type Client = { query: (sql: string, params?: any[]) => Promise<{ rows: any[] }> }
@@ -39,35 +39,34 @@ export async function draftPacketSiblings(
 ): Promise<{ count: number; groupId: string | null; homeSaleContractId: string | null }> {
   const { landlordId, unitId, leaseDocId, leaseTemplateId, signers } = args
 
-  // The sale first, so the package reads the unit as a sale.
-  let sale: any = null
+  // S652 (Nic): the sale terms are TYPED on the installment contract at signing
+  // and become the record then — nothing derives from the invite. "Selling
+  // them this home" on the invite only says the packet drafts as a sale; any
+  // numbers given with it just prefill the boxes for the landlord to type over.
+  const selling = !!args.homeSale
+  const sale: any = null
   let salePrefill: Record<string, string> = {}
-  if (args.homeSale) {
-    const terms = homeSaleTermsSchema.parse(args.homeSale)
-    const primary = signers.find(s => s.role === 'primary')
-    const buyer = primary ? await client.query(`SELECT id FROM tenants WHERE user_id=$1`, [primary.userId]).then(r => r.rows[0]) : null
-    if (!buyer) throw new AppError(400, 'A home sale needs a primary resident to be the buyer.')
-    sale = await createHomeSaleContract(client as any, {
-      unitId, leaseId: null, tenantId: buyer.id, landlordId,
-      salePrice: terms.salePrice, downPayment: terms.downPayment, annualInterestRate: terms.annualInterestRate,
-      termMonths: terms.termMonths, startMonth: terms.startMonth, planType: terms.planType, pendingSignature: true,
-    })
-    salePrefill = {
-      sale_price:               Number(terms.salePrice).toFixed(2),
-      sale_down_payment:        Number(terms.downPayment).toFixed(2),
-      sale_financed_amount:     Number(sale.financed_amount).toFixed(2),
-      sale_monthly_payment:     Number(sale.monthly_payment).toFixed(2),
-      sale_term_months:         String(terms.termMonths),
-      sale_interest_rate:       String(terms.annualInterestRate),
-      sale_first_payment_month: String(terms.startMonth),
+  if (selling && typeof args.homeSale === 'object') {
+    const parsed = homeSaleTermsSchema.safeParse(args.homeSale)
+    if (parsed.success) {
+      const terms = parsed.data
+      salePrefill = {
+        sale_price:               Number(terms.salePrice).toFixed(2),
+        sale_down_payment:        Number(terms.downPayment).toFixed(2),
+        sale_term_months:         String(terms.termMonths),
+        sale_interest_rate:       String(terms.annualInterestRate),
+        sale_first_payment_month: String(terms.startMonth),
+        ...(terms.planType === 'flat' && args.homeSale.monthlyAmount != null
+          ? { sale_monthly_payment: Number(args.homeSale.monthlyAmount).toFixed(2) } : {}),
+      }
     }
   }
 
-  const pkg = await resolvePackageForUnit({ landlordIds: [landlordId], unitId, kind: sale ? 'sale' : undefined })
+  const pkg = await resolvePackageForUnit({ landlordIds: [landlordId], unitId, kind: selling ? 'sale' : undefined })
   const ticked = args.templateIds ? new Set(args.templateIds) : null
   const extras = (pkg?.items ?? []).filter(i =>
     (ticked ? ticked.has(i.templateId) : i.suggested) && i.templateId !== leaseTemplateId && i.purpose !== 'lease')
-  if (sale && !extras.some(i => i.purpose === 'installment_sale')) {
+  if (selling && !extras.some(i => i.purpose === 'installment_sale')) {
     throw new AppError(400, 'This household is buying the home, but the package has no installment contract to sign. Add one to the package first.')
   }
   if (!pkg || !extras.length) return { count: 0, groupId: null, homeSaleContractId: sale?.id ?? null }

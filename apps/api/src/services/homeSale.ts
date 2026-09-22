@@ -369,3 +369,138 @@ export async function assertBuyerIsKnown(
       'That buyer has no record with you — invite them first, then sell them the home.')
   }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S652 (Nic): THE PAPER IS THE RECORD.
+//
+// "If I want my payment to be $19 for one hundred payments I need to type
+// those in ... have the data tag be the correct label where the invoice will
+// go out correctly no matter what I type in that box at signing time."
+//
+// The installment contract's boxes tagged with sale labels are TYPED by the
+// landlord at signing. When the landlord signs, those values become the sale
+// record — the thing that bills each month and stops after the last payment.
+// Nothing derives from an invite or a sheet; a prefilled box is only a
+// suggestion the landlord may type over.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type TypedSaleTerms = {
+  monthlyAmount: number | null; numberOfPayments: number | null; salePrice: number | null
+  downPayment: number; annualInterestRate: number; startMonth: string | null
+}
+
+const num = (v: unknown): number | null => {
+  if (v == null) return null
+  const n = Number(String(v).replace(/[$,%\s]/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december']
+/** "10/01/2026", "10/2026", "2026-10", "2026-10-01", "October 2026", "Oct 2026" → "2026-10-01". */
+export function monthFromTyped(v: unknown): string | null {
+  if (v == null) return null
+  const t = String(v).trim()
+  if (!t) return null
+  let m = /^(\d{4})-(\d{1,2})(?:-\d{1,2})?/.exec(t)
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-01`
+  m = /^(\d{1,2})[\/\-](?:(\d{1,2})[\/\-])?(\d{4})$/.exec(t)
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-01`
+  m = /^([A-Za-z]+)\.?,?\s+(\d{4})$/.exec(t)
+  if (m) {
+    const i = MONTHS.findIndex(x => x.startsWith(m![1].toLowerCase().slice(0, 3)))
+    if (i >= 0) return `${m[2]}-${String(i + 1).padStart(2, '0')}-01`
+  }
+  return null
+}
+
+/** Read the sale terms off a document's fields (by lease_column). */
+export function saleTermsFromFields(fields: Array<{ lease_column: string | null; value: string | null }>): TypedSaleTerms {
+  const get = (col: string) => fields.find(f => f.lease_column === col)?.value ?? null
+  return {
+    monthlyAmount:      num(get('sale_monthly_payment')),
+    numberOfPayments:   (() => { const n = num(get('sale_term_months')); return n == null ? null : Math.round(n) })(),
+    salePrice:          num(get('sale_price')),
+    downPayment:        num(get('sale_down_payment')) ?? 0,
+    annualInterestRate: num(get('sale_interest_rate')) ?? 0,
+    startMonth:         monthFromTyped(get('sale_first_payment_month')),
+  }
+}
+
+/** What the typed terms mean, or why they cannot bill — said in the landlord's words. */
+export function resolveTypedSaleTerms(t: TypedSaleTerms): { planType: 'flat' | 'amortized'; salePrice: number; downPayment: number; annualInterestRate: number; termMonths: number; startMonth: string } {
+  const n = t.numberOfPayments
+  if (!n || n <= 0) throw new AppError(400, 'The installment contract needs the number of payments.')
+  const start = t.startMonth ?? (() => { const d = new Date(); d.setUTCMonth(d.getUTCMonth() + 1, 1); return d.toISOString().slice(0, 10) })()
+  // Same amount every month, no interest: the plain case — price is the sum.
+  if (t.monthlyAmount && t.monthlyAmount > 0 && (!t.annualInterestRate || t.annualInterestRate === 0)
+      && (t.salePrice == null || Math.abs(t.salePrice - t.downPayment - t.monthlyAmount * n) < 1)) {
+    return { planType: 'flat', salePrice: Math.round((t.monthlyAmount * n + t.downPayment) * 100) / 100,
+             downPayment: t.downPayment, annualInterestRate: 0, termMonths: n, startMonth: start }
+  }
+  if (t.salePrice == null || t.salePrice <= 0) {
+    throw new AppError(400, 'The installment contract needs either a monthly payment with no interest, or a sale price with the rate and number of payments.')
+  }
+  return { planType: 'amortized', salePrice: t.salePrice, downPayment: t.downPayment,
+           annualInterestRate: t.annualInterestRate, termMonths: n, startMonth: start }
+}
+
+/**
+ * On the landlord's signature of an installment contract: the typed terms
+ * become the sale record (pending the tenant's signature, which activates
+ * billing), and the derived boxes — amount financed, final payment amount and
+ * month — are stamped so the printed paper agrees with the record.
+ */
+export async function applySaleTermsFromDocument(documentId: string): Promise<{ contractId: string }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const doc = (await client.query<any>(
+      `SELECT d.id, d.unit_id, d.landlord_id FROM lease_documents d WHERE d.id = $1 FOR UPDATE`, [documentId])).rows[0]
+    if (!doc?.unit_id) throw new AppError(400, 'This installment contract is not attached to a unit.')
+    const fields = (await client.query<any>(
+      `SELECT id, lease_column, value FROM lease_document_fields WHERE document_id = $1 AND lease_column LIKE 'sale_%'`, [documentId])).rows
+    const terms = resolveTypedSaleTerms(saleTermsFromFields(fields))
+    const buyer = (await client.query<any>(
+      `SELECT t.id FROM lease_document_signers s JOIN tenants t ON t.user_id = s.user_id
+        WHERE s.document_id = $1 AND s.role IN ('primary','purchaser') ORDER BY s.order_index LIMIT 1`, [documentId])).rows[0]
+    if (!buyer) throw new AppError(400, 'The installment contract has no buyer on it.')
+
+    // A pending record already on this unit gives way to the paper.
+    const existing = (await client.query<any>(
+      `SELECT id, purchase_document_id, sale_price, down_payment, annual_interest_rate, term_months, start_month, plan_type
+         FROM home_sale_contracts WHERE unit_id = $1 AND status = 'pending_signature' FOR UPDATE`, [doc.unit_id])).rows[0]
+    let contract: any = null
+    if (existing && existing.purchase_document_id === documentId
+        && Number(existing.sale_price) === terms.salePrice && Number(existing.down_payment) === terms.downPayment
+        && Number(existing.annual_interest_rate) === terms.annualInterestRate && Number(existing.term_months) === terms.termMonths
+        && String(existing.start_month).slice(0, 10) === terms.startMonth) {
+      contract = (await client.query<any>(`SELECT * FROM home_sale_contracts WHERE id = $1`, [existing.id])).rows[0]
+    } else {
+      if (existing) {
+        await client.query(`UPDATE home_sale_contracts SET status = 'cancelled', updated_at = NOW() WHERE id = $1`, [existing.id])
+      }
+      contract = await createHomeSaleContract(client, {
+        unitId: doc.unit_id, leaseId: null, tenantId: buyer.id, landlordId: doc.landlord_id,
+        salePrice: terms.salePrice, downPayment: terms.downPayment, annualInterestRate: terms.annualInterestRate,
+        termMonths: terms.termMonths, startMonth: terms.startMonth, planType: terms.planType, pendingSignature: true,
+      })
+      await client.query(`UPDATE home_sale_contracts SET purchase_document_id = $2, updated_at = NOW() WHERE id = $1`, [contract.id, documentId])
+    }
+
+    // The derived boxes, printed from the record.
+    const financed = Number(contract.financed_amount)
+    const { schedule } = computeAmortization(financed, terms.annualInterestRate, terms.termMonths)
+    const last = schedule[schedule.length - 1]
+    const lastMonth = (() => { const d = new Date(terms.startMonth + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + terms.termMonths - 1); return d })()
+    const derived: Record<string, string> = {
+      sale_financed_amount:      financed.toFixed(2),
+      sale_final_payment_amount: Number(last?.amount ?? contract.monthly_payment).toFixed(2),
+      sale_final_payment_month:  `${lastMonth.getUTCMonth() + 1}/1/${lastMonth.getUTCFullYear()}`,
+    }
+    for (const [col, val] of Object.entries(derived)) {
+      await client.query(`UPDATE lease_document_fields SET value = $3 WHERE document_id = $1 AND lease_column = $2`, [documentId, col, val])
+    }
+    await client.query('COMMIT')
+    return { contractId: contract.id }
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
+}
