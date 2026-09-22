@@ -110,7 +110,7 @@ describe('S640 team invites survive the account/entity split', () => {
 
   // The one role with no property to derive from. An account with a single
   // company still resolves; a two-company account is asked, in words.
-  it('a bookkeeper invite resolves for one company and asks when there are two', async () => {
+  it('a bookkeeper invite resolves for one company, and for the founding company when there are two', async () => {
     const one = await seedAccount(1)
     const okRes = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${one.token}`)
@@ -121,7 +121,8 @@ describe('S640 team invites survive the account/entity split', () => {
     const askRes = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${two.token}`)
       .send({ email: 'books2@example.com', scope: { accessLevel: 'read_only' } })
-    expect(askRes.status).toBe(400)
-    expect(String(askRes.body.error)).toMatch(/more than one company/i)
+    // S652 (Nic): the account is never asked which company it is — with none
+    // named, the invite lands on the company the account founded.
+    expect(askRes.status, JSON.stringify(askRes.body)).toBe(201)
   })
 })

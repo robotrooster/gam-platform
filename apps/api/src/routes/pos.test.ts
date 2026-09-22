@@ -2242,8 +2242,10 @@ describe('S649 a two-company account uses the register by property', () => {
       { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
         landlordIds: [f.landlordId, secondLandlord], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
+    // S652 (Nic): the account is never asked which company it is — with no
+    // property named, the register lists the founding company's items.
     const bare = await request(buildApp()).get('/api/pos/items').set('Authorization', `Bearer ${token}`)
-    expect(bare.status).toBe(400)   // no property, no company: still refused, never guessed
+    expect(bare.status, JSON.stringify(bare.body)).toBe(200)
     const res = await request(buildApp()).get(`/api/pos/items?propertyId=${f.propertyId}`).set('Authorization', `Bearer ${token}`)
     expect(res.status).toBe(200)
     expect(res.body.data.map((i: any) => i.id)).toContain(itemId)
