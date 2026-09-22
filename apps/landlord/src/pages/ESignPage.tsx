@@ -37,6 +37,9 @@ const FIELD_TYPES = [
   // document on every lease" — printed, not a box; the landlord can change it
   // on one lease with a deliberate click.
   { type:'fixed_text',label:'Fixed text', icon:'🔤', color:'#64748b', w:200, h:20 },
+  // S652 (Blu): the year of manufacture picked from a list, not typed — a
+  // year only, no month or day.
+  { type:'year',      label:'Year (pick from a list)', icon:'📆', color:'#0ea5e9', w:70, h:18 },
 ]
 
 // Lease roles + S568 generic roles (standalone contracts: purchase agreements,

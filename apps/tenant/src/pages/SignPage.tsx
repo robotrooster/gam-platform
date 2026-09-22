@@ -871,7 +871,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'visible' }}>{shown(f,val)}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':f.fieldType==='year'?'Year':'Click'}
                   </span>
                 )}
               </div>
@@ -907,6 +907,16 @@ export function SignPage() {
                   </label>
                 ))}
               </div>
+            )}
+            {activeField.fieldType==='year' && (
+              // S652 (Blu): a year is picked from a list — the current year and
+              // back a century — and the editor stays open until Save.
+              <select autoFocus className="input" value={fieldValues[activeField.id]||''}
+                onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
+                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14, background:'white', color:'#1a1a1a' }}>
+                <option value="">Pick a year…</option>
+                {Array.from({ length: 111 }, (_, i) => String(new Date().getFullYear() + 1 - i)).map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
             )}
             {(activeField.fieldType==='text'||activeField.fieldType==='fixed_text') && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}

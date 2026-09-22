@@ -762,3 +762,6 @@ Still held for Nic's go: tenant packet email bundling (tenant is emailed per doc
 - `services/packetRelay.ts`: `advancePacket(groupId)` — after any signature on a packet document, the next signer in order is invited ONCE, only when everyone ahead of them has signed every document in the packet; one email (link to the first document needing them), all their signer rows marked sent. `announcePacketIfComplete` — the "fully signed" note goes out once per signer when the LAST document completes. Standalone documents keep the per-document relay. Test: signingPackages "advancePacket — one invitation per packet".
 - Both signing pages: the "Document N of M" line opens the whole packet — every document with its state for this signer (this one / needs you / you signed / not yours yet / done); click any that is theirs to open it. Order is the signer's choice.
 - Tenants at Country Acres already invited per document before this change keep those links; nothing re-sends.
+
+## Year field (Blu) — deploy 42
+`field_type='year'`: template palette "Year (pick from a list)"; on the signing page a scroll list (next year back a century) that stays open until Save; stamped as text. Blu's installment contract "Year of manufacture" box (page 4) switched to it on the template; documents already drafted keep their text box until re-drafted.
