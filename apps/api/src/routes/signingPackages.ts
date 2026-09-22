@@ -144,6 +144,9 @@ signingPackagesRouter.get('/for-unit/:unitId', requirePerm('leases.create'), asy
       landlordIds: landlordScopeIds(req.user!),
       unitId: req.params.unitId,
       packageId: typeof req.query.packageId === 'string' ? req.query.packageId : null,
+      // S652: the invite asks "selling them this home?" before any sale exists —
+      // show the packet as it will draft.
+      kind: req.query.sale === '1' ? 'sale' : undefined,
     })
     res.json({ success: true, data: resolved })
   } catch (e) { next(e) }

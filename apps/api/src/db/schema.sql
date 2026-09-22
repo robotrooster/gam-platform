@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 1cfLL43hLx9mLHN5DICLoABBwxdIqYtkMWby3daCqIDudK9NLikecp1LWapdXR9
+\restrict 9GZ92x0RSZZjL8296PKj4q9T5nfFRLzU7Eo5Tdbd7o3Nqx8aNqPXLoDlh0r0XXe
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6642,6 +6642,7 @@ CREATE TABLE public.pending_tenant_intents (
     work_trade_covered_charges text[],
     work_trade_tracks_hours boolean,
     home_sale_terms jsonb,
+    package_template_ids uuid[],
     CONSTRAINT pending_intent_work_trade_covered_check CHECK (((work_trade_covered_charges IS NULL) OR ((array_length(work_trade_covered_charges, 1) > 0) AND (work_trade_covered_charges <@ ARRAY['rent'::text, 'fees'::text, 'water'::text, 'sewer'::text, 'electric'::text, 'gas'::text, 'trash'::text, 'propane'::text])))),
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text]))),
     CONSTRAINT pti_work_trade_hours_positive CHECK (((work_trade_hours_target IS NULL) OR (work_trade_hours_target > 0)))
@@ -27968,5 +27969,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 1cfLL43hLx9mLHN5DICLoABBwxdIqYtkMWby3daCqIDudK9NLikecp1LWapdXR9
+\unrestrict 9GZ92x0RSZZjL8296PKj4q9T5nfFRLzU7Eo5Tdbd7o3Nqx8aNqPXLoDlh0r0XXe
 

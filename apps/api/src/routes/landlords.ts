@@ -2412,6 +2412,9 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     const homeSaleTerms = req.body?.homeSale
       ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
       : null
+    // S652: the packet as the landlord left it ticked on the invite.
+    const packageTemplateIds: string[] | null = Array.isArray(req.body?.packageTemplateIds)
+      ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && /^[0-9a-f-]{36}$/i.test(t)) : null
     const { firstName, lastName, email, phone, unitId,
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
@@ -2569,13 +2572,13 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // that an invite had been lost. Re-inviting to the SAME unit still reopens
     // that invite, which is the behaviour this clause was written for.
     await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms)
-       VALUES ($1, $2, 'not_uploaded', $3, $4)
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms, package_template_ids)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5)
        ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
        DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL,
-                     home_sale_terms=EXCLUDED.home_sale_terms, updated_at=NOW()`,
-      // S652: the home sale is decided on the invite and rides on the intent.
-      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null])
+                     home_sale_terms=EXCLUDED.home_sale_terms, package_template_ids=EXCLUDED.package_template_ids, updated_at=NOW()`,
+      // S652: the home sale and the ticked packet are decided on the invite and ride on the intent.
+      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null, packageTemplateIds])
 
     await client.query('COMMIT')
 
@@ -2752,6 +2755,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     const homeSaleTerms = req.body?.homeSale
       ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
       : null
+    // S652: the packet as the landlord left it ticked on the invite.
+    const packageTemplateIds: string[] | null = Array.isArray(req.body?.packageTemplateIds)
+      ? req.body.packageTemplateIds.filter((t: any) => typeof t === 'string' && /^[0-9a-f-]{36}$/i.test(t)) : null
     const { firstName, lastName, email, phone, unitId,
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
@@ -2883,8 +2889,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
           is_work_trade, work_trade_hours_target, work_trade_duties,
-          work_trade_tracks_hours, home_sale_terms)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8)
+          work_trade_tracks_hours, home_sale_terms, package_template_ids)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
@@ -2895,7 +2901,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        // "not stated", which the signing path treats as tracked.
        isWorkTrade === true ? workTradeTracksHours !== false : null,
        // S652: selling them the home on installments — decided on the invite.
-       homeSaleTerms]
+       homeSaleTerms, packageTemplateIds]
     )
 
     await client.query('COMMIT')

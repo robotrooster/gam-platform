@@ -47,6 +47,8 @@ export async function draftHouseholdLease(args: {
   residents: Array<{ userId: string; name: string; email: string; phone?: string | null }>
   /** S652: the household is buying the home on installments — terms from the invite. */
   homeSale?: any | null
+  /** S652: what the landlord left ticked on the invite. */
+  packageTemplateIds?: string[] | null
 }): Promise<HouseholdDraftResult> {
   const { landlordId, unitId, residents } = args
   if (!residents.length) return { drafted: false, reason: 'No residents to draft for' }
@@ -147,6 +149,7 @@ export async function draftHouseholdLease(args: {
           name: r.name, email: r.email, phone: r.phone ?? null, orderIndex: i + 2 })),
       ],
       homeSale: args.homeSale ?? null,
+      templateIds: args.packageTemplateIds ?? null,
     }, createDocumentRecord)
     const packetSize = 1 + siblings.count
     // Waiting rows are closed out inside createDocumentRecord — every lease

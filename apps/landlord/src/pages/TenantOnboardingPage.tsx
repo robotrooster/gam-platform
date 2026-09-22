@@ -296,6 +296,51 @@ export const homeSaleComplete = (f: HomeSaleForm | null) => !f ? true : f.planTy
   ? Number(f.monthlyAmount) > 0 && Number(f.numberOfPayments) > 0
   : Number(f.salePrice) > 0 && Number(f.termMonths) > 0
 
+/**
+ * S652 (Nic): "it needs to show the packet at the invite." The unit's default
+ * package, as it will draft, pre-ticked — untick what does not apply. Same
+ * checklist the e-sign page shows. `sale` re-asks the package as a sale so the
+ * installment papers appear the moment the sale box is ticked.
+ */
+export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
+  unitId: string; sale: boolean; ticked: Record<string, boolean> | null; setTicked: (v: Record<string, boolean>) => void
+}) {
+  const { data: pkg, isLoading } = useQuery<any>(['signing-package-for-unit', unitId, sale],
+    () => apiGet(`/signing-packages/for-unit/${unitId}${sale ? '?sale=1' : ''}`), { enabled: !!unitId })
+  // Pre-tick from the package's own judgement whenever the packet is (re)loaded.
+  useEffect(() => {
+    if (!pkg?.items) return
+    const next: Record<string, boolean> = {}
+    for (const i of pkg.items) next[i.templateId] = !!i.suggested
+    setTicked(next)
+  }, [pkg])
+  if (isLoading) return <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10 }}>Loading the packet…</div>
+  if (!pkg?.items?.length) return (
+    <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+      No package for this kind of unit yet — only the default lease drafts. Set one up under GoldSign → Packages.
+    </div>
+  )
+  const t = ticked ?? {}
+  return (
+    <div style={{ marginBottom: 10, padding: '10px 12px', background: 'var(--bg-2)', borderRadius: 8, border: '1px solid var(--border-0)' }}>
+      <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)', marginBottom: 2 }}>{pkg.name}</div>
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 8 }}>What they sign, in this order. Untick anything that doesn't apply.</div>
+      {pkg.items.map((i: any) => (
+        <label key={i.templateId} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '4px 0',
+          cursor: i.required ? 'default' : 'pointer', opacity: i.required ? .85 : 1 }}>
+          <input type="checkbox" checked={i.required ? true : !!t[i.templateId]} disabled={i.required}
+            onChange={e => setTicked({ ...t, [i.templateId]: e.target.checked })} style={{ marginTop: 3 }} />
+          <span>
+            <span style={{ fontSize: '.78rem', color: 'var(--text-1)' }}>{i.templateName}</span>
+            <span style={{ display: 'block', fontSize: '.68rem', color: 'var(--text-3)', marginTop: 1 }}>{i.reason}</span>
+          </span>
+        </label>
+      ))}
+    </div>
+  )
+}
+export const tickedIds = (t: Record<string, boolean> | null) => t ? Object.entries(t).filter(([, v]) => v).map(([k]) => k) : undefined
+
 /** "Are you adding a home to the sale?" — the invite's one question beyond who lives there. */
 export function HomeSaleToggle({ sale, setSale }: { sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void }) {
   const f = sale
@@ -404,6 +449,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
   // only for a park-owned home. Terms travel with the invite so the packet
   // drafts as a sale before the landlord signs anything.
   const [sale, setSale] = useState<Record<string, HomeSaleForm | null>>({})
+  // S652: the packet as the landlord left it ticked, per unit.
+  const [packet, setPacket] = useState<Record<string, Record<string, boolean> | null>>({})
   const [open, setOpen] = useState<Record<string, boolean>>(
     initialUnitId ? { [initialUnitId]: true } : {})
   const [sent, setSent] = useState<Record<string, string[]>>({})
@@ -456,7 +503,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
         try {
           await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
             { ...p, unitId: u.id, existingResident: attest[u.id] !== false,
-              homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined })
+              homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined,
+              packageTemplateIds: tickedIds(packet[u.id] ?? null) })
           okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
         } catch (e: any) {
           failed.push(p)
@@ -567,6 +615,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
                   setAttest={v => setAttest(prev => ({ ...prev, [u.id]: v }))}
                   sale={sale[u.id] ?? null}
                   setSale={v => setSale(prev => ({ ...prev, [u.id]: v }))}
+                  packet={packet[u.id] ?? null}
+                  setPacket={v => setPacket(prev => ({ ...prev, [u.id]: v }))}
                   error={errors[u.id] ?? null} />
               ))}
             </div>
@@ -599,11 +649,12 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
 
 /** S629: one unit's roster. Presentational — the page owns the data so a
  *  single send can see every unit at once. */
-function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, error }: {
+function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, packet, setPacket, error }: {
   unit: any; open: boolean; onOpen: () => void; onClose: () => void
   people: Person[]; setPeople: (next: Person[]) => void
   attest: boolean; setAttest: (v: boolean) => void
   sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void
+  packet: Record<string, boolean> | null; setPacket: (v: Record<string, boolean>) => void
   error: string | null
 }) {
   const { data: obWindow } = useQuery<any>(
@@ -658,6 +709,8 @@ function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest
       {unit.dwellingOwnership === 'landlord' && unit.unitType === 'mobile_home' && (
         <HomeSaleToggle sale={sale} setSale={setSale} />
       )}
+      {/* S652 (Nic): the packet, at the invite. */}
+      <PacketChecklist unitId={unit.id} sale={!!sale} ticked={packet} setTicked={setPacket} />
 
       {people.map((p, i) => (
         <div key={i} style={{ marginBottom: 8 }}>

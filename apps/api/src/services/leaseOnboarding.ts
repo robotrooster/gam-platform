@@ -84,7 +84,7 @@ type IntentRow = {
 
 async function loadRoster(client: Client, unitId: string): Promise<IntentRow[]> {
   return client.query(
-    `SELECT pti.id, pti.tenant_id, pti.accepted_at, pti.draft_document_id, pti.home_sale_terms,
+    `SELECT pti.id, pti.tenant_id, pti.accepted_at, pti.draft_document_id, pti.home_sale_terms, pti.package_template_ids,
             u.id AS user_id, u.first_name, u.last_name, u.email, pti.created_at
        FROM pending_tenant_intents pti
        JOIN tenants t ON t.id = pti.tenant_id
@@ -187,6 +187,7 @@ export async function autoDraftLeasesForUnit(
         landlordId: unit.landlord_id, unitId, leaseDocId: doc.id, leaseTemplateId: tmpl.id,
         signers: [{ ...landlord, orderIndex: 1 }, ...tenantSigners],
         homeSale: (members as any[]).find(m => m.home_sale_terms)?.home_sale_terms ?? null,
+        templateIds: (members as any[]).find(m => m.package_template_ids)?.package_template_ids ?? null,
         prefill: { ...term },
       }, createDocumentRecord)
       await client.query(

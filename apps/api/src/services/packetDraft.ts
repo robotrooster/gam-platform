@@ -32,6 +32,8 @@ export async function draftPacketSiblings(
     signers: Array<{ userId: string; role: string; name: string; email: string; phone?: string | null; orderIndex: number }>
     homeSale?: any | null
     prefill?: Record<string, string>
+    /** S652: what the landlord left ticked on the invite; null = the package's own suggestion. */
+    templateIds?: string[] | null
   },
   createDocumentRecord: (client: any, opts: any) => Promise<any>,
 ): Promise<{ count: number; groupId: string | null; homeSaleContractId: string | null }> {
@@ -62,7 +64,9 @@ export async function draftPacketSiblings(
   }
 
   const pkg = await resolvePackageForUnit({ landlordIds: [landlordId], unitId, kind: sale ? 'sale' : undefined })
-  const extras = (pkg?.items ?? []).filter(i => i.suggested && i.templateId !== leaseTemplateId && i.purpose !== 'lease')
+  const ticked = args.templateIds ? new Set(args.templateIds) : null
+  const extras = (pkg?.items ?? []).filter(i =>
+    (ticked ? ticked.has(i.templateId) : i.suggested) && i.templateId !== leaseTemplateId && i.purpose !== 'lease')
   if (sale && !extras.some(i => i.purpose === 'installment_sale')) {
     throw new AppError(400, 'This household is buying the home, but the package has no installment contract to sign. Add one to the package first.')
   }

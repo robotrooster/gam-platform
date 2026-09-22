@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { HomeSaleToggle, homeSalePayload, homeSaleComplete, type HomeSaleForm } from './TenantOnboardingPage'
+import { HomeSaleToggle, homeSalePayload, homeSaleComplete, PacketChecklist, tickedIds, type HomeSaleForm } from './TenantOnboardingPage'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
@@ -99,6 +99,7 @@ export function InviteTenantModal({ onClose }: Props) {
             const r: any = await apiPost('/esign/draft-household', {
               unitId: form.unitId, emails: out.map(o => o.email),
               homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,
+              packageTemplateIds: tickedIds(packet),
             })
             draft = r?.data ?? r
           } catch { draft = null }
@@ -124,6 +125,7 @@ export function InviteTenantModal({ onClose }: Props) {
   const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
   // S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home.
   const [homeSale, setHomeSale] = useState<HomeSaleForm | null>(null)
+  const [packet, setPacket] = useState<Record<string, boolean> | null>(null)
   const askSale = selectedUnit?.dwellingOwnership === 'landlord' && selectedUnit?.unitType === 'mobile_home'
 
   const validateStep = () => {
@@ -382,6 +384,7 @@ export function InviteTenantModal({ onClose }: Props) {
             )}
             {/* S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home. */}
             {askSale && <div style={{ marginTop: 12 }}><HomeSaleToggle sale={homeSale} setSale={setHomeSale} /></div>}
+            {form.unitId && <div style={{ marginTop: 12 }}><PacketChecklist unitId={form.unitId} sale={askSale && !!homeSale} ticked={packet} setTicked={setPacket} /></div>}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
 
             {form.unitId && (

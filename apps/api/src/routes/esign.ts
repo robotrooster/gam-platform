@@ -6075,6 +6075,7 @@ esignRouter.post('/draft-household', requirePerm('leases.create'), async (req, r
       // Household order — first email is the primary resident.
       emails: z.array(z.string().email()).min(1).max(8),
       homeSale: z.any().optional(),
+      packageTemplateIds: z.array(z.string().uuid()).max(40).optional(),
     }).parse(req.body)
 
     const unit = await queryOne<any>(
@@ -6090,6 +6091,7 @@ esignRouter.post('/draft-household', requirePerm('leases.create'), async (req, r
     }
     const result = await draftHouseholdLease({
       landlordId: unit.landlord_id, unitId: body.unitId, residents, homeSale: body.homeSale ?? null,
+      packageTemplateIds: body.packageTemplateIds ?? null,
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }

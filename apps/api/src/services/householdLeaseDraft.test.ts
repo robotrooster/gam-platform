@@ -176,6 +176,26 @@ describe('draftHouseholdLease', () => {
     expect(rows).toHaveLength(0)
   })
 
+  // S652 (Nic): "it needs to show the packet at the invite" — and what was
+  // unticked there stays out of the draft.
+  it('drafts exactly what the landlord left ticked on the invite', async () => {
+    const c = await seedCtx('mobile_home')
+    const tpl = await seedTemplate(c.landlordId, 'mobile_home')
+    const mk = async (name: string, dt: string) => (await db.query<any>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, base_pdf_url, disclosure_type, is_active)
+       VALUES ($1,$2,'state_disclosure','/uploads/x.pdf',$3,TRUE) RETURNING id`, [c.landlordId, name, dt])).rows[0].id
+    const rules = await mk('Park Rules', 'park_rules'), pets = await mk('Pet Policy', 'other')
+    const { rows: [pkg] } = await db.query<any>(
+      `INSERT INTO document_packages (landlord_id, name, unit_type, is_default) VALUES ($1,'MH packet','mobile_home',TRUE) RETURNING id`, [c.landlordId])
+    await db.query(`INSERT INTO document_package_items (package_id, template_id, sort_order, renewal_behavior, required)
+                    VALUES ($1,$2,0,'with_lease',TRUE), ($1,$3,1,'once_per_tenancy',FALSE), ($1,$4,2,'once_per_tenancy',FALSE)`, [pkg.id, tpl, rules, pets])
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents: resident(c),
+      packageTemplateIds: [tpl, rules] })   // pets unticked at the invite
+    expect(res.drafted).toBe(true)
+    const { rows: docs } = await db.query<any>(`SELECT title FROM lease_documents WHERE unit_id=$1 ORDER BY package_sort_order`, [c.unitId])
+    expect(docs.map((d: any) => d.title)).toEqual([expect.stringMatching(/^Lease/), 'Park Rules'])
+  })
+
   it('does not draft twice for the same unit', async () => {
     const c = await seedCtx('rv_spot')
     await seedTemplate(c.landlordId, 'rv_spot')
