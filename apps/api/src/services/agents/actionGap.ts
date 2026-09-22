@@ -50,6 +50,9 @@ const DELIBERATE = new Map(Object.entries({
     'emails an existing charge again. Done from the open-links list at the register, next to the address it goes to.',
   'posPayLinks POST /:id/cancel':
     'closes a link somebody may be about to pay. Done from the open-links list, where the desk can see whether it has already been paid.',
+  // ── S652: posting a check that arrived before its bill ────────────────────
+  'payments POST /post-payment':
+    'writes down cash, a check or a money order handed over at the office and banks what is beyond the open balance as paid ahead. Done at the desk with the check in hand — the amount, the check number and the date come off the paper, and a misheard figure is money the books say arrived and did not. The agent records a payment against an open charge (record_cash_payment); money ahead of any bill is the desk\'s to post.',
   // ── S642: pushing a signing reminder ───────────────────────────────────────
   'esign POST /documents/:id/remind':
     'emails a reminder to whoever is holding up a lease. Reachable by an agent would defeat the point: the automatic reminder already has a ceiling precisely so nobody is chased forever, and an agent that can push on request is a ceiling with a loophole. This is the landlord deciding one person is worth another nudge, on a screen showing how many have already gone.',
