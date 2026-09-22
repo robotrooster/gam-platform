@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { HomeSaleToggle, homeSalePayload, homeSaleComplete, type HomeSaleForm } from './TenantOnboardingPage'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
@@ -97,6 +98,7 @@ export function InviteTenantModal({ onClose }: Props) {
           try {
             const r: any = await apiPost('/esign/draft-household', {
               unitId: form.unitId, emails: out.map(o => o.email),
+              homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,
             })
             draft = r?.data ?? r
           } catch { draft = null }
@@ -120,6 +122,9 @@ export function InviteTenantModal({ onClose }: Props) {
   const removeResident = (i: number) => setResidents(rs => rs.filter((_, idx) => idx !== i))
 
   const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
+  // S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home.
+  const [homeSale, setHomeSale] = useState<HomeSaleForm | null>(null)
+  const askSale = selectedUnit?.dwellingOwnership === 'landlord' && selectedUnit?.unitType === 'mobile_home'
 
   const validateStep = () => {
     const errs: Record<string, string> = {}
@@ -137,6 +142,7 @@ export function InviteTenantModal({ onClose }: Props) {
       })
     }
     if (step === 1 && !form.unitId) errs.unitId = 'Select a unit'
+    if (step === 1 && askSale && !homeSaleComplete(homeSale)) errs.unitId = 'Fill in the home sale terms, or untick the box'
     setErrors(errs)
     return Object.keys(errs).length === 0
   }
@@ -374,6 +380,8 @@ export function InviteTenantModal({ onClose }: Props) {
                 Not shown: {hiddenReasons.join(', ')}.
               </div>
             )}
+            {/* S652 (Nic): "are you adding a home to the sale?" — only for a park-owned home. */}
+            {askSale && <div style={{ marginTop: 12 }}><HomeSaleToggle sale={homeSale} setSale={setHomeSale} /></div>}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
 
             {form.unitId && (

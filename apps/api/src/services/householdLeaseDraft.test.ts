@@ -136,6 +136,46 @@ describe('draftHouseholdLease', () => {
     expect(primaries).toHaveLength(2)
   })
 
+  // S652 (Nic): the home sale is decided on the invite — the packet drafts as
+  // a sale, the contract exists, and the two are linked.
+  it('with sale terms from the invite, drafts the installment contract too and writes the sale', async () => {
+    const c = await seedCtx('mobile_home')
+    await db.query(`UPDATE units SET dwelling_ownership='landlord' WHERE id=$1`, [c.unitId])
+    const tpl = await seedTemplate(c.landlordId, 'mobile_home')
+    const { rows: [contract] } = await db.query<any>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, base_pdf_url, applies_to, is_active)
+       VALUES ($1,'Installment Contract','installment_sale','/uploads/contract.pdf','sale',TRUE) RETURNING id`, [c.landlordId])
+    const { rows: [pkg] } = await db.query<any>(
+      `INSERT INTO document_packages (landlord_id, name, unit_type, is_default) VALUES ($1,'MH packet','mobile_home',TRUE) RETURNING id`, [c.landlordId])
+    await db.query(`INSERT INTO document_package_items (package_id, template_id, sort_order, renewal_behavior, required)
+                    VALUES ($1,$2,0,'with_lease',TRUE), ($1,$3,1,'once_per_tenancy',FALSE)`, [pkg.id, tpl, contract.id])
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents: resident(c),
+      homeSale: { planType: 'flat', monthlyAmount: 200, numberOfPayments: 55, startMonth: '2026-10-01' } })
+    expect(res.drafted).toBe(true)
+    const { rows: docs } = await db.query<any>(
+      `SELECT id, document_type, package_group_id FROM lease_documents WHERE unit_id=$1 ORDER BY package_sort_order`, [c.unitId])
+    expect(docs.map((d: any) => d.document_type)).toEqual(['original_lease', 'purchase_agreement'])
+    const { rows: [sale] } = await db.query<any>(`SELECT status, sale_price, monthly_payment, purchase_document_id FROM home_sale_contracts WHERE unit_id=$1`, [c.unitId])
+    expect(sale.status).toBe('pending_signature')
+    expect(Number(sale.sale_price)).toBe(11000)
+    expect(sale.purchase_document_id).toBe(docs[1].id)
+    // and the contract page carries the same numbers
+    const { rows: pre } = await db.query<any>(
+      `SELECT value FROM lease_document_fields WHERE document_id=$1 AND lease_column='sale_monthly_payment'`, [docs[1].id])
+    expect(pre.length === 0 || Number(pre[0].value) === 200).toBe(true)
+  })
+
+  it('sale terms with no installment contract in the package is refused, not silently billed', async () => {
+    const c = await seedCtx('mobile_home')
+    await seedTemplate(c.landlordId, 'mobile_home')
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents: resident(c),
+      homeSale: { planType: 'flat', monthlyAmount: 200, numberOfPayments: 55, startMonth: '2026-10-01' } })
+    expect(res.drafted).toBe(false)
+    expect((res as any).reason).toMatch(/installment contract/)
+    const { rows } = await db.query(`SELECT 1 FROM home_sale_contracts WHERE unit_id=$1`, [c.unitId])
+    expect(rows).toHaveLength(0)
+  })
+
   it('does not draft twice for the same unit', async () => {
     const c = await seedCtx('rv_spot')
     await seedTemplate(c.landlordId, 'rv_spot')

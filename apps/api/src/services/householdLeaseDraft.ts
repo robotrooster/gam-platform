@@ -27,8 +27,6 @@ import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { resolveLeaseSigner } from './leaseSigner'
 import { createDocumentRecord } from '../routes/esign'
 import { logger } from '../lib/logger'
-import { resolvePackageForUnit } from './signingPackages'
-import crypto from 'crypto'
 
 export type HouseholdDraftResult =
   | { drafted: true; documentId: string; templateId: string; packetSize?: number }
@@ -47,6 +45,8 @@ export async function draftHouseholdLease(args: {
   unitId: string
   /** Every resident invited to this unit, in household order (primary first). */
   residents: Array<{ userId: string; name: string; email: string; phone?: string | null }>
+  /** S652: the household is buying the home on installments — terms from the invite. */
+  homeSale?: any | null
 }): Promise<HouseholdDraftResult> {
   const { landlordId, unitId, residents } = args
   if (!residents.length) return { drafted: false, reason: 'No residents to draft for' }
@@ -136,41 +136,19 @@ export async function draftHouseholdLease(args: {
       ],
     })
     // S652 (Nic): "no selecting package/templates at invite." The unit's
-    // default PACKAGE decides what rides with the lease — every document it
-    // ticks for this unit, same signers, one packet, nothing chosen by hand.
-    // Exactly what the e-sign page drafts when the landlord sends from there.
-    // An installment sale is the one thing left out here: its terms have to
-    // come with the draft or it would be signed and bill nothing.
-    const signers = [
-      { userId: signer.userId, role: 'landlord', name: signer.name, email: signer.email, phone: signer.phone, orderIndex: 1 },
-      ...residents.map((r, i) => ({ userId: r.userId, role: i === 0 ? 'primary' : `co_tenant_${i}`,
-        name: r.name, email: r.email, phone: r.phone ?? null, orderIndex: i + 2 })),
-    ]
-    const pkg = await resolvePackageForUnit({ landlordIds: [landlordId], unitId }).catch(() => null)
-    const extras = (pkg?.items ?? []).filter(i =>
-      i.suggested && i.templateId !== template.id && i.purpose !== 'lease' && i.purpose !== 'installment_sale')
-    let packetSize = 1
-    if (pkg && extras.length) {
-      const groupId = crypto.randomUUID()
-      await client.query(
-        `UPDATE lease_documents SET package_group_id=$1, package_id=$2, package_sort_order=0 WHERE id=$3`,
-        [groupId, pkg.packageId, doc.id])
-      let order = 1
-      for (const i of extras) {
-        const t = await client.query(
-          `SELECT id, name, base_pdf_url, purpose, version FROM lease_templates WHERE id=$1 AND landlord_id = ANY(SELECT account_companies($2)) AND is_active`,
-          [i.templateId, landlordId]).then(r => r.rows[0])
-        if (!t?.base_pdf_url) continue
-        await createDocumentRecord(client, {
-          landlordId, templateId: t.id, unitId, leaseId: null, title: t.name,
-          basePdfUrl: t.base_pdf_url, documentType: 'addendum_terms' as any,
-          targetLeaseTenantId: null, promoteLeaseTenantId: null, signers, prefillValues: {},
-          packageGroupId: groupId, packageId: pkg.packageId, packageSortOrder: order++,
-          templateVersion: Number(t.version) || 1,
-        } as any)
-        packetSize++
-      }
-    }
+    // default PACKAGE decides what rides with the lease; a home sale comes in
+    // with the invite. One helper for every door — services/packetDraft.
+    const { draftPacketSiblings } = await import('./packetDraft')
+    const siblings = await draftPacketSiblings(client as any, {
+      landlordId, unitId, leaseDocId: doc.id, leaseTemplateId: template.id,
+      signers: [
+        { userId: signer.userId, role: 'landlord', name: signer.name, email: signer.email, phone: signer.phone, orderIndex: 1 },
+        ...residents.map((r, i) => ({ userId: r.userId, role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          name: r.name, email: r.email, phone: r.phone ?? null, orderIndex: i + 2 })),
+      ],
+      homeSale: args.homeSale ?? null,
+    }, createDocumentRecord)
+    const packetSize = 1 + siblings.count
     // Waiting rows are closed out inside createDocumentRecord — every lease
     // document goes through it, so a hand-sent lease clears them too.
     await client.query('COMMIT')
@@ -180,7 +158,8 @@ export async function draftHouseholdLease(args: {
   } catch (e: any) {
     await client.query('ROLLBACK')
     logger.error({ err: e, unitId }, '[household-draft] draft failed')
-    return { drafted: false, reason: 'Could not draft the lease automatically — you can send it manually from the unit.' }
+    return { drafted: false, reason: e?.statusCode === 400 && e?.message ? e.message
+      : 'Could not draft the lease automatically — you can send it manually from the unit.' }
   } finally {
     client.release()
   }

@@ -2407,6 +2407,11 @@ landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, 
 landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboard'), async (req, res, next) => {
   const client = await getClient()
   try {
+    // S652 (Nic): "are you adding a home to the sale?" — asked on the invite for
+    // a park-owned home, carried on the intent so the packet drafts as a sale.
+    const homeSaleTerms = req.body?.homeSale
+      ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
+      : null
     const { firstName, lastName, email, phone, unitId,
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
@@ -2564,11 +2569,13 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     // that an invite had been lost. Re-inviting to the SAME unit still reopens
     // that invite, which is the behaviour this clause was written for.
     await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
-       VALUES ($1, $2, 'not_uploaded', $3)
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, home_sale_terms)
+       VALUES ($1, $2, 'not_uploaded', $3, $4)
        ON CONFLICT (tenant_id, unit_id) WHERE cancelled_at IS NULL AND unit_id IS NOT NULL
-       DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL, updated_at=NOW()`,
-      [landlordId, tenantId, unitId])
+       DO UPDATE SET resolved_at=NULL, accepted_at=NULL, draft_document_id=NULL,
+                     home_sale_terms=EXCLUDED.home_sale_terms, updated_at=NOW()`,
+      // S652: the home sale is decided on the invite and rides on the intent.
+      [landlordId, tenantId, unitId, homeSaleTerms ? JSON.stringify(homeSaleTerms) : null])
 
     await client.query('COMMIT')
 
@@ -2740,6 +2747,11 @@ type CsvRow = {
 landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create'), async (req, res, next) => {
   const client = await getClient()
   try {
+    // S652 (Nic): "are you adding a home to the sale?" — asked on the invite for
+    // a park-owned home, carried on the intent so the packet drafts as a sale.
+    const homeSaleTerms = req.body?.homeSale
+      ? (await import('../services/homeSale')).homeSaleTermsSchema.parse(req.body.homeSale) && req.body.homeSale
+      : null
     const { firstName, lastName, email, phone, unitId,
             isWorkTrade, workTradeHoursTarget, workTradeDuties,
             workTradeTracksHours } = req.body
@@ -2871,8 +2883,8 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       `INSERT INTO pending_tenant_intents
          (landlord_id, tenant_id, parser_status, unit_id,
           is_work_trade, work_trade_hours_target, work_trade_duties,
-          work_trade_tracks_hours)
-       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7)
+          work_trade_tracks_hours, home_sale_terms)
+       VALUES ($1, $2, 'not_uploaded', $3, $4, $5, $6, $7, $8)
        RETURNING id, parser_status, created_at, is_work_trade`,
       [landlordId, tenantId, unitId || null,
        isWorkTrade === true,
@@ -2881,7 +2893,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
        isWorkTrade === true ? (workTradeDuties || null) : null,
        // S637: only meaningful on a work-trade invite; NULL elsewhere reads as
        // "not stated", which the signing path treats as tracked.
-       isWorkTrade === true ? workTradeTracksHours !== false : null]
+       isWorkTrade === true ? workTradeTracksHours !== false : null,
+       // S652: selling them the home on installments — decided on the invite.
+       homeSaleTerms]
     )
 
     await client.query('COMMIT')

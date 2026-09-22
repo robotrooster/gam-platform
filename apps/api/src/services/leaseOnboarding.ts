@@ -84,7 +84,7 @@ type IntentRow = {
 
 async function loadRoster(client: Client, unitId: string): Promise<IntentRow[]> {
   return client.query(
-    `SELECT pti.id, pti.tenant_id, pti.accepted_at, pti.draft_document_id,
+    `SELECT pti.id, pti.tenant_id, pti.accepted_at, pti.draft_document_id, pti.home_sale_terms,
             u.id AS user_id, u.first_name, u.last_name, u.email, pti.created_at
        FROM pending_tenant_intents pti
        JOIN tenants t ON t.id = pti.tenant_id
@@ -180,6 +180,15 @@ export async function autoDraftLeasesForUnit(
         signers: [{ ...landlord, orderIndex: 1 }, ...tenantSigners],
         prefillValues: { ...term },
       })
+      // S652: the rest of the packet — the package's documents, and the home
+      // sale if the invite said so (terms travel on the primary's intent).
+      const { draftPacketSiblings } = await import('./packetDraft')
+      await draftPacketSiblings(client as any, {
+        landlordId: unit.landlord_id, unitId, leaseDocId: doc.id, leaseTemplateId: tmpl.id,
+        signers: [{ ...landlord, orderIndex: 1 }, ...tenantSigners],
+        homeSale: (members as any[]).find(m => m.home_sale_terms)?.home_sale_terms ?? null,
+        prefill: { ...term },
+      }, createDocumentRecord)
       await client.query(
         `UPDATE pending_tenant_intents SET draft_document_id=$1, updated_at=NOW() WHERE id = ANY($2)`,
         [doc.id, members.map(m => m.id)])

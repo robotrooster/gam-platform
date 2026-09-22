@@ -282,6 +282,73 @@ export function TenantOnboardingPage() {
 // Unit-linked invite → the lease auto-drafts from the unit's default template
 // on accept. Co-tenants: keep the same unit and invite again before anyone signs.
 type Person = { firstName: string; lastName: string; email: string; phone: string }
+
+// S652: the terms of a home sold on installments, as typed on the invite.
+export type HomeSaleForm = { planType: 'flat' | 'amortized'; monthlyAmount: string; numberOfPayments: string;
+  salePrice: string; downPayment: string; annualInterestRate: string; termMonths: string; startMonth: string }
+export const emptyHomeSale = (): HomeSaleForm => ({ planType: 'flat', monthlyAmount: '', numberOfPayments: '',
+  salePrice: '', downPayment: '0', annualInterestRate: '0', termMonths: '', startMonth: new Date().toISOString().slice(0, 7) + '-01' })
+export const homeSalePayload = (f: HomeSaleForm) => f.planType === 'flat'
+  ? { planType: 'flat', monthlyAmount: Number(f.monthlyAmount), numberOfPayments: Number(f.numberOfPayments), startMonth: f.startMonth }
+  : { planType: 'amortized', salePrice: Number(f.salePrice), downPayment: Number(f.downPayment || 0),
+      annualInterestRate: Number(f.annualInterestRate || 0), termMonths: Number(f.termMonths), startMonth: f.startMonth }
+export const homeSaleComplete = (f: HomeSaleForm | null) => !f ? true : f.planType === 'flat'
+  ? Number(f.monthlyAmount) > 0 && Number(f.numberOfPayments) > 0
+  : Number(f.salePrice) > 0 && Number(f.termMonths) > 0
+
+/** "Are you adding a home to the sale?" — the invite's one question beyond who lives there. */
+export function HomeSaleToggle({ sale, setSale }: { sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void }) {
+  const f = sale
+  const set = (k: keyof HomeSaleForm, v: string) => f && setSale({ ...f, [k]: v })
+  const inp = { fontSize: '.8rem' } as React.CSSProperties
+  return (
+    <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
+      <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer' }}>
+        <input type="checkbox" checked={!!f} onChange={e => setSale(e.target.checked ? emptyHomeSale() : null)} style={{ marginTop: 3, flexShrink: 0 }} />
+        <div>
+          <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Selling them this home on installments</div>
+          <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
+            The packet drafts as a sale: the installment contract and the sale papers go in with the lot lease, pre-filled from these terms.
+          </div>
+        </div>
+      </label>
+      {f && (
+        <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {(['flat', 'amortized'] as const).map(pt => (
+              <button key={pt} type="button" className={`btn btn-sm ${f.planType === pt ? 'btn-primary' : 'btn-ghost'}`} onClick={() => set('planType', pt)}>
+                {pt === 'flat' ? 'Same amount each month' : 'Price, rate and term'}</button>
+            ))}
+          </div>
+          {f.planType === 'flat' ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Each month ($)</label>
+                <input className="input" style={inp} type="number" min="1" value={f.monthlyAmount} onChange={e => set('monthlyAmount', e.target.value)} placeholder="200" /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Number of payments</label>
+                <input className="input" style={inp} type="number" min="1" value={f.numberOfPayments} onChange={e => set('numberOfPayments', e.target.value)} placeholder="55" /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>First payment month</label>
+                <input className="input" style={inp} type="month" value={f.startMonth.slice(0, 7)} onChange={e => set('startMonth', e.target.value + '-01')} /></div>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Price ($)</label>
+                <input className="input" style={inp} type="number" min="1" value={f.salePrice} onChange={e => set('salePrice', e.target.value)} /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Down payment ($)</label>
+                <input className="input" style={inp} type="number" min="0" value={f.downPayment} onChange={e => set('downPayment', e.target.value)} /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Interest (% / yr)</label>
+                <input className="input" style={inp} type="number" min="0" step="0.1" value={f.annualInterestRate} onChange={e => set('annualInterestRate', e.target.value)} /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>Term (months)</label>
+                <input className="input" style={inp} type="number" min="1" value={f.termMonths} onChange={e => set('termMonths', e.target.value)} /></div>
+              <div><label style={{ fontSize: '.7rem', color: 'var(--text-2)' }}>First payment month</label>
+                <input className="input" style={inp} type="month" value={f.startMonth.slice(0, 7)} onChange={e => set('startMonth', e.target.value + '-01')} /></div>
+            </div>
+          )}
+          {!homeSaleComplete(f) && <div style={{ fontSize: '.7rem', color: 'var(--amber, #d97706)' }}>Fill in the terms, or untick the box.</div>}
+        </div>
+      )}
+    </div>
+  )
+}
 const blankPerson = (): Person => ({ firstName: '', lastName: '', email: '', phone: '' })
 
 /**
@@ -333,6 +400,10 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
 
   const [rosters, setRosters] = useState<Record<string, Person[]>>({})
   const [attest, setAttest] = useState<Record<string, boolean>>({})
+  // S652 (Nic): "are you adding a home to the sale?" — per unit, on the invite,
+  // only for a park-owned home. Terms travel with the invite so the packet
+  // drafts as a sale before the landlord signs anything.
+  const [sale, setSale] = useState<Record<string, HomeSaleForm | null>>({})
   const [open, setOpen] = useState<Record<string, boolean>>(
     initialUnitId ? { [initialUnitId]: true } : {})
   const [sent, setSent] = useState<Record<string, string[]>>({})
@@ -384,7 +455,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       for (const p of people) {
         try {
           await apiPost<any>('/landlords/me/onboard-new-lease-tenant',
-            { ...p, unitId: u.id, existingResident: attest[u.id] !== false })
+            { ...p, unitId: u.id, existingResident: attest[u.id] !== false,
+              homeSale: sale[u.id] ? homeSalePayload(sale[u.id]!) : undefined })
           okNames.push(`${p.firstName} ${p.lastName}`.trim() || p.email)
         } catch (e: any) {
           failed.push(p)
@@ -493,6 +565,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
                   setPeople={next => setRoster(u.id, next)}
                   attest={attest[u.id] !== false}
                   setAttest={v => setAttest(prev => ({ ...prev, [u.id]: v }))}
+                  sale={sale[u.id] ?? null}
+                  setSale={v => setSale(prev => ({ ...prev, [u.id]: v }))}
                   error={errors[u.id] ?? null} />
               ))}
             </div>
@@ -525,10 +599,12 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
 
 /** S629: one unit's roster. Presentational — the page owns the data so a
  *  single send can see every unit at once. */
-function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, error }: {
+function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest, setAttest, sale, setSale, error }: {
   unit: any; open: boolean; onOpen: () => void; onClose: () => void
   people: Person[]; setPeople: (next: Person[]) => void
-  attest: boolean; setAttest: (v: boolean) => void; error: string | null
+  attest: boolean; setAttest: (v: boolean) => void
+  sale: HomeSaleForm | null; setSale: (v: HomeSaleForm | null) => void
+  error: string | null
 }) {
   const { data: obWindow } = useQuery<any>(
     ['ob-window', unit.propertyId],
@@ -576,6 +652,12 @@ function UnitInviteCard({ unit, open, onOpen, onClose, people, setPeople, attest
           Onboarding window closed — everyone invited here completes a background check before portal access.
         </div>
       ))}
+
+      {/* S652 (Nic): asked only for a park-owned home — a tenant-owned home,
+          an RV site or a bare lot never asks. */}
+      {unit.dwellingOwnership === 'landlord' && unit.unitType === 'mobile_home' && (
+        <HomeSaleToggle sale={sale} setSale={setSale} />
+      )}
 
       {people.map((p, i) => (
         <div key={i} style={{ marginBottom: 8 }}>

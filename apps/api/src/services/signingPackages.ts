@@ -112,6 +112,9 @@ export async function resolvePackageForUnit(params: {
   landlordIds: string[]
   unitId: string
   packageId?: string | null
+  // S652: a sale being papered in the same transaction is not visible to the
+  // pool yet — the caller says so.
+  kind?: TransactionKind
 }): Promise<ResolvedPackage | null> {
   const unit = await queryOne<{ property_id: string; unit_type: string | null; state: string | null }>(
     `SELECT u.property_id, u.unit_type, p.state
@@ -137,7 +140,7 @@ export async function resolvePackageForUnit(params: {
   if (!pkg) return null
 
   // S652: which disclosures belong in front of THIS household.
-  const kind = await transactionKindForUnit(params.unitId)
+  const kind = params.kind ?? await transactionKindForUnit(params.unitId)
   // A lot lease matches neither side — the landlord is renting land, and a
   // disclosure about a dwelling he does not provide is not his to make.
   const wantedAppliesTo = kind === 'sale' ? 'sale' : kind === 'rental' ? 'rental' : null
