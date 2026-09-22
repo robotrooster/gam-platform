@@ -454,6 +454,49 @@ is $0, so the evening run cannot double-pay.
   the next day. `disbursements.trigger_type='catch_up'`.
 - Claude does not create payouts or move money itself; that stays with Nic.
 
+**Work trade, built out (late S652).** One window for landlord and tenant
+(`packages/shared-ui/WorkTradePanel.tsx`): duties, skills, covered charges,
+this month's hours, the review day (last business day), each person's record
+(turned in / approved / denied, by count and hours). Trusted or Monitored per
+person; Logged → Approved / Denied. Jobs from the tenant portal: open work
+(general, grounds, cleaning, pests) to every work trader at the property,
+skilled work by skill; take, mark done, log hours in one step; a monitored
+person's skilled job waits for a trusted work trader or the landlord to confirm.
+Neighbours' contact details never reach a work trader. Jobs go back on the
+board when an agreement ends or sleeps for the season. Field permissions
+(`field_permissions`, first one `read_meters`): the meter walk moved to
+`packages/shared-ui/MeterWalk.tsx` and a work trader with Read meters takes it
+from their Work Trade tab, own property only, never the review. Indefinite
+carry-forward (`carry_forward_indefinite`). Curtis Clabough: 25 hrs, no limit,
+reads meters.
+
+**Utility bills wait for the landlord — when the company chooses.** Blu asked to
+see and correct bills before tenants do. It went platform-wide for an hour, then
+Nic separated two things: WHO may enter readings is a per-person permission
+(Team page; a work-trade agreement's Read meters), WHETHER the bills wait for
+approval is the company's own toggle on Settings (`landlords.review_utility_bills`,
+off by default; TruBlu / Country Acres on). A month's readings are priced by the
+same engine (`services/utilityReview.ts`), left unissued, and shown on the
+Meters page (Review bills & approve) with previous / this month / usage / bill
+per site. A read can be fixed in place until approved; approving completes the
+run and issues the bills. Invoices carrying those utilities wait, whole; an
+unread or flagged meter bills nothing and holds only its own unit — approval
+never waits on it. The landlord is notified when the last re-read lands.
+Tenants never see an unissued bill; the landlord's bill list was empty for
+every landlord (read profileId) and is fixed. Digits editable per meter; a
+readings spreadsheet (CSV) per property.
+
+**Country Acres, closed out.** 11 orphan duplicate water meters (no site, no
+read) deleted; the 13 real meters (occupied lots) hold the 8/26 baseline; the
+August run is closed with no bills. September usage → October invoices, all 13,
+via `is_existing_tenancy` (onboarding leases bill from the baseline whatever
+their start date). Lots 21, 22, 24 still flagged no-movement → re-read.
+
+**Blu's package save.** Documents and packages belong to the ACCOUNT
+(`account_companies()`, `fileUnderCompany()`); no "choose which company"
+question anywhere on documents. Errors show the server's sentence in both
+portals.
+
 ---
 
 ## Verified against code, not taken on trust
