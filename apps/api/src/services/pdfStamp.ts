@@ -95,7 +95,6 @@ export async function stampPdf(
   // person and "not applicable" to another. ZapfDingbats is one of the fourteen
   // fonts every PDF reader carries, and its '3' is a check mark — Helvetica's
   // WinAnsi encoding has no such glyph, so a literal ✓ would stamp as garbage.
-  const dingbats = await pdfDoc.embedFont(StandardFonts.ZapfDingbats)
   const signatureFontFor = (fontCss: string | null | undefined) => {
     if (!fontCss) return helvetica
     const css = String(fontCss).toLowerCase()
@@ -112,7 +111,12 @@ export async function stampPdf(
     const { height: pageHeight } = page.getSize()
     const pdfY = pageHeight - field.y - field.height
 
-    if (field.field_type === 'signature' || field.field_type === 'initials') {
+    // S652: a CHOICE box marked with initials prints like an initial; marked
+    // with X or a check it prints like a ticked checkbox. Fixed text prints
+    // as text, in the default branch below.
+    const choiceAsInitials = field.field_type === 'choice' && field.checkbox_mark === 'initials'
+    const choiceAsMark = field.field_type === 'choice' && !choiceAsInitials
+    if (field.field_type === 'signature' || field.field_type === 'initials' || choiceAsInitials) {
       if (field.value.startsWith('data:image')) {
         try {
           const base64Data = field.value.split(',')[1]
@@ -136,15 +140,27 @@ export async function stampPdf(
     } else if (field.field_type === 'date') {
       page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
         size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })
-    } else if (field.field_type === 'checkbox' && field.value === 'checked') {
+    } else if ((field.field_type === 'checkbox' && field.value === 'checked') || choiceAsMark) {
       const useCheck = field.checkbox_mark === 'check'
-      page.drawText(useCheck ? '3' : 'X', {
-        x: field.x + field.width * 0.2,
-        y: pdfY + field.height * 0.15,
-        size: field.height * 0.65,
-        font: useCheck ? dingbats : helveticaBold,
-        color: rgb(0, 0.4, 0),
-      })
+      if (useCheck) {
+        // S652: drawn as two strokes. ZapfDingbats' check glyph was addressed
+        // as '3', which pdf-lib cannot encode — every check-marked box threw.
+        const w = field.width, h = field.height
+        const p1 = { x: field.x + w * 0.2,  y: pdfY + h * 0.5 }
+        const p2 = { x: field.x + w * 0.42, y: pdfY + h * 0.2 }
+        const p3 = { x: field.x + w * 0.85, y: pdfY + h * 0.85 }
+        const t = Math.max(1, Math.min(w, h) * 0.12)
+        page.drawLine({ start: p1, end: p2, thickness: t, color: rgb(0, 0.4, 0) })
+        page.drawLine({ start: p2, end: p3, thickness: t, color: rgb(0, 0.4, 0) })
+      } else {
+        page.drawText('X', {
+          x: field.x + field.width * 0.2,
+          y: pdfY + field.height * 0.15,
+          size: field.height * 0.65,
+          font: helveticaBold,
+          color: rgb(0, 0.4, 0),
+        })
+      }
     } else if (field.value) {
       page.drawText(field.value, { x:field.x+2, y:pdfY+field.height*0.2,
         size:fitSize(helvetica, field.value, field.width, field.height, 10), font:helvetica, color:rgb(0,0,0) })

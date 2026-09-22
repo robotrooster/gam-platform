@@ -30,6 +30,13 @@ const FIELD_TYPES = [
   { type:'text',      label:'Text Field', icon:'📝', color:'#a78bfa', w:200, h:40 },
   { type:'checkbox',  label:'Checkbox',   icon:'☑️', color:'#f59e0b', w:30,  h:30 },
   { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:16, h:16 },
+  // S652 (Nic): several boxes on the page, pick ONE — marked X, a check, or the
+  // signer's initials. The lead-paint form's (a)(i)/(a)(ii) is one of these.
+  { type:'choice',    label:'Choice (pick one)', icon:'◯', color:'#f97316', w:30, h:16 },
+  // S652 (Nic): "text I put in the template that is just there, as part of the
+  // document on every lease" — printed, not a box; the landlord can change it
+  // on one lease with a deliberate click.
+  { type:'fixed_text',label:'Fixed text', icon:'🔤', color:'#64748b', w:200, h:20 },
 ]
 
 // Lease roles + S568 generic roles (standalone contracts: purchase agreements,
@@ -220,12 +227,20 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
         overflow:'visible',
       }}>
         {locked && <span style={{ position:'absolute', top:-8, left:-8, fontSize: Math.max(9, 11*scale), zIndex:998, pointerEvents:'none' }}>🔒</span>}
-        <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>{ft.icon}</span>
+        {field.fieldType === 'fixed_text' ? (
+          <span style={{ color:'#1a1a1a', whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, Math.min(field.height * scale * 0.6, 12 * scale)), pointerEvents:'none', padding:'0 2px' }}>
+            {field.defaultValue || 'Fixed text — type it in the panel'}
+          </span>
+        ) : (<>
+        <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>
+          {field.fieldType === 'choice' ? (field.checkboxMark === 'check' ? '✓' : field.checkboxMark === 'initials' ? 'AB' : 'X') : ft.icon}
+        </span>
         {field.width * scale > 50 && (
           <span style={{ color, fontWeight:700, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, 9 * scale), pointerEvents:'none' }}>
             {field.label || ft.label}
           </span>
         )}
+        </>)}
         {selected && [
           { id:'e',  style:{ position:'absolute' as const, right:-5, top:'50%', transform:'translateY(-50%)', cursor:'ew-resize',   width:8, height:20, background:color, borderRadius:2, zIndex:20 } },
           { id:'s',  style:{ position:'absolute' as const, bottom:-5, left:'50%', transform:'translateX(-50%)', cursor:'ns-resize',  width:20, height:8, background:color, borderRadius:2, zIndex:20 } },
@@ -414,11 +429,15 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     const y = (e.clientY - rect.top) / scale
     const ft = FIELD_TYPES.find(f => f.type === activeTool)!
     const remembered = lastSizes.current[activeTool]
-    const newField = {
-      id: `f_${Date.now()}`, fieldType: activeTool, signerRole: activeRole,
-      label: ft.label, page: currentPage, x, y,
+    const newField: any = {
+      id: `f_${Date.now()}`, fieldType: activeTool,
+      signerRole: activeTool === 'fixed_text' ? 'landlord' : activeRole,
+      label: activeTool === 'choice' ? '' : ft.label, page: currentPage, x, y,
       width: remembered ? remembered.w : ft.w,
-      height: remembered ? remembered.h : ft.h, required: true
+      height: remembered ? remembered.h : ft.h,
+      required: activeTool !== 'fixed_text',
+      checkboxMark: activeTool === 'choice' ? 'x' : undefined,
+      defaultValue: activeTool === 'fixed_text' ? '' : undefined,
     }
     setFields(prev => [...prev, newField])
     setSelectedField(newField.id)
@@ -467,7 +486,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
       // S556: conditional nesting — clientId is this field's stable key, and
       // parentClientId points at the parent field's clientId (the server maps
       // both to new DB ids after the full-replace insert).
-      clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null
+      clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null,
+      defaultValue: f.defaultValue ?? null, checkboxMark: f.checkboxMark ?? null,
     })), lateFeeTerms, conditionalFees: conditionalFees.map((c: any) => ({
       label: c.label, amount: c.amount, conditionText: c.conditionText,
     })) }),
@@ -948,6 +968,26 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   })()}
                 </div>
               )}
+              {sel.fieldType === 'choice' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Group (boxes with the same group name — pick one of them)</label>
+                  <input className="input" value={sel.options||''} onChange={e => updateSelected('options', e.target.value)} placeholder="e.g. lead paint (a)" style={{ width:'100%', fontSize:'.75rem' }} />
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', margin:'6px 0 3px' }}>Marked with</label>
+                  <select className="input" value={sel.checkboxMark || 'x'} onChange={e => updateSelected('checkboxMark', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }}>
+                    <option value="x">X</option>
+                    <option value="check">Check mark</option>
+                    <option value="initials">Signer's initials</option>
+                  </select>
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Required means one box in the group must be marked, not each of them. The label above is this box's option.</div>
+                </div>
+              )}
+              {sel.fieldType === 'fixed_text' && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Text printed here on every document</label>
+                  <textarea className="input" value={sel.defaultValue||''} onChange={e => updateSelected('defaultValue', e.target.value)} placeholder="e.g. $150.00" rows={2} style={{ width:'100%', fontSize:'.75rem', resize:'vertical' }} />
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Not a box — it prints as text. You can change it on one lease by clicking it while signing; the tenant never can.</div>
+                </div>
+              )}
               {sel.fieldType === 'radio_group' && (
                 <div style={{ marginBottom:8 }}>
                   <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Options (comma separated)</label>
@@ -967,18 +1007,21 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   = "Month-to-month"). Inapplicable fields auto-hide + drop their
                   required flag, so the landlord never marks N/A. */}
               {(() => {
-                const candidates = fields.filter(x => x.fieldType === 'radio_group' && x.id !== sel.id)
+                const candidates = fields.filter(x => (x.fieldType === 'radio_group' || x.fieldType === 'choice') && x.id !== sel.id)
                 if (candidates.length === 0) return null
                 const parent = candidates.find(x => x.id === sel.parentFieldId)
-                const parentOpts = (parent?.options || '').split(',').map((o:string) => o.trim()).filter(Boolean)
+                // S652: a CHOICE box has no options of its own — the condition is
+                // simply that it is the one chosen.
+                const parentIsChoice = parent?.fieldType === 'choice'
+                const parentOpts = parentIsChoice ? [] : (parent?.options || '').split(',').map((o:string) => o.trim()).filter(Boolean)
                 return (
                   <div style={{ marginBottom:8 }}>
                     <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Only show if…</label>
-                    <select className="input" value={sel.parentFieldId || ''} onChange={e => { updateSelected('parentFieldId', e.target.value || null); updateSelected('parentOption', null) }} style={{ width:'100%', fontSize:'.75rem' }}>
+                    <select className="input" value={sel.parentFieldId || ''} onChange={e => { const c = candidates.find(x => x.id === e.target.value); updateSelected('parentFieldId', e.target.value || null); updateSelected('parentOption', c?.fieldType === 'choice' ? 'chosen' : null) }} style={{ width:'100%', fontSize:'.75rem' }}>
                       <option value="">Always shown</option>
-                      {candidates.map(c => <option key={c.id} value={c.id}>{c.label || c.groupName || 'Radio group'}</option>)}
+                      {candidates.map(c => <option key={c.id} value={c.id}>{c.fieldType === 'choice' ? `${c.options ? c.options + ': ' : ''}${c.label || 'choice'} is chosen` : (c.label || c.groupName || 'Radio group')}</option>)}
                     </select>
-                    {sel.parentFieldId && (
+                    {sel.parentFieldId && !parentIsChoice && (
                       <select className="input" value={sel.parentOption || ''} onChange={e => updateSelected('parentOption', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem', marginTop:4 }}>
                         <option value="">Pick trigger option…</option>
                         {parentOpts.map((o:string) => <option key={o} value={o}>{o}</option>)}
@@ -1006,7 +1049,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 </button>
               )}
               <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontSize:'.72rem', color:'var(--text-2)' }}>
-                <input type="checkbox" checked={sel.required} onChange={e => updateSelected('required', e.target.checked)} /> Required
+                {sel.fieldType !== 'fixed_text' && <><input type="checkbox" checked={sel.required} onChange={e => updateSelected('required', e.target.checked)} /> Required</>}
               </label>
             </div>
           )}

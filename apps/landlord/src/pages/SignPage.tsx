@@ -2,11 +2,12 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
-import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone,
+import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso,
   FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent,
   leaseDueDay, dueDayLabel, parseDueDay } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
+import { TypedDateInput } from '../components/TypedDateInput'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -526,6 +527,8 @@ export function SignPage() {
     if (!f.parentFieldId) return true
     const parent = allFields.find((p:any)=> p.templateFieldId && p.templateFieldId === f.parentFieldId)
     if (!parent) return true // parent not in this signer's set → always show
+    // S652: a child of a CHOICE box shows when that box is the one chosen.
+    if (parent.fieldType === 'choice') return !!(fieldValues[parent.id] ?? parent.value)
     return (fieldValues[parent.id] ?? parent.value ?? null) === f.parentOption
   }
   // Set a value and clear any children of this field whose trigger no longer
@@ -563,13 +566,25 @@ export function SignPage() {
   // DO uses only this signer's. Older payloads carry no `mine`, in which case
   // every field returned was already this signer's — treat it as true.
   const isMine = (f:any) => f.mine !== false
+  // S652: a choice box marked X/check shows the glyph, not the option text it stores.
+  const shown = (f:any, v:string) => f.fieldType==='choice' && f.checkboxMark!=='initials' ? (f.checkboxMark==='check' ? '✓' : 'X') : v
   const myFields = activeFields.filter(isMine)
   const requiredFields = myFields.filter((f:any)=>f.required)
   // Filled by the system rather than by this signer — lease data stamped at
   // draft time, plus the signing date. Counted separately so the header can say
   // what is actually left to do.
   const prefilledCount = requiredFields.filter((f:any)=>f.value || /^(date_signed|tenant_|sale_)/.test(f.leaseColumn || '')).length
-  const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
+  // S652 (Nic): a CHOICE group is required as a group — one box marked, not
+  // each. Counted once, by its first box, so "3 required left" means three
+  // things to do.
+  const choiceKey = (f:any) => String(f.options ?? f.id)
+  const groupChosen = (f:any) => myFields.some((g:any)=> g.fieldType==='choice' && choiceKey(g)===choiceKey(f) && (fieldValues[g.id]??'').trim())
+  const seenGroups = new Set<string>()
+  const unfilledRequired = requiredFields.filter((f:any)=> {
+    if (f.fieldType!=='choice') return !fieldValues[f.id]?.trim()
+    if (seenGroups.has(choiceKey(f))) return false
+    seenGroups.add(choiceKey(f)); return !groupChosen(f)
+  })
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
@@ -584,6 +599,19 @@ export function SignPage() {
     if (field.fieldType==='initials' && savedInit) {
       setFieldValues(p=>({...p,[field.id]:savedInit.value}))
       if(savedInit.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
+      setTimeout(()=>jumpToNext(field.id), 150)
+      return
+    }
+    // S652 (Nic): a CHOICE box — one of a group. Marking it clears the others in
+    // the group; the mark is X, a check, or the signer's own initials.
+    if (field.fieldType==='choice') {
+      const mark = field.checkboxMark === 'initials' ? (savedInit?.value ?? '') : (field.label || 'X')
+      if (!mark) { setActiveField(field); return }
+      const key = String(field.options ?? field.id)
+      setFieldValues(p=>{ const n:Record<string,string> = {...p}
+        for (const g of allFields) if (g.fieldType==='choice' && String(g.options ?? g.id)===key && g.id!==field.id && isMine(g)) delete n[g.id]
+        n[field.id]=mark; return n })
+      if (field.checkboxMark === 'initials' && savedInit?.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
@@ -794,6 +822,21 @@ export function SignPage() {
             // already signed. Drawing it as a green box implies this signer did
             // it, and drawing it as a grey one implies they still have to. It is
             // neither: it is the page they are reading.
+            // S652 (Nic): FIXED TEXT prints as text, never a box. The landlord —
+            // and only the landlord, only while it is his turn — gets a pencil
+            // to change it on this one document; the tenant reads it.
+            if (f.fieldType==='fixed_text') {
+              const editable = isMine(f) && !data.readOnly
+              return (
+                <div key={f.id} id={'field-'+f.id} title={editable ? 'Set on the template — click to change it on this document only' : undefined}
+                  onClick={()=>{ if (editable) setActiveField(f) }}
+                  style={{ position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s, display:'flex', alignItems:'center',
+                           overflow:'hidden', boxSizing:'border-box' as const, zIndex:3, cursor: editable?'pointer':'default', pointerEvents: editable?'auto':'none' }}>
+                  <span style={{ fontSize:fitFontSize(String(val||' '), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', flex:1 }}>{String(val)}</span>
+                  {editable && <span style={{ fontSize:Math.max(8,f.height*s*0.5), color:'#c9a227', opacity:.75, paddingRight:2, flexShrink:0 }}>✎</span>}
+                </div>
+              )
+            }
             if (!isMine(f) && val) {
               return (
                 <div key={f.id} id={'field-'+f.id}
@@ -808,7 +851,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
                                      fontSize:fitFontSize(String(val), f.width*s, f.height*s),
                                      color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
-                                     overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>}
+                                     overflow:'hidden', textOverflow:'ellipsis' }}>{shown(f,val)}</span>}
                 </div>
               )
             }
@@ -848,10 +891,10 @@ export function SignPage() {
                     // usual average for proportional text and is deliberately
                     // conservative — slightly small beats truncated, because a
                     // number nobody can read is worse than a small one.
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{shown(f,val)}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':'Click'}
                   </span>
                 )}
               </div>
@@ -1008,7 +1051,7 @@ export function SignPage() {
                 ))}
               </div>
             )}
-            {activeField.fieldType==='text' && (
+            {(activeField.fieldType==='text'||activeField.fieldType==='fixed_text') && (
               // S632 (Nic): "When it opens that little window to put in an
               // amount for security deposit or pet deposit or proration, it
               // should open with a cursor in the box already so I can just start
@@ -1027,12 +1070,18 @@ export function SignPage() {
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             {activeField.fieldType==='date' && (
-              // S534: term dates (lease start/end) are picked deliberately —
-              // stored as the locale string the stamped PDF prints.
-              <input type="date" autoFocus
-                onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
-                onKeyDown={e=>{ if (e.key === 'Enter') { e.preventDefault(); setActiveField(null) } }}
-                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
+              // S534: term dates (lease start/end) are picked deliberately.
+              // S652 (Blu): the browser's own date box closed the editor on every
+              // part he changed — month, then day, then year, three trips in. The
+              // tenant page already uses three typed boxes that stay put until
+              // Save; the landlord page uses the same now.
+              <div style={{ marginBottom:14 }}>
+                <TypedDateInput key={activeField.id}
+                  value={documentDateToIso(fieldValues[activeField.id])}
+                  onChange={iso=>{ setFieldValues(p=>({...p,[activeField.id]:isoToDocumentDate(iso)})) }}
+                  inputStyle={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, background:'white', color:'#1a1a1a' }}
+                />
+              </div>
             )}
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setActiveField(null)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', cursor:'pointer' }}>Cancel</button>
@@ -1048,7 +1097,7 @@ export function SignPage() {
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
-              {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
+              {allFields.filter((f:any)=>fieldValues[f.id] && f.fieldType!=='fixed_text').map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
                   <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')

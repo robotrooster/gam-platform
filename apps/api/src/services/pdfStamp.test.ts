@@ -67,6 +67,23 @@ describe('stampPdf', () => {
     expect(parsed.getPageCount()).toBe(3)
   })
 
+  // S652 (Nic): a choice group's box prints an X or a check, or the signer's
+  // initials when the group is marked that way; fixed text prints as text.
+  it('stamps choice boxes (X / check / initials) and fixed text', async () => {
+    const src = await makeSourcePdf(1)
+    const out = outputPath()
+    const fields = [
+      { page: 1, x: 50, y: 100, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'x', value: '(a)(i)' },
+      { page: 1, x: 50, y: 130, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'check', value: '(a)(ii)' },
+      { page: 1, x: 50, y: 160, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'initials', value: 'JD', font_css: 'cursive' },
+      { page: 1, x: 50, y: 190, width: 30, height: 14, field_type: 'choice', checkbox_mark: 'x', value: null },
+      { page: 1, x: 50, y: 220, width: 200, height: 16, field_type: 'fixed_text', value: '$150.00' },
+    ] as any[]
+    await stampPdf(src, fields, [signerOne], out)
+    const parsed = await PDFDocument.load(fs.readFileSync(out))
+    expect(parsed.getPageCount()).toBe(2)
+  })
+
   it('handles text + date + checkbox + signature field types without throwing', async () => {
     const src = await makeSourcePdf(1)
     const out = outputPath()

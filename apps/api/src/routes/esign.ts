@@ -2599,11 +2599,14 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
         // keep signer_role='landlord' on a box the landlord can never usefully
         // fill. `required` goes too: the value arrives from the invite, so asking
         // a signer to complete it is wrong.
+        // S652 (Nic): FIXED TEXT belongs to the landlord — printed on every
+        // document from the template, changeable by the landlord on one lease
+        // with a deliberate click, never a box anyone must fill.
         [template.id, f.fieldType,
-         isAutoFilledLeaseColumn(f.leaseColumn) ? null : f.signerRole,
+         f.fieldType === 'fixed_text' ? 'landlord' : isAutoFilledLeaseColumn(f.leaseColumn) ? null : f.signerRole,
          f.label||null, f.leaseColumn||null,
          f.page||1, f.x, f.y, f.width||200, f.height||50,
-         isAutoFilledLeaseColumn(f.leaseColumn) ? false : (f.required??true),
+         (f.fieldType === 'fixed_text' || isAutoFilledLeaseColumn(f.leaseColumn)) ? false : (f.required??true),
          f.sortOrder||0, f.fontCss||null,
          f.options||null,
          // S641: the template's own starting answer. A box the landlord ticks
@@ -2613,7 +2616,9 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
          (f.fieldType === 'signature' || f.fieldType === 'initials' || f.fieldType === 'date')
            ? null
            : (f.defaultValue ?? null),
-         f.checkboxMark === 'check' ? 'check' : 'x'])
+         // S652: a CHOICE group's boxes are marked X, a check, or the signer's
+         // initials (Blu's lead-paint form initials the option that applies).
+         (f.checkboxMark === 'check' || f.checkboxMark === 'initials') ? f.checkboxMark : 'x'])
       if (f.clientId != null) clientToDbId.set(String(f.clientId), row!.id)
       inserted.push({ f, dbId: row!.id })
     }
@@ -5244,7 +5249,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // its parent's effective selection == the child's trigger option — a hidden
     // child (e.g. auto_renew_mode when the lease is month-to-month) is skipped.
     const allFieldsRes = await client.query(`
-      SELECT id, template_field_id, parent_field_id, parent_option, label, field_type, signer_role, required, value
+      SELECT id, template_field_id, parent_field_id, parent_option, label, field_type, signer_role, required, value, options
       FROM lease_document_fields WHERE document_id=$1`, [doc.id])
     const allFields = allFieldsRes.rows as any[]
     const submittedById = new Map<string, string>()
@@ -5265,12 +5270,27 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       if (!f.parent_field_id) return true
       const parent = byTemplateFieldId.get(f.parent_field_id)
       if (!parent) return true // parent pruned/missing → degrade to always-shown
+      // S652: a child of a CHOICE box shows when that box is the one chosen.
+      if (parent.field_type === 'choice') return effVal(parent) != null
       return effVal(parent) === f.parent_option
     }
+    // S652 (Nic): a choice group — several boxes, pick one — is required as a
+    // GROUP: one of its boxes must be marked, never each of them. "Both of them
+    // need an initial, like whichever option is correct."
+    const choiceKey = (f: any) => `${f.signer_role}:${f.options ?? f.id}`
     const missingRequired: string[] = []
+    const groupsChecked = new Set<string>()
     for (const f of allFields) {
       if (f.signer_role !== signer.role || !f.required) continue
       if (!isActive(f)) continue // hidden conditional child is not required
+      if (f.field_type === 'choice') {
+        const key = choiceKey(f)
+        if (groupsChecked.has(key)) continue
+        groupsChecked.add(key)
+        const chosen = allFields.some(g => g.field_type === 'choice' && choiceKey(g) === key && effVal(g) != null)
+        if (!chosen) missingRequired.push(`a choice for ${f.options || f.label || 'the group'}`)
+        continue
+      }
       if (effVal(f) == null) missingRequired.push(f.label || `${f.field_type} field`)
     }
     if (missingRequired.length > 0) {

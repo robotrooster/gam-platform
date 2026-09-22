@@ -746,3 +746,13 @@ Rule for any future hand-drafted onboarding: write the `pending_tenant_intents` 
 ## "Lease did not issue" ×4 on MH 06 (2026-09-22 08:25) — fixed, deploy 38
 
 Blu signed four disclosure addenda before/around the lease; each landlord signature runs issuance, and an `addendum_terms` with no `lease_id` threw "Addendum has no parent lease_id" → critical alert. Packet siblings are drafted before the lease exists (`packetDraft.ts`), so none carried a lease id. `buildLeaseFromDocument` now: a packet document with no lease_id binds to the packet's lease if it has issued (stamps it, proceeds), otherwise returns `deferred` quietly; and when the packet's `original_lease` issues, every sibling is stamped with the lease. Backfilled: 77 sibling documents at Country Acres now carry their lease; the four alerts acknowledged. Test: esign "S652: a packet sibling waits for its lease, then binds to it". Signing the installment contract (`purchase_agreement`) is a standalone type — no build runs; the sale was linked at draft.
+
+## Template features (Nic, 2026-09-22) + Blu's date entry — deploy 40
+
+- **Choice group** (`field_type='choice'`): several boxes on the page, one group name (stored in `options`), pick ONE. Marked X (default), a check, or the signer's initials (`checkbox_mark`). Required means one box in the group, enforced as a group on the sign submit and counted once on the page. A child field can be "only shown if [box] is chosen" (`parent_option='chosen'`). Stamped like a ticked checkbox or an initial.
+- **Fixed text** (`field_type='fixed_text'`): typed once on the template (`default_value`), printed as plain text on every document; landlord role, never required; the landlord can change it on one document by clicking the pencil while it is his turn (opens the text editor); the tenant only reads it (sign submit writes only your own role). Excluded from the review list.
+- Landlord signing page's date entry is now the tenant page's three-box `TypedDateInput` (copied into apps/landlord/components) — the browser date box closed the editor per part changed.
+- Fix found on the way: check-marked boxes threw at stamping (ZapfDingbats addressed as '3'); check marks are drawn as two strokes now. Test: pdfStamp "stamps choice boxes (X / check / initials) and fixed text".
+- Editor sends `defaultValue` and `checkboxMark` on save (it never did; the API read them).
+
+Still held for Nic's go: tenant packet email bundling (tenant is emailed per document as the landlord signs each — Shane got nine); a jump-to-any-document list on the signing page; re-drafting the unsigned Country Acres packets from the updated templates and re-sending in lot order.

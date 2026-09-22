@@ -555,6 +555,8 @@ export function SignPage() {
     if (!f.parentFieldId) return true
     const parent = allFields.find((p:any)=> p.templateFieldId && p.templateFieldId === f.parentFieldId)
     if (!parent) return true
+    // S652: a child of a CHOICE box shows when that box is the one chosen.
+    if (parent.fieldType === 'choice') return !!(fieldValues[parent.id] ?? parent.value)
     return (fieldValues[parent.id] ?? parent.value ?? null) === f.parentOption
   }
   const setFieldValue = (fieldId:string, value:string) => {
@@ -587,9 +589,21 @@ export function SignPage() {
   // every field; the counters use only this signer's. Payloads without `mine`
   // predate the change and contained only this signer's fields anyway.
   const isMine = (f:any) => f.mine !== false
+  // S652: a choice box marked X/check shows the glyph, not the option text it stores.
+  const shown = (f:any, v:string) => f.fieldType==='choice' && f.checkboxMark!=='initials' ? (f.checkboxMark==='check' ? '✓' : 'X') : v
   const myFields = activeFields.filter(isMine)
   const requiredFields = myFields.filter((f:any)=>f.required)
-  const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
+  // S652 (Nic): a CHOICE group is required as a group — one box marked, not
+  // each. Counted once, by its first box, so "3 required left" means three
+  // things to do.
+  const choiceKey = (f:any) => String(f.options ?? f.id)
+  const groupChosen = (f:any) => myFields.some((g:any)=> g.fieldType==='choice' && choiceKey(g)===choiceKey(f) && (fieldValues[g.id]??'').trim())
+  const seenGroups = new Set<string>()
+  const unfilledRequired = requiredFields.filter((f:any)=> {
+    if (f.fieldType!=='choice') return !fieldValues[f.id]?.trim()
+    if (seenGroups.has(choiceKey(f))) return false
+    seenGroups.add(choiceKey(f)); return !groupChosen(f)
+  })
   const nextField = unfilledRequired[0]
   const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const allFilled = unfilledRequired.length === 0
@@ -604,6 +618,19 @@ export function SignPage() {
     if (field.fieldType==='initials' && savedInit) {
       setFieldValues(p=>({...p,[field.id]:savedInit.value}))
       if(savedInit.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
+      setTimeout(()=>jumpToNext(field.id), 150)
+      return
+    }
+    // S652 (Nic): a CHOICE box — one of a group. Marking it clears the others in
+    // the group; the mark is X, a check, or the signer's own initials.
+    if (field.fieldType==='choice') {
+      const mark = field.checkboxMark === 'initials' ? (savedInit?.value ?? '') : (field.label || 'X')
+      if (!mark) { setActiveField(field); return }
+      const key = String(field.options ?? field.id)
+      setFieldValues(p=>{ const n:Record<string,string> = {...p}
+        for (const g of allFields) if (g.fieldType==='choice' && String(g.options ?? g.id)===key && g.id!==field.id && isMine(g)) delete n[g.id]
+        n[field.id]=mark; return n })
+      if (field.checkboxMark === 'initials' && savedInit?.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
@@ -777,6 +804,21 @@ export function SignPage() {
             // out as not a box to be filled out. It just needs to show it as
             // plain text data, not an actual box." A value somebody else already
             // entered is part of the page being read, not an input.
+            // S652 (Nic): FIXED TEXT prints as text, never a box. The landlord —
+            // and only the landlord, only while it is his turn — gets a pencil
+            // to change it on this one document; the tenant reads it.
+            if (f.fieldType==='fixed_text') {
+              const editable = isMine(f) && !data.readOnly
+              return (
+                <div key={f.id} id={'field-'+f.id} title={editable ? 'Set on the template — click to change it on this document only' : undefined}
+                  onClick={()=>{ if (editable) setActiveField(f) }}
+                  style={{ position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s, display:'flex', alignItems:'center',
+                           overflow:'hidden', boxSizing:'border-box' as const, zIndex:3, cursor: editable?'pointer':'default', pointerEvents: editable?'auto':'none' }}>
+                  <span style={{ fontSize:fitFontSize(String(val||' '), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', flex:1 }}>{String(val)}</span>
+                  {editable && <span style={{ fontSize:Math.max(8,f.height*s*0.5), color:'#c9a227', opacity:.75, paddingRight:2, flexShrink:0 }}>✎</span>}
+                </div>
+              )
+            }
             if (!isMine(f) && val) {
               return (
                 <div key={f.id} id={'field-'+f.id}
@@ -791,7 +833,7 @@ export function SignPage() {
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit',
                                      fontSize:fitFontSize(String(val), f.width*s, f.height*s),
                                      color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const,
-                                     overflow:'visible' }}>{val}</span>}
+                                     overflow:'visible' }}>{shown(f,val)}</span>}
                 </div>
               )
             }
@@ -816,10 +858,10 @@ export function SignPage() {
                     // wide values ("29" became "2", a full name became "Jon…"),
                     // and the clipped text is what gets stamped into the
                     // executed PDF.
-                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'visible' }}>{val}</span>
+                    : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:fitFontSize(String(val), f.width*s, f.height*s), color:'#1a1a1a', padding:2, whiteSpace:'nowrap' as const, overflow:'visible' }}>{shown(f,val)}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':f.fieldType==='choice'?'○':'Click'}
                   </span>
                 )}
               </div>
@@ -856,7 +898,7 @@ export function SignPage() {
                 ))}
               </div>
             )}
-            {activeField.fieldType==='text' && (
+            {(activeField.fieldType==='text'||activeField.fieldType==='fixed_text') && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
@@ -926,7 +968,7 @@ export function SignPage() {
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
-              {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
+              {allFields.filter((f:any)=>fieldValues[f.id] && f.fieldType!=='fixed_text').map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
                   <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
