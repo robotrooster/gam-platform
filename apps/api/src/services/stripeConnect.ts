@@ -23,6 +23,7 @@
 import Stripe from 'stripe'
 import { PROCESSING_FEES, processingFeeFor } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
+import { connectPayoutOwner, fileConnectPayout } from './connectPayoutSync'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { createAdminNotification } from './adminNotifications'
@@ -592,8 +593,13 @@ export async function fireManagerTransfersForReference(
  */
 export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string): Promise<void> {
   // Resolve which GAM entity owns the Connect account
+  // S652: a landlord's Connect account is stamped on the COMPANY (landlords),
+  // and only sometimes on the user — Mountain View's is on the company alone,
+  // so this used to drop every one of its payout events as "unknown".
   const userRow = await queryOne<{ id: string }>(
-    `SELECT id FROM users WHERE stripe_connect_account_id = $1`, [accountId]
+    `SELECT id FROM users WHERE stripe_connect_account_id = $1
+     UNION SELECT user_id FROM landlords WHERE stripe_connect_account_id = $1 AND user_id IS NOT NULL
+     LIMIT 1`, [accountId]
   )
   const pmRow = userRow ? null : await queryOne<{ id: string }>(
     `SELECT id FROM pm_companies WHERE stripe_connect_account_id = $1`, [accountId]
@@ -601,6 +607,11 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
   if (!userRow && !pmRow) return  // Unknown Connect account — silent no-op
 
   const status = payout.status as string  // pending | paid | failed | canceled | in_transit
+  // S652: Stripe redelivers events and GAM replays stored ones; the landlord
+  // is told about a payout ONCE — only when its status actually changes.
+  const before = await queryOne<{ status: string }>(
+    `SELECT status FROM connect_payouts WHERE stripe_payout_id = $1`, [payout.id])
+  const statusChanged = before?.status !== status
   const amountDollars = (payout.amount ?? 0) / 100
   const arrivalDate = payout.arrival_date
     ? new Date(payout.arrival_date * 1000).toISOString().slice(0, 10)
@@ -657,6 +668,19 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
     )
   }
 
+  // S652 (Nic: "if it's free, do it"): file the payout on the landlord's
+  // page the moment Stripe reports it — with the bank it went to, and as a
+  // 'stripe_dashboard' row when the landlord made it in Stripe themselves.
+  // Same row the nightly sync writes; this just makes it instant.
+  if (userRow) {
+    try {
+      const owner = await connectPayoutOwner(accountId)
+      if (owner) await fileConnectPayout(getStripe() as any, owner, payout)
+    } catch (e) {
+      logger.warn({ err: e, payout_id: payout.id }, '[payout] could not file on the disbursements page; the nightly sync will')
+    }
+  }
+
   // S175 / S176: notify the recipient when a Connect payout reaches a
   // terminal status. Two routing paths:
   //   - userRow match (landlord / opt-in manager): single recipient via
@@ -667,7 +691,7 @@ export async function recordPayoutEvent(payout: Stripe.Payout, accountId: string
   // Failures swallowed + logged: a bad notification call must not fail
   // the webhook, since Stripe would retry the whole event and re-write
   // the connect_payouts row.
-  if ((userRow || pmRow) && (status === 'paid' || status === 'failed')) {
+  if ((userRow || pmRow) && statusChanged && (status === 'paid' || status === 'failed')) {
     try {
       if (userRow) {
         const u = await queryOne<{ email: string; phone: string | null }>(

@@ -51,7 +51,12 @@ disbursementsRouter.get('/', async (req, res, next) => {
              -- name and to filter on, and inventing a property link here would
              -- be inventing data.
              d.landlord_id,
-             ll.business_name AS company_name
+             ll.business_name AS company_name,
+             -- S652: the bank it went to, from Stripe's own payout record; and
+             -- when no one company is stamped, every company on that account.
+             d.bank_name, d.bank_last4,
+             (SELECT string_agg(l2.business_name, ' + ' ORDER BY l2.business_name)
+                FROM landlords l2 WHERE l2.user_id = d.user_id) AS companies_on_account
         FROM disbursements d
         LEFT JOIN users u ON u.id = d.user_id
         LEFT JOIN landlords ll ON ll.id = d.landlord_id

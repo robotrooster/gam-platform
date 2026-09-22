@@ -492,6 +492,20 @@ August run is closed with no bills. September usage → October invoices, all 13
 via `is_existing_tenancy` (onboarding leases bill from the baseline whatever
 their start date). Lots 21, 22, 24 still flagged no-movement → re-read.
 
+**The invite shows the packet (late S652, three corrections from Nic).**
+Nothing is chosen at invite. Pick a unit → the unit's default package is
+listed, pre-ticked, with the reason for anything left off; untick what does not
+apply; the ticked list rides `pending_tenant_intents.package_template_ids` and
+drafts exactly that through every drafting door (`services/packetDraft.ts`).
+No package for that state × unit type → **Build the packet from my documents**
+on the invite (`buildDefaultPackageForUnit`: default lease + filled slots +
+government forms + unfiled documents that fit, saved as the default). No lease
+template at all → sent to Templates. Park-owned home only → **Selling them
+this home on installments?** with the terms (`home_sale_terms` on the intent;
+the draft writes the sale and links the contract; refused if the package has no
+installment contract). Future (Nic): counsel-reviewed GAM-approved documents
+per state as free-version slot fillers.
+
 **Blu's package save.** Documents and packages belong to the ACCOUNT
 (`account_companies()`, `fileUnderCompany()`); no "choose which company"
 question anywhere on documents. Errors show the server's sentence in both
@@ -695,3 +709,18 @@ out of a box gets fixed and "She…" does not.
   The register can now charge their saved card, which is what was actually missing.
 - **Whether a pay link for a stay should be refused.** It should not; it consumes
   inventory like every other door.
+
+## Payouts: the page now says what Stripe knows (Nic: option 1 + display; "if it's free, do it" → the Stripe notification too)
+
+**What was wrong.** The dashboard showed "$413 catch_up", no bank, no company, and the $4,154.89 Nic paid out from the Stripe dashboard did not exist in GAM. Stripe HAD been delivering every payout event (six of them, all stored in `stripe_webhook_events`); the handler dropped each one because it looked the Connect account up on `users`, and Mountain View's account is stamped on the company (`landlords`). The `connect_payouts` audit table had never had a row.
+
+**What ships (deploy 35).**
+- `services/connectPayoutSync.ts` — `fileConnectPayout()` puts one Stripe payout on the landlord's page: updates the row GAM wrote when it initiated the payout (status, settled date, bank name + last four from Stripe's own record, company), or inserts a `stripe_dashboard` row when the landlord made it in Stripe. `syncConnectPayouts()` walks every Connect account's recent payouts (two free read calls per account) — runs right after each auto-payout run and nightly at 04:10 UTC (`jobs/scheduler.ts`). Run once by hand tonight: the $4,154.89 row is now on the books.
+- `services/stripeConnect.ts recordPayoutEvent` — resolves the account via `users` UNION `landlords`; files the payout on the page the instant Stripe reports it (same routine); tells the landlord ONCE — only when the payout's status actually changes, because Stripe redelivers events. Test: `stripeConnect.test.ts` "once-only notice".
+- `jobs/autoPayouts.ts` — auto-payout rows carry `landlord_id` (the company whose Connect account it is).
+- `routes/disbursements.ts` — returns `bank_name`, `bank_last4`, `companies_on_account`.
+- Landlord `DisbursementsPage` / `DashboardPage` — `DISBURSEMENT_TRIGGER_LABEL` ("Landed after the weekly run", "Paid out from Stripe by you"…), company name or every company on the account, bank + last four.
+- Migration `20260922040000_payouts_say_where_they_went.sql` (bank_name, bank_last4, `stripe_dashboard` trigger).
+- Stripe side: NOTHING new. The Connect listener `we_1TwmXE…` (payout.*, account.updated → api.goldassetmanagement.com/webhooks/stripe) already existed and works; no new endpoint, no .env change, no cost.
+
+**Side effect to own.** Replaying the six stored events through the fixed handler (to backfill `connect_payouts`) re-sent three "Payout Sent" emails to realestaterhoades@gmail.com ($2,638.11 / $4,154.89 / $413.00). The three in-app notices were marked read. The once-only guard above means this cannot happen again.

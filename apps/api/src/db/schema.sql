@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 9GZ92x0RSZZjL8296PKj4q9T5nfFRLzU7Eo5Tdbd7o3Nqx8aNqPXLoDlh0r0XXe
+\restrict 7fLDqByV0bRZsnV2SOBMEEqlxjYWA6UgEJcgYZE0emwCaDFH0Yz6uAJjU9Z2FJ1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3595,8 +3595,10 @@ CREATE TABLE public.disbursements (
     trigger_type text,
     fee_charged numeric(10,2) DEFAULT 0,
     bank_account_id uuid,
+    bank_name text,
+    bank_last4 text,
     CONSTRAINT disbursements_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text]))),
-    CONSTRAINT disbursements_trigger_type_check CHECK (((trigger_type IS NULL) OR (trigger_type = ANY (ARRAY['auto_friday'::text, 'manual_on_demand'::text, 'otp_legacy'::text, 'catch_up'::text]))))
+    CONSTRAINT disbursements_trigger_type_check CHECK (((trigger_type IS NULL) OR (trigger_type = ANY (ARRAY['auto_friday'::text, 'manual_on_demand'::text, 'otp_legacy'::text, 'catch_up'::text, 'stripe_dashboard'::text]))))
 );
 
 
@@ -27969,5 +27971,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 9GZ92x0RSZZjL8296PKj4q9T5nfFRLzU7Eo5Tdbd7o3Nqx8aNqPXLoDlh0r0XXe
+\unrestrict 7fLDqByV0bRZsnV2SOBMEEqlxjYWA6UgEJcgYZE0emwCaDFH0Yz6uAJjU9Z2FJ1
 

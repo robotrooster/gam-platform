@@ -665,9 +665,11 @@ async function processOneCandidate(
   if (cand.kind === 'user') {
     await query(
       `INSERT INTO disbursements
-         (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
-       VALUES ($1, $4, $2, 'processing', $3, NOW(), 0)`,
-      [cand.entity_id, available, stripePayoutId, catchUpRun ? 'catch_up' : 'auto_friday']
+         (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged, landlord_id)
+       VALUES ($1, $4, $2, 'processing', $3, NOW(), 0,
+               -- S652: the company whose Connect account this is, so the row says who
+               (SELECT id FROM landlords WHERE stripe_connect_account_id = $5 ORDER BY created_at LIMIT 1))`,
+      [cand.entity_id, available, stripePayoutId, catchUpRun ? 'catch_up' : 'auto_friday', cand.stripe_connect_account_id]
     )
   }
 

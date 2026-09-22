@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
-import { humanize } from '@gam/shared'
+import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
@@ -238,16 +238,18 @@ export function DisbursementsPage() {
                       {[d.firstName, d.lastName].filter(Boolean).join(' ') || '—'}
                       {d.email && <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{d.email}</div>}
                     </td>
-                    <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>{d.companyName || '—'}</td>
+                    <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>{d.companyName || d.companiesOnAccount || '—'}</td>
                     <td style={{ fontSize: '.78rem' }}>
-                      {d.triggerType === 'auto_friday' ? 'Auto-Friday' : d.triggerType === 'manual_on_demand' ? 'Manual' : (d.triggerType || '—')}
+                      {DISBURSEMENT_TRIGGER_LABEL[d.triggerType] ?? (d.triggerType ? humanize(d.triggerType) : '—')}
                     </td>
                     <td className="mono" style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(d.amount)}</td>
                     <td className="mono" style={{ fontSize: '.78rem', color: parseFloat(d.feeCharged ?? '0') > 0 ? 'var(--red)' : 'var(--text-3)' }}>
                       {parseFloat(d.feeCharged ?? '0') > 0 ? `−${fmt(d.feeCharged)}` : '—'}
                     </td>
                     <td style={{ fontSize: '.78rem' }}>
-                      {d.bankNickname ? <>{d.bankNickname} <span style={{ color: 'var(--text-3)' }}>•••• {d.bankLast4}</span></> : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                      {d.bankNickname || d.bankName
+                        ? <>{d.bankNickname || d.bankName} <span style={{ color: 'var(--text-3)' }}>•••• {d.bankLast4}</span></>
+                        : <span style={{ color: 'var(--text-3)' }}>—</span>}
                     </td>
                     <td>
                       <span className={'badge ' + (d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red')}>
@@ -292,7 +294,7 @@ export function DisbursementsPage() {
               <span className={'badge ' + (selected.status === 'settled' ? 'badge-green' : 'badge-amber')}>{humanize(selected.status)}</span>
             </div>
             <div className="data-row"><span className="data-key">Trigger</span>
-              <span className="data-val">{selected.triggerType === 'auto_friday' ? 'Auto-Friday payout' : selected.triggerType === 'manual_on_demand' ? 'Manual on-demand' : (selected.triggerType || '—')}</span>
+              <span className="data-val">{DISBURSEMENT_TRIGGER_LABEL[selected.triggerType] ?? (selected.triggerType ? humanize(selected.triggerType) : '—')}</span>
             </div>
             {selected.bankNickname && (
               <div className="data-row"><span className="data-key">Destination bank</span>

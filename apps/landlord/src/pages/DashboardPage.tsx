@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react'
 import { useQuery } from 'react-query'
-import { humanize } from '@gam/shared'
+import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
@@ -391,7 +391,7 @@ export function DashboardPage() {
                       <td className="mono">{dateStr ? new Date(dateStr).toLocaleDateString() : '—'}</td>
                       <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
                       <td style={{fontSize:'.78rem'}}>
-                        {d.triggerType === 'auto_friday' ? 'Auto-Friday' : d.triggerType === 'manual_on_demand' ? 'Manual' : (d.triggerType ?? '—')}
+                        {DISBURSEMENT_TRIGGER_LABEL[d.triggerType] ?? (d.triggerType ? humanize(d.triggerType) : '—')}
                       </td>
                       <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' || d.status === 'processing' ? 'badge-amber' : 'badge-red'}`}>{humanize(d.status)}</span></td>
                     </tr>

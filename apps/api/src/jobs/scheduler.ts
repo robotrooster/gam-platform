@@ -1288,6 +1288,17 @@ export function schedulerInit() {
   // runs at 01:00 UTC — not 9am Phoenix, which was sixteen hours late and cost
   // the landlord most of a business day at his own bank. UTC, because that is
   // the frame available_on is expressed in and the engine now counts in it too.
+  // S652 (Nic, option 1): nightly, every Connect account's payouts as Stripe
+  // has them — a payout made in the Stripe dashboard shows on the landlord's
+  // page by morning. Two free read calls per account.
+  cron.schedule('10 4 * * *', async () => {
+    try {
+      const { syncConnectPayouts } = await import('../services/connectPayoutSync')
+      const r = await syncConnectPayouts()
+      if (r.created || r.updated) logger.info(r, '[payout-sync]')
+    } catch (e) { logger.error({ err: e }, '[payout-sync] fatal') }
+  }, { timezone: 'UTC' })
+
   cron.schedule('0 1 * * 1-5', async () => {
     try {
       const { processAutoPayouts } = await import('./autoPayouts')
@@ -1295,6 +1306,10 @@ export function schedulerInit() {
       if (result.candidatesScanned > 0 || result.errors.length > 0) {
         logger.info(result, '[auto-payouts]')
       }
+      // S652 (Nic, option 1): stamp each payout with the bank it went to, and
+      // pick up any the landlord made in Stripe themselves. Reads only — free.
+      const { syncConnectPayouts } = await import('../services/connectPayoutSync')
+      await syncConnectPayouts().catch(err => logger.error({ err }, '[payout-sync] after auto-payouts failed'))
     } catch (e) {
       logger.error({ err: e }, '[auto-payouts] fatal')
     }

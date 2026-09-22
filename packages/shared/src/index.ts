@@ -6465,6 +6465,18 @@ export const WORK_TRADE_FIELD_PERMISSION_LABEL: Record<WorkTradeFieldPermission,
   read_meters: 'Read meters',
 }
 
+// S652 (Nic): what a payout row is called — never the raw trigger word.
+//   auto_friday      the scheduled weekly run
+//   catch_up         money that landed after the weekly run, paid the next day
+//   stripe_dashboard a payout the landlord made themselves in Stripe
+export const DISBURSEMENT_TRIGGER_LABEL: Record<string, string> = {
+  auto_friday:      'Weekly payout',
+  catch_up:         'Landed after the weekly run',
+  manual_on_demand: 'Requested payout',
+  otp_legacy:       'On-Time Pay (legacy)',
+  stripe_dashboard: 'Paid out from Stripe by you',
+}
+
 // S652 (Nic): the words a work trader sees on their hours. "Pending" read as if
 // the hours were already in trouble — "Logged" is hours turned in and not yet
 // reviewed; Approved and Denied are the only final states.
