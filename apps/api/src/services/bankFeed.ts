@@ -322,11 +322,24 @@ export async function refreshBalance(conn: any): Promise<void> {
   if (conn.provider !== 'stripe_fc' || !conn.stripe_fc_account_id) return
   const stripe = getStripe()
 
+  // S652 (Nic): "it shows September 18th, four days behind, but the sync
+  // button thinks it's current." The refresh call returns the account BEFORE
+  // the bank has answered, so this wrote yesterday's figure every morning and
+  // never looked again. Ask, then wait for Stripe to say the refresh finished
+  // (a few seconds), then read the balance it actually got.
   let acct: any
   try {
     acct = await stripe.financialConnections.accounts.refresh(conn.stripe_fc_account_id, {
       features: ['balance'],
     })
+    const startedAt = Number(acct?.balance?.as_of ?? 0)
+    for (let i = 0; i < 8; i++) {
+      const st = acct?.balance_refresh?.status
+      const fresh = Number(acct?.balance?.as_of ?? 0) > startedAt
+      if (st && st !== 'pending' && (fresh || i > 1)) break
+      await new Promise(r => setTimeout(r, 1500))
+      acct = await stripe.financialConnections.accounts.retrieve(conn.stripe_fc_account_id)
+    }
   } catch {
     // Refresh is a nicety — an account Stripe already has a balance for still
     // reports it on a plain retrieve, so fall back rather than giving up.
@@ -335,8 +348,10 @@ export async function refreshBalance(conn: any): Promise<void> {
 
   const bal = acct?.balance
   if (!bal) return
-  // Both shapes are currency-keyed maps of minor units.
-  const pick = bal.cash?.available ?? bal.current ?? null
+  // Both shapes are currency-keyed maps of minor units. The account balance
+  // as the bank states it — what the landlord compares against their own
+  // banking app — not the "available" subset.
+  const pick = bal.current ?? bal.cash?.available ?? null
   if (!pick) return
   const currency = Object.keys(pick)[0]
   if (!currency) return

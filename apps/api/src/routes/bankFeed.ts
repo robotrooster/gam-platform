@@ -8,6 +8,7 @@ import { AppError } from '../middleware/errorHandler'
 import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES } from '@gam/shared'
 import { queryOne } from '../db'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
+import { logger } from '../lib/logger'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
@@ -107,7 +108,16 @@ bankFeedRouter.get('/connections', requireLandlord, async (req: any, res, next) 
 bankFeedRouter.post('/connections/:id/sync', requireLandlord, async (req: any, res, next) => {
   try {
     await scopeFromRow(req, 'bank_connections', req.params.id)
-    res.json({ success: true, data: await syncConnection(req.params.id) })
+    const synced = await syncConnection(req.params.id)
+    // S652 (Nic): Sync means "what does the bank say now" — transactions AND
+    // the balance. Best-effort: a balance that will not come never blocks the
+    // transactions that did.
+    try {
+      const { refreshBalance } = await import('../services/bankFeed')
+      const conn = await queryOne<any>('SELECT * FROM bank_connections WHERE id = $1', [req.params.id])
+      if (conn) await refreshBalance(conn)
+    } catch (e) { logger.warn({ err: e, connectionId: req.params.id }, '[bank-feed] balance refresh on sync failed') }
+    res.json({ success: true, data: synced })
   } catch (e) { next(e) }
 })
 
