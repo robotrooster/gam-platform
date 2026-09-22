@@ -613,7 +613,14 @@ export function SignPage() {
   }
 
   const jumpToNext = (justFilledId: string) => {
-    const stillUnfilled = requiredFields.filter((f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim())
+    // S652 (Blu): initialing one box on page 1 threw him to page 2, because the
+    // jump only ever chased the next REQUIRED field. Finish the page you are on
+    // first — every box of yours on it, optional or not, top to bottom — and
+    // only leave the page when nothing of yours is left on it.
+    const unfilled = (f:any) => f.id !== justFilledId && !fieldValues[f.id]?.trim()
+    const onThisPage = myFields.filter((f:any) => f.page === currentPage && unfilled(f))
+      .sort((a:any, b:any) => Number(a.y) - Number(b.y))
+    const stillUnfilled = onThisPage.length ? onThisPage : requiredFields.filter(unfilled)
     const next = stillUnfilled[0]
     if (!next) return
     if (next.page !== currentPage) {

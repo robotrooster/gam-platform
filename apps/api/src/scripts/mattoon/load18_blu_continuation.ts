@@ -11,6 +11,8 @@ import { emailSigningRequest } from '../../services/email'
 import { packageSiblings } from '../../services/signingPackages'
 
 const APPLY = process.argv.includes('--apply')
+const onlyArg = process.argv[process.argv.indexOf('--only') + 1]
+const ONLY = process.argv.includes('--only') ? `MH ${onlyArg.padStart(2, '0')}` : null
 const PROPERTY = 'e9743bfa-1972-4e40-8a1b-ad76a52a17b9'
 
 async function main() {
@@ -22,6 +24,7 @@ async function main() {
       WHERE u.property_id=$1 AND d.document_type='original_lease' AND d.status NOT IN ('voided','completed')
       ORDER BY u.unit_number`, [PROPERTY])
   for (const l of leases) {
+    if (ONLY && l.unit_number !== ONLY) continue
     const sib = await packageSiblings(l.id, owner.user_id)
     const hasSale = sib.some(d => /Installment Contract/.test(d.title))
     const kind = l.dwelling_ownership === 'tenant' ? 'tenant-owned home' : 'park-owned home'
