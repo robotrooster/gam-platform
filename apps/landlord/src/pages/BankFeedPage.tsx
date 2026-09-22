@@ -158,7 +158,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   }, [me?.booksStartDate])
 
   const saveBooksStart = useMutation(
-    (date: string | null) => apiPut('/bank-feed/books-start-date', { date }),
+    (date: string | null) => apiPut('/bank-feed/books-start-date', { date, entityId }),
     { onSuccess: (r: any) => {
         qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('landlord-books-start')
         const ig = r?.data?.ignored ?? 0, re = r?.data?.restored ?? 0
@@ -169,18 +169,18 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       onError: (e: any) => toast(e?.response?.data?.error || 'Could not save the start date.') },
   )
 
-  const sync = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/sync`, {}), {
+  const sync = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/sync`, { entityId }), {
     onSuccess: (d: any) => { qc.invalidateQueries(['bank-txns']); qc.invalidateQueries('bank-connections')
       const n = d?.data?.inserted; toast(n ? `${n} new transaction(s).` : 'Up to date.') },
     onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Sync failed.'),
   })
 
-  const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, {}), {
+  const disconnect = useMutation((id: string) => apiPost(`/bank-feed/connections/${id}/disconnect`, { entityId }), {
     onSuccess: () => { qc.invalidateQueries('bank-connections'); toast('Bank disconnected.') },
   })
 
   const categorize = useMutation(
-    ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, body), {
+    ({ id, body }: { id: string; body: any }) => apiPost(`/bank-feed/transactions/${id}/categorize`, { ...body, entityId }), {
     onSuccess: (r: any) => { qc.invalidateQueries(['bank-txns'])
       // The API returns incomeId for money in, expenseId for money out — say
       // which side it landed on rather than always claiming "expenses".
@@ -188,7 +188,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
     onError: (e: any) => toast(e?.response?.data?.error || e?.response?.data?.message || 'Could not categorize.'),
   })
 
-  const ignore = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/ignore`, {}), {
+  const ignore = useMutation((id: string) => apiPost(`/bank-feed/transactions/${id}/ignore`, { entityId }), {
     onSuccess: () => { qc.invalidateQueries(['bank-txns']); toast('Ignored.') },
   })
 
@@ -275,13 +275,13 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
           here dates the payment to when the deposit was actually made — so any late
           fee charged while it was in transit comes back off.
         </div>
-        <DepositMatchPanel />
+        <DepositMatchPanel entityId={entityId} />
       </div>
 
       {/* The other side of the same question: cash marked collected in person
           that no deposit has accounted for. */}
       <div style={{ marginBottom: 20 }}>
-        <CashPositionPanel />
+        <CashPositionPanel entityId={entityId} />
       </div>
 
       {/* Linked banks */}

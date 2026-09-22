@@ -58,6 +58,18 @@ function scope(req: any): string {
   return resolveLandlordTarget(req.user, undefined, 'record')
 }
 
+// S652 (Nic): "I select Mountain View, it shows the linked bank, and when I
+// click sync it tells me I need to choose which business." A connection or a
+// transaction already belongs to ONE company; an action on it never needs to
+// be told which. Read the company off the row and check it is the caller's.
+async function scopeFromRow(req: any, table: 'bank_connections' | 'bank_transactions', id: string): Promise<string> {
+  const row = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM ${table} WHERE id = $1`, [id])
+  if (!row || !landlordScopeIds(req.user).includes(row.landlord_id)) {
+    throw new AppError(404, table === 'bank_connections' ? 'Connection not found' : 'Transaction not found')
+  }
+  return row.landlord_id
+}
+
 // POST /api/bank-feed/link-session — start FC link; returns client secret.
 bankFeedRouter.post('/link-session', requireLandlord, async (req: any, res, next) => {
   try {
@@ -94,11 +106,7 @@ bankFeedRouter.get('/connections', requireLandlord, async (req: any, res, next) 
 // POST /api/bank-feed/connections/:id/sync
 bankFeedRouter.post('/connections/:id/sync', requireLandlord, async (req: any, res, next) => {
   try {
-    const landlordId = scope(req)
-    // Ownership check inside the service via landlord_id on the row is not present
-    // on sync; guard here.
-    const conns = await listConnections(landlordId)
-    if (!conns.some((c: any) => c.id === req.params.id)) throw new AppError(404, 'Connection not found')
+    await scopeFromRow(req, 'bank_connections', req.params.id)
     res.json({ success: true, data: await syncConnection(req.params.id) })
   } catch (e) { next(e) }
 })
@@ -106,7 +114,7 @@ bankFeedRouter.post('/connections/:id/sync', requireLandlord, async (req: any, r
 // POST /api/bank-feed/connections/:id/disconnect
 bankFeedRouter.post('/connections/:id/disconnect', requireLandlord, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await disconnectConnection(scope(req), req.params.id) })
+    res.json({ success: true, data: await disconnectConnection(await scopeFromRow(req, 'bank_connections', req.params.id), req.params.id) })
   } catch (e) { next(e) }
 })
 
@@ -136,14 +144,14 @@ bankFeedRouter.post('/transactions/:id/categorize', requireLandlord, async (req:
       vendor: z.string().max(200).nullable().optional(),
       description: z.string().max(500).nullable().optional(),
     }).parse(req.body)
-    res.json({ success: true, data: await categorizeTransaction(scope(req), req.params.id, body as any) })
+    res.json({ success: true, data: await categorizeTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id, body as any) })
   } catch (e) { next(e) }
 })
 
 // POST /api/bank-feed/transactions/:id/ignore
 bankFeedRouter.post('/transactions/:id/ignore', requireLandlord, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await ignoreTransaction(scope(req), req.params.id) })
+    res.json({ success: true, data: await ignoreTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id) })
   } catch (e) { next(e) }
 })
 
@@ -184,7 +192,7 @@ bankFeedRouter.post('/deposits/:id/confirm', requireLandlord, async (req: any, r
       declarationId: z.string().uuid().nullish(),
     }).parse(req.body)
 
-    const landlordId = scope(req)
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
     // Scope check before anything else: the transaction must be this landlord's.
     // confirmDepositMatch re-checks charge ownership against the transaction, so
     // this is the outer of two gates rather than the only one.
@@ -213,7 +221,7 @@ bankFeedRouter.post('/deposits/:id/confirm', requireLandlord, async (req: any, r
 // this deposit has no honest way out except to pick one.
 bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, res, next) => {
   try {
-    const landlordId = scope(req)
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
     const row = await queryOne<{ id: string }>(
       `UPDATE bank_transactions
           SET updated_at = NOW()

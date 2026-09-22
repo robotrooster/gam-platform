@@ -92,3 +92,26 @@ describe('POST /bank-feed/link-session', () => {
     expect(createLinkSession).toHaveBeenCalledWith(coA)
   })
 })
+
+// S652 (Nic): "I select Mountain View, it shows the linked bank, and when I
+// click sync it tells me I need to choose which business." A connection
+// belongs to one company already; acting on it never asks.
+describe('POST /bank-feed/connections/:id/sync — the row knows its company', () => {
+  async function seedConnection(landlordId: string) {
+    const { rows: [row] } = await db.query<{ id: string }>(
+      `INSERT INTO bank_connections (landlord_id, provider, status) VALUES ($1, 'stripe_fc', 'active') RETURNING id`, [landlordId])
+    return row.id
+  }
+  it('syncs a two-company account\'s connection without being told which company', async () => {
+    const id = await seedConnection(coB)
+    const res = await request(buildApp())
+      .post(`/api/bank-feed/connections/${id}/sync`).set('Authorization', `Bearer ${token}`).send({})
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+  })
+  it("refuses a connection that belongs to somebody else's company", async () => {
+    const id = await seedConnection(strangerCo)
+    const res = await request(buildApp())
+      .post(`/api/bank-feed/connections/${id}/sync`).set('Authorization', `Bearer ${token}`).send({})
+    expect(res.status).toBe(404)
+  })
+})

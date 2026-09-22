@@ -34,10 +34,11 @@ const CONFIDENCE_LABEL: Record<string, string> = {
   carried_paydown:  'Could be a carried-balance payment',
 }
 
-export function DepositMatchPanel() {
+export function DepositMatchPanel({ entityId = '' }: { entityId?: string }) {
+  const entityQS = entityId ? `?entityId=${encodeURIComponent(entityId)}` : ''
   const qc = useQueryClient()
-  const { data, isLoading } = useQuery<any>('unmatched-deposits',
-    () => apiGet('/bank-feed/deposits/unmatched'))
+  const { data, isLoading } = useQuery<any>(['unmatched-deposits', entityId],
+    () => apiGet('/bank-feed/deposits/unmatched' + entityQS))
   const [chosen, setChosen] = useState<Record<string, string>>({})
   const [method, setMethod] = useState<Record<string, ManualPaymentMethod>>({})
   const [error, setError] = useState<string | null>(null)
@@ -169,9 +170,10 @@ export function DepositMatchPanel() {
  * it is a control. Staff take cash and mark each tenant paid, the deposit posts
  * days later, and until now nothing checked the two against each other.
  */
-export function CashPositionPanel() {
-  const { data, isLoading } = useQuery<any>('cash-position',
-    () => apiGet('/bank-feed/cash-position'))
+export function CashPositionPanel({ entityId = '' }: { entityId?: string }) {
+  const entityQS = entityId ? `?entityId=${encodeURIComponent(entityId)}` : ''
+  const { data, isLoading } = useQuery<any>(['cash-position', entityId],
+    () => apiGet('/bank-feed/cash-position' + entityQS))
   if (isLoading) return null
   const unbanked: any[] = data?.unbanked ?? []
 
