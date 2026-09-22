@@ -31,7 +31,7 @@ bankFeedRouter.use(requireAuth)
  * middleware/auth), so an entity created moments ago resolves, and one that
  * belongs to somebody else does not.
  */
-function scope(req: any): string {
+function scope(req: any, mustName = false): string {
   // ── S637: READ THE ENTITY FROM THE BODY TOO ─────────────────────────
   //
   // Nic: "When I select Mountain View or Oak Park from the banking page and
@@ -55,7 +55,7 @@ function scope(req: any): string {
     return requested
   }
   // S633: no entity named — the account's only company, or a clear ask.
-  return resolveLandlordTarget(req.user, undefined, 'record')
+  return resolveLandlordTarget(req.user, undefined, mustName ? 'bank link' : 'record', mustName)
 }
 
 // S652 (Nic): "I select Mountain View, it shows the linked bank, and when I
@@ -73,7 +73,7 @@ async function scopeFromRow(req: any, table: 'bank_connections' | 'bank_transact
 // POST /api/bank-feed/link-session — start FC link; returns client secret.
 bankFeedRouter.post('/link-session', requireLandlord, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await createLinkSession(scope(req)) })
+    res.json({ success: true, data: await createLinkSession(scope(req, true)) })
   } catch (e) { next(e) }
 })
 
@@ -92,7 +92,7 @@ bankFeedRouter.put('/books-start-date', requireLandlord, async (req: any, res, n
 bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) => {
   try {
     const { sessionId } = z.object({ sessionId: z.string().min(1) }).parse(req.body)
-    res.json({ success: true, data: await finalizeConnection(scope(req), sessionId) })
+    res.json({ success: true, data: await finalizeConnection(scope(req, true), sessionId) })
   } catch (e) { next(e) }
 })
 

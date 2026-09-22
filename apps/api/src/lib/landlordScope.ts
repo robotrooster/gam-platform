@@ -150,6 +150,11 @@ export function resolveLandlordTarget(
   user: AuthPayload,
   explicit: string | null | undefined,
   what = 'record',
+  // S652: a NEW property or a NEW bank link is an attribute of one LLC — that
+  // is the one write where the account must still say which company, because
+  // filing it under the wrong one is unwound by hand. Everything else lands on
+  // the account's own company.
+  mustName = false,
 ): string {
   if (explicit) {
     if (!canManageLandlordResource(user, explicit, [])) {
@@ -159,6 +164,11 @@ export function resolveLandlordTarget(
   }
   const owned = landlordScopeIds(user)
   if (owned.length === 1) return owned[0]
+  // S652 (Nic): an account on several companies is "logged in omnipresent" —
+  // never asked which one it is. A write with nothing to derive a company
+  // from lands on the company the account itself founded.
+  const home = (user as any).homeLandlordId as string | null | undefined
+  if (!mustName && home && owned.includes(home)) return home
   // 400, not 403, and deliberately: this is the long-standing "No landlord scope
   // on this user" contract that admins, tenants and unscoped callers have always
   // received from these endpoints. The refactor changes WHICH company a write

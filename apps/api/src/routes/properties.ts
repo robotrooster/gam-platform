@@ -213,7 +213,7 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     // that has to be unwound by hand. This replaces `?? req.user!.profileId` —
     // the session's "active" entity, which is precisely the arbitrary default
     // this release removes.
-    const targetLandlordId = resolveLandlordTarget(req.user!, body.landlordId, 'property')
+    const targetLandlordId = resolveLandlordTarget(req.user!, body.landlordId, 'property', true)
     // S629: checked against the DATABASE, not just the token. landlordIds is
     // baked into the JWT at login, so an entity created after that login is
     // invisible to a synchronous check — and the session that created the

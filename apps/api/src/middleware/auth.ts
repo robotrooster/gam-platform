@@ -22,6 +22,12 @@ export interface AuthPayload {
   // the founding/primary entity; scope checks accept any id in this list.
   // Membership changes take effect at next login/refresh.
   landlordIds?: string[] | null
+  // S652 (Nic): "You're not logged in as one or the other. You're logged in
+  // omnipresent." The account stands above every company it may touch;
+  // reads span all of them. When a WRITE has no property or row to derive a
+  // company from, it lands on the account's OWN company — the one it founded
+  // — never on a session choice and never on a question.
+  homeLandlordId?: string | null
   // S453: business-side scope. Set for business_owner (resolved at
   // login from businesses.owner_user_id) and for business_staff
   // (resolved from business_users at login via getScopeForUser).
@@ -98,7 +104,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     // token's own claims are never widened by it.
     if (payload.role === 'landlord' && payload.userId) {
       try {
-        req.user = { ...payload, landlordIds: await currentLandlordIds(payload) }
+        req.user = { ...payload, landlordIds: await currentLandlordIds(payload), homeLandlordId: await homeLandlordIdFor(payload) }
       } catch { /* the token's own list still stands */ }
       // S652: a landlord GAM cannot collect from loses the portal until they
       // sort it out. Checked here so it covers every endpoint at once rather
@@ -386,8 +392,17 @@ export function requireBooksWrite(req: Request, res: Response, next: NextFunctio
  */
 const MEMBERSHIP_TTL_MS = 15_000
 const membershipCache = new Map<string, { ids: string[]; at: number }>()
+// S652: the company the account founded, cached beside its memberships.
+const homeCache = new Map<string, { id: string | null; at: number }>()
+async function homeLandlordIdFor(payload: AuthPayload): Promise<string | null> {
+  const key = payload.userId
+  const hit = homeCache.get(key)
+  if (hit && Date.now() - hit.at < MEMBERSHIP_TTL_MS) return hit.id
+  await currentLandlordIds(payload)   // fills both caches
+  return homeCache.get(key)?.id ?? null
+}
 
-export function _clearMembershipCache(): void { membershipCache.clear() }
+export function _clearMembershipCache(): void { membershipCache.clear(); homeCache.clear() }
 
 async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
   const key = payload.userId
@@ -404,6 +419,9 @@ async function currentLandlordIds(payload: AuthPayload): Promise<string[]> {
     `SELECT landlord_id FROM landlord_members WHERE user_id = $1
      UNION
      SELECT id           FROM landlords        WHERE user_id = $1`, [payload.userId])
+  const founded = await query<{ id: string }>(
+    `SELECT id FROM landlords WHERE user_id = $1 ORDER BY created_at LIMIT 1`, [payload.userId])
+  homeCache.set(key, { id: founded[0]?.id ?? null, at: now })
   const ids = Array.from(new Set([
     ...(payload.landlordIds ?? []),
     ...rows.map((r) => r.landlord_id),

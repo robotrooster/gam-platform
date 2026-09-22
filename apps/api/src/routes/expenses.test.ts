@@ -90,11 +90,13 @@ describe('landlord expenses', () => {
       .set('Authorization', `Bearer ${token}`)
     expect(foreign.status).toBe(403)
 
-    // The WRITE half is unchanged: two companies, no target named → asked which.
+    // S652 (Nic): the account is never asked which company it is. A write
+    // that names no company lands on the one the account founded.
     const write = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${token}`)
       .send(mk({ category: 'repairs', amount: 50, description: 'Ambiguous' }))
-    expect(write.status).toBe(400)
-    expect(String(write.body.error)).toMatch(/more than one company/i)
+    expect(write.status, JSON.stringify(write.body)).toBe(200)
+    const filed = await db.query(`SELECT landlord_id FROM expenses WHERE description = 'Ambiguous'`)
+    expect(filed.rows[0].landlord_id).toBe(llA)
   })
 
   it('creates a unit-linked expense', async () => {
