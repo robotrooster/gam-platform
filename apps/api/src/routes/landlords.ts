@@ -6469,7 +6469,16 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
           WHERE pti.id = $1 AND pti.cancelled_at IS NULL`, [req.params.id])
       if (!intent) throw new AppError(404, 'That invite no longer exists.')
       if (!canManageLandlordResource(req.user, intent.landlord_id)) throw new AppError(403, 'Forbidden')
-      if (intent.resolved_at) {
+      // S652 (Nic, Shannon Gregory): resolved_at is stamped for EVERY resident on
+      // the household the moment the lease issues on the landlord's signature —
+      // it never said whether THIS person signed. A co-tenant whose mother had
+      // signed was told "they have already signed" and her dead email could not
+      // be fixed. Only their own signature closes the door.
+      const signedThemself = await queryOne<{ id: string }>(
+        `SELECT s.id FROM lease_document_signers s JOIN lease_documents d ON d.id = s.document_id
+          WHERE s.user_id = $1 AND s.status = 'signed' AND d.status <> 'voided'
+            AND d.document_type = 'original_lease' AND d.unit_id = $2 LIMIT 1`, [intent.user_id, intent.unit_id])
+      if (signedThemself) {
         throw new AppError(409, 'They have already signed — their account is their own now.')
       }
       if (intent.accepted_at || intent.last_login_at) {
