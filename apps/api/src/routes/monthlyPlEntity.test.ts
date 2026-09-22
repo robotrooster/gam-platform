@@ -59,10 +59,13 @@ const pl = (qs: string, token: string) => request(buildApp())
   .get(`/api/reports/monthly-pl?${qs}`).set('Authorization', `Bearer ${token}`)
 
 describe('GET /reports/monthly-pl', () => {
-  it('refuses to blend two companies, and says so', async () => {
+  // S652 (Nic): the account is never asked which company it is. With no
+  // company named, the report is the one the account founded; the picker
+  // names another.
+  it('answers for the founding company when none is named, never blending', async () => {
     const res = await pl('year=2026&month=9', twoCoToken)
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/more than one company/i)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    expect(res.body.data).toHaveProperty('payments')
   })
 
   it('answers once a company is named — what the modal now sends', async () => {

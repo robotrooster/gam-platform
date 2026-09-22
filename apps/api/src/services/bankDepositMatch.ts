@@ -375,22 +375,12 @@ export function matchDeposit(
 
     // Short of everything — only a carried balance may be paid down in part
     // (S622). Rent stays all-or-nothing, so we do not offer it.
-    const carried = charges.filter(c => c.type === 'carried_balance')
-    const carriedTotal = round2(carried.reduce((s, c) => s + c.amount, 0))
-    if (carried.length > 0 && deposit.amount < carriedTotal) {
-      cands.push({
-        rank: 3,
-        m: {
-          chargeIds: carried.map(c => c.id),
-          leaseId, tenantId: head.tenantId,
-          tenantName: head.tenantName, unitNumber: head.unitNumber,
-          total: carriedTotal,
-          confidence: 'carried_paydown',
-          rivals: 0,
-          reason: `Could be a partial payment against ${head.tenantName}'s $${carriedTotal.toFixed(2)} carried balance.`,
-        },
-      })
-    }
+    // S652 (Nic): "it's thinking every single transaction is going to be
+    // Mobile Home 2's rent — none of them even are a dollar amount match."
+    // The old "could be a partial payment against a carried balance" guess
+    // fired for every deposit smaller than one tenant's balance. A candidate
+    // is an exact amount match, a tenant's own report, or their name on the
+    // memo — nothing weaker.
   }
 
   // Two tenants declaring the same figure in the same window is possible in a

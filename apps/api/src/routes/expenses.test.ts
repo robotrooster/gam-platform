@@ -95,7 +95,7 @@ describe('landlord expenses', () => {
     const write = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${token}`)
       .send(mk({ category: 'repairs', amount: 50, description: 'Ambiguous' }))
     expect(write.status, JSON.stringify(write.body)).toBe(200)
-    const filed = await db.query(`SELECT landlord_id FROM expenses WHERE description = 'Ambiguous'`)
+    const filed = await db.query(`SELECT landlord_id FROM landlord_expenses WHERE description = 'Ambiguous'`)
     expect(filed.rows[0].landlord_id).toBe(llA)
   })
 

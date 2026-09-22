@@ -119,12 +119,13 @@ describe('matching a deposit', () => {
     expect(m).toHaveLength(0)
   })
 
-  it('does offer a short deposit against a carried balance, which is partially payable', () => {
+  // S652 (Nic): a deposit that matches nobody's amount, name or report is
+  // offered to nobody — "every single transaction is going to be Mobile Home
+  // 2's rent" was this guess firing on a carried balance.
+  it('offers nothing for a short deposit against a carried balance', () => {
     const m = matchDeposit({ amount: 200, postedDate: '2026-09-03', description: 'DEPOSIT' },
       [charge({ id: 'a', amount: 1000, type: 'carried_balance' })])
-    expect(m).toHaveLength(1)
-    expect(m[0].confidence).toBe('carried_paydown')
-    expect(isPreselectable(m[0])).toBe(false)
+    expect(m).toHaveLength(0)
   })
 
   it('surfaces a named tenant even when the amount does not tie out', () => {
