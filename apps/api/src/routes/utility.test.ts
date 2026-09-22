@@ -206,14 +206,16 @@ describe('GET /master-bills', () => {
 })
 
 describe('GET /bills', () => {
-  it('tenant: sees only own bills', async () => {
+  it('tenant: sees only own bills, and only once they are issued', async () => {
     const f = await seed()
     const meter = await seedMeter(f, f.propertyAId)
-    await seedBill(f, meter)
-    const res = await request(buildApp())
-      .get('/api/utility/bills')
-      .set('Authorization', `Bearer ${f.tenantToken}`)
+    const id = await seedBill(f, meter)
+    // S652: computed for the landlord's review, not yet issued — not the tenant's to see.
+    let res = await request(buildApp()).get('/api/utility/bills').set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(0)
+    await db.query(`UPDATE utility_bills SET status = 'billed', billed_at = NOW() WHERE id = $1`, [id])
+    res = await request(buildApp()).get('/api/utility/bills').set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].tenant_id).toBe(f.tenantAId)
   })

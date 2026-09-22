@@ -17,11 +17,12 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { X, Check, Clock, ShieldCheck, Eye, Wrench } from 'lucide-react'
+import { X, Check, Clock, ShieldCheck, Eye, Wrench, Gauge } from 'lucide-react'
 import {
   WORK_TRADE_SKILLS, WORK_TRADE_SKILL_LABEL, WORK_TRADE_LOG_STATUS_LABEL,
-  WORK_TRADE_COVERABLE_LABEL,
+  WORK_TRADE_COVERABLE_LABEL, WORK_TRADE_FIELD_PERMISSIONS, WORK_TRADE_FIELD_PERMISSION_LABEL,
 } from '@gam/shared'
+import { ReadingWalkModal } from './MeterWalk'
 
 export type PanelApi = {
   get: (url: string) => Promise<any>
@@ -70,6 +71,18 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const [form, setForm] = useState({ workDate: new Date().toISOString().slice(0, 10), hours: '', description: '' })
   const [ending, setEnding] = useState(false)
   const [finishing, setFinishing] = useState<{ id: string; hours: string; note: string } | null>(null)
+  // S652 (Nic): "Curtis needs to be able to do and initiate the meter reading."
+  // The same walk the front desk takes, from the tenant portal, when the
+  // landlord ticked Read meters on this agreement.
+  const [walkRun, setWalkRun] = useState<any | null>(null)
+  const propertyIdForRuns = side === 'tenant' && data?.agreement?.fieldPermissions?.includes('read_meters') ? data.agreement.propertyId : null
+  const { data: runs = [] } = useQuery<any[]>(['wt-reading-runs', propertyIdForRuns],
+    () => api.get(`/utility/reading-runs?propertyId=${propertyIdForRuns}`),
+    { enabled: !!propertyIdForRuns })
+  const openRun = (runs as any[]).find(r => r.status === 'open' || r.status === 'double_check')
+  const startRun = useMutation(() => api.post('/utility/reading-runs', { propertyId: propertyIdForRuns }),
+    { onSuccess: () => qc.invalidateQueries(['wt-reading-runs', propertyIdForRuns]),
+      onError: (e: any) => say(e?.message || 'Could not start the reading', 'error') })
 
   // S652: the tenant's live job list (theirs, open ones, ones to confirm) —
   // their own endpoint, because what they may see depends on who they are.
@@ -98,7 +111,9 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const loggedHours = logs.filter(l => l.status === 'pending').reduce((s, l) => s + Number(l.hours), 0)
   const covers: string[] = a.coveredCharges?.length ? a.coveredCharges : Object.keys(WORK_TRADE_COVERABLE_LABEL)
   const skills: string[] = a.skills ?? []
+  const fieldPerms: string[] = a.fieldPermissions ?? []
   const canLog = a.status === 'active' && tracks
+  const readsMeters = side === 'tenant' && a.status === 'active' && fieldPerms.includes('read_meters') && !!a.propertyId
 
   return (
     <div>
@@ -181,6 +196,20 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
           {!isLandlord && skills.length === 0 && <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>General work: grounds, cleaning, and odd jobs.</span>}
         </div>
 
+        <div style={{ ...label, marginTop: 14 }}>Field work they may do from their portal</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {(isLandlord ? WORK_TRADE_FIELD_PERMISSIONS : fieldPerms).map((f: any) => {
+            const on = fieldPerms.includes(f)
+            return isLandlord ? (
+              <button key={f} className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={patch.isLoading}
+                onClick={() => patch.mutate({ fieldPermissions: on ? fieldPerms.filter(x => x !== f) : [...fieldPerms, f] })}>
+                {on && <Check size={11} />} {(WORK_TRADE_FIELD_PERMISSION_LABEL as any)[f]}
+              </button>
+            ) : <span key={f} className="badge">{(WORK_TRADE_FIELD_PERMISSION_LABEL as any)[f]}</span>
+          })}
+          {!isLandlord && fieldPerms.length === 0 && <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>None.</span>}
+        </div>
+
         <div style={{ ...label, marginTop: 14 }}>Covers</div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>
           {covers.map(c => (WORK_TRADE_COVERABLE_LABEL as any)[c] ?? c).join(', ')}</div>
@@ -195,6 +224,38 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
           </div>
         )}
       </div>
+
+      {/* ── meter readings (tenant with Read meters) ── */}
+      {readsMeters && (
+        <div className="card" style={card}>
+          <div style={label}><Gauge size={11} style={{ verticalAlign: '-1px' }} /> Meter readings</div>
+          {openRun ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ flex: 1, minWidth: 200, fontSize: '.82rem', color: 'var(--text-1)' }}>
+                <b>{openRun.status === 'double_check' ? 'Verification walk' : 'Readings due'}</b>
+                <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 2 }}>
+                  {openRun.status === 'double_check'
+                    ? `${openRun.dcDone ?? 0} of ${openRun.dcTotal ?? 0} re-checks entered.`
+                    : `${openRun.metersRead ?? 0} of ${openRun.metersTotal ?? 0} meters read.`}
+                </div>
+              </div>
+              <button className="btn btn-primary btn-sm" onClick={() => setWalkRun(openRun)}>
+                {openRun.status === 'double_check' ? 'Verify' : (openRun.metersRead > 0 ? 'Continue reading' : 'Start reading')}
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ flex: 1, minWidth: 200, fontSize: '.8rem', color: 'var(--text-2)' }}>
+                No readings due right now. The month's run opens on the last business day.</span>
+              <button className="btn btn-primary btn-sm" disabled={startRun.isLoading} onClick={() => startRun.mutate()}>Start early</button>
+            </div>
+          )}
+        </div>
+      )}
+      {walkRun && (
+        <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} api={api}
+          onClose={() => { setWalkRun(null); qc.invalidateQueries(['wt-reading-runs', propertyIdForRuns]) }} />
+      )}
 
       {/* ── jobs ── */}
       <div className="card" style={card}>

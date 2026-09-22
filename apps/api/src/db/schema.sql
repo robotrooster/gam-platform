@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict tfiEqCb4XdUueaK4fUoLMyBvdqxFepxxXnUkudUOmK7GDdvPpflS4lDkGfwCHSW
+\restrict FFpE7m9WLkRtE3mRnXP8xPTqMdnLMrh8aBzrWXzQg12Qg7P5SVR1quxZF5FMAYT
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7938,7 +7938,6 @@ CREATE TABLE public.properties (
     stripe_terminal_location_id text,
     register_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
     booking_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
-    review_utility_bills boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -11434,6 +11433,8 @@ CREATE TABLE public.work_trade_agreements (
     trusted boolean DEFAULT false NOT NULL,
     skills text[] DEFAULT '{}'::text[] NOT NULL,
     carry_forward_indefinite boolean DEFAULT false NOT NULL,
+    field_permissions text[] DEFAULT '{}'::text[] NOT NULL,
+    CONSTRAINT work_trade_agreements_field_permissions_check CHECK ((field_permissions <@ ARRAY['read_meters'::text])),
     CONSTRAINT work_trade_agreements_skills_check CHECK ((skills <@ ARRAY['plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text])),
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
@@ -27965,5 +27966,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict tfiEqCb4XdUueaK4fUoLMyBvdqxFepxxXnUkudUOmK7GDdvPpflS4lDkGfwCHSW
+\unrestrict FFpE7m9WLkRtE3mRnXP8xPTqMdnLMrh8aBzrWXzQg12Qg7P5SVR1quxZF5FMAYT
 

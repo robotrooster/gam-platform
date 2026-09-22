@@ -194,6 +194,7 @@ const DELIBERATE = new Map(Object.entries({
   // S652: marking a document slot as "already in my lease" is bookkeeping for
   // what the Templates page shows — done on the page, where the slots and the
   // landlord's documents are side by side. Nothing is sent, signed or billed.
+  'utility POST /reading-runs/:id/approve': 'approving a month of utility bills is the landlord looking at every number first; the agent can say the bills are waiting, never approve them',
   'workTrade POST /jobs/:jobId/take': 'a work trader claiming a repair commits their own hands to it; they claim it on the job list where they can see the job',
   'workTrade POST /jobs/:jobId/done': 'saying physical work is finished is the worker\'s own attestation, never the agent\'s',
   'workTrade POST /jobs/:jobId/check': 'confirming someone else\'s repair was done right is a person\'s judgment on site, never the agent\'s',

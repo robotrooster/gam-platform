@@ -184,6 +184,19 @@ export async function releaseJobsFor(exec: { query: (sql: string, p: any[]) => P
        AND mr.landlord_id = a.landlord_id`, [agreementIds])
 }
 
+/** S652: did the landlord tick this field permission (e.g. read_meters) on a
+ *  live work-trade agreement of this person AT this property? */
+export async function traderHasFieldPermission(userId: string, propertyId: string, perm: string): Promise<boolean> {
+  const r = await queryOne<{ ok: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM work_trade_agreements a
+         JOIN tenants t ON t.id = a.tenant_id
+         JOIN units un ON un.id = a.unit_id
+        WHERE t.user_id = $1 AND un.property_id = $2 AND a.status = 'active'
+          AND $3 = ANY(a.field_permissions)) AS ok`, [userId, propertyId, perm])
+  return r?.ok === true
+}
+
 /** People a landlord may assign a job at this property to: their maintenance
  *  team and the property's live work traders. */
 export async function assignableForProperty(propertyId: string) {

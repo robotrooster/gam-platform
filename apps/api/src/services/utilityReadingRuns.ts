@@ -476,8 +476,32 @@ export async function enterDoubleCheck(runId: string, meterId: string, secondVal
   let finishedRun = null
   if (remaining && remaining.n === 0) {
     finishedRun = await completeReadingRun(runId, userId)
+    if (!finishedRun || finishedRun.status !== 'completed') await tellLandlordBillsAreReady(runId)
   }
-  return { doubleCheck: updated, run: finishedRun ?? run }
+  return { doubleCheck: updated, run: finishedRun ?? run, remaining: remaining?.n ?? 0 }
+}
+
+/** S652: every read is in — the landlord approves before anything goes out. */
+async function tellLandlordBillsAreReady(runId: string) {
+  const r = await queryOne<any>(
+    `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+       JOIN landlords l ON l.id = p.landlord_id JOIN users u ON u.id = l.user_id
+      WHERE r.id = $1`, [runId])
+  if (!r) return
+  const month = new Date(String(r.billing_cycle_month).slice(0, 10) + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+  await createNotification({
+    userId: r.user_id, landlordId: r.landlord_id,
+    type: 'utility_bills_ready_to_review',
+    title: `Utility bills ready to review — ${r.name}`,
+    body: `${month}'s meter readings are all in. Look them over and approve, and the bills go out on each tenant's next invoice. Until then those invoices wait.`,
+    data: { runId: r.id, propertyId: r.property_id },
+    actionUrl: `/utilities?propertyId=${r.property_id}`,
+    sendEmail: true, emailTo: r.email,
+    emailSubject: `Utility bills ready to review — ${r.name} (${month})`,
+    emailHtml: `${month}'s meter readings for <b>${r.name}</b> are all in. Open the Utilities page, review the bills, and approve them to send.`,
+  }).catch(() => {})
 }
 
 /** Escalations left on a run's cycle — surfaced in the completion summary. */
@@ -498,13 +522,12 @@ export async function countEscalations(runId: string): Promise<number> {
  * 'double_check' (the normal path once verification finishes).
  */
 export async function completeReadingRun(runId: string, userId: string, opts: { approve?: boolean } = {}) {
-  const run = await queryOne<any>(
-    `SELECT r.*, p.review_utility_bills FROM utility_reading_runs r
-       JOIN properties p ON p.id = r.property_id WHERE r.id = $1`, [runId])
+  const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
   if (!run || run.status === 'completed') return run
-  // S652: a property that reviews its bills issues them only on the landlord's
-  // approval. The walk finishing is not that — it leaves the run waiting.
-  if (run.review_utility_bills && !run.approved_at && !opts.approve) return run
+  // S652 (Nic, platform-wide): a month's utility bills go out only on the
+  // landlord's approval. The walk finishing is not that — it leaves the run
+  // waiting, and the landlord is told the bills are ready to look over.
+  if (!run.approved_at && !opts.approve) return run
   if (opts.approve && !run.approved_at) {
     await query(`UPDATE utility_reading_runs SET approved_at = NOW(), approved_by_user_id = $2 WHERE id = $1`, [runId, userId])
   }

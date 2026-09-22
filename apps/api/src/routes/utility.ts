@@ -8,6 +8,29 @@ import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
+import { traderHasFieldPermission } from '../services/workTradeJobs'
+
+// S652 (Nic): "Curtis needs to be able to do and initiate the meter reading."
+// A work trader whose landlord ticked Read meters on their agreement takes the
+// same walk the front desk does — at their own property only. Staff pass the
+// way they always did (their permission, then their property scope).
+const METER_READ_PERMS = ['units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters']
+function requireMeterReader(req: any, res: any, next: any) {
+  const u = req.user
+  if (!u) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (u.role === 'tenant') return next()   // the handler checks the agreement
+  return requirePerm(...METER_READ_PERMS)(req, res, next)
+}
+async function assertMeterReadAccess(user: any, propertyId: string, landlordId: string) {
+  if (user?.role === 'tenant') {
+    if (!(await traderHasFieldPermission(user.userId, propertyId, 'read_meters'))) {
+      throw new AppError(403, 'Reading meters is not part of your work trade agreement')
+    }
+    return
+  }
+  if (!canAccessLandlordResource(user, landlordId)) throw new AppError(403, 'Forbidden')
+  await assertPropertyInScope(user, propertyId)  // S560: property-lock
+}
 import {
   generateBillsForMeter,
   generateBillsForProperty,
@@ -1124,15 +1147,13 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
   } catch (e) { next(e) }
 })
 
-utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.get('/reading-runs', requireMeterReader, async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
-    if (!canAccessLandlordResource(req.user, property.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
+    await assertMeterReadAccess(req.user, propertyId, property.landlord_id)
     const runs = await query<any>(
       `SELECT r.*,
               (SELECT COUNT(*)::int FROM utility_meters m
@@ -1159,7 +1180,7 @@ utilityRouter.get('/reading-runs', requirePerm('units.edit', 'units.view_status'
 
 // Manual open — lets a landlord start the run before the scheduled last
 // business day (or re-open coverage for a property added mid-month).
-utilityRouter.post('/reading-runs', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.post('/reading-runs', requireMeterReader, async (req, res, next) => {
   try {
     const body = z.object({
       propertyId: z.string().uuid(),
@@ -1171,10 +1192,7 @@ utilityRouter.post('/reading-runs', requirePerm('properties.edit', 'utility.read
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
-    if (!canAccessLandlordResource(req.user, property.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, body.propertyId)  // S560: property-lock
+    await assertMeterReadAccess(req.user, body.propertyId, property.landlord_id)
     const cycle = body.cycleMonth
       ?? new Date().toISOString().slice(0, 7) + '-01'
     const run = await openReadingRun(body.propertyId, cycle,
@@ -1191,14 +1209,12 @@ utilityRouter.post('/reading-runs', requirePerm('properties.edit', 'utility.read
 // Guided-walk payload: every readable meter with unit, prior reading,
 // this-cycle reading (if entered) and whether a lease makes the tenant
 // responsible (the auto-calc/bill preview).
-utilityRouter.get('/reading-runs/:id/meters', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.get('/reading-runs/:id/meters', requireMeterReader, async (req, res, next) => {
   try {
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     res.json({ success: true, data: await getRunMeters(req.params.id) })
   } catch (e) { next(e) }
 })
@@ -1206,7 +1222,7 @@ utilityRouter.get('/reading-runs/:id/meters', requirePerm('units.edit', 'units.v
 // Enter one meter's reading inside a run. Cycle comes from the run —
 // the reader never picks dates. Auto-completes the run (generate +
 // finalize bills) when this was the last unread meter.
-utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterReader, async (req, res, next) => {
   try {
     // Reads are odometer values; the digit width is per-meter (landlord
     // setting). Bounds are checked against the meter's own capacity
@@ -1225,10 +1241,7 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, run.property_id)  // S560: property-lock
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     if (run.status !== 'open') throw new AppError(409, 'Reading run is already completed')
     const meter = await queryOne<any>(
       `SELECT m.* FROM utility_meters m
@@ -1389,19 +1402,17 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requirePerm('pro
 })
 
 // ── DOUBLE-CHECK VERIFICATION (blind re-read walk) ───────────
-utilityRouter.get('/reading-runs/:id/double-checks', requirePerm('units.edit', 'units.view_status', 'properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.get('/reading-runs/:id/double-checks', requireMeterReader, async (req, res, next) => {
   try {
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     res.json({ success: true, data: await getDoubleChecks(req.params.id) })
   } catch (e) { next(e) }
 })
 
-utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requirePerm('properties.edit', 'utility.read_meters'), async (req, res, next) => {
+utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requireMeterReader, async (req, res, next) => {
   try {
     const body = z.object({
       readingValue: z.number().int().min(0),
@@ -1412,10 +1423,7 @@ utilityRouter.post('/reading-runs/:id/double-checks/:meterId', requirePerm('prop
     const run = await queryOne<any>(
       `SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
-    if (!canAccessLandlordResource(req.user, run.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-    await assertPropertyInScope(req.user, run.property_id)  // S560: property-lock
+    await assertMeterReadAccess(req.user, run.property_id, run.landlord_id)
     if (run.status !== 'double_check') throw new AppError(409, 'Run is not in its verification phase')
     const meter = await queryOne<any>(
       `SELECT * FROM utility_meters WHERE id = $1 AND property_id = $2`,
@@ -1688,30 +1696,11 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
     if (!run) throw new AppError(404, 'Reading run not found')
     if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
     if (run.status === 'completed') throw new AppError(409, 'These bills already went out')
-    const flagged = await queryOne<{ n: number }>(`
-      SELECT COUNT(*)::int AS n FROM utility_meter_readings rd
-        JOIN utility_meters m ON m.id = rd.meter_id
-       WHERE m.property_id = $1 AND rd.billing_cycle_month = $2 AND rd.needs_review
-         AND ($3::text IS NULL OR m.utility_type = $3)`,
-      [run.property_id, run.billing_cycle_month, run.utility_type ?? null])
-    if ((flagged?.n ?? 0) > 0) {
-      throw new AppError(409, `${flagged!.n} reading${flagged!.n === 1 ? ' is' : 's are'} flagged as a possible typo. Fix or confirm ${flagged!.n === 1 ? 'it' : 'them'} first.`)
-    }
+    // A reading still flagged as a possible typo bills nothing and holds only
+    // its own unit's invoice (S534) — it never holds the park (Nic).
     const done = await completeReadingRun(run.id, req.user!.userId, { approve: true })
-    res.json({ success: true, data: done })
-  } catch (e) { next(e) }
-})
-
-// The per-property switch: review utility bills before they go out.
-utilityRouter.patch('/properties/:propertyId/review-bills', requirePerm('properties.edit'), async (req, res, next) => {
-  try {
-    const { on } = z.object({ on: z.boolean() }).parse(req.body)
-    const prop = await queryOne<any>(`SELECT landlord_id FROM properties WHERE id = $1`, [req.params.propertyId])
-    if (!prop || !canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
-    const row = await queryOne<any>(
-      `UPDATE properties SET review_utility_bills = $2, updated_at = NOW() WHERE id = $1 RETURNING review_utility_bills`,
-      [req.params.propertyId, on])
-    res.json({ success: true, data: { reviewUtilityBills: row.review_utility_bills } })
+    const { countEscalations } = await import('../services/utilityReadingRuns')
+    res.json({ success: true, data: { ...done, escalated: await countEscalations(run.id) } })
   } catch (e) { next(e) }
 })
 
@@ -1721,7 +1710,7 @@ utilityRouter.patch('/properties/:propertyId/review-bills', requirePerm('propert
 utilityRouter.get('/readings/export', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
-    const prop = await queryOne<any>(`SELECT name, landlord_id, review_utility_bills FROM properties WHERE id = $1`, [propertyId])
+    const prop = await queryOne<any>(`SELECT name, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!prop || !canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
     const reads = await query<any>(`
       SELECT m.id AS meter_id, m.label, m.utility_type, m.digits, COALESCE(m.reading_multiplier, 1) AS mult,

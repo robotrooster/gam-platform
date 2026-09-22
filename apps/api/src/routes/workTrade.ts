@@ -8,7 +8,7 @@ import { logger } from '../lib/logger'
 import { canManageLandlordResource } from '../middleware/scope'
 import { workTradeFraction } from '../services/workTradeCredit'
 import { DateTime } from 'luxon'
-import { lastBusinessDay, WORK_TRADE_SKILLS } from '@gam/shared'
+import { lastBusinessDay, WORK_TRADE_SKILLS, WORK_TRADE_FIELD_PERMISSIONS } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough Landlord #29 — work-trade routes, percent model.
@@ -309,7 +309,7 @@ workTradeRouter.get('/:id', async (req, res, next) => {
   try {
     const agreement = await queryOne<any>(`
       SELECT wta.*, wta.monthly_hours_target AS target,
-        un.unit_number, p.name as property_name,
+        un.unit_number, p.name as property_name, p.id AS property_id,
         tu.first_name AS tenant_first, tu.last_name AS tenant_last, tu.id AS tenant_user_id
       FROM work_trade_agreements wta
       JOIN units un ON un.id = wta.unit_id
@@ -561,10 +561,12 @@ workTradeRouter.get('/:id/standing', async (req, res, next) => {
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths,
-            trusted, skills, duties, carryForwardIndefinite } = z.object({
+            trusted, skills, duties, carryForwardIndefinite, fieldPermissions } = z.object({
       // S652: trusted or monitored, what they can fix, and the duties in words.
       trusted: z.boolean().optional(),
       skills: z.array(z.enum(WORK_TRADE_SKILLS as unknown as [string, ...string[]])).optional(),
+      // S652: field work the landlord lets this person do from their tenant portal.
+      fieldPermissions: z.array(z.enum(WORK_TRADE_FIELD_PERMISSIONS as unknown as [string, ...string[]])).optional(),
       duties: z.string().max(5000).nullable().optional(),
       coveredCharges: z.array(z.enum(
         ['rent','fees','water','sewer','electric','gas','trash','propane'])).optional(),
@@ -600,11 +602,13 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         skills=COALESCE($9::text[],skills),
         duties=CASE WHEN $10::boolean THEN $11 ELSE duties END,
         carry_forward_indefinite=COALESCE($12,carry_forward_indefinite),
+        field_permissions=COALESCE($13::text[],field_permissions),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
        coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null,
-       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null, carryForwardIndefinite ?? null]
+       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null, carryForwardIndefinite ?? null,
+       fieldPermissions ?? null]
     )
 
     // S624 (Nic): "when the landlord marks the work trade agreement as over, any

@@ -6455,6 +6455,16 @@ export const WORK_TRADE_SKILL_LABEL: Record<WorkTradeSkill, string> = {
 }
 export const WORK_TRADE_OPEN_CATEGORIES = ['general', 'landscape', 'cleaning', 'pest'] as const
 
+// S652 (Nic): "stuff that's in the field — maintenance and meter reads and
+// repairs — need to be permissible when toggled by the landlord for tenants on
+// work trade." Office work (point of sale, money) stays with a team account.
+// The migration's CHECK lists the same values.
+export const WORK_TRADE_FIELD_PERMISSIONS = ['read_meters'] as const
+export type WorkTradeFieldPermission = typeof WORK_TRADE_FIELD_PERMISSIONS[number]
+export const WORK_TRADE_FIELD_PERMISSION_LABEL: Record<WorkTradeFieldPermission, string> = {
+  read_meters: 'Read meters',
+}
+
 // S652 (Nic): the words a work trader sees on their hours. "Pending" read as if
 // the hours were already in trouble — "Logged" is hours turned in and not yet
 // reviewed; Approved and Denied are the only final states.

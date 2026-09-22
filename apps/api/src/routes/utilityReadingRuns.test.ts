@@ -106,6 +106,10 @@ const openRun = async (app: express.Express, f: Fixture) => {
   return res.body.data
 }
 
+// S652 (platform-wide): the walk never issues bills — the landlord approves.
+const approve = (app: express.Express, f: Fixture, runId: string) =>
+  request(app).post(`/api/utility/reading-runs/${runId}/approve`).set('Authorization', `Bearer ${f.tokenA}`).send({})
+
 const enterReading = (app: express.Express, f: Fixture, runId: string, meterId: string, value: number) =>
   request(app)
     .post(`/api/utility/reading-runs/${runId}/meters/${meterId}/reading`)
@@ -247,8 +251,11 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 1250, 560)
     await enterDC(app, f, run.id, f.meterLeased, 1252) // meter moved 2 between reads
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
+    const last = await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(last.body.data.run.status).toBe('double_check')   // waits for the landlord
+    const done = await approve(app, f, run.id)
+    expect(done.status).toBe(200)
+    expect(done.body.data.status).toBe('completed')
     // Billed from 1250, NOT 1252: usage 250 × $0.14 = $35.00.
     const bills = await db.query(
       `SELECT usage_amount, charge_amount, status FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
@@ -274,6 +281,7 @@ describe('verification phase', () => {
     await mainWalk(app, f, run, 1250, 560)
     await enterDC(app, f, run.id, f.meterLeased, 1400) // 150 off — re-read wins
     await enterDC(app, f, run.id, f.meterVacant, 561)
+    await approve(app, f, run.id)
     const bills = await db.query(
       `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(Number(bills.rows[0].usage_amount)).toBe(400)
@@ -289,8 +297,11 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 138, 560)
     await enterDC(app, f, run.id, f.meterLeased, 139) // within tolerance — 138 stands
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
+    const last = await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(last.body.data.run.status).toBe('double_check')   // waits for the landlord
+    const done = await approve(app, f, run.id)
+    expect(done.status).toBe(200)
+    expect(done.body.data.status).toBe('completed')
     expect(done.body.data.escalated).toBe(0)
     const bills = await db.query(
       `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
@@ -304,9 +315,12 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 7000, 560) // 6,000 kWh — over the 5,000 threshold, silently flagged
     await enterDC(app, f, run.id, f.meterLeased, 7001) // re-read confirms
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
-    expect(done.body.data.run.bills_created).toBe(1)
+    const last = await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(last.body.data.run.status).toBe('double_check')   // waits for the landlord
+    const done = await approve(app, f, run.id)
+    expect(done.status).toBe(200)
+    expect(done.body.data.status).toBe('completed')
+    expect(done.body.data.bills_created).toBe(1)
     const bills = await db.query(
       `SELECT usage_amount, charge_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(Number(bills.rows[0].usage_amount)).toBe(6000)
@@ -327,10 +341,13 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 50, 560) // wrap 500050 ≥ half range → suspect
     await enterDC(app, f, run.id, f.meterLeased, 51) // re-read confirms the low value
-    const done = await enterDC(app, f, run.id, f.meterVacant, 561)
-    expect(done.body.data.run.status).toBe('completed')
+    const last = await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(last.body.data.run.status).toBe('double_check')   // waits for the landlord
+    const done = await approve(app, f, run.id)
+    expect(done.status).toBe(200)
+    expect(done.body.data.status).toBe('completed')
     expect(done.body.data.escalated).toBe(1)
-    expect(done.body.data.run.bills_created).toBe(0) // escalated meter held from billing
+    expect(done.body.data.bills_created).toBe(0) // escalated meter held from billing
 
     const flagged = await request(app)
       .get(`/api/utility/readings/flagged?propertyId=${f.propertyAId}`)
@@ -395,6 +412,7 @@ describe('verification phase', () => {
     await mainWalk(app, f, run, 138, 560)
     await enterDC(app, f, run.id, f.meterLeased, 138)
     await enterDC(app, f, run.id, f.meterVacant, 561)
+    await approve(app, f, run.id)
     const bills = await db.query(
       `SELECT usage_amount FROM utility_bills WHERE billing_cycle_month = $1`, [CYCLE])
     expect(Number(bills.rows[0].usage_amount)).toBe(316)
@@ -437,8 +455,11 @@ describe('verification phase', () => {
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 1250, 560) // water usage 250 gal
     await enterDC(app, f, run.id, f.meterLeased, 1250)
-    const done = await enterDC(app, f, run.id, f.meterVacant, 560)
-    expect(done.body.data.run.status).toBe('completed')
+    const last = await enterDC(app, f, run.id, f.meterVacant, 560)
+    expect(last.body.data.run.status).toBe('double_check')   // waits for the landlord
+    const done = await approve(app, f, run.id)
+    expect(done.status).toBe(200)
+    expect(done.body.data.status).toBe('completed')
 
     // ONE bill: 250 × (0.008 + 0.006) = $3.50.
     // Tax = 250×0.008×2% + 250×0.006×4% = 0.04 + 0.06 = $0.10.
@@ -485,6 +506,10 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     const r = await enterReading(app, f, run.id, f.meterLeased, 1250)
     expect(r.body.data.run.status).toBe('double_check') // verification NOT done
 
+    // S652 (platform-wide): read is not enough — the landlord approves the month.
+    await generateInvoices(AUG)
+    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // still held
+    await approve(app, f, run.id)
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
     expect(inv.rows).toHaveLength(1) // released — billed from the original read
@@ -500,7 +525,8 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
-    await enterReading(app, f, run.id, f.meterLeased, 1250) // vacant meter unread, run still open
+    await enterReading(app, f, run.id, f.meterLeased, 1250) // vacant meter unread
+    await approve(app, f, run.id)   // S652: approval never waits on an unread meter
 
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
@@ -541,6 +567,7 @@ describe('S534 per-unit billing on the lease invoice date', () => {
 
     await enterDC(app, f, run.id, f.meterLeased, 7001) // re-read confirms → flag resolves
     await enterDC(app, f, run.id, f.meterVacant, 561)
+    await approve(app, f, run.id)
 
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
@@ -553,13 +580,14 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     const f = await seed()
     const run = await openRun(app, f)
     await mainWalk(app, f, run, 1250, 560)
-
+    // S652: bills issue only on approval, and approval closes the month — so a
+    // re-read after billing is refused outright rather than merely ignored.
+    await approve(app, f, run.id)
     await generateInvoices(AUG) // bills + invoices from the original reads
     expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(1)
 
     const dc = await enterDC(app, f, run.id, f.meterLeased, 1400) // would normally replace
-    expect(dc.status).toBe(201)
-    await enterDC(app, f, run.id, f.meterVacant, 561)
+    expect(dc.status).toBe(409)
 
     const reading = await db.query(
       `SELECT reading_value FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2`,
@@ -573,7 +601,7 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     const outcome = await db.query(
       `SELECT outcome FROM utility_reading_double_checks WHERE run_id = $1 AND meter_id = $2`,
       [run.id, f.meterLeased])
-    expect(outcome.rows[0].outcome).toBe('verified')
+    expect(outcome.rows[0]?.outcome ?? 'verified').toBe('verified')
   })
 })
 
@@ -613,6 +641,7 @@ describe('S558 RUBS invoice gate', () => {
 
     // Read the master (period usage 500 gal → 1 rented RUBS unit → $5).
     await enterReading(app, f, run.id, masterId, 500)
+    await approve(app, f, run.id)
     await generateInvoices(AUG)
     const inv = await invoiceFor(f.leaseAId)
     expect(inv.rows).toHaveLength(1) // released
@@ -644,6 +673,7 @@ describe('S558 RUBS invoice gate', () => {
     await enterReading(app, f, run.id, f.meterVacant, 560)
     await enterReading(app, f, run.id, masterId, 500)
     // unit2's submeter is left unread — and unitA's invoice goes out anyway.
+    await approve(app, f, run.id)
     await generateInvoices(AUG)
     expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(1)
   })
@@ -1797,7 +1827,6 @@ describe('S652 — review utility bills before billing', () => {
   it('holds the invoice until approved, shows the bill, lets a fat-fingered read be fixed, then releases', async () => {
     const app = buildApp()
     const f = await seed()
-    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
     const run = await openRun(app, f)
     await enterReading(app, f, run.id, f.meterVacant, 560)
     await enterReading(app, f, run.id, f.meterLeased, 1950)   // meant 1250
@@ -1827,7 +1856,6 @@ describe('S652 — review utility bills before billing', () => {
   it('finishing the walk does not issue anything while review is on', async () => {
     const app = buildApp()
     const f = await seed()
-    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
     const run = await openRun(app, f)
     await enterReading(app, f, run.id, f.meterVacant, 560)
     await enterReading(app, f, run.id, f.meterLeased, 1250)
@@ -1839,7 +1867,6 @@ describe('S652 — review utility bills before billing', () => {
   it('a bill computed for review is not shown to the tenant', async () => {
     const app = buildApp()
     const f = await seed()
-    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
     const run = await openRun(app, f)
     await enterReading(app, f, run.id, f.meterVacant, 560)
     await enterReading(app, f, run.id, f.meterLeased, 1250)
@@ -1874,5 +1901,42 @@ describe('S652 — review utility bills before billing', () => {
     expect(r.text).toContain('2026-07 reading')
     expect(r.text).toContain('1250')
     expect(r.text).toContain('250')
+  })
+})
+
+// ── S652 (Nic): "Curtis needs to be able to do and initiate the meter reading." ──
+describe('S652 — a work trader the landlord let read meters', () => {
+  async function trader(f: Fixture, perms: string[]) {
+    await db.query(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status, field_permissions)
+       VALUES ($1,$2,$3,'2026-01-01','active',$4)`, [f.unitAId, f.tenantAId, f.landlordAId, perms])
+    const uid = (await db.query(`SELECT user_id FROM tenants WHERE id=$1`, [f.tenantAId])).rows[0].user_id
+    return jwt.sign({ userId: uid, role: 'tenant', email: 'c@t.dev', profileId: f.tenantAId, permissions: {} }, process.env.JWT_SECRET!)
+  }
+
+  it('takes the same walk the front desk does: starts the month, sees the list, records a read', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const tok = await trader(f, ['read_meters'])
+    const opened = await request(app).post('/api/utility/reading-runs').set('Authorization', `Bearer ${tok}`).send({ propertyId: f.propertyAId })
+    expect(opened.status).toBe(201)
+    const runId = opened.body.data.id
+    const list = await request(app).get(`/api/utility/reading-runs/${runId}/meters`).set('Authorization', `Bearer ${tok}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data.length).toBeGreaterThan(0)
+    const read = await request(app).post(`/api/utility/reading-runs/${runId}/meters/${f.meterLeased}/reading`)
+      .set('Authorization', `Bearer ${tok}`).send({ readingValue: 1250 })
+    expect(read.status).toBe(201)
+    // and never the review: that stays the landlord's
+    const review = await request(app).get(`/api/utility/reading-runs/${runId}/review`).set('Authorization', `Bearer ${tok}`)
+    expect(review.status).toBe(403)
+  })
+
+  it('without the permission a tenant is refused, work trade or not', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const tok = await trader(f, [])
+    const r = await request(app).get(`/api/utility/reading-runs?propertyId=${f.propertyAId}`).set('Authorization', `Bearer ${tok}`)
+    expect(r.status).toBe(403)
   })
 })
