@@ -798,3 +798,6 @@ The 7:00 banking-day job asked Stripe to refresh the balance and read the accoun
 
 ## "GAM payouts" view on the bank feed (Nic, 2026-09-22) — deploy 53
 The $4,154.89 and $413 payouts were in the feed (imported at midnight, matched to their disbursements) but no view showed matched rows. Bank feed tab now has **GAM payouts** beside Needs review / Categorized / Ignored.
+
+## Old signing links forward; invite acceptance stamps (2026-09-22) — deploy 54
+Blu kept opening links from the earlier emails; every one pointed at a document voided by the 2:25 PM re-draft and answered 410. `authOrSignerToken`: a token for a voided document now forwards to its replacement — same packet group, same slot, same signer — and only a document with no replacement is 410. Both signing pages show the server's reason instead of a generic "Invalid Signing Link". Shannon Gregory: the accept step stamped only invites still waiting to draft, so an invite already resolved by the landlord's signature never showed accepted on the front desk; every non-cancelled invite of the person is stamped on accept (hers stamped by hand).

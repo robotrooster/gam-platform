@@ -534,7 +534,7 @@ export function SignPage() {
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
       <AlertCircle size={40} style={{ color:'var(--red)' }}/>
       <h2 style={{ color:'var(--text-0)' }}>Invalid Signing Link</h2>
-      <p style={{ color:'var(--text-3)', maxWidth:380 }}>This link may be invalid or not associated with your account.</p>
+      <p style={{ color:'var(--text-3)', maxWidth:380 }}>{(error as any)?.message || 'This link may be invalid or not associated with your account.'}</p>
       <button className="btn btn-ghost" onClick={()=>navigate('/')}>Back to Portal</button>
     </div>
   )

@@ -210,6 +210,16 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // the newest invite and left the other sitting there for ever, with the
       // tenant given no way to reach it. Every open invite is accepted and
       // drafted on the way in.
+      // S652 (Nic, Shannon Gregory): the invite is ACCEPTED the moment the person
+      // sets their account up — whether or not the lease already issued on the
+      // landlord's signature. Only the invites still waiting to draft were being
+      // stamped, so a co-tenant whose lease had existed since the 16th accepted
+      // on the 22nd and the front desk kept saying she had not.
+      await query(
+        `UPDATE pending_tenant_intents pti SET accepted_at = NOW(), updated_at = NOW()
+           FROM tenants t
+          WHERE t.id = pti.tenant_id AND t.user_id = $1
+            AND pti.cancelled_at IS NULL AND pti.accepted_at IS NULL`, [user.id])
       const intents = await query<{ id: string; unit_id: string }>(
         `SELECT pti.id, pti.unit_id
            FROM pending_tenant_intents pti JOIN tenants t ON t.id = pti.tenant_id

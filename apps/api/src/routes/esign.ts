@@ -4885,13 +4885,28 @@ async function authOrSignerToken(req: any, res: any, next: any) {
   }
   if (!SIGNER_TOKEN_RE.test(supplied)) return requireAuth(req, res, next)
   try {
-    const signer = await queryOne<any>(
-      `SELECT s.*, d.status AS doc_status FROM lease_document_signers s
+    let signer = await queryOne<any>(
+      `SELECT s.*, d.status AS doc_status, d.package_group_id, d.package_sort_order FROM lease_document_signers s
          JOIN lease_documents d ON d.id = s.document_id
         WHERE s.token = $1`, [supplied])
     if (!signer) return res.status(404).json({ success: false, error: 'That signing link is not valid.' })
     if (signer.doc_status === 'voided') {
-      return res.status(410).json({ success: false, error: 'This document was voided and can no longer be signed.' })
+      // S652 (Nic, Blu): a document re-drafted from an updated template keeps
+      // its place in the packet; an old link to it is not dead, it is out of
+      // date. Forward to the replacement — same packet, same slot, same
+      // signer — so an email from this morning still opens this afternoon's
+      // copy. Only a document with no replacement is truly gone.
+      const replacement = signer.package_group_id ? await queryOne<any>(
+        `SELECT s.*, d.status AS doc_status FROM lease_documents d
+           JOIN lease_document_signers s ON s.document_id = d.id AND s.user_id = $3
+          WHERE d.package_group_id = $1 AND d.package_sort_order = $2
+            AND d.status <> 'voided' AND d.voided_at IS NULL
+          ORDER BY d.created_at DESC LIMIT 1`,
+        [signer.package_group_id, signer.package_sort_order ?? 0, signer.user_id]) : null
+      if (!replacement) {
+        return res.status(410).json({ success: false, error: 'This document was voided and can no longer be signed.' })
+      }
+      signer = replacement
     }
     req.params.documentId = signer.document_id
     req.user = { userId: signer.user_id, role: 'signer', email: signer.email, profileId: null }
