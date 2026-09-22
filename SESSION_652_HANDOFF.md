@@ -801,3 +801,6 @@ The $4,154.89 and $413 payouts were in the feed (imported at midnight, matched t
 
 ## Old signing links forward; invite acceptance stamps (2026-09-22) — deploy 54
 Blu kept opening links from the earlier emails; every one pointed at a document voided by the 2:25 PM re-draft and answered 410. `authOrSignerToken`: a token for a voided document now forwards to its replacement — same packet group, same slot, same signer — and only a document with no replacement is 410. Both signing pages show the server's reason instead of a generic "Invalid Signing Link". Shannon Gregory: the accept step stamped only invites still waiting to draft, so an invite already resolved by the landlord's signature never showed accepted on the front desk; every non-cancelled invite of the person is stamped on accept (hers stamped by hand).
+
+## Bank feed is the whole log (Nic, 2026-09-22) — deploy 55
+"The transaction log of the bank account is all money going in and out." The feed opens on **All transactions**, newest first, GAM payouts included and labelled "matched to its disbursement — never counted twice"; Needs review / Categorized / Ignored are filters over the same log; a row's controls follow the row's own state. The separate "GAM payouts" view (deploy 53) is gone.

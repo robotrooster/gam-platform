@@ -55,7 +55,11 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   // It was there — imported at midnight and MATCHED to GAM's own payout, which
   // is exactly right (a payout landing is never income) — but no view showed
   // matched rows. Now one does.
-  const [view, setView] = useState<'needs_review' | 'matched' | 'categorized' | 'ignored'>('needs_review')
+  // S652 (Nic): "the transaction log of the bank account is all money going in
+  // and out of that bank account." The log opens on everything, newest first —
+  // GAM's payouts landing included, labelled as matched so nothing is booked
+  // twice. The buttons are filters over it, not separate pages.
+  const [view, setView] = useState<'all' | 'needs_review' | 'categorized' | 'ignored'>('all')
 
   // S629 (Nic): "a property selector or entity selector, to view the
   // transaction logs and stuff specific to that entity." The feed was pinned
@@ -70,7 +74,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const { data: txns = [], isLoading } = useQuery<any[]>(
     ['bank-txns', view, entityId],
-    () => apiGet(`/bank-feed/transactions?status=${view}${entityQS ? `&${entityQS}` : ''}`))
+    () => apiGet(`/bank-feed/transactions?${view === 'all' ? '' : `status=${view}&`}${entityQS}`))
 
   const propOf = (u: any) => u.propertyId
   const unitsForProp = (pid: string) => (units as any[]).filter(u => propOf(u) === pid)
@@ -352,10 +356,11 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
 
       {/* Transaction views */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        {(['needs_review', 'matched', 'categorized', 'ignored'] as const).map(v => (
+        {(['all', 'needs_review', 'categorized', 'ignored'] as const).map(v => (
           <button key={v} className={`btn btn-sm ${view === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setView(v)}>
-            {v === 'needs_review' ? `Needs review${reviewCount && view === v ? ` (${reviewCount})` : ''}`
-              : v === 'matched' ? 'GAM payouts' : v === 'categorized' ? 'Categorized' : 'Ignored'}
+            {v === 'all' ? 'All transactions'
+              : v === 'needs_review' ? `Needs review${reviewCount ? ` (${reviewCount})` : ''}`
+              : v === 'categorized' ? 'Categorized' : 'Ignored'}
           </button>
         ))}
       </div>
@@ -363,8 +368,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       <div className="card">
         {isLoading ? <div style={{ color: 'var(--text-3)' }}>Loading…</div>
           : txns.length === 0 ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>
-              {view === 'needs_review' ? 'Nothing to review. Sync a linked bank to pull new transactions.'
-                : view === 'matched' ? 'No GAM payouts have landed in this bank yet.' : 'None.'}
+              {view === 'needs_review' ? 'Nothing to review.'
+                : view === 'all' ? 'No transactions yet. Sync a linked bank to pull them in.' : 'None.'}
             </div>
           : <div style={{ display: 'grid', gap: 10 }}>
               {txns.map((t: any) => {
@@ -396,7 +401,7 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                         showing it on this page?" — money in used to be a dead end here.
                         It now categorizes as income exactly like money out categorizes as
                         an expense; only the category list differs. */}
-                    {view === 'needs_review' && (
+                    {t.status === 'needs_review' && (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' }}>
                         <select className="input input-sm" value={d.category} onChange={e => setDraft(t.id, { category: e.target.value })}>
                           {isExpense
@@ -431,15 +436,18 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                       </div>
                     )}
 
-                    {view === 'categorized' && (
+                    {t.status === 'categorized' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         Added to your {isExpense ? 'expenses' : 'income'}.
                       </div>
                     )}
-                    {view === 'matched' && (
-                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
-                        A GAM payout landing in your bank — matched to the disbursement, so it is never counted as income twice.
+                    {t.status === 'matched' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--gold, #c9a227)', marginTop: 4 }}>
+                        GAM payout — matched to its disbursement; already in your books, never counted twice.
                       </div>
+                    )}
+                    {t.status === 'ignored' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Ignored.</div>
                     )}
                   </div>
                 )
