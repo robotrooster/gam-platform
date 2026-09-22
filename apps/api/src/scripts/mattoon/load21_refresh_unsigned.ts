@@ -22,6 +22,11 @@ import { voidDocument } from '../../lib/voidDocument'
 import fs from 'fs'
 
 const APPLY = process.argv.includes('--apply')
+// --purpose installment_sale : only documents drafted from templates of that
+// purpose (Blu re-saved the installment contract's fields on the 22nd; the
+// other templates did not change, and re-drafting them would only cost him
+// the pages he has already worked through).
+const PURPOSE = (() => { const i = process.argv.indexOf('--purpose'); return i > 0 ? process.argv[i + 1] : null })()
 const PROPERTY = 'e9743bfa-1972-4e40-8a1b-ad76a52a17b9'
 const TERMS: Record<string, { monthly: number; payments: number }> = {
   '18': { monthly: 100, payments: 60 },
@@ -41,9 +46,10 @@ async function main() {
     const t = TERMS[lot] ?? (row?.rto === 'x' && Number(row.rto_pay) > 0 && Number(String(row.months_left ?? '').replace(/\D/g, '')) > 0
       ? { monthly: Number(row.rto_pay), payments: Number(String(row.months_left).replace(/\D/g, '')) } : null)
     const docs = await query<any>(
-      `SELECT d.*, (SELECT status FROM lease_document_signers s WHERE s.document_id=d.id AND s.role='landlord') AS blu
+      `SELECT d.*, (SELECT status FROM lease_document_signers s WHERE s.document_id=d.id AND s.role='landlord') AS blu,
+              (SELECT purpose FROM lease_templates t WHERE t.id=d.template_id) AS purpose
          FROM lease_documents d WHERE d.unit_id=$1 AND d.status NOT IN ('voided','completed') ORDER BY d.package_sort_order`, [unit.id])
-    const stale = docs.filter((d: any) => d.blu !== 'signed')
+    const stale = docs.filter((d: any) => d.blu !== 'signed' && (!PURPOSE || d.purpose === PURPOSE))
     console.log(`${unit.unit_number}: ${docs.length} documents, Blu signed ${docs.length - stale.length}, re-drafting ${stale.length}${t ? ` (contract $${t.monthly} × ${t.payments})` : ''}`)
     if (!stale.length) continue
 

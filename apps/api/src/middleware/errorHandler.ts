@@ -27,6 +27,12 @@ export function errorHandler(err: any, req: Request, res: Response, _next: NextF
 
   const status  = err.statusCode || 500
   const message = err.message || 'Internal server error'
+  if (status >= 400 && status < 500 && req.method !== 'GET') {
+    // S652: a rejected write used to log only its status code. When a landlord
+    // reports "it just reloads", the reason has to be in the log.
+    const log = ((req as any).log ?? logger) as typeof logger
+    log.warn({ status, reason: message, path: req.originalUrl }, 'request rejected (4xx)')
+  }
   if (status >= 500) {
     // Prefer the per-request child logger (carries request id) when
     // available; fall back to the process logger if pino-http

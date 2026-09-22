@@ -5239,8 +5239,12 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // its parent's effective selection == the child's trigger option — a hidden
     // child (e.g. auto_renew_mode when the lease is month-to-month) is skipped.
     const allFieldsRes = await client.query(`
-      SELECT id, template_field_id, parent_field_id, parent_option, label, field_type, signer_role, required, value, options
+      SELECT id, template_field_id, parent_field_id, parent_option, label, field_type, signer_role, required, value, options, lease_column
       FROM lease_document_fields WHERE document_id=$1`, [doc.id])
+    // S652 (Blu, MH 18): lease_column was missing from this SELECT, so the
+    // typed-sale-terms check below saw no tagged boxes at all and rejected
+    // every installment contract with "needs the number of payments" — after
+    // the landlord had typed it. Four tries, no message on screen.
     const allFields = allFieldsRes.rows as any[]
     const submittedById = new Map<string, string>()
     for (const fv of (fieldValues || [])) {

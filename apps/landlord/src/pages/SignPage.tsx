@@ -318,6 +318,7 @@ export function SignPage() {
   const navigate = useNavigate()
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [fieldFonts, setFieldFonts]   = useState<Record<string,string>>({})
   const [savedSig, setSavedSig]       = useState<{value:string,font?:string}|null>(null)
   const [savedInit, setSavedInit]     = useState<{value:string,font?:string}|null>(null)
@@ -345,7 +346,10 @@ export function SignPage() {
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
     { onSuccess:(res:any)=>{ setAllDone(res.data?.completed ?? res.completed); setStage('done') },
-      onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
+      // S652 (Blu, MH 18): a rejected submit used to drop back to the document
+      // with a toast that nobody saw — "it just reloads to the same page." The
+      // review sheet stays open and says what the server said.
+      onError:(e:any)=>{ setSubmitError(e?.message || 'Signing failed — try again.'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
@@ -1142,9 +1146,14 @@ export function SignPage() {
             <div style={{ padding:'11px 14px', background:'#fffdf5', border:'1px solid rgba(201,162,39,.3)', borderRadius:9, fontSize:'.73rem', color:'#999', lineHeight:1.6, marginBottom:18 }}>
               By clicking Submit, you confirm your electronic signature is legally binding under UETA and the federal E-SIGN Act.
             </div>
+            {submitError && (
+              <div role="alert" style={{ padding:'11px 14px', background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:9, fontSize:'.8rem', color:'#991b1b', lineHeight:1.5, marginBottom:14 }}>
+                <strong>Not submitted.</strong> {submitError}
+              </div>
+            )}
             <div style={{ display:'flex', gap:9 }}>
-              <button onClick={()=>setStage('signing')} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
-              <button onClick={()=>submitMut.mutate()} disabled={submitMut.isLoading}
+              <button onClick={()=>{ setSubmitError(null); setStage('signing') }} style={{ flex:1, padding:'12px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600 }}>← Edit</button>
+              <button onClick={()=>{ setSubmitError(null); submitMut.mutate() }} disabled={submitMut.isLoading}
                 style={{ flex:2, padding:'12px', borderRadius:10, border:'none', background:'#c9a227', color:'white', fontWeight:800, cursor:'pointer' }}>
                 {submitMut.isLoading?'Submitting...':'✓ Submit Signatures'}
               </button>

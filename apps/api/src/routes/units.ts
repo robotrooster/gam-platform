@@ -1485,18 +1485,12 @@ unitsRouter.patch('/:id/utility-responsibility', requirePerm('properties.edit'),
         `The next lease decides this on its own terms.`)
     }
 
-    // A responsibility that CAME FROM the signed lease is not overwritten into
-    // silence here: switching one off would be altering what the tenant signed,
-    // which is the thing this whole rule protects.
-    const existing = await queryOne<any>(
-      `SELECT source, tenant_responsible FROM lease_utility_responsibilities
-        WHERE lease_id = $1 AND utility_type = $2`, [lease.id, body.utilityType])
-    if (existing && existing.source === 'lease' && existing.tenant_responsible && !body.tenantResponsible) {
-      throw new AppError(409,
-        `The signed lease makes this tenant responsible for ${body.utilityType}. That is a term of ` +
-        `the lease, so it can't be switched off here — it changes on the next lease, or by an ` +
-        `agreement you both sign.`)
-    }
+    // S652 (Nic, Billy Miranda — two spaces, one trash can): a utility the lease
+    // bills can be turned OFF for this lease too. It is the landlord's call, it
+    // is recorded as an addendum with who and when, and it lasts exactly as long
+    // as this lease: "back on when another person assumes the spot" — the next
+    // lease decides on its own terms. Before this, the route refused, and the
+    // only way to honour the ask was a row written by hand.
 
     const row = await queryOne<any>(
       `INSERT INTO lease_utility_responsibilities

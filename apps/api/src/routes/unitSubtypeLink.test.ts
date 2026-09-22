@@ -360,8 +360,10 @@ describe('charges outside the lease (S613)', () => {
     expect(row.note).toMatch(/addendum/)
   })
 
-  // The half of the rule that stays: what the signed lease FIXES cannot move.
-  it('a responsibility that came from the signed lease cannot be switched off', async () => {
+  // S652 (Nic, Billy Miranda — two spaces, one trash can): a utility the lease
+  // bills CAN be turned off for this lease. It is recorded as an addendum, with
+  // who did it, and it lasts only as long as this lease.
+  it('a responsibility that came from the signed lease can be switched off for this lease, on record', async () => {
     const app = buildApp(); const f = await seed()
     const leaseId = await activeLease(f.rvA, f.landlordId)
     await db.query(
@@ -369,12 +371,15 @@ describe('charges outside the lease (S613)', () => {
        VALUES ($1, 'water', true, 'lease')`, [leaseId])
     const res = await request(app).patch(`/api/units/${f.rvA}/utility-responsibility`)
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ utilityType: 'water', tenantResponsible: false })
-    expect(res.status).toBe(409)
+      .send({ utilityType: 'water', tenantResponsible: false, note: 'shares one can with the next space' })
+    expect(res.status).toBe(200)
     const row = (await db.query(
-      `SELECT tenant_responsible FROM lease_utility_responsibilities
+      `SELECT tenant_responsible, source, set_by_user_id, note FROM lease_utility_responsibilities
         WHERE lease_id = $1 AND utility_type = 'water'`, [leaseId])).rows[0]
-    expect(row.tenant_responsible).toBe(true)
+    expect(row.tenant_responsible).toBe(false)
+    expect(row.source).toBe('addendum')
+    expect(row.set_by_user_id).toBeTruthy()
+    expect(row.note).toMatch(/one can/)
   })
 
   it('no active lease → says there is nobody to bill', async () => {

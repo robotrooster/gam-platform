@@ -1206,7 +1206,27 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
   // else — deliberately, because a tenant pays what they signed — so this warns
   // rather than offering a switch that would override the lease.
   const notBilled = (t: string) => hasLease && !tenantBilled.includes(t)
-  const LeaseGateWarning = ({ t }: { t: string }) => notBilled(t) ? (
+  // S652 (Nic, Billy Miranda): "take it off just one unit during the duration
+  // of his lease" — one household, two spaces, one trash can. The switch is
+  // per LEASE, recorded as an addendum: when somebody else takes the space,
+  // their own lease decides again.
+  const LeaseOffSwitch = ({ t }: { t: string }) => hasLease && tenantBilled.includes(t) && can('schedule.configure_unit') ? (
+    <div style={{ fontSize: '.66rem', color: 'var(--text-3)', margin: '2px 0 6px 10px', display: 'flex', alignItems: 'center', gap: 8 }}>
+      <span>Billed to this tenant.</span>
+      <button className="btn btn-ghost btn-sm" style={{ padding: '1px 8px', fontSize: '.68rem' }}
+        disabled={respMut.isLoading}
+        onClick={() => appConfirm(
+          `Stop billing ${t} to this tenant?\n\n` +
+          `This is for their current lease only — GAM records that you turned it off and when. ` +
+          `Whoever takes this space next is billed by their own lease.\n\n` +
+          `It stops on the next invoice. Nothing already sent changes.`,
+          { confirmLabel: `Turn ${t} off for this lease` },
+        ).then(ok => { if (ok) respMut.mutate({ utilityType: t, tenantResponsible: false }) })}>
+        Turn off for this lease
+      </button>
+    </div>
+  ) : null
+  const LeaseGateWarning = ({ t }: { t: string }) => !notBilled(t) ? <LeaseOffSwitch t={t} /> : (
     <div style={{ fontSize: '.66rem', color: 'var(--amber)', margin: '2px 0 6px 10px', lineHeight: 1.6,
                   display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <span>⚠ This tenant&apos;s signed lease doesn&apos;t mention {t}, so nothing bills for it.</span>
@@ -1225,7 +1245,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber, hasPropaneTank, tenant
         </button>
       )}
     </div>
-  ) : null
+  )
   const HOW_LABEL: Record<string, string> = {
     submeter:  'Its own sub-meter (read monthly)',
     flat_rate: 'Flat monthly charge',

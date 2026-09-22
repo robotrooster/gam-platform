@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          type ManualPaymentMethod,
-         TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL, allocateCredits } from '@gam/shared'
+         TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { api, apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
@@ -140,6 +140,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
   const mut = useMutation(
     () => apiPost(`/payments/${anchor.id}/record-manual`, {
       method,
+      settleHousehold: true,
       reference: reference.trim() || undefined,
       // Every method carries its amount now — a check can be written over.
       ...(entered ? { amountTendered: paid } : {}),
@@ -164,7 +165,7 @@ function TakePaymentModal({ group, onClose, onRecorded }: {
           {`${group.tenantFirst ?? ''} ${group.tenantLast ?? ''}`.trim() || 'Record payment'}
         </div>
         <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 14 }}>
-          {group.unitNumber ? `Unit ${group.unitNumber}` : ''}
+          {group.unitNumber ? `${(group.units?.length ?? 1) > 1 ? 'Units' : 'Unit'} ${group.unitNumber}` : ''}
           {group.propertyName ? ` · ${group.propertyName}` : ''}
         </div>
 
@@ -591,6 +592,16 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
   const { data: leases = [] } = useQuery<any[]>('leases', () => apiGet('/leases'))
   const activeLeases = (leases as any[]).filter((l: any) => l.status === 'active')
   const [leaseId, setLeaseId] = useState('')
+  // S652 (Nic): "searchable name — matched to a lease." Nobody knows a spot
+  // number cold; they know who is standing at the counter.
+  const [who, setWho] = useState('')
+  const personLabel = (l: any) => {
+    const names = (l.tenants ?? []).map((t: any) => `${t.firstName ?? ''} ${t.lastName ?? ''}`.trim()).filter(Boolean)
+    return `${names.join(' & ') || 'No tenant on file'} · ${l.unitNumber || 'Unit'}${l.propertyName ? ` · ${l.propertyName}` : ''}`
+  }
+  const q = who.trim().toLowerCase()
+  const matches = q.length < 2 ? [] : activeLeases.filter((l: any) => personLabel(l).toLowerCase().includes(q)).slice(0, 8)
+  const picked = activeLeases.find((l: any) => l.id === leaseId)
   const [amount, setAmount] = useState('')
   const [category, setCategory] = useState<string>('goodwill')
   const [reason, setReason] = useState('')
@@ -613,13 +624,31 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div>
-            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Lease / tenant</span>
-            <select className="form-select" value={leaseId} onChange={e => setLeaseId(e.target.value)} style={{ width: '100%' }}>
-              <option value="" disabled>Select a lease…</option>
-              {activeLeases.map((l: any) => (
-                <option key={l.id} value={l.id}>{(l.unitNumber || 'Unit')} · {(l.propertyName || '')}</option>
-              ))}
-            </select>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Who</span>
+            {picked ? (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', background: 'var(--surface-2, #f8f8f5)', borderRadius: 8, fontSize: '.82rem' }}>
+                <span style={{ fontWeight: 600 }}>{personLabel(picked)}</span>
+                <button className="btn btn-ghost btn-sm" onClick={() => { setLeaseId(''); setWho('') }}>Change</button>
+              </div>
+            ) : (
+              <>
+                <input className="form-input" autoFocus value={who} onChange={e => setWho(e.target.value)}
+                  placeholder="Type a name, space number or property…" style={{ width: '100%' }} />
+                {matches.length > 0 && (
+                  <div style={{ marginTop: 4, border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                    {matches.map((l: any) => (
+                      <button key={l.id} type="button" onClick={() => setLeaseId(l.id)}
+                        style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 10px', background: 'transparent', border: 'none', borderBottom: '1px solid var(--border)', cursor: 'pointer', fontSize: '.82rem', color: 'var(--text-0)' }}>
+                        {personLabel(l)}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {q.length >= 2 && matches.length === 0 && (
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 4 }}>No active lease matches that.</div>
+                )}
+              </>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 10 }}>
             <div style={{ flex: 1 }}>
@@ -732,13 +761,19 @@ export function PaymentsPage() {
       if (Array.isArray(p.creditPool) && !poolByTenant.has(poolKey)) {
         poolByTenant.set(poolKey, p.creditPool.map((c: any) => ({ leaseId: c.leaseId ?? null, amount: Number(c.amount) })))
       }
-      const key = p.leaseId || `tenant:${p.tenantId}`
+      // S652 (Nic): "people with multiple leases shown as one payment. It's one
+      // outstanding balance." One person, one company, one row — however many
+      // spaces they rent. Record payment settles the lot.
+      const key = `tenant:${p.tenantId}:${p.landlordId}`
       const g = groups.get(key) ?? {
-        key, unitNumber: p.unitNumber, propertyName: p.propertyName,
+        key, units: [] as string[], leaseIds: [] as string[], unitNumber: '', propertyName: p.propertyName,
         poolKey, leaseId: p.leaseId ?? null,
         tenantFirst: p.tenantFirst, tenantLast: p.tenantLast,
         charges: [] as any[], total: 0, earliestDue: p.dueDate,
       }
+      if (p.unitNumber && !g.units.includes(p.unitNumber)) g.units.push(p.unitNumber)
+      if (p.leaseId && !g.leaseIds.includes(p.leaseId)) g.leaseIds.push(p.leaseId)
+      g.unitNumber = [...g.units].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(', ')
       g.charges.push(p)
       g.total += Number(p.amount || 0)
       if (p.dueDate && (!g.earliestDue || p.dueDate < g.earliestDue)) g.earliestDue = p.dueDate
@@ -760,10 +795,11 @@ export function PaymentsPage() {
     // person's whole credit off EACH of their leases. Now it is spent once,
     // oldest bill first, lease-tied credits only on their own lease.
     for (const [poolKey, pool] of poolByTenant) {
-      const mine = [...groups.values()].filter(g => g.poolKey === poolKey)
-      const alloc = allocateCredits(pool, mine.map(g => ({
-        key: g.key, leaseId: g.leaseId, total: g.total, earliestDue: g.earliestDue })))
-      for (const g of mine) g.creditApplied = alloc.applied[g.key] ?? 0
+      const g = groups.get(`tenant:${poolKey}`)
+      if (!g) continue
+      const usable = pool.filter(c => !c.leaseId || g.leaseIds.includes(c.leaseId))
+        .reduce((s, c) => s + c.amount, 0)
+      g.creditApplied = Math.min(Math.round(usable * 100) / 100, g.total)
     }
     for (const g of groups.values()) {
       g.creditApplied = g.creditApplied ?? 0

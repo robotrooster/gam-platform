@@ -235,6 +235,29 @@ async function seedDoc(f: SeedFixture, opts: {
   return { documentId, landlordSignerId: ls.rows[0].id, tenantSignerId: ts.rows[0].id }
 }
 
+// ─── S652 (Blu, MH 18): the landlord's typed sale terms are read at submit ──
+//
+// The submit route's field query did not select lease_column, so the
+// installment-contract pre-check saw no tagged boxes and rejected every
+// contract with "needs the number of payments" — after he had typed it.
+describe('POST /sign — installment contract reads the typed terms', () => {
+  it('a landlord signs an installment contract whose sale boxes are filled', async () => {
+    const f = await seedFixture()
+    const d = await seedDoc(f, { status: 'sent', landlordSignerStatus: 'viewed', documentType: 'purchase_agreement' as any })
+    await seedDocFields(d.documentId, {
+      sale_monthly_payment: '100.00', sale_term_months: '60', sale_first_payment_month: '10/1/2026',
+    })
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${d.documentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    const signer = await db.query<{ status: string }>(
+      `SELECT status FROM lease_document_signers WHERE id = $1`, [d.landlordSignerId])
+    expect(signer.rows[0].status).toBe('signed')
+  })
+})
+
 // ─── POST /documents — validation gates ─────────────────────────
 
 describe('POST /documents — validation', () => {

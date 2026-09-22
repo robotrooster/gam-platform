@@ -804,3 +804,20 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 
 ## Bank feed is the whole log (Nic, 2026-09-22) — deploy 55
 "The transaction log of the bank account is all money going in and out." The feed opens on **All transactions**, newest first, GAM payouts included and labelled "matched to its disbursement — never counted twice"; Needs review / Categorized / Ignored are filters over the same log; a row's controls follow the row's own state. The separate "GAM payouts" view (deploy 53) is gone.
+
+## Deploy 56 — Blu's installment contract would not submit (2026-09-22 ~16:40)
+
+**What Blu saw:** Review & Sign on the MH 18 installment contract, page reloads, no message. Four POSTs, every one a 400, log showed only the status code.
+
+**Cause (reproduced, not guessed):** cloned the document, signers and fields into `gam_test` and replayed the submit in-process — `"The installment contract needs the number of payments."` The submit route's field SELECT did not fetch `lease_column`, so the typed-sale-terms pre-check saw no tagged boxes at all. Every installment contract was un-signable since the pre-check shipped (deploy 43/44).
+
+**Fixed and shipped:**
+- `lease_column` selected; regression test proven to fail without the fix (`esign.test.ts` "installment contract reads the typed terms").
+- Both SignPages keep the review sheet open on a rejected submit and print the server's reason ("Not submitted. …") instead of a lost toast.
+- Error handler logs every non-GET 4xx with its reason (`request rejected (4xx)`).
+- Blu re-saved the installment template fields at 16:20 (dropped the untagged "Late fee initial flat/percent" boxes, added co-tenant initials). Re-drafted the 8 unsigned installment contracts (MH 01, 18, 21, 22, 24, 28, 29, 30) from the current template in place — same packet slot, same signers, sale terms carried — with `load21 --purpose installment_sale --apply`. Old links forward to the new copies; no new emails needed. MH 11 (Blu already signed) untouched.
+- Payments page: one person + one company = ONE outstanding row and balance across their leases (Billy RV 34 + 35); Record payment sends `settleHousehold: true`; credits are the household pool.
+- Issue credit: type a name / space / property, pick from matches (no more spot scroll).
+- Unit page: "Turn off for this lease" beside every billed utility; route now allows switching a lease-billed utility off as a recorded addendum (was a 409 — Billy's trash had to be written by hand).
+
+**Not built (asked S652):** credit to a returning POS customer. It is a new mechanism: a `pos_customer_credits` table, `POST /tenant-credits` accepting `posCustomerId`, register auto-apply as a "Store credit" discount line, parity for the business POS. ~half a day; needs a go.

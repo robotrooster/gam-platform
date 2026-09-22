@@ -1132,6 +1132,10 @@ const recordManualSchema = z.object({
   // a check is written for the amount, and the bank-match path never knows.
   amountTendered:   z.number().nonnegative().optional(),
   surplusHandling:  z.enum(['change', 'credit']).optional(),
+  // S652 (Nic): "people with multiple leases shown as one payment. It's one
+  // outstanding balance." The desk settles everything this person owes this
+  // company, not just the lease the anchor charge sits on.
+  settleHousehold:  z.boolean().optional(),
 })
 
 paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (req: any, res, next) => {
@@ -1220,6 +1224,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       reference: body.reference ?? null,
       // S636 (Nic): cash clears the whole balance, like a card does.
       settleWholeBalance: true,
+      settleHousehold: body.settleHousehold === true,
       amountTendered: body.amountTendered ?? null,
       // S637: passed through as given. There is deliberately NO default — a
       // surplus with no answer is refused, not guessed at.

@@ -54,6 +54,8 @@ export interface ManualSettleInput {
    * narrow behaviour keeps every existing caller as it was.
    */
   settleWholeBalance?: boolean
+  /** S652 (Nic): one person, several leases, ONE balance — settle every open charge of theirs with this company. */
+  settleHousehold?: boolean
   /**
    * S637 (Nic): what the resident actually handed over, when it is known.
    *
@@ -175,11 +177,14 @@ export async function settleManualRentPayment(
       WHERE CASE WHEN $2::boolean THEN
               (status IN ('pending', 'failed')
                AND work_trade_suspended_at IS NULL
-               AND (CASE WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
+               AND (CASE WHEN $3::boolean
+                         THEN tenant_id = (SELECT tenant_id FROM payments WHERE id = $1)
+                          AND landlord_id = (SELECT landlord_id FROM payments WHERE id = $1)
+                         WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
                          THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
                          ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
             ELSE id = $1 END`,
-    [payment.id, input.settleWholeBalance === true])
+    [payment.id, input.settleWholeBalance === true, input.settleHousehold === true])
   const chargesOpen = Math.round(Number(owedRow.rows[0]?.owed ?? 0) * 100) / 100
 
   // ── S638 (Nic): THE CREDIT COMES OFF BEFORE THE DESK ASKS FOR MONEY ──────
@@ -199,8 +204,8 @@ export async function settleManualRentPayment(
        FROM tenant_credits
       WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
         -- S648: a general credit is only the issuing landlord's to give
-        AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3))`,
-    [payment.tenant_id, payment.lease_id, payment.landlord_id])
+        AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3) OR ($4::boolean AND landlord_id = $3))`,
+    [payment.tenant_id, payment.lease_id, payment.landlord_id, input.settleHousehold === true])
   const creditAvailable = Math.round(Number(creditRow.rows[0]?.credit ?? 0) * 100) / 100
   const creditUsed = Math.min(creditAvailable, chargesOpen)
   const amountSettled = Math.round((chargesOpen - creditUsed) * 100) / 100
@@ -281,14 +286,17 @@ export async function settleManualRentPayment(
               -- Whole balance: cash arrives against what a resident OWES.
               (status IN ('pending', 'failed')
                AND work_trade_suspended_at IS NULL
-               AND (CASE WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
+               AND (CASE WHEN $6::boolean
+                         THEN tenant_id = (SELECT tenant_id FROM payments WHERE id = $1)
+                          AND landlord_id = (SELECT landlord_id FROM payments WHERE id = $1)
+                         WHEN (SELECT lease_id FROM payments WHERE id = $1) IS NOT NULL
                          THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
                          ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
             ELSE id = $1 END
     RETURNING id`,
     [payment.id, method,
      `Recorded as manual ${method} payment${refNote}${provenance}`,
-     input.settledAt, input.settleWholeBalance === true])
+     input.settledAt, input.settleWholeBalance === true, input.settleHousehold === true])
 
   let feePaymentId: string | null = null
 
@@ -367,8 +375,8 @@ export async function settleManualRentPayment(
     const open = await client.query<{ id: string; amount_remaining: string }>(
       `SELECT id, amount_remaining::text FROM tenant_credits
         WHERE tenant_id = $1 AND status = 'active' AND amount_remaining > 0
-          AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3))
-        ORDER BY (lease_id IS NULL), created_at`, [payment.tenant_id, payment.lease_id, payment.landlord_id])
+          AND (lease_id = $2 OR (lease_id IS NULL AND landlord_id = $3) OR ($4::boolean AND landlord_id = $3))
+        ORDER BY (lease_id IS NULL), created_at`, [payment.tenant_id, payment.lease_id, payment.landlord_id, input.settleHousehold === true])
     for (const c of open.rows) {
       if (left <= 0) break
       const take = Math.min(left, Number(c.amount_remaining))
