@@ -2,8 +2,8 @@ import { useState, useEffect, useMemo, useRef, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch } from '../lib/api'
-import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil } from 'lucide-react'
+import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check } from 'lucide-react'
 import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
 
@@ -120,6 +120,27 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
   })()
 
   const [walkRun, setWalkRun] = useState<any | null>(null)
+  // S652: Blu reviews the bills before they go out.
+  const [reviewRunId, setReviewRunId] = useState<string | null>(null)
+  const thisProperty = (properties as any[]).find((p: any) => p.id === propertyId)
+  const reviewOn = thisProperty?.reviewUtilityBills === true
+  const reviewSwitch = useMutation(
+    (on: boolean) => apiPatch(`/utility/properties/${propertyId}/review-bills`, { on }),
+    { onSuccess: () => qc.invalidateQueries('properties'),
+      onError: (e: any) => toast.error(e?.message || 'Could not change that') })
+  const downloadReads = async () => {
+    try {
+      const res = await fetch(`${(import.meta as any).env?.VITE_API_URL || ''}/api/utility/readings/export?propertyId=${propertyId}`,
+        { headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') } })
+      if (!res.ok) { toast.error('Could not download the readings'); return }
+      const blob = await res.blob()
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `${String(thisProperty?.name || 'property').replace(/[^A-Za-z0-9]+/g, '-')}-meter-readings.csv`
+      a.click()
+      URL.revokeObjectURL(a.href)
+    } catch { toast.error('Could not download the readings') }
+  }
   const [reviewReading, setReviewReading] = useState<any | null>(null)
   const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string } | null>(null)
 
@@ -218,6 +239,21 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             </div>
           )}
 
+          {/* ── S652: review before billing + the readings spreadsheet ── */}
+          {canReview && propertyId && (
+            <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:12, fontSize:'.8rem', color:'var(--text-2)' }}>
+              <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer' }}>
+                <input type="checkbox" checked={reviewOn} disabled={reviewSwitch.isLoading}
+                  onChange={e => reviewSwitch.mutate(e.target.checked)} />
+                Review utility bills before they go out
+              </label>
+              <span style={{ color:'var(--text-3)', fontSize:'.72rem', flex:1 }}>
+                {reviewOn ? 'Nothing is billed from a month of readings until you approve it.' : 'Bills go out on each tenant\'s invoice as soon as their meters are read.'}
+              </span>
+              <button className="btn btn-primary btn-sm" onClick={downloadReads}>Download readings</button>
+            </div>
+          )}
+
           {/* ── READING RUN ────────────────────────────────── */}
           {openRun ? (
             <div className="card" style={{ marginBottom:24, display:'flex', alignItems:'center', gap:16, borderColor:'var(--gold)', flexWrap:'wrap' }}>
@@ -239,7 +275,12 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                   ? (openRun.dcDone > 0 ? 'Continue verification' : 'Start verification')
                   : (openRun.metersRead > 0 ? 'Continue reading' : 'Start reading')} <ChevronRight size={14}/>
               </button>
-              {(openRun.status === 'double_check' || openRun.metersRead > 0) && (
+              {canReview && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
+                <button className="btn btn-primary btn-sm" onClick={() => setReviewRunId(openRun.id)}>
+                  Review bills{reviewOn ? ' & approve' : ''}
+                </button>
+              )}
+              {!reviewOn && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" disabled={forceCompleteMut.isLoading}
                   onClick={()=>{ appConfirm('Complete this run now? Unread meters produce no bill this cycle and their held invoices release. Flagged reads still need your review before their unit\'s invoice goes out.', { confirmLabel: 'Complete run' }).then(ok => { if (ok) forceCompleteMut.mutate(openRun.id) }) }}>
                   Complete now
@@ -404,6 +445,7 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
           onClose={()=>setOpeningReads(false)} onSaved={invalidate} />
       )}
 
+      {reviewRunId && <ReviewBillsModal runId={reviewRunId} onClose={() => setReviewRunId(null)} onDone={invalidate} />}
       {walkRun && (
         <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} onClose={()=>{ setWalkRun(null); invalidate() }} />
       )}
@@ -2929,6 +2971,10 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
   const locked = editing && meter.hasHistory === true
   const [utilityType, setUtilityType] = useState(meter?.utilityType ?? 'water')
   const [label, setLabel] = useState(meter?.label ?? '')
+  // S652 (Nic): "If we discover that one of those is actually six digits later
+  // on, can the landlord get on there and just change it?" Yes — past reads are
+  // untouched; the width only sets the largest read and where the dial wraps.
+  const [digitsSel, setDigitsSel] = useState(String(meter?.digits ?? METER_READING_DEFAULT_DIGITS))
   const [method, setMethod] = useState(meter?.billingMethod ?? 'rubs')
   const [basis, setBasis] = useState(meter?.rubsBasis ?? 'usage_rate')
   const [subRate, setSubRate] = useState(meter?.rubsSubmeterRate ?? 'property_rate')
@@ -2974,6 +3020,7 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
       ? apiPatch(`/utility/meters/${meter.id}`, {
           label,
           baseFee: Number(baseFee || 0),
+          ...((method === 'submeter' || method === 'rubs') ? { digits: Number(digitsSel) } : {}),
           // S609: until a meter has readings or bills, the utility and billing
           // method are fixable too — sending them only when they are actually
           // editable keeps a locked meter's payload identical to before.
@@ -2992,6 +3039,7 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
       : apiPost('/utility/meters', {
       propertyId, utilityType, label,
       billingMethod: method,
+      ...((method === 'submeter' || method === 'rubs') ? { digits: Number(digitsSel) } : {}),
       ratePerUnit: method === 'flat_rate' || method === 'master_bill_to_landlord' ? null : (rate === '' ? null : Number(rate)),
       baseFee: method === 'flat_rate' ? Number(baseFee || 0) : Number(baseFee || 0),
       rubsAllocationMethod: method === 'rubs' ? alloc : null,
@@ -3050,6 +3098,15 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
           <label style={lbl}>Label</label>
           <input className="input" value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Master C — city water" style={{ width: '100%' }} autoFocus />
         </div>
+        {(method === 'submeter' || method === 'rubs') && (
+        <div style={{ marginBottom: 10 }}>
+          <label style={lbl}>Digits on the meter face</label>
+          <select className="form-select" value={digitsSel} onChange={e => setDigitsSel(e.target.value)} style={{ width: '100%' }}>
+            {(METER_READING_DIGIT_OPTIONS as readonly number[]).map(d => <option key={d} value={d}>{d} digits</option>)}
+          </select>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>Changing this never alters past reads — it sets the largest number a read can be and where the dial rolls over.</div>
+        </div>
+        )}
         {!locked && (
         <div style={{ marginBottom: 10 }}>
           <label style={lbl}>Billing method</label>
@@ -3226,3 +3283,91 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
     </div>
   )
 }
+
+// S652 (Nic, for Blu): "he wants to know how much people are gonna owe... if
+// anything gets fat fingered he'd rather fix it before the people get billed."
+// Every bill this month's readings produce, priced by the same engine the
+// invoice uses, with the reading editable in place until it is approved.
+function ReviewBillsModal({ runId, onClose, onDone }: { runId: string; onClose: () => void; onDone: () => void }) {
+  const qc = useQueryClient()
+  const { data, isLoading } = useQuery<any>(['bill-review', runId], () => apiGet(`/utility/reading-runs/${runId}/review`))
+  const [edit, setEdit] = useState<{ meterId: string; readingId: string; value: string } | null>(null)
+  const refresh = () => { qc.invalidateQueries(['bill-review', runId]); onDone() }
+  const fix = useMutation(
+    ({ meterId, readingId, value }: any) => apiPatch(`/utility/meters/${meterId}/readings/${readingId}`, { readingValue: Number(value), note: 'Corrected on bill review' }),
+    { onSuccess: () => { setEdit(null); refresh(); toast('Reading corrected — bills recalculated') },
+      onError: (e: any) => toast.error(e?.message || 'Could not correct that reading') })
+  const approve = useMutation(() => apiPost(`/utility/reading-runs/${runId}/approve`, {}),
+    { onSuccess: () => { refresh(); toast('Approved — these bills go out on each tenant\'s invoice'); onClose() },
+      onError: (e: any) => toast.error(e?.message || 'Could not approve') })
+  const run = data?.run, lines: any[] = data?.lines ?? [], totals = data?.totals
+  const approved = run?.status === 'completed' || !!run?.approvedAt
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 980, width: '96vw', maxHeight: '92vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Review bills — {run ? monthLabel(run.cycle) : ''}{run?.utilityType ? ` · ${UTILITY_TYPE_LABEL[run.utilityType as UtilityType] ?? run.utilityType}` : ''}</div>
+        {isLoading || !data ? <div style={{ color:'var(--text-3)', padding:16 }}>Pricing this month's readings…</div> : (
+          <>
+            <div style={{ display:'flex', gap:18, flexWrap:'wrap', margin:'6px 0 12px', fontSize:'.82rem' }}>
+              <span><b>{totals.bills}</b> bills</span>
+              <span>Total <b>{fmt(totals.amount)}</b></span>
+              {totals.unread > 0 && <span style={{ color:'var(--amber, #d97706)' }}>{totals.unread} not read yet</span>}
+              {totals.flagged > 0 && <span style={{ color:'var(--red)' }}>{totals.flagged} flagged as a possible typo</span>}
+            </div>
+            <table className="data-table">
+              <thead><tr><th>Site</th><th>Meter</th><th>Tenant</th><th style={{textAlign:'right'}}>Previous</th><th style={{textAlign:'right'}}>This month</th><th style={{textAlign:'right'}}>Usage</th><th style={{textAlign:'right'}}>Bill</th></tr></thead>
+              <tbody>
+                {lines.map((l: any) => (
+                  <tr key={l.meterId + (l.unitNumber ?? '')} style={l.flagged ? { background:'rgba(239,68,68,.06)' } : undefined}>
+                    <td className="mono">{l.unitNumber ?? '—'}</td>
+                    <td style={{ fontSize:'.76rem' }}>{l.label}</td>
+                    <td style={{ fontSize:'.76rem' }}>{l.tenant ?? <span style={{ color:'var(--text-3)' }}>—</span>}</td>
+                    <td className="mono" style={{ textAlign:'right' }}>{l.prior != null ? fmtRead(l.prior, l.digits) : '—'}</td>
+                    <td className="mono" style={{ textAlign:'right' }}>
+                      {edit && edit.meterId === l.meterId ? (
+                        <span style={{ display:'inline-flex', gap:4 }}>
+                          <input className="input mono" style={{ width: 110, textAlign:'right' }} autoFocus inputMode="numeric"
+                            value={edit.value} onChange={e => setEdit({ ...edit, value: e.target.value.replace(/\D/g, '').slice(0, Number(l.digits) || 8) })}
+                            onKeyDown={e => { if (e.key === 'Enter' && edit.value) fix.mutate(edit) }} />
+                          <button className="btn btn-primary btn-sm" disabled={!edit.value || fix.isLoading} onClick={() => fix.mutate(edit)}><Check size={12}/></button>
+                          <button className="btn btn-ghost btn-sm" onClick={() => setEdit(null)}>✕</button>
+                        </span>
+                      ) : l.reading == null ? <span style={{ color:'var(--amber, #d97706)' }}>not read</span> : (
+                        <span>
+                          {fmtRead(l.reading, l.digits)}
+                          {!approved && !l.issued && l.readingId && (
+                            <button className="btn btn-ghost btn-sm" style={{ marginLeft:4, padding:'0 4px', fontSize:'.66rem' }}
+                              onClick={() => setEdit({ meterId: l.meterId, readingId: l.readingId, value: String(Math.trunc(l.reading)) })}>Fix</button>
+                          )}
+                        </span>
+                      )}
+                      {l.flagged && <div style={{ fontSize:'.64rem', color:'var(--red)' }}>Possible typo{l.flagNote ? ` — ${l.flagNote}` : ''}</div>}
+                    </td>
+                    <td className="mono" style={{ textAlign:'right' }}>{l.usage != null ? Number(l.usage).toLocaleString() : '—'}</td>
+                    <td className="mono" style={{ textAlign:'right', fontWeight:600 }}>{l.charge != null ? fmt(l.charge) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ display:'flex', justifyContent:'flex-end', alignItems:'center', gap:10, marginTop:14 }}>
+              {approved ? <span style={{ fontSize:'.8rem', color:'var(--green)' }}>Approved — these went out on each tenant's invoice.</span> : (
+                <>
+                  <span style={{ fontSize:'.74rem', color:'var(--text-3)', flex:1 }}>
+                    {run.reviewRequired
+                      ? 'Nothing from this month goes to tenants until you approve. Unread meters bill nothing this month.'
+                      : 'Approving issues these now and closes this month\'s readings.'}
+                  </span>
+                  <button className="btn btn-ghost" onClick={onClose}>Close</button>
+                  <button className="btn btn-primary" disabled={approve.isLoading || totals.flagged > 0} onClick={() => approve.mutate()}>
+                    Approve {fmt(totals.amount)}
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+

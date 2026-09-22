@@ -285,7 +285,7 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
     const { rows: agreements } = await client.query(
       `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
               wta.banked_hours::float AS banked_hours,
-              wta.carry_forward_months,
+              wta.carry_forward_months, wta.carry_forward_indefinite,
               -- A lease has no tenant_id: tenancy lives in lease_tenants, which
               -- is what makes co-tenants and mid-term changes expressible. The
               -- agreement's tenant must be an ACTIVE party to the lease for it
@@ -338,7 +338,8 @@ export async function runWorkTradeSettlement(periodMonth: string): Promise<Settl
           periods: ordered,
           hoursWorked: hoursWorkedByMonth.get(periodMonth) ?? 0,
           bankedHours: Number(a.banked_hours),
-          carryForwardMonths: Number(a.carry_forward_months),
+          // S652: a landlord floating the shortfall indefinitely never has it billed.
+          carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
         })
 
         await persist(client, a, ordered, hoursWorkedByMonth, result, run)
@@ -394,7 +395,7 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
         await client.query('BEGIN')
         const { rows } = await client.query(
           `SELECT wta.id, wta.landlord_id, wta.unit_id, wta.tenant_id,
-                  wta.banked_hours::float AS banked_hours, wta.carry_forward_months,
+                  wta.banked_hours::float AS banked_hours, wta.carry_forward_months, wta.carry_forward_indefinite,
                   (SELECT l.id FROM leases l
                      JOIN lease_tenants lt ON lt.lease_id = l.id
                     WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
@@ -422,7 +423,8 @@ export async function runDueWorkTradeSettlements(todayIso: string): Promise<Sett
           periods: ordered,
           hoursWorked: worked,
           bankedHours: Number(a.banked_hours),
-          carryForwardMonths: Number(a.carry_forward_months),
+          // S652: a landlord floating the shortfall indefinitely never has it billed.
+          carryForwardMonths: a.carry_forward_indefinite ? Number.POSITIVE_INFINITY : Number(a.carry_forward_months),
         })
         await persist(client, a, ordered, new Map([[c.period_start, worked]]), result, run)
         await client.query(`UPDATE work_trade_settlements SET close_run_at = NOW() WHERE id = $1`, [c.id])

@@ -1787,3 +1787,92 @@ describe('S648 per-tenant read-by dates', () => {
     expect(ok.status).toBe(201)
   })
 })
+
+// ── S652 (Nic, for Blu): review the bills before they go out ───────────
+describe('S652 — review utility bills before billing', () => {
+  const AUG = new Date('2026-08-05T12:00:00Z')
+  const invoiceFor = (leaseId: string) => db.query(
+    `SELECT id, subtotal_utilities FROM invoices WHERE lease_id = $1`, [leaseId])
+
+  it('holds the invoice until approved, shows the bill, lets a fat-fingered read be fixed, then releases', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, f.meterLeased, 1950)   // meant 1250
+
+    await generateInvoices(AUG)
+    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0)   // held for review
+
+    const review = await request(app).get(`/api/utility/reading-runs/${run.id}/review`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(review.status).toBe(200)
+    const line = review.body.data.lines.find((l: any) => l.meterId === f.meterLeased)
+    expect(line.charge).toBeCloseTo(133.0, 2)   // 950 × 0.14
+    expect(line.issued).toBe(false)
+
+    const fix = await request(app).patch(`/api/utility/meters/${f.meterLeased}/readings/${line.readingId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ readingValue: 1250 })
+    expect(fix.status).toBe(200)
+    const again = await request(app).get(`/api/utility/reading-runs/${run.id}/review`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(again.body.data.lines.find((l: any) => l.meterId === f.meterLeased).charge).toBeCloseTo(35.0, 2)
+
+    await request(app).post(`/api/utility/reading-runs/${run.id}/approve`).set('Authorization', `Bearer ${f.tokenA}`).expect(200)
+    await generateInvoices(AUG)
+    const inv = await invoiceFor(f.leaseAId)
+    expect(inv.rows).toHaveLength(1)
+    expect(Number(inv.rows[0].subtotal_utilities)).toBeCloseTo(35.0, 2)
+  })
+
+  it('finishing the walk does not issue anything while review is on', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    const { completeReadingRun } = await import('../services/utilityReadingRuns')
+    const after = await completeReadingRun(run.id, f.landlordAUserId)
+    expect(after.status).not.toBe('completed')
+  })
+
+  it('a bill computed for review is not shown to the tenant', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(`UPDATE properties SET review_utility_bills = TRUE WHERE id = $1`, [f.propertyAId])
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    await request(app).get(`/api/utility/reading-runs/${run.id}/review`).set('Authorization', `Bearer ${f.tokenA}`).expect(200)
+    const tUser = (await db.query(`SELECT user_id FROM tenants WHERE id=$1`, [f.tenantAId])).rows[0].user_id
+    const tTok = jwt.sign({ userId: tUser, role: 'tenant', email: 't@t.dev', profileId: f.tenantAId, permissions: {} }, process.env.JWT_SECRET!)
+    const mine = await request(app).get('/api/utility/bills').set('Authorization', `Bearer ${tTok}`)
+    expect(mine.status).toBe(200)
+    expect(mine.body.data).toHaveLength(0)
+  })
+
+  it('a landlord\'s own bill list is no longer empty', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    await generateBillsForMeter(f.meterLeased, new Date(CYCLE + 'T00:00:00Z'))
+    const list = await request(app).get('/api/utility/bills').set('Authorization', `Bearer ${f.tokenA}`)
+    expect(list.body.data.length).toBeGreaterThan(0)
+  })
+
+  it('the readings spreadsheet has a row per meter with the month\'s reading and usage', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    const r = await request(app).get(`/api/utility/readings/export?propertyId=${f.propertyAId}`).set('Authorization', `Bearer ${f.tokenA}`)
+    expect(r.status).toBe(200)
+    expect(r.headers['content-type']).toMatch(/text\/csv/)
+    expect(r.text).toContain('2026-07 reading')
+    expect(r.text).toContain('1250')
+    expect(r.text).toContain('250')
+  })
+})

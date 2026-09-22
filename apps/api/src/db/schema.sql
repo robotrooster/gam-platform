@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict NcAFP7CKCHDSNTibvxyJrJoKkeRJC2OAditTTRUlvwBFXy55tIHMcHB1zfbXhGc
+\restrict tfiEqCb4XdUueaK4fUoLMyBvdqxFepxxXnUkudUOmK7GDdvPpflS4lDkGfwCHSW
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -7938,6 +7938,7 @@ CREATE TABLE public.properties (
     stripe_terminal_location_id text,
     register_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
     booking_card_fee_payer text DEFAULT 'customer'::text NOT NULL,
+    review_utility_bills boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -11156,6 +11157,8 @@ CREATE TABLE public.utility_reading_runs (
     billed_total numeric(12,2),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     utility_type text,
+    approved_at timestamp with time zone,
+    approved_by_user_id uuid,
     CONSTRAINT utility_reading_runs_status_check CHECK ((status = ANY (ARRAY['open'::text, 'double_check'::text, 'completed'::text])))
 );
 
@@ -11430,6 +11433,7 @@ CREATE TABLE public.work_trade_agreements (
     tracks_hours boolean DEFAULT true NOT NULL,
     trusted boolean DEFAULT false NOT NULL,
     skills text[] DEFAULT '{}'::text[] NOT NULL,
+    carry_forward_indefinite boolean DEFAULT false NOT NULL,
     CONSTRAINT work_trade_agreements_skills_check CHECK ((skills <@ ARRAY['plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text])),
     CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0)),
@@ -27790,6 +27794,14 @@ ALTER TABLE ONLY public.utility_reading_double_checks
 
 
 --
+-- Name: utility_reading_runs utility_reading_runs_approved_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_approved_by_user_id_fkey FOREIGN KEY (approved_by_user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: utility_reading_runs utility_reading_runs_completed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27953,5 +27965,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict NcAFP7CKCHDSNTibvxyJrJoKkeRJC2OAditTTRUlvwBFXy55tIHMcHB1zfbXhGc
+\unrestrict tfiEqCb4XdUueaK4fUoLMyBvdqxFepxxXnUkudUOmK7GDdvPpflS4lDkGfwCHSW
 

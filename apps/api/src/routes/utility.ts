@@ -7,6 +7,7 @@ import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+import { landlordScopeIds } from '../lib/landlordScope'
 import {
   generateBillsForMeter,
   generateBillsForProperty,
@@ -39,9 +40,14 @@ utilityRouter.get('/bills', async (req, res, next) => {
     const params: any[] = []
     let where = ''
     if (role === 'tenant') {
-      where = `WHERE ub.tenant_id = $${params.push(req.user!.profileId)}`
+      // S652: a bill the landlord has not issued yet — computed early for their
+      // review — is not the tenant's to see until it goes out.
+      where = `WHERE ub.tenant_id = $${params.push(req.user!.profileId)}
+                 AND (ub.status <> 'unbilled' OR ub.payment_id IS NOT NULL)`
     } else if (role === 'landlord') {
-      where = `WHERE ub.landlord_id = $${params.push(req.user!.profileId)}`
+      // S652: a landlord's session names no company (S633) — this read
+      // profileId and so returned nothing for every landlord.
+      where = `WHERE ub.landlord_id = ANY($${params.push(landlordScopeIds(req.user!))}::uuid[])`
     } else if (['property_manager','onsite_manager','maintenance'].includes(role)) {
       if (!req.user!.landlordId) return res.json({ success: true, data: [] })
       where = `WHERE ub.landlord_id = $${params.push(req.user!.landlordId)}`
@@ -1094,12 +1100,12 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
         `That is more than a ${meter.digits}-digit meter can show. Check the odometer size on the meter if the face is wider.`)
     }
 
-    // Anything billed from this read, or from the span that starts at it.
-    const billed = await queryOne<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM utility_bills
-        WHERE meter_id = $1 AND billing_cycle_month >= $2::date`,
-      [req.params.id, reading.billing_cycle_month])
-    if (Number(billed?.n ?? 0) > 0) {
+    // Anything ISSUED from this read, or from the span that starts at it.
+    // S652: a bill computed for the landlord's review and not yet sent is
+    // not a charge anyone has seen — it is dropped and priced again from the
+    // corrected read, which is the whole point of reviewing before billing.
+    const { dropUnissuedBillsFrom } = await import('../services/utilityReview')
+    if (!(await dropUnissuedBillsFrom(req.params.id, reading.billing_cycle_month))) {
       throw new AppError(409,
         'A bill has already been issued from this read, so changing it would rewrite a charge a tenant has already seen. ' +
         'Enter a correcting read instead, or reverse that bill first.')
@@ -1657,8 +1663,106 @@ utilityRouter.post('/reading-runs/:id/complete', requirePerm('properties.edit'),
       throw new AppError(403, 'Forbidden')
     }
     if (run.status === 'completed') throw new AppError(409, 'Reading run is already completed')
-    const completed = await completeReadingRun(run.id, req.user!.userId)
+    // S652: the landlord completing the run IS the approval of its bills.
+    const completed = await completeReadingRun(run.id, req.user!.userId, { approve: true })
     res.json({ success: true, data: completed })
+  } catch (e) { next(e) }
+})
+
+// ── S652: REVIEW THE BILLS BEFORE THEY GO OUT ─────────────────
+// Blu: see what everybody will owe, fix a fat-fingered read, then approve.
+
+utilityRouter.get('/reading-runs/:id/review', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const run = await queryOne<any>(`SELECT landlord_id FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    const { billReview } = await import('../services/utilityReview')
+    res.json({ success: true, data: await billReview(req.params.id) })
+  } catch (e) { next(e) }
+})
+
+utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
+    if (!run) throw new AppError(404, 'Reading run not found')
+    if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (run.status === 'completed') throw new AppError(409, 'These bills already went out')
+    const flagged = await queryOne<{ n: number }>(`
+      SELECT COUNT(*)::int AS n FROM utility_meter_readings rd
+        JOIN utility_meters m ON m.id = rd.meter_id
+       WHERE m.property_id = $1 AND rd.billing_cycle_month = $2 AND rd.needs_review
+         AND ($3::text IS NULL OR m.utility_type = $3)`,
+      [run.property_id, run.billing_cycle_month, run.utility_type ?? null])
+    if ((flagged?.n ?? 0) > 0) {
+      throw new AppError(409, `${flagged!.n} reading${flagged!.n === 1 ? ' is' : 's are'} flagged as a possible typo. Fix or confirm ${flagged!.n === 1 ? 'it' : 'them'} first.`)
+    }
+    const done = await completeReadingRun(run.id, req.user!.userId, { approve: true })
+    res.json({ success: true, data: done })
+  } catch (e) { next(e) }
+})
+
+// The per-property switch: review utility bills before they go out.
+utilityRouter.patch('/properties/:propertyId/review-bills', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { on } = z.object({ on: z.boolean() }).parse(req.body)
+    const prop = await queryOne<any>(`SELECT landlord_id FROM properties WHERE id = $1`, [req.params.propertyId])
+    if (!prop || !canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
+    const row = await queryOne<any>(
+      `UPDATE properties SET review_utility_bills = $2, updated_at = NOW() WHERE id = $1 RETURNING review_utility_bills`,
+      [req.params.propertyId, on])
+    res.json({ success: true, data: { reviewUtilityBills: row.review_utility_bills } })
+  } catch (e) { next(e) }
+})
+
+// Every read at a property as a spreadsheet — one row per meter, a reading and
+// a usage column per month (Nic: "your sites and your reads at different dates
+// for total evaluation history of overall utility usage"). CSV opens in Excel.
+utilityRouter.get('/readings/export', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    const prop = await queryOne<any>(`SELECT name, landlord_id, review_utility_bills FROM properties WHERE id = $1`, [propertyId])
+    if (!prop || !canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
+    const reads = await query<any>(`
+      SELECT m.id AS meter_id, m.label, m.utility_type, m.digits, COALESCE(m.reading_multiplier, 1) AS mult,
+             (SELECT string_agg(u.unit_number, ' / ' ORDER BY u.unit_number) FROM utility_meter_units mu
+                JOIN units u ON u.id = mu.unit_id WHERE mu.meter_id = m.id) AS sites,
+             to_char(rd.billing_cycle_month, 'YYYY-MM') AS month, rd.reading_date, rd.reading_value, rd.is_rollover, rd.reason
+        FROM utility_meters m
+        JOIN utility_meter_readings rd ON rd.meter_id = m.id
+       WHERE m.property_id = $1
+       ORDER BY m.utility_type, sites NULLS LAST, m.label, rd.reading_date, rd.created_at`, [propertyId])
+    const months = [...new Set(reads.filter(r => r.reason === 'monthly_cycle').map(r => r.month))].sort()
+    type Row = { sites: string; label: string; type: string; byMonth: Map<string, { read: number; usage: number | null }> }
+    const meters = new Map<string, Row>()
+    const lastRead = new Map<string, any>()
+    for (const r of reads) {
+      let row = meters.get(r.meter_id)
+      if (!row) meters.set(r.meter_id, row = { sites: r.sites ?? '', label: r.label ?? '', type: r.utility_type, byMonth: new Map() })
+      const prev = lastRead.get(r.meter_id)
+      lastRead.set(r.meter_id, r)
+      if (r.reason !== 'monthly_cycle') continue
+      const cur = Number(r.reading_value)
+      let usage: number | null = null
+      if (prev) {
+        const mod = Math.pow(10, Number(r.digits) || 7)
+        const diff = cur >= Number(prev.reading_value) ? cur - Number(prev.reading_value)
+          : (r.is_rollover ? cur + mod - Number(prev.reading_value) : null)
+        usage = diff == null ? null : Math.round(diff * Number(r.mult) * 100) / 100
+      }
+      row.byMonth.set(r.month, { read: cur, usage })
+    }
+    const esc = (v: any) => { const t = v == null ? '' : String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t }
+    const header = ['Site', 'Meter', 'Utility', ...months.flatMap(m => [`${m} reading`, `${m} usage`])]
+    const lines = [header.map(esc).join(',')]
+    for (const row of meters.values()) {
+      lines.push([row.sites, row.label, row.type,
+        ...months.flatMap(m => { const c = row.byMonth.get(m); return [c?.read ?? '', c?.usage ?? ''] })].map(esc).join(','))
+    }
+    const file = `${String(prop.name).replace(/[^A-Za-z0-9]+/g, '-')}-meter-readings.csv`
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="${file}"`)
+    res.send('\ufeff' + lines.join('\r\n'))
   } catch (e) { next(e) }
 })
 

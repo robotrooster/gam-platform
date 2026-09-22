@@ -435,7 +435,25 @@ async function runGeneration(
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
-      if (readHold || flagHold) continue
+      // S652 (Nic, for Blu): a property that reviews its utility bills holds
+      // this invoice — whole, like the two holds above — until the landlord
+      // approves the reading run its utilities come from. "He'd rather fix it
+      // before the people get billed than wait till they complain."
+      const reviewHold = (readHold || flagHold) ? null : await queryOne<{ id: string }>(
+        `SELECT r.id
+           FROM utility_reading_runs r
+           JOIN properties p ON p.id = r.property_id AND p.review_utility_bills
+           JOIN utility_meters m ON m.property_id = r.property_id
+                                AND m.billing_method IN ('submeter','rubs')
+                                AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)
+           JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
+           JOIN lease_utility_responsibilities lur
+             ON lur.lease_id = $1 AND lur.utility_type = m.utility_type AND lur.tenant_responsible
+          WHERE r.status <> 'completed' AND r.approved_at IS NULL
+            AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
+          LIMIT 1`,
+        [lease.id, lease.unit_id, dueDate])
+      if (readHold || flagHold || reviewHold) continue
 
       // S534: per-unit billing readiness — generate any bills this
       // unit's readings support before pulling them below. Write-path

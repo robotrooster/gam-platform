@@ -497,10 +497,17 @@ export async function countEscalations(runId: string): Promise<number> {
  * (escape hatch — e.g. a physically unreadable meter) or from
  * 'double_check' (the normal path once verification finishes).
  */
-export async function completeReadingRun(runId: string, userId: string) {
+export async function completeReadingRun(runId: string, userId: string, opts: { approve?: boolean } = {}) {
   const run = await queryOne<any>(
-    `SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+    `SELECT r.*, p.review_utility_bills FROM utility_reading_runs r
+       JOIN properties p ON p.id = r.property_id WHERE r.id = $1`, [runId])
   if (!run || run.status === 'completed') return run
+  // S652: a property that reviews its bills issues them only on the landlord's
+  // approval. The walk finishing is not that — it leaves the run waiting.
+  if (run.review_utility_bills && !run.approved_at && !opts.approve) return run
+  if (opts.approve && !run.approved_at) {
+    await query(`UPDATE utility_reading_runs SET approved_at = NOW(), approved_by_user_id = $2 WHERE id = $1`, [runId, userId])
+  }
 
   // pg returns date columns as local-midnight Date objects — normalize to
   // the day string before rebuilding a UTC date (string-concat on a Date

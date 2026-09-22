@@ -100,7 +100,7 @@ export function workTradeStanding(input: {
     currentMonthHours, carriedHours, catchUpHours, bankedHours: banked,
     carriedValue: forTenant ? null : carriedValue,
     catchUpPlausible,
-    nextBillingMonth: soonest ? soonest.periodMonth : null,
+    nextBillingMonth: soonest && soonest.closesRemaining < Number.MAX_SAFE_INTEGER ? soonest.periodMonth : null,
     summary: summarise({
       currentMonthHours, carriedHours, catchUpHours, banked, carriedValue, forTenant,
     }),
@@ -158,8 +158,8 @@ export async function loadWorkTradeStanding(
   const month = asOfMonth
     ?? DateTime.now().setZone('America/Phoenix').startOf('month').toISODate()!
 
-  const ag = await queryOne<{ banked_hours: string; carry_forward_months: number }>(
-    `SELECT banked_hours, carry_forward_months
+  const ag = await queryOne<{ banked_hours: string; carry_forward_months: number; carry_forward_indefinite: boolean }>(
+    `SELECT banked_hours, carry_forward_months, carry_forward_indefinite
        FROM work_trade_agreements WHERE id = $1`, [agreementId])
   if (!ag) return null
 
@@ -186,7 +186,8 @@ export async function loadWorkTradeStanding(
       periodMonth: r.period_month,
       hoursOutstanding: Math.max(0, round2h(Number(r.target_hours) - Number(r.hours_applied))),
       hourRate: Number(r.hour_rate),
-      closesRemaining: Math.max(0,
+      // S652: floated indefinitely — no close ever bills it.
+      closesRemaining: ag.carry_forward_indefinite ? Number.MAX_SAFE_INTEGER : Math.max(0,
         Number(ag.carry_forward_months) - Number(r.aged_closes)),
     }))
     .filter(c => c.hoursOutstanding > 0)

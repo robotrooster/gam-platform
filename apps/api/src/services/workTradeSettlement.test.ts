@@ -44,6 +44,17 @@ describe('a prorated move-in month', () => {
 })
 
 describe('settling a month from its own hours', () => {
+  // S652 (Nic, for Blu and Curtis): "He's willing to float that for an
+  // indefinite time." A shortfall years old is still carried, never billed.
+  it('an indefinite float never bills a shortfall, however old', () => {
+    const r = settleMonth({
+      periods: [period({ periodMonth: '2020-01-01', agedCloses: 80 } as any)],
+      hoursWorked: 0, bankedHours: 0, carryForwardMonths: Number.POSITIVE_INFINITY,
+    })
+    expect(r.periods[0].status).toBe('open')
+    expect(r.endsAgreement).toBe(false)
+  })
+
   it('a full target month covers the whole bill', () => {
     const r = settleMonth({
       periods: [period({ periodMonth: '2026-09-01' })],

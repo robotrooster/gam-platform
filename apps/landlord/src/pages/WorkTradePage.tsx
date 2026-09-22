@@ -107,7 +107,7 @@ export function WorkTradePage() {
                     : `${Number(a.hoursThisMonth || 0).toFixed(1)} / ${a.target} hrs`}</td>
                   <td onClick={e => e.stopPropagation()}><AgreementTargetCell agreementId={a.id} target={Number(a.target)}
                     tracksHours={a.tracksHours !== false} /></td>
-                  <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} /></td>
+                  <td onClick={e => e.stopPropagation()}><CarryForwardCell agreementId={a.id} months={Number(a.carryForwardMonths ?? 1)} indefinite={a.carryForwardIndefinite === true} /></td>
                   <td onClick={e => e.stopPropagation()}><AgreementCoversCell agreement={a} /></td>
                   <td className="mono">{Number(a.pendingCount) > 0
                     ? <span className="badge badge-amber">{a.pendingCount}</span>
@@ -338,8 +338,13 @@ function AgreementTargetCell(
  * So it is a setting, not a constant — and the copy names the consequence rather
  * than the mechanism, because "carry_forward_months" means nothing to anybody.
  */
-function CarryForwardCell({ agreementId, months }: { agreementId: string; months: number }) {
+function CarryForwardCell({ agreementId, months, indefinite }: { agreementId: string; months: number; indefinite?: boolean }) {
   const qc = useQueryClient()
+  // S652 (Nic, for Blu and Curtis): "carry it forward... He's willing to float
+  // that for an indefinite time."
+  const setIndefinite = useMutation(
+    (on: boolean) => apiPatch(`/work-trade/${agreementId}`, { carryForwardIndefinite: on }),
+    { onSuccess: () => qc.invalidateQueries('work-trade') })
   const [value, setValue] = useState<string | null>(null)
   const shown = value ?? String(months ?? 1)
   const save = useMutation(
@@ -348,6 +353,19 @@ function CarryForwardCell({ agreementId, months }: { agreementId: string; months
   )
   const n = Number(shown)
   const dirty = value != null && n !== months && n >= 0 && n <= 24
+  if (indefinite) {
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: '.8rem', fontWeight: 600 }}>No limit</span>
+          <button className="btn btn-ghost btn-sm" disabled={setIndefinite.isLoading} onClick={() => setIndefinite.mutate(false)}>Set a limit</button>
+        </div>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+          Unworked hours carry forward with no deadline and are never billed while the agreement runs.
+        </div>
+      </div>
+    )
+  }
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -368,6 +386,8 @@ function CarryForwardCell({ agreementId, months }: { agreementId: string; months
         {n === 0
           ? 'Unworked hours are billed at the end of the month they were owed.'
           : `Unworked hours carry for ${n} more ${n === 1 ? 'month' : 'months'}. After that they're billed and the agreement ends.`}
+        {' '}<button className="btn btn-ghost btn-sm" style={{ padding: '0 4px', fontSize: '.66rem' }} disabled={setIndefinite.isLoading}
+          onClick={() => setIndefinite.mutate(true)}>No limit</button>
       </div>
     </div>
   )

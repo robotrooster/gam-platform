@@ -561,7 +561,7 @@ workTradeRouter.get('/:id/standing', async (req, res, next) => {
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const { status, endDate, monthlyHoursTarget, tracksHours, coveredCharges, carryForwardMonths,
-            trusted, skills, duties } = z.object({
+            trusted, skills, duties, carryForwardIndefinite } = z.object({
       // S652: trusted or monitored, what they can fix, and the duties in words.
       trusted: z.boolean().optional(),
       skills: z.array(z.enum(WORK_TRADE_SKILLS as unknown as [string, ...string[]])).optional(),
@@ -579,6 +579,8 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
       // so... but at some point, a landlord's gonna know that somebody's never
       // gonna be able to physically catch up." 0 = bill at the first close.
       carryForwardMonths: z.number().int().min(0).max(24).optional(),
+      // S652: float a shortfall with no deadline while the agreement runs.
+      carryForwardIndefinite: z.boolean().optional(),
     }).parse(req.body)
 
     const before = await getAgreementForUser(req.params.id, req.user!)
@@ -597,11 +599,12 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
         trusted=COALESCE($8,trusted),
         skills=COALESCE($9::text[],skills),
         duties=CASE WHEN $10::boolean THEN $11 ELSE duties END,
+        carry_forward_indefinite=COALESCE($12,carry_forward_indefinite),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
       [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null,
        coveredCharges ?? null, carryForwardMonths ?? null, tracksHours ?? null,
-       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null]
+       trusted ?? null, skills ?? null, duties !== undefined, duties ?? null, carryForwardIndefinite ?? null]
     )
 
     // S624 (Nic): "when the landlord marks the work trade agreement as over, any
