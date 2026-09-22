@@ -784,7 +784,11 @@ async function resolveUnitsToApplicableLeases(
   return result.rows;
 }
 
-export async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: string; status: string; primaryTenantId: string; alreadyBuilt: boolean }> {
+export async function buildLeaseFromDocument(documentId: string): Promise<{
+  leaseId: string; status: string; primaryTenantId: string; alreadyBuilt: boolean
+  /** S652: a packet document signed before its lease has issued — nothing to bind to yet, nothing wrong. */
+  deferred?: boolean
+}> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -838,10 +842,40 @@ export async function buildLeaseFromDocument(documentId: string): Promise<{ leas
       return { leaseId, status, primaryTenantId, alreadyBuilt: true }
     }
 
+    // ── S652: A PACKET DOCUMENT BINDS TO THE PACKET'S LEASE ──────────────
+    //
+    // The disclosures and the installment contract are drafted beside the lease
+    // BEFORE the lease exists (services/packetDraft.ts), so they carry no
+    // lease_id. Blu signed four of them on MH 06 and each one raised "Lease did
+    // not issue — Addendum has no parent lease_id", a critical alert for a
+    // document that had nothing to issue. The packet's lease is the parent:
+    // once it has issued, every sibling is stamped with it; signed before that,
+    // a sibling simply waits — the lease's own issuance stamps it below.
+    if (!doc.lease_id && doc.package_group_id && doc.document_type !== 'original_lease') {
+      const parent = await client.query(
+        `SELECT lease_id FROM lease_documents
+          WHERE package_group_id = $1 AND document_type = 'original_lease' AND lease_id IS NOT NULL
+          ORDER BY created_at LIMIT 1`, [doc.package_group_id]).then((r: any) => r.rows[0])
+      if (parent?.lease_id) {
+        await client.query(`UPDATE lease_documents SET lease_id = $2, updated_at = NOW() WHERE id = $1`, [doc.id, parent.lease_id])
+        doc.lease_id = parent.lease_id
+      } else {
+        await client.query('COMMIT')
+        return { leaseId: '', status: 'deferred', primaryTenantId: '', alreadyBuilt: false, deferred: true }
+      }
+    }
+
     let result: { leaseId: string; status: string; primaryTenantId: string }
     switch (doc.document_type) {
       case 'original_lease':
         result = await executeOriginalLease(client, doc)
+        // S652: the packet's other documents now have a lease to belong to.
+        if (doc.package_group_id) {
+          await client.query(
+            `UPDATE lease_documents SET lease_id = $2, updated_at = NOW()
+              WHERE package_group_id = $1 AND lease_id IS NULL AND id <> $3`,
+            [doc.package_group_id, result.leaseId, doc.id])
+        }
         break
       case 'addendum_add':
         result = await executeAddendumAdd(client, doc)
@@ -5369,7 +5403,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     if (signer.role === 'landlord' && !isNoLeaseDoc) {
       try {
         const issued = await buildLeaseFromDocument(doc.id)
-        await query(
+        if (!issued.deferred) await query(
           `UPDATE lease_documents SET issued_at = COALESCE(issued_at, NOW()), updated_at = NOW()
             WHERE id = $1`, [doc.id])
 

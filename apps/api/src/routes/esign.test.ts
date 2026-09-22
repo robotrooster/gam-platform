@@ -1652,6 +1652,38 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     expect(r.alreadyBuilt).toBe(true)
   })
 
+  // S652 (Blu, MH 06): a packet's disclosures are drafted beside the lease before
+  // the lease exists. Signing one first must not raise "Addendum has no parent
+  // lease_id" — it waits; and once the packet's lease has issued, a sibling
+  // binds to it on its own.
+  it('S652: a packet sibling waits for its lease, then binds to it', async () => {
+    const f = await seedFixture()
+    const group = randomUUID()
+    const { documentId: sibling } = await seedDoc(f, { documentType: 'addendum_terms', status: 'in_progress', landlordSignerStatus: 'signed' })
+    const { documentId: leaseDoc } = await seedDoc(f, { documentType: 'original_lease', status: 'in_progress', landlordSignerStatus: 'signed' })
+    await db.query(`UPDATE lease_documents SET package_group_id = $1, lease_id = NULL WHERE id = ANY($2::uuid[])`, [group, [sibling, leaseDoc]])
+
+    const early = await buildLeaseFromDocument(sibling)
+    expect(early.deferred).toBe(true)
+    expect((await db.query(`SELECT finalized_at FROM lease_documents WHERE id = $1`, [sibling])).rows[0].finalized_at).toBeNull()
+
+    // The packet's lease issues (stand in for executeOriginalLease's result).
+    const c = await db.connect()
+    let leaseId = ''
+    try {
+      await c.query('BEGIN')
+      leaseId = await seedLease(c, { unitId: f.unitId, landlordId: f.landlordId, status: 'active' })
+      await seedLeaseTenant(c, { leaseId, tenantId: f.tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(`UPDATE lease_documents SET lease_id = $2 WHERE id = $1`, [leaseDoc, leaseId])
+
+    const later = await buildLeaseFromDocument(sibling)
+    expect(later.deferred).toBeFalsy()
+    expect(later.leaseId).toBe(leaseId)
+    expect((await db.query(`SELECT lease_id FROM lease_documents WHERE id = $1`, [sibling])).rows[0].lease_id).toBe(leaseId)
+  })
+
   it('future start_date → lease.status=pending, unit stays vacant', async () => {
     const f = await seedFixture()
     // Use a date safely in the future relative to test runtime.
