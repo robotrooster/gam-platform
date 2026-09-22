@@ -20,7 +20,7 @@ import { AppError } from '../middleware/errorHandler'
 import { fileUnderCompany, landlordScopeIds } from '../lib/landlordScope'
 import { RENEWAL_BEHAVIORS, UNIT_TYPES } from '@gam/shared'
 import {
-  resolvePackageForUnit, setTemplateProperties, templatePropertyIds,
+  resolvePackageForUnit, setTemplateProperties, templatePropertyIds, buildDefaultPackageForUnit,
 } from '../services/signingPackages'
 
 export const signingPackagesRouter = Router()
@@ -43,6 +43,21 @@ const packageSchema = z.object({
   isDefault: z.boolean().optional(),
   items: z.array(itemSchema).max(40).optional(),
   landlordId: z.string().uuid().optional(),
+})
+
+/**
+ * S652 (Nic): "when no packet is set… it should allow you to create the packet
+ * from that point." Builds the default package for this unit's state and kind
+ * from the landlord's filled slots, right from the invite.
+ */
+signingPackagesRouter.post('/for-unit/:unitId/build-default', requirePerm('leases.create', 'esign.template_manage'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<{ landlord_id: string }>(
+      `SELECT u.landlord_id FROM units u WHERE u.id = $1 AND u.landlord_id = ANY($2::uuid[])`,
+      [req.params.unitId, landlordScopeIds(req.user!)])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    res.json({ success: true, data: await buildDefaultPackageForUnit(landlordScopeIds(req.user!), req.params.unitId) })
+  } catch (e) { next(e) }
 })
 
 /** Every package the landlord has, with its items. */

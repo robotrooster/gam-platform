@@ -182,3 +182,41 @@ describe('what comes back at renewal', () => {
     expect(due.find(d => d.templateName === 'Park Rules')!.why).toBe('Never signed')
   })
 })
+
+// S652 (Nic): "when no packet is set… allow you to create the packet from that point."
+describe('building the default packet from filled slots, at the invite', () => {
+  it('assembles lease + filled slots + government forms, saves it as the default, and is idempotent', async () => {
+    const w = await world()
+    // Drop the seeded default package so nothing resolves for the RV unit.
+    await db.query(`UPDATE document_packages SET archived_at = NOW() WHERE landlord_id = $1`, [w.landlordId])
+    const { buildDefaultPackageForUnit } = await import('./signingPackages')
+    // Nic's properties all have their default lease template set; so does this one.
+    await db.query(`UPDATE lease_templates SET is_unit_type_default = TRUE, base_pdf_url = '/uploads/mh.pdf', is_active = TRUE
+                     WHERE landlord_id = $1 AND purpose = 'lease'`, [w.landlordId])
+    const first = await buildDefaultPackageForUnit([w.landlordId], w.mhUnit)
+    expect(first.packageId).toBeTruthy()
+    expect((first as any).created).toBe(true)
+    const items = (await db.query(
+      `SELECT t.purpose FROM document_package_items i JOIN lease_templates t ON t.id = i.template_id
+        WHERE i.package_id = $1 ORDER BY i.sort_order`, [first.packageId])).rows
+    expect(items[0].purpose).toBe('lease')
+    const pkg = (await db.query(`SELECT is_default, unit_type, state_code FROM document_packages WHERE id=$1`, [first.packageId])).rows[0]
+    expect(pkg.is_default).toBe(true)
+    expect(pkg.unit_type).toBe('mobile_home')
+    // the unfiled documents that fit came along
+    expect(items.map((i: any) => i.purpose)).toEqual(expect.arrayContaining(['lease', 'installment_sale', 'state_disclosure']))
+    const again = await buildDefaultPackageForUnit([w.landlordId], w.mhUnit)
+    expect(again.packageId).toBe(first.packageId)
+    expect((again as any).created).toBe(false)
+  })
+
+  it('with no lease template for that kind of unit, says so and points at Templates', async () => {
+    const w = await world()
+    await db.query(`UPDATE document_packages SET archived_at = NOW() WHERE landlord_id = $1`, [w.landlordId])
+    await db.query(`UPDATE lease_templates SET is_active = FALSE WHERE landlord_id = $1 AND purpose = 'lease'`, [w.landlordId])
+    const { buildDefaultPackageForUnit } = await import('./signingPackages')
+    const r = await buildDefaultPackageForUnit([w.landlordId], w.rvUnit)
+    expect(r.packageId).toBeNull()
+    expect((r as any).needsLease).toBe(true)
+  })
+})

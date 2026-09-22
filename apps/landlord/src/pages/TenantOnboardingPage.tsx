@@ -2,7 +2,7 @@ import { useState, useRef, useMemo, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 // S633: an import lands in ONE company. The account names it.
 import { EntityPicker } from '../components/EntityPicker'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut, apiPatch } from '../lib/api'
@@ -314,10 +314,34 @@ export function PacketChecklist({ unitId, sale, ticked, setTicked }: {
     for (const i of pkg.items) next[i.templateId] = !!i.suggested
     setTicked(next)
   }, [pkg])
+  // S652 (Nic): "no packet yet — build one; not able to build one — take you
+  // to the upload for your templates."
+  const qc = useQueryClient()
+  const [buildErr, setBuildErr] = useState<{ reason: string; needsLease: boolean } | null>(null)
+  const build = useMutation(() => apiPost<any>(`/signing-packages/for-unit/${unitId}/build-default`, {}), {
+    onSuccess: (r: any) => {
+      const d = r?.data ?? r
+      if (d?.packageId) { setBuildErr(null); qc.invalidateQueries(['signing-package-for-unit', unitId, sale]); qc.invalidateQueries('signing-packages') }
+      else setBuildErr({ reason: d?.reason || 'Could not build the packet', needsLease: !!d?.needsLease })
+    },
+    onError: (e: any) => setBuildErr({ reason: e?.message || 'Could not build the packet', needsLease: false }),
+  })
   if (isLoading) return <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10 }}>Loading the packet…</div>
   if (!pkg?.items?.length) return (
-    <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
-      No package for this kind of unit yet — only the default lease drafts. Set one up under GoldSign → Packages.
+    <div style={{ marginBottom: 10, padding: '10px 12px', background: 'var(--bg-2)', borderRadius: 8, border: '1px solid var(--border-0)' }}>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 8 }}>
+        No packet is set for this kind of unit yet. Build one from your documents — the default lease plus every filled slot for this state and kind of space — and it becomes the packet for every invite like this one.
+      </div>
+      {buildErr ? (
+        <div style={{ fontSize: '.74rem', color: 'var(--amber, #d97706)', lineHeight: 1.5 }}>
+          {buildErr.reason}{' '}
+          {buildErr.needsLease && <Link to="/esign" style={{ color: 'var(--gold)', fontWeight: 600 }}>Go to Templates</Link>}
+        </div>
+      ) : (
+        <button type="button" className="btn btn-primary btn-sm" disabled={build.isLoading} onClick={() => build.mutate()}>
+          {build.isLoading ? 'Building…' : 'Build the packet from my documents'}
+        </button>
+      )}
     </div>
   )
   const t = ticked ?? {}

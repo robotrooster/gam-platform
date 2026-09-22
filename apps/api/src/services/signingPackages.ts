@@ -12,7 +12,8 @@
  * work-trade or buying on installment. So the landlord gets a pre-ticked
  * checklist at the moment they already know the tenant.
  */
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
+import { AppError } from '../middleware/errorHandler'
 
 export type RenewalBehavior = 'with_lease' | 'once_per_tenancy' | 'on_version_change'
 
@@ -349,3 +350,101 @@ export async function packageSiblings(documentId: string): Promise<Array<{
     sortOrder: Number(r.sort_order), isSelf: r.id === documentId,
   }))
 }
+
+/**
+ * S652 (Nic): "when no packet is set… it should allow you to create the packet
+ * from that point." Assemble the default package for this unit's state and
+ * kind of space from the landlord's FILLED slots — the same rule as the
+ * Packages page's "Fill from my documents": the default lease, every filled
+ * document slot (their own upload, or the government's version), nothing that
+ * is covered by another document, no notice sent later, no read-only form. An
+ * installment sale contract is included when they have one; the draft decides
+ * per unit whether a sale is happening. Saved as the default for that state ×
+ * unit type so it is simply there next time.
+ *
+ * Returns the package, or a reason it could not be built — the only real one
+ * is "no lease template yet", which is the cue to go upload one.
+ */
+export async function buildDefaultPackageForUnit(
+  landlordIds: string[], unitId: string,
+): Promise<{ packageId: string; created: boolean } | { packageId: null; reason: string; needsLease: boolean }> {
+  const unit = await queryOne<{ landlord_id: string; unit_type: string | null; state: string | null }>(
+    `SELECT u.landlord_id, u.unit_type, p.state FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
+  if (!unit) throw new AppError(404, 'Unit not found')
+  if (!unit.unit_type || !unit.state) return { packageId: null, reason: 'This unit has no kind or state set yet.', needsLease: false }
+
+  const existing = await queryOne<{ id: string }>(
+    `SELECT id FROM document_packages WHERE landlord_id = ANY($1::uuid[]) AND archived_at IS NULL AND is_default
+        AND (unit_type = $2 OR unit_type IS NULL) AND (state_code = $3 OR state_code IS NULL)
+      ORDER BY (unit_type IS NOT NULL) DESC, (state_code IS NOT NULL) DESC LIMIT 1`,
+    [landlordIds, unit.unit_type, unit.state])
+  if (existing) return { packageId: existing.id, created: false }
+
+  const exec = { query: (sql: string, params: any[]) => query<any>(sql, params).then(r => ({ rows: r })) }
+  const { sleevesForLandlord } = await import('./documentSleeves')
+  const { adoptLibraryDocument } = await import('./disclosureLibrary')
+  const view: any = await sleevesForLandlord(exec, landlordIds)
+  const st = view.states.find((x: any) => x.state === unit.state)
+  const fits = (u: string[] | null) => !u || u.includes(unit.unit_type!)
+  const wanted: Array<{ templateId?: string; lib?: string; purpose: string }> = []
+  for (const s of [...(st?.sleeves ?? []), ...(view.federal ?? [])] as any[]) {
+    if (!fits(s.unitTypes) || s.coveredBy?.length) continue
+    if (s.group === 'notices_later' || s.whenItHappens) continue
+    if (s.kind === 'government') {
+      if (s.signable === false) continue
+      wanted.push(s.cards[0] ? { templateId: s.cards[0].templateId, purpose: 'state_disclosure' } : { lib: s.libraryDocumentId, purpose: 'state_disclosure' })
+    } else if (s.cards.length) {
+      const pick = s.kind === 'lease' ? (s.cards.find((c: any) => c.isUnitTypeDefault) ?? s.cards[0]) : s.cards[0]
+      wanted.push({ templateId: pick.templateId, purpose: s.kind === 'lease' ? 'lease' : s.kind === 'sale_contract' ? 'installment_sale' : 'state_disclosure' })
+    } else if (s.freeVersion && s.freeVersion.signable !== false) {
+      wanted.push(s.freeVersion.templateId ? { templateId: s.freeVersion.templateId, purpose: s.kind === 'lease' ? 'lease' : 'state_disclosure' }
+                                           : { lib: s.freeVersion.libraryDocumentId, purpose: s.kind === 'lease' ? 'lease' : 'state_disclosure' })
+    }
+  }
+  // Not every document is filed in a slot — older uploads, and a test
+  // database with no slot catalog at all. The unit type's default lease is the
+  // lease whatever slot it sits in, and unfiled documents that fit this kind
+  // of unit ride along, the way the Templates page lists them under Other.
+  if (!wanted.some(w => w.purpose === 'lease')) {
+    const { resolveDefaultTemplateForUnit } = await import('./templateResolve')
+    const dflt = await resolveDefaultTemplateForUnit(unitId)
+    if (dflt?.id) wanted.unshift({ templateId: dflt.id, purpose: 'lease' })
+  }
+  for (const o of (view.other ?? []) as any[]) {
+    if (o.purpose === 'lease' || o.purpose === 'work_trade_addendum') continue
+    if (o.unitType && o.unitType !== unit.unit_type) continue
+    if (!wanted.some(w => w.templateId === o.templateId)) {
+      wanted.push({ templateId: o.templateId, purpose: o.purpose === 'installment_sale' ? 'installment_sale' : 'state_disclosure' })
+    }
+  }
+  if (!wanted.some(w => w.purpose === 'lease')) {
+    return { packageId: null, reason: 'There is no lease template for this kind of unit yet. Upload one under Templates and the packet builds from it.', needsLease: true }
+  }
+  // The company that runs this state files the package and holds the copies.
+  const fileUnder = unit.landlord_id
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const { US_STATE_NAME, UNIT_TYPE_LABEL } = await import('@gam/shared')
+    const name = `${(US_STATE_NAME as any)[unit.state] ?? unit.state} — ${(UNIT_TYPE_LABEL as any)[unit.unit_type] ?? unit.unit_type}`
+    const pkg = await client.query(
+      `INSERT INTO document_packages (landlord_id, name, description, unit_type, is_default, state_code)
+       VALUES ($1,$2,$3,$4,true,$5) RETURNING id`,
+      [fileUnder, name, 'Built from your filled document slots at the invite.', unit.unit_type, unit.state]).then(r => r.rows[0])
+    let order = 0
+    const seen = new Set<string>()
+    for (const w of wanted) {
+      let templateId = w.templateId
+      if (!templateId && w.lib) templateId = (await adoptLibraryDocument(client as any, fileUnder, w.lib)).templateId
+      if (!templateId || seen.has(templateId)) continue
+      seen.add(templateId)
+      await client.query(
+        `INSERT INTO document_package_items (package_id, template_id, sort_order, renewal_behavior, required)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (package_id, template_id) DO NOTHING`,
+        [pkg.id, templateId, order++, w.purpose === 'lease' ? 'with_lease' : 'once_per_tenancy', w.purpose === 'lease'])
+    }
+    await client.query('COMMIT')
+    return { packageId: pkg.id, created: true }
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
+}
+
