@@ -155,6 +155,20 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
     field_type: 'signature', signer_role: 'primary',
   }
 
+  async function fontsDrawn(file: string): Promise<string[]> {
+    const { PDFDocument: Doc, PDFName, PDFArray, PDFDict, decodePDFRawStream } = await import('pdf-lib')
+    const doc = await Doc.load(fs.readFileSync(file))
+    const page = doc.getPages()[0]
+    const contents: any = page.node.Contents()
+    const streams = contents instanceof PDFArray
+      ? contents.asArray().map((r: any) => doc.context.lookup(r)) : [contents]
+    let ops = ''
+    for (const st of streams) ops += Buffer.from(decodePDFRawStream(st as any).decode()).toString('latin1')
+    const fonts = page.node.Resources()!.lookup(PDFName.of('Font'), PDFDict)
+    return [...ops.matchAll(/\/(\S+)\s+[\d.]+\s+Tf/g)].map(m =>
+      String(fonts.lookup(PDFName.of(m[1]), PDFDict).lookup(PDFName.of('BaseFont'))))
+  }
+
   it('an italic/script choice does not render in the body font', async () => {
     const src = await makeSourcePdf(1)
     const styled = path.join(os.tmpdir(), `s637-styled-${randomUUID()}.pdf`)
@@ -165,8 +179,10 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
       font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [], styled)
     await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [], plain)
 
-    // Different embedded faces produce different bytes for the same name.
-    expect(fs.readFileSync(styled).length).not.toBe(fs.readFileSync(plain).length)
+    // S652: ask which face actually DREW the name. Comparing file lengths
+    // failed the day two different faces happened to produce equal lengths.
+    expect(await fontsDrawn(styled)).toContain('/Times-Italic')
+    expect(await fontsDrawn(plain)).not.toContain('/Times-Italic')
   })
 
   it('a missing choice still stamps, and never throws', async () => {
