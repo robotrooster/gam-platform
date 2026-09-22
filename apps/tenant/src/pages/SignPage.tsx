@@ -540,6 +540,14 @@ export function SignPage() {
 
   const { signer, document:doc, fields, readOnly, waitingOn, packageDocs } = data
   const allFields = fields || []
+
+  // S652: the next document in this packet that still needs THIS signer. Blu
+  // signed nine leases and never saw the eight documents behind each one.
+  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
+  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
+  const needsMe = (d:any) => d.mine && d.mine.status !== 'signed' && d.mine.status !== 'declined' && d.status !== 'completed' && d.status !== 'voided'
+  const nextForMe = [...bundle.slice(selfAt + 1), ...bundle.slice(0, Math.max(selfAt, 0))].find((d:any)=> !d.isSelf && needsMe(d))
+  const leftForMe = bundle.filter((d:any)=> !d.isSelf && needsMe(d)).length
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
   // child to its parent by (child.parentFieldId == parent.templateFieldId).
@@ -680,13 +688,18 @@ export function SignPage() {
       <h2 style={{ color:'var(--text-0)', margin:0 }}>{allDone?'Document Fully Executed!':'Signatures Submitted!'}</h2>
       <p style={{ color:'var(--text-3)', maxWidth:400, lineHeight:1.6 }}>{allDone?'All parties have signed. A copy will be sent to your email.':'Your signatures have been recorded. The next party will be notified.'}</p>
       <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Signed: {new Date().toLocaleString()} · UETA & E-SIGN Act compliant</div>
-      <button className="btn btn-primary" onClick={()=>navigate('/lease')}>Back to Lease</button>
+      {nextForMe && nextForMe.mine?.token && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          This is part of a packet — {leftForMe} more document{leftForMe===1?'':'s'} in it still need your signature.
+        </div>
+      )}
+      {nextForMe && nextForMe.mine?.token
+        ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+nextForMe.mine.token) }}>Next: {nextForMe.title} →</button>
+        : <button className="btn btn-primary" onClick={()=>navigate('/lease')}>Back to Lease</button>}
     </div>
   )
 
   // S641: where this document sits in its bundle, and how much is left.
-  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
-  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
   const packagePosition = bundle.length > 1 && selfAt >= 0
     ? {
         index: selfAt + 1,

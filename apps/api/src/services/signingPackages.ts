@@ -334,20 +334,31 @@ export async function assemblePackageDocuments(
  * The other documents in this document's bundle, in order — what the signing
  * screen needs to say "2 of 4" and to move somebody to the next one.
  */
-export async function packageSiblings(documentId: string): Promise<Array<{
+export async function packageSiblings(documentId: string, forUserId?: string | null): Promise<Array<{
   id: string; title: string; status: string; sortOrder: number; isSelf: boolean
+  /** S652: this signer's own row on the sibling — their status and the token that opens it. */
+  mine: { status: string; token: string | null } | null
 }>> {
+  // S652 (Nic, from Blu): "none of the packets included the installment
+  // contract." They did — it was document 2 of 9. Blu signed the lease, the
+  // done screen said "the next party will be notified", and nothing led him to
+  // the other eight, which sat waiting on HIM. So every sibling now carries the
+  // signer's own status and token, and the page can walk them from one to the
+  // next.
   const rows = await query<any>(
-    `SELECT d.id, d.title, d.status, COALESCE(d.package_sort_order, 0) AS sort_order
+    `SELECT d.id, d.title, d.status, COALESCE(d.package_sort_order, 0) AS sort_order,
+            s.status AS my_status, s.token AS my_token
        FROM lease_documents d
+       LEFT JOIN lease_document_signers s ON s.document_id = d.id AND s.user_id = $2
       WHERE d.package_group_id = (SELECT package_group_id FROM lease_documents WHERE id = $1)
         AND d.package_group_id IS NOT NULL
         AND d.voided_at IS NULL
       ORDER BY d.package_sort_order, d.created_at`,
-    [documentId])
+    [documentId, forUserId ?? null])
   return rows.map(r => ({
     id: r.id, title: r.title, status: r.status,
     sortOrder: Number(r.sort_order), isSelf: r.id === documentId,
+    mine: r.my_status ? { status: r.my_status, token: r.my_token ?? null } : null,
   }))
 }
 

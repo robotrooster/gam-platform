@@ -239,6 +239,34 @@ describe('drafting a package as one bundle', () => {
     expect(siblings[0].isSelf).toBe(true)
   })
 
+  // S652 (Blu): the lease's done screen has to lead to the next document that
+  // still needs THIS signer — otherwise a nine-document packet ends after one.
+  it('siblings carry the signer\'s own status and token so the page can walk them', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Mobile Home Lease',
+        packageTemplateIds: [f.rules, f.inst],
+        homeSale: { tenantId: f.tenantId, salePrice: 24000, downPayment: 2000,
+                    annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
+        signers: [
+          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: 'l@x.dev' },
+          { userId: f.tenantUserId, role: 'primary', name: 'Tenant', email: 't@x.dev' },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const forLandlord = await packageSiblings(res.body.data.id, f.a.userId)
+    expect(forLandlord).toHaveLength(3)
+    for (const d of forLandlord) {
+      expect(d.mine).not.toBeNull()
+      expect(d.mine!.status).not.toBe('signed')
+      expect(d.mine!.token).toBeTruthy()
+    }
+    const forNobody = await packageSiblings(res.body.data.id, randomUUID())
+    expect(forNobody.every(d => d.mine === null)).toBe(true)
+  })
+
   // An installment contract must stay a separate instrument. Nic: the current
   // Country Acres owner bundles lot rent and the trailer into one flat price,
   // "so you don't know what's getting paid to lot rent and what's getting paid

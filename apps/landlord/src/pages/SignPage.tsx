@@ -509,8 +509,16 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields, readOnly } = data
+  const { signer, document:doc, fields, readOnly, packageDocs } = data
   const allFields = fields || []
+
+  // S652: the next document in this packet that still needs THIS signer. Blu
+  // signed nine leases and never saw the eight documents behind each one.
+  const bundle: any[] = Array.isArray(packageDocs) ? packageDocs : []
+  const selfAt = bundle.findIndex((d:any)=> d.isSelf)
+  const needsMe = (d:any) => d.mine && d.mine.status !== 'signed' && d.mine.status !== 'declined' && d.status !== 'completed' && d.status !== 'voided'
+  const nextForMe = [...bundle.slice(selfAt + 1), ...bundle.slice(0, Math.max(selfAt, 0))].find((d:any)=> !d.isSelf && needsMe(d))
+  const leftForMe = bundle.filter((d:any)=> !d.isSelf && needsMe(d)).length
   // S556: conditional (nested) fields. A child radio is only shown/required
   // when its parent's current selection == the child's trigger option. Match a
   // child to its parent by (child.parentFieldId == parent.templateFieldId).
@@ -661,8 +669,15 @@ export function SignPage() {
           back to a list of finished ones between each is friction on repeat. The
           signing queue is the destination; Leases stays one click away for when
           the batch is actually done. */}
+      {nextForMe && nextForMe.mine?.token && (
+        <div style={{ fontSize:'.85rem', color:'var(--text-2)', maxWidth:440, lineHeight:1.5 }}>
+          This is part of a packet — {leftForMe} more document{leftForMe===1?'':'s'} in it still need your signature.
+        </div>
+      )}
       <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', justifyContent:'center' }}>
-        <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>
+        {nextForMe && nextForMe.mine?.token
+          ? <button className="btn btn-primary" onClick={()=>{ setStage('signing'); navigate('/sign/'+nextForMe.mine.token) }}>Next: {nextForMe.title} →</button>
+          : <button className="btn btn-primary" onClick={()=>navigate('/esign')}>Sign the next one</button>}
         <button className="btn btn-ghost" onClick={()=>navigate('/leases')}>Back to Leases</button>
       </div>
     </div>
@@ -682,6 +697,11 @@ export function SignPage() {
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
+          {bundle.length > 1 && selfAt >= 0 && (
+            <div style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600 }}>
+              Document {selfAt + 1} of {bundle.length}{leftForMe > 0 ? ` · ${leftForMe} more for you to sign` : ' · the last one for you'}
+            </div>
+          )}
           {/* S629 (Nic): "it said four out of twenty three required fields
               complete without me completing anything." They were filled — by
               the lease data and the signing date — but calling machine-filled

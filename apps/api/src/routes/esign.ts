@@ -5089,7 +5089,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     // one ceremony rather than a series of unrelated requests arriving days
     // apart. Nic: "a lot of people are gonna be like, well, I already signed the
     // lease, what's this for?"
-    const packageDocs = doc.package_group_id ? await packageSiblings(doc.id) : []
+    const packageDocs = doc.package_group_id ? await packageSiblings(doc.id, signer.user_id) : []
 
     // S648: page 8 locks differently for an onboarding resident.
     const { isExistingTenancyDocument } = await import('../services/moveInBoxes')
