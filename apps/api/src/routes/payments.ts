@@ -1058,6 +1058,35 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S652 (Nic): POST a payment that arrived before there was a bill — a check
+// paid ahead for October. Settles what is open, banks the rest as paid ahead.
+const postPaymentSchema = z.object({
+  tenantId:   z.string().uuid(),
+  method:     z.enum(MANUAL_PAYMENT_METHODS),
+  amount:     z.number().positive(),
+  reference:  z.string().max(64).optional().nullable(),
+  notes:      z.string().max(500).optional().nullable(),
+  receivedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+})
+paymentsRouter.post('/post-payment', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = postPaymentSchema.parse(req.body)
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Landlord scope required')
+    await client.query('BEGIN')
+    const { postTenantPayment } = await import('../services/postPayment')
+    const r = await postTenantPayment(client, {
+      tenantId: body.tenantId, landlordIds, method: body.method, amount: body.amount,
+      reference: body.reference ?? null, notes: body.notes ?? null,
+      receivedAt: body.receivedAt ? new Date(body.receivedAt + 'T12:00:00') : null,
+      postedBy: req.user!.userId,
+    })
+    await client.query('COMMIT')
+    res.json({ success: true, data: r })
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); next(e) } finally { client.release() }
+})
+
 // POST /api/payments/:id/record-manual — S562.
 //
 // Landlord/staff records that a tenant paid a pending rent charge OFF-PLATFORM

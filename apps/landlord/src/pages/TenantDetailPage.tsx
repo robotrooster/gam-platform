@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery, useMutation } from 'react-query'
-import { humanize } from '@gam/shared'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
@@ -134,6 +134,7 @@ export function TenantDetailPage() {
             </div>
           </div>
 
+          <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} paidAhead={Number(data.paidAhead ?? 0)} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
           <div className="card" style={{ marginBottom: 16 }}>
@@ -441,6 +442,87 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
         </div>
       </div>
+    </div>
+  )
+}
+
+
+// S652 (Nic): "there's only a way to add a charge. There's no way to post a
+// payment." A check that arrived before its bill: settles what is open, and
+// the rest is paid ahead — drawn down by the next invoice before it goes out.
+function PostPaymentCard({ tenantId, hasUnit, paidAhead }: { tenantId: string; hasUnit: boolean; paidAhead: number }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [amount, setAmount] = useState('')
+  const [method, setMethod] = useState<string>('check')
+  const [reference, setReference] = useState('')
+  const [receivedAt, setReceivedAt] = useState(new Date().toISOString().slice(0, 10))
+  const [notes, setNotes] = useState('')
+  const [error, setError] = useState('')
+  const today = new Date().toISOString().slice(0, 10)
+  const save = useMutation(
+    () => apiPost<any>('/payments/post-payment', {
+      tenantId, method, amount: Number(amount), reference: reference.trim() || null,
+      notes: notes.trim() || null, receivedAt,
+    }),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toast(`Posted — ${fmt(d.applied)} to open charges, ${fmt(d.paidAhead)} paid ahead.`)
+        qc.invalidateQueries(['tenant-profile', tenantId])
+        setOpen(false); setAmount(''); setReference(''); setNotes('')
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not post that payment'),
+    },
+  )
+  const ready = Number(amount) > 0 && (method === 'cash' || reference.trim().length > 0 || true)
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+        <div className="card-title" style={{ marginBottom: 0 }}>Payments</div>
+        {hasUnit && (
+          <button className="btn btn-primary btn-sm" onClick={() => { setError(''); setOpen(true) }}>
+            <Plus size={13}/> Post a payment
+          </button>
+        )}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+        Cash, a check or a money order handed over. It settles whatever is open first; anything
+        beyond that is paid ahead and comes off their next invoice before it goes out.
+      </div>
+      {paidAhead > 0 && (
+        <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.25)', fontSize: '.8rem', color: 'var(--text-0)' }}>
+          Paid ahead: <strong className="mono">{fmt(paidAhead)}</strong> — covers their next invoice.
+        </div>
+      )}
+      {open && (
+        <div className="modal-overlay" onClick={() => setOpen(false)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title">Post a payment</div>
+            <label style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:4, display:'block' }}>Amount received</label>
+            <input className="form-input" type="number" min="0.01" step="0.01" value={amount} placeholder="450.00" onChange={e => setAmount(e.target.value)} autoFocus />
+            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>How</label>
+            <select className="form-select" value={method} onChange={e => setMethod(e.target.value)}>
+              {MANUAL_PAYMENT_METHODS.map(m => <option key={m} value={m}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</option>)}
+            </select>
+            {method !== 'cash' && (<>
+              <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>{method === 'check' ? 'Check number' : 'Money order number'}</label>
+              <input className="form-input" value={reference} maxLength={64} onChange={e => setReference(e.target.value)} />
+            </>)}
+            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>Date received</label>
+            <input className="form-input" type="date" value={receivedAt} max={today} onChange={e => setReceivedAt(e.target.value)} />
+            <label style={{ fontSize:'.75rem', color:'var(--text-3)', margin:'10px 0 4px', display:'block' }}>Note <span style={{ color:'var(--text-3)' }}>(yours; the tenant does not see it)</span></label>
+            <textarea className="form-input" rows={2} value={notes} maxLength={500} onChange={e => setNotes(e.target.value)} />
+            {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+              <button className="btn btn-primary" disabled={!ready || save.isLoading} onClick={() => { setError(''); save.mutate() }}>
+                {save.isLoading ? 'Posting…' : 'Post payment'}
+              </button>
+              <button className="btn btn-ghost" onClick={() => setOpen(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

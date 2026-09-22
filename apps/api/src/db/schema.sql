@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict bfiNbfqK1hjUfXRt6ehm9RLDQUFzEjg7Rd84xn5ZhBOrqxhanbogGL6JCkaQkRZ
+\restrict 4xwZiZJTfRUaOVfVgfnifpO9oKq46Ht7JpJNEgn7tpBgbYeHXlxhWnjomvUcDMa
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -10039,9 +10039,12 @@ CREATE TABLE public.tenant_remittances (
     settled_at timestamp with time zone,
     gross_amount numeric(12,2),
     processing_fee_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    reference text,
+    notes text,
+    received_by uuid,
     CONSTRAINT tenant_remittances_amount_check CHECK ((amount > (0)::numeric)),
     CONSTRAINT tenant_remittances_applied_amount_check CHECK ((applied_amount >= (0)::numeric)),
-    CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text]))),
+    CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text, 'cash'::text, 'check'::text, 'money_order'::text]))),
     CONSTRAINT tenant_remittances_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'settled'::text, 'failed'::text]))),
     CONSTRAINT tenant_remittances_unapplied_amount_check CHECK ((unapplied_amount >= (0)::numeric))
 );
@@ -10059,6 +10062,20 @@ COMMENT ON COLUMN public.tenant_remittances.gross_amount IS 'S616: what Stripe a
 --
 
 COMMENT ON COLUMN public.tenant_remittances.processing_fee_amount IS 'S616: the processing fee the TENANT bore on top, which is zero when the property routes the fee to the landlord. gross_amount − this = the obligation collected.';
+
+
+--
+-- Name: COLUMN tenant_remittances.reference; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.reference IS 'S652: the check or money-order number, as handed over.';
+
+
+--
+-- Name: COLUMN tenant_remittances.received_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_remittances.received_by IS 'S652: who at the office posted this manual receipt.';
 
 
 --
@@ -27064,6 +27081,14 @@ ALTER TABLE ONLY public.tenant_remittances
 
 
 --
+-- Name: tenant_remittances tenant_remittances_received_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_remittances
+    ADD CONSTRAINT tenant_remittances_received_by_fkey FOREIGN KEY (received_by) REFERENCES public.users(id);
+
+
+--
 -- Name: tenant_remittances tenant_remittances_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27971,5 +27996,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict bfiNbfqK1hjUfXRt6ehm9RLDQUFzEjg7Rd84xn5ZhBOrqxhanbogGL6JCkaQkRZ
+\unrestrict 4xwZiZJTfRUaOVfVgfnifpO9oKq46Ht7JpJNEgn7tpBgbYeHXlxhWnjomvUcDMa
 

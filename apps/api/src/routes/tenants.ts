@@ -2285,7 +2285,11 @@ tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (r
     if (!req.file) throw new AppError(400, 'No file')
     const url = '/api/tenants/avatar-files/' + req.file.filename
     if (req.user!.profileId!) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId!])
-    res.json({ success: true, data: { url } })
+    // S652: money that arrived before its bill — shown so nobody posts it twice.
+    const paidAhead = Number((await queryOne<{ n: string }>(
+      `SELECT COALESCE(SUM(amount_remaining), 0)::text AS n FROM lease_prepaid_credits WHERE tenant_id = $1 AND amount_remaining > 0`,
+      [req.params.id]))?.n ?? 0)
+    res.json({ success: true, data: { paidAhead, url } })
   } catch(e) { next(e) }
 })
 
