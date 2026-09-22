@@ -51,7 +51,11 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
   const qc = useQueryClient()
   const [linking, setLinking] = useState(false)
   const [linkErr, setLinkErr] = useState<string | null>(null)
-  const [view, setView] = useState<'needs_review' | 'categorized' | 'ignored'>('needs_review')
+  // S652 (Nic): "that $4,154.89 is not showing up on the transactions tab."
+  // It was there — imported at midnight and MATCHED to GAM's own payout, which
+  // is exactly right (a payout landing is never income) — but no view showed
+  // matched rows. Now one does.
+  const [view, setView] = useState<'needs_review' | 'matched' | 'categorized' | 'ignored'>('needs_review')
 
   // S629 (Nic): "a property selector or entity selector, to view the
   // transaction logs and stuff specific to that entity." The feed was pinned
@@ -348,9 +352,10 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
 
       {/* Transaction views */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        {(['needs_review', 'categorized', 'ignored'] as const).map(v => (
+        {(['needs_review', 'matched', 'categorized', 'ignored'] as const).map(v => (
           <button key={v} className={`btn btn-sm ${view === v ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setView(v)}>
-            {v === 'needs_review' ? `Needs review${reviewCount && view === v ? ` (${reviewCount})` : ''}` : v === 'categorized' ? 'Categorized' : 'Ignored'}
+            {v === 'needs_review' ? `Needs review${reviewCount && view === v ? ` (${reviewCount})` : ''}`
+              : v === 'matched' ? 'GAM payouts' : v === 'categorized' ? 'Categorized' : 'Ignored'}
           </button>
         ))}
       </div>
@@ -358,7 +363,8 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
       <div className="card">
         {isLoading ? <div style={{ color: 'var(--text-3)' }}>Loading…</div>
           : txns.length === 0 ? <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>
-              {view === 'needs_review' ? 'Nothing to review. Sync a linked bank to pull new transactions.' : 'None.'}
+              {view === 'needs_review' ? 'Nothing to review. Sync a linked bank to pull new transactions.'
+                : view === 'matched' ? 'No GAM payouts have landed in this bank yet.' : 'None.'}
             </div>
           : <div style={{ display: 'grid', gap: 10 }}>
               {txns.map((t: any) => {
@@ -428,6 +434,11 @@ export function BankFeedPage({ embedded = false }: { embedded?: boolean } = {}) 
                     {view === 'categorized' && (
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
                         Added to your {isExpense ? 'expenses' : 'income'}.
+                      </div>
+                    )}
+                    {view === 'matched' && (
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        A GAM payout landing in your bank — matched to the disbursement, so it is never counted as income twice.
                       </div>
                     )}
                   </div>

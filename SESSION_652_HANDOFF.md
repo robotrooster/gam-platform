@@ -795,3 +795,6 @@ Nic: "the bank feed and reconciliation need to be on a separate page." Bank page
 
 ## Bank balance four days stale (Nic, 2026-09-22) — deploy 52
 The 7:00 banking-day job asked Stripe to refresh the balance and read the account back in the same call — before the bank had answered — so it recorded the previous figure every morning (GAM: $206,520.82 as of 9/18; Stripe: $211,088.71 as of 9/21). `refreshBalance` now waits for Stripe's `balance_refresh.status` to leave `pending` (polls up to ~12 s) before writing, and records the account's stated balance (`current`) rather than the "available" subset. Sync refreshes the balance as well as transactions (best-effort). Wells Fargo 8739 re-read by hand: $211,088.71 as of 9/21.
+
+## "GAM payouts" view on the bank feed (Nic, 2026-09-22) — deploy 53
+The $4,154.89 and $413 payouts were in the feed (imported at midnight, matched to their disbursements) but no view showed matched rows. Bank feed tab now has **GAM payouts** beside Needs review / Categorized / Ignored.
