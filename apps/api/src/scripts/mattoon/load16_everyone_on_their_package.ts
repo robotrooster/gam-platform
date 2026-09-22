@@ -72,11 +72,11 @@ async function main() {
       const t = TERMS[String(row.lot)]
       const monthly = t?.monthly ?? Number(row.rto_pay ?? 0)
       const payments = t?.payments ?? Number(String(row.months_left ?? '').replace(/\D/g, ''))
+      // No number to write = no contract to write; the lease and disclosures
+      // do not wait on it. Blu adds the installment contract when he has it.
       if (!(monthly > 0) || !(payments > 0)) {
-        held.push(`${label} (${household.join(' + ')}): sheet says installments but $${monthly} × ${payments || '?'} months — "${row.notes ?? ''}"`)
-        continue
-      }
-      terms = { monthly, payments, why: t?.why ?? `sheet: $${row.amount_left} left, ${payments} months, $${monthly}/mo` }
+        console.log(`\n${label}: sheet says installments but $${monthly} × ${payments || '?'} months — "${row.notes ?? ''}" — drafting the lease without a sale`)
+      } else terms = { monthly, payments, why: t?.why ?? `sheet: $${row.amount_left} left, ${payments} months, $${monthly}/mo` }
     }
 
     console.log(`\n${prop.name} · ${unit.unit_number} — ${tenantOwned ? 'tenant-owned home, lot lease' : terms ? 'park-owned home on installments' : 'park-owned home, rental'}`)
