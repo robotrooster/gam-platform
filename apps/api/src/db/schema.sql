@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict FFpE7m9WLkRtE3mRnXP8xPTqMdnLMrh8aBzrWXzQg12Qg7P5SVR1quxZF5FMAYT
+\restrict gZt7nbmD8aP9L1PtdNnoMdTfSVptAF6WVfnBiNYNwKagjedsGXhvPMyOkWoS6iR
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -5203,6 +5203,7 @@ CREATE TABLE public.landlords (
     platform_locked_reason text,
     platform_locked_by uuid,
     uncollectable_notice_at timestamp with time zone,
+    review_utility_bills boolean DEFAULT false NOT NULL,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_first_billing_cycle_is_month CHECK (((first_billing_cycle IS NULL) OR (date_trunc('month'::text, (first_billing_cycle)::timestamp with time zone) = first_billing_cycle))),
@@ -27966,5 +27967,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict FFpE7m9WLkRtE3mRnXP8xPTqMdnLMrh8aBzrWXzQg12Qg7P5SVR1quxZF5FMAYT
+\unrestrict gZt7nbmD8aP9L1PtdNnoMdTfSVptAF6WVfnBiNYNwKagjedsGXhvPMyOkWoS6iR
 

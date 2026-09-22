@@ -9,8 +9,9 @@
  * So nothing here prices anything. The bills on the review are computed by the
  * SAME engine the invoice run uses (generateBillsForProperty), just earlier, and
  * left unissued: a tenant never sees an unissued bill (GET /utility/bills), and
- * an invoice that would carry them is held until the landlord approves
- * (invoiceGeneration). Platform-wide, every property, one way (Nic). Correcting a read throws the
+ * where the company chose to review (landlords.review_utility_bills), an
+ * invoice that would carry them is held until the landlord approves
+ * (invoiceGeneration). Off, the bills go through on their own. Correcting a read throws the
  * unissued bills away so the same engine prices them again from the fixed read.
  */
 import { query, queryOne } from '../db'
@@ -27,8 +28,9 @@ const cycleDateOf = (d: any) => {
 /** Everything the review page shows for one reading run. */
 export async function billReview(runId: string) {
   const run = await queryOne<any>(
-    `SELECT r.*, p.name AS property_name
-       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id WHERE r.id = $1`, [runId])
+    `SELECT r.*, p.name AS property_name, l.review_utility_bills
+       FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
+       JOIN landlords l ON l.id = r.landlord_id WHERE r.id = $1`, [runId])
   if (!run) throw new AppError(404, 'Reading run not found')
   const cycle = cycleDateOf(run.billing_cycle_month)
 
@@ -79,7 +81,7 @@ export async function billReview(runId: string) {
     run: {
       id: run.id, propertyId: run.property_id, propertyName: run.property_name, cycle,
       utilityType: run.utility_type, status: run.status,
-      approvedAt: run.approved_at,
+      approvedAt: run.approved_at, reviewRequired: run.review_utility_bills === true,
     },
     lines,
     totals: {

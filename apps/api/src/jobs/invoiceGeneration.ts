@@ -435,14 +435,15 @@ async function runGeneration(
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
-      // S652 (Nic, platform-wide): this invoice waits — whole, like the two
-      // holds above — until the landlord approves the reading run its
-      // utilities come from. "He'd rather fix it before the people get billed
-      // than wait till they complain." One unread meter still holds only ITS
-      // unit; approval never needs every meter read.
+      // S652 (Nic): a company that chose to review its utility bills has this
+      // invoice wait — whole, like the two holds above — until the landlord
+      // approves the reading run its utilities come from. "He'd rather fix it
+      // before the people get billed than wait till they complain." One unread
+      // meter still holds only ITS unit; approval never needs every meter read.
       const reviewHold = (readHold || flagHold) ? null : await queryOne<{ id: string }>(
         `SELECT r.id
            FROM utility_reading_runs r
+           JOIN landlords ll ON ll.id = r.landlord_id AND ll.review_utility_bills
            JOIN utility_meters m ON m.property_id = r.property_id
                                 AND m.billing_method IN ('submeter','rubs')
                                 AND (r.utility_type IS NULL OR m.utility_type = r.utility_type)

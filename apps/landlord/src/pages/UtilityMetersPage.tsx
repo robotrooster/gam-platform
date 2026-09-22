@@ -266,10 +266,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
               </button>
               {canReview && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" onClick={() => setReviewRunId(openRun.id)}>
-                  Review bills &amp; approve
+                  {openRun.needsApproval ? 'Review bills & approve' : 'Review bills'}
                 </button>
               )}
-              {false && (
+              {!openRun.needsApproval && (openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" disabled={forceCompleteMut.isLoading}
                   onClick={()=>{ appConfirm('Complete this run now? Unread meters produce no bill this cycle and their held invoices release. Flagged reads still need your review before their unit\'s invoice goes out.', { confirmLabel: 'Complete run' }).then(ok => { if (ok) forceCompleteMut.mutate(openRun.id) }) }}>
                   Complete now
@@ -2855,7 +2855,9 @@ function ReviewBillsModal({ runId, onClose, onDone }: { runId: string; onClose: 
               {approved ? <span style={{ fontSize:'.8rem', color:'var(--green)' }}>Approved — these went out on each tenant's invoice.</span> : (
                 <>
                   <span style={{ fontSize:'.74rem', color:'var(--text-3)', flex:1 }}>
-                    Nothing from this month goes to tenants until you approve. An unread or flagged meter bills nothing and holds only its own unit — approving never waits on it.
+                    {run.reviewRequired
+                      ? 'Nothing from this month goes to tenants until you approve. An unread or flagged meter bills nothing and holds only its own unit — approving never waits on it.'
+                      : 'Bills go out on their own as meters are read. Approving now closes the month and issues what is read; unread meters bill nothing this month.'}
                   </span>
                   <button className="btn btn-ghost" onClick={onClose}>Close</button>
                   <button className="btn btn-primary" disabled={approve.isLoading} onClick={() => approve.mutate()}>

@@ -1156,6 +1156,8 @@ utilityRouter.get('/reading-runs', requireMeterReader, async (req, res, next) =>
     await assertMeterReadAccess(req.user, propertyId, property.landlord_id)
     const runs = await query<any>(
       `SELECT r.*,
+              -- S652: does this company hold the month for the landlord's approval?
+              (SELECT l.review_utility_bills FROM landlords l WHERE l.id = r.landlord_id) AS needs_approval,
               (SELECT COUNT(*)::int FROM utility_meters m
                 WHERE m.property_id = r.property_id
                   AND m.billing_method IN ('submeter','rubs')) AS meters_total,

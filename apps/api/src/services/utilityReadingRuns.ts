@@ -487,7 +487,7 @@ async function tellLandlordBillsAreReady(runId: string) {
     `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
        FROM utility_reading_runs r JOIN properties p ON p.id = r.property_id
        JOIN landlords l ON l.id = p.landlord_id JOIN users u ON u.id = l.user_id
-      WHERE r.id = $1`, [runId])
+      WHERE r.id = $1 AND l.review_utility_bills`, [runId])
   if (!r) return
   const month = new Date(String(r.billing_cycle_month).slice(0, 10) + 'T00:00:00Z')
     .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
@@ -522,12 +522,15 @@ export async function countEscalations(runId: string): Promise<number> {
  * 'double_check' (the normal path once verification finishes).
  */
 export async function completeReadingRun(runId: string, userId: string, opts: { approve?: boolean } = {}) {
-  const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [runId])
+  const run = await queryOne<any>(
+    `SELECT r.*, l.review_utility_bills FROM utility_reading_runs r
+       JOIN landlords l ON l.id = r.landlord_id WHERE r.id = $1`, [runId])
   if (!run || run.status === 'completed') return run
-  // S652 (Nic, platform-wide): a month's utility bills go out only on the
-  // landlord's approval. The walk finishing is not that — it leaves the run
-  // waiting, and the landlord is told the bills are ready to look over.
-  if (!run.approved_at && !opts.approve) return run
+  // S652 (Nic): a company that chose to review its utility bills issues them
+  // only on the landlord's approval. The walk finishing is not that — it
+  // leaves the run waiting, and the landlord is told the bills are ready.
+  // Everyone else's bills go through on their own, as they always did.
+  if (run.review_utility_bills && !run.approved_at && !opts.approve) return run
   if (opts.approve && !run.approved_at) {
     await query(`UPDATE utility_reading_runs SET approved_at = NOW(), approved_by_user_id = $2 WHERE id = $1`, [runId, userId])
   }

@@ -1259,6 +1259,8 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
 landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_approval'), async (req, res, next) => {
   try {
     const { businessName, ein, maintApprovalThreshold, depositReturnApprovalThreshold, defaultEarlyTerminationMonthsRent } = req.body
+    // S652 (Nic): whether this company reviews utility bills before they go out.
+    const reviewUtilityBills = typeof req.body?.reviewUtilityBills === 'boolean' ? req.body.reviewUtilityBills : null
     // S633: these are a COMPANY's details — its legal name, its EIN, its
     // approval thresholds. The account names which one it is editing.
     const settingsLandlordId = resolveLandlordTarget(req.user!, req.body?.landlordId, 'company')
@@ -1273,11 +1275,12 @@ landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_appr
         maint_approval_threshold = COALESCE($3, maint_approval_threshold),
         deposit_return_approval_threshold = COALESCE($5, deposit_return_approval_threshold),
         default_early_termination_months_rent = ${clearMonths ? 'NULL' : 'COALESCE($6, default_early_termination_months_rent)'},
+        review_utility_bills = COALESCE(${clearMonths ? '$6' : '$7'}, review_utility_bills),
         updated_at = NOW()
       WHERE id = $4`,
       clearMonths
-        ? [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null]
-        : [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null, defaultEarlyTerminationMonthsRent||null]
+        ? [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null, reviewUtilityBills]
+        : [businessName||null, ein||null, maintApprovalThreshold||null, settingsLandlordId, depositReturnApprovalThreshold ?? null, defaultEarlyTerminationMonthsRent||null, reviewUtilityBills]
     )
     const updated = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [settingsLandlordId])
     res.json({ success: true, data: updated })

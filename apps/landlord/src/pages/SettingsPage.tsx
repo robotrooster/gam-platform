@@ -192,6 +192,8 @@ export function SettingsPage() {
 
   const [threshold, setThreshold] = useState<string>('')
   const [depThreshold, setDepThreshold] = useState<string>('')
+  // S652 (Nic): whether this company looks at utility bills before they go out.
+  const [reviewBills, setReviewBills] = useState<boolean>(false)
   const [saved, setSaved] = useState(false)
 
   // S620: editing the entity's business name + EIN. The PATCH already accepted
@@ -218,6 +220,7 @@ export function SettingsPage() {
     if (me) {
       setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
       setDepThreshold(me.depositReturnApprovalThreshold != null ? String(me.depositReturnApprovalThreshold) : '500')
+      setReviewBills(me.reviewUtilityBills === true)
     }
   }, [me])
 
@@ -225,6 +228,7 @@ export function SettingsPage() {
     () => apiPatch('/landlords/me', {
       maintApprovalThreshold: Number(threshold),
       depositReturnApprovalThreshold: Number(depThreshold),
+      reviewUtilityBills: reviewBills,
       landlordId: companyId || undefined,
     }),
     {
@@ -243,6 +247,7 @@ export function SettingsPage() {
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
     && !isNaN(depThresholdNum) && depThresholdNum >= 0
   const thresholdChanged = me && (
+    (me.reviewUtilityBills === true) !== reviewBills ||
     Number(me.maintApprovalThreshold || 500) !== thresholdNum
     || Number(me.depositReturnApprovalThreshold ?? 500) !== depThresholdNum
   )
@@ -458,6 +463,21 @@ export function SettingsPage() {
                 <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6 }}>
                   Team members can finalize deposit refunds up to {fmt(depThresholdNum || 0)}; anything above waits for your approval. Set 0 to approve every refund yourself.
                 </div>
+              </div>
+
+              {/* S652 (Nic): "The landlord toggles whether or not they want to be
+                  part of the review process or just trust them to go through."
+                  Separate from WHO may enter readings — that is a permission. */}
+              <div style={{ marginTop: 18, maxWidth: 480 }}>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={reviewBills} onChange={e => setReviewBills(e.target.checked)} style={{ marginTop: 3 }} />
+                  <span>
+                    <span style={{ fontSize: '.86rem', fontWeight: 600, color: 'var(--text-0)' }}>Review utility bills before they go out</span>
+                    <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.45 }}>
+                      On: each month's meter readings are priced and shown to you first; nothing reaches a tenant until you approve, and a mistyped read can be fixed in place. Off: bills go out on each tenant's next invoice as soon as their meters are read. Either way you can look over any month on the Utilities page.
+                    </div>
+                  </span>
+                </label>
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 14 }}>
