@@ -68,7 +68,7 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
 DATA_LABELS.year = DATA_LABELS.text
 DATA_LABELS.checkbox = DATA_LABELS.text
 DATA_LABELS.choice = DATA_LABELS.text
-DATA_LABELS.radio_group = DATA_LABELS.text
+DATA_LABELS['radio_group'] = DATA_LABELS.text
 DATA_LABELS.signature = LEASE_COLUMNS.filter(c => /_signature$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
 DATA_LABELS.initials = LEASE_COLUMNS.filter(c => /_initial$/.test(c)).map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] }))
 // S622 (Nic): the Data label dropdown is how a landlord RE-TAGS a box the
