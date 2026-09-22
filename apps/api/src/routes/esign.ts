@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { packageSiblings } from '../services/signingPackages'
+import { advancePacket, announcePacketIfComplete } from '../services/packetRelay'
 import {
   LeaseDocumentType,
   UnitType,
@@ -5676,7 +5677,15 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
           if (fpath && fs.existsSync(fpath)) executedBytes = fs.readFileSync(fpath)
         } catch (e) { logger.error({ err: e, documentId: doc.id }, '[ESIGN] could not attach the executed PDF') }
       }
-      for (const s of allSigners as any[]) {
+      // S652 (Nic): a packet speaks ONCE — when its last document completes,
+      // every signer hears; a document inside a packet says nothing on its own.
+      const packetGroup = doc.package_group_id as string | null
+      if (packetGroup) {
+        await announcePacketIfComplete(packetGroup, (role) => isTenantRole(role)
+          ? (process.env.TENANT_APP_URL || 'https://tenant.goldassetmanagement.com') + '/lease'
+          : (process.env.LANDLORD_APP_URL || 'https://landlord.goldassetmanagement.com') + '/esign')
+      }
+      if (!packetGroup) for (const s of allSigners as any[]) {
         // S636 (Nic): "It says click to download and view your lease, and it
         // provides a link that does absolutely nothing from the tenant portal."
         //
@@ -5707,7 +5716,12 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
 
       res.json({ success: true, data: { completed: true, leaseId: leaseResult?.leaseId, leaseStatus: leaseResult?.status } })
     } else {
-      const nextSigner = await queryOne<any>(`
+      // S652 (Nic): "it needs to be bundled as a true package." A packet
+      // document hands on as a PACKET — the next signer is invited once, when
+      // everyone before them has finished every document (services/packetRelay).
+      // Only a standalone document still relays itself.
+      if (doc.package_group_id) await advancePacket(doc.package_group_id)
+      const nextSigner = doc.package_group_id ? null : await queryOne<any>(`
         SELECT * FROM lease_document_signers
         WHERE document_id=$1 AND status='pending'
         ORDER BY order_index LIMIT 1`, [doc.id])

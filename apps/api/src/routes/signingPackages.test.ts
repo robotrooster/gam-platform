@@ -173,6 +173,7 @@ describe('the draft checklist for a unit', () => {
 // ── the assembled bundle ────────────────────────────────────────────────────
 import { esignRouter } from './esign'
 import { packageSiblings } from '../services/signingPackages'
+import { advancePacket } from '../services/packetRelay'
 import { randomUUID } from 'crypto'
 
 function buildEsignApp() {
@@ -614,5 +615,45 @@ describe('an account that runs two companies (Blu: Country Acres in IL, Oak Park
     const r = await request(buildApp()).post('/api/signing-packages').set('Authorization', `Bearer ${f.both}`)
       .send({ name: 'IL', stateCode: 'IL', items: [{ templateId: t }] })
     expect(r.status).toBe(403)
+  })
+})
+
+// S652 (Nic): "it needs to be bundled as a true package." The tenant is invited
+// to a packet ONCE, when the landlord has signed every document in it — not
+// per document as each signature lands (Shane got nine emails for Lot 11).
+describe('advancePacket — one invitation per packet (S652)', () => {
+  it('waits for the landlord to finish every document, then invites the tenant once', async () => {
+    const f = await seedSignableUnit()
+    const res = await request(buildEsignApp())
+      .post('/api/esign/documents').set('Authorization', `Bearer ${f.tokenA}`)
+      .send({
+        templateId: f.tplA, unitId: f.unitA, title: 'Mobile Home Lease',
+        packageTemplateIds: [f.rules, f.inst],
+        homeSale: { tenantId: f.tenantId, salePrice: 24000, downPayment: 2000,
+                    annualInterestRate: 0, termMonths: 55, startMonth: '2026-11-01' },
+        signers: [
+          { userId: f.a.userId, role: 'landlord', name: 'Landlord', email: 'l@x.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'Tenant', email: 't@x.dev', orderIndex: 2 },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const group = (await db.query(`SELECT package_group_id FROM lease_documents WHERE id = $1`, [res.body.data.id])).rows[0].package_group_id
+    const docs = (await db.query(`SELECT id FROM lease_documents WHERE package_group_id = $1 ORDER BY package_sort_order`, [group])).rows.map(r => r.id)
+    expect(docs).toHaveLength(3)
+    const tenantStates = async () => (await db.query(
+      `SELECT status, COALESCE(invite_sent, false) AS invite_sent FROM lease_document_signers
+        WHERE document_id = ANY($1::uuid[]) AND user_id = $2 ORDER BY document_id`, [docs, f.tenantUserId])).rows
+
+    // Landlord signs the first document only → the tenant hears nothing.
+    await db.query(`UPDATE lease_document_signers SET status='signed', signed_at=NOW() WHERE document_id=$1 AND user_id=$2`, [docs[0], f.a.userId])
+    expect((await advancePacket(group)).invited).toBeNull()
+    expect((await tenantStates()).every(r => r.status === 'pending' && !r.invite_sent)).toBe(true)
+
+    // Landlord finishes the packet → the tenant is invited, once, to all of it.
+    await db.query(`UPDATE lease_document_signers SET status='signed', signed_at=NOW() WHERE document_id = ANY($1::uuid[]) AND user_id=$2`, [docs, f.a.userId])
+    expect((await advancePacket(group)).invited).toBe('t@x.dev')
+    expect((await tenantStates()).every(r => r.status === 'sent' && r.invite_sent)).toBe(true)
+    // A later signature in the packet does not invite them again.
+    expect((await advancePacket(group)).invited).toBeNull()
   })
 })

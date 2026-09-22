@@ -323,6 +323,7 @@ export function SignPage() {
   const [savedInit, setSavedInit]     = useState<{value:string,font?:string}|null>(null)
   const [activeField, setActiveField] = useState<any>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [showBundle, setShowBundle] = useState(false)
   const [pdfPageCount, setPdfPageCount] = useState(1)
   const [pdfDims, setPdfDims]         = useState<{width:number,height:number}|null>(null)
   const [allDone, setAllDone]         = useState(false)
@@ -733,8 +734,28 @@ export function SignPage() {
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
           {bundle.length > 1 && selfAt >= 0 && (
-            <div style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600 }}>
-              Document {selfAt + 1} of {bundle.length}{leftForMe > 0 ? ` · ${leftForMe} more for you to sign` : ' · the last one for you'}
+            <div>
+              <div onClick={()=>setShowBundle(v=>!v)} style={{ fontSize:'.72rem', color:'var(--gold,#c9a227)', fontWeight:600, cursor:'pointer' }}>
+                Document {selfAt + 1} of {bundle.length}{leftForMe > 0 ? ` · ${leftForMe} more for you to sign` : ' · the last one for you'} {showBundle ? '▴' : '▾'}
+              </div>
+              {/* S652 (Nic): "let him just scroll through and do them in any
+                  order he desires" — the whole packet, any document a click away. */}
+              {showBundle && (
+                <div style={{ marginTop:6, background:'var(--bg-2,#151a22)', border:'1px solid var(--border-0)', borderRadius:8, padding:'6px 8px', maxWidth:440 }}>
+                  {bundle.map((d:any, i:number) => {
+                    const state = d.isSelf ? 'this one' : d.status==='completed' ? 'done' : !d.mine ? 'not yours yet' : d.mine.status==='signed' ? 'you signed' : 'needs you'
+                    const canOpen = !d.isSelf && !!d.mine?.token
+                    return (
+                      <div key={d.id} onClick={()=>{ if (canOpen) { setShowBundle(false); setStage('signing'); navigate('/sign/'+d.mine.token) } }}
+                           style={{ display:'flex', justifyContent:'space-between', gap:10, padding:'4px 2px', fontSize:'.74rem', cursor: canOpen?'pointer':'default',
+                                    color: d.isSelf?'var(--gold,#c9a227)':'var(--text-1,#ddd)', borderBottom: i<bundle.length-1?'1px solid var(--border-0)':'none' }}>
+                        <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{i+1}. {d.title}</span>
+                        <span style={{ flexShrink:0, color: state==='needs you'?'var(--gold,#c9a227)':'var(--text-3)' }}>{state}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
           {/* S629 (Nic): "it said four out of twenty three required fields
