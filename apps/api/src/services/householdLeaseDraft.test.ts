@@ -109,6 +109,33 @@ describe('draftHouseholdLease', () => {
   })
 
   // Re-inviting must not stack a second unsigned lease on the same unit.
+  // S652 (Nic): "no selecting package/templates at invite" — the unit's default
+  // package decides what rides with the lease, and it all drafts as one packet.
+  it('drafts the whole default package as one packet — nothing chosen at invite', async () => {
+    const c = await seedCtx('mobile_home')
+    const tpl = await seedTemplate(c.landlordId, 'mobile_home')
+    const { rows: [disc] } = await db.query<any>(
+      `INSERT INTO lease_templates (landlord_id, name, purpose, base_pdf_url, disclosure_type, is_active)
+       VALUES ($1,'Park Rules','state_disclosure','/uploads/rules.pdf','park_rules',TRUE) RETURNING id`, [c.landlordId])
+    const { rows: [pkg] } = await db.query<any>(
+      `INSERT INTO document_packages (landlord_id, name, unit_type, is_default) VALUES ($1,'MH packet','mobile_home',TRUE) RETURNING id`,
+      [c.landlordId])
+    await db.query(`INSERT INTO document_package_items (package_id, template_id, sort_order, renewal_behavior, required)
+                    VALUES ($1,$2,0,'with_lease',TRUE), ($1,$3,1,'once_per_tenancy',FALSE)`, [pkg.id, tpl, disc.id])
+    const res = await draftHouseholdLease({ landlordId: c.landlordId, unitId: c.unitId, residents: resident(c) })
+    expect(res.drafted).toBe(true)
+    const { rows: docs } = await db.query<any>(
+      `SELECT id, title, document_type, package_group_id FROM lease_documents WHERE unit_id=$1 ORDER BY package_sort_order`, [c.unitId])
+    expect(docs).toHaveLength(2)
+    expect(docs[0].document_type).toBe('original_lease')
+    expect(docs[1].title).toBe('Park Rules')
+    expect(docs[1].package_group_id).toBe(docs[0].package_group_id)
+    // the same people sign every document in the packet
+    const { rows: primaries } = await db.query<any>(
+      `SELECT document_id FROM lease_document_signers WHERE document_id = ANY($1::uuid[]) AND role='primary'`, [docs.map((d: any) => d.id)])
+    expect(primaries).toHaveLength(2)
+  })
+
   it('does not draft twice for the same unit', async () => {
     const c = await seedCtx('rv_spot')
     await seedTemplate(c.landlordId, 'rv_spot')
