@@ -25,7 +25,9 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
   const [editCost, setEditCost] = useState('')
   const [editSchedule, setEditSchedule] = useState('')
   // S475: pending worker-assignment selection.
-  const [editAssignee, setEditAssignee] = useState<string>('')
+  // null = untouched; '' = "— Unassigned —" chosen (S652: that used to be
+  // indistinguishable from untouched, so unassigning silently did nothing).
+  const [editAssignee, setEditAssignee] = useState<string | null>(null)
 
   const { data, isLoading } = useQuery(
     ['maint-detail', r.id],
@@ -40,6 +42,17 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
   )
   const maintenanceWorkers = (teamData?.members ?? []).filter(
     (m: any) => m.role === 'maintenance',
+  )
+
+  // S652: the property's live work traders can be given a job too.
+  const propertyIdForJob = (data as any)?.propertyId
+  const { data: workTraders = [] } = useQuery<any[]>(
+    ['wt-assignable', propertyIdForJob],
+    () => apiGet<any[]>(`/work-trade/assignable/${propertyIdForJob}`),
+    { enabled: !!propertyIdForJob })
+  const checkMut = useMutation(
+    () => apiPost(`/work-trade/jobs/${r.id}/check`, {}),
+    { onSuccess: () => { qc.invalidateQueries('maintenance'); qc.invalidateQueries(['maint-detail', r.id]) } }
   )
 
   const updateMut = useMutation(
@@ -203,36 +216,68 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                   )}
                 </div>
               )}
-              {maintenanceWorkers.length === 0 ? (
+              {maintenanceWorkers.length === 0 && (workTraders as any[]).length === 0 ? (
                 <div style={{ fontSize: '.72rem', color: 'var(--text-3)', padding: '6px 0' }}>
-                  No maintenance team members yet — invite one on the Team page.
+                  No maintenance team members or work traders here yet.
                 </div>
               ) : (
                 <div style={{ display: 'flex', gap: 6 }}>
                   <select
                     className="input"
-                    value={editAssignee || req.assignedTo || ''}
+                    value={editAssignee ?? req.assignedTo ?? ''}
                     onChange={e => setEditAssignee(e.target.value)}
                     style={{ flex: 1, fontSize: '.78rem' }}
                   >
                     <option value="">— Unassigned —</option>
-                    {maintenanceWorkers.map((w: any) => (
-                      <option key={w.userId} value={w.userId}>
-                        {w.firstName} {w.lastName}
-                      </option>
-                    ))}
+                    {maintenanceWorkers.length > 0 && (
+                      <optgroup label="Team">
+                        {maintenanceWorkers.map((w: any) => (
+                          <option key={w.userId} value={w.userId}>{w.firstName} {w.lastName}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {(workTraders as any[]).length > 0 && (
+                      <optgroup label="Work traders">
+                        {(workTraders as any[]).map((w: any) => (
+                          <option key={w.userId} value={w.userId}>{w.firstName} {w.lastName}</option>
+                        ))}
+                      </optgroup>
+                    )}
                   </select>
                   <button
                     className="btn btn-ghost btn-sm"
                     onClick={() => updateMut.mutate({
                       assignedTo: editAssignee || null,
                     })}
-                    disabled={editAssignee === (req.assignedTo || '')}
+                    disabled={editAssignee === null || editAssignee === (req.assignedTo || '')}
                     title="Save assignment"
                   ><Check size={12} /></button>
                 </div>
               )}
             </div>
+            )}
+
+            {/* S652: which of the property's work traders see this job while it is
+                unassigned. Open work (grounds, cleaning, pests, general) goes to
+                everyone by default; skilled work to those with the skill. */}
+            {can('maintenance.assign') && (
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Work traders who can take it</label>
+              <select className="input" style={{ width: '100%', fontSize: '.78rem' }}
+                value={req.workTradeAccess || 'auto'}
+                onChange={e => updateMut.mutate({ workTradeAccess: e.target.value })}>
+                <option value="auto">By kind of job — open work to all, skilled work to those with the skill</option>
+                <option value="anyone">Any work trader</option>
+                <option value="none">No work traders</option>
+              </select>
+            </div>
+            )}
+
+            {req.status === 'completed' && req.needsCheck && (
+              <div style={{ marginBottom: 10, padding: '8px 10px', border: '1px solid var(--gold)', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ flex: 1, fontSize: '.78rem', color: 'var(--text-1)' }}>Done by a work trader — skilled work waiting for a check.</span>
+                <button className="btn btn-primary btn-sm" disabled={checkMut.isLoading} onClick={() => checkMut.mutate()}><Check size={12} /> Confirm</button>
+              </div>
             )}
 
             {/* Quick status buttons */}

@@ -220,6 +220,11 @@ maintenanceRouter.post('/', async (req, res, next) => {
 maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, res, next) => {
   try {
     const { status: rawStatus, assignedTo, estimatedCost, actualCost, scheduledAt, landlordNotes, manHours, priority: rawPriority, category: rawCategory } = req.body
+    // S652: who may see an unassigned job among the property's work traders.
+    const workTradeAccess = ['auto', 'anyone', 'none'].includes(req.body?.workTradeAccess) ? req.body.workTradeAccess : null
+    // S652: "— Unassigned —" sends null, which COALESCE used to swallow — the
+    // old person stayed on the job. An explicit null now clears it.
+    const assignTouched = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'assignedTo')
 
     // S571: landlord may override the agent-recommended priority + category.
     const priority = rawPriority && MAINTENANCE_PRIORITIES.includes(rawPriority) ? rawPriority : null
@@ -230,6 +235,24 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     if (!request) throw new AppError(404, 'Request not found')
     if (!canManageLandlordResource(req.user, request.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+    // S652: an assignee must be someone who works this job's property — the
+    // landlord's own team, or a live work trader there. It used to accept any
+    // user id at all.
+    if (assignTouched && assignedTo) {
+      const ok = await queryOne<{ ok: boolean }>(`
+        SELECT (
+          EXISTS (SELECT 1 FROM landlords l WHERE l.id = $2 AND l.user_id = $1)
+          OR EXISTS (SELECT 1 FROM landlord_members m WHERE m.landlord_id = $2 AND m.user_id = $1)
+          OR EXISTS (SELECT 1 FROM maintenance_worker_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM property_manager_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM onsite_manager_scopes s WHERE s.landlord_id = $2 AND s.user_id = $1)
+          OR EXISTS (SELECT 1 FROM work_trade_agreements a JOIN tenants t ON t.id = a.tenant_id
+                       JOIN units au ON au.id = a.unit_id
+                      WHERE t.user_id = $1 AND a.status = 'active'
+                        AND au.property_id = (SELECT property_id FROM units WHERE id = $3))
+        ) AS ok`, [assignedTo, request.landlord_id, request.unit_id])
+      if (!ok?.ok) throw new AppError(400, 'That person does not work at this property')
     }
 
     // Auto-approval gate: if a new estimated cost is being set AND it exceeds the
@@ -267,8 +290,9 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     const updated = await queryOne<any>(`
       UPDATE maintenance_requests SET
         status         = COALESCE($1, status),
-        assigned_to    = COALESCE($2, assigned_to),
-        assigned_at    = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE assigned_at END,
+        assigned_to    = CASE WHEN $12::boolean THEN $2::uuid ELSE assigned_to END,
+        assigned_at    = CASE WHEN $12::boolean AND $2 IS NOT NULL THEN NOW() ELSE assigned_at END,
+        work_trade_access = COALESCE($13, work_trade_access),
         estimated_cost = COALESCE($3, estimated_cost),
         actual_cost    = COALESCE($4, actual_cost),
         platform_fee   = COALESCE($5, platform_fee),
@@ -282,7 +306,8 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
       WHERE id=$8 RETURNING *`,
       [effectiveStatus, assignedTo||null, estimatedCostNum,
        actualCost||null, platformFee, scheduledAt||null,
-       landlordNotes||null, req.params.id, manHours||null, priority, category])
+       landlordNotes||null, req.params.id, manHours||null, priority, category,
+       assignTouched, workTradeAccess])
 
     // Auto-add status change comment
     if (effectiveStatus && effectiveStatus !== request.status) {

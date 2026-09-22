@@ -211,6 +211,59 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
 
 // ── GET AGREEMENT BY UNIT ─────────────────────────────────────
 
+// ── S652: MAINTENANCE JOBS FOR WORK TRADERS ─────────────────────
+// Declared before '/:id' so "jobs" is never read as an agreement id.
+
+/** The caller's jobs: open ones they may take, theirs, and (trusted) ones to check. */
+workTradeRouter.get('/jobs', async (req, res, next) => {
+  try {
+    const { jobsForTrader } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await jobsForTrader(req.user!.userId) })
+  } catch (e) { next(e) }
+})
+
+workTradeRouter.post('/jobs/:jobId/take', async (req, res, next) => {
+  try {
+    const { takeJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await takeJob(req.user!.userId, req.params.jobId) })
+  } catch (e) { next(e) }
+})
+
+workTradeRouter.post('/jobs/:jobId/done', async (req, res, next) => {
+  try {
+    const body = z.object({
+      hours: z.number().positive().max(24).optional(),
+      note: z.string().max(2000).optional(),
+    }).parse(req.body ?? {})
+    const { finishJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await finishJob(req.user!.userId, req.params.jobId, body) })
+  } catch (e) { next(e) }
+})
+
+/** Confirm finished skilled work: the landlord's side, or a trusted work trader. */
+workTradeRouter.post('/jobs/:jobId/check', async (req, res, next) => {
+  try {
+    const job = await queryOne<{ landlord_id: string }>(
+      `SELECT landlord_id FROM maintenance_requests WHERE id=$1`, [req.params.jobId])
+    if (!job) throw new AppError(404, 'Job not found')
+    const asLandlord = canManageLandlordResource(req.user, job.landlord_id, ['property_manager', 'onsite_manager', 'maintenance'])
+    const { checkJob } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await checkJob(req.user!, req.params.jobId, asLandlord) })
+  } catch (e) { next(e) }
+})
+
+/** Work traders a landlord may assign a job at this property to. */
+workTradeRouter.get('/assignable/:propertyId', requirePerm('maintenance.assign'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.propertyId])
+    if (!prop || !canManageLandlordResource(req.user, prop.landlord_id, ['property_manager', 'onsite_manager', 'maintenance'])) {
+      throw new AppError(404, 'Property not found')
+    }
+    const { assignableForProperty } = await import('../services/workTradeJobs')
+    res.json({ success: true, data: await assignableForProperty(req.params.propertyId) })
+  } catch (e) { next(e) }
+})
+
 workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
   try {
     // S397: validate caller can access the unit's landlord scope OR is the
@@ -257,7 +310,7 @@ workTradeRouter.get('/:id', async (req, res, next) => {
     const agreement = await queryOne<any>(`
       SELECT wta.*, wta.monthly_hours_target AS target,
         un.unit_number, p.name as property_name,
-        tu.first_name AS tenant_first, tu.last_name AS tenant_last
+        tu.first_name AS tenant_first, tu.last_name AS tenant_last, tu.id AS tenant_user_id
       FROM work_trade_agreements wta
       JOIN units un ON un.id = wta.unit_id
       JOIN properties p ON p.id = un.property_id
@@ -343,6 +396,16 @@ workTradeRouter.get('/:id', async (req, res, next) => {
           reviewBy,
         },
         record,
+        // S652: this person's jobs, for the landlord's copy of the window —
+        // what they have on the go and what they finished lately.
+        jobs: await query<any>(`
+          SELECT mr.id, mr.title, mr.category, mr.status, mr.needs_check, mr.completed_at,
+                 un.unit_number
+            FROM maintenance_requests mr JOIN units un ON un.id = mr.unit_id
+           WHERE (mr.assigned_to = $1 OR mr.done_by_user_id = $1)
+             AND (mr.status IN ('assigned','in_progress') OR mr.completed_at > NOW() - interval '60 days')
+           ORDER BY mr.status = 'completed', mr.completed_at DESC NULLS FIRST
+           LIMIT 40`, [agreement.tenant_user_id ?? null]),
       }
     })
   } catch (e) { next(e) }
@@ -552,6 +615,11 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
     // Deliberately not fatal: the status change is the landlord's decision and
     // must stand even if billing the remainder fails. A failure here leaves open
     // periods that the month-close run will still find.
+    // S652: an agreement that stops hands back the jobs its person had taken.
+    if ((status === 'ended' || status === 'paused') && wasActive) {
+      const { releaseJobsFor } = await import('../services/workTradeJobs')
+      await releaseJobsFor({ query: (sql: string, p: any[]) => query(sql, p) }, [req.params.id])
+    }
     let settlement = null
     if (status === 'ended' && wasActive) {
       try {

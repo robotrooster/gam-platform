@@ -1151,6 +1151,9 @@ leasesRouter.post('/:id/hibernate', requirePerm('leases.edit'), async (req, res,
         WHERE unit_id=$1 AND status='active'
           AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
         RETURNING id`, [lease.unit_id, lease.id])
+    // S652: jobs they had taken go back on the board for the season.
+    const { releaseJobsFor } = await import('../services/workTradeJobs')
+    await releaseJobsFor(client, paused.rows.map((r: any) => r.id))
     await client.query('COMMIT')
     logger.info(`[hibernate] lease ${lease.id} (unit ${lease.unit_number}) → dormant; paused ${paused.rowCount} work-trade agreement(s)`)
     res.json({ success: true, data: { id: lease.id, isHibernating: true, workTradePaused: paused.rowCount } })

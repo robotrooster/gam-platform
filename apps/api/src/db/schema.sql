@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict gEZybDIAXvybYUhAtPjDgkBEIlSY5qqums4CiDAToRLFRhFU7ffm2yQe20Wo1JI
+\restrict NcAFP7CKCHDSNTibvxyJrJoKkeRJC2OAditTTRUlvwBFXy55tIHMcHB1zfbXhGc
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6133,11 +6133,17 @@ CREATE TABLE public.maintenance_requests (
     category text DEFAULT 'general'::text NOT NULL,
     recommended_priority text,
     priority_source text,
+    work_trade_access text DEFAULT 'auto'::text NOT NULL,
+    done_by_user_id uuid,
+    needs_check boolean DEFAULT false NOT NULL,
+    checked_by uuid,
+    checked_at timestamp with time zone,
     CONSTRAINT maintenance_requests_category_check CHECK ((category = ANY (ARRAY['general'::text, 'plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'landscape'::text, 'pest'::text, 'cleaning'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text]))),
     CONSTRAINT maintenance_requests_priority_check CHECK ((priority = ANY (ARRAY['emergency'::text, 'high'::text, 'normal'::text, 'low'::text]))),
     CONSTRAINT maintenance_requests_priority_source_check CHECK ((priority_source = ANY (ARRAY['agent'::text, 'heuristic'::text, 'landlord'::text]))),
     CONSTRAINT maintenance_requests_recommended_priority_check CHECK ((recommended_priority = ANY (ARRAY['emergency'::text, 'high'::text, 'normal'::text, 'low'::text]))),
-    CONSTRAINT maintenance_requests_status_check CHECK ((status = ANY (ARRAY['open'::text, 'awaiting_approval'::text, 'assigned'::text, 'in_progress'::text, 'completed'::text, 'cancelled'::text])))
+    CONSTRAINT maintenance_requests_status_check CHECK ((status = ANY (ARRAY['open'::text, 'awaiting_approval'::text, 'assigned'::text, 'in_progress'::text, 'completed'::text, 'cancelled'::text]))),
+    CONSTRAINT maintenance_requests_work_trade_access_check CHECK ((work_trade_access = ANY (ARRAY['auto'::text, 'anyone'::text, 'none'::text])))
 );
 
 
@@ -24592,6 +24598,22 @@ ALTER TABLE ONLY public.maintenance_requests
 
 
 --
+-- Name: maintenance_requests maintenance_requests_checked_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_checked_by_fkey FOREIGN KEY (checked_by) REFERENCES public.users(id);
+
+
+--
+-- Name: maintenance_requests maintenance_requests_done_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_done_by_user_id_fkey FOREIGN KEY (done_by_user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: maintenance_requests maintenance_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27931,5 +27953,5 @@ ALTER TABLE ONLY public.work_trade_settlements
 -- PostgreSQL database dump complete
 --
 
-\unrestrict gEZybDIAXvybYUhAtPjDgkBEIlSY5qqums4CiDAToRLFRhFU7ffm2yQe20Wo1JI
+\unrestrict NcAFP7CKCHDSNTibvxyJrJoKkeRJC2OAditTTRUlvwBFXy55tIHMcHB1zfbXhGc
 

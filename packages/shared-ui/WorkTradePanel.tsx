@@ -17,7 +17,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { X, Check, Clock, ShieldCheck, Eye } from 'lucide-react'
+import { X, Check, Clock, ShieldCheck, Eye, Wrench } from 'lucide-react'
 import {
   WORK_TRADE_SKILLS, WORK_TRADE_SKILL_LABEL, WORK_TRADE_LOG_STATUS_LABEL,
   WORK_TRADE_COVERABLE_LABEL,
@@ -69,6 +69,17 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
   const [logging, setLogging] = useState(false)
   const [form, setForm] = useState({ workDate: new Date().toISOString().slice(0, 10), hours: '', description: '' })
   const [ending, setEnding] = useState(false)
+  const [finishing, setFinishing] = useState<{ id: string; hours: string; note: string } | null>(null)
+
+  // S652: the tenant's live job list (theirs, open ones, ones to confirm) —
+  // their own endpoint, because what they may see depends on who they are.
+  const { data: myJobs } = useQuery<any>(['wt-jobs'], () => api.get('/work-trade/jobs'),
+    { enabled: side === 'tenant' })
+  const refreshJobs = () => { qc.invalidateQueries(['wt-jobs']); refresh() }
+  const jobAct = useMutation(({ id, act, body }: any) => api.post(`/work-trade/jobs/${id}/${act}`, body ?? {}),
+    { onSuccess: (_r: any, v: any) => { refreshJobs(); setFinishing(null)
+        say(v.act === 'take' ? 'Job taken' : v.act === 'done' ? 'Marked done' : 'Confirmed') },
+      onError: (e: any) => say(e?.message || 'Could not do that', 'error') })
 
   const patch = useMutation((body: any) => api.patch(`/work-trade/${agreementId}`, body),
     { onSuccess: () => { refresh(); setDuties(null) }, onError: (e: any) => say(e?.message || 'Could not save that', 'error') })
@@ -182,6 +193,64 @@ export function WorkTradePanel({ agreementId, side, api, onClose, notify }: {
             <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
               {a.trusted ? 'Their hours count when logged, and they can confirm finished jobs.' : 'Their hours wait for your review.'}</span>
           </div>
+        )}
+      </div>
+
+      {/* ── jobs ── */}
+      <div className="card" style={card}>
+        <div style={label}><Wrench size={11} style={{ verticalAlign: '-1px' }} /> Jobs</div>
+        {side === 'tenant' ? (
+          <>
+            {[['Yours', myJobs?.mine ?? [], 'mine'], ['Open — take one', myJobs?.available ?? [], 'open'],
+              ...(a.trusted ? [['Finished work to confirm', myJobs?.toCheck ?? [], 'check']] : [])].map(([title, list, kind]: any) => (
+              <div key={kind} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: '.74rem', fontWeight: 700, color: 'var(--text-2)', margin: '4px 0' }}>{title}</div>
+                {list.length === 0 && <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+                  {kind === 'open' ? 'Nothing open right now.' : kind === 'mine' ? 'None taken.' : 'Nothing waiting.'}</div>}
+                {list.map((j: any) => (
+                  <div key={j.id} style={{ padding: '8px 0', borderTop: '1px solid var(--border-0, var(--b1))' }}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: '.84rem', color: 'var(--text-0)' }}>{j.title}
+                          {j.priority === 'emergency' || j.priority === 'high' ? <span className="badge" style={{ marginLeft: 6, fontSize: '.6rem', color: 'var(--red, #dc4c4c)' }}>{j.priority === 'emergency' ? 'Emergency' : 'High'}</span> : null}</div>
+                        <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Unit {j.unitNumber} · {j.propertyName}</div>
+                        {j.description && <div style={{ fontSize: '.78rem', color: 'var(--text-1)', marginTop: 3, whiteSpace: 'pre-wrap' }}>{j.description}</div>}
+                        {j.notes && <div style={{ fontSize: '.74rem', color: 'var(--text-2)', marginTop: 3 }}>Notes: {j.notes}</div>}
+                      </div>
+                      {kind === 'open' && <button className="btn btn-primary btn-sm" disabled={jobAct.isLoading} onClick={() => jobAct.mutate({ id: j.id, act: 'take' })}>Take it</button>}
+                      {kind === 'mine' && finishing?.id !== j.id && <button className="btn btn-primary btn-sm" onClick={() => setFinishing({ id: j.id, hours: '', note: '' })}>Mark done</button>}
+                      {kind === 'check' && <button className="btn btn-primary btn-sm" disabled={jobAct.isLoading} onClick={() => jobAct.mutate({ id: j.id, act: 'check' })}>Confirm</button>}
+                    </div>
+                    {finishing && finishing.id === j.id && (
+                      <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr', gap: 6, marginTop: 6 }}>
+                        <input className="input" type="number" step="0.25" min="0" placeholder="Hours" value={finishing.hours} onChange={e => setFinishing({ ...finishing, hours: e.target.value })} />
+                        <input className="input" placeholder="What you did (optional)" value={finishing.note} onChange={e => setFinishing({ ...finishing, note: e.target.value })} />
+                        <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 6 }}>
+                          <button className="btn btn-primary btn-sm" disabled={jobAct.isLoading} onClick={() => jobAct.mutate({ id: j.id, act: 'done',
+                            body: { hours: Number(finishing.hours) > 0 ? Number(finishing.hours) : undefined, note: finishing.note.trim() || undefined } })}>Done</button>
+                          <button className="btn btn-ghost btn-sm" onClick={() => setFinishing(null)}>Cancel</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </>
+        ) : (
+          <>
+            {(data?.jobs ?? []).length === 0 && <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>No jobs taken or finished lately.</div>}
+            {(data?.jobs ?? []).map((j: any) => (
+              <div key={j.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '7px 0', borderTop: '1px solid var(--border-0, var(--b1))' }}>
+                <div style={{ flex: 1, minWidth: 0, fontSize: '.82rem', color: 'var(--text-1)' }}>{j.title}
+                  <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}> · Unit {j.unitNumber}</span></div>
+                <span className="badge" style={{ fontSize: '.64rem' }}>
+                  {j.status === 'completed' ? (j.needsCheck ? 'Done, needs a check' : 'Done') : 'In progress'}</span>
+                {j.status === 'completed' && j.needsCheck && (
+                  <button className="btn btn-primary btn-sm" disabled={jobAct.isLoading} onClick={() => jobAct.mutate({ id: j.id, act: 'check' })}>Confirm</button>)}
+              </div>
+            ))}
+          </>
         )}
       </div>
 
