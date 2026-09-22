@@ -687,7 +687,7 @@ paymentsRouter.get('/absorbed-manual-fees', async (req: any, res, next) => {
 
     const rows = await query<any>(`
       SELECT prl.id, prl.amount::float AS amount, prl.created_at, prl.notes,
-             p.id AS property_id, p.name AS property_name,
+             p.id AS property_id, p.name AS property_name, p.landlord_id,
              u.unit_number
         FROM platform_revenue_ledger prl
         JOIN properties p ON p.id = prl.property_id

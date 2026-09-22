@@ -1078,6 +1078,7 @@ landlordsRouter.get('/:id/next-payout', async (req, res, next) => {
              COALESCE(ubl.amount, 0)::float AS to_you,
              COALESCE(p.settled_at, p.processed_at, p.created_at) AS dated,
              u.unit_number, pr.name AS property_name, ll.business_name AS company_name,
+             p.landlord_id,
              (SELECT us.first_name || ' ' || us.last_name FROM tenants t JOIN users us ON us.id = t.user_id
                WHERE t.id = p.tenant_id) AS tenant_name
         FROM payments p
@@ -1092,7 +1093,7 @@ landlordsRouter.get('/:id/next-payout', async (req, res, next) => {
        ORDER BY dated`, [ids])
     const held = await query<any>(`
       SELECT h.id, h.source_type, h.description, h.amount::float AS to_you, h.created_at AS dated,
-             ll.business_name AS company_name
+             ll.business_name AS company_name, h.landlord_id
         FROM held_payout_items h JOIN landlords ll ON ll.id = h.landlord_id
        WHERE h.landlord_id = ANY($1) AND h.payout_intent_id IS NULL
        ORDER BY h.created_at`, [ids])
@@ -6742,7 +6743,7 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
     if (!landlordIds.length) throw new AppError(400, 'No landlord scope on this user')
 
     const charges = await query<any>(
-      `SELECT c.id, c.kind, c.amount::text AS amount,
+      `SELECT c.id, c.kind, c.landlord_id, c.amount::text AS amount,
               c.collected_amount::text AS collected_amount,
               c.collected_at, c.notes, c.created_at,
               p.name AS property_name,
@@ -6756,7 +6757,7 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
       [landlordIds])
 
     const debits = await query<any>(
-      `SELECT id, charges_amount::text AS charges_amount,
+      `SELECT id, landlord_id, charges_amount::text AS charges_amount,
               bank_cost_amount::text AS bank_cost_amount,
               total_amount::text AS total_amount,
               status, failure_reason, created_at, settled_at

@@ -3,9 +3,9 @@ import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
+import { useEntities } from '../components/EntityPicker'
 import { usePerms } from '../lib/permissions'
 import { X } from 'lucide-react'
-import { PropertySelect } from '../components/ListControls'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S607 (Nic): "If the landlord is covering the ten dollars, it needs to be
@@ -17,17 +17,18 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 // cost they do not bear is noise. It appears only once they have actually
 // absorbed something, which is also the moment the payout reduction becomes
 // real: ten cash payments is $100 off a disbursement, and it should have a name.
-function AbsorbedManualFeesSection() {
+function AbsorbedManualFeesSection({ companyId }: { companyId: string }) {
   const { data } = useQuery<any>('absorbed-manual-fees',
     () => apiGet('/payments/absorbed-manual-fees?months=6'))
-  const rows: any[] = data?.rows ?? []
+  const rows: any[] = (data?.rows ?? []).filter((r: any) => !companyId || r.landlordId === companyId)
+  const total = rows.reduce((n: number, r: any) => n + Number(r.amount || 0), 0)
   if (!rows.length) return null
 
   return (
     <div className="card" style={{ marginBottom: 16 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
         <h3 style={{ margin: 0, fontSize: '1rem' }}>Cash-payment fees you're covering</h3>
-        <span style={{ fontWeight: 700 }}>{fmt(data?.total)}</span>
+        <span style={{ fontWeight: 700 }}>{fmt(total)}</span>
       </div>
       <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 10 }}>
         You've chosen to cover the fee on cash, check and money-order payments, so it comes out of
@@ -75,15 +76,20 @@ const GAM_CHARGE_LABEL: Record<string, string> = {
   bank_debit_cost:    'Bank transfer cost',
 }
 
-function GamChargesSection() {
+function GamChargesSection({ companyId }: { companyId: string }) {
   const { data } = useQuery<any>('gam-charges', () => apiGet('/landlords/me/gam-charges'))
 
-  const charges: any[] = data?.charges ?? []
-  const debits: any[] = data?.debits ?? []
-  const banks: any[] = data?.banks ?? []
+  // S652 (Nic): "it blends both properties on the What you pay GAM card" —
+  // the page's company filter cuts this card too, and the total is the sum of
+  // what is shown, never the account-wide figure under a company heading.
+  const mine = (r: any) => !companyId || r.landlordId === companyId
+  const charges: any[] = (data?.charges ?? []).filter(mine)
+  const debits: any[] = (data?.debits ?? []).filter(mine)
+  const banks: any[] = (data?.banks ?? []).filter(mine)
   if (!charges.length && !debits.length) return null
 
-  const outstanding = Number(data?.outstanding ?? 0)
+  const outstanding = Math.round(charges.reduce(
+    (n: number, c: any) => n + (Number(c.amount) - Number(c.collectedAmount)), 0) * 100) / 100
   const missingBank = banks.filter((b: any) => !b.hasBankLink)
 
   return (
@@ -163,23 +169,27 @@ export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
 
   // S637 (Nic, DIRECTIVE): "disbursements page needs to show first to who and
-  // where", and every multi-property view needs a filter.
+  // where", and every multi-property view needs a filter. A payout carries no
+  // property — one weekly payout aggregates whatever came in across that
+  // COMPANY's parks — so the company is the grain that exists.
   //
-  // A payout carries no property — `disbursements` has landlord_id and
-  // bank_account_id and nothing else (checked against the live schema). One
-  // Friday payout aggregates whatever rent came in across that COMPANY's parks,
-  // so the company is the grain that exists, and it is also the cut that matters
-  // for an account holding more than one LLC. PropertySelect is reused as-is: it
-  // is an id/name dropdown, and the label says what these actually are.
+  // S652 (Nic): "I want to see all of Oak Park's disbursements, total disbursed
+  // and total pending ... it blends both properties on the What you pay GAM
+  // card." One filter at the top of the page, listing every company on the
+  // account (not just the ones that happen to have a payout row), and EVERY
+  // card below it follows: next payout, covered cash fees, what you pay GAM,
+  // the two totals and the list. Nothing on this page is account-wide while a
+  // company is chosen.
   const [companyId, setCompanyId] = useState('')
-  const companyOptions = (disbs as any[])
-    .map(d => ({ id: d.landlordId || '', name: d.companyName || 'Unnamed company' }))
+  const { data: entities = [] } = useEntities()
   const shown = (disbs as any[]).filter(d => companyId === '' || d.landlordId === companyId)
   const [selected, setSelected] = useState<any | null>(null)
   const { can } = usePerms()
 
-  const totalSettled = (disbs as any[]).filter((d: any) => d.status === 'settled').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
-  const totalPending = (disbs as any[]).filter((d: any) => d.status === 'pending').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
+  // A payout Stripe is still moving is money on its way, not money missing.
+  const isPending = (d: any) => d.status === 'pending' || d.status === 'processing'
+  const totalSettled = shown.filter((d: any) => d.status === 'settled').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
+  const totalPending = shown.filter(isPending).reduce((sum: number, d: any) => sum + Number(d.amount), 0)
 
   return (
     <div>
@@ -190,34 +200,42 @@ export function DisbursementsPage() {
         </div>
       </div>
 
-      <NextPayoutFlow />
+      {entities.length > 1 && (
+        <div className="filter-bar" style={{ marginBottom: 16 }}>
+          <select className="form-input" style={{ width: 'auto', minWidth: 220 }}
+                  value={companyId} onChange={e => setCompanyId(e.target.value)}>
+            <option value="">All companies</option>
+            {entities.map((en: any) => (
+              <option key={en.id} value={en.id}>
+                {en.businessName || 'Unnamed company'}
+                {en.propertyCount ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      <NextPayoutFlow companyId={companyId} />
       <BalanceWithdrawSection />
 
       {can('disbursements.pm_impact_view') && <PmImpactSection />}
 
-      <AbsorbedManualFeesSection />
+      <AbsorbedManualFeesSection companyId={companyId} />
 
-      <GamChargesSection />
+      <GamChargesSection companyId={companyId} />
 
       <div className="kpi-grid" style={{ marginBottom: 24 }}>
         <div className="kpi-card">
           <div className="kpi-label">Total Disbursed</div>
           <div className="kpi-value green">{fmt(totalSettled)}</div>
-          <div className="kpi-sub">{(disbs as any[]).filter((d: any) => d.status === 'settled').length} settled payouts</div>
+          <div className="kpi-sub">{shown.filter((d: any) => d.status === 'settled').length} settled payouts</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Pending</div>
           <div className="kpi-value amber">{fmt(totalPending)}</div>
-          <div className="kpi-sub">{(disbs as any[]).filter((d: any) => d.status === 'pending').length} queued</div>
+          <div className="kpi-sub">{shown.filter(isPending).length} on the way</div>
         </div>
       </div>
-
-      {(disbs as any[]).length > 0 && (
-        <div className="filter-bar">
-          <PropertySelect value={companyId} onChange={setCompanyId}
-            properties={companyOptions} allLabel="All companies" />
-        </div>
-      )}
 
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
@@ -252,8 +270,8 @@ export function DisbursementsPage() {
                         : <span style={{ color: 'var(--text-3)' }}>—</span>}
                     </td>
                     <td>
-                      <span className={'badge ' + (d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red')}>
-                        {d.status === 'settled' ? 'Settled' : d.status === 'pending' ? 'Pending' : d.status}
+                      <span className={'badge ' + (d.status === 'settled' ? 'badge-green' : isPending(d) ? 'badge-amber' : 'badge-red')}>
+                        {d.status === 'settled' ? 'Settled' : d.status === 'processing' ? 'On its way' : d.status === 'pending' ? 'Pending' : humanize(d.status)}
                       </span>
                     </td>
                     <td className="mono" style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>
@@ -322,12 +340,17 @@ export function DisbursementsPage() {
 // held for you → sent to your bank on the next run. Below it, every payment in
 // the next payout, so the number is never a mystery.
 const TYPE_LABEL: Record<string, string> = { rent: 'Rent', utility: 'Utilities', deposit: 'Deposit', fee: 'Fee', late_fee: 'Late fee' }
-function NextPayoutFlow() {
+function NextPayoutFlow({ companyId }: { companyId: string }) {
   const { data, isLoading } = useQuery<any>('next-payout', () => apiGet('/landlords/me/next-payout'))
   const [showClearing, setShowClearing] = useState(false)
   if (isLoading || !data) return null
-  const ready = data.ready ?? { total: 0, rows: [] }
-  const clearing = data.clearing ?? { total: 0, rows: [] }
+  // One company at a time when the page is filtered: its payments, its total.
+  const cut = (g: any, k: string) => {
+    const rows = (g?.rows ?? []).filter((r: any) => !companyId || r.landlordId === companyId)
+    return { rows, total: Math.round(rows.reduce((n: number, r: any) => n + Number(r[k] || 0), 0) * 100) / 100 }
+  }
+  const ready = cut(data.ready, 'toYou')
+  const clearing = cut(data.clearing, 'paid')
   const when = data.nextPayoutDate
     ? new Date(data.nextPayoutDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
     : 'the next weekly run'

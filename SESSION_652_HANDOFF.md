@@ -724,3 +724,13 @@ out of a box gets fixed and "She…" does not.
 - Stripe side: NOTHING new. The Connect listener `we_1TwmXE…` (payout.*, account.updated → api.goldassetmanagement.com/webhooks/stripe) already existed and works; no new endpoint, no .env change, no cost.
 
 **Side effect to own.** Replaying the six stored events through the fixed handler (to backfill `connect_payouts`) re-sent three "Payout Sent" emails to realestaterhoades@gmail.com ($2,638.11 / $4,154.89 / $413.00). The three in-app notices were marked read. The once-only guard above means this cannot happen again.
+
+## Disbursements page: one company filter, every card follows (Nic, end of S652)
+
+Nic: "I want to see all of Oak Park's disbursements, total disbursed and total pending ... it blends both properties on the What you pay GAM card ... the account is completely — nothing should make one property supersede another."
+
+- `DisbursementsPage.tsx`: a company filter at the top (every company on the account from `/landlords/me/entities`, "All companies" default, hidden for a one-company account). It drives the next-payout flow, the covered-cash-fees card, **What you pay GAM** (charges, debits, banks and the outstanding total are all cut to the chosen company), the two totals and the list. A payout still moving at Stripe (`processing`) counts as pending and reads "On its way" — the three Mountain View payouts sat in that status, which is why both totals read $0.
+- API: `next-payout` rows, `gam-charges` charges/debits and `absorbed-manual-fees` rows now carry `landlord_id` so the page can cut them.
+- **Not done — a separate pass:** Nic's "search everywhere" for anything that lets the first company on an account stand in for the account (`profileId` is used ~419 times across routes/services/jobs). That is an audit, by hand, in order, not a grep-and-replace.
+
+Lot 15 (Mike Boyd) was drafted, then voided at Nic's instruction — Blu gets the figure from the previous owner tomorrow. Lots 6 and 17 (tenant-owned) went in the batch and stay sent. Deploy 36 = this page.
