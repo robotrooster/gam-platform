@@ -106,6 +106,49 @@ async function appendLeaseAddendums(leaseId: string, mainBytes: Uint8Array): Pro
   return merged.save()
 }
 
+/**
+ * GET /api/leases/:id/documents — S652 (Nic): "when I click on somebody's
+ * name... what I want to see is the whole package of all the documents." The
+ * packet behind a lease: the lease document and every sibling drafted with it
+ * (same package group), each with who has signed and who has not, and the file
+ * to open — the executed copy once complete, the drafted copy until then.
+ */
+leasesRouter.get('/:id/documents', async (req, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      'SELECT id, landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    const u = req.user!
+    const allowed = u.role === 'tenant'
+      ? (u.profileId ? await isTenantOnLease(lease.id, u.profileId) : false)
+      : canAccessLandlordResource(u, lease.landlord_id)
+    if (!allowed) throw new AppError(403, 'Forbidden')
+
+    const docs = await query<any>(`
+      SELECT d.id, d.title, d.document_type, d.status, d.package_sort_order, d.completed_at, d.sent_at,
+             d.executed_pdf_url, d.base_pdf_url,
+             (SELECT json_agg(json_build_object('role', s.role, 'name', s.name, 'status', s.status, 'signedAt', s.signed_at)
+                              ORDER BY s.order_index)
+                FROM lease_document_signers s WHERE s.document_id = d.id) AS signers
+        FROM lease_documents d
+       WHERE d.status <> 'voided'
+         AND (d.lease_id = $1
+              OR (d.package_group_id IS NOT NULL AND d.package_group_id IN (
+                    SELECT package_group_id FROM lease_documents WHERE lease_id = $1 AND package_group_id IS NOT NULL)))
+       ORDER BY d.package_sort_order NULLS LAST, d.created_at`, [lease.id])
+    res.json({
+      success: true,
+      data: docs.map((d: any) => ({
+        id: d.id, title: d.title, documentType: d.document_type, status: d.status,
+        completedAt: d.completed_at, sentAt: d.sent_at, signers: d.signers ?? [],
+        // What to open: the signed copy when there is one, the draft until then.
+        fileUrl: d.status === 'completed' && d.executed_pdf_url ? d.executed_pdf_url : d.base_pdf_url,
+        executed: !!(d.status === 'completed' && d.executed_pdf_url),
+      })),
+    })
+  } catch (e) { next(e) }
+})
+
 leasesRouter.get('/:id/pdf', async (req, res, next) => {
   try {
     const lease = await queryOne<{ id: string; landlord_id: string; imported_pdf_url: string | null }>(

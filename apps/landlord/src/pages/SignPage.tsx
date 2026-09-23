@@ -329,6 +329,14 @@ export function SignPage() {
   const [pdfDims, setPdfDims]         = useState<{width:number,height:number}|null>(null)
   const [allDone, setAllDone]         = useState(false)
   const [setupDone, setSetupDone]     = useState(false)
+  // S652 (Blu): walking from page 4 of the installment contract into the
+  // two-page lead-paint disclosure showed "4/2" and no boxes until he paged
+  // away and back. The route changes the token but React keeps this same
+  // component, so every per-document state has to start over here.
+  useEffect(() => {
+    setCurrentPage(1); setActiveField(null); setFieldValues({}); setFieldFonts({})
+    setStage('signing'); setSubmitError(null); setAllDone(false); setShowBundle(false)
+  }, [token])
   const containerRef = useRef<HTMLDivElement>(null)
   const pdfRef       = useRef<any>(null)
   const canvasRef    = useRef<HTMLCanvasElement>(null)

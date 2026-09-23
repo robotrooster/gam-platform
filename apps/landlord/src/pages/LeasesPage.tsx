@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Fragment } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play, ArrowRight } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
@@ -117,38 +118,6 @@ export function LeasesPage() {
   // opens the editable confirm form for staff who can edit — that row is
   // flagged for action, not reading. Lease details moved to the Details
   // row button.
-  const openLease = (l: any) => {
-    // ── S639 (Nic): A LEASE IS READ-ONLY ───────────────────────────────────
-    //
-    // "This page should be read only. Right now that pending one, I can click
-    // on it and it wants me to select a tenant, which is not selectable, select
-    // a space, which is not selectable. It lets me change the dates, the rent
-    // and the security deposit. Lets me disable late fees, which is false. Late
-    // fees need to be set at the property level. Why am I able to toggle it on
-    // or off for this specific lease? That is a real possible discrimination
-    // gap. Basically that window should never pop up."
-    //
-    // He is right, and the late-fee toggle is the sharpest edge of it: a
-    // landlord able to switch late fees off for one tenant and on for another,
-    // after the fact, from a screen with no record of why, is a fair-housing
-    // problem waiting to happen. Late-fee terms belong to the PROPERTY and are
-    // stamped onto the lease when it is drafted — billing already reads them
-    // from the signed document, which stays true; what is going away is the
-    // ability to reach in afterwards and change one tenant's copy.
-    //
-    // Everything else in that form was equally wrong to offer: rent, deposit,
-    // dates and parties are what the signed document says. Editing them here
-    // would make the record disagree with the paper both sides signed.
-    //
-    // The needs-review branch that opened it is gone. Imports are confirmed in
-    // the pending pool now, and the one lease still carrying that flag is an
-    // orphan from a cancelled test booking.
-    if (can('leases.view_pdf')) {
-      navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)
-      return
-    }
-    openDetails(l)
-  }
   // S640: discard an unsigned draft. Soft — the row stays, marked cancelled.
   const discardDraft = async (l: any) => {
     const where = [l.unitNumber, l.propertyName].filter(Boolean).join(' at ')
@@ -187,6 +156,10 @@ export function LeasesPage() {
   // force (active + pending). Expired/terminated history stays reachable
   // behind the toggle, not mixed into the default list.
   const [showHistory, setShowHistory] = useState(false)
+  // S652 (Nic): a row opens the PACKET — every document signed with this lease —
+  // not one PDF. "I click on his name and it would expand a little bit
+  // underneath his name and show all the documents."
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const currentLeases = (leases as any[]).filter(l => l.status === 'active' || l.status === 'pending')
   // S536: count over CURRENT leases (matches the dashboard alert and the
   // default table) — a needs_review flag on an expired lease shouldn't
@@ -312,13 +285,18 @@ export function LeasesPage() {
                     + (activeTenants.length > 1 ? ` +${activeTenants.length - 1}` : '')
                   : '—'
                 return (
+                  <Fragment key={l.id}>
                   <tr
-                    key={l.id}
-                    onClick={() => openLease(l)}
+                    onClick={() => setExpandedId(id => id === l.id ? null : l.id)}
                     style={{ cursor: 'pointer' }}
                     className="row-clickable"
                   >
-                    <td className="mono">{l.unitNumber || '—'}</td>
+                    <td className="mono">
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {expandedId === l.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        {l.unitNumber || '—'}
+                      </span>
+                    </td>
                     <td>
                       {tenantName}
                       {/* S609 (Nic): autopay VISIBILITY only. Knowing a payment
@@ -532,6 +510,14 @@ export function LeasesPage() {
                       </div>
                     </td>
                   </tr>
+                  {expandedId === l.id && (
+                    <tr>
+                      <td colSpan={8} style={{ background: 'var(--bg-2)', padding: '10px 16px 14px' }} onClick={e => e.stopPropagation()}>
+                        <LeasePacket lease={l} canViewPdf={can('leases.view_pdf')} />
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 )
               }) : (
                 <tr>
@@ -1206,6 +1192,45 @@ function MoveSpotModal({ lease, onClose }: { lease: any; onClose: () => void }) 
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+// S652 (Nic): "I only wanted to see that package — what was sent to who when
+// you expand their name, and what they got and what they signed." Every
+// document drafted with this lease, when it went out, and each signer's
+// answer. Nothing else lives here.
+function LeasePacket({ lease, canViewPdf }: { lease: any; canViewPdf: boolean }) {
+  const navigate = useNavigate()
+  const { data: docs = [], isLoading } = useQuery<any[]>(['lease-packet', lease.id], () => apiGet(`/leases/${lease.id}/documents`))
+  const open = (src: string, title: string) =>
+    navigate(`/view?src=${encodeURIComponent(src.replace(/^\/api/, ''))}&title=${encodeURIComponent(title)}`)
+  const day = (d: string | null) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null
+  if (isLoading) return <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Loading the packet…</div>
+  if (!docs.length) return <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>No documents were sent with this lease.</div>
+  return (
+    <div>
+      {docs.map((d: any) => {
+        const signers: any[] = d.signers || []
+        return (
+          <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '7px 10px', borderTop: '1px solid var(--border-1)', fontSize: '.8rem' }}>
+            <FileText size={14} style={{ color: d.status === 'completed' ? 'var(--green)' : 'var(--text-3)', flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.title}</div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+                {d.sentAt ? `Sent ${day(d.sentAt)}` : 'Not sent yet'}
+                {signers.length > 0 && ' · ' + signers.map((s: any) =>
+                  `${s.name || humanize(s.role)}: ${s.status === 'signed' ? `signed${s.signedAt ? ' ' + day(s.signedAt) : ''}` : s.status === 'declined' ? 'declined' : 'not signed'}`).join(' · ')}
+              </div>
+            </div>
+            {canViewPdf && d.fileUrl && (
+              <button className="btn btn-ghost btn-sm" onClick={() => open(d.fileUrl, d.title)}>
+                {d.executed ? 'Open signed copy' : 'Open'}
+              </button>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }

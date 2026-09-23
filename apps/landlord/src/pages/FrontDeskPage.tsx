@@ -140,15 +140,28 @@ function classify(r: Row): { phase: PhaseId; say: string } {
 const money = (n: number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 
+/** A YYYY-MM-DD string as a local calendar date, never shifted by the time zone. */
+const localDate = (s: string) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s)
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(s)
+}
+
 /** What the desk says to somebody who owes. The figure is the server's, already
  *  net of any credit and already excluding work trade — a work-trade resident
  *  settles in hours, not cash, and must never be asked for money at a counter. */
-function classifyBalance(b: Balance): { phase: PhaseId; say: string } {
+function classifyBalance(b: Balance): { phase: PhaseId; say: string } | null {
   const first = (b.firstName || 'They').trim()
   const owed = Number(b.balance || 0)
   const credit = Number(b.creditOnAccount || 0)
-  const due = b.oldestDueDate ? new Date(b.oldestDueDate) : null
-  const overdue = due ? due.getTime() < Date.now() : false
+  // S652 (Nic, Blu): "why is it saying they owe rent on September 30th?" The
+  // bill was due October 1st. A date-only string parsed as a Date is midnight
+  // UTC, which is the evening before in Phoenix. Read it as a calendar date.
+  const due = b.oldestDueDate ? localDate(b.oldestDueDate) : null
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  // "It shouldn't show until it's due." A bill for next month is not something
+  // to say to somebody at the counter today.
+  if (due && due.getTime() > today.getTime()) return null
+  const overdue = due ? due.getTime() < today.getTime() : false
   const when = due
     ? due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     : null
@@ -212,13 +225,14 @@ export function FrontDeskPage() {
                             phase: PhaseId; say: string
                             name: string; email: string; phone: string | null
                             unit: string | null; property: string | null }> = [
-    ...(balances as Balance[]).map(b => {
+    ...(balances as Balance[]).flatMap(b => {
       const c = classifyBalance(b)
-      return {
+      if (!c) return []
+      return [{
         key: `bal:${b.tenantId}`, r: null, b, ...c,
         name: `${b.firstName ?? ''} ${b.lastName ?? ''}`.trim() || b.email,
         email: b.email, phone: b.phone, unit: b.unitNumber, property: b.propertyName,
-      }
+      }]
     }),
     ...(rows as Row[]).map(r => {
       const c = classify(r)

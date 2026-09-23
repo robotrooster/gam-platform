@@ -340,6 +340,13 @@ export function SignPage() {
   const [pdfDims, setPdfDims]         = useState<{width:number,height:number}|null>(null)
   const [allDone, setAllDone]         = useState(false)
   const [setupDone, setSetupDone]     = useState(false)
+  // S652: the route changes the token but React keeps this component, so every
+  // per-document state starts over here (page, boxes, stage). Same fix as the
+  // landlord side — "4/2" and no boxes on the second document of a packet.
+  useEffect(() => {
+    setCurrentPage(1); setActiveField(null); setFieldValues({}); setFieldFonts({})
+    setStage('signing'); setSubmitError(null); setAllDone(false); setShowBundle(false)
+  }, [documentId])
   const containerRef = useRef<HTMLDivElement>(null)
   const pdfRef       = useRef<any>(null)
   const canvasRef    = useRef<HTMLCanvasElement>(null)

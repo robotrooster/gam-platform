@@ -1256,3 +1256,40 @@ describe('POST /leases/:id/charge — one-off charge with a description', () => 
     expect(row.type).not.toBe('late_fee')
   })
 })
+
+// S652 (Nic): a lease row opens the PACKET — every document drafted with it.
+describe('GET /api/leases/:id/documents', () => {
+  it('lists the lease document and its packet siblings with signers, oldest first, never voided ones', async () => {
+    const f = await seedFixture({})
+    const group = randomUUID()
+    const mk = async (title: string, sort: number, status: string, withLease: boolean, exec: string | null = null) => {
+      const { rows: [{ id }] } = await db.query<{ id: string }>(
+        `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status, package_group_id, package_sort_order, base_pdf_url, executed_pdf_url)
+         VALUES ($1,$2,$3,$4,'original_lease',$5,$6,$7,'/api/esign/files/base.pdf',$8) RETURNING id`,
+        [f.landlordId, f.unitId, withLease ? f.leaseId : null, title, status, group, sort, exec])
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+         VALUES ($1,$2,'landlord','LL','ll@test.dev',1,$3,$4)`, [id, f.landlordUserId, randomUUID(), status === 'completed' ? 'signed' : 'sent'])
+      return id
+    }
+    const leaseDoc = await mk('Lease', 0, 'completed', true, '/api/esign/files/executed-1.pdf')
+    const radon = await mk('Radon', 1, 'sent', false)
+    await mk('Old copy', 1, 'voided', false)
+    const res = await request(buildApp()).get(`/api/leases/${f.leaseId}/documents`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((d: any) => d.id)).toEqual([leaseDoc, radon])
+    expect(res.body.data[0].executed).toBe(true)
+    expect(res.body.data[0].fileUrl).toBe('/api/esign/files/executed-1.pdf')
+    expect(res.body.data[1].executed).toBe(false)
+    expect(res.body.data[1].fileUrl).toBe('/api/esign/files/base.pdf')
+    expect(res.body.data[1].signers[0]).toMatchObject({ role: 'landlord', status: 'sent' })
+  })
+
+  it('a stranger gets 403', async () => {
+    const f = await seedFixture({})
+    const other = jwt.sign({ userId: randomUUID(), role: 'landlord', email: 'x@test.dev', profileId: randomUUID(), permissions: {} }, process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp()).get(`/api/leases/${f.leaseId}/documents`).set('Authorization', `Bearer ${other}`)
+    expect(res.status).toBe(403)
+  })
+})
