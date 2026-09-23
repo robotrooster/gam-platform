@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 import { appendEvent } from './creditLedger'
-import type { CreditEventType } from '@gam/shared'
+import type { CreditEventType, CreditAttestationSource } from '@gam/shared'
 
 // ============================================================
 // Credit-ledger emitters: thin wrappers that compute the right
@@ -75,6 +75,10 @@ export async function emitPaymentSettledEvent(
     settledAt: Date
     graceDays: number | null
     stripePaymentIntentId: string | null
+    /** S652: a cash/check settlement the landlord recorded at the desk is
+     *  landlord-attested with the check number as evidence; default Stripe. */
+    attestationSource?: CreditAttestationSource
+    attestationEvidence?: Record<string, unknown>
   },
 ): Promise<void> {
   const eventType = classifyPaymentTier({
@@ -102,10 +106,9 @@ export async function emitPaymentSettledEvent(
         grace_days: args.graceDays ?? DEFAULT_GRACE_DAYS,
       },
       occurredAt: args.settledAt,
-      attestationSource: 'stripe_attested',
-      attestationEvidence: args.stripePaymentIntentId
-        ? { stripe_payment_intent_id: args.stripePaymentIntentId }
-        : {},
+      attestationSource: args.attestationSource ?? 'stripe_attested',
+      attestationEvidence: args.attestationEvidence
+        ?? (args.stripePaymentIntentId ? { stripe_payment_intent_id: args.stripePaymentIntentId } : {}),
       dimensionTags: ['payment_reliability'],
       networkVisibility: visibility,
     },

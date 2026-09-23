@@ -23,6 +23,7 @@ import { activateBillingForSettledRent } from './billingActivation'
 import { MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { chargeLandlord } from './landlordGamAccount'
 import { AppError } from '../middleware/errorHandler'
+import { emitPaymentSettledEvent } from './creditLedgerEmitters'
 import type { ManualPaymentMethod } from '@gam/shared'
 
 export interface ManualSettleInput {
@@ -293,10 +294,30 @@ export async function settleManualRentPayment(
                          THEN lease_id = (SELECT lease_id FROM payments WHERE id = $1)
                          ELSE tenant_id = (SELECT tenant_id FROM payments WHERE id = $1) END))
             ELSE id = $1 END
-    RETURNING id`,
+    RETURNING id, tenant_id, lease_id, type, amount, due_date, settled_at`,
     [payment.id, method,
      `Recorded as manual ${method} payment${refNote}${provenance}`,
      input.settledAt, input.settleWholeBalance === true, input.settleHousehold === true])
+
+  // S652 (Nic): the credit ledger only heard about Stripe settlements, so a
+  // resident who paid cash three weeks late was never recorded as late — and
+  // the "late payments" count, which now derives from the ledger, would have
+  // missed every desk payment. Same event, same tiering, landlord-attested
+  // with the check or money-order number as the evidence.
+  for (const row of settledRows.rows as any[]) {
+    if (!row.tenant_id || (row.type !== 'rent' && row.type !== 'utility') || !row.due_date) continue
+    const grace = row.lease_id
+      ? (await client.query<{ late_fee_grace_days: number }>(
+          `SELECT late_fee_grace_days FROM leases WHERE id = $1`, [row.lease_id])).rows[0]?.late_fee_grace_days ?? null
+      : null
+    await emitPaymentSettledEvent(client, {
+      tenantId: row.tenant_id, paymentId: row.id, paymentType: row.type,
+      amount: row.amount, dueDate: new Date(row.due_date), settledAt: new Date(row.settled_at),
+      graceDays: grace, stripePaymentIntentId: null,
+      attestationSource: 'landlord_self_reported_with_evidence',
+      attestationEvidence: { manual_method: method, reference: input.reference ?? null },
+    })
+  }
 
   let feePaymentId: string | null = null
 

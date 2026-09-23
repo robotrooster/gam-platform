@@ -2109,10 +2109,17 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       ORDER BY p.due_date DESC
       LIMIT 36`, [req.params.id])
 
-    // Lifetime payment stats. lateCount sources from
-    // tenants.late_payment_count (maintained by the daily late-fee
-    // job in scheduler.ts) — payments.status has no 'late' value
-    // so a FILTER on it always returns 0.
+    // Lifetime payment stats. S652 (Nic): lateCount is the number of charges
+    // the credit ledger recorded as paid past grace — once per charge, the
+    // same events the score reads. The old tenants.late_payment_count column
+    // was bumped every morning a balance stayed open and is no longer kept.
+    const lateRow = await queryOne<{ n: string }>(
+      `SELECT ` + `(SELECT COUNT(*) FROM credit_events ce
+                JOIN credit_subjects cs ON cs.id = ce.subject_id
+               WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1
+                 AND ce.superseded_by IS NULL
+                 AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe'))` + ` AS n`,
+      [req.params.id])
     const paymentStats = await queryOne<any>(`
       SELECT
         COUNT(*) as total_payments,
@@ -2166,7 +2173,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           avgPayment:   parseFloat(paymentStats?.avg_payment || 0),
           settledCount: settled,
           failedCount:  parseInt(paymentStats?.failed || 0),
-          lateCount:    tenant.late_payment_count ?? 0,
+          lateCount:    parseInt(lateRow?.n || '0', 10),
           totalPayments: total,
           onTimeRate,
           firstPayment: paymentStats?.first_payment,

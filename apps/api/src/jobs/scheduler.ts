@@ -2584,7 +2584,7 @@ export function schedulerInit() {
       // no per-row joins for email payloads).
       const overdue = await query<any>(`
         SELECT p.*, u.unit_number, u.id AS unit_id,
-          t.id AS tenant_id, t.late_payment_count, t.ssi_ssdi,
+          t.id AS tenant_id, t.ssi_ssdi,
           tu.email AS tenant_email, tu.first_name AS tenant_first,
           tu.last_name AS tenant_last,
           ul.email AS landlord_email,
@@ -2619,11 +2619,11 @@ export function schedulerInit() {
       // separate alerts to one person is also how a sending domain gets flagged.
       const digests = new Map<string, { landlordName: string; landlordId: string; items: any[] }>()
       for (const payment of overdue) {
-        // Increment late count
-        await query(
-          `UPDATE tenants SET late_payment_count = late_payment_count + 1 WHERE id = $1`,
-          [payment.tenant_id]
-        )
+        // S652 (Nic): the "late payments" number is no longer kept here. This
+        // added one every MORNING a balance stayed open, so thirty days late
+        // read as thirty late payments. It now derives from the credit ledger,
+        // which records each charge once, at settlement, with its due date,
+        // paid date and grace — the same events the score reads.
 
         // Mark unit delinquent
         await query(

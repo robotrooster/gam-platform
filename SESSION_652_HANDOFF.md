@@ -832,3 +832,11 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 - Verified the Day-2090 alerts are gone: no open rent charges before June 2026 remain on Blu's account after the load17 repair.
 
 **Flagged, not changed (needs Nic):** the 7am job adds 1 to a tenant's `late_payment_count` EVERY morning a balance is still open, so a tenant 30 days late is counted as 30 late payments. It should count once per late charge. Needs a marker on the charge (migration) and a decision on what a "late payment" is for screening purposes.
+
+## Deploy 58 — "late payments" counts charges, not mornings (2026-09-22 ~5:40 pm)
+
+**Nic's call (option 1):** the admin "Late Payments" number derives from the credit ledger. The `tenants.late_payment_count` column was bumped every morning a balance stayed open (thirty days late = thirty late payments); the 7am job no longer touches it and nothing reads it. Windows stay as they are (grace / 3 days / 15 days past grace). The stamps stay: every ledger event carries due date, paid date and grace days, so a window change can rescore full history.
+
+**Found and fixed on the way:** only Stripe settlements wrote to the credit ledger. A check or cash payment recorded at the desk, however late, was never a late payment anywhere — and the new counter would have missed every one. `settleManualRentPayment` now writes the same event, same tier, `landlord_self_reported_with_evidence`, with the method and check number as evidence. Tests: `payments.test.ts` "a check recorded late writes the same ledger event", `tenants-admin-views.test.ts` counter-from-ledger.
+
+**Open (needs Nic):** past desk settlements from before this deploy are not in the ledger. Backfilling them is a retroactive change to real tenants' credit history — numbers in the session notes; not done without a go.

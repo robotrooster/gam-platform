@@ -1503,7 +1503,13 @@ export const tenantsListHandler = async (req: any, res: any, next: any) => {
     const tenants = await query<any>(`
       SELECT t.id, t.ach_verified, t.bank_last4, t.on_time_pay_enrolled,
              t.credit_reporting_enrolled, t.flex_deposit_enrolled, t.float_fee_active,
-             t.ssi_ssdi, t.late_payment_count, t.created_at,
+             t.ssi_ssdi, t.created_at,
+             -- S652: late payments = charges the credit ledger recorded as paid past grace, once each
+             (SELECT COUNT(*) FROM credit_events ce
+                JOIN credit_subjects cs ON cs.id = ce.subject_id
+               WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = t.id
+                 AND ce.superseded_by IS NULL
+                 AND ce.event_type IN ('payment_received_late_minor','payment_received_late_major','payment_received_late_severe')) AS late_payment_count,
              u.first_name, u.last_name, u.email, u.phone,
              un.unit_number, p.name AS property_name,
              lu.first_name AS landlord_first, lu.last_name AS landlord_last

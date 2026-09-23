@@ -676,6 +676,28 @@ describe('POST /api/payments/:id/pay', () => {
 
 // ─── POST /api/payments/:id/record-manual (S562) ──────────────
 describe('POST /api/payments/:id/record-manual', () => {
+  // S652 (Nic): the credit ledger only heard about Stripe settlements. A check
+  // recorded at the desk three weeks late is a late payment too — same event,
+  // same tier, landlord-attested with the check number as evidence.
+  it('a check recorded late writes the same ledger event a card payment would', async () => {
+    const f = await seed()
+    // due a month ago, paid today: well past any grace
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 700, dueOffsetMonths: -1 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check', reference: 'CHK-77' })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query<any>(
+      `SELECT ce.event_type, ce.attestation_source, ce.attestation_evidence, ce.event_data
+         FROM credit_events ce JOIN credit_subjects cs ON cs.id = ce.subject_id
+        WHERE cs.subject_type = 'tenant' AND cs.subject_ref_id = $1`, [f.tenant1Id])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].event_type).toBe('payment_received_late_severe')
+    expect(rows[0].attestation_source).toBe('landlord_self_reported_with_evidence')
+    expect(rows[0].attestation_evidence).toMatchObject({ manual_method: 'check', reference: 'CHK-77' })
+    expect(rows[0].event_data.payment_id).toBe(pid)
+  })
+
   it('first rent payment → recorded settled (no disbursement), fee WAIVED', async () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })

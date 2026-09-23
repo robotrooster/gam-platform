@@ -196,21 +196,32 @@ describe('GET /:id/profile — lifetime tenant profile', () => {
     expect(res.body.data.stats.unitsOccupied).toBe(1)
   })
 
-  it('lateCount sources from tenants.late_payment_count, NOT a payments filter', async () => {
-    // Pre-fix bug: lateCount was COUNT(*) FILTER (WHERE status='late')
-    // — but payments_status_check enum has no 'late', so it always
-    // returned 0. Fixed in S379: now reads from
-    // tenants.late_payment_count (maintained by scheduler.ts late-fee
-    // job).
+  // S652 (Nic): lateCount is the number of charges the credit ledger recorded
+  // as paid past grace — once per charge. The old tenants.late_payment_count
+  // was bumped every morning a balance stayed open (thirty days late read as
+  // thirty late payments) and is ignored now.
+  it('lateCount counts ledger late-payment events, once per charge, and ignores the old daily counter', async () => {
     const f = await seedPortfolio()
-    await db.query(
-      `UPDATE tenants SET late_payment_count=4 WHERE id=$1`, [f.tenantId])
+    await db.query(`UPDATE tenants SET late_payment_count=30 WHERE id=$1`, [f.tenantId])
+    const { emitPaymentSettledEvent } = await import('../services/creditLedgerEmitters')
+    const c = await db.connect()
+    try {
+      const day = 86_400_000
+      const due = new Date('2026-06-01T00:00:00Z')
+      // on time, within grace, 2 days past grace, 10 days past grace, 40 days past grace
+      for (const lateDays of [0, 3, 7, 15, 45]) {
+        await emitPaymentSettledEvent(c, {
+          tenantId: f.tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '500',
+          dueDate: due, settledAt: new Date(due.getTime() + lateDays * day), graceDays: 5, stripePaymentIntentId: null,
+        })
+      }
+    } finally { c.release() }
 
     const res = await request(buildApp())
       .get(`/api/tenants/${f.tenantId}/profile`)
       .set('Authorization', `Bearer ${f.adminToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.stats.lateCount).toBe(4)
+    expect(res.body.data.stats.lateCount).toBe(3)
   })
 })
 
