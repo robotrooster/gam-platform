@@ -3,7 +3,7 @@ import { DateTime } from 'luxon'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
   emailSigningReminder, emailDocumentAutoVoided, emailSigningRequest,
-  sendLatePaymentNotice,
+  sendLatePaymentDigest,
 } from '../services/email'
 import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { query, queryOne, getClient } from '../db'
@@ -397,6 +397,48 @@ async function processInvitationExpiry() {
 // tests can place the cutover in the past and exercise the real query.
 const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00:00Z'
 
+// S652 (Nic, Blu): "he just wants one per packet." Blu's eight re-drafted
+// packets produced fifty-four reminder emails in one tick — one for every
+// document, each saying the same sentence. A packet is signed as one thing:
+// one reminder per signer per packet, pointing at the first document that
+// still needs them (the sign page walks them through the rest), and stamped
+// on every document in it so the cadence and the cap count packets, not pages.
+//
+// Link: landlords sign in the landlord portal with their signer token (S629 —
+// a document id is not recognised as a token URL and demanded a login);
+// tenants get the one link that sets up their account and opens the lease
+// (S647). Same helper the send path uses.
+async function remindByPacket(rows: any[], tag: string): Promise<number> {
+  const groups = new Map<string, any[]>()
+  for (const r of rows) {
+    const k = `${String(r.email).toLowerCase()}|${r.package_group_id ?? r.doc_id}`
+    if (!groups.has(k)) groups.set(k, [])
+    groups.get(k)!.push(r)
+  }
+  let sent = 0
+  for (const g of groups.values()) {
+    g.sort((a, b) => Number(a.package_sort_order ?? 0) - Number(b.package_sort_order ?? 0))
+    const r = g[0]
+    try {
+      const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
+      const { url, needsSetup } = r.role === 'landlord'
+        ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
+        : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
+      const title = g.length > 1 ? `your ${g.length} documents for ${unitLabel}` : r.title
+      await emailSigningReminder(r.email, r.name, title, unitLabel, r.landlord_name, url,
+        { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup, documentCount: g.length })
+      await query(
+        `UPDATE lease_document_signers
+            SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
+          WHERE id = ANY($1::uuid[])`, [g.map((x: any) => x.id)])
+      sent++
+    } catch (e) {
+      logger.error({ err: e, signer_id: r.id, documents: g.length }, `[ESIGN-TIMEOUTS] ${tag} failed`)
+    }
+  }
+  return sent
+}
+
 export async function processEsignTimeouts() {
   try {
     // Pass 1: reminders.
@@ -409,7 +451,7 @@ export async function processEsignTimeouts() {
     // the relay ordering stays in one place.
     const remind = await query<any>(`
       SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
-             d.id as doc_id, d.title, d.landlord_id,
+             d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
              u.unit_number, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_document_signers s
@@ -460,37 +502,9 @@ export async function processEsignTimeouts() {
                ELSE s.reminder_sent_at IS NULL
           END)
     `)
-    for (const r of remind as any[]) {
-      try {
-        const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
-        // S536: landlords sign in the landlord portal — a tenant-portal
-        // link would bounce off tenant auth for them.
-        //
-        // S629 (Nic): "when I follow the link from the reminder email, the
-        // scroll was locked again." Both reminders built /sign/<document id>,
-        // written before signer tokens existed and never updated — so a
-        // reminder link was not recognised as a token URL. It demanded a login,
-        // it did not unlock the standalone page's scrolling, and it sent an
-        // Authorization header the recipient did not have. The FIRST email
-        // worked and the reminder did not, from the same document.
-        //
-        // Same helper the send path uses, so there is one definition of what a
-        // signing link is.
-        const { url: signingUrl, needsSetup } = r.role === 'landlord'
-          ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
-          // S647: one link that sets up their account and opens the lease.
-          : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
-        await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup })
-        await query(
-          `UPDATE lease_document_signers
-              SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
-            WHERE id = $1`, [r.id])
-      } catch(e) {
-        logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] reminder failed for signer')
-      }
-    }
-    if ((remind as any[]).length > 0) {
-      logger.info(`[ESIGN-TIMEOUTS] sent ${(remind as any[]).length} reminder(s)`)
+    const remindersSent = await remindByPacket(remind as any[], 'reminder')
+    if (remindersSent > 0) {
+      logger.info(`[ESIGN-TIMEOUTS] sent ${remindersSent} reminder(s) for ${(remind as any[]).length} document(s)`)
     }
 
     // Pass 2: auto-void — BOTH 48-hour windows (S636).
@@ -741,7 +755,7 @@ export async function processEsignTimeouts() {
       const landlordPass = hour === 8
       const renewalRemind = await query<any>(`
         SELECT s.id, s.email, s.name, s.role, s.token, s.user_id,
-               d.id as doc_id, d.title, d.landlord_id,
+               d.id as doc_id, d.title, d.landlord_id, d.package_group_id, d.package_sort_order,
                u.unit_number, p.name as property_name,
                lu.first_name || ' ' || lu.last_name as landlord_name
         FROM lease_document_signers s
@@ -763,25 +777,9 @@ export async function processEsignTimeouts() {
                  SELECT 1 FROM lease_document_signers ls
                  WHERE ls.document_id = d.id AND ls.role='landlord' AND ls.status != 'signed')`}
       `)
-      for (const r of renewalRemind as any[]) {
-        try {
-          const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
-          // S629: the signer's token, not the document id. S647: a tenant gets
-          // the one-link form (services/tenantLeaseLink).
-          const { url, needsSetup } = r.role === 'landlord'
-            ? { url: `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/sign/${r.token || r.doc_id}`, needsSetup: false }
-            : await tenantLeaseLink({ userId: r.user_id, documentId: r.doc_id, signerToken: r.token })
-          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, url, { landlordId: r.landlord_id, documentId: r.doc_id, needsSetup })
-          await query(
-            `UPDATE lease_document_signers
-                SET reminder_sent_at = NOW(), reminder_count = COALESCE(reminder_count, 0) + 1
-              WHERE id = $1`, [r.id])
-        } catch(e) {
-          logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] renewal reminder failed')
-        }
-      }
-      if ((renewalRemind as any[]).length > 0) {
-        logger.info(`[ESIGN-TIMEOUTS] sent ${(renewalRemind as any[]).length} renewal ${landlordPass ? 'landlord' : 'tenant'} reminder(s)`)
+      const renewalSent = await remindByPacket(renewalRemind as any[], 'renewal reminder')
+      if (renewalSent > 0) {
+        logger.info(`[ESIGN-TIMEOUTS] sent ${renewalSent} renewal ${landlordPass ? 'landlord' : 'tenant'} reminder(s)`)
       }
     }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] esign timeouts') }
@@ -2615,6 +2613,11 @@ export function schedulerInit() {
           AND p.work_trade_suspended_at IS NULL
       `)
 
+      // S652 (Nic): "The landlord doesn't need one email per person that's
+      // outstanding... I don't need 15 emails. I know when people haven't paid."
+      // One morning email per landlord, every overdue balance in it. Fifteen
+      // separate alerts to one person is also how a sending domain gets flagged.
+      const digests = new Map<string, { landlordName: string; landlordId: string; items: any[] }>()
       for (const payment of overdue) {
         // Increment late count
         await query(
@@ -2628,26 +2631,27 @@ export function schedulerInit() {
           [payment.unit_id]
         )
 
-        // S88: notify landlord every detection cycle. Email failures must
-        // not abort the loop — log and keep processing other payments.
         const daysLate = Math.max(
           0,
           Math.floor((Date.now() - new Date(payment.due_date).getTime()) / (24 * 60 * 60 * 1000))
         )
         if (payment.landlord_email) {
-          try {
-            await sendLatePaymentNotice({
-              landlordEmail: payment.landlord_email,
-              landlordName:  payment.landlord_name || 'there',
-              tenantName:    `${payment.tenant_first || ''} ${payment.tenant_last || ''}`.trim() || 'Tenant',
-              unitNumber:    payment.unit_number || '—',
-              propertyName:  payment.property_name || '—',
-              daysLate,
-              amount:        Number(payment.amount || 0),
-              ctx:           { landlordId: payment.landlord_id, paymentId: payment.id },
-            })
-          } catch (e) { logger.error({ err: e }, '[EMAIL late_payment]') }
+          const key = String(payment.landlord_email).toLowerCase()
+          if (!digests.has(key)) digests.set(key, { landlordName: payment.landlord_name || 'there', landlordId: payment.landlord_id, items: [] })
+          digests.get(key)!.items.push({
+            tenantName:   `${payment.tenant_first || ''} ${payment.tenant_last || ''}`.trim() || 'Tenant',
+            unitNumber:   payment.unit_number || '—',
+            propertyName: payment.property_name || '—',
+            daysLate,
+            amount:       Number(payment.amount || 0),
+            paymentId:    payment.id,
+          })
         }
+      }
+      for (const [landlordEmail, d] of digests) {
+        try {
+          await sendLatePaymentDigest({ landlordEmail, landlordName: d.landlordName, items: d.items, ctx: { landlordId: d.landlordId } })
+        } catch (e) { logger.error({ err: e, landlordEmail }, '[EMAIL late_payment digest]') }
       }
 
       // ── S638 (Nic): DELINQUENCY HAS TO BE ABLE TO END ─────────────────────

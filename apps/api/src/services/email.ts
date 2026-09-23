@@ -526,12 +526,17 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
 
 // ── ESIGN REMINDER + AUTO-VOID EMAILS (S29) ───────────────
 
-export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean }) {
+export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string, ctx?: { landlordId?: string; documentId?: string; needsSetup?: boolean; documentCount?: number }) {
+  // S652: one reminder per packet. documentCount > 1 means this covers the
+  // whole packet; the link opens the first document and walks through the rest.
+  const n = ctx?.documentCount ?? 1
   await send(to, `Reminder: please sign ${documentTitle}`,
     base(
-      h('Reminder: Document Awaiting Your Signature') +
+      h(n > 1 ? 'Reminder: Documents Awaiting Your Signature' : 'Reminder: Document Awaiting Your Signature') +
       p(`Hi ${signerName},`) +
-      p(`This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a document to review and sign, and it has not yet been signed:`) +
+      p(n > 1
+        ? `This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a packet of documents to review and sign, and <strong style="color:#eef1f8">${n}</strong> of them still need your signature. The link below opens the first and walks you through the rest — this is the only reminder for the whole packet.`
+        : `This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a document to review and sign, and it has not yet been signed:`) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
@@ -1105,6 +1110,45 @@ export async function sendPosCustomerOnboarding({
       metadata: {},
     },
     'support',
+  )
+}
+
+// S652 (Nic): the morning late-rent email is ONE per landlord — every overdue
+// balance in a table — never one per tenant. "I don't need 15 emails."
+export async function sendLatePaymentDigest({ landlordEmail, landlordName, items, ctx }: {
+  landlordEmail: string; landlordName: string
+  items: Array<{ tenantName: string; unitNumber: string; propertyName: string; daysLate: number; amount: number; paymentId?: string }>
+  ctx?: { landlordId?: string }
+}) {
+  if (!items.length) return
+  const sorted = [...items].sort((a, b) => b.daysLate - a.daysLate)
+  const total = sorted.reduce((s, i) => s + i.amount, 0)
+  const properties = [...new Set(sorted.map(i => i.propertyName))]
+  const where = properties.length === 1 ? properties[0] : `${properties.length} properties`
+  const td = (v: string, extra = '') => `<td style="padding:7px 8px;border-bottom:1px solid #1f2733;font-size:.82rem;color:#eef1f8;${extra}">${v}</td>`
+  const rows = sorted.map(i =>
+    `<tr>${td(escapeHtml(i.tenantName))}${td(escapeHtml(i.unitNumber))}${properties.length > 1 ? td(escapeHtml(i.propertyName)) : ''}${td(`$${i.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, 'text-align:right;font-variant-numeric:tabular-nums')}${td(`${i.daysLate}`, 'text-align:right')}</tr>`).join('')
+  const th = (v: string, extra = '') => `<th style="padding:6px 8px;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:#b8c4d8;border-bottom:1px solid #2a3442;${extra}">${v}</th>`
+  await send(landlordEmail,
+    `${sorted.length} overdue rent balance${sorted.length === 1 ? '' : 's'} — ${where}`,
+    base(
+      `<div style="margin-bottom:14px;padding:10px 14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;color:#f59e0b;font-size:.85rem">⚠️ ${sorted.length} overdue rent balance${sorted.length === 1 ? '' : 's'} — $${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} outstanding</div>` +
+      h('Overdue Rent — This Morning') +
+      p(`Hi ${landlordName},`) +
+      p(`These balances are five or more days past due. This is the only email about them today.`) +
+      `<table style="width:100%;border-collapse:collapse;margin:12px 0;background:#0a0f14;border-radius:8px">
+        <thead><tr>${th('Tenant')}${th('Unit')}${properties.length > 1 ? th('Property') : ''}${th('Owed', 'text-align:right')}${th('Days late', 'text-align:right')}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` +
+      `<div style="margin-top:14px;font-size:.75rem;color:#4a5568">If you wish to file for eviction, activate Eviction Mode in your dashboard first — this hard-blocks all ACH. Check your local laws before accepting any payment during an eviction process.</div>`
+    ),
+    {
+      category: 'late_payment_notice',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: null,
+      relatedEntityId: null,
+      metadata: { count: sorted.length, total, payment_ids: sorted.map(i => i.paymentId).filter(Boolean) },
+    }
   )
 }
 

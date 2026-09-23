@@ -237,6 +237,57 @@ describe('S639 — tenant reminders once a day, and they stop', () => {
   })
 })
 
+// ─── S652 (Nic, Blu): "he just wants one per packet" ─────────────────────────
+//
+// Eight re-drafted packets produced fifty-four reminder emails in one tick,
+// one per document. A packet is reminded about once, and every document in it
+// is stamped so the cadence and the cap count packets.
+describe('S652 — one reminder per signer per packet', () => {
+  it('sends one email for a packet of three and stamps all three signer rows', async () => {
+    const first = await seedDoc({
+      status: 'in_progress', sentHoursAgo: 40,
+      landlordSignedHoursAgo: 39, tenantInvitedHoursAgo: 39, tenantRemindedHoursAgo: 25,
+    })
+    const base = (await db.query<any>(
+      `SELECT d.landlord_id, d.unit_id, s.user_id, s.email, s.name
+         FROM lease_documents d JOIN lease_document_signers s ON s.document_id = d.id AND s.role = 'primary'
+        WHERE d.id = $1`, [first])).rows[0]
+    const llUser = (await db.query<any>(
+      `SELECT user_id FROM lease_document_signers WHERE document_id = $1 AND role = 'landlord'`, [first])).rows[0].user_id
+    const packet = randomUUID()
+    await db.query(`UPDATE lease_documents SET package_group_id = $2, package_sort_order = 0 WHERE id = $1`, [first, packet])
+    for (const [i, title] of [[1, 'Radon'], [2, 'Lead paint']] as const) {
+      const id = randomUUID()
+      await db.query(
+        `INSERT INTO lease_documents (id, landlord_id, unit_id, title, document_type, status, sent_at, created_at, package_group_id, package_sort_order)
+         VALUES ($1,$2,$3,$4,'addendum_terms','in_progress', NOW() - INTERVAL '40 hours', NOW(), $5, $6)`,
+        [id, base.landlord_id, base.unit_id, title, packet, i])
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, invite_sent, invite_sent_at, signed_at)
+         VALUES ($1,$2,'landlord','LL',$3,1,$4,'signed',TRUE, NOW() - INTERVAL '40 hours', NOW() - INTERVAL '39 hours')`,
+        [id, llUser, `ll-${randomUUID()}@t.dev`, randomUUID()])
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, invite_sent, invite_sent_at, reminder_sent_at)
+         VALUES ($1,$2,'primary',$3,$4,2,$5,'sent',TRUE, NOW() - INTERVAL '39 hours', NOW() - INTERVAL '25 hours')`,
+        [id, base.user_id, base.name, base.email, randomUUID()])
+    }
+    await processEsignTimeouts()
+    expect(emailSigningReminder).toHaveBeenCalledTimes(1)
+    const [, , title, , , , meta] = (emailSigningReminder as any).mock.calls[0]
+    expect(meta.documentCount).toBe(3)
+    expect(title).toMatch(/3 documents/)
+    // the link opens the FIRST document of the packet
+    expect(meta.documentId).toBe(first)
+    const { rows } = await db.query<any>(
+      `SELECT reminder_count, reminder_sent_at FROM lease_document_signers WHERE role = 'primary' AND email = $1`, [base.email])
+    expect(rows).toHaveLength(3)
+    for (const r of rows) {
+      expect(Number(r.reminder_count)).toBe(1)
+      expect(new Date(r.reminder_sent_at).getTime()).toBeGreaterThan(Date.now() - 60_000)
+    }
+  })
+})
+
 // ─── S638: a resend goes to ONE person, never the whole household ────────────
 //
 // Nic: "I don't want it to send to them at all out of order because I have

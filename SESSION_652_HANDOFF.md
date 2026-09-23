@@ -821,3 +821,14 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 - Unit page: "Turn off for this lease" beside every billed utility; route now allows switching a lease-billed utility off as a recorded addendum (was a 409 — Billy's trash had to be written by hand).
 
 **Not built (asked S652):** credit to a returning POS customer. It is a new mechanism: a `pos_customer_credits` table, `POST /tenant-credits` accepting `posCustomerId`, register auto-apply as a "Store credit" discount line, parity for the business POS. ~half a day; needs a go.
+
+## Deploy 57 — one reminder per packet, one late-rent digest per landlord (2026-09-22 ~17:15)
+
+**Why Blu got ~50 emails at 16:30:** the signing-reminder job (every 15 min) nudges a landlord once, two hours after a document is sent — per DOCUMENT. The 8 installment contracts re-drafted at 14:25 plus the other unsigned documents in those packets came due together: 54 reminders in one tick, 6 more at 16:45. Not the re-draft itself (that sent nothing); the reminder pass behind it.
+
+**Shipped:**
+- Reminders are per signer per PACKET: one email, "your N documents for Unit MH 18 — Country Acres", link opens the first document and the sign page walks through the rest; every document in the packet is stamped so the cadence and the five-reminder cap count packets. Same for renewal reminders. Test: `esignTimeouts.test.ts` "one reminder per signer per packet".
+- 7am late-rent alerts: ONE digest per landlord (table of tenant · unit · owed · days late, total in the banner), category unchanged so the email dashboard still sees them. The per-tenant sender still exists but nothing calls it. Test: `email.test.ts` "sendLatePaymentDigest".
+- Verified the Day-2090 alerts are gone: no open rent charges before June 2026 remain on Blu's account after the load17 repair.
+
+**Flagged, not changed (needs Nic):** the 7am job adds 1 to a tenant's `late_payment_count` EVERY morning a balance is still open, so a tenant 30 days late is counted as 30 late payments. It should count once per late charge. Needs a marker on the charge (migration) and a decision on what a "late payment" is for screening purposes.

@@ -392,6 +392,27 @@ describe('late payment sender', () => {
     expect(log.category).toBe('late_payment_notice')
     expect(log.metadata).toEqual({ days_late: 5, amount: 1200 })
   })
+
+  // S652 (Nic): the morning email is ONE per landlord with every overdue
+  // balance in it — "I don't need 15 emails."
+  it('sendLatePaymentDigest: one email, every balance in it, category=late_payment_notice', async () => {
+    await email.sendLatePaymentDigest({
+      landlordEmail: 'l@mailer-test.co', landlordName: 'L',
+      items: [
+        { tenantName: 'T One', unitNumber: 'A1', propertyName: 'Sunset', daysLate: 5, amount: 1200, paymentId: 'p1' },
+        { tenantName: 'T Two', unitNumber: 'B2', propertyName: 'Sunset', daysLate: 52, amount: 450.5, paymentId: 'p2' },
+      ],
+    })
+    expect(resendSendMock).toHaveBeenCalledTimes(1)
+    const call = (resendSendMock.mock.calls[0] as any[])[0]
+    expect(call.subject).toBe('2 overdue rent balances — Sunset')
+    expect(call.html).toContain('T One')
+    expect(call.html).toContain('T Two')
+    expect(call.html).toContain('1,650.50')
+    const log = await logRowFor('l@mailer-test.co')
+    expect(log.category).toBe('late_payment_notice')
+    expect(log.metadata).toEqual({ count: 2, total: 1650.5, payment_ids: ['p2', 'p1'] })
+  })
 })
 
 describe('sendNotificationEmail', () => {
