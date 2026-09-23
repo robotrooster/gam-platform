@@ -20,6 +20,7 @@ import {
   type SettlementPeriod, type SettlementResult,
 } from '../services/workTradeSettlement'
 import { round2 } from '../services/workTradeCredit'
+import { emitPaymentSettledEvent } from '../services/creditLedgerEmitters'
 
 export interface SettlementRunResult {
   agreementsProcessed: number
@@ -82,7 +83,7 @@ async function creditInvoice(
 ): Promise<void> {
   let remaining = round2(credit)
   const { rows } = await client.query(
-    `SELECT p.id, p.amount::float AS amount
+    `SELECT p.id, p.amount::float AS amount, p.tenant_id, p.type, p.due_date
        FROM payments p
       WHERE p.invoice_id = $1 AND p.status = 'pending'
         -- Late fees and one-off charges are never work-trade creditable: a fine
@@ -103,6 +104,17 @@ async function creditInvoice(
             SET amount = 0, status = 'settled', settled_at = NOW(),
                 notes = COALESCE(notes || ' — ', '') || 'Covered by work-trade credit'
           WHERE id = $1`, [r.id])
+      // S652 (Nic): "let's count work trade as on time." Hours worked paid this
+      // line; the resident's credit history says so — settled on its due date,
+      // whatever day the month actually closed.
+      if (r.tenant_id && (r.type === 'rent' || r.type === 'utility') && r.due_date) {
+        await emitPaymentSettledEvent(client, {
+          tenantId: r.tenant_id, paymentId: r.id, paymentType: r.type, amount: take,
+          dueDate: new Date(r.due_date), settledAt: new Date(r.due_date), graceDays: null,
+          stripePaymentIntentId: null, attestationSource: 'gam_workflow_auto',
+          attestationEvidence: { covered_by: 'work_trade_credit', hours, invoice_id: invoiceId },
+        })
+      }
     } else {
       await client.query(`UPDATE payments SET amount = $2 WHERE id = $1`,
         [r.id, net.toFixed(2)])

@@ -127,6 +127,13 @@ describe('month close, against the database', () => {
     expect(rent.status).toBe('settled')
     expect(rent.amount).toBe(0)
     expect(rent.notes).toContain('work-trade')
+    // S652 (Nic): "let's count work trade as on time" — the credit history says so.
+    const ev = (await db.query(
+      `SELECT ce.event_type, ce.attestation_source FROM credit_events ce
+        WHERE ce.event_data->>'payment_id' = (SELECT id::text FROM payments WHERE invoice_id=$1 AND type='rent')`, [s.invoiceId])).rows
+    expect(ev).toHaveLength(1)
+    expect(ev[0].event_type).toBe('payment_received_on_time')
+    expect(ev[0].attestation_source).toBe('gam_workflow_auto')
   })
 
   // Nic's example: 80-hour agreement, 60 worked, 20 hours carry forward.

@@ -66,6 +66,54 @@ beforeEach(async () => {
   await cleanupAllSchema()
 })
 
+// S652 (Nic): "don't count the onboarding month for anything negative, only
+// positive." The onboarding month is the month of the first rent charge on an
+// existing-tenancy lease.
+describe('onboarding month is never negative', () => {
+  async function seedOnboarded() {
+    const { seedLandlord, seedProperty, seedUnit, seedTenant, seedLease } = await import('../test/dbHelpers')
+    const c = await db.connect()
+    try {
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId, startDate: '2024-03-01' })
+      await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
+      const pay = async (due: string) => (await c.query<{ id: string }>(
+        `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+         VALUES ($1,$2,$3,$4,'rent',900,'settled','RENT',$5) RETURNING id`, [unitId, tenantId, landlordId, leaseId, due])).rows[0].id
+      return { tenantId, first: await pay('2026-09-01'), second: await pay('2026-10-01') }
+    } finally { c.release() }
+  }
+  const eventsFor = async (tenantId: string) => (await db.query<any>(
+    `SELECT ce.event_type FROM credit_events ce JOIN credit_subjects cs ON cs.id = ce.subject_id
+      WHERE cs.subject_type='tenant' AND cs.subject_ref_id=$1 ORDER BY ce.recorded_at`, [tenantId])).rows.map(r => r.event_type)
+
+  it('a late payment in the onboarding month writes nothing; on time writes a good mark', async () => {
+    const s = await seedOnboarded()
+    await withTx(c => emitPaymentSettledEvent(c, {
+      tenantId: s.tenantId, paymentId: s.first, paymentType: 'rent', amount: '900',
+      dueDate: new Date('2026-09-01T00:00:00Z'), settledAt: new Date('2026-09-28T00:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
+    }))
+    expect(await eventsFor(s.tenantId)).toEqual([])
+    await withTx(c => emitPaymentSettledEvent(c, {
+      tenantId: s.tenantId, paymentId: s.first, paymentType: 'rent', amount: '900',
+      dueDate: new Date('2026-09-01T00:00:00Z'), settledAt: new Date('2026-09-01T12:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
+    }))
+    expect(await eventsFor(s.tenantId)).toEqual(['payment_received_on_time'])
+  })
+
+  it('the month after onboarding is scored normally', async () => {
+    const s = await seedOnboarded()
+    await withTx(c => emitPaymentSettledEvent(c, {
+      tenantId: s.tenantId, paymentId: s.second, paymentType: 'rent', amount: '900',
+      dueDate: new Date('2026-10-01T00:00:00Z'), settledAt: new Date('2026-10-28T00:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
+    }))
+    expect(await eventsFor(s.tenantId)).toEqual(['payment_received_late_severe'])
+  })
+})
+
 /**
  * Run a function inside a transaction, passing the PoolClient through.
  * Emitters require a PoolClient (the workflow's transaction); in tests

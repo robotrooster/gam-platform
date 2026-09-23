@@ -46,6 +46,17 @@ export function classifyPaymentTier(args: {
   return 'payment_received_late_severe'
 }
 
+async function isOnboardingMonthCharge(client: PoolClient, paymentId: string): Promise<boolean> {
+  const { rows } = await client.query<{ onboarding: boolean }>(
+    `SELECT l.is_existing_tenancy
+            AND date_trunc('month', p.due_date) = (
+              SELECT date_trunc('month', MIN(p2.due_date)) FROM payments p2
+               WHERE p2.lease_id = l.id AND p2.type = 'rent') AS onboarding
+       FROM payments p JOIN leases l ON l.id = p.lease_id
+      WHERE p.id = $1`, [paymentId])
+  return rows[0]?.onboarding === true
+}
+
 function addDays(d: Date, days: number): Date {
   const out = new Date(d)
   out.setUTCDate(out.getUTCDate() + days)
@@ -87,10 +98,17 @@ export async function emitPaymentSettledEvent(
     graceDays: args.graceDays ?? DEFAULT_GRACE_DAYS,
   })
 
-  const visibility =
+  const positive =
     eventType === 'payment_received_on_time' || eventType === 'payment_received_late_grace'
-      ? 'visible_to_current_landlord'
-      : 'visible_to_gam_network'
+
+  // S652 (Nic): "don't count the onboarding month for anything negative, only
+  // positive." A household moved onto GAM mid-tenancy gets its first bill on
+  // GAM's terms, not theirs — paying it on time is a good mark, paying it late
+  // is nothing. The onboarding month is the month of the first rent charge on
+  // an existing-tenancy lease.
+  if (!positive && await isOnboardingMonthCharge(client, args.paymentId)) return
+
+  const visibility = positive ? 'visible_to_current_landlord' : 'visible_to_gam_network'
 
   await appendEvent(
     {

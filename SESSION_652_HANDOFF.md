@@ -840,3 +840,15 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 **Found and fixed on the way:** only Stripe settlements wrote to the credit ledger. A check or cash payment recorded at the desk, however late, was never a late payment anywhere — and the new counter would have missed every one. `settleManualRentPayment` now writes the same event, same tier, `landlord_self_reported_with_evidence`, with the method and check number as evidence. Tests: `payments.test.ts` "a check recorded late writes the same ledger event", `tenants-admin-views.test.ts` counter-from-ledger.
 
 **Open (needs Nic):** past desk settlements from before this deploy are not in the ledger. Backfilling them is a retroactive change to real tenants' credit history — numbers in the session notes; not done without a go.
+
+## Deploy 59 — credit history rules: onboarding month, work trade, every method (2026-09-22 ~6:05 pm)
+
+**Nic's rules (DIRECTIVE):**
+- The onboarding month (month of the first rent charge on an existing-tenancy lease) is never negative: on time / within grace = good mark, late = nothing. Enforced inside `emitPaymentSettledEvent`, so every settlement path obeys it.
+- Work trade counts as on time: a line covered by approved hours at month close writes `payment_received_on_time` (gam_workflow_auto). A deficit billed afterwards gets its own due date, so paying it by then is on time on its own.
+- Every payment method counts (deploy 58 added desk cash/check/money order).
+- Windows unchanged (grace / 3 days / 15 days past grace). Stamps kept: due date, paid date, grace on every event.
+
+**Backfill applied (positive only):** 14 desk payments from September paid within grace → `late_grace` good marks for Russ Fuller, Jonathan Covey, Coreen Covarrubias, Henry Cisneros, Illyana Gonzalez, Jeremy Parker, Julie Kenyon. 55 late desk payments and 8 prior-arrangement rows left out — nobody gained a late mark. Script: `src/scripts/backfillDeskLedger.ts` (dry run by default).
+
+Tests: `creditLedgerEmitters.test.ts` "onboarding month is never negative", `workTradeSettlement.test.ts` on-time event on a covered rent row.
