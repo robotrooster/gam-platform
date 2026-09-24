@@ -859,3 +859,15 @@ Tests: `creditLedgerEmitters.test.ts` "onboarding month is never negative", `wor
 - **Leases tab = the packet (Nic: "I only wanted to see that package — what was sent to who... and what they signed"):** a row expands under the tenant to every document drafted with that lease (`GET /leases/:id/documents`: the lease document plus package-group siblings, never voided): title, when it was sent, each signer's answer (signed + date / not signed / declined), and Open (signed copy once complete, draft until then). Nothing else in the expansion. Jay Jones' one-page "lease" was the generated summary shown when a packet is not complete.
 - **Front desk "owes Sept 30":** the October 1 due date parsed as midnight UTC, which is the evening before in Phoenix. Dates are read as calendar dates now. And a bill that is not due yet no longer puts anyone in "Owes" — Nic: "it shouldn't show until it's due."
 - **Register stays (Mountain View) — NOT changed (Nic: "don't do anything with the point of sale right now").** Finding only: a stay item has no price of its own by the S652 rule; the SITE's rate is the price ($49 / $269 / $589 on all 53 sites) and the server refuses a stay sale without a site. The cart shows $0.00 until "Pick a site and dates" is answered. The public booking site quotes from the unit rate (verified live: 2 nights = $98 + tax) — nobody books free online.
+
+## Deploy 61 — "Send an addendum" from the lease packet (2026-09-24)
+
+**Blu's deposit question ($0 on page 1, $450 on page 5):** not a tag error, not derived from rent. Page 1's tagged `security_deposit` box prints what GAM holds ($0 — onboarding leases bill no deposit; Blu physically holds none). Page 5 is his Exhibit A whose PDF TEXT says "Security Deposit: $450"; the only boxes there are the untagged five-year rent history he typed (450/450/400/350/300) on every lease. Nic: leave the existing leases; he corrects contradictions by addendum. No change made.
+
+**Addendum sending (built):** the `addendum-terms` route existed and no screen used it. Leases tab → expand a name → gold "Send an addendum": pick a template (any of his except installment/work-trade), title prefilled, "Everyone on the lease" (agreement) or "Notice only"; drafted onto the lease and sent at once — landlord signs first, tenants invited by the relay after. Appears in the packet list. Blu's two new addendum templates are saved with purpose 'lease'; they work from the button as-is.
+
+**Answered, not built (Nic: curiosity):**
+- One-signature property-wide notice with per-household acknowledgement: not built. The batch route drafts one document per lease, each needing his signature. ~1 day if wanted.
+- Mountain View / Oak Park leases pre-date packets (packet = the signed lease only); adding state-required documents today = the same button per lease, "Notice only".
+
+Nic's baby was born 2026-09-24; he is away. POS: untouched by instruction.

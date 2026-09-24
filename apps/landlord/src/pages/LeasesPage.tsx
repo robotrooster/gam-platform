@@ -1206,10 +1206,23 @@ function LeasePacket({ lease, canViewPdf }: { lease: any; canViewPdf: boolean })
   const open = (src: string, title: string) =>
     navigate(`/view?src=${encodeURIComponent(src.replace(/^\/api/, ''))}&title=${encodeURIComponent(title)}`)
   const day = (d: string | null) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null
+  const [addendumOpen, setAddendumOpen] = useState(false)
   if (isLoading) return <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Loading the packet…</div>
-  if (!docs.length) return <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>No documents were sent with this lease.</div>
   return (
     <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+          {docs.length ? `${docs.length} document${docs.length === 1 ? '' : 's'} sent with this lease` : 'No documents were sent with this lease.'}
+        </div>
+        {/* S652 (Nic, Blu): "there is no way to add an addendum document that
+            would go into their package." From here: pick a template, it is
+            drafted onto this lease and lands in your signing queue first; the
+            tenant is invited once you have signed. */}
+        {lease.status === 'active' && (
+          <button className="btn btn-primary btn-sm" onClick={() => setAddendumOpen(true)}>Send an addendum</button>
+        )}
+      </div>
+      {addendumOpen && <SendAddendumModal lease={lease} onClose={() => setAddendumOpen(false)} />}
       {docs.map((d: any) => {
         const signers: any[] = d.signers || []
         return (
@@ -1231,6 +1244,86 @@ function LeasePacket({ lease, canViewPdf }: { lease: any; canViewPdf: boolean })
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// S652 (Nic): "Blue went and created an addendum as a template but how do you
+// actually go about sending that addendum?" One of the landlord's templates,
+// drafted onto this lease as an addendum. Everyone on the lease signs it (an
+// agreement), or only the landlord (a notice). It is sent the moment it is
+// drafted: the landlord signs first, and the tenant is invited after that.
+function SendAddendumModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const { data: templates = [] } = useQuery<any[]>('esign-templates', () => apiGet('/esign/templates'))
+  const usable = (templates as any[])
+    .filter((t: any) => t.purpose !== 'installment_sale' && t.purpose !== 'work_trade_addendum' && t.basePdfUrl)
+    .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
+  const [templateId, setTemplateId] = useState('')
+  const [title, setTitle] = useState('')
+  const [mode, setMode] = useState<'agreement' | 'notice'>('agreement')
+  const [error, setError] = useState<string | null>(null)
+  const chosen = usable.find((t: any) => t.id === templateId)
+  const pick = (id: string) => {
+    setTemplateId(id)
+    const t = usable.find((x: any) => x.id === id)
+    if (t) setTitle(`${t.name} — ${lease.unitNumber || ''}`.trim())
+  }
+  const mut = useMutation(
+    async () => {
+      const created: any = await apiPost('/esign/documents/addendum-terms', { leaseId: lease.id, templateId, title: title.trim(), mode })
+      await apiPost(`/esign/documents/${created.data.id}/send`, {})
+    },
+    {
+      onSuccess: () => {
+        qc.invalidateQueries(['lease-packet', lease.id]); qc.invalidateQueries('esign-documents')
+        toast(mode === 'agreement'
+          ? 'Sent. It is in your signing queue first; the tenant is invited once you have signed.'
+          : 'Sent. It is in your signing queue; the tenant receives it once you have signed.')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not send that'),
+    })
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Send an addendum</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 14 }}>
+          {lease.unitNumber ? `Unit ${lease.unitNumber}` : 'This lease'}{lease.propertyName ? ` · ${lease.propertyName}` : ''}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Template</span>
+            <select className="form-select" value={templateId} onChange={e => pick(e.target.value)} style={{ width: '100%' }}>
+              <option value="" disabled>Pick a template…</option>
+              {usable.map((t: any) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            {!usable.length && <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 4 }}>No templates yet — build one under Documents first.</div>}
+          </div>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Title on the document</span>
+            <input className="form-input" value={title} onChange={e => setTitle(e.target.value)} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 6 }}>Who signs</span>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: '.82rem', marginBottom: 6, cursor: 'pointer' }}>
+              <input type="radio" checked={mode === 'agreement'} onChange={() => setMode('agreement')} />
+              <span><b>Everyone on the lease</b> — you sign first, then each tenant.</span>
+            </label>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: '.82rem', cursor: 'pointer' }}>
+              <input type="radio" checked={mode === 'notice'} onChange={() => setMode('notice')} />
+              <span><b>Notice only</b> — you sign, the tenant receives a copy.</span>
+            </label>
+          </div>
+          {error && <div style={{ fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" disabled={!chosen || !title.trim() || mut.isLoading} onClick={() => mut.mutate()}>
+              {mut.isLoading ? 'Sending…' : 'Draft and send'}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
