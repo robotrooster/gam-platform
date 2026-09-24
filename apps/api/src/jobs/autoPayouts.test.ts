@@ -169,7 +169,11 @@ describe('nextPayoutDateUtc', () => {
   it('is always a day the engine would actually fire on', () => {
     const d = nextPayoutDateUtc()
     expect(d).toMatch(/^\d{4}-\d{2}-\d{2}$/)
-    expect(shouldRunToday(new Date(d + 'T01:00:00Z'))).toBe(true)
+    // S641: the month-end sweep is a payout day too. Near a month's end the
+    // next date a landlord sees is the sweep, not the weekly run — this
+    // failed on 2026-09-24 because the answer was the 28th, which was right.
+    const inst = new Date(d + 'T01:00:00Z')
+    expect(shouldRunToday(inst) || isMonthEndSweepDay(inst)).toBe(true)
   })
 
   it('is in the future, never today already-past', () => {
